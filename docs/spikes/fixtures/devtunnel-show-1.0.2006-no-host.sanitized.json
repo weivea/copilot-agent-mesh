@@ -1,0 +1,21 @@
+{
+  "tunnel": {
+    "tunnelId": "fixture-tunnel",
+    "hostConnections": 0,
+    "clientConnections": 0,
+    "labels": [
+      "copilot-agent-mesh-p0"
+    ],
+    "tunnelExpiration": "<redacted>",
+    "description": "<redacted>",
+    "currentUploadRate": "<redacted>",
+    "currentDownloadRate": "<redacted>",
+    "ports": [
+      {
+        "portNumber": 43123,
+        "protocol": "http"
+      }
+    ],
+    "accessControl": []
+  }
+}
