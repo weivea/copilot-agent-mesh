@@ -35,13 +35,14 @@ Run from the repository root:
 
 ```sh
 npm ci
-npm run test:unit
+npm test
 npm run check-types
 npm run lint
-npm run compile-tests
-npm run compile
-npx vscode-test --code-version 1.134.0 --timeout 20000
 ```
+
+`npm test` runs both freshly compiled unit tests and the Extension Host suite. Use
+`npm run test:extension -- --code-version 1.134.0 --timeout 20000` to pin the
+Extension Host validation to the spike environment.
 
 Observed results:
 
