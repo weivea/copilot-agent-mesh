@@ -9,6 +9,7 @@ Project documents:
 - [Product requirements](./copilot-agent-mesh-prd.md)
 - [Technical implementation](./docs/technical-implementation.md)
 - [Implementation plan](./docs/implementation-plan.md)
+- [Compatibility matrix](./docs/compatibility-matrix.md)
 
 ## Development
 

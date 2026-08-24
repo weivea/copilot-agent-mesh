@@ -1,8 +1,9 @@
 # Copilot Agent Mesh 实施计划
 
-> 状态：Draft<br>
+> 状态：Phase 0 in progress<br>
 > 日期：2026-08-24<br>
 > 依据：[PRD v0.3](../copilot-agent-mesh-prd.md) 与 [技术实施方案](./technical-implementation.md)<br>
+> 兼容性 Gate：[Compatibility Matrix](./compatibility-matrix.md)<br>
 > 计划方式：按技术 Gate 推进，不以未经验证的日历日期承诺
 
 ## 1. 目标
