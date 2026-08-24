@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 
 import { MESH_PROTOCOL_VERSION } from '../shared/protocol';
+import { registerMeshSpikeEchoTool } from './tools/spikeEchoTool';
 import { AgentMeshViewProvider } from './ui/AgentMeshViewProvider';
 
 const configurationSection = 'copilotAgentMesh';
@@ -43,6 +44,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
 	context.subscriptions.push(
 		output,
+		registerMeshSpikeEchoTool(),
 		vscode.window.registerWebviewViewProvider(AgentMeshViewProvider.viewType, dashboard),
 		configureDevice,
 		refreshDashboard,

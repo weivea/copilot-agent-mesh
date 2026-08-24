@@ -40,6 +40,61 @@
     }
   },
   "contributes": {
+    "languageModelTools": [
+      {
+        "name": "mesh_spike_echo",
+        "displayName": "Mesh Spike Echo",
+        "toolReferenceName": "meshSpikeEcho",
+        "canBeReferencedInPrompt": true,
+        "modelDescription": "Starts a local simulated asynchronous mesh task and returns a structured pending result after a configurable acknowledgement delay. Use only to validate the Copilot Agent Mesh tool workflow.",
+        "userDescription": "Validate the asynchronous Copilot Agent Mesh tool workflow without calling a model or accessing workspace files.",
+        "tags": [
+          "copilot-agent-mesh",
+          "spike"
+        ],
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "description": "A short, non-sensitive message for the spike tool to echo."
+            },
+            "delaySeconds": {
+              "type": "number",
+              "enum": [
+                5,
+                15,
+                30
+              ],
+              "default": 5,
+              "description": "Simulated worker acknowledgement delay in seconds."
+            },
+            "confirmationBudgetSeconds": {
+              "type": "number",
+              "enum": [
+                5,
+                15,
+                30
+              ],
+              "default": 15,
+              "description": "Application-level acknowledgement wait budget in seconds."
+            },
+            "delegationRequestId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "description": "Optional stable request ID used to reconcile a retry without starting a second task."
+            }
+          },
+          "required": [
+            "message"
+          ],
+          "additionalProperties": false
+        }
+      }
+    ],
     "viewsContainers": {
       "activitybar": [
         {
@@ -111,6 +166,7 @@
     "pretest": "npm run compile-tests && npm run compile && npm run lint",
     "check-types": "tsc --noEmit",
     "lint": "eslint src shared",
+    "test:unit": "npm run compile-tests && node --test out/src/unitTest/*.test.js",
     "test": "vscode-test"
   },
   "devDependencies": {
