@@ -217,12 +217,44 @@ test('kills an inherited-pipe descendant that ignores SIGTERM within a bound', {
 
 	assert.ok(Date.now() - startedAt < 1_500);
 	assert.ok(commandError.processGroupId);
-	assert.throws(
-		() => process.kill(-commandError.processGroupId!, 0),
-		(error: unknown) => error instanceof Error
-			&& 'code' in error
-			&& error.code === 'ESRCH',
-	);
+	assertProcessGroupGone(commandError.processGroupId);
+});
+
+test('kills a detached-output descendant after a nonzero launcher exit', {
+	skip: process.platform === 'win32',
+}, async () => {
+	const launcher = launcherWithIgnoringDescendant(7);
+	let commandError: OwnedCommandError | undefined;
+
+	try {
+		await runOwnedCommand(process.execPath, ['-e', launcher], {
+			timeoutMs: 1_000,
+			terminationGraceMs: 100,
+		});
+		assert.fail('The launcher should report its nonzero exit.');
+	} catch (error) {
+		assert.ok(error instanceof OwnedCommandError);
+		commandError = error;
+	}
+
+	assert.match(commandError.message, /exited with 7/u);
+	assert.ok(commandError.processGroupId);
+	assertProcessGroupGone(commandError.processGroupId);
+});
+
+test('kills a detached-output descendant after a successful launcher exit', {
+	skip: process.platform === 'win32',
+}, async () => {
+	const launcher = launcherWithIgnoringDescendant(0, true);
+	const command = runOwnedCommand(process.execPath, ['-e', launcher], {
+		timeoutMs: 1_000,
+		terminationGraceMs: 100,
+	});
+	const output = await command;
+	const processGroupId = Number(output.trim());
+
+	assert.ok(Number.isInteger(processGroupId) && processGroupId > 0);
+	assertProcessGroupGone(processGroupId);
 });
 
 function fixture(overrides: Record<string, unknown> = {}): {
@@ -253,5 +285,27 @@ function assertSelectionCode(callback: () => unknown, expectedCode: string): voi
 	assert.throws(
 		callback,
 		(error: unknown) => error instanceof EndpointSelectionError && error.code === expectedCode,
+	);
+}
+
+function launcherWithIgnoringDescendant(exitCode: number, printPid = false): string {
+	const descendant = [
+		"process.on('SIGTERM', () => {});",
+		'setInterval(() => {}, 1000);',
+	].join('');
+	return [
+		"const { spawn } = require('node:child_process');",
+		printPid ? 'console.log(process.pid);' : '',
+		`spawn(process.execPath, ['-e', ${JSON.stringify(descendant)}], { stdio: 'ignore' });`,
+		`process.exit(${exitCode});`,
+	].join('');
+}
+
+function assertProcessGroupGone(processGroupId: number): void {
+	assert.throws(
+		() => process.kill(-processGroupId, 0),
+		(error: unknown) => error instanceof Error
+			&& 'code' in error
+			&& error.code === 'ESRCH',
 	);
 }

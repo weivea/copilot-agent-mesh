@@ -87,6 +87,26 @@ export function runOwnedCommand(
 			reject(error);
 		};
 
+		const terminateAndResolve = async () => {
+			if (settling) {
+				return;
+			}
+			settling = true;
+			clearTimeout(timer);
+			if (processGroupId !== undefined) {
+				try {
+					await terminateOwnedProcessGroup(processGroupId, terminationGraceMs);
+				} catch {
+					reject(new OwnedCommandError(
+						`${commandLabel(executable, args)} failed to terminate its owned process group.`,
+						processGroupId,
+					));
+					return;
+				}
+			}
+			resolve(Buffer.concat(stdoutChunks).toString('utf8'));
+		};
+
 		const recordOutput = (chunk: Buffer, keep: boolean) => {
 			outputBytes += chunk.byteLength;
 			if (outputBytes > maxOutputBytes) {
@@ -117,16 +137,14 @@ export function runOwnedCommand(
 			if (settling) {
 				return;
 			}
-			settling = true;
-			clearTimeout(timer);
 			if (code !== 0) {
-				reject(new OwnedCommandError(
+				void terminateAndReject(new OwnedCommandError(
 					`${commandLabel(executable, args)} exited with ${code ?? signal ?? 'unknown'}.`,
 					processGroupId,
 				));
 				return;
 			}
-			resolve(Buffer.concat(stdoutChunks).toString('utf8'));
+			void terminateAndResolve();
 		});
 	});
 }
@@ -135,19 +153,24 @@ export async function terminateOwnedProcessGroup(
 	processGroupId: number,
 	graceMs: number,
 ): Promise<void> {
-	signalProcessGroup(processGroupId, 'SIGTERM');
+	const groupExisted = signalProcessGroup(processGroupId, 'SIGTERM');
+	if (!groupExisted) {
+		return;
+	}
 	await delay(graceMs);
 	signalProcessGroup(processGroupId, 'SIGKILL');
 	await delay(postKillWaitMs);
 }
 
-function signalProcessGroup(processGroupId: number, signal: NodeJS.Signals): void {
+function signalProcessGroup(processGroupId: number, signal: NodeJS.Signals): boolean {
 	try {
 		process.kill(-processGroupId, signal);
+		return true;
 	} catch (error) {
-		if (!isErrno(error, 'ESRCH')) {
-			throw error;
+		if (isErrno(error, 'ESRCH')) {
+			return false;
 		}
+		throw error;
 	}
 }
 
