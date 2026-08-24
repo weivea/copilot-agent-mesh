@@ -4,6 +4,12 @@ Copilot Agent Mesh is a desktop VS Code extension for delegating GitHub Copilot 
 
 The project is currently in its bootstrap phase. The extension contributes an Activity Bar dashboard, device-name configuration, and the initial shared protocol types described in the [product requirements](./copilot-agent-mesh-prd.md).
 
+Project documents:
+
+- [Product requirements](./copilot-agent-mesh-prd.md)
+- [Technical implementation](./docs/technical-implementation.md)
+- [Implementation plan](./docs/implementation-plan.md)
+
 ## Development
 
 Requirements:

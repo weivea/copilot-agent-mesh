@@ -1,7 +1,7 @@
 # Copilot Agent Mesh 产品需求文档
 
 > 工作名称：Copilot Agent Mesh  
-> 文档版本：v0.2<br>
+> 文档版本：v0.3<br>
 > 状态：Draft / 可用于创建项目  
 > 日期：2026-08-24  
 > 产品形态：个人使用的 VS Code Desktop 扩展  
@@ -109,8 +109,9 @@ Windows Copilot Agent：
 4. Coordinator 扩展通过 Dev Tunnel 将任务发送到 Worker。
 5. Worker 使用本地 AHP 创建 Copilot Agent Session 并开始执行。
 6. 进度实时显示在主设备控制界面。
-7. 远端 Agent 完成后，结果返回 `mesh_delegate_task`。
-8. Tool Result 被加入主 Copilot Agent 当前推理循环，主 Agent继续处理并最终回复用户。
+7. `mesh_delegate_task` 在 Worker 接受后立即返回 `pending + taskId`，不等待完整编码任务。
+8. 主 Agent 可调用 `mesh_get_task` 查询状态；用户也可在 Dashboard 查看进度。
+9. 远端 Agent 完成后，`mesh_get_task` 返回受限的结构化结果，主 Agent 可在当前会话继续处理。
 
 ### 6.4 远程问题与审批
 
@@ -148,7 +149,8 @@ Windows Copilot Agent：
 
 ### FR-3：监听服务
 
-- Worker Gateway 仅绑定 `127.0.0.1` 的随机可用端口。
+- Worker Gateway 仅绑定 `127.0.0.1`。首次使用随机可用端口并持久化，后续优先复用同一端口。
+- 端口冲突时不得静默改变公开地址；由用户确认迁移 Tunnel Port，并明确要求已有 Coordinator 重新配对。
 - Gateway 提供 HTTP 健康检查与 WebSocket JSON-RPC 端点。
 - 用户可手动启动、停止、重启监听。
 - 可配置随 VS Code 启动自动监听。
@@ -164,16 +166,18 @@ MVP 使用 `devtunnel` CLI 子进程，而不是直接集成 SDK。
 - 缺少 CLI 或登录状态时，在 UI 中显示平台对应安装/登录指引。
 - 首次监听时创建持久 Tunnel，并在后续启动复用。
 - Tunnel 使用 HTTP 协议转发本地 Gateway，远端以 WSS 连接。
-- MVP 使用 `--allow-anonymous` 简化 Dev Tunnel 身份认证，同时由插件自己的高熵配对密钥保护 Gateway。
-- 使用 `devtunnel show --json` 获取结构化 Tunnel 与 `portUri` 信息；若当前 CLI 版本不支持所需字段，明确报错而不是解析自然语言输出。
+- MVP 默认使用 Port-scoped、有限期 Anonymous Access，同时由插件自己的高熵配对邀请和 Peer Credential 保护 Gateway。
+- Tunnel-wide `--allow-anonymous` 只能由用户每次显式选择，并显示更大暴露面的 Preview 警告。
+- 使用 `devtunnel show --json` 获取结构化 Tunnel 信息；按已验证 CLI Build 使用版本化 Decoder 发现目标 Port 的 HTTPS Forwarding URI，不硬编码单一字段名。未知结构明确报错，不解析自然语言输出。
 - 支持重新生成 Tunnel、连接 URL 和配对密钥。
 
 参考命令流程：
 
 ```bash
 devtunnel user show
-devtunnel create <tunnel-id> --allow-anonymous --tags copilot-agent-mesh
+devtunnel create <tunnel-id> --tags copilot-agent-mesh
 devtunnel port create <tunnel-id> -p <gateway-port> --protocol http
+devtunnel access create <tunnel-id> --port <gateway-port> --anonymous --expiration <duration>
 devtunnel host <tunnel-id>
 devtunnel show <tunnel-id> --json
 ```
@@ -215,7 +219,7 @@ https://<tunnel-port-uri>/agent-mesh/connect?v=1&device=<device-id>#secret=<pair
 | Tool | 用途 |
 | --- | --- |
 | `mesh_list_workers` | 返回在线设备、能力标签、Workspace 和忙闲状态。 |
-| `mesh_delegate_task` | 向指定设备和 Workspace 派发开发任务，并默认等待结果。 |
+| `mesh_delegate_task` | 向指定设备和 Workspace 创建异步开发任务，Worker 接受后立即返回 `taskId`。 |
 | `mesh_get_task` | 查询任务状态、阶段和已产生的结果。 |
 | `mesh_cancel_task` | 取消远端任务。 |
 | `mesh_answer_task` | 回答远端 Agent 的问题或审批请求。 |
@@ -242,6 +246,8 @@ interface DelegateTaskInput {
 - Tool 执行前显示目标设备、Workspace 和任务摘要确认。
 - Tool 支持 VS Code `CancellationToken`。
 - 成功、失败、超时、离线必须返回不同的结构化结果。
+- Tool API 是一次性结果；`mesh_delegate_task` 不等待完整任务，返回 `pending + taskId`，由 `mesh_get_task` 查询。
+- Tool 调用取消或确认超时不等于远端任务取消；已接受任务继续由 Dashboard 和 `mesh_get_task` 管理。
 - 远程输出过大时只返回摘要和引用，避免占满主 Agent 上下文。
 
 ### FR-8：Worker 任务执行
@@ -272,7 +278,7 @@ running → completed | failed | cancelled | timedOut
 - `taskId` 由 Coordinator 生成并保证幂等。
 - Worker 重复收到相同 `taskId` 时返回已有任务，不重复执行。
 - Worker 将任务最小状态持久化，扩展重启后可恢复展示。
-- 当前 Tool 等待超时不等同于远端任务失败；任务可继续运行并通过 `mesh_get_task` 查询。
+- Tool 确认等待超时或取消不等同于远端任务失败；任务可继续运行并通过 `mesh_get_task` 查询。
 
 ### FR-10：任务结果
 
@@ -434,7 +440,13 @@ code agent host \
   --connection-token <random-token>
 ```
 
-Worker 从 stdout 读取 `READY:<port>`，通过以下本地地址连接：
+Worker 不解析 Agent Host stdout Readiness 文本。使用 Mesh-owned `user-data-dir` 启动后，通过以下命令读取并严格验证 Endpoint JSON：
+
+```bash
+code agent endpoints --user-data-dir <mesh-user-data-dir>
+```
+
+从启动前后 Endpoint 集合中唯一识别 Mesh-owned Standalone Endpoint，再使用其本地 WebSocket 地址和 Token 连接：
 
 ```text
 ws://127.0.0.1:<port>?tkn=<connection-token>
@@ -445,11 +457,12 @@ ws://127.0.0.1:<port>?tkn=<connection-token>
 1. `initialize` 并订阅 `ahp-root://`。
 2. 发现 Copilot Agent provider。
 3. 在本机完成 Copilot/GitHub 身份认证并发送 AHP `authenticate`。
-4. `createSession`，设置 Worker 的本地 Workspace URI。
-5. 订阅 Session 和默认 Chat。
-6. 发送 `chat/turnStarted`。
-7. 聚合 `chat/responsePart`、`chat/delta`、Tool Call、输入请求和 `chat/turnComplete`。
-8. 将结构化结果映射为 Mesh Task Result。
+4. `createSession`，使用已注册 Workspace 的 `workingDirectories`。
+5. 订阅 Session，应用 Snapshot 并等待 `session/ready`。
+6. 从 Session State 获取并订阅默认 Chat。
+7. 发送 `chat/turnStarted`。
+8. 聚合 `chat/responsePart`、`chat/delta`、Tool Call、输入请求和 `chat/turnComplete`。
+9. 将结构化结果映射为 Mesh Task Result。
 
 发送给 Agent 的 Prompt 只包含主 Agent 提供的任务描述、验收条件和必要的传输上下文。扩展不得追加 Git 状态检查、分支管理、worktree、Commit、Push 或 PR 策略。
 
@@ -512,8 +525,8 @@ shared/
 1. Dev Tunnels 支持 Windows、macOS、Linux。
 2. Host 和 Client 都只需要向 Azure Relay 建立出站连接，不要求设备开放入站端口。
 3. Web forwarding 原生支持 HTTP(S) 和 WS(S)，不安全连接会升级为 HTTPS/WSS。
-4. 可以创建持久 Tunnel，从而保持稳定连接 URL。
-5. 默认 Tunnel 私有；MVP 选择匿名 Tunnel + 插件配对密钥，以降低个人插件的登录和跨设备授权复杂度。
+4. 可以创建持久 Tunnel 并复用 Port，从而在资源仍存在时保持连接 URL；Persistent 不代表永久，Tunnel 和 Access 都可能过期。
+5. 默认 Tunnel 私有；MVP 选择有限期 Port-scoped Anonymous Access + 插件配对凭据，以降低个人插件的登录和跨设备授权复杂度。
 6. CLI 登录凭据缓存于系统安全钥匙串。
 7. `devtunnel` CLI 和服务仍处于 Public Preview，无 SLA，命令和行为可能变化。
 8. 官方 TypeScript SDK支持 Management、Client、Host 和重连；后续可替换 CLI 子进程方案。
@@ -535,7 +548,7 @@ MVP 采用 CLI 的原因：
 
 | 能力 | 结论 |
 | --- | --- |
-| 主 Agent 自动调用扩展能力 | Language Model Tool API 正式支持。 |
+| 主 Agent 自动调用扩展能力 | Language Model Tool API 正式支持，但稳定 API 只有一次性 Result，没有持久 Tool Progress。 |
 | 扩展自建 Chat Participant | 可行，但会变成自定义 Agent，不符合复用内置 Agent 的目标。 |
 | 通过 Language Model API 直接调用模型 | 只能调用模型，不包含完整 Agent Loop。 |
 | `workbench.action.chat.open` | 可做原型，但属于内部命令，不能稳定获取完整结构化结果。 |
@@ -544,6 +557,8 @@ MVP 采用 CLI 的原因：
 | 控制界面 | Webview View API适合设备和任务仪表板。 |
 
 AHP 的 Root、Session、Chat 和 Terminal channel 在当前规范中标记为 Stable，但 VS Code Agent Host 本身仍在持续演进。实现必须使用协议版本协商与 capability detection，不依赖内部对象结构。
+
+`mesh_delegate_task` 必须采用异步 `pending + taskId` 语义。扩展不能依赖长时间保持 Tool Invocation，也不能在旧 Copilot Turn 结束后主动追加结果。
 
 ## 12. 简化安全模型
 
@@ -567,6 +582,7 @@ AHP 的 Root、Session、Chat 和 Terminal channel 在当前规范中标记为 S
 
 - 支持 Windows x64/arm64、macOS x64/arm64、Linux x64；实际打包矩阵由依赖验证决定。
 - 要求桌面版 VS Code。
+- MVP 仅支持本机 `file:` Workspace；不支持 SSH、WSL、Dev Containers、Codespaces 或其他 VS Code Remote Workspace。
 - 每台 Worker 均需要有效 Copilot 权限并完成登录。
 - `devtunnel` 与 `code` CLI 路径可自动发现，也允许用户手动配置。
 
@@ -624,7 +640,7 @@ AHP 的 Root、Session、Chat 和 Terminal channel 在当前规范中标记为 S
 8. `mesh_list_workers`、`mesh_delegate_task`、`mesh_get_task`、`mesh_cancel_task`。
 9. Worker 通过 AHP 调用内置 Copilot Agent。
 10. 主设备 UI 显示任务状态和输出摘要。
-11. 任务完成结果返回原始 Tool 调用。
+11. 任务完成结果可通过 `mesh_get_task` 在当前 Copilot 会话中查询。
 12. 一台设备可注册多个 Workspace，但每个 Workspace 同时只执行一个任务。
 13. 插件不检查或管理 Git 状态、分支和 worktree，也不向 Agent 注入相关操作要求。
 
@@ -653,7 +669,7 @@ AHP 的 Root、Session、Chat 和 Terminal channel 在当前规范中标记为 S
 - Mac 创建内置 Copilot Agent Session，在注册的 Workspace 中执行。
 - 创建 Session 前，扩展不检查或修改 Git 状态、分支与 worktree，也不向 Agent 注入 Git 操作提示。
 - Mac 的文本输出和状态可在 Windows 控制界面查看。
-- 完成后结果自动返回 Windows Copilot Agent，Agent 能基于该结果继续回复。
+- `mesh_delegate_task` 先返回 `pending + taskId`；完成后 Windows Copilot Agent 可通过 `mesh_get_task` 取得结果并继续回复。
 
 ### AC-3：多平台与多仓库
 
@@ -678,8 +694,8 @@ AHP 的 Root、Session、Chat 和 Terminal channel 在当前规范中标记为 S
 - 使用 AHP TypeScript SDK创建 Copilot Session并得到 `turnComplete`。
 - 使用 `vscode.authentication` 完成本机 AHP Copilot认证。
 - `devtunnel host` 能稳定转发 Gateway WebSocket。
-- `devtunnel show --json` 在目标平台能返回 `portUri`。
-- 一个 Language Model Tool 能等待远程任务并把结果交回主 Agent。
+- `devtunnel show --json` 在目标平台能通过版本化 Decoder 唯一发现目标 Port 的 HTTPS URI。
+- 一个 Language Model Tool 能创建异步任务并返回 `pending + taskId`，随后可通过另一个 Tool 查询结果。
 
 ### Phase 1：设备连接
 
@@ -712,7 +728,7 @@ AHP 的 Root、Session、Chat 和 Terminal channel 在当前规范中标记为 S
 | --- | --- | --- |
 | Dev Tunnels 仍是 Public Preview | CLI 或服务行为变化 | 封装 `DevTunnelProvider`；锁定最低版本；保留 SDK 替换路径。 |
 | Agent Host持续演进 | AHP 集成可能随 VS Code 变化 | 使用正式 AHP SDK、版本协商和 capability detection。 |
-| Language Model Tool等待时间过长 | 主 Agent Turn 被取消或超时 | 持久 taskId；超时后返回 pending，并允许 `mesh_get_task` 继续查询。 |
+| Language Model Tool 是一次性调用 | 不能持续推送远端任务进度或写回旧 Turn | Delegate 仅等待 accepted，立即返回 pending + taskId，并允许 `mesh_get_task` 查询。 |
 | Worker 睡眠或 VS Code 关闭 | 远程任务中断 | 状态持久化、自动重连、明确 Offline；后续支持系统 keep-awake。 |
 | 远端 Workspace 状态不适合执行任务 | Agent 可能无法开始或需要用户决策 | 由远端 Agent 自主判断并通过现有输入/审批通道反馈；扩展不做 Git 预检或策略注入。 |
 | 远程执行风险 | 从设备文件或命令被误操作 | Workspace 白名单、任务确认、审批转发、可取消。 |
