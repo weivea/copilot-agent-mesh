@@ -6,9 +6,15 @@ import {
 	parseEndpointDocument,
 	redactSecrets,
 	requireGlobalWebSocket,
+	sanitizeError,
 	selectOwnedStandaloneEndpoint,
 	waitForOwnedStandaloneEndpoint,
 } from './agentHostEndpoint';
+import {
+	assertOwnedProcessControlSupported,
+	OwnedCommandError,
+	runOwnedCommand,
+} from './ownedProcess';
 
 const token = 'unit-test-secret-token';
 
@@ -164,6 +170,59 @@ test('redacts tokens in literals, JSON, URLs, and authorization headers', () => 
 test('records the global WebSocket transport boundary', () => {
 	assert.equal(typeof globalThis.WebSocket, 'function');
 	assert.doesNotThrow(() => requireGlobalWebSocket());
+});
+
+test('fails closed on Windows without a Job Object controller', () => {
+	assert.throws(
+		() => assertOwnedProcessControlSupported('win32'),
+		/Job Object based process controller/u,
+	);
+});
+
+test('sanitizes errors without retaining a secret-bearing cause', () => {
+	const unsafe = new Error(`request failed for ${token}`, {
+		cause: new Error(`nested ${token}`),
+	});
+	const safe = sanitizeError(unsafe, [token]);
+
+	assert.equal(safe.message.includes(token), false);
+	assert.equal(safe.cause, undefined);
+});
+
+test('kills an inherited-pipe descendant that ignores SIGTERM within a bound', {
+	skip: process.platform === 'win32',
+}, async () => {
+	const descendant = [
+		"process.on('SIGTERM', () => {});",
+		'setInterval(() => {}, 1000);',
+	].join('');
+	const launcher = [
+		"const { spawn } = require('node:child_process');",
+		`spawn(process.execPath, ['-e', ${JSON.stringify(descendant)}], { stdio: ['ignore', process.stdout, process.stderr] });`,
+		'setInterval(() => {}, 1000);',
+	].join('');
+	const startedAt = Date.now();
+	let commandError: OwnedCommandError | undefined;
+
+	try {
+		await runOwnedCommand(process.execPath, ['-e', launcher], {
+			timeoutMs: 100,
+			terminationGraceMs: 100,
+		});
+		assert.fail('The inherited-pipe command should time out.');
+	} catch (error) {
+		assert.ok(error instanceof OwnedCommandError);
+		commandError = error;
+	}
+
+	assert.ok(Date.now() - startedAt < 1_500);
+	assert.ok(commandError.processGroupId);
+	assert.throws(
+		() => process.kill(-commandError.processGroupId!, 0),
+		(error: unknown) => error instanceof Error
+			&& 'code' in error
+			&& error.code === 'ESRCH',
+	);
 });
 
 function fixture(overrides: Record<string, unknown> = {}): {

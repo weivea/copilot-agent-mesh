@@ -162,6 +162,11 @@ export function redactSecrets(value: string, secrets: readonly string[] = []): s
 		.replace(/(authorization\s*:\s*bearer\s+)[^\s"']+/giu, '$1<redacted>');
 }
 
+export function sanitizeError(error: unknown, secrets: readonly string[] = []): Error {
+	const message = error instanceof Error ? error.message : String(error);
+	return new Error(redactSecrets(message, secrets));
+}
+
 export function requireGlobalWebSocket(): void {
 	if (typeof globalThis.WebSocket !== 'function') {
 		throw new Error(

@@ -1,4 +1,4 @@
-import { execFile, spawn, type ChildProcess } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -8,9 +8,15 @@ import {
 	parseEndpointDocument,
 	redactSecrets,
 	requireGlobalWebSocket,
+	sanitizeError,
 	waitForOwnedStandaloneEndpoint,
 	type AgentHostEndpointDocument,
 } from './agentHostEndpoint';
+import {
+	assertOwnedProcessControlSupported,
+	runOwnedCommand,
+	terminateOwnedProcessGroup,
+} from './ownedProcess';
 
 const optInEnvironmentVariable = 'MESH_AGENT_HOST_E2E';
 const expectedAhpPackageVersion = '0.8.0';
@@ -19,6 +25,7 @@ const startupTimeoutMs = 30_000;
 const commandTimeoutMs = 10_000;
 const webSocketTimeoutMs = 10_000;
 const shutdownTimeoutMs = 5_000;
+const hostTerminationGraceMs = 5_000;
 
 interface SafeSpikeResult {
 	codeVersion: string;
@@ -49,6 +56,7 @@ async function main(): Promise<void> {
 }
 
 export async function runAgentHostSpike(codeCli: string): Promise<SafeSpikeResult> {
+	assertOwnedProcessControlSupported();
 	const ownedRoot = await mkdtemp(join(tmpdir(), 'copilot-agent-mesh-ahp-'));
 	const userDataDir = join(ownedRoot, 'user-data');
 	const serverDataDir = join(ownedRoot, 'server-data');
@@ -58,6 +66,7 @@ export async function runAgentHostSpike(codeCli: string): Promise<SafeSpikeResul
 	let host: ChildProcess | undefined;
 	let client: { shutdown(): Promise<void> } | undefined;
 	let ownedPids = new Set<number>();
+	let hostProcessGroupId: number | undefined;
 	let operationError: Error | undefined;
 	let hostSpawnError: Error | undefined;
 
@@ -91,6 +100,7 @@ export async function runAgentHostSpike(codeCli: string): Promise<SafeSpikeResul
 			'--log',
 			'error',
 		], {
+			detached: true,
 			shell: false,
 			windowsHide: true,
 			stdio: ['ignore', 'pipe', 'pipe'],
@@ -107,6 +117,7 @@ export async function runAgentHostSpike(codeCli: string): Promise<SafeSpikeResul
 		if (ownedPid === undefined) {
 			throw new Error('The Agent Host process did not expose an owned PID.');
 		}
+		hostProcessGroupId = ownedPid;
 		ownedPids.add(ownedPid);
 
 		const selected = await waitForOwnedStandaloneEndpoint({
@@ -118,7 +129,7 @@ export async function runAgentHostSpike(codeCli: string): Promise<SafeSpikeResul
 				if (host?.exitCode !== null) {
 					throw new Error(`The owned Agent Host exited before endpoint discovery (code ${host?.exitCode ?? 'unknown'}).`);
 				}
-				ownedPids = await readOwnedProcessTree(ownedPid);
+				ownedPids = await readOwnedProcessGroup(ownedPid);
 				return discoverEndpoints(codeCli, userDataDir, remainingMs);
 			},
 			ownedPids: () => ownedPids,
@@ -175,7 +186,7 @@ export async function runAgentHostSpike(codeCli: string): Promise<SafeSpikeResul
 			globalWebSocket: true,
 		};
 	} catch (error) {
-		operationError = new Error(redactSecrets(toErrorMessage(error), [token]), { cause: error });
+		operationError = sanitizeError(error, [token]);
 		throw operationError;
 	} finally {
 		const cleanupErrors: unknown[] = [];
@@ -187,20 +198,20 @@ export async function runAgentHostSpike(codeCli: string): Promise<SafeSpikeResul
 					`Timed out after ${shutdownTimeoutMs}ms shutting down the AHP client.`,
 				);
 			} catch (error) {
-				cleanupErrors.push(error);
+				cleanupErrors.push(sanitizeError(error, [token]));
 			}
 		}
-		if (host !== undefined) {
+		if (host !== undefined && hostProcessGroupId !== undefined) {
 			try {
-				await terminateOwnedHost(host, ownedPids);
+				await terminateOwnedProcessGroup(hostProcessGroupId, hostTerminationGraceMs);
 			} catch (error) {
-				cleanupErrors.push(error);
+				cleanupErrors.push(sanitizeError(error, [token]));
 			}
 		}
 		try {
 			await rm(ownedRoot, { recursive: true, force: true });
 		} catch (error) {
-			cleanupErrors.push(error);
+			cleanupErrors.push(sanitizeError(error, [token]));
 		}
 		if (cleanupErrors.length > 0) {
 			throw new AggregateError(
@@ -243,111 +254,21 @@ async function readCodeVersion(codeCli: string): Promise<Pick<SafeSpikeResult, '
 }
 
 function execute(executable: string, args: readonly string[], timeoutMs = commandTimeoutMs): Promise<string> {
-	return new Promise((resolve, reject) => {
-		execFile(executable, [...args], {
-			encoding: 'utf8',
-			killSignal: 'SIGKILL',
-			maxBuffer: 1024 * 1024,
-			timeout: timeoutMs,
-			windowsHide: true,
-		}, (error, stdout) => {
-			if (error) {
-				reject(new Error(`${executable} ${args.slice(0, 2).join(' ')} failed with exit code ${error.code ?? 'unknown'}.`));
-				return;
-			}
-			resolve(stdout);
-		});
+	return runOwnedCommand(executable, args, {
+		timeoutMs,
+		maxOutputBytes: 1024 * 1024,
 	});
 }
 
-async function readOwnedProcessTree(rootPid: number): Promise<Set<number>> {
-	const relationships = process.platform === 'win32'
-		? await readWindowsProcessRelationships()
-		: await readPosixProcessRelationships();
-	const owned = new Set([rootPid]);
-	let changed = true;
-	while (changed) {
-		changed = false;
-		for (const [pid, parentPid] of relationships) {
-			if (owned.has(parentPid) && !owned.has(pid)) {
-				owned.add(pid);
-				changed = true;
-			}
-		}
-	}
-	return owned;
-}
-
-async function readPosixProcessRelationships(): Promise<Array<[number, number]>> {
-	const stdout = await execute('ps', ['-axo', 'pid=,ppid='], commandTimeoutMs);
-	return stdout
+async function readOwnedProcessGroup(processGroupId: number): Promise<Set<number>> {
+	const stdout = await execute('ps', ['-axo', 'pid=,pgid='], commandTimeoutMs);
+	const owned = stdout
 		.split(/\r?\n/u)
 		.map((line) => line.trim().split(/\s+/u).map(Number))
-		.filter((pair): pair is [number, number] =>
-			pair.length === 2 && pair.every((value) => Number.isInteger(value) && value > 0),
-		);
-}
-
-async function readWindowsProcessRelationships(): Promise<Array<[number, number]>> {
-	const stdout = await execute('powershell.exe', [
-		'-NoProfile',
-		'-NonInteractive',
-		'-Command',
-		'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress',
-	], commandTimeoutMs);
-	const parsed = JSON.parse(stdout) as unknown;
-	const entries = Array.isArray(parsed) ? parsed : [parsed];
-	return entries.flatMap((entry): Array<[number, number]> => {
-		if (!isRecord(entry)
-			|| !isPositiveInteger(entry.ProcessId)
-			|| !isPositiveInteger(entry.ParentProcessId)) {
-			return [];
-		}
-		return [[entry.ProcessId, entry.ParentProcessId]];
-	});
-}
-
-async function terminateOwnedHost(host: ChildProcess, knownOwnedPids: ReadonlySet<number>): Promise<void> {
-	if (host.pid === undefined) {
-		return;
-	}
-	const ownedPids = await readOwnedProcessTree(host.pid).catch(() => new Set(knownOwnedPids));
-	for (const pid of knownOwnedPids) {
-		ownedPids.add(pid);
-	}
-	signalOwnedPids(ownedPids, host.pid, 'SIGTERM');
-	try {
-		await waitForOwnedPidsToExit(ownedPids, 5_000);
-	} catch {
-		signalOwnedPids(ownedPids, host.pid, 'SIGKILL');
-		await waitForOwnedPidsToExit(ownedPids, 5_000);
-	}
-}
-
-function signalOwnedPids(pids: ReadonlySet<number>, launcherPid: number | undefined, signal: NodeJS.Signals): void {
-	const orderedPids = [...pids].filter((pid) => pid !== launcherPid);
-	if (launcherPid !== undefined) {
-		orderedPids.push(launcherPid);
-	}
-	for (const pid of orderedPids) {
-		try {
-			process.kill(pid, signal);
-		} catch (error) {
-			if (!isRecord(error) || error.code !== 'ESRCH') {
-				throw error;
-			}
-		}
-	}
-}
-
-async function waitForOwnedPidsToExit(pids: ReadonlySet<number>, timeoutMs: number): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while ([...pids].some(isProcessAlive)) {
-		if (Date.now() >= deadline) {
-			throw new Error(`Owned Agent Host processes did not exit within ${timeoutMs}ms.`);
-		}
-		await delay(50);
-	}
+		.filter((pair) => pair.length === 2 && pair[1] === processGroupId)
+		.map((pair) => pair[0])
+		.filter((pid): pid is number => pid !== undefined && Number.isInteger(pid) && pid > 0);
+	return new Set(owned);
 }
 
 async function readInstalledAhpPackageVersion(): Promise<string> {
@@ -422,22 +343,6 @@ function readSafeProviderEvidence(state: unknown): SafeSpikeResult['providers'] 
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function isPositiveInteger(value: unknown): value is number {
-	return typeof value === 'number' && Number.isInteger(value) && value > 0;
-}
-
-function isProcessAlive(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		if (isRecord(error) && error.code === 'ESRCH') {
-			return false;
-		}
-		throw error;
-	}
 }
 
 function delay(milliseconds: number): Promise<void> {

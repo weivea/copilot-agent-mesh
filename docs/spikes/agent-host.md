@@ -60,11 +60,13 @@ code agent host
   --log error
 ```
 
-Readiness stdout is drained and never parsed or logged because the current CLI includes the token in that human-readable text. The harness polls only `code agent endpoints ...` JSON, requires one new `standalone` entry, and matches a PID in the spawned launcher's owned process tree plus the expected token. This distinction is required on macOS because `/usr/local/bin/code` is a shell launcher and the registry reports its child supervisor PID. Zero matches time out; multiple matches fail immediately. It validates a loopback TCP endpoint and constructs the WebSocket URL itself. Safe output omits the token and query string.
+Readiness stdout is drained and never parsed or logged because the current CLI includes the token in that human-readable text. On macOS/Linux the launcher starts in a dedicated process group. The harness polls only `code agent endpoints ...` JSON, requires one new `standalone` entry, and matches a PID in that owned process group plus the expected token. This distinction is required on macOS because `/usr/local/bin/code` is a shell launcher and the registry reports its child supervisor PID. Zero matches time out; multiple matches fail immediately. It validates a loopback TCP endpoint and constructs the WebSocket URL itself. Safe output omits the token and query string.
 
-Only validated members of the spawned process tree are signalled. Shutdown closes the AHP client, sends `SIGTERM` to owned descendants and the launcher, escalates to `SIGKILL` only for those same PIDs after five seconds, and recursively removes only the unique temporary root it created.
+Shutdown closes the AHP client, sends `SIGTERM` to the owned process group, waits a fixed five-second grace period, then sends `SIGKILL` to that group unconditionally. It never signals a saved list of PIDs that could be reused. It recursively removes only the unique temporary root it created.
 
-CLI calls, endpoint polling, WebSocket establishment, and AHP requests all have explicit time limits. A WebSocket timeout closes the still-connecting socket before the harness enters owned-process cleanup.
+Every auxiliary CLI command also runs in its own process group with bounded stdout/stderr. A timeout terminates the complete group even when a launcher descendant ignores `SIGTERM` and inherits the output pipe. Endpoint polling, WebSocket establishment, AHP requests, and AHP shutdown all have explicit time limits. A WebSocket timeout closes the still-connecting socket before the harness enters owned-process cleanup.
+
+Windows fails closed before creating temporary resources. A Windows implementation requires a Job Object (or an equivalently reliable tree controller); PID enumeration is not accepted as ownership.
 
 ## Real evidence
 
@@ -100,7 +102,7 @@ The SDK WebSocket implementation explicitly uses `globalThis.WebSocket`. It is a
 
 ## Ordinary CI coverage
 
-`npm run test:unit` does not start VS Code, use the network, or call a model. It covers:
+`npm test` runs the endpoint/process unit suite first and then the Extension Host suite. Direct `npm run test:unit` compiles the TypeScript tests before running and does not start VS Code, use the network, or call a model. It covers:
 
 - strict JSON parsing and invalid fields;
 - unique new standalone endpoint selection;
@@ -109,6 +111,9 @@ The SDK WebSocket implementation explicitly uses `globalThis.WebSocket`. It is a
 - zero-match polling and timeout;
 - multiple-match rejection;
 - token, URL query, JSON field, and Authorization redaction;
+- secret-bearing error causes are discarded after message redaction;
+- owned command timeout kills inherited-pipe descendants that ignore `SIGTERM`;
+- Windows process control fails closed without a Job Object;
 - the global WebSocket transport boundary.
 
 ## Unverified requirements
@@ -116,7 +121,8 @@ The SDK WebSocket implementation explicitly uses `globalThis.WebSocket`. It is a
 The following are explicitly **not passed**:
 
 - A lower minimum VS Code version; only `1.134.0` was tested.
-- Windows or Linux Host startup and AHP initialization.
+- Windows Host startup/AHP initialization (explicitly unavailable without a Job Object).
+- Linux Host startup and AHP initialization.
 - `vscode.authentication` and AHP `authenticate`.
 - Session config resolution, Session creation, readiness, and default Chat discovery.
 - Any prompt or `turnComplete`; no Copilot quota was consumed by this probe.
