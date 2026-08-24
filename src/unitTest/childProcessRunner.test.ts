@@ -1,5 +1,7 @@
 import * as assert from 'node:assert/strict';
-import { basename } from 'node:path';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { basename, join } from 'node:path';
 import { suite, test } from 'node:test';
 
 import {
@@ -70,27 +72,144 @@ suite('ChildProcessRunner', () => {
 		assert.ok(Date.now() - startedAt < 1_000);
 	});
 
-	test('force-kills the owned group when a descendant ignores SIGTERM', {
+	test('force-kills a ready owned group when a descendant ignores SIGTERM', {
 		skip: process.platform === 'win32',
 	}, async () => {
 		const signals: NodeJS.Signals[] = [];
+		const controller = new AbortController();
+		const readyRoot = await mkdtemp(join(tmpdir(), 'cam-process-ready-'));
+		const readyFile = join(readyRoot, 'ready');
 		const runner = createNodeRunner((pid, signal) => {
-			signals.push(signal);
 			process.kill(-pid, signal);
+			signals.push(signal);
 		});
-		const script = [
-			"const { spawn } = require('node:child_process');",
-			"spawn(process.execPath, ['-e',",
-			"  \"process.on('SIGTERM', () => undefined); setInterval(() => undefined, 1000);\"",
-			"], { stdio: 'ignore' });",
-			'setInterval(() => undefined, 1000);',
-		].join('\n');
+
+		try {
+			const execution = runner.run(
+				process.execPath,
+				['-e', launcherWithReadyIgnoringDescendant(undefined, readyFile)],
+				{ signal: controller.signal, timeoutMs: 2_000 },
+			);
+			await waitForFile(readyFile, 1_000);
+			controller.abort();
+
+			await assert.rejects(
+				execution,
+				(error: unknown) => hasCode(error, 'PROCESS_ABORTED'),
+			);
+			assert.deepStrictEqual(signals, ['SIGTERM', 'SIGKILL']);
+		} finally {
+			controller.abort();
+			await rm(readyRoot, { recursive: true, force: true });
+		}
+	});
+
+	test('cleans the owned group after a successful launcher exit', {
+		skip: process.platform === 'win32',
+	}, async () => {
+		const signals: NodeJS.Signals[] = [];
+		let processGroupId: number | undefined;
+		const runner = createNodeRunner((pid, signal) => {
+			processGroupId = pid;
+			process.kill(-pid, signal);
+			signals.push(signal);
+		});
+
+		const result = await runner.run(
+			process.execPath,
+			['-e', launcherWithReadyIgnoringDescendant(0, undefined, true)],
+		);
+
+		assert.equal(result.exitCode, 0);
+		assert.deepStrictEqual(signals, ['SIGTERM', 'SIGKILL']);
+		assert.ok(processGroupId);
+		assertProcessGroupGone(processGroupId);
+	});
+
+	test('cleans the owned group after a nonzero launcher exit', {
+		skip: process.platform === 'win32',
+	}, async () => {
+		const signals: NodeJS.Signals[] = [];
+		let processGroupId: number | undefined;
+		const runner = createNodeRunner((pid, signal) => {
+			processGroupId = pid;
+			process.kill(-pid, signal);
+			signals.push(signal);
+		});
 
 		await assert.rejects(
-			runner.run(process.execPath, ['-e', script], { timeoutMs: 20 }),
-			(error: unknown) => hasCode(error, 'PROCESS_TIMEOUT'),
+			runner.run(
+				process.execPath,
+				['-e', launcherWithReadyIgnoringDescendant(7, undefined, true)],
+			),
+			(error: unknown) => hasCode(error, 'PROCESS_EXIT_NONZERO'),
 		);
 		assert.deepStrictEqual(signals, ['SIGTERM', 'SIGKILL']);
+		assert.ok(processGroupId);
+		assertProcessGroupGone(processGroupId);
+	});
+
+	test('keeps polling after a transient process-group permission error', async () => {
+		let probes = 0;
+		const runner = new ChildProcessRunner({
+			allowedExecutableBasenames: [basename(process.execPath)],
+			isProcessTreeAlive: () => {
+				probes += 1;
+				if (probes === 1) {
+					throw Object.assign(new Error('Transient process-group state.'), { code: 'EPERM' });
+				}
+				return false;
+			},
+			terminateProcessTree: () => undefined,
+			terminationConfirmationMs: 100,
+			terminationGraceMs: 1,
+			terminationPollMs: 5,
+		});
+
+		const result = await runner.run(process.execPath, ['-e', 'process.exit(0);']);
+
+		assert.equal(result.exitCode, 0);
+		assert.equal(probes, 2);
+	});
+
+	test('does not SIGKILL after the owned group disappears during grace', async () => {
+		const signals: NodeJS.Signals[] = [];
+		let probes = 0;
+		const runner = new ChildProcessRunner({
+			allowedExecutableBasenames: [basename(process.execPath)],
+			isProcessTreeAlive: () => {
+				probes += 1;
+				return probes === 1;
+			},
+			terminateProcessTree: (_pid, signal) => signals.push(signal),
+			terminationConfirmationMs: 100,
+			terminationGraceMs: 50,
+			terminationPollMs: 1,
+		});
+
+		const result = await runner.run(process.execPath, ['-e', 'process.exit(0);']);
+
+		assert.equal(result.exitCode, 0);
+		assert.deepStrictEqual(signals, ['SIGTERM']);
+		assert.equal(probes, 2);
+	});
+
+	test('does not sleep beyond the process-tree confirmation deadline', async () => {
+		const runner = new ChildProcessRunner({
+			allowedExecutableBasenames: [basename(process.execPath)],
+			isProcessTreeAlive: () => true,
+			terminateProcessTree: () => undefined,
+			terminationConfirmationMs: 20,
+			terminationGraceMs: 1,
+			terminationPollMs: 500,
+		});
+		const startedAt = Date.now();
+
+		await assert.rejects(
+			runner.run(process.execPath, ['-e', 'process.exit(0);']),
+			(error: unknown) => hasCode(error, 'PROCESS_TREE_TERMINATION_FAILED'),
+		);
+		assert.ok(Date.now() - startedAt < 200);
 	});
 
 	test('terminates a process when aborted', async () => {
@@ -169,6 +288,9 @@ function createNodeRunner(
 	return new ChildProcessRunner({
 		allowedExecutableBasenames: [basename(process.execPath)],
 		defaultTimeoutMs: 2_000,
+		isProcessTreeAlive: process.platform === 'win32'
+			? (pid) => isProcessAlive(pid)
+			: undefined,
 		terminateProcessTree: terminateProcessTree ?? (
 			process.platform === 'win32'
 				? (pid, signal) => process.kill(pid, signal)
@@ -182,4 +304,70 @@ function hasCode(error: unknown, code: ChildProcessExecutionError['code']): bool
 	assert.ok(error instanceof ChildProcessExecutionError);
 	assert.equal(error.code, code);
 	return true;
+}
+
+function launcherWithReadyIgnoringDescendant(
+	exitCode?: number,
+	readyFile?: string,
+	inheritOutput = false,
+): string {
+	const descendant = [
+		"process.on('SIGTERM', () => undefined);",
+		"process.send?.('ready');",
+		'setInterval(() => undefined, 1000);',
+	].join('');
+	return [
+		"const { spawn } = require('node:child_process');",
+		`const child = spawn(process.execPath, ['-e', ${JSON.stringify(descendant)}],`,
+		inheritOutput
+			? "  { stdio: ['ignore', 'inherit', 'inherit', 'ipc'] });"
+			: "  { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });",
+		"child.once('message', () => {",
+		readyFile === undefined
+			? ''
+			: `  require('node:fs').writeFileSync(${JSON.stringify(readyFile)}, 'ready');`,
+		exitCode === undefined
+			? '  setInterval(() => undefined, 1000);'
+			: `  process.exit(${exitCode});`,
+		'});',
+	].join('');
+}
+
+function assertProcessGroupGone(processGroupId: number): void {
+	assert.throws(
+		() => process.kill(-processGroupId, 0),
+		(error: unknown) => error instanceof Error
+			&& 'code' in error
+			&& error.code === 'ESRCH',
+	);
+}
+
+async function waitForFile(path: string, timeoutMs: number): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (true) {
+		try {
+			await readFile(path);
+			return;
+		} catch (error: unknown) {
+			if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) {
+				throw error;
+			}
+		}
+		if (Date.now() >= deadline) {
+			throw new Error(`Timed out waiting for readiness file after ${timeoutMs}ms.`);
+		}
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+}
+
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error: unknown) {
+		if (error instanceof Error && 'code' in error && error.code === 'ESRCH') {
+			return false;
+		}
+		throw error;
+	}
 }

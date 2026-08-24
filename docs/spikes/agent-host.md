@@ -62,9 +62,20 @@ code agent host
 
 Readiness stdout is drained and never parsed or logged because the current CLI includes the token in that human-readable text. On macOS/Linux the launcher starts in a dedicated process group. The harness polls only `code agent endpoints ...` JSON, requires one new `standalone` entry, and matches a PID in that owned process group plus the expected token. This distinction is required on macOS because `/usr/local/bin/code` is a shell launcher and the registry reports its child supervisor PID. Zero matches time out; multiple matches fail immediately. It validates a loopback TCP endpoint and constructs the WebSocket URL itself. Safe output omits the token and query string.
 
-Shutdown closes the AHP client, sends `SIGTERM` to the owned process group, waits a fixed five-second grace period, then sends `SIGKILL` to that group unconditionally. It never signals a saved list of PIDs that could be reused. It recursively removes only the unique temporary root it created.
+Shutdown closes the AHP client, sends `SIGTERM` to the owned process group, and polls
+throughout the five-second grace period. Once the group is observed absent, cleanup stops
+permanently; `SIGKILL` is sent only if the group stayed continuously present through the
+deadline, followed by bounded confirmation that it disappeared. It never signals a saved
+list of PIDs that could be reused. It recursively removes only the unique temporary root
+it created.
 
-Every auxiliary CLI command also runs in its own process group with bounded stdout/stderr. A timeout terminates the complete group even when a launcher descendant ignores `SIGTERM` and inherits the output pipe. Endpoint polling, WebSocket establishment, AHP requests, and AHP shutdown all have explicit time limits. A WebSocket timeout closes the still-connecting socket before the harness enters owned-process cleanup.
+Every auxiliary CLI command also runs in its own process group with bounded stdout/stderr.
+The launcher `exit` event starts cleanup immediately; output parsing waits for bounded
+pipe closure after the group is gone. Timeout, successful exit, and nonzero exit all
+clean the complete group even when a ready descendant ignores `SIGTERM` and inherits the
+output pipe. Endpoint polling, WebSocket establishment, AHP requests, and AHP shutdown
+all have explicit time limits. A WebSocket timeout closes the still-connecting socket
+before the harness enters owned-process cleanup.
 
 Windows fails closed before creating temporary resources. A Windows implementation requires a Job Object (or an equivalently reliable tree controller); PID enumeration is not accepted as ownership.
 

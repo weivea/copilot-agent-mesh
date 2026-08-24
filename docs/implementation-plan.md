@@ -1,6 +1,6 @@
 # Copilot Agent Mesh 实施计划
 
-> 状态：Phase 0 in progress<br>
+> 状态：Phase 0 evaluated; Gate G0 No-Go<br>
 > 日期：2026-08-24<br>
 > 依据：[PRD v0.3](../copilot-agent-mesh-prd.md) 与 [技术实施方案](./technical-implementation.md)<br>
 > 兼容性 Gate：[Compatibility Matrix](./compatibility-matrix.md)<br>
@@ -179,6 +179,11 @@ Known unsupported:
 - 若 AHP Auth 或真实 Copilot Session 不可用，停止构建完整 MVP；只保留 Fake Agent Demo，不把它声明为可交付产品。
 - 更新 `engines.vscode`，将 `@types/vscode` 精确锁定到同一最低 API 版本，锁定 AHP/CLI 兼容版本。
 - 把 Manifest `extensionKind` 改为 `ui`，记录本机桌面 Workspace Feature Guard 和 Feature Flag 默认值。
+
+2026-08-24 首轮执行结论：**No-Go**。P0.1 仍缺少已认证 Copilot UI 与自动轮询验证；P0.2
+仍缺少 Auth、Session、Turn 和恢复验证；P0.3 的已安装旧 CLI 无法满足机器可读创建与 hosted
+readiness 契约。详见 [Compatibility Matrix](./compatibility-matrix.md) 和 `docs/spikes/`。
+在这些 Gate 关闭前，不进入 P1 正式功能开发，也不宣称端到端 MVP 可交付。
 
 ## 6. Phase 1：工程与领域基础
 

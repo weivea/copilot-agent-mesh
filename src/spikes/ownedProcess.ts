@@ -2,7 +2,8 @@ import { spawn } from 'node:child_process';
 
 const defaultMaxOutputBytes = 1024 * 1024;
 const defaultTerminationGraceMs = 250;
-const postKillWaitMs = 50;
+const terminationConfirmationMs = 1_000;
+const terminationPollMs = 10;
 
 export class OwnedCommandError extends Error {
 	constructor(
@@ -51,66 +52,96 @@ export function runOwnedCommand(
 		});
 		const processGroupId = child.pid;
 		const stdoutChunks: Buffer[] = [];
+		let closeObserved = false;
+		let finalError: Error | undefined;
+		let finalizing = false;
 		let outputBytes = 0;
-		let settling = false;
+		let resolveClose: (() => void) | undefined;
+		let settled = false;
+		const closePromise = new Promise<void>((resolveClosePromise) => {
+			resolveClose = resolveClosePromise;
+		});
 
 		const timer = setTimeout(() => {
-			void terminateAndReject(
-				new OwnedCommandError(
-					`${commandLabel(executable, args)} timed out after ${options.timeoutMs}ms.`,
-					processGroupId,
-				),
-			);
+			finalize(new OwnedCommandError(
+				`${commandLabel(executable, args)} timed out after ${options.timeoutMs}ms.`,
+				processGroupId,
+			));
 		}, options.timeoutMs);
 
-		const terminateAndReject = async (error: Error) => {
-			if (settling) {
-				return;
-			}
-			settling = true;
+		const cleanup = () => {
 			clearTimeout(timer);
-			if (processGroupId !== undefined) {
-				try {
-					await terminateOwnedProcessGroup(processGroupId, terminationGraceMs);
-				} catch {
-					child.stdout?.destroy();
-					child.stderr?.destroy();
-					reject(new OwnedCommandError(
-						`${commandLabel(executable, args)} failed to terminate its owned process group.`,
-						processGroupId,
-					));
-					return;
-				}
-			}
+			child.stdout?.removeAllListeners('data');
+			child.stderr?.removeAllListeners('data');
 			child.stdout?.destroy();
 			child.stderr?.destroy();
-			reject(error);
+			child.unref();
 		};
 
-		const terminateAndResolve = async () => {
-			if (settling) {
+		const waitForOutputClose = async () => {
+			if (closeObserved) {
 				return;
 			}
-			settling = true;
-			clearTimeout(timer);
-			if (processGroupId !== undefined) {
-				try {
-					await terminateOwnedProcessGroup(processGroupId, terminationGraceMs);
-				} catch {
-					reject(new OwnedCommandError(
-						`${commandLabel(executable, args)} failed to terminate its owned process group.`,
-						processGroupId,
-					));
-					return;
+			let drainTimer: NodeJS.Timeout | undefined;
+			try {
+				await Promise.race([
+					closePromise,
+					new Promise<void>((_resolve, rejectDrain) => {
+						drainTimer = setTimeout(
+							() => rejectDrain(new OwnedCommandError(
+								`${commandLabel(executable, args)} output pipes did not close after process-group cleanup.`,
+								processGroupId,
+							)),
+							terminationConfirmationMs,
+						);
+					}),
+				]);
+			} finally {
+				if (drainTimer !== undefined) {
+					clearTimeout(drainTimer);
 				}
 			}
-			resolve(Buffer.concat(stdoutChunks).toString('utf8'));
+		};
+
+		const finalize = (error?: Error) => {
+			if (settled) {
+				return;
+			}
+			if (error !== undefined && finalError === undefined) {
+				finalError = error;
+			}
+			if (finalizing) {
+				return;
+			}
+			finalizing = true;
+			clearTimeout(timer);
+			void (async () => {
+				if (processGroupId !== undefined) {
+					await terminateOwnedProcessGroup(processGroupId, terminationGraceMs);
+				}
+				await waitForOutputClose();
+				const output = Buffer.concat(stdoutChunks).toString('utf8');
+				settled = true;
+				cleanup();
+				if (finalError !== undefined) {
+					reject(finalError);
+				} else {
+					resolve(output);
+				}
+			})().catch(() => {
+				settled = true;
+				cleanup();
+				reject(new OwnedCommandError(
+					`${commandLabel(executable, args)} failed to clean up its owned process group or output pipes.`,
+					processGroupId,
+				));
+			});
 		};
 
 		const recordOutput = (chunk: Buffer, keep: boolean) => {
 			outputBytes += chunk.byteLength;
 			if (outputBytes > maxOutputBytes) {
-				void terminateAndReject(
+				finalize(
 					new OwnedCommandError(
 						`${commandLabel(executable, args)} exceeded the ${maxOutputBytes} byte output limit.`,
 						processGroupId,
@@ -126,25 +157,28 @@ export function runOwnedCommand(
 		child.stdout?.on('data', (chunk: Buffer) => recordOutput(chunk, true));
 		child.stderr?.on('data', (chunk: Buffer) => recordOutput(chunk, false));
 		child.once('error', (error) => {
-			void terminateAndReject(
+			finalize(
 				new OwnedCommandError(
 					`${commandLabel(executable, args)} failed to spawn: ${error.message}`,
 					processGroupId,
 				),
 			);
 		});
-		child.once('close', (code, signal) => {
-			if (settling) {
-				return;
-			}
+		child.once('exit', (code, signal) => {
 			if (code !== 0) {
-				void terminateAndReject(new OwnedCommandError(
+				finalize(
+				new OwnedCommandError(
 					`${commandLabel(executable, args)} exited with ${code ?? signal ?? 'unknown'}.`,
 					processGroupId,
-				));
+				),
+			);
 				return;
 			}
-			void terminateAndResolve();
+			finalize();
+		});
+		child.once('close', () => {
+			closeObserved = true;
+			resolveClose?.();
 		});
 	});
 }
@@ -157,9 +191,26 @@ export async function terminateOwnedProcessGroup(
 	if (!groupExisted) {
 		return;
 	}
-	await delay(graceMs);
-	signalProcessGroup(processGroupId, 'SIGKILL');
-	await delay(postKillWaitMs);
+	const exitedDuringGrace = await waitForProcessGroupExit(
+		processGroupId,
+		Date.now() + graceMs,
+	);
+	if (exitedDuringGrace) {
+		return;
+	}
+	if (!signalProcessGroup(processGroupId, 'SIGKILL')) {
+		return;
+	}
+	const exitedAfterForce = await waitForProcessGroupExit(
+		processGroupId,
+		Date.now() + terminationConfirmationMs,
+	);
+	if (!exitedAfterForce) {
+		throw new OwnedCommandError(
+			'The owned process group remained alive after forced termination.',
+			processGroupId,
+		);
+	}
 }
 
 function signalProcessGroup(processGroupId: number, signal: NodeJS.Signals): boolean {
@@ -169,6 +220,37 @@ function signalProcessGroup(processGroupId: number, signal: NodeJS.Signals): boo
 	} catch (error) {
 		if (isErrno(error, 'ESRCH')) {
 			return false;
+		}
+		throw error;
+	}
+}
+
+async function waitForProcessGroupExit(
+	processGroupId: number,
+	deadline: number,
+): Promise<boolean> {
+	while (true) {
+		if (!isProcessGroupAlive(processGroupId)) {
+			return true;
+		}
+		const remainingMs = deadline - Date.now();
+		if (remainingMs <= 0) {
+			return false;
+		}
+		await delay(Math.min(terminationPollMs, remainingMs));
+	}
+}
+
+function isProcessGroupAlive(processGroupId: number): boolean {
+	try {
+		process.kill(-processGroupId, 0);
+		return true;
+	} catch (error) {
+		if (isErrno(error, 'ESRCH')) {
+			return false;
+		}
+		if (isErrno(error, 'EPERM')) {
+			return true;
 		}
 		throw error;
 	}

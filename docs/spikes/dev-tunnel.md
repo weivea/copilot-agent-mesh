@@ -34,7 +34,9 @@ The CLI reports this build as outdated. The candidate build named in the technic
 - The default executable allowlist contains only `devtunnel` and `devtunnel.exe`.
 - On POSIX, every child starts in an owned process group. Timeout, abort, and output
   overflow send `SIGTERM`, then unconditionally send `SIGKILL` to that group after a
-  bounded grace period before settling. Windows fails closed with
+  bounded grace period, and poll within a second bounded deadline until the group is
+  confirmed absent before settling. Successful and nonzero launcher exits use the same
+  cleanup. Windows fails closed with
   `PROCESS_TREE_UNSUPPORTED` until a Job Object or equivalent owned-tree controller is
   implemented.
 - Abort, timeout, nonzero exit, process-start failure, and combined output overflow have
@@ -95,6 +97,7 @@ The P0.3 unit suite covers:
 
 - executable allowlisting, shell-free execution, unavailable process-tree control,
   timeout, inherited pipes, a descendant that ignores `SIGTERM`, abort, pre-abort,
+  successful/nonzero launcher cleanup, transient Darwin `EPERM`, confirmation deadline,
   output bounds, nonzero exit secrecy, and redaction;
 - valid URI selection, the real no-host fixture, non-JSON prefixes, unknown fields,
   unrelated-port version drift, missing ports, wrong protocols, multiple URIs, HTTP,

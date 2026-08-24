@@ -1,4 +1,5 @@
 import * as assert from 'node:assert/strict';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { test } from 'node:test';
 
 import {
@@ -9,12 +10,13 @@ import {
 	sanitizeError,
 	selectOwnedStandaloneEndpoint,
 	waitForOwnedStandaloneEndpoint,
-} from './agentHostEndpoint';
+} from '../spikes/agentHostEndpoint';
 import {
 	assertOwnedProcessControlSupported,
 	OwnedCommandError,
 	runOwnedCommand,
-} from './ownedProcess';
+	terminateOwnedProcessGroup,
+} from '../spikes/ownedProcess';
 
 const token = 'unit-test-secret-token';
 
@@ -189,41 +191,68 @@ test('sanitizes errors without retaining a secret-bearing cause', () => {
 	assert.equal(safe.cause, undefined);
 });
 
-test('kills an inherited-pipe descendant that ignores SIGTERM within a bound', {
+test('kills a ready inherited-pipe descendant that ignores SIGTERM', {
 	skip: process.platform === 'win32',
 }, async () => {
 	const descendant = [
 		"process.on('SIGTERM', () => {});",
+		"process.send?.('ready');",
 		'setInterval(() => {}, 1000);',
 	].join('');
 	const launcher = [
 		"const { spawn } = require('node:child_process');",
-		`spawn(process.execPath, ['-e', ${JSON.stringify(descendant)}], { stdio: ['ignore', process.stdout, process.stderr] });`,
-		'setInterval(() => {}, 1000);',
+		`const child = spawn(process.execPath, ['-e', ${JSON.stringify(descendant)}],`,
+		"  { stdio: ['ignore', process.stdout, process.stderr, 'ipc'] });",
+		"child.once('message', () => { process.send?.('ready'); setInterval(() => {}, 1000); });",
 	].join('');
-	const startedAt = Date.now();
-	let commandError: OwnedCommandError | undefined;
-
+	const host = spawn(process.execPath, ['-e', launcher], {
+		detached: true,
+		stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+	});
+	const processGroupId = host.pid;
+	assert.ok(processGroupId);
+	let terminated = false;
 	try {
-		await runOwnedCommand(process.execPath, ['-e', launcher], {
-			timeoutMs: 100,
-			terminationGraceMs: 100,
-		});
-		assert.fail('The inherited-pipe command should time out.');
-	} catch (error) {
-		assert.ok(error instanceof OwnedCommandError);
-		commandError = error;
-	}
+		await waitForReadyMessage(host, 1_000);
+		const startedAt = Date.now();
 
-	assert.ok(Date.now() - startedAt < 1_500);
-	assert.ok(commandError.processGroupId);
-	assertProcessGroupGone(commandError.processGroupId);
+		await terminateOwnedProcessGroup(processGroupId, 100);
+		terminated = true;
+		assert.ok(Date.now() - startedAt < 1_500);
+		assertProcessGroupGone(processGroupId);
+	} finally {
+		if (!terminated) {
+			await terminateOwnedProcessGroup(processGroupId, 10).catch(() => undefined);
+		}
+		host.stdout?.destroy();
+		host.stderr?.destroy();
+		if (host.connected) {
+			host.disconnect();
+		}
+		host.unref();
+	}
 });
 
-test('kills a detached-output descendant after a nonzero launcher exit', {
+test('bounds an owned command timeout', {
 	skip: process.platform === 'win32',
 }, async () => {
-	const launcher = launcherWithIgnoringDescendant(7);
+	const startedAt = Date.now();
+
+	await assert.rejects(
+		runOwnedCommand(process.execPath, ['-e', 'setInterval(() => {}, 1000);'], {
+			timeoutMs: 100,
+			terminationGraceMs: 100,
+		}),
+		(error: unknown) => error instanceof OwnedCommandError
+			&& /timed out/u.test(error.message),
+	);
+	assert.ok(Date.now() - startedAt < 1_500);
+});
+
+test('kills an inherited-output descendant after a nonzero launcher exit', {
+	skip: process.platform === 'win32',
+}, async () => {
+	const launcher = launcherWithIgnoringDescendant(7, false, true);
 	let commandError: OwnedCommandError | undefined;
 
 	try {
@@ -242,10 +271,10 @@ test('kills a detached-output descendant after a nonzero launcher exit', {
 	assertProcessGroupGone(commandError.processGroupId);
 });
 
-test('kills a detached-output descendant after a successful launcher exit', {
+test('kills an inherited-output descendant after a successful launcher exit', {
 	skip: process.platform === 'win32',
 }, async () => {
-	const launcher = launcherWithIgnoringDescendant(0, true);
+	const launcher = launcherWithIgnoringDescendant(0, true, true);
 	const command = runOwnedCommand(process.execPath, ['-e', launcher], {
 		timeoutMs: 1_000,
 		terminationGraceMs: 100,
@@ -288,16 +317,24 @@ function assertSelectionCode(callback: () => unknown, expectedCode: string): voi
 	);
 }
 
-function launcherWithIgnoringDescendant(exitCode: number, printPid = false): string {
+function launcherWithIgnoringDescendant(
+	exitCode: number,
+	printPid = false,
+	inheritOutput = false,
+): string {
 	const descendant = [
 		"process.on('SIGTERM', () => {});",
+		"process.send?.('ready');",
 		'setInterval(() => {}, 1000);',
 	].join('');
 	return [
 		"const { spawn } = require('node:child_process');",
 		printPid ? 'console.log(process.pid);' : '',
-		`spawn(process.execPath, ['-e', ${JSON.stringify(descendant)}], { stdio: 'ignore' });`,
-		`process.exit(${exitCode});`,
+		`const child = spawn(process.execPath, ['-e', ${JSON.stringify(descendant)}],`,
+		inheritOutput
+			? "  { stdio: ['ignore', 'inherit', 'inherit', 'ipc'] });"
+			: "  { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });",
+		`child.once('message', () => process.exit(${exitCode}));`,
 	].join('');
 }
 
@@ -308,4 +345,37 @@ function assertProcessGroupGone(processGroupId: number): void {
 			&& 'code' in error
 			&& error.code === 'ESRCH',
 	);
+}
+
+function waitForReadyMessage(child: ChildProcess, timeoutMs: number): Promise<void> {
+	return new Promise((resolve, reject) => {
+		const timeout = setTimeout(() => {
+			cleanup();
+			reject(new Error(`Timed out waiting for child readiness after ${timeoutMs}ms.`));
+		}, timeoutMs);
+		const handleMessage = (message: unknown) => {
+			if (message === 'ready') {
+				cleanup();
+				resolve();
+			}
+		};
+		const handleError = () => {
+			cleanup();
+			reject(new Error('Child process failed before readiness.'));
+		};
+		const handleExit = () => {
+			cleanup();
+			reject(new Error('Child process exited before readiness.'));
+		};
+		const cleanup = () => {
+			clearTimeout(timeout);
+			child.off('message', handleMessage);
+			child.off('error', handleError);
+			child.off('exit', handleExit);
+		};
+
+		child.on('message', handleMessage);
+		child.once('error', handleError);
+		child.once('exit', handleExit);
+	});
 }

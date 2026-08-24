@@ -5,8 +5,10 @@ export type ChildProcessErrorCode =
 	| 'EXECUTABLE_NOT_ALLOWED'
 	| 'PROCESS_ABORTED'
 	| 'PROCESS_EXIT_NONZERO'
+	| 'PROCESS_OUTPUT_DRAIN_FAILED'
 	| 'PROCESS_OUTPUT_LIMIT'
 	| 'PROCESS_START_FAILED'
+	| 'PROCESS_TREE_TERMINATION_FAILED'
 	| 'PROCESS_TREE_UNSUPPORTED'
 	| 'PROCESS_TIMEOUT';
 
@@ -36,9 +38,12 @@ export interface ChildProcessRunnerOptions {
 	readonly allowedExecutableBasenames?: readonly string[];
 	readonly defaultTimeoutMs?: number;
 	readonly defaultMaxOutputBytes?: number;
+	readonly isProcessTreeAlive?: (pid: number) => boolean;
 	readonly platform?: NodeJS.Platform;
 	readonly terminateProcessTree?: (pid: number, signal: NodeJS.Signals) => void;
+	readonly terminationConfirmationMs?: number;
 	readonly terminationGraceMs?: number;
+	readonly terminationPollMs?: number;
 }
 
 const defaultAllowedExecutables = ['devtunnel', 'devtunnel.exe'];
@@ -47,9 +52,12 @@ export class ChildProcessRunner {
 	private readonly allowedExecutableBasenames: ReadonlySet<string>;
 	private readonly defaultTimeoutMs: number;
 	private readonly defaultMaxOutputBytes: number;
+	private readonly isProcessTreeAlive: ((pid: number) => boolean) | undefined;
 	private readonly platform: NodeJS.Platform;
 	private readonly terminateProcessTree: ((pid: number, signal: NodeJS.Signals) => void) | undefined;
+	private readonly terminationConfirmationMs: number;
 	private readonly terminationGraceMs: number;
+	private readonly terminationPollMs: number;
 
 	constructor(options: ChildProcessRunnerOptions = {}) {
 		this.allowedExecutableBasenames = new Set(
@@ -61,7 +69,20 @@ export class ChildProcessRunner {
 		this.platform = options.platform ?? process.platform;
 		this.terminateProcessTree = options.terminateProcessTree
 			?? (this.platform === 'win32' ? undefined : terminatePosixProcessGroup);
+		this.isProcessTreeAlive = options.isProcessTreeAlive
+			?? (this.platform === 'win32' ? undefined : isPosixProcessGroupAlive);
+		this.terminationConfirmationMs = options.terminationConfirmationMs ?? 1_000;
 		this.terminationGraceMs = options.terminationGraceMs ?? 1_000;
+		this.terminationPollMs = options.terminationPollMs ?? 10;
+		for (const [name, value] of [
+			['terminationConfirmationMs', this.terminationConfirmationMs],
+			['terminationGraceMs', this.terminationGraceMs],
+			['terminationPollMs', this.terminationPollMs],
+		] as const) {
+			if (!Number.isSafeInteger(value) || value <= 0) {
+				throw new RangeError(`${name} must be a positive safe integer.`);
+			}
+		}
 	}
 
 	run(
@@ -82,7 +103,9 @@ export class ChildProcessRunner {
 				'The process request was cancelled before it started.',
 			));
 		}
-		if (this.terminateProcessTree === undefined) {
+		const terminateProcessTree = this.terminateProcessTree;
+		const isProcessTreeAlive = this.isProcessTreeAlive;
+		if (terminateProcessTree === undefined || isProcessTreeAlive === undefined) {
 			return Promise.reject(new ChildProcessExecutionError(
 				'PROCESS_TREE_UNSUPPORTED',
 				'Owned process-tree termination is unavailable on this platform.',
@@ -109,30 +132,26 @@ export class ChildProcessRunner {
 			const stdoutChunks: Buffer[] = [];
 			const stderrChunks: Buffer[] = [];
 			let capturedBytes = 0;
+			let closeObserved = false;
+			let finalError: ChildProcessExecutionError | undefined;
+			let finalizing = false;
+			let resolveClose: (() => void) | undefined;
 			let settled = false;
-			let terminationError: ChildProcessExecutionError | undefined;
-			let forceKillTimer: NodeJS.Timeout | undefined;
-			let settlementTimer: NodeJS.Timeout | undefined;
 			let timeoutTimer: NodeJS.Timeout | undefined;
+			const closePromise = new Promise<void>((resolveClosePromise) => {
+				resolveClose = resolveClosePromise;
+			});
 
 			const cleanup = (): void => {
 				if (timeoutTimer !== undefined) {
 					clearTimeout(timeoutTimer);
 				}
-				if (forceKillTimer !== undefined) {
-					clearTimeout(forceKillTimer);
-				}
-				if (settlementTimer !== undefined) {
-					clearTimeout(settlementTimer);
-				}
 				options.signal?.removeEventListener('abort', abortListener);
-				if (terminationError !== undefined) {
-					child.stdout.removeAllListeners('data');
-					child.stderr.removeAllListeners('data');
-					child.stdout.destroy();
-					child.stderr.destroy();
-					child.unref();
-				}
+				child.stdout.removeAllListeners('data');
+				child.stderr.removeAllListeners('data');
+				child.stdout.destroy();
+				child.stderr.destroy();
+				child.unref();
 			};
 
 			const settleReject = (error: ChildProcessExecutionError): void => {
@@ -144,32 +163,142 @@ export class ChildProcessRunner {
 				reject(error);
 			};
 
-			const killOwnedProcessTree = (signal: NodeJS.Signals): void => {
-				if (child.pid === undefined) {
+			const settleResolve = (): void => {
+				if (settled) {
 					return;
 				}
+				const result = {
+					exitCode: 0,
+					stdout: Buffer.concat(stdoutChunks).toString('utf8'),
+					stderr: Buffer.concat(stderrChunks).toString('utf8'),
+				};
+				settled = true;
+				cleanup();
+				resolve(result);
+			};
+
+			const killOwnedProcessTree = (signal: NodeJS.Signals): boolean => {
+				if (child.pid === undefined) {
+					return false;
+				}
 				try {
-					this.terminateProcessTree?.(child.pid, signal);
-				} catch {
-					// The final settlement deadline still bounds the caller even if the
-					// process already exited or the platform refuses the group signal.
+					terminateProcessTree(child.pid, signal);
+					return true;
+				} catch (error: unknown) {
+					if (isProcessMissingError(error)) {
+						return false;
+					}
+					throw new ChildProcessExecutionError(
+						'PROCESS_TREE_TERMINATION_FAILED',
+						'The owned process tree could not be terminated.',
+					);
 				}
 			};
 
-			const terminate = (error: ChildProcessExecutionError): void => {
-				if (terminationError !== undefined || settled) {
+			const processTreeIsAlive = (): boolean => {
+				if (child.pid === undefined) {
+					return false;
+				}
+				try {
+					return isProcessTreeAlive(child.pid);
+				} catch (error: unknown) {
+					if (isProcessMissingError(error)) {
+						return false;
+					}
+					if (isProcessPermissionError(error)) {
+						return true;
+					}
+					throw toProcessTreeTerminationError(error);
+				}
+			};
+
+			const waitForProcessTreeExitUntil = async (deadline: number): Promise<boolean> => {
+				while (true) {
+					if (!processTreeIsAlive()) {
+						return true;
+					}
+					const remainingMs = deadline - Date.now();
+					if (remainingMs <= 0) {
+						return false;
+					}
+					await delay(Math.min(this.terminationPollMs, remainingMs));
+				}
+			};
+
+			const cleanupOwnedProcessTree = async (): Promise<void> => {
+				if (!killOwnedProcessTree('SIGTERM')) {
 					return;
 				}
-				terminationError = error;
-				killOwnedProcessTree('SIGTERM');
-				forceKillTimer = setTimeout(() => {
-					killOwnedProcessTree('SIGKILL');
-					settleReject(error);
-				}, this.terminationGraceMs);
-				settlementTimer = setTimeout(
-					() => settleReject(error),
-					this.terminationGraceMs * 2,
+				const exitedDuringGrace = await waitForProcessTreeExitUntil(
+					Date.now() + this.terminationGraceMs,
 				);
+				if (exitedDuringGrace) {
+					return;
+				}
+				if (!killOwnedProcessTree('SIGKILL')) {
+					return;
+				}
+				const exitedAfterForce = await waitForProcessTreeExitUntil(
+					Date.now() + this.terminationConfirmationMs,
+				);
+				if (!exitedAfterForce) {
+					throw new ChildProcessExecutionError(
+						'PROCESS_TREE_TERMINATION_FAILED',
+						'The owned process tree remained alive after forced termination.',
+					);
+				}
+			};
+
+			const waitForOutputClose = async (): Promise<void> => {
+				if (closeObserved) {
+					return;
+				}
+				let drainTimer: NodeJS.Timeout | undefined;
+				try {
+					await Promise.race([
+						closePromise,
+						new Promise<void>((_resolve, rejectDrain) => {
+							drainTimer = setTimeout(() => rejectDrain(
+								new ChildProcessExecutionError(
+									'PROCESS_OUTPUT_DRAIN_FAILED',
+									'The process output pipes did not close after tree cleanup.',
+								),
+							), this.terminationConfirmationMs);
+						}),
+					]);
+				} finally {
+					if (drainTimer !== undefined) {
+						clearTimeout(drainTimer);
+					}
+				}
+			};
+
+			const finalize = (error?: ChildProcessExecutionError): void => {
+				if (settled) {
+					return;
+				}
+				if (error !== undefined && finalError === undefined) {
+					finalError = error;
+				}
+				if (finalizing) {
+					return;
+				}
+				finalizing = true;
+				clearTimeout(timeoutTimer);
+				options.signal?.removeEventListener('abort', abortListener);
+				void (async () => {
+					await cleanupOwnedProcessTree();
+					await waitForOutputClose();
+					if (finalError !== undefined) {
+						settleReject(finalError);
+					} else {
+						settleResolve();
+					}
+				})().catch((failure: unknown) => {
+					settleReject(failure instanceof ChildProcessExecutionError
+						? failure
+						: toProcessTreeTerminationError(failure));
+				});
 			};
 
 			const capture = (target: Buffer[], chunk: Buffer | string): void => {
@@ -180,18 +309,18 @@ export class ChildProcessRunner {
 				}
 				capturedBytes += buffer.byteLength;
 				if (capturedBytes > maxOutputBytes) {
-					terminate(new ChildProcessExecutionError(
+					finalize(new ChildProcessExecutionError(
 						'PROCESS_OUTPUT_LIMIT',
 						'The process exceeded the bounded output limit.',
 					));
 				}
 			};
 
-			const abortListener = (): void => terminate(new ChildProcessExecutionError(
+			const abortListener = (): void => finalize(new ChildProcessExecutionError(
 				'PROCESS_ABORTED',
 				'The process request was cancelled.',
 			));
-			timeoutTimer = setTimeout(() => terminate(new ChildProcessExecutionError(
+			timeoutTimer = setTimeout(() => finalize(new ChildProcessExecutionError(
 				'PROCESS_TIMEOUT',
 				'The process exceeded its execution timeout.',
 			)), timeoutMs);
@@ -202,32 +331,23 @@ export class ChildProcessRunner {
 			}
 			child.stdout.on('data', (chunk: Buffer | string) => capture(stdoutChunks, chunk));
 			child.stderr.on('data', (chunk: Buffer | string) => capture(stderrChunks, chunk));
-			child.once('error', () => settleReject(new ChildProcessExecutionError(
+			child.once('error', () => finalize(new ChildProcessExecutionError(
 				'PROCESS_START_FAILED',
 				'The process could not be started.',
 			)));
-			child.once('close', (exitCode) => {
-				if (settled) {
-					return;
-				}
-				if (terminationError !== undefined) {
-					return;
-				}
+			child.once('exit', (exitCode) => {
 				if (exitCode !== 0) {
-					settleReject(new ChildProcessExecutionError(
+					finalize(new ChildProcessExecutionError(
 						'PROCESS_EXIT_NONZERO',
 						`The process exited with code ${exitCode ?? 'unknown'}.`,
 					));
 					return;
 				}
-
-				settled = true;
-				cleanup();
-				resolve({
-					exitCode,
-					stdout: Buffer.concat(stdoutChunks).toString('utf8'),
-					stderr: Buffer.concat(stderrChunks).toString('utf8'),
-				});
+				finalize();
+			});
+			child.once('close', () => {
+				closeObserved = true;
+				resolveClose?.();
 			});
 		});
 	}
@@ -244,4 +364,41 @@ export function redactProcessText(value: string): string {
 
 function terminatePosixProcessGroup(pid: number, signal: NodeJS.Signals): void {
 	process.kill(-pid, signal);
+}
+
+function isPosixProcessGroupAlive(pid: number): boolean {
+	try {
+		process.kill(-pid, 0);
+		return true;
+	} catch (error: unknown) {
+		if (isProcessMissingError(error)) {
+			return false;
+		}
+		throw error;
+	}
+}
+
+function isProcessMissingError(error: unknown): boolean {
+	return error instanceof Error
+		&& 'code' in error
+		&& error.code === 'ESRCH';
+}
+
+function isProcessPermissionError(error: unknown): boolean {
+	return error instanceof Error
+		&& 'code' in error
+		&& error.code === 'EPERM';
+}
+
+function toProcessTreeTerminationError(error: unknown): ChildProcessExecutionError {
+	return error instanceof ChildProcessExecutionError
+		? error
+		: new ChildProcessExecutionError(
+			'PROCESS_TREE_TERMINATION_FAILED',
+			'The owned process tree could not be terminated.',
+		);
+}
+
+function delay(milliseconds: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
