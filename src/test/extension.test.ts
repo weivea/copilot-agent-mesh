@@ -114,6 +114,10 @@ suite('Copilot Agent Mesh', () => {
 		assert.strictEqual(GATEWAY_METHODS.taskStart, 'task.start');
 		assert.ok(TASK_STATUSES.includes('needsInput'));
 	});
+
+	test('provides the global WebSocket required by the pinned AHP transport', () => {
+		assert.strictEqual(typeof globalThis.WebSocket, 'function');
+	});
 });
 
 function getExtension(): vscode.Extension<unknown> {
