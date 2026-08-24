@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    "module": "Node16",
+    "target": "ES2022",
+    "lib": [
+      "ES2022"
+    ],
+    "types": [
+      "node",
+      "mocha"
+    ],
+    "sourceMap": true,
+    "rootDir": ".",
+    "strict": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitReturns": true
+  },
+  "include": [
+    "src/**/*.ts",
+    "shared/**/*.ts"
+  ],
+  "exclude": [
+    ".vscode-test",
+    "dist",
+    "node_modules",
+    "out"
+  ]
+}
