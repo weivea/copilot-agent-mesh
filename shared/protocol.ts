@@ -38,8 +38,6 @@ export interface DeviceInfo {
 export interface WorkspaceSummary {
 	readonly workspaceId: string;
 	readonly name: string;
-	readonly repository?: string;
-	readonly branch?: string;
-	readonly headSha?: string;
+	readonly capabilityTags: readonly string[];
 	readonly busy: boolean;
 }

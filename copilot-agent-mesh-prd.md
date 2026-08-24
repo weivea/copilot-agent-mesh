@@ -1,7 +1,7 @@
 # Copilot Agent Mesh 产品需求文档
 
 > 工作名称：Copilot Agent Mesh  
-> 文档版本：v0.1  
+> 文档版本：v0.2<br>
 > 状态：Draft / 可用于创建项目  
 > 日期：2026-08-24  
 > 产品形态：个人使用的 VS Code Desktop 扩展  
@@ -36,7 +36,7 @@ Windows Copilot Agent：
 2. 调用扩展 Tool，把 iOS 子任务发给 Mac。
 3. 调用扩展 Tool，把服务端子任务发给 Linux。
 4. 等待远程任务完成。
-5. 汇总各设备结果、Commit、测试结果和未解决问题。
+5. 汇总各设备的 Agent 结果、测试结果和未解决问题。
 ```
 
 ## 3. 产品目标
@@ -58,6 +58,8 @@ Windows Copilot Agent：
 - 远程桌面、屏幕控制或键鼠模拟。
 - 接管从设备上用户当前打开的任意 Copilot Chat 标签页。
 - 自动把一个产品需求拆成完整 DAG；任务拆分主要由主 Copilot Agent 完成。
+- 检查或改变 Workspace 的 Git 状态、当前分支、HEAD、worktree，或判断当前状态是否适合开始开发。
+- 向远端 Agent 注入创建 Git worktree、切换或创建分支、Commit、Push、创建 PR 等操作要求；这些行为完全由 Agent 自主决定。
 - 自动解决跨仓库合并冲突。
 - 自动部署生产环境。
 - 支持 vscode.dev Web Extension；首版仅支持桌面扩展宿主。
@@ -138,9 +140,8 @@ Windows Copilot Agent：
   - `workspaceId`
   - 显示名称
   - 本地路径，仅保存在 Worker
-  - Git remote 标识
-  - 当前分支与 HEAD SHA
   - 可编辑能力标签，例如 `ios`、`windows`、`linux`、`backend`、`docker`
+- Workspace 可以是任意本地目录；扩展不要求它是 Git 仓库，也不读取 Git remote、分支、HEAD、worktree 或工作区状态。
 - Coordinator 只能使用 `workspaceId`，不能提交任意绝对路径。
 - 用户可以启用、禁用或删除 Workspace。
 - MVP 每个 Workspace 同时只允许一个远程写任务。
@@ -228,21 +229,16 @@ interface DelegateTaskInput {
   title: string;
   prompt: string;
   acceptanceCriteria?: string[];
-  baseRef?: string;
-  baseSha?: string;
-  contextRefs?: Array<{
-    repository: string;
-    ref: string;
-    path?: string;
-  }>;
   timeoutMinutes?: number;
-  deliveryMode?: 'workspace' | 'commit' | 'pushBranch';
 }
 ```
 
 要求：
 
 - Tool 的 `modelDescription` 明确告诉模型何时应委派远程任务。
+- Tool 只选择目标设备与 Workspace，并传递主 Agent 给出的任务意图；不得添加 Git、分支或 worktree 操作策略。
+- Tool 不检查 Workspace 的 Git 状态，也不因分支、HEAD、未提交修改或 worktree 状态阻止任务。
+- 是否开始开发以及是否执行任何 Git 操作由远端内置 Agent 自主判断；扩展尤其不得提示 Agent 创建 Git worktree。
 - Tool 执行前显示目标设备、Workspace 和任务摘要确认。
 - Tool 支持 VS Code `CancellationToken`。
 - 成功、失败、超时、离线必须返回不同的结构化结果。
@@ -254,13 +250,14 @@ Worker 接收任务后：
 
 1. 校验协议版本、任务 ID 和 Workspace。
 2. 确保没有违反 Workspace 并发限制。
-3. 校验 `baseSha`；不一致时返回明确错误或等待用户决定。
-4. 连接或启动本地 VS Code Agent Host。
-5. 通过 AHP Root State 动态发现 Copilot provider；不得永久硬编码 provider ID。
-6. 在目标 Workspace 上创建 Session/Chat。
-7. 发送任务 Prompt 并订阅 Chat、Tool、Terminal 和 Changeset 事件。
-8. 持续更新任务状态。
-9. 完成后生成结构化结果并回传 Coordinator。
+3. 连接或启动本地 VS Code Agent Host。
+4. 通过 AHP Root State 动态发现 Copilot provider；不得永久硬编码 provider ID。
+5. 在目标 Workspace 上创建 Session/Chat。
+6. 发送任务 Prompt 并订阅 Chat、Tool、Terminal 和 Changeset 事件。
+7. 持续更新任务状态。
+8. 完成后生成结构化结果并回传 Coordinator。
+
+任务开始前，扩展不得检查或修改 Git 状态、分支、HEAD 或 worktree，也不得把相关策略注入 Prompt。远端 Agent 根据任务、本地环境和自身能力自主决定是否开始开发及是否执行 Git 操作；如需用户决策，沿用任务输入与审批转发机制。
 
 ### FR-9：任务状态
 
@@ -287,16 +284,6 @@ interface RemoteTaskResult {
   deviceId: string;
   workspaceId: string;
   agentSessionUri?: string;
-  git?: {
-    repository?: string;
-    branch?: string;
-    baseSha?: string;
-    headSha?: string;
-    commitSha?: string;
-    remoteBranch?: string;
-    pullRequestUrl?: string;
-    changedFiles?: string[];
-  };
   validations?: Array<{
     command: string;
     success: boolean;
@@ -313,14 +300,16 @@ interface RemoteTaskResult {
 }
 ```
 
+分支、worktree、Commit、Push 和 PR 不属于 Mesh 结构化协议字段。若远端 Agent 在结果中主动提供相关信息，扩展只把它作为普通摘要、输出或 Artifact 透传，不解析、不校验，也不据此控制后续任务。
+
 ### FR-11：跨仓库支持
 
-- 一个 Worker 可以注册多个不同仓库的 Workspace。
+- 一个 Worker 可以注册多个 Workspace；它们可以属于不同仓库，也可以不是 Git 仓库。
 - Coordinator 可连接多个设备，并查看所有 Workspace。
 - 每次任务只绑定一个目标 Workspace；跨仓库功能由主 Copilot Agent拆成多个任务。
-- 任务可携带其他仓库的 Git ref、API Schema、Proto 或文档引用。
 - 插件不通过聊天消息复制整套源码。
-- Git 仍是跨设备代码交付和版本关联的可信来源。
+- 插件协议不携带 Git 基线、目标分支、交付模式或 worktree 策略。
+- 远端 Agent 根据用户任务和本地环境自主处理所有 Git 操作；插件不得要求或暗示 Agent 创建 worktree 或分支。
 
 ### FR-12：任务与连接控制界面
 
@@ -337,8 +326,8 @@ This Device
   [Copy Connection URL] [Stop]
 
 Shared Workspaces
-  ● iOS Client      repo/client-ios      main@abc123
-  ● Shared Client   repo/client          develop@def456
+  ● iOS Client      ios
+  ● Shared Client   cross-platform
   [+ Add Current Workspace]
 
 Remote Devices
@@ -361,7 +350,7 @@ Tasks
 - 展示设备状态、延迟、Workspace 和活动任务。
 - 查看任务详情、进度、输出摘要、审批和错误。
 - 取消任务。
-- 打开对应 Agent Session 或相关文件/Commit。
+- 打开对应 Agent Session 或 Agent 返回的文件与链接。
 
 详细日志写入独立 `OutputChannel`，不把调试日志全部塞入 Webview。
 
@@ -462,6 +451,8 @@ ws://127.0.0.1:<port>?tkn=<connection-token>
 7. 聚合 `chat/responsePart`、`chat/delta`、Tool Call、输入请求和 `chat/turnComplete`。
 8. 将结构化结果映射为 Mesh Task Result。
 
+发送给 Agent 的 Prompt 只包含主 Agent 提供的任务描述、验收条件和必要的传输上下文。扩展不得追加 Git 状态检查、分支管理、worktree、Commit、Push 或 PR 策略。
+
 连接 URL、Agent Host token 和 GitHub token必须彼此隔离；GitHub/Copilot token不得发送给 Coordinator。
 
 ## 9. 技术选型
@@ -478,7 +469,7 @@ ws://127.0.0.1:<port>?tkn=<connection-token>
 | 非敏感存储 | `ExtensionContext.globalState` |
 | 密钥存储 | `ExtensionContext.secrets` / SecretStorage |
 | 日志 | VS Code OutputChannel + 可选滚动文件日志 |
-| 代码同步 | Git branch/commit/PR，不自建源码同步协议 |
+| Workspace 与 Git 操作 | 完全由远端内置 Agent 自主处理；扩展不检查、不控制，也不注入操作策略 |
 
 建议目录结构：
 
@@ -609,7 +600,7 @@ AHP 的 Root、Session、Chat 和 Terminal channel 在当前规范中标记为 S
 - Tunnel 创建、端口注册或 host 失败。
 - 配对 URL 无效或协议版本不兼容。
 - Worker 离线或 VS Code 已关闭。
-- Workspace 被删除、未启用或 Git 状态不符合要求。
+- Workspace 被删除、未启用或本地路径不可访问。
 - Copilot 未登录、无权限、配额不足。
 - Agent Host 启动失败或 Provider 不存在。
 - Agent 请求用户输入但 Coordinator 断线。
@@ -634,13 +625,12 @@ AHP 的 Root、Session、Chat 和 Terminal channel 在当前规范中标记为 S
 9. Worker 通过 AHP 调用内置 Copilot Agent。
 10. 主设备 UI 显示任务状态和输出摘要。
 11. 任务完成结果返回原始 Tool 调用。
-12. 一台设备可注册多个仓库，但每个 Workspace 同时只执行一个任务。
+12. 一台设备可注册多个 Workspace，但每个 Workspace 同时只执行一个任务。
+13. 插件不检查或管理 Git 状态、分支和 worktree，也不向 Agent 注入相关操作要求。
 
 ### MVP 后续
 
 - 多任务并行和任务队列优先级。
-- 自动创建 Git worktree 和分支。
-- 自动 Commit、Push、创建 PR。
 - 文件、截图和构建产物传输。
 - 更完整的远程 Terminal/Changeset 展示。
 - 直接使用 Dev Tunnels TypeScript SDK。
@@ -661,6 +651,7 @@ AHP 的 Root、Session、Chat 和 Terminal channel 在当前规范中标记为 S
 - 用户在 Windows Copilot Agent 要求执行 iOS 任务。
 - Copilot Agent 可以调用 `mesh_delegate_task`。
 - Mac 创建内置 Copilot Agent Session，在注册的 Workspace 中执行。
+- 创建 Session 前，扩展不检查或修改 Git 状态、分支与 worktree，也不向 Agent 注入 Git 操作提示。
 - Mac 的文本输出和状态可在 Windows 控制界面查看。
 - 完成后结果自动返回 Windows Copilot Agent，Agent 能基于该结果继续回复。
 
@@ -723,7 +714,7 @@ AHP 的 Root、Session、Chat 和 Terminal channel 在当前规范中标记为 S
 | Agent Host持续演进 | AHP 集成可能随 VS Code 变化 | 使用正式 AHP SDK、版本协商和 capability detection。 |
 | Language Model Tool等待时间过长 | 主 Agent Turn 被取消或超时 | 持久 taskId；超时后返回 pending，并允许 `mesh_get_task` 继续查询。 |
 | Worker 睡眠或 VS Code 关闭 | 远程任务中断 | 状态持久化、自动重连、明确 Offline；后续支持系统 keep-awake。 |
-| 多设备 Git 状态不一致 | Agent 基于错误代码开发 | 任务携带 `baseSha`，Worker 执行前校验。 |
+| 远端 Workspace 状态不适合执行任务 | Agent 可能无法开始或需要用户决策 | 由远端 Agent 自主判断并通过现有输入/审批通道反馈；扩展不做 Git 预检或策略注入。 |
 | 远程执行风险 | 从设备文件或命令被误操作 | Workspace 白名单、任务确认、审批转发、可取消。 |
 | CLI 路径差异 | macOS/Linux 找不到 `code` 或 `devtunnel` | 自动发现 + 配置项 + 明确安装指引。 |
 
