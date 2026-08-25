@@ -1,14 +1,24 @@
 # Copilot Agent Mesh
 
-Copilot Agent Mesh is a Preview desktop VS Code extension for delegating GitHub Copilot coding tasks across trusted devices and local workspaces.
+Copilot Agent Mesh is a Preview desktop VS Code extension for coordinating GitHub Copilot coding tasks across trusted devices and local workspaces. This package is an evaluation build, not a declaration that the end-to-end G0 release gate has passed.
 
-The only Worker Preview candidate platform is **macOS arm64**; full authenticated
-end-to-end support remains gated by the opt-in compatibility evidence. Windows, Linux,
-macOS x64, and other architectures may use Coordinator features when the peer
-client is otherwise available, but they cannot host a listener or execute Worker
-tasks. Unsupported Worker surfaces return `CLI_UNSUPPORTED` and
+The only Worker Preview candidate platform is **macOS arm64**. Windows, Linux,
+macOS x64, and every other architecture are **Coordinator-only**: they may connect
+to an already configured peer, but cannot host a listener or execute Worker tasks.
+Unsupported Worker surfaces return `CLI_UNSUPPORTED` and
 `AGENT_UNAVAILABLE` with an actionable macOS arm64 requirement; they never fall
 back to an unowned process or unvalidated tunnel build.
+
+## Preview prerequisites and limitations
+
+- VS Code 1.103 or newer is required.
+- Real Worker execution is experimental, disabled by default, and may consume Copilot quota.
+- Enable `copilotAgentMesh.experimental.agentHost` only after reviewing the first-task confirmation and process ownership behavior.
+- AHP authentication is not inferred. Every advertised protected-resource or authorization-server URL must be mapped explicitly in `copilotAgentMesh.experimental.authenticationProviders` to an installed VS Code authentication provider and its exact scopes. Missing mappings fail with `AGENT_AUTH_REQUIRED`.
+- Tunnel hosting requires a user-supplied `copilotAgentMesh.devTunnelPath` pointing to the exact validated macOS arm64 CLI build `1.0.2030+fc9273aa0f`. The extension does not search `PATH`, download, install, or upgrade Dev Tunnel.
+- Gate G0 remains **No-Go**: authenticated AHP Session/Turn E2E has not passed, so this Preview does not claim a full end-to-end MVP.
+
+See [Preview release and installation](./docs/mvp/release.md) for packaging, installation, and verification instructions.
 
 Project documents:
 
@@ -46,6 +56,8 @@ npm run watch
 npm run check-types
 npm run lint
 npm test
+npm run verify
+npm run package:vsix
 ```
 
 ## Project layout

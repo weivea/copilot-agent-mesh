@@ -2,7 +2,7 @@
 
 > Status: Phase 0 in progress  
 > Evidence date: 2026-08-25
-> Baseline commit: `66b2954`
+> Baseline commit: `06775c7e2e8a18f7771507e4a739fad0b865d9a0`
 
 This document is the release gate for external platform compatibility. A version is
 supported only after the corresponding opt-in spike has produced reproducible evidence.
@@ -29,7 +29,8 @@ must not claim an end-to-end Copilot Agent Mesh MVP.
 
 ## Preview platform support
 
-The Marketplace Preview scope does not claim cross-platform Worker support.
+The Preview package scope does not claim cross-platform Worker support or
+Marketplace publication.
 Coordinator support still depends on the peer client being available in that
 environment.
 

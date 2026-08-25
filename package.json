@@ -1,9 +1,11 @@
 {
   "name": "copilot-agent-mesh",
   "displayName": "Copilot Agent Mesh",
-  "description": "Preview mesh coordinator with an experimental macOS arm64 Worker candidate.",
-  "version": "0.0.1",
+  "description": "Preview mesh coordinator; experimental Worker hosting is limited to macOS arm64.",
+  "version": "0.1.0",
+  "preview": true,
   "publisher": "weivea",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/weivea/copilot-agent-mesh.git"
@@ -29,6 +31,18 @@
   ],
   "activationEvents": [],
   "main": "./dist/extension.js",
+  "files": [
+    "dist/**",
+    "media/**",
+    "package.json",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "NOTICE",
+    "docs/mvp/release.md",
+    "vendor/microsoft-agent-host-protocol-0.8.0.tgz",
+    "vendor/microsoft-agent-host-protocol-LICENSE.txt"
+  ],
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": false,
@@ -414,7 +428,7 @@
           "type": "string",
           "default": "",
           "scope": "machine",
-          "markdownDescription": "Optional path to the exact supported macOS arm64 Dev Tunnel CLI executable for Worker Preview. Other platforms are Coordinator-only. The extension never installs or upgrades the CLI."
+          "markdownDescription": "User-supplied path to the exact supported macOS arm64 Dev Tunnel CLI `1.0.2030+fc9273aa0f` executable. Required for Worker Preview tunnel hosting. Other platforms are Coordinator-only. The extension never downloads, installs, discovers by PATH, or upgrades this CLI."
         },
         "copilotAgentMesh.listener.port": {
           "type": "integer",
@@ -445,12 +459,16 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run package",
+    "vscode:prepublish": "npm run bundle",
     "compile": "npm run check-types && npm run lint && node esbuild.js",
+    "bundle": "npm run check-types && npm run lint && node esbuild.js --production",
     "watch": "npm-run-all -p watch:*",
     "watch:esbuild": "node esbuild.js --watch",
     "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
-    "package": "npm run check-types && npm run lint && node esbuild.js --production",
+    "package:vsix": "node -e \"require('node:fs').mkdirSync('artifacts',{recursive:true})\" && vsce package --pre-release --no-dependencies --out artifacts/copilot-agent-mesh-0.1.0-preview.vsix && npm run verify:vsix",
+    "vsix:list": "vsce ls --no-dependencies",
+    "verify:vsix": "npm run vsix:list && node scripts/verify-vsix.mjs artifacts/copilot-agent-mesh-0.1.0-preview.vsix",
+    "smoke:vsix": "node scripts/smoke-vsix.mjs artifacts/copilot-agent-mesh-0.1.0-preview.vsix",
     "compile-tests": "tsc -p . --outDir out",
     "watch-tests": "tsc -p . -w --outDir out",
     "check-types": "tsc --noEmit",
@@ -460,6 +478,7 @@
     "test:dev-tunnel-real": "npm run compile-tests && node --test out/src/integrationTest/devTunnel.real.test.js",
     "test:extension": "npm run compile-tests && npm run compile && vscode-test",
     "test": "npm run test:unit && npm run test:component && npm run test:extension",
+    "verify": "npm run test:unit && npm run test:component && npm run test:extension && npm run package:vsix",
     "spike:dev-tunnel": "npm run test:dev-tunnel-real",
     "test:agent-host-auth-e2e": "npm run compile-tests && node out/src/e2e/agentHost.e2e.js auth-boundary",
     "test:agent-host-success-e2e": "npm run compile-tests && node out/src/e2e/agentHost.e2e.js success-turn",
@@ -472,6 +491,7 @@
     "@types/ws": "8.18.1",
     "@vscode/test-cli": "^0.0.15",
     "@vscode/test-electron": "^3.0.0",
+    "@vscode/vsce": "3.9.2",
     "esbuild": "^0.28.1",
     "eslint": "^10.5.0",
     "npm-run-all": "^4.1.5",
@@ -484,7 +504,7 @@
   },
   "dependencies": {
     "@microsoft/agent-host-protocol": "file:vendor/microsoft-agent-host-protocol-0.8.0.tgz",
-    "zod": "4.1.11",
-    "ws": "8.21.3"
+    "ws": "8.21.3",
+    "zod": "4.1.11"
   }
 }

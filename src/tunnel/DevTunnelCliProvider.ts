@@ -38,7 +38,7 @@ import {
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { realpath } from 'node:fs/promises';
-import { basename, delimiter, isAbsolute, join } from 'node:path';
+import { basename, isAbsolute } from 'node:path';
 
 interface DevTunnelCommandRunner {
 	run(
@@ -126,7 +126,7 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 				allowedExecutableBasenames: [allowedExecutableBasename],
 			})
 		);
-		this.executable = options.executable ?? 'devtunnel';
+		this.executable = options.executable ?? '';
 		this.healthProbe = options.healthProbe ?? probeDevTunnelHealth;
 		this.localHealthProbe = options.localHealthProbe ?? probeLoopbackHealth;
 		this.maxRestartAttempts = options.maxRestartAttempts ?? 5;
@@ -1254,19 +1254,11 @@ async function verifyOfficialExecutable(path: string): Promise<boolean> {
 }
 
 async function resolveExecutablePath(executable: string): Promise<string> {
-	if (isAbsolute(executable) || executable.includes('/') || executable.includes('\\')) {
-		return realpath(executable);
+	if (executable.length === 0) {
+		throw new Error('An explicit Dev Tunnel executable path is required.');
 	}
-	for (const directory of (process.env.PATH ?? '').split(delimiter)) {
-		if (directory.length === 0) {
-			continue;
-		}
-		const candidate = join(directory, executable);
-		try {
-			return await realpath(candidate);
-		} catch {
-			continue;
-		}
+	if (!isAbsolute(executable) && !executable.includes('/') && !executable.includes('\\')) {
+		throw new Error('Dev Tunnel executable discovery through PATH is not supported.');
 	}
-	throw new Error('Dev Tunnel executable was not found on PATH.');
+	return realpath(executable);
 }

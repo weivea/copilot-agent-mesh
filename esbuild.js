@@ -1,4 +1,5 @@
 const esbuild = require("esbuild");
+const { rmSync } = require("node:fs");
 
 const production = process.argv.includes('--production');
 const watch = process.argv.includes('--watch');
@@ -24,6 +25,9 @@ const esbuildProblemMatcherPlugin = {
 };
 
 async function main() {
+	if (production) {
+		rmSync('dist', { recursive: true, force: true });
+	}
 	const ctx = await esbuild.context({
 		entryPoints: [
 			'src/extension.ts'

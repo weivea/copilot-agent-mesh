@@ -1,0 +1,112 @@
+# Preview release engineering
+
+> Version: `0.1.0` pre-release
+> Baseline: `06775c7e2e8a18f7771507e4a739fad0b865d9a0`
+> Gate status: G0 **No-Go**
+
+This document describes a reproducible evaluation package. It does not authorize
+Marketplace publication, GitHub release creation, or promotion to general
+availability.
+
+## Supported Preview surface
+
+| Platform | Coordinator | Worker host |
+| --- | --- | --- |
+| macOS arm64 | Preview | Experimental candidate; disabled by default |
+| macOS x64 and other macOS architectures | Preview | Unsupported |
+| Windows | Preview | Unsupported |
+| Linux | Preview | Unsupported |
+
+Coordinator support assumes a separately configured, reachable trusted peer.
+Unsupported platforms fail closed instead of launching Worker processes.
+
+The real Agent Host/AHP runtime requires:
+
+1. `copilotAgentMesh.experimental.agentHost: true`.
+2. An explicit first-task confirmation.
+3. Explicit protected-resource or authorization-server mappings in
+   `copilotAgentMesh.experimental.authenticationProviders`.
+4. Available credentials from the mapped VS Code authentication provider.
+
+No provider, account, resource, or scope is inferred. A successful real turn may
+consume Copilot quota.
+
+Worker tunnel hosting additionally requires a user-supplied
+`copilotAgentMesh.devTunnelPath` to the exact validated macOS arm64 build
+`1.0.2030+fc9273aa0f`. The extension does not discover it on `PATH` and never
+downloads, installs, or upgrades the CLI.
+
+## Build and verify
+
+Use Node.js 22 or newer:
+
+```sh
+npm ci
+npm audit --audit-level=high
+npm run verify
+```
+
+`verify` runs unit, component, Extension Host, and VSIX package verification.
+The package command creates:
+
+```text
+artifacts/copilot-agent-mesh-0.1.0-preview.vsix
+```
+
+The production bundle is separate from VSIX creation:
+
+```sh
+npm run bundle
+npm run package:vsix
+```
+
+`package:vsix` invokes `vsce package --pre-release --no-dependencies`, prints
+`vsce ls`, and verifies the ZIP central directory against an exact allowlist.
+Only the production bundle, media, extension manifest, release documents,
+project notices, and pinned AHP tarball/license are permitted. Source, tests,
+shared TypeScript, build output, test downloads, source maps, credentials, and
+external CLIs are rejected.
+
+Inspect and hash the result independently:
+
+```sh
+npx vsce ls --no-dependencies
+unzip -Z1 artifacts/copilot-agent-mesh-0.1.0-preview.vsix
+shasum -a 256 artifacts/copilot-agent-mesh-0.1.0-preview.vsix
+```
+
+## Isolated activation smoke
+
+The smoke command installs the VSIX into temporary user-data and extension
+directories (an isolated VS Code profile), then starts an independent Extension
+Host that activates the installed extension:
+
+```sh
+npm run smoke:vsix
+```
+
+Set `VSCODE_EXECUTABLE_PATH` to reuse a specific VS Code executable; otherwise
+`@vscode/test-electron` downloads or reuses its stable test build. The fresh
+profile keeps listener auto-start and experimental Agent Host disabled, so the
+smoke does not create a public tunnel or run a model task.
+
+## CI boundary
+
+The `preview-package.yml` matrix runs on Linux, macOS, and Windows. It performs
+clean install, audit, type checking, lint, offline unit/component tests,
+Extension Host tests, package verification, and artifact upload. Linux runs the
+Extension Host under `xvfb`.
+
+Ordinary CI must not run `test:dev-tunnel-real`,
+`test:agent-host-auth-e2e`, or `test:agent-host-success-e2e`. Those tests require
+explicit local opt-in, platform credentials, exact external executables, and
+cleanup review; the success path may consume Copilot quota.
+
+## Manual release checklist
+
+1. Confirm `git merge-base HEAD mvp-e2e-base` is the recorded baseline.
+2. Run `npm ci`, `npm audit --audit-level=high`, and `npm run verify`.
+3. Run `npm run smoke:vsix` without enabling Worker settings.
+4. Record the commit SHA, VSIX SHA-256, and verified archive listing.
+5. Transfer the VSIX only as an explicitly labeled Preview evaluation artifact.
+6. Do not publish, push, create a release, or claim G0 completion from this procedure.

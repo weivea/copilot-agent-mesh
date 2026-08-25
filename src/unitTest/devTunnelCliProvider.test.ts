@@ -38,6 +38,26 @@ const request: TunnelRequest = {
 };
 
 suite('DevTunnelCliProvider', () => {
+	test('requires an explicit executable path instead of discovering through PATH', async () => {
+		let verified = false;
+		const provider = new DevTunnelCliProvider({
+			architecture: 'arm64',
+			binaryVerifier: async () => {
+				verified = true;
+				return true;
+			},
+			platform: 'darwin',
+			stateStore: new MemoryStore(),
+		});
+
+		assert.deepStrictEqual(await provider.probe(), {
+			loggedIn: false,
+			supported: false,
+			reason: 'CLI_UNSUPPORTED',
+		});
+		assert.equal(verified, false);
+	});
+
 	test('provisions one exact-build tunnel and starts one owned host', async () => {
 		const runner = new FakeRunner();
 		const store = new MemoryStore();
