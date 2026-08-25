@@ -350,29 +350,27 @@ export class VscodeSessionConfigurationResolver implements SessionConfigurationR
 		picker.matchOnDetail = true;
 		picker.keepScrollPosition = true;
 		let debounce: NodeJS.Timeout | undefined;
-		let activeRequest: CompletionRequest | undefined;
+		const activeRequests = new Map<number, CompletionRequest>();
 		let pendingRequest: CompletionRequest | undefined;
-		let queuedRequest: CompletionRequest | undefined;
 		let revision = 0;
 		let settled = false;
 		const subscriptions: vscode.Disposable[] = [];
+		const maxInflight = 2;
 
 		return new Promise<string>((resolve, reject) => {
 			const updateBusy = (): void => {
-				picker.busy = activeRequest !== undefined
-					|| pendingRequest !== undefined
-					|| queuedRequest !== undefined;
+				picker.busy = activeRequests.size > 0 || pendingRequest !== undefined;
 			};
 			const cleanup = (): void => {
 				if (debounce !== undefined) {
 					clearTimeout(debounce);
 					debounce = undefined;
 				}
-				activeRequest?.controller.abort();
+				for (const request of activeRequests.values()) {
+					request.controller.abort();
+				}
 				pendingRequest?.controller.abort();
-				queuedRequest?.controller.abort();
 				pendingRequest = undefined;
-				queuedRequest = undefined;
 				for (const subscription of subscriptions.splice(0)) {
 					subscription.dispose();
 				}
@@ -386,14 +384,18 @@ export class VscodeSessionConfigurationResolver implements SessionConfigurationR
 				cleanup();
 				operation();
 			};
-			const pump = (): void => {
-				if (settled || activeRequest !== undefined || queuedRequest === undefined) {
+			const launchLatest = (): void => {
+				if (
+					settled
+					|| pendingRequest === undefined
+					|| activeRequests.size >= maxInflight
+				) {
 					updateBusy();
 					return;
 				}
-				const request = queuedRequest;
-				queuedRequest = undefined;
-				activeRequest = request;
+				const request = pendingRequest;
+				pendingRequest = undefined;
+				activeRequests.set(request.revision, request);
 				updateBusy();
 				void completions(
 					propertyId,
@@ -421,10 +423,8 @@ export class VscodeSessionConfigurationResolver implements SessionConfigurationR
 						}
 					},
 				).finally(() => {
-					if (activeRequest === request) {
-						activeRequest = undefined;
-					}
-					pump();
+					activeRequests.delete(request.revision);
+					launchLatest();
 				});
 			};
 			const schedule = (query: string, immediate = false): void => {
@@ -433,23 +433,21 @@ export class VscodeSessionConfigurationResolver implements SessionConfigurationR
 					clearTimeout(debounce);
 					debounce = undefined;
 				}
-				activeRequest?.controller.abort();
+				for (const request of activeRequests.values()) {
+					request.controller.abort();
+				}
 				pendingRequest?.controller.abort();
-				queuedRequest?.controller.abort();
 				const request: CompletionRequest = {
 					query,
 					revision,
 					controller: new AbortController(),
 				};
 				pendingRequest = request;
-				queuedRequest = undefined;
 				updateBusy();
 				debounce = setTimeout(() => {
 					debounce = undefined;
 					if (pendingRequest === request && !request.controller.signal.aborted) {
-						pendingRequest = undefined;
-						queuedRequest = request;
-						pump();
+						launchLatest();
 					}
 				}, immediate ? 0 : this.completionDebounceMs);
 			};

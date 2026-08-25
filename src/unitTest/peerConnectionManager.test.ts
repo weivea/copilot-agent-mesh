@@ -342,7 +342,7 @@ test('PeerConnectionManager rolls back a provisional peer after a retry becomes 
 	await manager.dispose();
 });
 
-test('PeerConnectionManager retains profile references when secret rollback fails', async () => {
+test('PeerConnectionManager does not restore a profile after partial secret rollback', async () => {
 	const storedSecrets = new InMemorySecretStore();
 	const secrets: SecretStore = {
 		get: (key) => storedSecrets.get(key),
@@ -388,8 +388,7 @@ test('PeerConnectionManager retains profile references when secret rollback fail
 
 	await assert.rejects(manager.add(connectionUrl), /roll back/u);
 
-	const retained = await profiles.get('rollback-profile');
-	assert.equal(retained?.credentialKeyRef, 'mesh.remotePeer.rollback-profile');
+	assert.equal(await profiles.get('rollback-profile'), undefined);
 	assert.ok(await storedSecrets.get('mesh.remotePeer.rollback-profile'));
 	assert.equal(manager.get('rollback-profile'), undefined);
 	await manager.dispose();
@@ -451,7 +450,7 @@ test('PeerConnectionManager reports and awaits a background rollback failure on 
 			&& error.message === 'One or more peer reconnect operations failed.'
 		),
 	);
-	assert.ok(await profiles.get('background-profile'));
+	assert.equal(await profiles.get('background-profile'), undefined);
 	assert.ok(await storedSecrets.get('background-credential'));
 });
 

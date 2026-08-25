@@ -97,6 +97,12 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		const ids = { next: randomUUID };
 		const workerPlatform = getWorkerPlatformSupport();
 		const configuration = vscode.workspace.getConfiguration('copilotAgentMesh');
+		const storageRoot = vscode.Uri.joinPath(context.globalStorageUri, 'mesh-state');
+		await vscode.workspace.fs.createDirectory(storageRoot);
+		const ownership = await WorkerOwnerLock.acquire(context.globalStorageUri.fsPath, {
+			instanceId: randomUUID(),
+		});
+		cleanup.push(() => ownership.dispose());
 		const extensionVersion = String(context.extension?.packageJSON.version ?? '0.0.0');
 		const deviceStore = new DeviceProfileStore(state, ids, systemClock);
 		const device = new DeviceService(deviceStore, {
@@ -105,14 +111,18 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			architecture: process.arch,
 			vscodeVersion: vscode.version,
 			extensionVersion,
-		}, guard);
-		let deviceProfile = await device.initialize();
+		}, guard, ownership);
+		let deviceProfile = ownership.isOwner()
+			? await device.initialize()
+			: device.initializeReadOnly();
 		const configuredDeviceName = configuration.get<string>('deviceName', '').trim();
 		if (
 			configuredDeviceName.length > 0
 			&& configuredDeviceName !== deviceProfile.name
 		) {
-			deviceProfile = await device.rename(configuredDeviceName);
+			if (ownership.isOwner()) {
+				deviceProfile = await device.rename(configuredDeviceName);
+			}
 		}
 
 		const leases = new WorkspaceLeaseManager();
@@ -146,13 +156,8 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			() => vscode.workspace
 				.getConfiguration('copilotAgentMesh')
 				.get<readonly string[]>('workspace.capabilityTags', []),
+			ownership,
 		);
-		const storageRoot = vscode.Uri.joinPath(context.globalStorageUri, 'mesh-state');
-		await vscode.workspace.fs.createDirectory(storageRoot);
-		const ownership = await WorkerOwnerLock.acquire(context.globalStorageUri.fsPath, {
-			instanceId: randomUUID(),
-		});
-		cleanup.push(() => ownership.dispose());
 		const files = new AtomicFileStore(storageRoot.fsPath, new NodeAtomicFileSystem(), ids);
 		const taskStore = new FileTaskStore(files, systemClock);
 
@@ -168,6 +173,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			peerProfiles,
 			secrets,
 			new WebSocketPeerTransport(),
+			{ ownership },
 		);
 		cleanup.push(() => peerManager.dispose());
 
@@ -242,6 +248,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			void Promise.allSettled([
 				workerTasks.dispose(),
 				listener.dispose(),
+				peerManager.dispose(),
 			]).then((results) => {
 				for (const result of results) {
 					if (result.status === 'rejected') {
@@ -262,6 +269,9 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			peerProfiles,
 			state,
 			guard,
+			randomUUID,
+			() => new Date(),
+			ownership,
 		);
 
 		const bindings = new ProductionDashboardBindings(
@@ -284,13 +294,13 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		const dashboardFacade = new ServiceDashboardFacade(bindings);
 		const dashboard = new AgentMeshViewProvider(dashboardFacade, context.extensionUri);
 		cleanup.push(() => dashboard.dispose());
-		await peerManager.restore();
 		if (ownership.isOwner()) {
+			await peerManager.restore();
 			await restoreListener(listener, configuration, logger);
+			await coordinator.refreshKnownTasks().catch((error: unknown) => {
+				logger.error('coordinator', 'Task status recovery did not complete.', error);
+			});
 		}
-		await coordinator.refreshKnownTasks().catch((error: unknown) => {
-			logger.error('coordinator', 'Task status recovery did not complete.', error);
-		});
 
 		contributions.push(
 			registerMeshTaskTools(coordinator),
@@ -306,6 +316,9 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			vscode.workspace.onDidChangeWorkspaceFolders(() => changeEvents.fire()),
 			vscode.workspace.onDidChangeConfiguration((event) => {
 				if (event.affectsConfiguration('copilotAgentMesh.deviceName')) {
+					if (!ownership.isOwner()) {
+						return;
+					}
 					const name = vscode.workspace
 						.getConfiguration('copilotAgentMesh')
 						.get<string>('deviceName', '')

@@ -4,7 +4,6 @@ import {
 	open,
 	readFile,
 	rename,
-	stat,
 	unlink,
 	type FileHandle,
 } from 'node:fs/promises';
@@ -13,6 +12,7 @@ import { join } from 'node:path';
 import { MeshDomainError } from '../domain/errors';
 
 const lockFileName = 'worker-owner.lock';
+const takeoverLockFileName = 'worker-owner.takeover';
 const defaultTtlMs = 30_000;
 const defaultHeartbeatMs = 5_000;
 
@@ -21,8 +21,17 @@ interface WorkerOwnerRecord {
 	readonly pid: number;
 	readonly instanceId: string;
 	readonly token: string;
+	readonly generation: string;
 	readonly acquiredAt: string;
 	readonly heartbeatAt: string;
+}
+
+interface TakeoverRecord {
+	readonly schemaVersion: 1;
+	readonly pid: number;
+	readonly instanceId: string;
+	readonly token: string;
+	readonly createdAt: string;
 }
 
 export interface WorkerOwnershipSnapshot {
@@ -48,6 +57,7 @@ export interface WorkerOwnerLockOptions {
 	readonly ttlMs?: number;
 	readonly heartbeatMs?: number;
 	readonly pidAlive?: (pid: number) => boolean;
+	readonly onTakeoverMutexAcquired?: () => Promise<void>;
 }
 
 export class WorkerOwnerLock implements WorkerOwnership {
@@ -61,13 +71,16 @@ export class WorkerOwnerLock implements WorkerOwnership {
 
 	private constructor(
 		private readonly path: string,
+		private readonly takeoverPath: string,
 		private readonly pid: number,
 		private readonly instanceId: string,
 		private readonly token: string,
+		private readonly generation: string,
 		private readonly now: () => number,
 		private readonly ttlMs: number,
 		private readonly heartbeatMs: number,
 		private readonly pidAlive: (pid: number) => boolean,
+		private readonly onTakeoverMutexAcquired?: () => Promise<void>,
 	) {}
 
 	public static async acquire(
@@ -76,13 +89,16 @@ export class WorkerOwnerLock implements WorkerOwnership {
 	): Promise<WorkerOwnerLock> {
 		const lock = new WorkerOwnerLock(
 			join(rootDirectory, lockFileName),
+			join(rootDirectory, takeoverLockFileName),
 			options.pid ?? process.pid,
 			options.instanceId ?? randomUUID(),
 			options.token ?? randomUUID(),
+			randomUUID(),
 			options.now ?? Date.now,
 			options.ttlMs ?? defaultTtlMs,
 			options.heartbeatMs ?? defaultHeartbeatMs,
 			options.pidAlive ?? isPidAlive,
+			options.onTakeoverMutexAcquired,
 		);
 		await mkdir(rootDirectory, { recursive: true });
 		await lock.tryAcquire();
@@ -156,56 +172,8 @@ export class WorkerOwnerLock implements WorkerOwnership {
 	}
 
 	private async tryAcquire(): Promise<void> {
-		for (let attempt = 0; attempt < 4; attempt += 1) {
-			let createdHandle: FileHandle | undefined;
-			try {
-				createdHandle = await open(this.path, 'wx+', 0o600);
-				const at = new Date(this.now()).toISOString();
-				const record: WorkerOwnerRecord = {
-					schemaVersion: 1,
-					pid: this.pid,
-					instanceId: this.instanceId,
-					token: this.token,
-					acquiredAt: at,
-					heartbeatAt: at,
-				};
-				await writeRecord(createdHandle, record);
-				this.handle = createdHandle;
-				this.record = record;
-				this.holder = record;
-				this.startHeartbeat();
-				return;
-			} catch (error) {
-				await createdHandle?.close().catch(() => undefined);
-				if (!hasCode(error, 'EEXIST')) {
-					throw error;
-				}
-			}
-
-			const observed = await readRecord(this.path).catch(() => undefined);
-			if (observed !== undefined && this.isLive(observed)) {
-				this.holder = observed;
-				return;
-			}
-			if (observed === undefined && await this.isRecentlyModified()) {
-				return;
-			}
-			const stalePath = `${this.path}.stale-${this.token}`;
-			try {
-				await rename(this.path, stalePath);
-			} catch (error) {
-				if (hasCode(error, 'ENOENT')) {
-					continue;
-				}
-				throw error;
-			}
-			await unlink(stalePath).catch((error: unknown) => {
-				if (!hasCode(error, 'ENOENT')) {
-					throw error;
-				}
-			});
-		}
-		this.holder = await readRecord(this.path).catch(() => undefined);
+		const observed = await readRecord(this.path).catch(() => undefined);
+		await this.tryAcquireWithMutex(observed);
 	}
 
 	private isLive(record: WorkerOwnerRecord): boolean {
@@ -268,15 +236,98 @@ export class WorkerOwnerLock implements WorkerOwnership {
 		}
 	}
 
-	private async isRecentlyModified(): Promise<boolean> {
+	private async createOwnerFile(): Promise<boolean> {
+		let handle: FileHandle | undefined;
 		try {
-			const metadata = await stat(this.path);
-			return this.now() - metadata.mtimeMs <= this.ttlMs;
+			handle = await open(this.path, 'wx+', 0o600);
+			const at = new Date(this.now()).toISOString();
+			const record: WorkerOwnerRecord = {
+				schemaVersion: 1,
+				pid: this.pid,
+				instanceId: this.instanceId,
+				token: this.token,
+				generation: this.generation,
+				acquiredAt: at,
+				heartbeatAt: at,
+			};
+			await writeRecord(handle, record);
+			this.handle = handle;
+			this.record = record;
+			this.holder = record;
+			this.startHeartbeat();
+			return true;
 		} catch (error) {
-			if (hasCode(error, 'ENOENT')) {
+			await handle?.close().catch(() => undefined);
+			if (hasCode(error, 'EEXIST')) {
 				return false;
 			}
 			throw error;
+		}
+	}
+
+	private async tryAcquireWithMutex(observed: WorkerOwnerRecord | undefined): Promise<void> {
+		let mutex: FileHandle | undefined;
+		try {
+			mutex = await open(this.takeoverPath, 'wx+', 0o600);
+		} catch (error) {
+			if (hasCode(error, 'EEXIST')) {
+				this.holder = observed;
+				return;
+			}
+			throw error;
+		}
+		const takeover: TakeoverRecord = {
+			schemaVersion: 1,
+			pid: this.pid,
+			instanceId: this.instanceId,
+			token: this.token,
+			createdAt: new Date(this.now()).toISOString(),
+		};
+		let releaseMutex = false;
+		try {
+			await writeRecord(mutex, takeover);
+			if (observed !== undefined && !this.isLive(observed)) {
+				await this.onTakeoverMutexAcquired?.();
+			}
+			const current = await readRecord(this.path).catch(() => undefined);
+			if (observed === undefined && current === undefined) {
+				if (await this.createOwnerFile()) {
+					releaseMutex = true;
+				}
+				return;
+			}
+			if (
+				current === undefined
+				|| observed === undefined
+				|| current.token !== observed.token
+				|| current.generation !== observed.generation
+				|| this.isLive(current)
+			) {
+				this.holder = current;
+				releaseMutex = true;
+				return;
+			}
+			const stalePath = `${this.path}.stale-${this.token}`;
+			await rename(this.path, stalePath);
+			if (!await this.createOwnerFile()) {
+				this.holder = await readRecord(this.path).catch(() => undefined);
+				return;
+			}
+			releaseMutex = true;
+			await unlink(stalePath).catch((error: unknown) => {
+				if (!hasCode(error, 'ENOENT')) {
+					throw error;
+				}
+			});
+		} finally {
+			await mutex.close().catch(() => undefined);
+			if (releaseMutex) {
+				await unlink(this.takeoverPath).catch((error: unknown) => {
+					if (!hasCode(error, 'ENOENT')) {
+						throw error;
+					}
+				});
+			}
 		}
 	}
 }
@@ -294,6 +345,10 @@ async function readRecord(path: string): Promise<WorkerOwnerRecord | undefined> 
 		|| typeof value.instanceId !== 'string'
 		|| !('token' in value)
 		|| typeof value.token !== 'string'
+		|| (
+			'generation' in value
+			&& typeof value.generation !== 'string'
+		)
 		|| !('acquiredAt' in value)
 		|| typeof value.acquiredAt !== 'string'
 		|| !('heartbeatAt' in value)
@@ -301,10 +356,13 @@ async function readRecord(path: string): Promise<WorkerOwnerRecord | undefined> 
 	) {
 		return undefined;
 	}
-	return value as WorkerOwnerRecord;
+	return {
+		...(value as Omit<WorkerOwnerRecord, 'generation'>),
+		generation: 'generation' in value ? value.generation as string : value.token,
+	};
 }
 
-async function writeRecord(handle: FileHandle, record: WorkerOwnerRecord): Promise<void> {
+async function writeRecord(handle: FileHandle, record: WorkerOwnerRecord | TakeoverRecord): Promise<void> {
 	const data = Buffer.from(JSON.stringify(record), 'utf8');
 	await handle.write(data, 0, data.length, 0);
 	await handle.truncate(data.length);

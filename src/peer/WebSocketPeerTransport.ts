@@ -81,6 +81,7 @@ async function completeEnrollment(
 	}
 	const completed: PeerProfile = {
 		id: profile.id,
+		generation: profile.generation,
 		rpcEndpoint: profile.rpcEndpoint,
 		workerDeviceId: profile.workerDeviceId,
 		peerId: profile.peerId,
@@ -427,6 +428,7 @@ async function reconcileProfileStore(
 function profilesEqual(left: PeerProfile | undefined, right: PeerProfile): boolean {
 	return left !== undefined
 		&& left.id === right.id
+		&& left.generation === right.generation
 		&& left.rpcEndpoint === right.rpcEndpoint
 		&& left.workerDeviceId === right.workerDeviceId
 		&& left.invitationId === right.invitationId

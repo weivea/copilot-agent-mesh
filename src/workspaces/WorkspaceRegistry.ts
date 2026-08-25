@@ -71,6 +71,10 @@ export class WorkspaceRegistry {
 		);
 	}
 
+	public listLocalSnapshot(): readonly LocalWorkspace[] {
+		return structuredClone(this.read().workspaces);
+	}
+
 	public listForWire(): Promise<readonly WorkspaceSummary[]> {
 		return this.runExclusive(async () => {
 			const workspaces = (await this.revalidateAllUnlocked()).workspaces.map((workspace) => ({

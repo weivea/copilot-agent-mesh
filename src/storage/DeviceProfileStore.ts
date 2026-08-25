@@ -35,6 +35,38 @@ export class DeviceProfileStore {
 		private readonly clock: Clock,
 	) {}
 
+	public get(): DeviceProfile | undefined {
+		const stored = this.state.get<unknown>(DEVICE_PROFILE_KEY);
+		if (stored === undefined) {
+			return undefined;
+		}
+		const parsed = deviceProfileSchema.safeParse(stored);
+		if (!parsed.success) {
+			throw new TypeError(`Invalid persisted device profile: ${parsed.error.message}`);
+		}
+		return parsed.data;
+	}
+
+	public getReadOnly(environment: DeviceEnvironment): DeviceProfile {
+		const stored = this.get();
+		if (stored !== undefined) {
+			return stored;
+		}
+		const at = this.clock.now().toISOString();
+		return deviceProfileSchema.parse({
+			schemaVersion: 1,
+			deviceId: this.ids.next(),
+			name: environment.defaultName,
+			platform: environment.platform,
+			architecture: environment.architecture,
+			vscodeVersion: environment.vscodeVersion,
+			extensionVersion: environment.extensionVersion,
+			protocolVersion: MESH_PROTOCOL_VERSION,
+			createdAt: at,
+			updatedAt: at,
+		});
+	}
+
 	public async getOrCreate(environment: DeviceEnvironment): Promise<DeviceProfile> {
 		const stored = this.state.get<unknown>(DEVICE_PROFILE_KEY);
 		if (stored !== undefined) {

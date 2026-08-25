@@ -3,6 +3,7 @@ import type * as vscode from 'vscode';
 
 import type { LocalDesktopWorkspaceGuard } from './LocalDesktopWorkspaceGuard';
 import type { WorkspaceRegistry, LocalWorkspace } from '../workspaces/WorkspaceRegistry';
+import type { WorkerOwnership } from '../storage/WorkerOwnerLock';
 
 export class WorkspaceService {
 	public constructor(
@@ -14,6 +15,7 @@ export class WorkspaceService {
 			folders: readonly vscode.WorkspaceFolder[],
 		) => Promise<vscode.WorkspaceFolder | undefined>,
 		private readonly capabilityTags: () => readonly string[] = () => [],
+		private readonly ownership?: WorkerOwnership,
 	) {}
 
 	public async list(_authenticatedPeerId: string): Promise<{ readonly workspaces: readonly WorkspaceSummary[] }> {
@@ -23,10 +25,13 @@ export class WorkspaceService {
 
 	public listLocal(): Promise<readonly LocalWorkspace[]> {
 		this.guard.assertAllowed();
-		return this.registry.listLocal();
+		return this.ownership?.isOwner() === false
+			? Promise.resolve(this.registry.listLocalSnapshot())
+			: this.registry.listLocal();
 	}
 
 	public async registerCurrent(): Promise<LocalWorkspace> {
+		await this.ownership?.assertOwner();
 		this.guard.assertAllowed();
 		const folders = this.workspaceFolders().filter((folder) => folder.uri.scheme === 'file');
 		const active = this.activeWorkspaceFolder();
@@ -46,12 +51,14 @@ export class WorkspaceService {
 		});
 	}
 
-	public remove(workspaceId: string): Promise<void> {
+	public async remove(workspaceId: string): Promise<void> {
+		await this.ownership?.assertOwner();
 		this.guard.assertAllowed();
 		return this.registry.remove(workspaceId);
 	}
 
-	public setEnabled(workspaceId: string, enabled: boolean): Promise<LocalWorkspace> {
+	public async setEnabled(workspaceId: string, enabled: boolean): Promise<LocalWorkspace> {
+		await this.ownership?.assertOwner();
 		this.guard.assertAllowed();
 		return this.registry.setEnabled(workspaceId, enabled);
 	}

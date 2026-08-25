@@ -251,6 +251,7 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 	}
 
 	public async configureDeviceName(name: string): Promise<void> {
+		await this.ownership.assertOwner();
 		this.guard.assertAllowed({ requireWorkspace: false });
 		await this.vscodeApi.workspace.getConfiguration('copilotAgentMesh').update(
 			'deviceName',
@@ -262,11 +263,13 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 	}
 
 	public async registerCurrentWorkspace(): Promise<void> {
+		await this.ownership.assertOwner();
 		await this.workspaces.registerCurrent();
 		this.changed.fire();
 	}
 
 	public async removeWorkspace(workspaceId: string): Promise<void> {
+		await this.ownership.assertOwner();
 		await this.workspaces.remove(workspaceId);
 		this.changed.fire();
 	}
@@ -286,12 +289,14 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 	}
 
 	public async addPeer(connectionUrl: string): Promise<void> {
+		await this.ownership.assertOwner();
 		this.guard.assertAllowed({ requireWorkspace: false });
 		await this.peers.add(connectionUrl);
 		this.changed.fire();
 	}
 
 	public async removePeer(peerId: string): Promise<void> {
+		await this.ownership.assertOwner();
 		this.guard.assertAllowed({ requireWorkspace: false });
 		await this.peers.remove(peerId);
 		this.changed.fire();
@@ -302,6 +307,7 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 		readonly workspaceId?: string;
 		readonly instruction: string;
 	}): Promise<void> {
+		await this.ownership.assertOwner();
 		this.guard.assertAllowed({ requireWorkspace: false });
 		const directoryController = deadlineSignal(5_000);
 		let directory: MeshWorkerDirectorySnapshot;
@@ -359,6 +365,7 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 	}
 
 	public async cancelTask(taskId: string): Promise<void> {
+		await this.ownership.assertOwner();
 		const controller = deadlineSignal(10_000);
 		try {
 			await this.coordinator.cancelOwnedTask({ taskId }, controller.signal);
@@ -369,6 +376,7 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 	}
 
 	public async answerTaskInput(taskId: string, answer: string): Promise<void> {
+		await this.ownership.assertOwner();
 		const task = this.coordinator.listKnownTasks().find(({ intent }) => intent.taskId === taskId);
 		const inputId = task?.snapshot?.pendingInput?.inputId;
 		if (inputId === undefined) {

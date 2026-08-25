@@ -6,6 +6,7 @@ import type {
 	DeviceProfile,
 	DeviceProfileStore,
 } from '../storage/DeviceProfileStore';
+import type { WorkerOwnership } from '../storage/WorkerOwnerLock';
 
 export class DeviceService {
 	private profile: DeviceProfile | undefined;
@@ -14,11 +15,19 @@ export class DeviceService {
 		private readonly profiles: DeviceProfileStore,
 		private readonly environment: DeviceEnvironment,
 		private readonly guard: LocalDesktopWorkspaceGuard,
+		private readonly ownership?: WorkerOwnership,
 	) {}
 
 	public async initialize(): Promise<DeviceProfile> {
+		await this.ownership?.assertOwner();
 		this.guard.assertAllowed({ requireWorkspace: false });
 		this.profile = await this.profiles.getOrCreate(this.environment);
+		return this.profile;
+	}
+
+	public initializeReadOnly(): DeviceProfile {
+		this.guard.assertAllowed({ requireWorkspace: false });
+		this.profile = this.profiles.getReadOnly(this.environment);
 		return this.profile;
 	}
 
@@ -37,6 +46,7 @@ export class DeviceService {
 	}
 
 	public async rename(name: string): Promise<DeviceProfile> {
+		await this.ownership?.assertOwner();
 		this.guard.assertAllowed({ requireWorkspace: false });
 		this.profile = await this.profiles.rename(name);
 		return this.profile;

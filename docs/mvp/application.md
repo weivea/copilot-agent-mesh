@@ -40,13 +40,20 @@ coordinator, and metadata-only operations do not require an open folder, but sti
 remote Extension Host or untrusted workspace. Workspace registration and worker execution
 also require an all-local `file:` workspace.
 
-Worker and Listener services are exclusive across VS Code windows that share the extension's
+The mutable Mesh application is exclusive across VS Code windows that share the extension's
 `globalStorageUri`. Activation acquires an atomic owner lock containing a process ID, instance
-ID, token, and heartbeat. A live lock keeps later Extension Hosts Coordinator-only: they do not
-restore Worker tasks or touch Listener, tunnel, or pairing resources, and Dashboard reports the
-owner conflict explicitly. Takeover requires both an expired heartbeat and a dead owner process,
-preventing delayed live Extension Hosts from being fenced out. Shutdown removes the lock only
-when its on-disk token still belongs to that instance.
+ID, generation, token, and heartbeat. A stale takeover first acquires a separate `O_EXCL`
+mutex, then re-reads the exact observed generation/token before replacing it. Concurrent
+contenders remain passive, and an orphaned takeover mutex fails closed. Takeover also requires
+both an expired heartbeat and a dead owner process.
+
+Later Extension Hosts are read-only Coordinator dashboards. They do not restore or mutate peer
+connections, delegation intents, workspace registrations or leases, Worker tasks, Listener,
+tunnel, or pairing resources. Mutating commands and task tools return stable `WORKER_DRAINING`
+guidance pointing to the owner window. Shutdown removes the owner lock only when its on-disk
+token still belongs to that instance. Dynamic Agent Host configuration search debounces queries,
+keeps at most two bounded AHP completion requests in flight, and displays only the latest
+revision even when an older request has not resolved.
 
 ## Task lifecycle
 

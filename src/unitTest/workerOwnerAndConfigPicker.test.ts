@@ -1,5 +1,5 @@
 import * as assert from 'node:assert/strict';
-import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, test } from 'node:test';
@@ -14,12 +14,18 @@ import type {
 import { ListenerService, type ListenerGateway, type ListenerPairing } from '../application/ListenerService';
 import { LocalDesktopWorkspaceGuard } from '../application/LocalDesktopWorkspaceGuard';
 import { WorkerTaskService } from '../application/RemoteTaskRunner';
+import { TaskCoordinator } from '../application/TaskCoordinator';
 import { getWorkerPlatformSupport } from '../application/WorkerPlatformSupport';
+import { WorkspaceService } from '../application/WorkspaceService';
 import { VscodeSessionConfigurationResolver } from '../composition/VscodeAgentRuntime';
+import { InMemorySecretStore } from '../gateway/SecretStore';
+import { PeerConnectionManager } from '../peer/PeerConnectionManager';
+import { InMemoryPeerProfileStore } from '../peer/PeerProfile';
 import {
 	AtomicFileStore,
 	NodeAtomicFileSystem,
 } from '../storage/AtomicFileStore';
+import { DeviceProfileStore } from '../storage/DeviceProfileStore';
 import { WorkerOwnerLock } from '../storage/WorkerOwnerLock';
 import { FileTaskStore } from '../tasks/FileTaskStore';
 import { WorkspaceLeaseManager } from '../tasks/WorkspaceLeaseManager';
@@ -106,6 +112,110 @@ test('stale owner lock can be atomically taken over without old-token deletion',
 	await second.dispose();
 });
 
+test('two concurrent stale-lock contenders elect exactly one owner', async () => {
+	const root = await makeDirectory();
+	const now = Date.parse('2026-08-25T00:00:01.000Z');
+	await writeOwnerRecord(root, {
+		pid: 101,
+		instanceId: 'dead-window',
+		token: 'dead-token',
+		generation: 'dead-generation',
+		at: new Date(now - 1_000).toISOString(),
+	});
+	const options = {
+		now: () => now,
+		ttlMs: 100,
+		heartbeatMs: 60_000,
+		pidAlive: () => false,
+	};
+	const [first, second] = await Promise.all([
+		WorkerOwnerLock.acquire(root, {
+			...options,
+			pid: 201,
+			instanceId: 'first-contender',
+			token: 'first-contender-token',
+		}),
+		WorkerOwnerLock.acquire(root, {
+			...options,
+			pid: 202,
+			instanceId: 'second-contender',
+			token: 'second-contender-token',
+		}),
+	]);
+	assert.equal(Number(first.isOwner()) + Number(second.isOwner()), 1);
+	await first.dispose();
+	await second.dispose();
+});
+
+test('takeover winner revalidates generation and cannot replace a newer lock', async () => {
+	const root = await makeDirectory();
+	const now = Date.parse('2026-08-25T00:00:01.000Z');
+	await writeOwnerRecord(root, {
+		pid: 101,
+		instanceId: 'old-window',
+		token: 'old-token',
+		generation: 'old-generation',
+		at: new Date(now - 1_000).toISOString(),
+	});
+	const mutexAcquired = deferred<void>();
+	const releaseValidation = deferred<void>();
+	const acquisition = WorkerOwnerLock.acquire(root, {
+		pid: 202,
+		instanceId: 'contender',
+		token: 'contender-token',
+		now: () => now,
+		ttlMs: 100,
+		heartbeatMs: 60_000,
+		pidAlive: () => false,
+		onTakeoverMutexAcquired: async () => {
+			mutexAcquired.resolve(undefined);
+			await releaseValidation.promise;
+		},
+	});
+	await mutexAcquired.promise;
+	const replacement = join(root, 'replacement.lock');
+	await writeFile(replacement, JSON.stringify(ownerRecord({
+		pid: 303,
+		instanceId: 'new-window',
+		token: 'new-token',
+		generation: 'new-generation',
+		at: new Date(now).toISOString(),
+	})));
+	await rename(replacement, join(root, 'worker-owner.lock'));
+	releaseValidation.resolve(undefined);
+	const contender = await acquisition;
+	assert.equal(contender.isOwner(), false);
+	assert.equal(
+		JSON.parse(await readFile(join(root, 'worker-owner.lock'), 'utf8')).token,
+		'new-token',
+	);
+	await contender.dispose();
+});
+
+test('orphaned takeover mutex fails closed instead of being stolen', async () => {
+	const root = await makeDirectory();
+	const now = Date.parse('2026-08-25T00:00:01.000Z');
+	await writeFile(join(root, 'worker-owner.takeover'), JSON.stringify({
+		schemaVersion: 1,
+		pid: 999,
+		instanceId: 'crashed-contender',
+		token: 'crashed-token',
+		createdAt: new Date(now - 1_000).toISOString(),
+	}));
+	const contender = await WorkerOwnerLock.acquire(root, {
+		pid: 202,
+		instanceId: 'passive-window',
+		token: 'passive-token',
+		now: () => now,
+		ttlMs: 100,
+		heartbeatMs: 60_000,
+		pidAlive: () => false,
+	});
+	assert.equal(contender.isOwner(), false);
+	await assert.rejects(readFile(join(root, 'worker-owner.lock')), /ENOENT/u);
+	await contender.dispose();
+});
+
 test('expired heartbeat cannot fence out a still-live owner process', async () => {
 	const root = await makeDirectory();
 	let now = Date.parse('2026-08-25T00:00:00.000Z');
@@ -135,12 +245,11 @@ test('expired heartbeat cannot fence out a still-live owner process', async () =
 	await first.dispose();
 });
 
-test('fresh in-progress lock files are not mistaken for stale owners', async () => {
+test('incomplete lock files fail closed even after TTL', async () => {
 	const root = await makeDirectory();
 	const lockPath = join(root, 'worker-owner.lock');
 	await writeFile(lockPath, '', { mode: 0o600 });
-	const metadata = await stat(lockPath);
-	let now = metadata.mtimeMs;
+	let now = Date.now();
 	const blocked = await WorkerOwnerLock.acquire(root, {
 		pid: 202,
 		instanceId: 'blocked-window',
@@ -153,7 +262,7 @@ test('fresh in-progress lock files are not mistaken for stale owners', async () 
 	assert.equal(blocked.isOwner(), false);
 	await blocked.dispose();
 	now += 101;
-	const takeover = await WorkerOwnerLock.acquire(root, {
+	const stillBlocked = await WorkerOwnerLock.acquire(root, {
 		pid: 202,
 		instanceId: 'takeover-window',
 		token: 'takeover-token',
@@ -162,8 +271,8 @@ test('fresh in-progress lock files are not mistaken for stale owners', async () 
 		heartbeatMs: 60_000,
 		pidAlive: () => true,
 	});
-	assert.equal(takeover.isOwner(), true);
-	await takeover.dispose();
+	assert.equal(stillBlocked.isOwner(), false);
+	await stillBlocked.dispose();
 });
 
 test('non-owner window does not read active tasks or touch listener resources', async () => {
@@ -240,7 +349,195 @@ test('non-owner window does not read active tasks or touch listener resources', 
 	await owner.dispose();
 });
 
-test('dynamic configuration search drops stale completions and exposes more than 100 results', async () => {
+test('non-owner rejects peer, coordinator, and workspace mutations without touching state', async () => {
+	const root = await makeDirectory();
+	const owner = await WorkerOwnerLock.acquire(root, {
+		pid: 101,
+		instanceId: 'owner',
+		token: 'owner-token',
+		pidAlive: () => true,
+		heartbeatMs: 60_000,
+	});
+	const nonOwner = await WorkerOwnerLock.acquire(root, {
+		pid: 202,
+		instanceId: 'non-owner',
+		token: 'non-owner-token',
+		pidAlive: () => true,
+		heartbeatMs: 60_000,
+	});
+	const profiles = new InMemoryPeerProfileStore();
+	let transportCalls = 0;
+	const peers = new PeerConnectionManager(
+		deviceId,
+		profiles,
+		new InMemorySecretStore(),
+		{
+			connect: async () => {
+				transportCalls += 1;
+				throw new Error('must not connect');
+			},
+		},
+		{ ownership: nonOwner },
+	);
+	await assert.rejects(peers.restore(), /Another VS Code window/u);
+	await assert.rejects(peers.add('not-a-connection-url'), /Another VS Code window/u);
+	assert.equal(transportCalls, 0);
+	assert.deepStrictEqual(await profiles.list(), []);
+
+	const state = new MemoryState();
+	const leases = new WorkspaceLeaseManager();
+	const registry = new WorkspaceRegistry(
+		state,
+		{ next: () => workspaceId },
+		{ now: () => new Date() },
+		{ resolve: async () => ({ canonicalUri: 'file:///workspace', identity: 'file:1:1' }) },
+		leases,
+	);
+	const workspaces = new WorkspaceService(
+		registry,
+		allowedGuard(),
+		() => [],
+		() => undefined,
+		undefined,
+		() => [],
+		nonOwner,
+	);
+	await assert.rejects(workspaces.registerCurrent(), /Another VS Code window/u);
+	await assert.rejects(workspaces.remove(workspaceId), /Another VS Code window/u);
+	await assert.rejects(workspaces.setEnabled(workspaceId, false), /Another VS Code window/u);
+	assert.deepStrictEqual(await registry.listLocal(), []);
+	assert.equal(leases.owner('file:1:1'), undefined);
+
+	const coordinator = new TaskCoordinator(
+		peers,
+		profiles,
+		state,
+		allowedGuard(),
+		() => taskId,
+		() => new Date(),
+		nonOwner,
+	);
+	await assert.rejects(coordinator.persistDelegationIntent({
+		peerId,
+		workspaceId,
+		title: 'Blocked',
+		prompt: 'Must not persist.',
+		acceptanceCriteria: [],
+	}), (error: unknown) => (
+		typeof error === 'object'
+		&& error !== null
+		&& 'code' in error
+		&& error.code === 'WORKER_DRAINING'
+	));
+	assert.equal(state.get('copilotAgentMesh.delegationIntents'), undefined);
+	await peers.dispose();
+	await nonOwner.dispose();
+	await owner.dispose();
+});
+
+test('non-owner workspace snapshot does not revalidate or write shared state', async () => {
+	const root = await makeDirectory();
+	const owner = await WorkerOwnerLock.acquire(root, {
+		pid: 101,
+		instanceId: 'owner',
+		token: 'owner-token',
+		pidAlive: () => true,
+		heartbeatMs: 60_000,
+	});
+	const nonOwner = await WorkerOwnerLock.acquire(root, {
+		pid: 202,
+		instanceId: 'non-owner',
+		token: 'non-owner-token',
+		pidAlive: () => true,
+		heartbeatMs: 60_000,
+	});
+	const state = new MemoryState();
+	await state.update('copilotAgentMesh.workspaceRegistry', {
+		schemaVersion: 1,
+		workspaces: [{
+			workspaceId,
+			registeredUri: 'file:///registered',
+			localUri: 'file:///old-location',
+			fileIdentity: 'old:identity',
+			name: 'Read only',
+			capabilityTags: [],
+			enabled: true,
+			stale: false,
+			createdAt: '2026-08-25T00:00:00.000Z',
+			updatedAt: '2026-08-25T00:00:00.000Z',
+		}],
+	});
+	state.updateCalls = 0;
+	let identityReads = 0;
+	const registry = new WorkspaceRegistry(
+		state,
+		{ next: () => workspaceId },
+		{ now: () => new Date() },
+		{
+			resolve: async () => {
+				identityReads += 1;
+				return { canonicalUri: 'file:///new-location', identity: 'new:identity' };
+			},
+		},
+		new WorkspaceLeaseManager(),
+	);
+	const service = new WorkspaceService(
+		registry,
+		allowedGuard(),
+		() => [],
+		() => undefined,
+		undefined,
+		() => [],
+		nonOwner,
+	);
+	const snapshot = await service.listLocal();
+	assert.equal(snapshot[0]?.localUri, 'file:///old-location');
+	assert.equal(identityReads, 0);
+	assert.equal(state.updateCalls, 0);
+	await nonOwner.dispose();
+	await owner.dispose();
+});
+
+test('read-only device initialization creates no shared profile state', () => {
+	const state = new MemoryState();
+	const profiles = new DeviceProfileStore(
+		state,
+		{ next: () => deviceId },
+		{ now: () => new Date('2026-08-25T00:00:00.000Z') },
+	);
+	const profile = profiles.getReadOnly({
+		defaultName: 'Transient window',
+		platform: 'darwin',
+		architecture: 'arm64',
+		vscodeVersion: '1.103.0',
+		extensionVersion: '0.0.1',
+	});
+	assert.equal(profile.deviceId, deviceId);
+	assert.equal(state.get('copilotAgentMesh.deviceProfile'), undefined);
+	assert.equal(state.updateCalls, 0);
+});
+
+test('peer profile conditional deletion preserves a replacement generation and refs', async () => {
+	const profiles = new InMemoryPeerProfileStore();
+	await profiles.store({
+		id: peerId,
+		generation: 'new-generation',
+		rpcEndpoint: 'wss://worker.example/rpc',
+		workerDeviceId: deviceId,
+		pairingSecretKeyRef: 'new-secret',
+	});
+	assert.equal(await profiles.delete(peerId, {
+		generation: 'old-generation',
+		pairingSecretKeyRef: 'old-secret',
+	}), false);
+	assert.equal((await profiles.get(peerId))?.generation, 'new-generation');
+	assert.equal(await profiles.delete(peerId, {
+		generation: 'new-generation',
+		pairingSecretKeyRef: 'new-secret',
+	}), true);
+});
+
+test('dynamic configuration launches the latest query while an old completion never resolves', async () => {
 	const picker = new TestQuickPick();
 	const resolver = new VscodeSessionConfigurationResolver(vscodeWithPicker(picker), 1);
 	const requests: Array<{
@@ -265,14 +562,9 @@ test('dynamic configuration search drops stale completions and exposes more than
 		},
 	});
 	await waitFor(() => requests.length === 1);
-	picker.emitValue('old');
-	await new Promise((resolve) => setTimeout(resolve, 3));
 	picker.emitValue('new');
-	await new Promise((resolve) => setTimeout(resolve, 3));
-	assert.equal(requests.length, 1);
-	assert.equal(requests[0]?.signal?.aborted, true);
-	requests[0]?.result.resolve([{ value: 'stale-value', label: 'Stale result' }]);
 	await waitFor(() => requests.length === 2);
+	assert.equal(requests[0]?.signal?.aborted, true);
 	const latest = Array.from({ length: 150 }, (_, index) => ({
 		value: `new-${index}`,
 		label: `New model ${index}`,
@@ -316,12 +608,14 @@ test('closing dynamic configuration search aborts the active completion request'
 
 class MemoryState {
 	private readonly values = new Map<string, unknown>();
+	public updateCalls = 0;
 
 	public get<T>(key: string): T | undefined {
 		return this.values.get(key) as T | undefined;
 	}
 
 	public async update(key: string, value: unknown): Promise<void> {
+		this.updateCalls += 1;
 		this.values.set(key, value);
 	}
 }
@@ -503,4 +797,32 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 		await new Promise((resolve) => setTimeout(resolve, 2));
 	}
 	throw new Error('Condition was not reached.');
+}
+
+interface OwnerRecordInput {
+	readonly pid: number;
+	readonly instanceId: string;
+	readonly token: string;
+	readonly generation: string;
+	readonly at: string;
+}
+
+function ownerRecord(input: OwnerRecordInput) {
+	return {
+		schemaVersion: 1,
+		pid: input.pid,
+		instanceId: input.instanceId,
+		token: input.token,
+		generation: input.generation,
+		acquiredAt: input.at,
+		heartbeatAt: input.at,
+	};
+}
+
+function writeOwnerRecord(root: string, input: OwnerRecordInput): Promise<void> {
+	return writeFile(
+		join(root, 'worker-owner.lock'),
+		JSON.stringify(ownerRecord(input)),
+		{ mode: 0o600 },
+	);
 }

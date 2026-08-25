@@ -24,6 +24,8 @@ import { PeerRpcError } from '../peer/WebSocketPeerTransport';
 import type { TaskToolFacade } from '../tools/taskToolFacade';
 import { TaskToolFacadeError } from '../tools/taskToolFacade';
 import type { LocalDesktopWorkspaceGuard } from './LocalDesktopWorkspaceGuard';
+import { MeshDomainError } from '../domain/errors';
+import type { WorkerOwnership } from '../storage/WorkerOwnerLock';
 
 const delegationStateKey = 'copilotAgentMesh.delegationIntents';
 
@@ -73,6 +75,7 @@ export class TaskCoordinator implements TaskToolFacade {
 		private readonly guard: LocalDesktopWorkspaceGuard,
 		private readonly id: () => string = randomUUID,
 		private readonly now: () => Date = () => new Date(),
+		private readonly ownership?: WorkerOwnership,
 	) {}
 
 	public async listWorkers(signal: AbortSignal): Promise<MeshWorkerDirectorySnapshot> {
@@ -126,6 +129,7 @@ export class TaskCoordinator implements TaskToolFacade {
 	): Promise<PersistedDelegationIntent> {
 		this.guard.assertAllowed({ requireWorkspace: false });
 		return this.mutate(async () => {
+			await this.assertOwner();
 			const requestHash = hashIntent(input);
 			const state = this.read();
 			const existing = state.intents.find((intent) => intent.requestHash === requestHash);
@@ -174,6 +178,7 @@ export class TaskCoordinator implements TaskToolFacade {
 		signal: AbortSignal,
 	): Promise<DelegationAcceptance> {
 		this.guard.assertAllowed({ requireWorkspace: false });
+		await this.assertOwner();
 		const intent = this.read().intents.find((candidate) =>
 			candidate.delegationRequestId === request.delegationRequestId
 			&& candidate.taskId === request.taskId,
@@ -243,6 +248,7 @@ export class TaskCoordinator implements TaskToolFacade {
 		signal: AbortSignal,
 	): Promise<TaskActionReceipt> {
 		this.guard.assertAllowed({ requireWorkspace: false });
+		await this.assertOwner();
 		const intent = this.requireIntentForTask(request.taskId);
 		const value = await rpcRequest(
 			this.requireConnection(intent.peerId).request('task.cancel', { taskId: request.taskId }),
@@ -263,6 +269,7 @@ export class TaskCoordinator implements TaskToolFacade {
 		signal: AbortSignal,
 	): Promise<TaskActionReceipt> {
 		this.guard.assertAllowed({ requireWorkspace: false });
+		await this.assertOwner();
 		const intent = this.requireIntentForTask(request.taskId);
 		const value = await rpcRequest(this.requireConnection(intent.peerId).request('task.answer', {
 			taskId: request.taskId,
@@ -276,6 +283,7 @@ export class TaskCoordinator implements TaskToolFacade {
 	}
 
 	public async startTask(input: DelegationIntentInput, signal: AbortSignal): Promise<PersistedDelegationIntent> {
+		await this.assertOwner();
 		const persisted = await this.persistDelegationIntent(input);
 		await this.waitForDelegationAcceptance(persisted, signal);
 		return persisted;
@@ -339,6 +347,17 @@ export class TaskCoordinator implements TaskToolFacade {
 		const result = this.mutation.then(operation, operation);
 		this.mutation = result.then(() => undefined, () => undefined);
 		return result;
+	}
+
+	private async assertOwner(): Promise<void> {
+		try {
+			await this.ownership?.assertOwner();
+		} catch (error) {
+			if (error instanceof MeshDomainError && error.reason === 'WORKER_DRAINING') {
+				throw new TaskToolFacadeError('WORKER_DRAINING', true);
+			}
+			throw error;
+		}
 	}
 }
 

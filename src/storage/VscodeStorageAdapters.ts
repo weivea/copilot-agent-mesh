@@ -8,7 +8,12 @@ import type {
 	PendingPeerRecord,
 } from '../gateway/PairingService';
 import type { SecretStore } from '../gateway/SecretStore';
-import type { PeerProfile, PeerProfileStore } from '../peer/PeerProfile';
+import {
+	matchesDeleteCondition,
+	type PeerProfile,
+	type PeerProfileDeleteCondition,
+	type PeerProfileStore,
+} from '../peer/PeerProfile';
 import type {
 	DevTunnelStateStore,
 	TunnelMetadata,
@@ -224,10 +229,30 @@ export class VscodePeerProfileStore implements PeerProfileStore {
 		});
 	}
 
-	public delete(id: string): Promise<void> {
+	public storeIfAbsent(profile: PeerProfile): Promise<boolean> {
 		return this.mutate(async () => {
-			const profiles = this.read().filter((profile) => profile.id !== id);
+			const profiles = this.read();
+			if (profiles.some((candidate) => candidate.id === profile.id)) {
+				return false;
+			}
+			await this.state.update(peerProfilesKey, {
+				schemaVersion: 1,
+				profiles: [...profiles, structuredClone(profile)],
+			});
+			return true;
+		});
+	}
+
+	public delete(id: string, expected?: PeerProfileDeleteCondition): Promise<boolean> {
+		return this.mutate(async () => {
+			const current = this.read();
+			const profile = current.find((candidate) => candidate.id === id);
+			if (profile === undefined || !matchesDeleteCondition(profile, expected)) {
+				return false;
+			}
+			const profiles = current.filter((candidate) => candidate.id !== id);
 			await this.state.update(peerProfilesKey, { schemaVersion: 1, profiles });
+			return true;
 		});
 	}
 
@@ -242,7 +267,7 @@ export class VscodePeerProfileStore implements PeerProfileStore {
 		return structuredClone(value.profiles);
 	}
 
-	private mutate(operation: () => Promise<void>): Promise<void> {
+	private mutate<T>(operation: () => Promise<T>): Promise<T> {
 		const result = this.mutation.then(operation, operation);
 		this.mutation = result.then(() => undefined, () => undefined);
 		return result;

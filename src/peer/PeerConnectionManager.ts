@@ -5,6 +5,7 @@ import { parseConnectionUrl } from './ConnectionUrl';
 import { PeerConnection } from './PeerConnection';
 import type { PeerProfile, PeerProfileStore } from './PeerProfile';
 import type { PeerTransport } from './WebSocketPeerTransport';
+import type { WorkerOwnership } from '../storage/WorkerOwnerLock';
 
 export interface PeerConnectionManagerOptions {
 	readonly reconnectBaseMs?: number;
@@ -12,6 +13,7 @@ export interface PeerConnectionManagerOptions {
 	readonly stableOnlineMs?: number;
 	readonly random?: () => number;
 	readonly id?: () => string;
+	readonly ownership?: WorkerOwnership;
 }
 
 interface ManagedPeer {
@@ -19,6 +21,7 @@ interface ManagedPeer {
 	enabled: boolean;
 	provisional: boolean;
 	readonly pairingSecretKeyRef?: string;
+	readonly profileGeneration?: string;
 	attempt: number;
 	reconnectTimer?: NodeJS.Timeout;
 	stableTimer?: NodeJS.Timeout;
@@ -32,6 +35,7 @@ export class PeerConnectionManager {
 	private readonly stableOnlineMs: number;
 	private readonly random: () => number;
 	private readonly id: () => string;
+	private readonly ownership: WorkerOwnership | undefined;
 	private readonly backgroundFailures: unknown[] = [];
 	private readonly listeners = new Set<() => void>();
 	private readonly notificationListeners = new Set<(
@@ -54,9 +58,13 @@ export class PeerConnectionManager {
 		this.stableOnlineMs = options.stableOnlineMs ?? 30_000;
 		this.random = options.random ?? Math.random;
 		this.id = options.id ?? randomUUID;
+		this.ownership = options.ownership;
 	}
 
-	public add(connectionUrl: string): Promise<PeerConnection> {
+	public async add(connectionUrl: string): Promise<PeerConnection> {
+		if (this.ownership !== undefined) {
+			await this.ownership.assertOwner();
+		}
 		this.assertActive();
 		return this.track(this.addCore(connectionUrl));
 	}
@@ -70,6 +78,7 @@ export class PeerConnectionManager {
 			this.assertActive();
 			const profile: PeerProfile = {
 				id,
+				generation: id,
 				rpcEndpoint: parsed.rpcEndpoint,
 				workerDeviceId: parsed.workerDeviceId,
 				invitationId: parsed.invitationId,
@@ -77,7 +86,7 @@ export class PeerConnectionManager {
 			};
 			await this.profiles.store(profile);
 			this.assertActive();
-			const managed = this.createManaged(id, true, pairingSecretKeyRef);
+			const managed = this.createManaged(id, true, pairingSecretKeyRef, profile.generation);
 			this.peers.set(id, managed);
 			await managed.connection.connect();
 			this.assertActive();
@@ -86,12 +95,12 @@ export class PeerConnectionManager {
 			return managed.connection;
 		} catch (error: unknown) {
 			if (this.disposed || !this.peers.has(id)) {
-				await this.rollbackAddedPeer(id, pairingSecretKeyRef);
+				await this.rollbackAddedPeer(id, pairingSecretKeyRef, id);
 			} else {
 				const managed = this.peers.get(id);
 				const state = managed?.connection.snapshot().state;
 				if (state === 'authFailed' || state === 'incompatible') {
-					await this.rollbackAddedPeer(id, pairingSecretKeyRef);
+					await this.rollbackAddedPeer(id, pairingSecretKeyRef, id);
 				} else if (state === 'offline' && managed !== undefined) {
 					this.scheduleReconnect(managed);
 				}
@@ -100,7 +109,10 @@ export class PeerConnectionManager {
 		}
 	}
 
-	public restore(): Promise<void> {
+	public async restore(): Promise<void> {
+		if (this.ownership !== undefined) {
+			await this.ownership.assertOwner();
+		}
 		this.assertActive();
 		return this.track(this.restoreCore());
 	}
@@ -113,7 +125,12 @@ export class PeerConnectionManager {
 			if (this.peers.has(profile.id)) {
 				continue;
 			}
-			const managed = this.createManaged(profile.id, isProvisionalProfile(profile));
+			const managed = this.createManaged(
+				profile.id,
+				isProvisionalProfile(profile),
+				profile.pairingSecretKeyRef,
+				profile.generation,
+			);
 			this.assertActive();
 			this.peers.set(profile.id, managed);
 			this.launchTryConnect(managed);
@@ -148,7 +165,10 @@ export class PeerConnectionManager {
 		return () => this.notificationListeners.delete(listener);
 	}
 
-	public connect(profileId: string): Promise<void> {
+	public async connect(profileId: string): Promise<void> {
+		if (this.ownership !== undefined) {
+			await this.ownership.assertOwner();
+		}
 		this.assertActive();
 		return this.track(this.connectCore(profileId));
 	}
@@ -168,6 +188,9 @@ export class PeerConnectionManager {
 	}
 
 	public async disconnect(profileId: string): Promise<void> {
+		if (this.ownership !== undefined) {
+			await this.ownership.assertOwner();
+		}
 		const managed = this.peers.get(profileId);
 		if (managed === undefined) {
 			return;
@@ -178,6 +201,9 @@ export class PeerConnectionManager {
 	}
 
 	public async remove(profileId: string): Promise<void> {
+		if (this.ownership !== undefined) {
+			await this.ownership.assertOwner();
+		}
 		const managed = this.peers.get(profileId);
 		if (managed !== undefined) {
 			managed.enabled = false;
@@ -187,16 +213,30 @@ export class PeerConnectionManager {
 		}
 		const profile = await this.profiles.get(profileId);
 		if (profile !== undefined) {
-			if (profile.pairingSecretKeyRef !== undefined) {
-				await this.secrets.delete(profile.pairingSecretKeyRef);
+			const deleted = await this.profiles.delete(profileId, deleteCondition(profile));
+			if (deleted === false) {
+				return;
 			}
-			if (profile.credentialKeyRef !== undefined) {
-				await this.secrets.delete(profile.credentialKeyRef);
+			let secretCleanupSucceeded = false;
+			try {
+				if (profile.pairingSecretKeyRef !== undefined) {
+					await this.secrets.delete(profile.pairingSecretKeyRef);
+					secretCleanupSucceeded = true;
+				}
+				if (profile.credentialKeyRef !== undefined) {
+					await this.secrets.delete(profile.credentialKeyRef);
+					secretCleanupSucceeded = true;
+				}
+				if (profile.pendingCommitProofKeyRef !== undefined) {
+					await this.secrets.delete(profile.pendingCommitProofKeyRef);
+					secretCleanupSucceeded = true;
+				}
+			} catch (error) {
+				if (!secretCleanupSucceeded) {
+					await this.profiles.storeIfAbsent?.(profile);
+				}
+				throw error;
 			}
-			if (profile.pendingCommitProofKeyRef !== undefined) {
-				await this.secrets.delete(profile.pendingCommitProofKeyRef);
-			}
-			await this.profiles.delete(profileId);
 		}
 	}
 
@@ -228,6 +268,7 @@ export class PeerConnectionManager {
 		profileId: string,
 		provisional = false,
 		pairingSecretKeyRef?: string,
+		profileGeneration?: string,
 	): ManagedPeer {
 		let managed: ManagedPeer;
 		const connection = new PeerConnection(
@@ -243,6 +284,7 @@ export class PeerConnectionManager {
 			enabled: true,
 			provisional,
 			pairingSecretKeyRef,
+			profileGeneration,
 			attempt: 0,
 		};
 		connection.onStateChanged((snapshot) => {
@@ -279,13 +321,23 @@ export class PeerConnectionManager {
 		if (concurrentlyCreated !== undefined) {
 			return concurrentlyCreated;
 		}
-		const managed = this.createManaged(profileId, isProvisionalProfile(profile));
+		const managed = this.createManaged(
+			profileId,
+			isProvisionalProfile(profile),
+			profile.pairingSecretKeyRef,
+			profile.generation,
+		);
 		this.peers.set(profileId, managed);
 		return managed;
 	}
 
 	private scheduleReconnect(managed: ManagedPeer): void {
-		if (!managed.enabled || this.disposed || managed.reconnectTimer !== undefined) {
+		if (
+			!managed.enabled
+			|| this.disposed
+			|| managed.reconnectTimer !== undefined
+			|| this.ownership?.isOwner() === false
+		) {
 			return;
 		}
 		if (managed.stableTimer !== undefined) {
@@ -315,6 +367,9 @@ export class PeerConnectionManager {
 		if (!managed.enabled || this.disposed) {
 			return;
 		}
+		if (this.ownership !== undefined) {
+			await this.ownership.assertOwner();
+		}
 		try {
 			await managed.connection.connect();
 			managed.provisional = false;
@@ -328,6 +383,7 @@ export class PeerConnectionManager {
 				await this.rollbackAddedPeer(
 					managed.connection.profileId,
 					managed.pairingSecretKeyRef,
+					managed.profileGeneration,
 				);
 			}
 		}
@@ -379,7 +435,11 @@ export class PeerConnectionManager {
 		await Promise.all(disconnects);
 	}
 
-	private async rollbackAddedPeer(id: string, pairingSecretKeyRef?: string): Promise<void> {
+	private async rollbackAddedPeer(
+		id: string,
+		pairingSecretKeyRef?: string,
+		profileGeneration?: string,
+	): Promise<void> {
 		let cleanupFailed = false;
 		const cleanup = async (operation: () => Promise<unknown>): Promise<void> => {
 			try {
@@ -389,7 +449,7 @@ export class PeerConnectionManager {
 			}
 		};
 		const managed = this.peers.get(id);
-		if (managed !== undefined) {
+		if (managed !== undefined && managed.profileGeneration === profileGeneration) {
 			managed.enabled = false;
 			this.clearTimers(managed);
 			await cleanup(() => managed.connection.disconnect());
@@ -401,23 +461,50 @@ export class PeerConnectionManager {
 		} catch {
 			cleanupFailed = true;
 		}
-		if (pairingSecretKeyRef !== undefined) {
-			await cleanup(() => this.secrets.delete(pairingSecretKeyRef));
+		if (
+			profile !== undefined
+			&& (
+				profile.generation !== profileGeneration
+				|| profile.pairingSecretKeyRef !== pairingSecretKeyRef
+			)
+		) {
+			if (cleanupFailed) {
+				throw new Error('Failed to completely roll back the peer profile.');
+			}
+			return;
 		}
+		let claimedProfile = profile === undefined;
 		if (profile !== undefined) {
+			try {
+				claimedProfile = await this.profiles.delete(id, deleteCondition(profile)) !== false;
+			} catch {
+				cleanupFailed = true;
+				claimedProfile = false;
+			}
+		}
+		if (claimedProfile) {
+			let secretCleanupFailed = false;
+			let secretCleanupSucceeded = false;
 			const secretRefs = new Set([
+				pairingSecretKeyRef,
 				profile?.pairingSecretKeyRef,
 				profile?.credentialKeyRef,
 				profile?.pendingCommitProofKeyRef,
 			]);
 			for (const secretRef of secretRefs) {
-				if (secretRef !== undefined && secretRef !== pairingSecretKeyRef) {
-					await cleanup(() => this.secrets.delete(secretRef));
+				if (secretRef !== undefined) {
+					try {
+						await this.secrets.delete(secretRef);
+						secretCleanupSucceeded = true;
+					} catch {
+						cleanupFailed = true;
+						secretCleanupFailed = true;
+					}
 				}
 			}
-		}
-		if (!cleanupFailed) {
-			await cleanup(() => this.profiles.delete(id));
+			if (secretCleanupFailed && !secretCleanupSucceeded && profile !== undefined) {
+				await cleanup(() => this.profiles.storeIfAbsent?.(profile) ?? Promise.resolve(false));
+			}
 		}
 		if (cleanupFailed) {
 			throw new Error('Failed to completely roll back the peer profile.');
@@ -434,4 +521,13 @@ export class PeerConnectionManager {
 
 function isProvisionalProfile(profile: PeerProfile): boolean {
 	return profile.invitationId !== undefined || profile.pendingEnrollmentId !== undefined;
+}
+
+function deleteCondition(profile: PeerProfile) {
+	return {
+		generation: profile.generation,
+		pairingSecretKeyRef: profile.pairingSecretKeyRef,
+		credentialKeyRef: profile.credentialKeyRef,
+		pendingCommitProofKeyRef: profile.pendingCommitProofKeyRef,
+	};
 }
