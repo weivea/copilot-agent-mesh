@@ -11,7 +11,7 @@ import type {
 } from '../../shared/toolProtocol';
 import { TaskToolFacade, TaskToolFacadeError } from '../tools/taskToolFacade';
 import {
-	fitToolResultToTokenBudget,
+	serializeToolResultToTokenBudget,
 	TaskToolsCore,
 	ToolCancellation,
 	ToolClock,
@@ -168,6 +168,94 @@ suite('TaskToolsCore', () => {
 		assert.ok((result.events as readonly unknown[]).length < 10);
 	});
 
+	test('progressively bounds maximum pending input while preserving the answer contract', async () => {
+		const facade = new RecordingFacade();
+		facade.taskRead = {
+			snapshot: {
+				taskId: 'task-1',
+				status: 'needsInput',
+				title: 'Fix scheduler',
+				updatedAt: '2026-08-25T00:00:00.000Z',
+				validation: {
+					status: 'failed',
+					summary: 'v'.repeat(16 * 1024),
+				},
+				pendingInput: {
+					inputId: 'input-1',
+					prompt: 'p'.repeat(16 * 1024),
+					choices: Array.from({ length: 32 }, (_, index) => `${index}-${'c'.repeat(4_090)}`),
+				},
+			},
+			eventCursor: 0,
+			events: [],
+			truncated: false,
+		};
+		const core = new TaskToolsCore(facade, { outputByteLimit: 1_024 });
+
+		const result = await core.getTask({ taskId: 'task-1' });
+		const snapshot = result.snapshot as Record<string, unknown>;
+		const pendingInput = snapshot.pendingInput as Record<string, unknown>;
+		const validation = snapshot.validation as Record<string, unknown>;
+
+		assert.equal(result.status, 'ok');
+		assert.equal(result.truncated, true);
+		assert.equal(snapshot.taskId, 'task-1');
+		assert.equal(pendingInput.inputId, 'input-1');
+		assert.equal(result.answerTool, MESH_TOOL_NAMES.answerTask);
+		assert.equal(validation.status, 'failed');
+		assert.ok(typeof pendingInput.prompt === 'string' && pendingInput.prompt.length > 0);
+		assert.ok(
+			pendingInput.choices === undefined
+			|| (pendingInput.choices as readonly unknown[]).length < 32,
+		);
+		assert.ok(Buffer.byteLength(JSON.stringify(result), 'utf8') <= 1_024);
+	});
+
+	test('preserves maximum-length task and input IDs at the minimum output budget', async () => {
+		const facade = new RecordingFacade();
+		const taskId = 't'.repeat(128);
+		const inputId = 'i'.repeat(128);
+		facade.taskRead = {
+			snapshot: {
+				taskId,
+				status: 'needsInput',
+				title: 'n'.repeat(256),
+				updatedAt: '2026-08-25T00:00:00.000Z',
+				phase: 'p'.repeat(256),
+				summary: 's'.repeat(16 * 1024),
+				validation: {
+					status: 'failed',
+					summary: 'v'.repeat(16 * 1024),
+				},
+				artifacts: Array.from({ length: 32 }, (_, index) => ({
+					artifactId: `artifact-${index}`,
+					label: 'a'.repeat(512),
+				})),
+				pendingInput: {
+					inputId,
+					prompt: 'q'.repeat(16 * 1024),
+					choices: Array.from({ length: 32 }, () => 'c'.repeat(4 * 1024)),
+				},
+			},
+			eventCursor: 0,
+			events: [],
+			truncated: false,
+		};
+		const core = new TaskToolsCore(facade, { outputByteLimit: 1_024 });
+
+		const result = await core.getTask({ taskId });
+		const snapshot = result.snapshot as Record<string, unknown>;
+		const pendingInput = snapshot.pendingInput as Record<string, unknown>;
+
+		assert.equal(result.status, 'ok');
+		assert.equal(result.truncated, true);
+		assert.equal(snapshot.taskId, taskId);
+		assert.equal(pendingInput.inputId, inputId);
+		assert.equal(result.answerTool, MESH_TOOL_NAMES.answerTask);
+		assert.ok(typeof pendingInput.prompt === 'string' && pendingInput.prompt.length > 0);
+		assert.ok(Buffer.byteLength(JSON.stringify(result), 'utf8') <= 1_024);
+	});
+
 	test('cancel and answer use owner-scoped Facade methods', async () => {
 		const facade = new RecordingFacade();
 		const core = new TaskToolsCore(facade);
@@ -293,12 +381,51 @@ suite('TaskToolsCore', () => {
 		};
 		const countTokens = async (text: string): Promise<number> => text.length;
 
-		const fitted = await fitToolResultToTokenBudget(result, 220, countTokens);
+		const serialized = await serializeToolResultToTokenBudget(result, 220, countTokens);
+		const fitted = JSON.parse(serialized) as Record<string, unknown>;
 
 		assert.equal(fitted.status, 'ok');
 		assert.equal(fitted.truncated, true);
 		assert.ok((fitted.events as readonly unknown[]).length < result.events.length);
-		assert.ok(await countTokens(JSON.stringify(fitted)) <= 220);
+		assert.ok(await countTokens(serialized) <= 220);
+	});
+
+	test('returns no over-budget fallback for zero, one, and exact-boundary budgets', async () => {
+		const result = { status: 'ok', taskId: 'task-1' };
+		const expected = JSON.stringify(result);
+		const countTokens = async (text: string): Promise<number> => text.length;
+
+		const zero = await serializeToolResultToTokenBudget(result, 0, countTokens);
+		const one = await serializeToolResultToTokenBudget(result, 1, countTokens);
+		const boundary = await serializeToolResultToTokenBudget(result, expected.length, countTokens);
+
+		assert.equal(zero, '');
+		assert.equal(one, '');
+		assert.equal(boundary, expected);
+		assert.ok(await countTokens(zero) <= 0);
+		assert.ok(await countTokens(one) <= 1);
+		assert.equal(await countTokens(boundary), expected.length);
+	});
+
+	test('disposes deadline timers after success, failure, cancellation, and concurrent calls', async () => {
+		const clock = new ManualClock();
+		const facade = new RecordingFacade();
+		const core = new TaskToolsCore(facade, { clock });
+
+		await Promise.all(Array.from({ length: 20 }, () => core.listWorkers({})));
+		facade.listError = new TaskToolFacadeError('RATE_LIMITED', true);
+		await core.listWorkers({});
+		facade.listError = undefined;
+		facade.acceptance = new Promise(() => undefined);
+		const cancellation = new ManualCancellation();
+		const cancelled = core.delegateTask(delegationInput(), cancellation);
+		await Promise.resolve();
+		await Promise.resolve();
+		cancellation.cancel();
+		await cancelled;
+
+		assert.equal(clock.activeTimers, 0);
+		assert.equal(clock.createdTimers, clock.disposedTimers);
 	});
 });
 
@@ -434,17 +561,40 @@ class RecordingFacade implements TaskToolFacade {
 
 class ManualClock implements ToolClock {
 	private now = 0;
-	private readonly sleepers: Array<{ dueAt: number; resolve: () => void }> = [];
+	private readonly sleepers: Array<{ dueAt: number; resolve: () => void; disposed: boolean }> = [];
+	activeTimers = 0;
+	createdTimers = 0;
+	disposedTimers = 0;
 
-	sleep(delayMs: number): Promise<void> {
-		return new Promise((resolve) => {
-			this.sleepers.push({ dueAt: this.now + delayMs, resolve });
+	createTimer(delayMs: number): { readonly promise: Promise<void>; dispose(): void } {
+		let resolveTimer: (() => void) | undefined;
+		const sleeper = {
+			dueAt: this.now + delayMs,
+			resolve: () => resolveTimer?.(),
+			disposed: false,
+		};
+		const promise = new Promise<void>((resolve) => {
+			resolveTimer = resolve;
 		});
+		this.sleepers.push(sleeper);
+		this.activeTimers += 1;
+		this.createdTimers += 1;
+		return {
+			promise,
+			dispose: () => {
+				if (!sleeper.disposed) {
+					sleeper.disposed = true;
+					this.activeTimers -= 1;
+					this.disposedTimers += 1;
+				}
+				resolveTimer = undefined;
+			},
+		};
 	}
 
 	advanceBy(delayMs: number): void {
 		this.now += delayMs;
-		const ready = this.sleepers.filter(({ dueAt }) => dueAt <= this.now);
+		const ready = this.sleepers.filter(({ dueAt, disposed }) => !disposed && dueAt <= this.now);
 		for (const sleeper of ready) {
 			this.sleepers.splice(this.sleepers.indexOf(sleeper), 1);
 			sleeper.resolve();

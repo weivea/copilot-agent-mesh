@@ -28,7 +28,8 @@ inside one `LanguageModelTextPart`; list and get results truncate bounded data
 rather than returning raw transcripts. When VS Code supplies
 `tokenizationOptions`, the adapter uses its model-specific `countTokens`
 function and shrinks events, worker lists, and optional snapshot fields to the
-actual token budget.
+actual token budget. If even the smallest JSON result does not fit, the adapter
+returns an empty `LanguageModelTextPart` rather than exceeding the budget.
 
 Cancelling a `CancellationToken` aborts only the current Tool wait. In
 particular, delegate cancellation or acknowledgement timeout does not call the
@@ -76,3 +77,19 @@ Copy the five objects exported as `MESH_TOOL_MANIFEST_DESCRIPTORS` into
 calling `registerMeshTaskTools(facade)` during activation. The exported
 `assertMeshToolNameParity` and `getMeshColdActivationContract` helpers support
 manifest/runtime parity and cold implicit activation tests.
+
+`applyMeshToolManifestDescriptors(packageJson)` returns a mechanically updated
+manifest that preserves unrelated tools, replaces stale production entries,
+and removes the Phase 0 `mesh_spike_echo` descriptor.
+`verifyMeshToolManifestDescriptors(packageJson)` reports missing/mismatched
+production descriptors and whether the legacy spike is still present.
+
+### Phase 0 spike migration
+
+The `66b2954` baseline still imports and registers `registerMeshSpikeEchoTool`
+from `src/extension.ts` and contributes `mesh_spike_echo` from `package.json`.
+The parent integration must remove both legacy registration points when it
+installs the five production descriptors and calls
+`registerMeshTaskTools(realFacade)`. Do not register the spike alongside the
+production tools: it owns an in-memory simulated task lifecycle and is retained
+only as isolated Phase 0 evidence under the spike-specific source and docs.

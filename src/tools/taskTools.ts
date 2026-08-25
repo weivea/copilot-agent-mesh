@@ -4,8 +4,8 @@ import {
 	AnswerTaskInput,
 	CancelTaskInput,
 	DelegateTaskInput,
-	fitToolResultToTokenBudget,
 	GetTaskInput,
+	serializeToolResultToTokenBudget,
 	TaskToolsCore,
 	TaskToolsCoreOptions,
 	ToolJsonResult,
@@ -35,11 +35,11 @@ abstract class TaskToolBase {
 		options?: vscode.LanguageModelToolInvocationOptions<unknown>,
 	): Promise<vscode.LanguageModelToolResult> {
 		const tokenization = options?.tokenizationOptions;
-		const fitted = tokenization === undefined
-			? value
-			: await fitToolResultToTokenBudget(value, tokenization.tokenBudget, tokenization.countTokens);
+		const serialized = tokenization === undefined
+			? JSON.stringify(value)
+			: await serializeToolResultToTokenBudget(value, tokenization.tokenBudget, tokenization.countTokens);
 		return new vscode.LanguageModelToolResult([
-			new vscode.LanguageModelTextPart(JSON.stringify(fitted)),
+			new vscode.LanguageModelTextPart(serialized),
 		]);
 	}
 
@@ -53,7 +53,7 @@ abstract class TaskToolBase {
 				message: 'The mesh operation failed without a safe diagnostic.',
 				retryable: false,
 			},
-		});
+		}, options);
 	}
 }
 

@@ -24,7 +24,12 @@ export interface ToolCancellation {
 }
 
 export interface ToolClock {
-	sleep(delayMs: number): Promise<void>;
+	createTimer(delayMs: number): ToolDeadlineTimer;
+}
+
+export interface ToolDeadlineTimer {
+	readonly promise: Promise<void>;
+	dispose(): void;
 }
 
 export interface DelegateTaskInput {
@@ -87,7 +92,21 @@ interface OperationTimedOut {
 type OperationOutcome<T> = OperationSuccess<T> | OperationFailure | OperationCancelled | OperationTimedOut;
 
 const systemClock: ToolClock = {
-	sleep: (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
+	createTimer: (delayMs) => {
+		let handle: NodeJS.Timeout | undefined;
+		const promise = new Promise<void>((resolve) => {
+			handle = setTimeout(resolve, delayMs);
+		});
+		return {
+			promise,
+			dispose: () => {
+				if (handle !== undefined) {
+					clearTimeout(handle);
+					handle = undefined;
+				}
+			},
+		};
+	},
 };
 
 const neverCancelled: ToolCancellation = {
@@ -342,6 +361,7 @@ export class TaskToolsCore {
 			signalCancellation = () => resolve({ kind: 'cancelled' });
 		});
 		const subscription = cancellation.onCancellationRequested(() => signalCancellation?.());
+		const deadline = this.clock.createTimer(deadlineMs);
 		const operationPromise = Promise.resolve()
 			.then(() => operation(abortController.signal))
 			.then<OperationOutcome<T>, OperationOutcome<T>>(
@@ -352,7 +372,7 @@ export class TaskToolsCore {
 		try {
 			const outcome = await Promise.race([
 				operationPromise,
-				this.clock.sleep(deadlineMs).then<OperationTimedOut>(() => ({ kind: 'timeout' })),
+				deadline.promise.then<OperationTimedOut>(() => ({ kind: 'timeout' })),
 				cancellationPromise,
 			]);
 			if (outcome.kind !== 'success' && outcome.kind !== 'failure') {
@@ -360,6 +380,7 @@ export class TaskToolsCore {
 			}
 			return outcome;
 		} finally {
+			deadline.dispose();
 			subscription.dispose();
 			signalCancellation = undefined;
 		}
@@ -567,13 +588,33 @@ export class TaskToolsCore {
 			eventCursor: number;
 			events: TaskToolEvent[];
 			eventGap?: TaskToolReadResult['eventGap'];
+			answerTool?: typeof MESH_TOOL_NAMES.answerTask;
 			truncated: boolean;
 		} = {
 			status: 'ok',
-			snapshot: { ...read.snapshot },
+			snapshot: {
+				...read.snapshot,
+				...(read.snapshot.validation === undefined
+					? {}
+					: { validation: { ...read.snapshot.validation } }),
+				...(read.snapshot.artifacts === undefined
+					? {}
+					: { artifacts: read.snapshot.artifacts.map((artifact) => ({ ...artifact })) }),
+				...(read.snapshot.pendingInput === undefined
+					? {}
+					: {
+						pendingInput: {
+							...read.snapshot.pendingInput,
+							...(read.snapshot.pendingInput.choices === undefined
+								? {}
+								: { choices: [...read.snapshot.pendingInput.choices] }),
+						},
+					}),
+			},
 			eventCursor: read.eventCursor,
 			events: read.events.map((event) => ({ ...event })),
 			...(read.eventGap === undefined ? {} : { eventGap: { ...read.eventGap } }),
+			...(read.snapshot.pendingInput === undefined ? {} : { answerTool: MESH_TOOL_NAMES.answerTask }),
 			truncated: read.truncated,
 		};
 
@@ -581,12 +622,120 @@ export class TaskToolsCore {
 			result.events.shift();
 			result.truncated = true;
 		}
-		if (utf8JsonBytes(result) > this.outputByteLimit && result.snapshot.artifacts !== undefined) {
-			result.snapshot = { ...result.snapshot, artifacts: [] };
+		while (
+			utf8JsonBytes(result) > this.outputByteLimit
+			&& result.snapshot.artifacts !== undefined
+			&& result.snapshot.artifacts.length > 0
+		) {
+			result.snapshot = {
+				...result.snapshot,
+				artifacts: result.snapshot.artifacts.slice(0, -1),
+			};
 			result.truncated = true;
 		}
-		if (utf8JsonBytes(result) > this.outputByteLimit && result.snapshot.summary !== undefined) {
-			result.snapshot = { ...result.snapshot, summary: boundedUtf8(result.snapshot.summary, 256) };
+		if (
+			utf8JsonBytes(result) > this.outputByteLimit
+			&& result.snapshot.artifacts !== undefined
+		) {
+			const { artifacts: _artifacts, ...withoutArtifacts } = result.snapshot;
+			result.snapshot = withoutArtifacts;
+			result.truncated = true;
+		}
+		while (
+			utf8JsonBytes(result) > this.outputByteLimit
+			&& result.snapshot.summary !== undefined
+			&& Buffer.byteLength(result.snapshot.summary, 'utf8') > 32
+		) {
+			result.snapshot = {
+				...result.snapshot,
+				summary: halveUtf8(result.snapshot.summary, 32),
+			};
+			result.truncated = true;
+		}
+		if (
+			utf8JsonBytes(result) > this.outputByteLimit
+			&& result.snapshot.summary !== undefined
+		) {
+			const { summary: _summary, ...withoutSummary } = result.snapshot;
+			result.snapshot = withoutSummary;
+			result.truncated = true;
+		}
+		if (
+			utf8JsonBytes(result) > this.outputByteLimit
+			&& result.snapshot.phase !== undefined
+		) {
+			const { phase: _phase, ...withoutPhase } = result.snapshot;
+			result.snapshot = withoutPhase;
+			result.truncated = true;
+		}
+		while (
+			utf8JsonBytes(result) > this.outputByteLimit
+			&& Buffer.byteLength(result.snapshot.title, 'utf8') > 1
+		) {
+			result.snapshot = {
+				...result.snapshot,
+				title: halveUtf8(result.snapshot.title, 1),
+			};
+			result.truncated = true;
+		}
+		while (
+			utf8JsonBytes(result) > this.outputByteLimit
+			&& result.snapshot.validation?.summary !== undefined
+		) {
+			const validationSummary = result.snapshot.validation.summary;
+			result.snapshot = {
+				...result.snapshot,
+				validation: Buffer.byteLength(validationSummary, 'utf8') > 128
+					? { ...result.snapshot.validation, summary: halveUtf8(validationSummary, 128) }
+					: { status: result.snapshot.validation.status },
+			};
+			result.truncated = true;
+		}
+		while (
+			utf8JsonBytes(result) > this.outputByteLimit
+			&& result.snapshot.pendingInput?.choices !== undefined
+			&& result.snapshot.pendingInput.choices.length > 0
+		) {
+			result.snapshot = {
+				...result.snapshot,
+				pendingInput: {
+					...result.snapshot.pendingInput,
+					choices: result.snapshot.pendingInput.choices.slice(0, -1),
+				},
+			};
+			result.truncated = true;
+		}
+		if (
+			utf8JsonBytes(result) > this.outputByteLimit
+			&& result.snapshot.pendingInput?.choices !== undefined
+		) {
+			const { choices: _choices, ...withoutChoices } = result.snapshot.pendingInput;
+			result.snapshot = {
+				...result.snapshot,
+				pendingInput: withoutChoices,
+			};
+			result.truncated = true;
+		}
+		while (
+			utf8JsonBytes(result) > this.outputByteLimit
+			&& result.snapshot.pendingInput !== undefined
+			&& Buffer.byteLength(result.snapshot.pendingInput.prompt, 'utf8') > 1
+		) {
+			result.snapshot = {
+				...result.snapshot,
+				pendingInput: {
+					...result.snapshot.pendingInput,
+					prompt: halveUtf8(result.snapshot.pendingInput.prompt, 1),
+				},
+			};
+			result.truncated = true;
+		}
+		if (
+			utf8JsonBytes(result) > this.outputByteLimit
+			&& result.snapshot.validation !== undefined
+		) {
+			const { validation: _validation, ...withoutValidation } = result.snapshot;
+			result.snapshot = withoutValidation;
 			result.truncated = true;
 		}
 		return this.fitResult(result);
@@ -681,28 +830,35 @@ export function parseAnswerTaskInput(value: unknown): AnswerTaskInput {
 	};
 }
 
-export async function fitToolResultToTokenBudget(
+export async function serializeToolResultToTokenBudget(
 	value: ToolJsonResult,
 	tokenBudget: number,
 	countTokens: (text: string) => PromiseLike<number>,
-): Promise<ToolJsonResult> {
-	if (!Number.isSafeInteger(tokenBudget) || tokenBudget < 1) {
-		return { status: 'error', error: { code: 'OUTPUT_TOO_LARGE' } };
-	}
-
+): Promise<string> {
+	const normalizedBudget = Number.isSafeInteger(tokenBudget) && tokenBudget >= 0 ? tokenBudget : 0;
 	let candidate = value;
-	while (await countTokens(JSON.stringify(candidate)) > tokenBudget) {
+	let serialized = JSON.stringify(candidate);
+	while (await countTokens(serialized) > normalizedBudget) {
 		const smaller = shrinkToolResult(candidate);
 		if (smaller === undefined) {
-			const fallback = { status: 'error', error: { code: 'OUTPUT_TOO_LARGE' } };
-			if (await countTokens(JSON.stringify(fallback)) <= tokenBudget) {
-				return fallback;
+			for (const fallback of [
+				'{"status":"error","error":{"code":"OUTPUT_TOO_LARGE"}}',
+				'{"status":"error"}',
+				'{}',
+				'',
+			]) {
+				if (await countTokens(fallback) <= normalizedBudget) {
+					return fallback;
+				}
 			}
-			return { status: 'error' };
+			await countTokens('');
+			return '';
 		}
 		candidate = smaller;
+		serialized = JSON.stringify(candidate);
 	}
-	return candidate;
+	await countTokens(serialized);
+	return serialized;
 }
 
 function parseWorkerDirectory(value: unknown): MeshWorkerDirectorySnapshot {
@@ -969,6 +1125,11 @@ function boundedUtf8(value: string, maxBytes: number): string {
 	return value.slice(0, end);
 }
 
+function halveUtf8(value: string, minimumBytes: number): string {
+	const currentBytes = Buffer.byteLength(value, 'utf8');
+	return boundedUtf8(value, Math.max(minimumBytes, Math.floor(currentBytes / 2)));
+}
+
 function shrinkToolResult(value: ToolJsonResult): ToolJsonResult | undefined {
 	if (Array.isArray(value.events) && value.events.length > 0) {
 		return {
@@ -994,9 +1155,39 @@ function shrinkToolResult(value: ToolJsonResult): ToolJsonResult | undefined {
 			const { artifacts: _artifacts, ...withoutArtifacts } = snapshot;
 			return { ...value, snapshot: withoutArtifacts, truncated: true };
 		}
-		if (snapshot.pendingInput !== undefined) {
-			const { pendingInput: _pendingInput, ...withoutPendingInput } = snapshot;
-			return { ...value, snapshot: withoutPendingInput, truncated: true };
+		if (isRecord(snapshot.validation) && snapshot.validation.summary !== undefined) {
+			const { summary: _summary, ...compactValidation } = snapshot.validation;
+			return {
+				...value,
+				snapshot: { ...snapshot, validation: compactValidation },
+				truncated: true,
+			};
+		}
+		if (isRecord(snapshot.pendingInput)) {
+			const pendingInput = snapshot.pendingInput;
+			if (Array.isArray(pendingInput.choices) && pendingInput.choices.length > 0) {
+				return {
+					...value,
+					snapshot: {
+						...snapshot,
+						pendingInput: { ...pendingInput, choices: pendingInput.choices.slice(0, -1) },
+					},
+					truncated: true,
+				};
+			}
+			if (typeof pendingInput.prompt === 'string' && pendingInput.prompt.length > 1) {
+				return {
+					...value,
+					snapshot: {
+						...snapshot,
+						pendingInput: {
+							...pendingInput,
+							prompt: pendingInput.prompt.slice(0, Math.max(1, Math.floor(pendingInput.prompt.length / 2))),
+						},
+					},
+					truncated: true,
+				};
+			}
 		}
 	}
 	if (isRecord(value.error) && (value.error.message !== undefined || value.error.retryable !== undefined)) {

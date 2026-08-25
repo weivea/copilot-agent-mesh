@@ -8,7 +8,7 @@ export const MESH_TOOL_NAMES = {
 
 export type MeshToolName = typeof MESH_TOOL_NAMES[keyof typeof MESH_TOOL_NAMES];
 
-interface ToolManifestDescriptor {
+export interface ToolManifestDescriptor {
 	readonly name: MeshToolName;
 	readonly displayName: string;
 	readonly toolReferenceName: string;
@@ -108,7 +108,7 @@ export const MESH_TOOL_MANIFEST_DESCRIPTORS: readonly ToolManifestDescriptor[] =
 		displayName: 'Answer Mesh Task',
 		toolReferenceName: 'meshAnswerTask',
 		canBeReferencedInPrompt: true,
-		modelDescription: 'Answers a pending question or approval request for a task owned by this coordinator. Requires the exact task, input, and answer IDs from mesh_get_task.',
+		modelDescription: 'Answers a pending question or approval request for a task owned by this coordinator. Use the exact task and input IDs from mesh_get_task plus a stable caller-generated answer ID for idempotent retries.',
 		userDescription: 'Send an answer to a delegated task that is waiting for input.',
 		tags: ['copilot-agent-mesh'],
 		inputSchema: {
@@ -126,6 +126,14 @@ export const MESH_TOOL_MANIFEST_DESCRIPTORS: readonly ToolManifestDescriptor[] =
 ] as const;
 
 export const MESH_RUNTIME_TOOL_NAMES: readonly MeshToolName[] = Object.values(MESH_TOOL_NAMES);
+export const LEGACY_MESH_SPIKE_TOOL_NAME = 'mesh_spike_echo';
+
+export interface MeshManifestIntegrationVerification {
+	readonly integrated: boolean;
+	readonly missingNames: readonly MeshToolName[];
+	readonly mismatchedNames: readonly MeshToolName[];
+	readonly legacySpikePresent: boolean;
+}
 
 export interface MeshColdActivationContract {
 	readonly toolNames: readonly MeshToolName[];
@@ -148,4 +156,79 @@ export function assertMeshToolNameParity(
 	if (JSON.stringify(manifest) !== JSON.stringify(runtime)) {
 		throw new Error('Mesh language model tool manifest/runtime name mismatch.');
 	}
+}
+
+/**
+ * Returns a package manifest with the production descriptors installed.
+ * Existing non-mesh tools are preserved; the Phase 0 spike descriptor and any
+ * stale production descriptors are replaced mechanically.
+ */
+export function applyMeshToolManifestDescriptors(
+	packageManifest: Readonly<Record<string, unknown>>,
+): Readonly<Record<string, unknown>> {
+	const contributes = isRecord(packageManifest.contributes) ? packageManifest.contributes : {};
+	const existing = Array.isArray(contributes.languageModelTools)
+		? contributes.languageModelTools.filter((descriptor) => {
+			if (!isRecord(descriptor) || typeof descriptor.name !== 'string') {
+				return true;
+			}
+			return descriptor.name !== LEGACY_MESH_SPIKE_TOOL_NAME
+				&& !MESH_RUNTIME_TOOL_NAMES.some((name) => name === descriptor.name);
+		})
+		: [];
+	return {
+		...packageManifest,
+		contributes: {
+			...contributes,
+			languageModelTools: [...existing, ...MESH_TOOL_MANIFEST_DESCRIPTORS],
+		},
+	};
+}
+
+export function verifyMeshToolManifestDescriptors(
+	packageManifest: unknown,
+): MeshManifestIntegrationVerification {
+	const manifest = isRecord(packageManifest) ? packageManifest : {};
+	const contributes = isRecord(manifest.contributes) ? manifest.contributes : {};
+	const descriptors = Array.isArray(contributes.languageModelTools)
+		? contributes.languageModelTools.filter(isRecord)
+		: [];
+	const descriptorsByName = new Map(
+		descriptors
+			.filter((descriptor): descriptor is Record<string, unknown> & { name: string } => (
+				typeof descriptor.name === 'string'
+			))
+			.map((descriptor) => [descriptor.name, descriptor]),
+	);
+	const missingNames = MESH_RUNTIME_TOOL_NAMES.filter((name) => !descriptorsByName.has(name));
+	const mismatchedNames = MESH_TOOL_MANIFEST_DESCRIPTORS
+		.filter((expected) => {
+			const actual = descriptorsByName.get(expected.name);
+			return actual !== undefined && canonicalJson(actual) !== canonicalJson(expected);
+		})
+		.map(({ name }) => name);
+	const legacySpikePresent = descriptorsByName.has(LEGACY_MESH_SPIKE_TOOL_NAME);
+	return {
+		integrated: missingNames.length === 0 && mismatchedNames.length === 0 && !legacySpikePresent,
+		missingNames,
+		mismatchedNames,
+		legacySpikePresent,
+	};
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function canonicalJson(value: unknown): string {
+	if (Array.isArray(value)) {
+		return `[${value.map(canonicalJson).join(',')}]`;
+	}
+	if (isRecord(value)) {
+		return `{${Object.keys(value)
+			.sort()
+			.map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+			.join(',')}}`;
+	}
+	return JSON.stringify(value) ?? 'undefined';
 }
