@@ -63,9 +63,10 @@ npm run package:vsix
 `package:vsix` invokes `vsce package --pre-release --no-dependencies`, prints
 `vsce ls`, and verifies the ZIP central directory against an exact allowlist.
 Only the production bundle, media, extension manifest, release documents,
-project notices, and pinned AHP tarball/license are permitted. Source, tests,
-shared TypeScript, build output, test downloads, source maps, credentials, and
-external CLIs are rejected.
+project notices, and the AHP license are permitted. AHP runtime code is already
+in the esbuild output, so its source tarball and every other nested archive are
+rejected alongside source, tests, shared TypeScript, build output, test
+downloads, source maps, credentials, and external CLIs.
 
 Inspect and hash the result independently:
 
@@ -94,8 +95,9 @@ smoke does not create a public tunnel or run a model task.
 
 The `preview-package.yml` matrix runs on Linux, macOS, and Windows. It performs
 clean install, audit, type checking, lint, offline unit/component tests,
-Extension Host tests, package verification, and artifact upload. Linux runs the
-Extension Host under `xvfb`.
+Extension Host tests, package verification, installed-VSIX activation smoke,
+and artifact upload. Linux runs both Extension Host phases under `xvfb`. A smoke
+failure blocks artifact upload on every matrix platform.
 
 Ordinary CI must not run `test:dev-tunnel-real`,
 `test:agent-host-auth-e2e`, or `test:agent-host-success-e2e`. Those tests require

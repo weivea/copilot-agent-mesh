@@ -40,7 +40,6 @@
     "LICENSE",
     "NOTICE",
     "docs/mvp/release.md",
-    "vendor/microsoft-agent-host-protocol-0.8.0.tgz",
     "vendor/microsoft-agent-host-protocol-LICENSE.txt"
   ],
   "capabilities": {

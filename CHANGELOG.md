@@ -11,7 +11,7 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 - Added a reproducible pre-release VSIX pipeline with a positive content allowlist, archive inspection, and isolated-profile activation smoke test.
 - Added Linux, macOS, and Windows offline test/package CI; real Worker E2E remains explicitly opt-in and outside ordinary CI.
 - Documented macOS arm64-only Worker hosting, Coordinator-only platforms, explicit AHP authentication mappings, and the exact user-supplied Dev Tunnel CLI `1.0.2030+fc9273aa0f`.
-- Included runtime dependency notices and the pinned AHP `0.8.0` tarball/license.
+- Included runtime dependency notices and the AHP `0.8.0` MIT license without nesting its already bundled source tarball in the VSIX.
 - Retained the Gate G0 **No-Go** status; this package does not claim full authenticated end-to-end support.
 
 - Scaffolded the TypeScript extension with esbuild.

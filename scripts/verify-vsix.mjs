@@ -19,7 +19,6 @@ const expected = [
 	'extension/media/dashboard.js',
 	'extension/package.json',
 	'extension/readme.md',
-	'extension/vendor/microsoft-agent-host-protocol-0.8.0.tgz',
 	'extension/vendor/microsoft-agent-host-protocol-LICENSE.txt',
 ].sort();
 
@@ -28,6 +27,7 @@ const prohibited = [
 	/\.map$/iu,
 	/(^|\/)(?:\.env(?:\.|$)|credentials?(?:\.|$)|secrets?(?:\.|$))/iu,
 	/(^|\/)(?:devtunnel|code|gh)(?:\.exe)?$/iu,
+	/\.(?:7z|bz2|cab|gz|jar|rar|tar|tgz|vsix|whl|xz|zip)$/iu,
 ];
 
 const unexpected = entries.filter((entry) => !expected.includes(entry));

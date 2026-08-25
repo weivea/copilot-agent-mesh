@@ -46,6 +46,14 @@ jobs:
 
       - run: npm run package:vsix
 
+      - name: Installed VSIX activation smoke (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a npm run smoke:vsix
+
+      - name: Installed VSIX activation smoke
+        if: runner.os != 'Linux'
+        run: npm run smoke:vsix
+
       - uses: actions/upload-artifact@v4
         with:
           name: copilot-agent-mesh-preview-${{ runner.os }}-${{ runner.arch }}
