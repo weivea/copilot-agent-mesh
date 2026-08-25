@@ -141,6 +141,18 @@ export const taskSnapshotSchema = persistedTaskRecordSchema
 	})
 	.extend({
 		deviceId: uuidSchema,
+	})
+	.superRefine((snapshot, context) => {
+		if (
+			utf8ByteLength(JSON.stringify(snapshot.events))
+			> PROTOCOL_LIMITS.taskEventJournalBytes
+		) {
+			context.addIssue({
+				code: 'custom',
+				path: ['events'],
+				message: 'Wire event journal exceeds the reserved task response budget',
+			});
+		}
 	});
 
 export type TaskSnapshot = z.infer<typeof taskSnapshotSchema>;

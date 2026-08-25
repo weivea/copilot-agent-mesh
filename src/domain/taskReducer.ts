@@ -40,7 +40,9 @@ export function taskReducer(record: TaskRecord, event: TaskDomainEvent): TaskRec
 				requireState(record, event, ['startingAgent', 'recovering']),
 				event,
 				{
-					state: 'running',
+					state: record.state === 'recovering' && record.pendingInput !== undefined
+						? 'needsInput'
+						: 'running',
 					recoveryDescriptor: event.recoveryDescriptor ?? record.recoveryDescriptor,
 				},
 			);

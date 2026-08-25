@@ -5,19 +5,23 @@ import {
 } from '../../shared/protocol';
 
 export const TASK_EVENT_RETENTION_MS = 24 * 60 * 60 * 1_000;
-export const TASK_EVENT_JOURNAL_BYTES = PROTOCOL_LIMITS.frameBytes;
+export const TASK_EVENT_JOURNAL_BYTES = PROTOCOL_LIMITS.taskEventJournalBytes;
 
 export function compactTaskEventJournal(
 	record: PersistedTaskRecord,
 	referenceAt: string,
 ): PersistedTaskRecord {
 	if (record.events.length === 0) {
-		return record.eventsTruncated
-			? {
+		if (!record.eventsTruncated) {
+			return record;
+		}
+		const earliestAvailableEventSeq = record.eventSeq + 1;
+		return record.earliestAvailableEventSeq === earliestAvailableEventSeq
+			? record
+			: {
 				...record,
-				earliestAvailableEventSeq: record.eventSeq + 1,
-			}
-			: record;
+				earliestAvailableEventSeq,
+			};
 	}
 
 	const referenceTime = Date.parse(referenceAt);
@@ -54,14 +58,21 @@ export function compactTaskEventJournal(
 
 	const events = record.events.slice(retainedStart);
 	const eventsTruncated = record.eventsTruncated || retainedStart > 0;
-	if (!eventsTruncated) {
+	const earliestAvailableEventSeq = events[0]?.eventSeq ?? record.eventSeq + 1;
+	if (
+		retainedStart === 0
+		&& (
+			!eventsTruncated
+			|| record.earliestAvailableEventSeq === earliestAvailableEventSeq
+		)
+	) {
 		return record;
 	}
 	return {
 		...record,
 		events,
 		eventsTruncated: true,
-		earliestAvailableEventSeq: events[0]?.eventSeq ?? record.eventSeq + 1,
+		earliestAvailableEventSeq,
 	};
 }
 

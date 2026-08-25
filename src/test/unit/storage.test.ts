@@ -1,7 +1,7 @@
 import * as assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, describe, test } from 'node:test';
 
 import { createAcceptedTask } from '../../domain/task';
@@ -57,6 +57,18 @@ const fixedClock: Clock = {
 	now: () => new Date(AT),
 };
 
+class MutableClock implements Clock {
+	public constructor(private value: Date) {}
+
+	public now(): Date {
+		return new Date(this.value);
+	}
+
+	public set(value: Date): void {
+		this.value = value;
+	}
+}
+
 class FailingRenameFileSystem extends NodeAtomicFileSystem {
 	public failRename = false;
 
@@ -65,6 +77,36 @@ class FailingRenameFileSystem extends NodeAtomicFileSystem {
 			throw Object.assign(new Error('simulated rename failure'), { code: 'EIO' });
 		}
 		await super.rename(from, to);
+	}
+}
+
+class RecordingFileSystem extends NodeAtomicFileSystem {
+	public readonly operations: string[] = [];
+
+	public override async mkdir(path: string): Promise<boolean> {
+		const created = await super.mkdir(path);
+		this.operations.push(`mkdir:${path}:${created}`);
+		return created;
+	}
+
+	public override async writeFile(path: string, contents: string): Promise<void> {
+		this.operations.push(`write:${path}`);
+		await super.writeFile(path, contents);
+	}
+
+	public override async syncFile(path: string): Promise<void> {
+		this.operations.push(`sync-file:${path}`);
+		await super.syncFile(path);
+	}
+
+	public override async rename(from: string, to: string): Promise<void> {
+		this.operations.push(`rename:${from}:${to}`);
+		await super.rename(from, to);
+	}
+
+	public override async syncDirectory(path: string): Promise<void> {
+		this.operations.push(`sync-directory:${path}`);
+		await super.syncDirectory(path);
 	}
 }
 
@@ -143,6 +185,35 @@ describe('foundation storage', () => {
 		fileSystem.failRename = true;
 		await assert.rejects(files.writeJson('state/value.json', { version: 2 }));
 		assert.deepStrictEqual(await files.readJson('state/value.json'), { version: 1 });
+	});
+
+	test('syncs each newly created owned directory entry in order', async () => {
+		const root = await makeDirectory();
+		const fileSystem = new RecordingFileSystem();
+		const files = new AtomicFileStore(
+			root,
+			fileSystem,
+			new SequenceIds(['temp-1']),
+		);
+		await files.writeJson('tasks/nested/value.json', { version: 1 });
+		const tasksDirectory = join(root, 'tasks');
+		const nestedDirectory = join(tasksDirectory, 'nested');
+		const temporary = join(nestedDirectory, 'value.json.temp-1.tmp');
+		const target = join(nestedDirectory, 'value.json');
+		assert.deepStrictEqual(fileSystem.operations, [
+			`mkdir:${tasksDirectory}:true`,
+			`sync-directory:${root}`,
+			`mkdir:${nestedDirectory}:true`,
+			`sync-directory:${tasksDirectory}`,
+			`write:${temporary}`,
+			`sync-file:${temporary}`,
+			`rename:${temporary}:${target}`,
+			`sync-directory:${nestedDirectory}`,
+		]);
+		assert.strictEqual(
+			fileSystem.operations.includes(`sync-directory:${dirname(root)}`),
+			false,
+		);
 	});
 
 	test('surfaces corrupted JSON instead of returning success-shaped defaults', async () => {
@@ -258,6 +329,7 @@ describe('foundation storage', () => {
 			eventSeq: events.length,
 			events,
 		});
+
 		const stored = await tasks.getOwned(IDS.peer, IDS.task);
 		assert.ok(stored);
 		assert.ok(taskEventJournalBytes(stored) <= 1_048_576);
@@ -266,6 +338,48 @@ describe('foundation storage', () => {
 			stored.earliestAvailableEventSeq,
 			stored.events[0].eventSeq,
 		);
+	});
+
+	test('atomically persists 24-hour retention from every task read API', async () => {
+		const methods = ['getOwned', 'list', 'listForRecovery'] as const;
+		for (const [index, method] of methods.entries()) {
+			const root = await makeDirectory();
+			const clock = new MutableClock(new Date(AT));
+			const tasks = new FileTaskStore(new AtomicFileStore(
+				root,
+				new NodeAtomicFileSystem(),
+				new SequenceIds([`temp-${index}-create`, `temp-${index}-trim`]),
+			), clock);
+			await tasks.create({
+				...createAcceptedTask(taskRequest(), AT),
+				state: 'completed',
+				eventSeq: 1,
+				events: [{
+					eventSeq: 1,
+					at: AT,
+					type: 'seed',
+				}],
+			});
+			clock.set(new Date(Date.parse(AT) + 24 * 60 * 60 * 1_000 + 1));
+			if (method === 'getOwned') {
+				await tasks.getOwned(IDS.peer, IDS.task);
+			} else if (method === 'list') {
+				await tasks.list();
+			} else {
+				await tasks.listForRecovery();
+			}
+			const persisted = JSON.parse(await readFile(
+				join(root, 'tasks', `${IDS.peer}--${IDS.task}.json`),
+				'utf8',
+			)) as {
+				events: unknown[];
+				eventsTruncated: boolean;
+				earliestAvailableEventSeq: number;
+			};
+			assert.deepStrictEqual(persisted.events, []);
+			assert.strictEqual(persisted.eventsTruncated, true);
+			assert.strictEqual(persisted.earliestAvailableEventSeq, 2);
+		}
 	});
 
 	test('rejects schema-invalid task files during recovery', async () => {

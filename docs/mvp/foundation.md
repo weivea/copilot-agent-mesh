@@ -52,17 +52,24 @@ Device IDs remain stable across reloads and renames. Workspace IDs are generated
 opaque identifiers.
 
 `AtomicFileStore` uses a temporary file, file sync, atomic rename, and directory
-sync where the platform supports it. Writes are serialized in process.
+sync where the platform supports it. New directories are created one level at a
+time below the owned storage root, and each new directory entry is persisted by
+syncing only its owned parent; ancestors outside the storage root are untouched.
+Writes are serialized in process.
 `FileTaskStore` validates every task record, serializes read-modify-write
 transitions, and stores one peer-namespaced task file per task. These task files
 are the recovery authority; in-memory workspace leases are rebuilt from active
 records. A corrupt record fails recovery explicitly rather than producing an
 empty or successful-looking result.
 
-Task event journals retain a contiguous suffix for at most 24 hours and 1 MiB
-of serialized UTF-8 JSON. Truncation updates `earliestAvailableEventSeq` and
-`eventsTruncated`; an individually oversized event is dropped together with all
-older events so gap reporting remains unambiguous.
+Task event journals retain a contiguous suffix for at most 24 hours and 768 KiB
+of serialized UTF-8 JSON, reserving headroom for the task snapshot and JSON-RPC
+envelope within the 1 MiB frame. Truncation updates
+`earliestAvailableEventSeq` and `eventsTruncated`; an individually oversized
+event is dropped together with all older events so gap reporting remains
+unambiguous. Every task read API applies retention with the injected clock and
+atomically rewrites a changed journal, including terminal tasks that receive no
+later transitions.
 
 Persisted task records contain identifiers, owner, workspace, canonical request
 hash, state, bounded summaries/events, and recovery metadata. They do not

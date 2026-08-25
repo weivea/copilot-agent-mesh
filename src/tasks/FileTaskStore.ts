@@ -33,7 +33,7 @@ export class FileTaskStore {
 		record: TaskRecord,
 	): Promise<{ readonly record: TaskRecord; readonly created: boolean }> {
 		return this.runExclusive(async () => {
-			const existing = matchIdempotentStart(await this.list(), request);
+			const existing = matchIdempotentStart(await this.listUnlocked(), request);
 			if (existing !== undefined) {
 				return { record: existing, created: false };
 			}
@@ -48,7 +48,7 @@ export class FileTaskStore {
 		if (!validated.success) {
 			throw new TypeError(`Invalid task record: ${validated.error.message}`);
 		}
-		const existing = await this.getOwned(record.peerId, record.taskId);
+		const existing = await this.getOwnedUnlocked(record.peerId, record.taskId);
 		if (existing !== undefined) {
 			throw new MeshDomainError('TASK_ID_CONFLICT', 'Task already exists.');
 		}
@@ -56,8 +56,10 @@ export class FileTaskStore {
 		return validated.data;
 	}
 
-	public async findIdempotentStart(request: OwnedTaskStart): Promise<TaskRecord | undefined> {
-		return matchIdempotentStart(await this.list(), request);
+	public findIdempotentStart(request: OwnedTaskStart): Promise<TaskRecord | undefined> {
+		return this.runExclusive(async () =>
+			matchIdempotentStart(await this.listUnlocked(), request),
+		);
 	}
 
 	private async saveUnlocked(record: TaskRecord): Promise<TaskRecord> {
@@ -76,12 +78,19 @@ export class FileTaskStore {
 		event: TaskDomainEvent,
 	): Promise<TaskRecord> {
 		return this.runExclusive(async () => {
-			const current = getOwnedTask(await this.getOwned(peerId, taskId), peerId);
+			const current = getOwnedTask(await this.getOwnedUnlocked(peerId, taskId), peerId);
 			return this.transitionUnlocked(current, event);
 		});
 	}
 
-	public async getOwned(peerId: string, taskId: string): Promise<TaskRecord | undefined> {
+	public getOwned(peerId: string, taskId: string): Promise<TaskRecord | undefined> {
+		return this.runExclusive(() => this.getOwnedUnlocked(peerId, taskId));
+	}
+
+	private async getOwnedUnlocked(
+		peerId: string,
+		taskId: string,
+	): Promise<TaskRecord | undefined> {
 		const parsedPeerId = uuidSchema.safeParse(peerId);
 		const parsedId = uuidSchema.safeParse(taskId);
 		if (!parsedPeerId.success || !parsedId.success) {
@@ -96,10 +105,14 @@ export class FileTaskStore {
 		if (record.peerId !== parsedPeerId.data || record.taskId !== parsedId.data) {
 			throw new StorageCorruptionError(path, 'record identity does not match its file name');
 		}
-		return record;
+		return this.compactOnRead(path, record);
 	}
 
-	public async list(): Promise<readonly TaskRecord[]> {
+	public list(): Promise<readonly TaskRecord[]> {
+		return this.runExclusive(() => this.listUnlocked());
+	}
+
+	private async listUnlocked(): Promise<readonly TaskRecord[]> {
 		const names = await this.files.list('tasks');
 		const records: TaskRecord[] = [];
 		for (const name of [...names].sort()) {
@@ -120,15 +133,17 @@ export class FileTaskStore {
 						'record identity does not match its file name',
 					);
 				}
-				records.push(record);
+				records.push(await this.compactOnRead(path, record));
 			}
 		}
 		return records;
 	}
 
-	public async listForRecovery(): Promise<readonly TaskRecord[]> {
-		return (await this.list()).filter((record) =>
-			!['completed', 'failed', 'cancelled', 'timedOut'].includes(record.state),
+	public listForRecovery(): Promise<readonly TaskRecord[]> {
+		return this.runExclusive(async () =>
+			(await this.listUnlocked()).filter((record) =>
+				!['completed', 'failed', 'cancelled', 'timedOut'].includes(record.state),
+			),
 		);
 	}
 
@@ -141,6 +156,19 @@ export class FileTaskStore {
 			return this.saveUnlocked(updated);
 		}
 		return updated;
+	}
+
+	private async compactOnRead(path: string, record: TaskRecord): Promise<TaskRecord> {
+		const compacted = compactTaskEventJournal(record, this.clock.now().toISOString());
+		if (compacted === record) {
+			return record;
+		}
+		const validated = persistedTaskRecordSchema.safeParse(compacted);
+		if (!validated.success) {
+			throw new StorageCorruptionError(path, validated.error.message);
+		}
+		await this.files.writeJson(path, validated.data);
+		return validated.data;
 	}
 
 	private runExclusive<T>(operation: () => Promise<T>): Promise<T> {

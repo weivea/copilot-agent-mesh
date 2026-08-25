@@ -1,7 +1,13 @@
 import * as assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 
-import { ACTIVE_TASK_STATUSES, PROTOCOL_LIMITS } from '../../../shared/protocol';
+import {
+	ACTIVE_TASK_STATUSES,
+	PROTOCOL_LIMITS,
+	rpcSuccessResponseSchema,
+	taskSnapshotSchema,
+	utf8ByteLength,
+} from '../../../shared/protocol';
 import { InvalidTaskTransitionError, MeshDomainError } from '../../domain/errors';
 import {
 	canonicalTaskRequestHash,
@@ -63,12 +69,38 @@ describe('task domain', () => {
 			at: LATER,
 			recoveryDescriptor: descriptor,
 		});
+
 		record = taskReducer(record, { type: 'recoveryStarted', at: LATER });
 		record = taskReducer(record, { type: 'agentStarted', at: LATER });
 		assert.deepStrictEqual(record.recoveryDescriptor, descriptor);
 		record = taskReducer(record, { type: 'recoveryStarted', at: LATER });
 		assert.strictEqual(record.state, 'recovering');
 		assert.deepStrictEqual(record.recoveryDescriptor, descriptor);
+	});
+
+	test('restores pending input after recovery and still accepts its answer', () => {
+		let record: TaskRecord = {
+			...createAcceptedTask(taskRequest(), AT),
+			state: 'running',
+		};
+		record = taskReducer(record, {
+			type: 'inputRequired',
+			at: LATER,
+			inputId: IDS.input,
+			prompt: 'Choose an option.',
+		});
+		record = taskReducer(record, { type: 'recoveryStarted', at: LATER });
+		record = taskReducer(record, { type: 'agentStarted', at: LATER });
+		assert.strictEqual(record.state, 'needsInput');
+		assert.strictEqual(record.pendingInput?.inputId, IDS.input);
+		record = taskReducer(record, {
+			type: 'inputAnswered',
+			at: LATER,
+			inputId: IDS.input,
+			answerId: IDS.answer,
+		});
+		assert.strictEqual(record.state, 'running');
+		assert.strictEqual(record.pendingInput, undefined);
 	});
 
 	test('trims event journals by bytes, age, and oversized-event gaps', () => {
@@ -124,6 +156,47 @@ describe('task domain', () => {
 		assert.deepStrictEqual(oversized.events, []);
 		assert.strictEqual(oversized.eventsTruncated, true);
 		assert.strictEqual(oversized.earliestAvailableEventSeq, 2);
+	});
+
+	test('keeps a maximal task snapshot response below the wire frame limit', () => {
+		const events = Array.from({ length: 80 }, (_, index) => ({
+			eventSeq: index + 1,
+			at: AT,
+			type: 'task.output',
+			summary: 'x'.repeat(PROTOCOL_LIMITS.outputEventBytes),
+		}));
+		const compacted = compactTaskEventJournal({
+			...createAcceptedTask(taskRequest(), AT),
+			state: 'needsInput',
+			eventSeq: events.length,
+			events,
+			pendingInput: {
+				inputId: IDS.input,
+				prompt: '🙂'.repeat(PROTOCOL_LIMITS.taskAnswerBytes / 4),
+			},
+		}, LATER);
+		const {
+			answeredInputs: _answeredInputs,
+			recoveryDescriptor: _recoveryDescriptor,
+			...wireRecord
+		} = compacted;
+		const snapshot = {
+			...wireRecord,
+			deviceId: IDS.device,
+		};
+		assert.strictEqual(taskSnapshotSchema.safeParse(snapshot).success, true);
+		const response = {
+			jsonrpc: '2.0',
+			id: 'request-1',
+			result: snapshot,
+		};
+		assert.strictEqual(rpcSuccessResponseSchema.safeParse(response).success, true);
+		assert.ok(
+			utf8ByteLength(JSON.stringify(response)) < PROTOCOL_LIMITS.frameBytes,
+		);
+		assert.ok(
+			taskEventJournalBytes(compacted) <= PROTOCOL_LIMITS.taskEventJournalBytes,
+		);
 	});
 
 	test('allows every active state to fail or time out', () => {

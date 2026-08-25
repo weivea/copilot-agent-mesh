@@ -12,7 +12,7 @@ import { dirname, isAbsolute, join, normalize, sep } from 'node:path';
 import type { IdGenerator } from '../domain/ports';
 
 export interface AtomicFileSystem {
-	mkdir(path: string): Promise<void>;
+	mkdir(path: string): Promise<boolean>;
 	readFile(path: string): Promise<string>;
 	writeFile(path: string, contents: string): Promise<void>;
 	syncFile(path: string): Promise<void>;
@@ -23,8 +23,16 @@ export interface AtomicFileSystem {
 }
 
 export class NodeAtomicFileSystem implements AtomicFileSystem {
-	public async mkdir(path: string): Promise<void> {
-		await mkdir(path, { recursive: true });
+	public async mkdir(path: string): Promise<boolean> {
+		try {
+			await mkdir(path);
+			return true;
+		} catch (error) {
+			if (isAlreadyExists(error)) {
+				return false;
+			}
+			throw error;
+		}
 	}
 
 	public readFile(path: string): Promise<string> {
@@ -139,7 +147,7 @@ export class AtomicFileStore {
 		const temporary = `${target}.${id}.tmp`;
 		const contents = `${JSON.stringify(value)}\n`;
 
-		await this.fileSystem.mkdir(directory);
+		await this.ensureOwnedDirectory(relativePath);
 		try {
 			await this.fileSystem.writeFile(temporary, contents);
 			await this.fileSystem.syncFile(temporary);
@@ -174,6 +182,21 @@ export class AtomicFileStore {
 		}
 		return join(this.rootDirectory, normalized);
 	}
+
+	private async ensureOwnedDirectory(relativePath: string): Promise<void> {
+		const relativeDirectory = dirname(normalize(relativePath));
+		if (relativeDirectory === '.') {
+			return;
+		}
+		let current = this.rootDirectory;
+		for (const segment of relativeDirectory.split(sep)) {
+			const parent = current;
+			current = join(current, segment);
+			if (await this.fileSystem.mkdir(current)) {
+				await this.fileSystem.syncDirectory(parent);
+			}
+		}
+	}
 }
 
 function isFileNotFound(error: unknown): boolean {
@@ -182,5 +205,14 @@ function isFileNotFound(error: unknown): boolean {
 		&& error !== null
 		&& 'code' in error
 		&& error.code === 'ENOENT'
+	);
+}
+
+function isAlreadyExists(error: unknown): boolean {
+	return (
+		typeof error === 'object'
+		&& error !== null
+		&& 'code' in error
+		&& error.code === 'EEXIST'
 	);
 }
