@@ -81,10 +81,11 @@ retained event gaps, and cancel has a worker deadline that fails with
 `TASK_CANCELLATION_UNCONFIRMED` if no terminal confirmation arrives.
 
 The production notification sink preserves that classification on the wire:
-`progress` emits `task.progress`, output and truncation emit `task.output`, and
-state/control transitions emit `task.stateChanged`. Terminal states therefore
-remain critical while high-volume progress/output uses the RpcPeer ordinary
-coalescing and backpressure budget.
+progress and bounded tool lifecycle summaries emit `task.progress`; output,
+truncation, and Terminal summaries emit `task.output`; only real state/control
+transitions emit `task.stateChanged`. Completed, failed, and cancelled states
+therefore remain critical while high-volume progress/tool/output/Terminal
+summaries use the RpcPeer ordinary coalescing and backpressure budget.
 
 On startup, peers reconnect, the prior listener is restored, coordinator task snapshots are
 reconciled, and worker task leases are rebuilt. Because the current `AgentRuntime` contract

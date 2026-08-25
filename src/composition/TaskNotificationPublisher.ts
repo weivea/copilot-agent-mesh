@@ -19,6 +19,7 @@ export function createTaskNotificationSink(
 			};
 			switch (event.type) {
 				case 'progress':
+				case 'tool':
 					if (Buffer.byteLength(event.summary, 'utf8') === 0) {
 						return;
 					}
@@ -27,6 +28,7 @@ export function createTaskNotificationSink(
 						summary: event.summary,
 					});
 				case 'output':
+				case 'terminal':
 					if (Buffer.byteLength(event.summary, 'utf8') === 0) {
 						return;
 					}

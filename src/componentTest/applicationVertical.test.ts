@@ -183,6 +183,32 @@ test('real loopback composes pairing, workspace, accepted task, input, get, and 
 			));
 		}
 		await Promise.all(pressurePublishes);
+		const toolPublishes: Promise<void>[] = [];
+		for (let index = 0; index < 200; index += 1) {
+			const event: TaskDomainEvent = {
+				type: 'tool',
+				at,
+				summary: `build: running — step ${index}`,
+			};
+			pressureRecord = taskReducer(pressureRecord, event);
+			toolPublishes.push(Promise.resolve(
+				productionNotifications.publish(pressureRecord, event),
+			));
+		}
+		await Promise.all(toolPublishes);
+		const terminalPublishes: Promise<void>[] = [];
+		for (let index = 0; index < 200; index += 1) {
+			const event: TaskDomainEvent = {
+				type: 'terminal',
+				at,
+				summary: `Terminal summary ${index}`,
+			};
+			pressureRecord = taskReducer(pressureRecord, event);
+			terminalPublishes.push(Promise.resolve(
+				productionNotifications.publish(pressureRecord, event),
+			));
+		}
+		await Promise.all(terminalPublishes);
 		const completed: TaskDomainEvent = {
 			type: 'completed',
 			at,
@@ -199,6 +225,15 @@ test('real loopback composes pairing, workspace, accepted task, input, get, and 
 		assert.ok(notifications.some(({ method, params }) =>
 			method === GATEWAY_NOTIFICATIONS.taskProgress
 			&& params.taskId === pressureTaskId));
+		assert.ok(notifications.some(({ method, params }) =>
+			method === GATEWAY_NOTIFICATIONS.taskProgress
+			&& params.taskId === pressureTaskId
+			&& params.summary === 'build: running — step 199'));
+		assert.ok(notifications.some(({ method, params }) =>
+			method === GATEWAY_NOTIFICATIONS.taskOutput
+			&& params.taskId === pressureTaskId
+			&& params.output === 'Terminal summary 0'
+			&& params.truncated === false));
 		assert.equal(notifications.some(({ method, params }) =>
 			method === GATEWAY_NOTIFICATIONS.taskStateChanged
 			&& params.taskId === pressureTaskId
@@ -261,6 +296,15 @@ test('real loopback composes pairing, workspace, accepted task, input, get, and 
 			method === GATEWAY_NOTIFICATIONS.taskOutput
 			&& params.taskId === taskId
 			&& params.output === 'Runtime output.'));
+		assert.ok(notifications.some(({ method, params }) =>
+			method === GATEWAY_NOTIFICATIONS.taskProgress
+			&& params.taskId === taskId
+			&& params.summary === 'compiler: running — Checking types.'));
+		assert.ok(notifications.some(({ method, params }) =>
+			method === GATEWAY_NOTIFICATIONS.taskOutput
+			&& params.taskId === taskId
+			&& params.output === 'Terminal output.'
+			&& params.truncated === false));
 		assert.equal(notifications.some(({ method, params }) =>
 			(method === GATEWAY_NOTIFICATIONS.taskProgress
 				|| method === GATEWAY_NOTIFICATIONS.taskOutput)
@@ -672,6 +716,13 @@ class StubTaskHandle implements AgentTaskHandle {
 		void this.events.push({ type: 'progress', message: '' });
 		void this.events.push({ type: 'output', text: '' });
 		void this.events.push({ type: 'output', text: 'Runtime output.' });
+		void this.events.push({
+			type: 'tool',
+			name: 'compiler',
+			status: 'running',
+			summary: 'Checking types.',
+		});
+		void this.events.push({ type: 'terminal', summary: 'Terminal output.' });
 		void this.events.push({
 			type: 'inputRequired',
 			request: {
