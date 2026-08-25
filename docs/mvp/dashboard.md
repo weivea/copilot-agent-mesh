@@ -50,14 +50,18 @@ malformed or oversized input before recognizing JSON, quoted, and whitespace
 credential assignments, including normalized compound keys such as access token,
 client secret, auth token, ID token, API key, private key, and refresh token.
 Credential keys use explicit sensitive suffixes so ordinary fields such as
-`tokenCount` remain valid. HTTP(S) values are parsed;
+`tokenCount` remain valid; quoted keys may contain spaces or hyphens. GitHub
+classic, OAuth, user, server, refresh, and fine-grained token prefixes are
+centralized in one deny list. HTTP(S) values are parsed;
 their decoded pathname, query keys/values, and fragment are recursively subjected
 to the same path and secret checks; any URL userinfo is rejected. URI schemes are
 canonicalized and parsed generically, with non-HTTP(S) schemes rejected fail
 closed so prefixed VS Code, remote, file, malformed, and unknown URI tokens cannot
 bypass path checks. Every `scheme:` form is inspected. Before URL parsing,
 HTTP(S) must have the exact raw `scheme://host` authority shape with two slashes
-and a non-empty host segment.
+and a non-empty host segment. URI candidates are checked in raw form before each
+bounded percent-decoding round, C0 input is rejected, and decoded path, query,
+and fragment components recursively pass through the same guard.
 
 The webview loads `media/dashboard.js` and `media/dashboard.css` through
 `asWebviewUri`. Its resource roots contain only `media/`, scripts are enabled, and

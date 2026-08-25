@@ -11,6 +11,14 @@ const sensitiveCredentialKeySuffixes = [
 	'tkn',
 	'token',
 ] as const;
+const githubTokenPrefixes = [
+	'gho_',
+	'ghp_',
+	'ghr_',
+	'ghs_',
+	'ghu_',
+	'github_pat_',
+] as const;
 
 export function redactRemoteText(value: string): string {
 	return containsUnsafeDashboardText(value) ? '[redacted sensitive details]' : value;
@@ -21,34 +29,39 @@ export function containsUnsafeDashboardText(value: string): boolean {
 }
 
 function containsUnsafeDashboardTextAtDepth(value: string, depth: number): boolean {
-	const canonical = canonicalizePercentEncoding(value);
-	if (canonical === undefined) {
+	const canonicalForms = canonicalizePercentEncoding(value);
+	if (canonicalForms === undefined) {
 		return true;
 	}
+	for (const form of canonicalForms) {
+		if (containsC0(form) || containsUnsafeUriCandidate(form, depth)) {
+			return true;
+		}
+	}
+	const canonical = canonicalForms[canonicalForms.length - 1];
 	const lower = canonical.toLowerCase();
 	if (
 		lower.includes('file://')
 		|| lower.includes('api_key=')
 		|| lower.includes('api-key=')
 		|| lower.includes('bearer ')
-		|| lower.includes('ghp_')
-		|| lower.includes('github_pat_')
+		|| githubTokenPrefixes.some((prefix) => lower.includes(prefix))
 		|| containsCredentialAssignment(lower)
 	) {
 		return true;
 	}
-	const uris = extractUriCandidates(canonical);
-	if (uris.length > 0) {
-		if (depth >= maximumUriInspectionDepth) {
-			return true;
-		}
-		for (const candidate of uris) {
-			if (containsUnsafeUri(candidate, depth + 1)) {
-				return true;
-			}
-		}
-	}
 	return lexicalTokens(lower).some(isPathToken);
+}
+
+function containsUnsafeUriCandidate(value: string, depth: number): boolean {
+	const uris = extractUriCandidates(value);
+	if (uris.length === 0) {
+		return false;
+	}
+	if (depth >= maximumUriInspectionDepth) {
+		return true;
+	}
+	return uris.some((candidate) => containsUnsafeUri(candidate, depth + 1));
 }
 
 function lexicalTokens(value: string): string[] {
@@ -133,11 +146,12 @@ function isAsciiLetter(character: string): boolean {
 	return (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
 }
 
-function canonicalizePercentEncoding(value: string): string | undefined {
+function canonicalizePercentEncoding(value: string): string[] | undefined {
 	if (value.length > maximumCanonicalLength) {
 		return undefined;
 	}
 	let canonical = value;
+	const forms = [value];
 	for (let round = 0; round < maximumDecodeRounds && canonical.includes('%'); round += 1) {
 		let decoded: string;
 		try {
@@ -149,11 +163,12 @@ function canonicalizePercentEncoding(value: string): string | undefined {
 			return undefined;
 		}
 		if (decoded === canonical) {
-			return canonical;
+			return forms;
 		}
 		canonical = decoded;
+		forms.push(canonical);
 	}
-	return canonical.includes('%') ? undefined : canonical;
+	return canonical.includes('%') ? undefined : forms;
 }
 
 function containsCredentialAssignment(value: string): boolean {
@@ -166,7 +181,10 @@ function containsCredentialAssignment(value: string): boolean {
 			cursor -= 1;
 		}
 		const keyEnd = cursor + 1;
-		while (cursor >= 0 && isIdentifierCharacter(value[cursor])) {
+		while (
+			cursor >= 0
+			&& (isIdentifierCharacter(value[cursor]) || value[cursor].trim().length === 0)
+		) {
 			cursor -= 1;
 		}
 		if (keyEnd === cursor + 1) {
@@ -198,7 +216,7 @@ function isIdentifierCharacter(character: string | undefined): boolean {
 function normalizeCredentialKey(value: string): string {
 	let normalized = '';
 	for (const character of value) {
-		if (character !== '_' && character !== '-') {
+		if (character !== '_' && character !== '-' && character.trim().length > 0) {
 			normalized += character.toLowerCase();
 		}
 	}
@@ -335,5 +353,15 @@ function addSchemeDelimiterTokens(value: string, candidates: Set<string>): void 
 }
 
 function isUrlTerminator(character: string): boolean {
-	return character.trim().length === 0 || '"\'`()[]{}<>'.includes(character);
+	return character.trim().length === 0 || '"`()[]{}<>'.includes(character);
+}
+
+function containsC0(value: string): boolean {
+	for (const character of value) {
+		const code = character.charCodeAt(0);
+		if (code <= 31 || code === 127) {
+			return true;
+		}
+	}
+	return false;
 }
