@@ -4,6 +4,7 @@ import { GATEWAY_METHODS, MESH_PROTOCOL_VERSION } from './constants';
 import { PROTOCOL_LIMITS, utf8String } from './limits';
 import {
 	deviceInfoSchema,
+	taskSnapshotAfterEventSeqSchema,
 	taskSnapshotSchema,
 	timestampSchema,
 	uuidSchema,
@@ -110,7 +111,10 @@ export const methodResultSchemas = {
 		workspaces: z.array(workspaceSummarySchema),
 	}),
 	[GATEWAY_METHODS.taskStart]: taskSnapshotSchema,
-	[GATEWAY_METHODS.taskGet]: taskSnapshotSchema,
+	[GATEWAY_METHODS.taskGet]: z.union([
+		taskSnapshotSchema,
+		taskSnapshotAfterEventSeqSchema,
+	]),
 	[GATEWAY_METHODS.taskCancel]: taskSnapshotSchema,
 	[GATEWAY_METHODS.taskAnswer]: taskSnapshotSchema,
 } as const;

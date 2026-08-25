@@ -13,9 +13,9 @@ export class WorkspaceLeaseManager {
 	private readonly leases = new Map<string, WorkspaceLeaseOwner>();
 
 	public acquire(workspaceId: string, peerId: string, taskId: string): void {
-		assertLeaseIdentity(workspaceId, peerId, taskId);
+		const identity = normalizeLeaseIdentity(workspaceId, peerId, taskId);
 		const owner = this.leases.get(workspaceId);
-		const requestedOwner = { peerId, taskId };
+		const requestedOwner = { peerId: identity.peerId, taskId: identity.taskId };
 		if (owner !== undefined && !sameOwner(owner, requestedOwner)) {
 			throw new MeshDomainError('WORKSPACE_BUSY', 'An active task is using this workspace.');
 		}
@@ -23,9 +23,9 @@ export class WorkspaceLeaseManager {
 	}
 
 	public release(workspaceId: string, peerId: string, taskId: string): void {
-		assertLeaseIdentity(workspaceId, peerId, taskId);
+		const identity = normalizeLeaseIdentity(workspaceId, peerId, taskId);
 		const owner = this.leases.get(workspaceId);
-		if (owner !== undefined && sameOwner(owner, { peerId, taskId })) {
+		if (owner !== undefined && sameOwner(owner, identity)) {
 			this.leases.delete(workspaceId);
 		}
 	}
@@ -34,7 +34,7 @@ export class WorkspaceLeaseManager {
 		if (activeStatuses.has(record.state)) {
 			throw new Error('Cannot release a workspace lease for a non-terminal task record.');
 		}
-		this.release(record.workspaceId, record.peerId, record.taskId);
+		this.release(record.workspaceLeaseKey, record.peerId, record.taskId);
 	}
 
 	public isLeased(workspaceId: string): boolean {
@@ -52,13 +52,17 @@ export class WorkspaceLeaseManager {
 			if (!activeStatuses.has(record.state)) {
 				continue;
 			}
-			assertLeaseIdentity(record.workspaceId, record.peerId, record.taskId);
-			const owner = restored.get(record.workspaceId);
-			const recordOwner = { peerId: record.peerId, taskId: record.taskId };
+			const identity = normalizeLeaseIdentity(
+				record.workspaceLeaseKey,
+				record.peerId,
+				record.taskId,
+			);
+			const owner = restored.get(record.workspaceLeaseKey);
+			const recordOwner = { peerId: identity.peerId, taskId: identity.taskId };
 			if (owner !== undefined && !sameOwner(owner, recordOwner)) {
 				throw new Error(`Multiple active task records claim workspace "${record.workspaceId}".`);
 			}
-			restored.set(record.workspaceId, recordOwner);
+			restored.set(record.workspaceLeaseKey, recordOwner);
 		}
 		this.leases.clear();
 		for (const [workspaceId, owner] of restored) {
@@ -71,12 +75,20 @@ function sameOwner(left: WorkspaceLeaseOwner, right: WorkspaceLeaseOwner): boole
 	return left.peerId === right.peerId && left.taskId === right.taskId;
 }
 
-function assertLeaseIdentity(workspaceId: string, peerId: string, taskId: string): void {
+function normalizeLeaseIdentity(
+	workspaceId: string,
+	peerId: string,
+	taskId: string,
+): { readonly peerId: string; readonly taskId: string } {
+	const parsedPeerId = uuidSchema.safeParse(peerId);
+	const parsedTaskId = uuidSchema.safeParse(taskId);
 	if (
-		!uuidSchema.safeParse(workspaceId).success
-		|| !uuidSchema.safeParse(peerId).success
-		|| !uuidSchema.safeParse(taskId).success
+		workspaceId.length === 0
+		|| Buffer.byteLength(workspaceId, 'utf8') > 1_024
+		|| !parsedPeerId.success
+		|| !parsedTaskId.success
 	) {
-		throw new TypeError('Workspace lease identity must contain valid UUIDs.');
+		throw new TypeError('Workspace lease key must be non-empty and its owner must contain valid UUIDs.');
 	}
+	return { peerId: parsedPeerId.data, taskId: parsedTaskId.data };
 }

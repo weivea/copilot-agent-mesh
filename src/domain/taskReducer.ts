@@ -82,6 +82,7 @@ export function taskReducer(record: TaskRecord, event: TaskDomainEvent): TaskRec
 			return transition(record, event, {
 				state: 'cancelling',
 				cancellationDeadline: event.cancellationDeadline,
+				pendingInput: undefined,
 			});
 		case 'cancelConfirmed':
 			return transition(
@@ -91,14 +92,15 @@ export function taskReducer(record: TaskRecord, event: TaskDomainEvent): TaskRec
 			);
 		case 'completed':
 			return transition(
-				requireState(record, event, ['running']),
+				requireState(record, event, ['running', 'needsInput']),
 				event,
-				{ state: 'completed', summary: event.summary },
+				{ state: 'completed', pendingInput: undefined, summary: event.summary },
 			);
 		case 'failed':
 			assertActive(record, event);
 			return transition(record, event, {
 				state: 'failed',
+				pendingInput: undefined,
 				failure: {
 					code: event.code,
 					message: event.message,
@@ -109,6 +111,7 @@ export function taskReducer(record: TaskRecord, event: TaskDomainEvent): TaskRec
 			assertActive(record, event);
 			return transition(record, event, {
 				state: 'timedOut',
+				pendingInput: undefined,
 				failure: {
 					code: 'TASK_TIMED_OUT',
 					message: event.message,

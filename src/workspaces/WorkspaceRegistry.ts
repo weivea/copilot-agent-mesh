@@ -1,4 +1,6 @@
 import { z } from 'zod';
+import { resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
 	PROTOCOL_LIMITS,
@@ -14,6 +16,7 @@ const WORKSPACE_REGISTRY_KEY = 'copilotAgentMesh.workspaceRegistry';
 const localWorkspaceSchema = z.strictObject({
 	workspaceId: uuidSchema,
 	localUri: z.string().url().refine((value) => new URL(value).protocol === 'file:', 'Workspace URI must use file:'),
+	fileIdentity: utf8String(1_024, 'workspace file identity', 1),
 	name: utf8String(PROTOCOL_LIMITS.nameBytes, 'workspace name', 1),
 	capabilityTags: z.array(utf8String(64, 'capability tag', 1)).max(32),
 	enabled: z.boolean(),
@@ -34,12 +37,22 @@ export interface RegisterWorkspaceInput {
 	readonly capabilityTags?: readonly string[];
 }
 
+export interface ResolvedFileIdentity {
+	readonly canonicalUri: string;
+	readonly identity: string;
+}
+
+export interface FileIdentityResolver {
+	resolve(localUri: string): Promise<ResolvedFileIdentity>;
+}
+
 export class WorkspaceRegistry {
 	public constructor(
 		private readonly state: StateStore,
 		private readonly ids: IdGenerator,
 		private readonly clock: Clock,
-		private readonly isWorkspaceLeased: (workspaceId: string) => boolean = () => false,
+		private readonly fileIdentityResolver: FileIdentityResolver,
+		private readonly isWorkspaceLeased: (workspaceLeaseKey: string) => boolean = () => false,
 	) {}
 
 	public listLocal(): readonly LocalWorkspace[] {
@@ -52,7 +65,7 @@ export class WorkspaceRegistry {
 			name: workspace.name,
 			capabilityTags: [...workspace.capabilityTags],
 			enabled: workspace.enabled,
-			busy: this.isWorkspaceLeased(workspace.workspaceId),
+			busy: this.isWorkspaceLeased(workspace.fileIdentity),
 		}));
 	}
 
@@ -70,13 +83,23 @@ export class WorkspaceRegistry {
 		return workspace;
 	}
 
+	public leaseKey(workspaceId: string): string {
+		return this.resolveEnabled(workspaceId).fileIdentity;
+	}
+
 	public async register(input: RegisterWorkspaceInput): Promise<LocalWorkspace> {
+		const lexicalUri = normalizeLocalFileUri(input.localUri);
+		const resolvedIdentity = await this.fileIdentityResolver.resolve(lexicalUri);
+		const canonicalUri = normalizeLocalFileUri(resolvedIdentity.canonicalUri);
 		const candidate = localWorkspaceSchema.pick({
 			localUri: true,
+			fileIdentity: true,
 			name: true,
 			capabilityTags: true,
 		}).safeParse({
 			...input,
+			localUri: canonicalUri,
+			fileIdentity: resolvedIdentity.identity,
 			capabilityTags: input.capabilityTags ?? [],
 		});
 		if (!candidate.success) {
@@ -85,7 +108,7 @@ export class WorkspaceRegistry {
 
 		const registry = this.read();
 		const existing = registry.workspaces.find(
-			(workspace) => workspace.localUri === candidate.data.localUri,
+			(workspace) => workspace.fileIdentity === candidate.data.fileIdentity,
 		);
 		if (existing !== undefined) {
 			return existing;
@@ -105,11 +128,14 @@ export class WorkspaceRegistry {
 
 	public async setEnabled(workspaceId: string, enabled: boolean): Promise<LocalWorkspace> {
 		const registry = this.read();
-		const index = registry.workspaces.findIndex((workspace) => workspace.workspaceId === workspaceId);
+		const parsedId = uuidSchema.safeParse(workspaceId);
+		const index = parsedId.success
+			? registry.workspaces.findIndex((workspace) => workspace.workspaceId === parsedId.data)
+			: -1;
 		if (index < 0) {
 			throw new MeshDomainError('WORKSPACE_NOT_FOUND', 'Workspace not found.');
 		}
-		if (!enabled && this.isWorkspaceLeased(workspaceId)) {
+		if (!enabled && this.isWorkspaceLeased(registry.workspaces[index].fileIdentity)) {
 			throw new MeshDomainError('WORKSPACE_BUSY', 'An active task is using this workspace.');
 		}
 		const updated = localWorkspaceSchema.parse({
@@ -124,12 +150,17 @@ export class WorkspaceRegistry {
 	}
 
 	public async remove(workspaceId: string): Promise<void> {
-		if (this.isWorkspaceLeased(workspaceId)) {
+		const registry = this.read();
+		const parsedId = uuidSchema.safeParse(workspaceId);
+		const normalizedId = parsedId.success ? parsedId.data : undefined;
+		const existing = registry.workspaces.find(
+			(workspace) => workspace.workspaceId === normalizedId,
+		);
+		if (existing !== undefined && this.isWorkspaceLeased(existing.fileIdentity)) {
 			throw new MeshDomainError('WORKSPACE_BUSY', 'An active task is using this workspace.');
 		}
-		const registry = this.read();
 		const workspaces = registry.workspaces.filter(
-			(workspace) => workspace.workspaceId !== workspaceId,
+			(workspace) => workspace.workspaceId !== normalizedId,
 		);
 		if (workspaces.length === registry.workspaces.length) {
 			throw new MeshDomainError('WORKSPACE_NOT_FOUND', 'Workspace not found.');
@@ -156,4 +187,29 @@ export class WorkspaceRegistry {
 		});
 		return this.state.update(WORKSPACE_REGISTRY_KEY, registry);
 	}
+}
+
+function normalizeLocalFileUri(value: string): string {
+	let uri: URL;
+	try {
+		uri = new URL(value);
+	} catch {
+		throw new TypeError('Workspace URI must be a valid file URI.');
+	}
+	if (
+		uri.protocol !== 'file:'
+		|| uri.username.length > 0
+		|| uri.password.length > 0
+		|| uri.search.length > 0
+		|| uri.hash.length > 0
+	) {
+		throw new TypeError('Workspace URI must be a local file URI without credentials, query, or fragment.');
+	}
+	let filePath: string;
+	try {
+		filePath = fileURLToPath(uri);
+	} catch {
+		throw new TypeError('Workspace URI contains an invalid file path.');
+	}
+	return pathToFileURL(resolve(filePath)).href;
 }

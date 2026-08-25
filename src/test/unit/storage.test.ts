@@ -16,6 +16,10 @@ import { DeviceProfileStore } from '../../storage/DeviceProfileStore';
 import { FileTaskStore } from '../../tasks/FileTaskStore';
 import { WorkspaceLeaseManager } from '../../tasks/WorkspaceLeaseManager';
 import { WorkspaceRegistry } from '../../workspaces/WorkspaceRegistry';
+import type {
+	FileIdentityResolver,
+	ResolvedFileIdentity,
+} from '../../workspaces/WorkspaceRegistry';
 import { AT, IDS, LATER, taskRequest } from './fixtures';
 
 const temporaryDirectories: string[] = [];
@@ -110,6 +114,50 @@ class RecordingFileSystem extends NodeAtomicFileSystem {
 	}
 }
 
+class FailingDirectorySyncFileSystem extends RecordingFileSystem {
+	public failNextDirectorySync = true;
+
+	public override async syncDirectory(path: string): Promise<void> {
+		this.operations.push(`sync-directory:${path}`);
+		if (this.failNextDirectorySync) {
+			this.failNextDirectorySync = false;
+			throw Object.assign(new Error('simulated directory sync failure'), { code: 'EIO' });
+		}
+		await NodeAtomicFileSystem.prototype.syncDirectory.call(this, path);
+	}
+
+	public override async removeDirectory(path: string): Promise<void> {
+		this.operations.push(`remove-directory:${path}`);
+		await super.removeDirectory(path);
+	}
+}
+
+class FailingDirectorySyncAndRollbackFileSystem extends FailingDirectorySyncFileSystem {
+	public failNextRollback = true;
+
+	public override async removeDirectory(path: string): Promise<void> {
+		this.operations.push(`remove-directory:${path}`);
+		if (this.failNextRollback) {
+			this.failNextRollback = false;
+			throw Object.assign(new Error('simulated directory rollback failure'), { code: 'EIO' });
+		}
+		await NodeAtomicFileSystem.prototype.removeDirectory.call(this, path);
+	}
+}
+
+class FakeFileIdentityResolver implements FileIdentityResolver {
+	public readonly inputs: string[] = [];
+
+	public constructor(
+		private readonly resolveIdentity: (localUri: string) => ResolvedFileIdentity,
+	) {}
+
+	public async resolve(localUri: string): Promise<ResolvedFileIdentity> {
+		this.inputs.push(localUri);
+		return this.resolveIdentity(localUri);
+	}
+}
+
 async function makeDirectory(): Promise<string> {
 	const path = await mkdtemp(join(tmpdir(), 'copilot-agent-mesh-'));
 	temporaryDirectories.push(path);
@@ -143,11 +191,16 @@ describe('foundation storage', () => {
 	test('registers file workspaces but exposes only opaque wire data', async () => {
 		const state = new MemoryState();
 		const leases = new WorkspaceLeaseManager();
+		const resolver = new FakeFileIdentityResolver((localUri) => ({
+			canonicalUri: localUri,
+			identity: 'device:1:inode:2',
+		}));
 		const registry = new WorkspaceRegistry(
 			state,
 			new SequenceIds([IDS.workspace]),
 			fixedClock,
-			(workspaceId) => leases.isLeased(workspaceId),
+			resolver,
+			(workspaceLeaseKey) => leases.isLeased(workspaceLeaseKey),
 		);
 		const workspace = await registry.register({
 			localUri: 'file:///Users/example/secret-project',
@@ -165,12 +218,43 @@ describe('foundation storage', () => {
 			}),
 			TypeError,
 		);
-		leases.acquire(IDS.workspace, IDS.peer, IDS.task);
+		assert.strictEqual(registry.leaseKey(IDS.workspace), 'device:1:inode:2');
+		leases.acquire(registry.leaseKey(IDS.workspace), IDS.peer, IDS.task);
 		assert.strictEqual(registry.listForWire()[0].busy, true);
 		await assert.rejects(
 			registry.setEnabled(IDS.workspace, false),
 			(error) => error instanceof Error && error.message.includes('active task'),
 		);
+	});
+
+	test('normalizes file URIs and deduplicates resolved symbolic-link identities', async () => {
+		const state = new MemoryState();
+		const resolver = new FakeFileIdentityResolver(() => ({
+			canonicalUri: 'file:///canonical/project',
+			identity: 'device:10:inode:20',
+		}));
+		const registry = new WorkspaceRegistry(
+			state,
+			new SequenceIds([IDS.workspace]),
+			fixedClock,
+			resolver,
+		);
+		const first = await registry.register({
+			localUri: 'file:///workspace/../alias',
+			name: 'Alias',
+		});
+		const second = await registry.register({
+			localUri: 'file:///other/symlink',
+			name: 'Symlink',
+		});
+		assert.strictEqual(first.workspaceId, second.workspaceId);
+		assert.strictEqual(first.localUri, 'file:///canonical/project');
+		assert.strictEqual(first.fileIdentity, 'device:10:inode:20');
+		assert.deepStrictEqual(resolver.inputs, [
+			'file:///alias',
+			'file:///other/symlink',
+		]);
+		assert.strictEqual(JSON.stringify(registry.listForWire()).includes('inode'), false);
 	});
 
 	test('preserves the previous file when an atomic replace is interrupted', async () => {
@@ -216,6 +300,50 @@ describe('foundation storage', () => {
 		);
 	});
 
+	test('rolls back an unsynced directory so retry repeats mkdir and parent sync', async () => {
+		const root = await makeDirectory();
+		const fileSystem = new FailingDirectorySyncFileSystem();
+		const files = new AtomicFileStore(
+			root,
+			fileSystem,
+			new SequenceIds(['temp-1', 'temp-2']),
+		);
+		await assert.rejects(files.writeJson('tasks/value.json', { version: 1 }));
+		const tasksDirectory = join(root, 'tasks');
+		assert.deepStrictEqual(fileSystem.operations.slice(0, 3), [
+			`mkdir:${tasksDirectory}:true`,
+			`sync-directory:${root}`,
+			`remove-directory:${tasksDirectory}`,
+		]);
+		await files.writeJson('tasks/value.json', { version: 2 });
+		assert.deepStrictEqual(fileSystem.operations.slice(3, 5), [
+			`mkdir:${tasksDirectory}:true`,
+			`sync-directory:${root}`,
+		]);
+		assert.deepStrictEqual(await files.readJson('tasks/value.json'), { version: 2 });
+	});
+
+	test('remembers an unsynced directory when rollback fails and syncs it on retry', async () => {
+		const root = await makeDirectory();
+		const fileSystem = new FailingDirectorySyncAndRollbackFileSystem();
+		const files = new AtomicFileStore(
+			root,
+			fileSystem,
+			new SequenceIds(['temp-1', 'temp-2']),
+		);
+		await assert.rejects(
+			files.writeJson('tasks/value.json', { version: 1 }),
+			AggregateError,
+		);
+		const tasksDirectory = join(root, 'tasks');
+		await files.writeJson('tasks/value.json', { version: 2 });
+		assert.deepStrictEqual(fileSystem.operations.slice(3, 5), [
+			`mkdir:${tasksDirectory}:false`,
+			`sync-directory:${root}`,
+		]);
+		assert.deepStrictEqual(await files.readJson('tasks/value.json'), { version: 2 });
+	});
+
 	test('surfaces corrupted JSON instead of returning success-shaped defaults', async () => {
 		const root = await makeDirectory();
 		const files = new AtomicFileStore(
@@ -249,7 +377,7 @@ describe('foundation storage', () => {
 		const leases = new WorkspaceLeaseManager();
 		leases.restoreFromTaskRecords(recovered);
 		assert.strictEqual(recovered[0].state, 'startingAgent');
-		assert.deepStrictEqual(leases.owner(IDS.workspace), {
+		assert.deepStrictEqual(leases.owner(IDS.workspaceLeaseKey), {
 			peerId: IDS.peer,
 			taskId: IDS.task,
 		});
@@ -279,13 +407,13 @@ describe('foundation storage', () => {
 			message: 'Session cannot be recovered.',
 			retryable: true,
 		});
-		assert.deepStrictEqual(leases.owner(IDS.workspace), {
+		assert.deepStrictEqual(leases.owner(IDS.workspaceLeaseKey), {
 			peerId: IDS.peer,
 			taskId: IDS.task,
 		});
 		const restartedLeases = new WorkspaceLeaseManager();
 		restartedLeases.restoreFromTaskRecords(await tasks.listForRecovery());
-		assert.strictEqual(restartedLeases.isLeased(IDS.workspace), false);
+		assert.strictEqual(restartedLeases.isLeased(IDS.workspaceLeaseKey), false);
 	});
 
 	test('namespaces identical task IDs by peer without leaking ownership', async () => {
@@ -307,6 +435,30 @@ describe('foundation storage', () => {
 		assert.strictEqual(
 			(await tasks.getOwned(IDS.otherPeer, IDS.task))?.peerId,
 			IDS.otherPeer,
+		);
+	});
+
+	test('uses lowercase canonical UUIDs for task filenames and lookups', async () => {
+		const root = await makeDirectory();
+		const tasks = new FileTaskStore(new AtomicFileStore(
+			root,
+			new NodeAtomicFileSystem(),
+			new SequenceIds(['temp-1']),
+		), fixedClock);
+		const upperPeer = 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA';
+		const upperTask = 'BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB';
+		const record = {
+			...createAcceptedTask(taskRequest(), AT),
+			peerId: upperPeer,
+			taskId: upperTask,
+		};
+		await tasks.create(record);
+		assert.deepStrictEqual(await new NodeAtomicFileSystem().readdir(join(root, 'tasks')), [
+			`${upperPeer.toLowerCase()}--${upperTask.toLowerCase()}.json`,
+		]);
+		assert.strictEqual(
+			(await tasks.getOwned(upperPeer, upperTask))?.taskId,
+			upperTask.toLowerCase(),
 		);
 	});
 

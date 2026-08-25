@@ -12,10 +12,11 @@ export type TaskRecord = PersistedTaskRecord;
 
 export interface OwnedTaskStart extends TaskStartParams {
 	readonly peerId: string;
+	readonly workspaceLeaseKey: string;
 }
 
-export function canonicalTaskRequest(request: OwnedTaskStart): string {
-	const { peerId, ...params } = request;
+function normalizeOwnedTaskStart(request: OwnedTaskStart): OwnedTaskStart {
+	const { peerId, workspaceLeaseKey, ...params } = request;
 	const parsed = taskStartParamsSchema.safeParse(params);
 	const parsedPeerId = uuidSchema.safeParse(peerId);
 	if (!parsed.success) {
@@ -24,17 +25,32 @@ export function canonicalTaskRequest(request: OwnedTaskStart): string {
 	if (!parsedPeerId.success) {
 		throw new TypeError(`Invalid task request: ${parsedPeerId.error.message}`);
 	}
+	if (
+		typeof workspaceLeaseKey !== 'string'
+		|| Buffer.byteLength(workspaceLeaseKey, 'utf8') === 0
+		|| Buffer.byteLength(workspaceLeaseKey, 'utf8') > 1_024
+	) {
+		throw new TypeError('Workspace lease key must contain between 1 and 1024 UTF-8 bytes.');
+	}
+	return {
+		...parsed.data,
+		peerId: parsedPeerId.data,
+		workspaceLeaseKey,
+	};
+}
 
+export function canonicalTaskRequest(request: OwnedTaskStart): string {
+	const normalized = normalizeOwnedTaskStart(request);
 	const fields = [
-		parsedPeerId.data,
-		parsed.data.delegationRequestId,
-		parsed.data.taskId,
-		parsed.data.workspaceId,
-		parsed.data.title,
-		parsed.data.prompt,
-		String(parsed.data.acceptanceCriteria.length),
-		...parsed.data.acceptanceCriteria,
-		parsed.data.workerDeadline,
+		normalized.peerId,
+		normalized.delegationRequestId,
+		normalized.taskId,
+		normalized.workspaceId,
+		normalized.title,
+		normalized.prompt,
+		String(normalized.acceptanceCriteria.length),
+		...normalized.acceptanceCriteria,
+		normalized.workerDeadline,
 	];
 
 	return fields.map(lengthPrefix).join('');
@@ -45,20 +61,22 @@ export function canonicalTaskRequestHash(request: OwnedTaskStart): string {
 }
 
 export function createAcceptedTask(request: OwnedTaskStart, at: string): TaskRecord {
-	const requestHash = canonicalTaskRequestHash(request);
+	const normalized = normalizeOwnedTaskStart(request);
+	const requestHash = canonicalTaskRequestHash(normalized);
 	return {
 		schemaVersion: 1,
-		taskId: request.taskId,
-		delegationRequestId: request.delegationRequestId,
+		taskId: normalized.taskId,
+		delegationRequestId: normalized.delegationRequestId,
 		requestHash,
-		peerId: request.peerId,
-		workspaceId: request.workspaceId,
-		title: request.title,
+		peerId: normalized.peerId,
+		workspaceId: normalized.workspaceId,
+		workspaceLeaseKey: normalized.workspaceLeaseKey,
+		title: normalized.title,
 		state: 'accepted',
 		createdAt: at,
 		updatedAt: at,
 		eventSeq: 0,
-		workerDeadline: request.workerDeadline,
+		workerDeadline: normalized.workerDeadline,
 		answeredInputs: {},
 		events: [],
 		eventsTruncated: false,
@@ -69,11 +87,12 @@ export function matchIdempotentStart(
 	records: readonly TaskRecord[],
 	request: OwnedTaskStart,
 ): TaskRecord | undefined {
-	const requestHash = canonicalTaskRequestHash(request);
-	const sameScope = records.filter((record) => record.peerId === request.peerId);
+	const normalized = normalizeOwnedTaskStart(request);
+	const requestHash = canonicalTaskRequestHash(normalized);
+	const sameScope = records.filter((record) => record.peerId === normalized.peerId);
 	const match = sameScope.find((record) =>
-		record.delegationRequestId === request.delegationRequestId
-		|| record.taskId === request.taskId,
+		record.delegationRequestId === normalized.delegationRequestId
+		|| record.taskId === normalized.taskId,
 	);
 
 	if (match === undefined) {
@@ -81,8 +100,8 @@ export function matchIdempotentStart(
 	}
 
 	if (
-		match.delegationRequestId !== request.delegationRequestId
-		|| match.taskId !== request.taskId
+		match.delegationRequestId !== normalized.delegationRequestId
+		|| match.taskId !== normalized.taskId
 		|| match.requestHash !== requestHash
 	) {
 		throw new MeshDomainError(
@@ -98,7 +117,12 @@ export function getOwnedTask(
 	record: TaskRecord | undefined,
 	authenticatedPeerId: string,
 ): TaskRecord {
-	if (record === undefined || record.peerId !== authenticatedPeerId) {
+	const parsedPeerId = uuidSchema.safeParse(authenticatedPeerId);
+	if (
+		record === undefined
+		|| !parsedPeerId.success
+		|| record.peerId !== parsedPeerId.data
+	) {
 		throw new MeshDomainError('TASK_NOT_FOUND', 'Task not found.');
 	}
 	return record;

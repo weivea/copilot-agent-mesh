@@ -2,7 +2,7 @@ import { z } from 'zod';
 
 export const PROTOCOL_LIMITS = {
 	frameBytes: 1_048_576,
-	taskEventJournalBytes: 768 * 1_024,
+	taskEventJournalBytes: 640 * 1_024,
 	unauthenticatedFrameBytes: 65_536,
 	taskTitleBytes: 256,
 	taskPromptBytes: 128 * 1_024,

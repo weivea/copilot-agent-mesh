@@ -8,7 +8,7 @@ import {
 } from './constants';
 import { PROTOCOL_LIMITS, utf8ByteLength, utf8String } from './limits';
 
-export const uuidSchema = z.string().uuid();
+export const uuidSchema = z.string().uuid().transform((value) => value.toLowerCase());
 export const timestampSchema = z.string().datetime({ offset: true });
 export const taskStatusSchema = z.enum(TASK_STATUSES);
 export const activeTaskStatusSchema = z.enum(ACTIVE_TASK_STATUSES);
@@ -62,13 +62,14 @@ export const recoveryDescriptorSchema = z.strictObject({
 
 export type RecoveryDescriptor = z.infer<typeof recoveryDescriptorSchema>;
 
-export const persistedTaskRecordSchema = z.strictObject({
+const persistedTaskRecordObjectSchema = z.strictObject({
 	schemaVersion: z.literal(1),
 	taskId: uuidSchema,
 	delegationRequestId: uuidSchema,
 	requestHash: z.string().regex(/^[a-f0-9]{64}$/),
 	peerId: uuidSchema,
 	workspaceId: uuidSchema,
+	workspaceLeaseKey: utf8String(1_024, 'workspace lease key', 1),
 	title: utf8String(PROTOCOL_LIMITS.taskTitleBytes, 'task title', 1),
 	state: taskStatusSchema,
 	createdAt: timestampSchema,
@@ -84,7 +85,48 @@ export const persistedTaskRecordSchema = z.strictObject({
 	events: z.array(taskEventRecordSchema),
 	earliestAvailableEventSeq: z.number().int().positive().optional(),
 	eventsTruncated: z.boolean(),
-}).superRefine((record, context) => {
+});
+
+export const persistedTaskRecordSchema = persistedTaskRecordObjectSchema
+	.superRefine(validateTaskState)
+	.superRefine(validateFullJournal);
+
+function validateTaskState(
+	record: {
+		readonly state: z.infer<typeof taskStatusSchema>;
+		readonly pendingInput?: z.infer<typeof pendingInputSchema>;
+	},
+	context: z.RefinementCtx,
+): void {
+	if (record.state === 'needsInput' && record.pendingInput === undefined) {
+		context.addIssue({
+			code: 'custom',
+			path: ['pendingInput'],
+			message: 'needsInput tasks must include pending input',
+		});
+	}
+	if (
+		record.pendingInput !== undefined
+		&& record.state !== 'needsInput'
+		&& record.state !== 'recovering'
+	) {
+		context.addIssue({
+			code: 'custom',
+			path: ['pendingInput'],
+			message: 'Only needsInput or recovering tasks may retain pending input',
+		});
+	}
+}
+
+function validateFullJournal(
+	record: {
+		readonly eventSeq: number;
+		readonly events: readonly z.infer<typeof taskEventRecordSchema>[];
+		readonly earliestAvailableEventSeq?: number;
+		readonly eventsTruncated: boolean;
+	},
+	context: z.RefinementCtx,
+): void {
 	const expectedFirstSequence = record.eventsTruncated
 		? record.earliestAvailableEventSeq
 		: 1;
@@ -101,6 +143,13 @@ export const persistedTaskRecordSchema = z.strictObject({
 			code: 'custom',
 			path: ['earliestAvailableEventSeq'],
 			message: 'Untruncated event journals cannot declare a gap',
+		});
+	}
+	if (record.eventsTruncated && (record.earliestAvailableEventSeq ?? 0) <= 1) {
+		context.addIssue({
+			code: 'custom',
+			path: ['earliestAvailableEventSeq'],
+			message: 'Truncated event journals must begin after the first event sequence',
 		});
 	}
 	for (let index = 0; index < record.events.length; index += 1) {
@@ -123,36 +172,132 @@ export const persistedTaskRecordSchema = z.strictObject({
 			message: 'Event sequence must match the newest retained event',
 		});
 	}
-	if (utf8ByteLength(JSON.stringify(record.events)) > PROTOCOL_LIMITS.frameBytes) {
+	if (
+		utf8ByteLength(JSON.stringify(record.events))
+		> PROTOCOL_LIMITS.taskEventJournalBytes
+	) {
 		context.addIssue({
 			code: 'custom',
 			path: ['events'],
-			message: 'Serialized event journal exceeds 1 MiB',
+			message: 'Serialized event journal exceeds its reserved response budget',
 		});
 	}
-});
+}
 
 export type PersistedTaskRecord = z.infer<typeof persistedTaskRecordSchema>;
 
-export const taskSnapshotSchema = persistedTaskRecordSchema
+const taskSnapshotObjectSchema = persistedTaskRecordObjectSchema
 	.omit({
 		recoveryDescriptor: true,
 		answeredInputs: true,
+		workspaceLeaseKey: true,
 	})
 	.extend({
 		deviceId: uuidSchema,
+	});
+
+function validateWireJournalBudget(
+	snapshot: { readonly events: readonly z.infer<typeof taskEventRecordSchema>[] },
+	context: z.RefinementCtx,
+): void {
+	if (
+		utf8ByteLength(JSON.stringify(snapshot.events))
+		> PROTOCOL_LIMITS.taskEventJournalBytes
+	) {
+		context.addIssue({
+			code: 'custom',
+			path: ['events'],
+			message: 'Wire event journal exceeds the reserved task response budget',
+		});
+	}
+}
+
+function validateWireEnvelopeBudget(
+	snapshot: object,
+	context: z.RefinementCtx,
+): void {
+	const maximalEnvelope = {
+		jsonrpc: '2.0',
+		id: 'x'.repeat(PROTOCOL_LIMITS.identifierBytes),
+		result: snapshot,
+	};
+	if (utf8ByteLength(JSON.stringify(maximalEnvelope)) >= PROTOCOL_LIMITS.frameBytes) {
+		context.addIssue({
+			code: 'custom',
+			message: 'Serialized task response exceeds the JSON-RPC frame limit',
+		});
+	}
+}
+
+export const taskSnapshotSchema = taskSnapshotObjectSchema
+	.superRefine(validateTaskState)
+	.superRefine(validateFullJournal)
+	.superRefine(validateWireJournalBudget)
+	.superRefine(validateWireEnvelopeBudget);
+
+export const taskSnapshotAfterEventSeqSchema = taskSnapshotObjectSchema
+	.extend({
+		afterEventSeq: z.number().int().nonnegative(),
 	})
+	.superRefine(validateTaskState)
 	.superRefine((snapshot, context) => {
+		if (snapshot.afterEventSeq > snapshot.eventSeq) {
+			context.addIssue({
+				code: 'custom',
+				path: ['afterEventSeq'],
+				message: 'afterEventSeq cannot exceed the task event sequence',
+			});
+			return;
+		}
+		const earliest = snapshot.earliestAvailableEventSeq ?? 1;
+		const gap = snapshot.afterEventSeq + 1 < earliest;
+		if (snapshot.eventsTruncated !== gap) {
+			context.addIssue({
+				code: 'custom',
+				path: ['eventsTruncated'],
+				message: 'Slice truncation must indicate whether afterEventSeq precedes retained events',
+			});
+		}
+		if (snapshot.earliestAvailableEventSeq !== undefined && earliest > snapshot.eventSeq + 1) {
+			context.addIssue({
+				code: 'custom',
+				path: ['earliestAvailableEventSeq'],
+				message: 'Earliest retained sequence cannot exceed the next event sequence',
+			});
+		}
+		const expectedFirst = Math.max(snapshot.afterEventSeq + 1, earliest);
+		const actualFirst = snapshot.events[0]?.eventSeq ?? snapshot.eventSeq + 1;
+		if (actualFirst !== expectedFirst) {
+			context.addIssue({
+				code: 'custom',
+				path: ['events', 0, 'eventSeq'],
+				message: 'Sliced events must begin at the first available sequence after afterEventSeq',
+			});
+		}
+		for (let index = 0; index < snapshot.events.length; index += 1) {
+			if (snapshot.events[index].eventSeq !== actualFirst + index) {
+				context.addIssue({
+					code: 'custom',
+					path: ['events', index, 'eventSeq'],
+					message: 'Sliced event sequences must be contiguous',
+				});
+			}
+		}
 		if (
-			utf8ByteLength(JSON.stringify(snapshot.events))
-			> PROTOCOL_LIMITS.taskEventJournalBytes
+			snapshot.events.length > 0
+			&& snapshot.events[snapshot.events.length - 1].eventSeq !== snapshot.eventSeq
 		) {
 			context.addIssue({
 				code: 'custom',
-				path: ['events'],
-				message: 'Wire event journal exceeds the reserved task response budget',
+				path: ['eventSeq'],
+				message: 'Sliced events must end at the current task event sequence',
 			});
 		}
-	});
+	})
+	.superRefine((snapshot, context) => {
+		validateWireJournalBudget(snapshot, context);
+	})
+	.superRefine(validateWireEnvelopeBudget);
 
 export type TaskSnapshot = z.infer<typeof taskSnapshotSchema>;
+export type TaskSnapshotAfterEventSeq = z.infer<typeof taskSnapshotAfterEventSeqSchema>;

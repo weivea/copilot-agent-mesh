@@ -48,11 +48,14 @@ export class FileTaskStore {
 		if (!validated.success) {
 			throw new TypeError(`Invalid task record: ${validated.error.message}`);
 		}
-		const existing = await this.getOwnedUnlocked(record.peerId, record.taskId);
+		const existing = await this.getOwnedUnlocked(validated.data.peerId, validated.data.taskId);
 		if (existing !== undefined) {
 			throw new MeshDomainError('TASK_ID_CONFLICT', 'Task already exists.');
 		}
-		await this.files.writeJson(taskPath(record.peerId, record.taskId), validated.data);
+		await this.files.writeJson(
+			taskPath(validated.data.peerId, validated.data.taskId),
+			validated.data,
+		);
 		return validated.data;
 	}
 
@@ -68,7 +71,10 @@ export class FileTaskStore {
 		if (!validated.success) {
 			throw new TypeError(`Invalid task record: ${validated.error.message}`);
 		}
-		await this.files.writeJson(taskPath(record.peerId, record.taskId), validated.data);
+		await this.files.writeJson(
+			taskPath(validated.data.peerId, validated.data.taskId),
+			validated.data,
+		);
 		return validated.data;
 	}
 

@@ -4,6 +4,7 @@ import {
 	readFile,
 	readdir,
 	rename,
+	rmdir,
 	unlink,
 	writeFile,
 } from 'node:fs/promises';
@@ -18,6 +19,7 @@ export interface AtomicFileSystem {
 	syncFile(path: string): Promise<void>;
 	rename(from: string, to: string): Promise<void>;
 	syncDirectory(path: string): Promise<void>;
+	removeDirectory(path: string): Promise<void>;
 	unlink(path: string): Promise<void>;
 	readdir(path: string): Promise<readonly string[]>;
 }
@@ -72,6 +74,10 @@ export class NodeAtomicFileSystem implements AtomicFileSystem {
 		return unlink(path);
 	}
 
+	public async removeDirectory(path: string): Promise<void> {
+		await rmdir(path);
+	}
+
 	public readdir(path: string): Promise<readonly string[]> {
 		return readdir(path);
 	}
@@ -86,6 +92,7 @@ export class StorageCorruptionError extends Error {
 
 export class AtomicFileStore {
 	private writeQueue: Promise<void> = Promise.resolve();
+	private readonly pendingDirectorySyncs = new Map<string, string>();
 
 	public constructor(
 		private readonly rootDirectory: string,
@@ -192,8 +199,26 @@ export class AtomicFileStore {
 		for (const segment of relativeDirectory.split(sep)) {
 			const parent = current;
 			current = join(current, segment);
-			if (await this.fileSystem.mkdir(current)) {
-				await this.fileSystem.syncDirectory(parent);
+			const created = await this.fileSystem.mkdir(current);
+			if (created || this.pendingDirectorySyncs.has(current)) {
+				this.pendingDirectorySyncs.set(current, parent);
+				try {
+					await this.fileSystem.syncDirectory(parent);
+					this.pendingDirectorySyncs.delete(current);
+				} catch (error) {
+					if (created) {
+						try {
+							await this.fileSystem.removeDirectory(current);
+							this.pendingDirectorySyncs.delete(current);
+						} catch (rollbackError) {
+							throw new AggregateError(
+								[error, rollbackError],
+								`Directory sync and rollback both failed for "${current}".`,
+							);
+						}
+					}
+					throw error;
+				}
 			}
 		}
 	}

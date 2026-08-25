@@ -146,6 +146,20 @@ describe('protocol schemas', () => {
 		}).success, false);
 		assert.strictEqual(persistedTaskRecordSchema.safeParse({
 			...record,
+			state: 'running',
+			pendingInput: { inputId: IDS.input, prompt: 'Not answerable' },
+		}).success, false);
+		assert.strictEqual(persistedTaskRecordSchema.safeParse({
+			...record,
+			state: 'needsInput',
+		}).success, false);
+		assert.strictEqual(persistedTaskRecordSchema.safeParse({
+			...record,
+			state: 'recovering',
+			pendingInput: { inputId: IDS.input, prompt: 'Still answerable after recovery' },
+		}).success, true);
+		assert.strictEqual(persistedTaskRecordSchema.safeParse({
+			...record,
 			output: 'must not persist',
 		}).success, false);
 		assert.strictEqual(persistedTaskRecordSchema.safeParse({

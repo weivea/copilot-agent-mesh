@@ -18,9 +18,10 @@ runtime and does not inspect or control Git.
   and 65,536 nodes, so adversarial nesting cannot overflow the call stack.
 - `shared/protocol.ts` remains a compatibility export while runtime schemas live
   under `shared/protocol/`.
-- Local workspace URIs exist only in `WorkspaceRegistry` persisted state.
-  `WorkspaceSummary` and Webview schemas expose opaque `workspaceId` values and
-  have no local path or URI field.
+- Local workspace URIs and canonical filesystem identities exist only in
+  `WorkspaceRegistry` persisted state. `WorkspaceSummary`, task snapshots, and
+  Webview schemas expose opaque `workspaceId` values and have no local path,
+  URI, or lease-key field.
 
 ## Task invariants
 
@@ -33,6 +34,8 @@ Terminal states are `completed`, `failed`, `cancelled`, and `timedOut`.
 - Terminal records are immutable.
 - Cancel and answer retries are idempotent. A completion arriving after
   cancellation begins cannot overwrite `cancelling`.
+- Pending input survives agent recovery, but is cleared whenever the task
+  leaves `needsInput` for a non-answerable state.
 - Task access is scoped to the authenticated owner. A different peer receives
   the same `TASK_NOT_FOUND` result as a missing task.
 - Workspace leases are owned by the compound `(peerId, taskId)` identity, so
@@ -43,26 +46,33 @@ Terminal states are `completed`, `failed`, `cancelled`, and `timedOut`.
 - The canonical hash uses UTF-8 byte-length-prefixed semantic fields. Prompt,
   title, and acceptance criteria are not trimmed, line-ending-normalized, or
   otherwise rewritten.
+- UUID inputs are canonicalized to lowercase before hashing, ownership checks,
+  idempotency matching, and task filename construction.
 
 ## Storage and recovery
 
 `DeviceProfileStore` and `WorkspaceRegistry` use only the injected state
 adapter's `get` and `update` operations. They never call `setKeysForSync`.
 Device IDs remain stable across reloads and renames. Workspace IDs are generated
-opaque identifiers.
+opaque identifiers. Workspace registration lexically normalizes file URIs, then
+uses an injected `FileIdentityResolver` to resolve aliases and symbolic links.
+The resolver's canonical filesystem identity is the deduplication and lease key.
 
 `AtomicFileStore` uses a temporary file, file sync, atomic rename, and directory
 sync where the platform supports it. New directories are created one level at a
 time below the owned storage root, and each new directory entry is persisted by
 syncing only its owned parent; ancestors outside the storage root are untouched.
-Writes are serialized in process.
+If that parent sync fails, the newly created empty directory is removed so a
+retry must recreate and sync it; if rollback also fails, the store remembers
+the unsynced entry and forces its parent sync on retry. Writes are serialized
+in process.
 `FileTaskStore` validates every task record, serializes read-modify-write
 transitions, and stores one peer-namespaced task file per task. These task files
 are the recovery authority; in-memory workspace leases are rebuilt from active
 records. A corrupt record fails recovery explicitly rather than producing an
 empty or successful-looking result.
 
-Task event journals retain a contiguous suffix for at most 24 hours and 768 KiB
+Task event journals retain a contiguous suffix for at most 24 hours and 640 KiB
 of serialized UTF-8 JSON, reserving headroom for the task snapshot and JSON-RPC
 envelope within the 1 MiB frame. Truncation updates
 `earliestAvailableEventSeq` and `eventsTruncated`; an individually oversized
@@ -83,6 +93,7 @@ contain the full prompt or raw output by default.
 | `IdGenerator` | Injectable UUID/opaque ID generation |
 | `StateStore` | Non-secret local state without Settings Sync |
 | `AtomicFileSystem` | Injectable filesystem operations for atomic replacement |
+| `FileIdentityResolver` / `NodeFileIdentityResolver` | Injectable canonical URI and filesystem identity resolution |
 | `LocalDesktopWorkspaceGuard` | Reusable runtime entry-point policy |
 | `DeviceProfileStore` | Stable local device identity |
 | `WorkspaceRegistry` | Local URI registry and opaque wire summaries |

@@ -6,6 +6,7 @@ import {
 	PROTOCOL_LIMITS,
 	rpcSuccessResponseSchema,
 	taskSnapshotSchema,
+	taskSnapshotAfterEventSeqSchema,
 	utf8ByteLength,
 } from '../../../shared/protocol';
 import { InvalidTaskTransitionError, MeshDomainError } from '../../domain/errors';
@@ -178,16 +179,33 @@ describe('task domain', () => {
 		const {
 			answeredInputs: _answeredInputs,
 			recoveryDescriptor: _recoveryDescriptor,
+			workspaceLeaseKey: _workspaceLeaseKey,
 			...wireRecord
 		} = compacted;
 		const snapshot = {
 			...wireRecord,
 			deviceId: IDS.device,
+			title: '\0'.repeat(PROTOCOL_LIMITS.taskTitleBytes),
+			state: 'needsInput',
+			pendingInput: {
+				inputId: IDS.input,
+				prompt: '\0'.repeat(PROTOCOL_LIMITS.taskAnswerBytes),
+			},
+			summary: '\0'.repeat(PROTOCOL_LIMITS.terminalSummaryBytes),
+			failure: {
+				code: '\0'.repeat(128),
+				message: '\0'.repeat(PROTOCOL_LIMITS.errorMessageBytes),
+				retryable: true,
+			},
 		};
 		assert.strictEqual(taskSnapshotSchema.safeParse(snapshot).success, true);
+		assert.strictEqual(taskSnapshotSchema.safeParse({
+			...snapshot,
+			workspaceLeaseKey: '/must/not/reach/wire',
+		}).success, false);
 		const response = {
 			jsonrpc: '2.0',
-			id: 'request-1',
+			id: 'x'.repeat(PROTOCOL_LIMITS.identifierBytes),
 			result: snapshot,
 		};
 		assert.strictEqual(rpcSuccessResponseSchema.safeParse(response).success, true);
@@ -197,6 +215,52 @@ describe('task domain', () => {
 		assert.ok(
 			taskEventJournalBytes(compacted) <= PROTOCOL_LIMITS.taskEventJournalBytes,
 		);
+	});
+
+	test('validates full and afterEventSeq journal sequence invariants separately', () => {
+		const record = {
+			...createAcceptedTask(taskRequest(), AT),
+			eventSeq: 3,
+			eventsTruncated: true,
+			earliestAvailableEventSeq: 2,
+			events: [
+				{ eventSeq: 2, at: AT, type: 'two' },
+				{ eventSeq: 3, at: AT, type: 'three' },
+			],
+		};
+		const {
+			answeredInputs: _answeredInputs,
+			recoveryDescriptor: _recoveryDescriptor,
+			workspaceLeaseKey: _workspaceLeaseKey,
+			...wireRecord
+		} = record;
+		const snapshot = { ...wireRecord, deviceId: IDS.device };
+		assert.strictEqual(taskSnapshotSchema.safeParse(snapshot).success, true);
+		assert.strictEqual(taskSnapshotSchema.safeParse({
+			...snapshot,
+			events: [{ eventSeq: 3, at: AT, type: 'three' }],
+		}).success, false);
+		assert.strictEqual(taskSnapshotSchema.safeParse({
+			...snapshot,
+			eventsTruncated: true,
+			earliestAvailableEventSeq: 1,
+			events: [
+				{ eventSeq: 1, at: AT, type: 'one' },
+				{ eventSeq: 2, at: AT, type: 'two' },
+				{ eventSeq: 3, at: AT, type: 'three' },
+			],
+		}).success, false);
+		assert.strictEqual(taskSnapshotAfterEventSeqSchema.safeParse({
+			...snapshot,
+			afterEventSeq: 2,
+			eventsTruncated: false,
+			events: [{ eventSeq: 3, at: AT, type: 'three' }],
+		}).success, true);
+		assert.strictEqual(taskSnapshotAfterEventSeqSchema.safeParse({
+			...snapshot,
+			afterEventSeq: 0,
+			eventsTruncated: false,
+		}).success, false);
 	});
 
 	test('allows every active state to fail or time out', () => {
@@ -214,6 +278,41 @@ describe('task domain', () => {
 				at: LATER,
 				message: 'Timed out',
 			}).state, 'timedOut');
+		}
+	});
+
+	test('clears pending input whenever needsInput becomes non-answerable', () => {
+		const waiting: TaskRecord = {
+			...createAcceptedTask(taskRequest(), AT),
+			state: 'needsInput',
+			pendingInput: { inputId: IDS.input, prompt: 'Pending' },
+		};
+		const outcomes = [
+			taskReducer(waiting, {
+				type: 'cancelRequested',
+				at: LATER,
+				cancellationDeadline: DEADLINE,
+			}),
+			taskReducer(waiting, {
+				type: 'failed',
+				at: LATER,
+				code: 'FAILED',
+				message: 'Failed',
+				retryable: false,
+			}),
+			taskReducer(waiting, {
+				type: 'timedOut',
+				at: LATER,
+				message: 'Timed out',
+			}),
+			taskReducer(waiting, {
+				type: 'completed',
+				at: LATER,
+				summary: 'Completed without an answer',
+			}),
+		];
+		for (const outcome of outcomes) {
+			assert.strictEqual(outcome.pendingInput, undefined);
 		}
 	});
 
@@ -318,6 +417,32 @@ describe('task domain', () => {
 		assert.strictEqual(plain, canonicalTaskRequestHash(taskRequest({ prompt: 'line\n' })));
 	});
 
+	test('normalizes UUID case consistently for hashes, records, and ownership', () => {
+		const upperPeer = 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA';
+		const upperTask = 'BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB';
+		const upperDelegation = 'CCCCCCCC-CCCC-4CCC-8CCC-CCCCCCCCCCCC';
+		const upperWorkspace = 'DDDDDDDD-DDDD-4DDD-8DDD-DDDDDDDDDDDD';
+		const upper = taskRequest({
+			peerId: upperPeer,
+			taskId: upperTask,
+			delegationRequestId: upperDelegation,
+			workspaceId: upperWorkspace,
+		});
+		const lower = {
+			...upper,
+			peerId: upperPeer.toLowerCase(),
+			taskId: upperTask.toLowerCase(),
+			delegationRequestId: upperDelegation.toLowerCase(),
+			workspaceId: upperWorkspace.toLowerCase(),
+		};
+		assert.strictEqual(canonicalTaskRequestHash(upper), canonicalTaskRequestHash(lower));
+		const record = createAcceptedTask(upper, AT);
+		assert.strictEqual(record.peerId, lower.peerId);
+		assert.strictEqual(record.taskId, lower.taskId);
+		assert.strictEqual(matchIdempotentStart([record], lower), record);
+		assert.strictEqual(getOwnedTask(record, upperPeer), record);
+	});
+
 	test('enforces peer-scoped idempotency and conflict detection', () => {
 		const record = createAcceptedTask(taskRequest(), AT);
 		assert.strictEqual(matchIdempotentStart([record], taskRequest()), record);
@@ -349,25 +474,38 @@ describe('task domain', () => {
 
 	test('enforces and restores one lease per workspace', () => {
 		const leases = new WorkspaceLeaseManager();
+		const leaseKey = IDS.workspaceLeaseKey;
 		assert.throws(
-			() => leases.acquire('invalid', IDS.peer, IDS.task),
+			() => leases.acquire('', IDS.peer, IDS.task),
 			TypeError,
 		);
-		leases.acquire(IDS.workspace, IDS.peer, IDS.task);
-		leases.acquire(IDS.workspace, IDS.peer, IDS.task);
+		const upperPeer = 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA';
+		const upperTask = 'BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB';
+		leases.acquire('canonical-file-identity', upperPeer, upperTask);
+		assert.deepStrictEqual(leases.owner('canonical-file-identity'), {
+			peerId: upperPeer.toLowerCase(),
+			taskId: upperTask.toLowerCase(),
+		});
+		leases.release(
+			'canonical-file-identity',
+			upperPeer.toLowerCase(),
+			upperTask.toLowerCase(),
+		);
+		leases.acquire(leaseKey, IDS.peer, IDS.task);
+		leases.acquire(leaseKey, IDS.peer, IDS.task);
 		assert.throws(
-			() => leases.acquire(IDS.workspace, IDS.peer, IDS.otherTask),
+			() => leases.acquire(leaseKey, IDS.peer, IDS.otherTask),
 			(error) => error instanceof MeshDomainError && error.reason === 'WORKSPACE_BUSY',
 		);
-		leases.release(IDS.workspace, IDS.peer, IDS.otherTask);
-		assert.deepStrictEqual(leases.owner(IDS.workspace), {
+		leases.release(leaseKey, IDS.peer, IDS.otherTask);
+		assert.deepStrictEqual(leases.owner(leaseKey), {
 			peerId: IDS.peer,
 			taskId: IDS.task,
 		});
-		leases.release(IDS.workspace, IDS.otherPeer, IDS.task);
-		assert.strictEqual(leases.isLeased(IDS.workspace), true);
+		leases.release(leaseKey, IDS.otherPeer, IDS.task);
+		assert.strictEqual(leases.isLeased(leaseKey), true);
 		assert.throws(
-			() => leases.acquire(IDS.workspace, IDS.otherPeer, IDS.task),
+			() => leases.acquire(leaseKey, IDS.otherPeer, IDS.task),
 			(error) => error instanceof MeshDomainError && error.reason === 'WORKSPACE_BUSY',
 		);
 		leases.restoreFromTaskRecords([
@@ -381,7 +519,7 @@ describe('task domain', () => {
 				state: 'completed',
 			},
 		]);
-		assert.deepStrictEqual(leases.owner(IDS.workspace), {
+		assert.deepStrictEqual(leases.owner(leaseKey), {
 			peerId: IDS.peer,
 			taskId: IDS.task,
 		});
@@ -396,7 +534,7 @@ describe('task domain', () => {
 				state: 'recovering',
 			},
 		]));
-		assert.deepStrictEqual(leases.owner(IDS.workspace), {
+		assert.deepStrictEqual(leases.owner(leaseKey), {
 			peerId: IDS.peer,
 			taskId: IDS.task,
 		});
@@ -404,8 +542,8 @@ describe('task domain', () => {
 			...createAcceptedTask(taskRequest(), AT),
 			state: 'failed' as const,
 		};
-		leases.acquire(IDS.workspace, IDS.peer, IDS.task);
+		leases.acquire(leaseKey, IDS.peer, IDS.task);
 		leases.releaseForPersistedTerminal(terminal);
-		assert.strictEqual(leases.isLeased(IDS.workspace), false);
+		assert.strictEqual(leases.isLeased(leaseKey), false);
 	});
 });
