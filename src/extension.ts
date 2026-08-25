@@ -468,6 +468,19 @@ async function requestTaskAnswer(request: AgentInputRequest): Promise<AgentTaskA
 		const choice = await vscode.window.showWarningMessage(request.prompt, { modal: true }, 'Approve', 'Deny');
 		return { requestId: request.requestId, outcome: choice === 'Approve' ? 'accept' : 'decline' };
 	}
+	if ((request.fields?.length ?? 0) === 0) {
+		const urlText = request.url === undefined ? '' : `\n\nReview URL: ${safeElicitationUrlText(request.url)}`;
+		const choice = await vscode.window.showWarningMessage(
+			`${request.prompt}${urlText}`,
+			{ modal: true },
+			'Accept',
+			'Decline',
+		);
+		return {
+			requestId: request.requestId,
+			outcome: choice === 'Accept' ? 'accept' : choice === 'Decline' ? 'decline' : 'cancel',
+		};
+	}
 	const values: Record<string, AgentInputValue> = {};
 	for (const field of request.fields ?? []) {
 		if (!field.required) {
@@ -564,4 +577,16 @@ async function requestTaskAnswer(request: AgentInputRequest): Promise<AgentTaskA
 		return undefined;
 	}
 	return { requestId: request.requestId, outcome: 'accept', values };
+}
+
+function safeElicitationUrlText(value: string): string {
+	try {
+		const url = new URL(value);
+		if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+			return '[unsupported URL]';
+		}
+		return `${url.origin}${url.pathname}`;
+	} catch {
+		return '[invalid URL]';
+	}
 }

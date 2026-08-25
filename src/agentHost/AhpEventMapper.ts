@@ -307,6 +307,7 @@ export class AhpEventMapper {
 	private mapChatInput(chatUri: string, request: {
 		readonly id: string;
 		readonly message?: string;
+		readonly url?: string;
 		readonly questions?: readonly unknown[];
 	}): readonly AgentRuntimeEvent[] {
 		const questions = (request.questions ?? []).map(parseQuestion);
@@ -320,6 +321,7 @@ export class AhpEventMapper {
 			requestId: request.id,
 			kind: 'chatInput',
 			prompt: bounded(request.message ?? 'The agent requires input.', 1_024),
+			url: request.url,
 			fields: questions.map((question) => ({
 				id: question.id,
 				prompt: question.prompt,

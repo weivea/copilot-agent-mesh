@@ -449,6 +449,8 @@ class AhpTask implements AgentTaskHandle {
 	private provider: AgentInfo | undefined;
 	private sessionReady = false;
 	private sessionDefaultChat: string | undefined;
+	private sessionDefaultChatState: 'unknown' | 'available' | 'cleared' = 'unknown';
+	private sessionDefaultChatRevision = 0;
 	private sessionCreated = false;
 	private lastSeenServerSeq = 0;
 	private terminal = false;
@@ -490,6 +492,7 @@ class AhpTask implements AgentTaskHandle {
 	private readonly deliveredResponsePartLengths = new Map<string, number>();
 	private readonly deliveredResponsePartStates = new Set<string>();
 	private readonly deliveredResponsePartOrdinals = new Map<string, number>();
+	private readonly retainedRecoveryCandidates = new Set<RecoveryCandidateCleanup>();
 
 	constructor(
 		private readonly request: ResolvedAgentTaskRequest,
@@ -564,32 +567,37 @@ class AhpTask implements AgentTaskHandle {
 		]);
 		this.throwIfTerminalError();
 		await this.waitForStartupRecovery();
-		let defaultChat: string;
 		while (true) {
-			defaultChat = await this.ensureStartupChatSubscription();
-			const generation = await this.waitForStartupRecovery();
-			await this.scheduleOwnedTerminals(this.rootTerminals, generation, true);
-			await this.waitForStartupRecovery();
+			const defaultChat = await this.ensureStartupChatSubscription();
+			const subscribedGeneration = await this.waitForStartupRecovery();
+			const defaultChatRevision = this.sessionDefaultChatRevision;
+			await this.scheduleOwnedTerminals(this.rootTerminals, subscribedGeneration, true);
+			const dispatchGeneration = await this.waitForStartupRecovery();
 			this.throwIfTerminalError();
-			if (this.sessionDefaultChat === defaultChat && this.subscriptions.has(defaultChat)) {
-				break;
+			if (
+				dispatchGeneration !== subscribedGeneration
+				|| !dispatchGeneration.valid
+				|| this.sessionDefaultChatRevision !== defaultChatRevision
+				|| this.sessionDefaultChatState !== 'available'
+				|| this.sessionDefaultChat !== defaultChat
+				|| dispatchGeneration.subscriptions.get(defaultChat) === undefined
+			) {
+				await this.releaseStartupSubscription(defaultChat, subscribedGeneration);
+				continue;
 			}
-			await this.releaseStartupSubscription(defaultChat);
+			this.turnId = randomUUID();
+			this.chatUri = defaultChat;
+			this.dispatchTracked(defaultChat, {
+				type: 'chat/turnStarted',
+				turnId: this.turnId,
+				startedAt: new Date().toISOString(),
+				message: {
+					text: buildPrompt(this.request),
+					origin: { kind: 'user' },
+				},
+			});
+			break;
 		}
-
-		this.turnId = randomUUID();
-		await this.waitForStartupRecovery();
-		this.throwIfTerminalError();
-		this.chatUri = defaultChat;
-		this.dispatchTracked(defaultChat, {
-			type: 'chat/turnStarted',
-			turnId: this.turnId,
-			startedAt: new Date().toISOString(),
-			message: {
-				text: buildPrompt(this.request),
-				origin: { kind: 'user' },
-			},
-		});
 		this.throwIfTerminalFailure();
 		await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
 		this.throwIfTerminalFailure();
@@ -668,6 +676,12 @@ class AhpTask implements AgentTaskHandle {
 			}]);
 		}
 		await this.drainAuthNotificationsForDispose();
+		await runCleanupPhase(
+			[...this.retainedRecoveryCandidates].map((candidate) => ({
+				label: 'dispose retained recovery candidate',
+				run: () => candidate.dispose(),
+			})),
+		);
 		if (!this.terminalUpdatesSettled) {
 			const terminalUpdates = this.terminalSubscriptionUpdates.get(this.connection);
 			if (terminalUpdates !== undefined) {
@@ -952,6 +966,12 @@ class AhpTask implements AgentTaskHandle {
 	}
 
 	private async ensureStartupChatSubscription(): Promise<string> {
+		if (this.sessionDefaultChatState === 'cleared') {
+			throw new AgentRuntimeError(
+				'TASK_EXECUTION_FAILED',
+				'The Agent Host Session cleared its default Chat before the turn could start.',
+			);
+		}
 		const defaultChat = this.sessionDefaultChat;
 		if (defaultChat === undefined) {
 			throw new AgentRuntimeError('TASK_EXECUTION_FAILED', 'The recovered Agent Host Session has no default Chat.');
@@ -960,8 +980,7 @@ class AhpTask implements AgentTaskHandle {
 		return defaultChat;
 	}
 
-	private async releaseStartupSubscription(uri: string): Promise<void> {
-		const generation = await this.waitForStartupRecovery();
+	private async releaseStartupSubscription(uri: string, generation: ConnectionGeneration): Promise<void> {
 		const subscription = generation.subscriptions.get(uri);
 		if (subscription === undefined) {
 			return;
@@ -1074,9 +1093,8 @@ class AhpTask implements AgentTaskHandle {
 				this.readyReject?.(error);
 				this.defaultChatReject?.(error);
 				this.fail(error);
-			} else if (action.type === 'session/defaultChatChanged' && action.defaultChat !== undefined) {
-				this.sessionDefaultChat = action.defaultChat;
-				this.defaultChatResolve?.(action.defaultChat);
+			} else if (action.type === 'session/defaultChatChanged') {
+				this.updateSessionDefaultChat(action.defaultChat);
 			}
 		}
 		this.trackDeliveredResponseAction(action);
@@ -1165,8 +1183,9 @@ class AhpTask implements AgentTaskHandle {
 				this.readyResolve?.();
 			}
 			if (state.defaultChat !== undefined) {
-				this.sessionDefaultChat = state.defaultChat;
-				this.defaultChatResolve?.(state.defaultChat);
+				this.updateSessionDefaultChat(state.defaultChat);
+			} else if (state.lifecycle === 'ready') {
+				this.updateSessionDefaultChat(undefined);
 			}
 			return;
 		}
@@ -1367,13 +1386,33 @@ class AhpTask implements AgentTaskHandle {
 	}
 
 	private waitForDefaultChat(): Promise<string> {
-		if (this.sessionDefaultChat !== undefined) {
+		if (this.sessionDefaultChatState === 'available' && this.sessionDefaultChat !== undefined) {
 			return Promise.resolve(this.sessionDefaultChat);
+		}
+		if (this.sessionDefaultChatState === 'cleared') {
+			return Promise.reject(new AgentRuntimeError(
+				'TASK_EXECUTION_FAILED',
+				'The Agent Host Session has no default Chat.',
+			));
 		}
 		return withTimeout(new Promise<string>((resolvePromise, reject) => {
 			this.defaultChatResolve = resolvePromise;
 			this.defaultChatReject = reject;
 		}), sessionReadyTimeoutMs, 'The Agent Host session did not publish a default chat.');
+	}
+
+	private updateSessionDefaultChat(defaultChat: string | undefined): void {
+		this.sessionDefaultChat = defaultChat;
+		this.sessionDefaultChatState = defaultChat === undefined ? 'cleared' : 'available';
+		this.sessionDefaultChatRevision += 1;
+		if (defaultChat !== undefined) {
+			this.defaultChatResolve?.(defaultChat);
+		} else {
+			this.defaultChatReject?.(new AgentRuntimeError(
+				'TASK_EXECUTION_FAILED',
+				'The Agent Host Session cleared its default Chat.',
+			));
+		}
 	}
 
 	private async subscribeOwnedTerminals(
@@ -1694,13 +1733,18 @@ class AhpTask implements AgentTaskHandle {
 					candidateGeneration.valid = false;
 					candidateGeneration.abort.abort();
 				}
-				const cleanup = await cleanupRecoveryCandidate(
+				let retainedCandidate: RecoveryCandidateCleanup;
+				retainedCandidate = new RecoveryCandidateCleanup(
 					candidate,
 					recoveredSubscriptions,
 					candidateAbortShutdown,
+					() => this.retainedRecoveryCandidates.delete(retainedCandidate),
 				);
-				if (cleanup !== undefined) {
-					failure = combineRuntimeErrors(failure, cleanup);
+				this.retainedRecoveryCandidates.add(retainedCandidate);
+				try {
+					await retainedCandidate.dispose();
+				} catch (cleanupError) {
+					failure = combineRuntimeErrors(failure, normalizeRuntimeError(cleanupError));
 					if (stopped) {
 						throw failure;
 					}
@@ -1895,23 +1939,64 @@ async function cleanupDetachedResources(
 	return failures.length === 0 ? undefined : cleanupFailure(failures);
 }
 
-async function cleanupRecoveryCandidate(
-	connection: AhpConnection,
-	subscriptions: ReadonlyMap<string, AhpSubscription>,
-	shutdown?: Promise<void>,
-): Promise<AgentRuntimeError | undefined> {
-	const failures: string[] = [];
-	await collectCleanupFailures(
-		[...subscriptions].map(([uri, subscription]) => ({
-			label: `close recovery subscription ${safeCleanupResource(uri)}`,
-			run: () => subscription.close(),
-		})),
-		failures,
-	);
-	await collectCleanupFailures([
-		{ label: 'shutdown recovery AHP connection', run: () => shutdown ?? connection.shutdown() },
-	], failures);
-	return failures.length === 0 ? undefined : cleanupFailure(failures);
+class RecoveryCandidateCleanup {
+	private readonly subscriptions: Map<string, {
+		readonly subscription: AhpSubscription;
+		closed: boolean;
+	}>;
+	private shutdownComplete = false;
+	private disposal: Promise<void> | undefined;
+	private disposed = false;
+
+	constructor(
+		private readonly connection: AhpConnection,
+		subscriptions: ReadonlyMap<string, AhpSubscription>,
+		private initialShutdown: Promise<void> | undefined,
+		private readonly didDispose: () => void,
+	) {
+		this.subscriptions = new Map([...subscriptions].map(([uri, subscription]) => [
+			uri,
+			{ subscription, closed: false },
+		]));
+	}
+
+	dispose(): Promise<void> {
+		if (this.disposed) {
+			return Promise.resolve();
+		}
+		this.disposal ??= this.disposeOwned().finally(() => {
+			if (!this.disposed) {
+				this.disposal = undefined;
+			}
+		});
+		return this.disposal;
+	}
+
+	private async disposeOwned(): Promise<void> {
+		await runCleanupPhase(
+			[...this.subscriptions]
+				.filter(([, state]) => !state.closed)
+				.map(([uri, state]) => ({
+					label: `close recovery subscription ${safeCleanupResource(uri)}`,
+					run: async () => {
+						await state.subscription.close();
+						state.closed = true;
+					},
+				})),
+		);
+		if (!this.shutdownComplete) {
+			const shutdown = this.initialShutdown ?? this.connection.shutdown();
+			try {
+				await shutdown;
+				this.shutdownComplete = true;
+			} catch (error) {
+				this.initialShutdown = undefined;
+				throw error;
+			}
+		}
+		this.disposed = true;
+		this.didDispose();
+	}
 }
 
 async function collectCleanupFailures(

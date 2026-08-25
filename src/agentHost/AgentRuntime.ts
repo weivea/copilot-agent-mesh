@@ -63,6 +63,7 @@ export interface AgentInputRequest {
 	readonly requestId: string;
 	readonly kind: AgentInputKind;
 	readonly prompt: string;
+	readonly url?: string;
 	readonly options?: readonly AgentInputOption[];
 	readonly fields?: readonly {
 		readonly id: string;
