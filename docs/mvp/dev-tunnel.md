@@ -25,15 +25,19 @@ text before the JSON document. Build 2030 fixes that issue. Its hosted `show --j
 contract uses the single `portUri` field; the decoder intentionally rejects
 `portForwardingUris` rather than accepting a permissive cross-version union.
 
-The complete lifecycle gate is currently **NO-GO**. The required command
+The complete lifecycle gate passes through an exact-build controlled fallback. The command
 `host <qualified-id> --port-number <fixed-port>` exits on the official 2030 build with
 `Invalid arguments. Batch update of ports is not supported. Add, update, or delete ports
 individually instead.` This occurs with both an already configured port and an empty
-persistent tunnel. The same command without `--port-number` works but is intentionally not
-used because it does not satisfy fixed-port host scoping. Homebrew and the public release
-channels currently expose no newer exact build. The provider reports permanent
-`CLI_UNSUPPORTED`, does not silently drop the port argument, and does not upgrade the global
-CLI.
+persistent tunnel. Only for the hash-gated exact 2030 build, the provider therefore permits
+`host <qualified-id>` after a fresh strict `show --json` proves that the tunnel has exactly
+one port, that the port is `metadata.localPort` with protocol `http`, and a port-scoped
+`access list --json` proves exactly the persisted index-zero anonymous/connect ACE and
+expiration. Tunnel-wide and inline port `accessControl` arrays must be empty. Initial host
+and every restart repeat all checks and re-hash the executable before process creation.
+Any extra port, protocol, ownership, ACE, index, scope, expiration, or executable drift
+fails closed and opens the circuit before another host starts. Renewal and host transitions
+are serialized against freshly loaded ownership metadata. No global CLI upgrade is attempted.
 
 ## Lifecycle
 
@@ -59,13 +63,13 @@ index-zero anonymous/connect ACE with the persisted expiration. Renewal then use
 or a failure after deletion starts opens `TUNNEL_ACCESS_EXPIRED`; a timeout or network
 failure while inspecting the ACE remains transient and performs no deletion.
 
-The host command always includes `--port-number <fixed-port>`, and `show --json` must contain
-no additional ports. An unexpected host exit starts full-jitter bounded backoff and repeats JSON discovery,
-HTTPS health, and WSS probes. Permanent build, schema, login, missing-resource, and
-expired-access failures open the circuit breaker. `stop()` cancels pending restart timers
-plus in-flight CLI, JSON discovery, HTTPS, WSS, and backoff work, and terminates only the
-owned process group. A stopped generation cannot publish later state. It does not delete
-the persistent tunnel.
+Before the exact-2030 host fallback starts, `show --json` must contain no additional ports
+and the ACE list must match persisted ownership metadata. An unexpected host exit starts
+full-jitter bounded backoff and repeats invariant validation, JSON discovery, HTTPS health,
+and WSS probes. Permanent build, schema, login, missing-resource, and expired-access failures
+open the circuit breaker. `stop()` cancels pending restart timers plus in-flight CLI, JSON
+discovery, HTTPS, WSS, and backoff work, and terminates only the owned process group. A
+stopped generation cannot publish later state. It does not delete the persistent tunnel.
 
 If the persisted port differs from the requested port, or no longer serves the expected
 loopback health endpoint, startup fails with `PORT_MIGRATION_REQUIRED` or `PORT_CONFLICT`.
@@ -80,8 +84,7 @@ Offline tests are the default:
 npm run test:unit
 ```
 
-The real test is opt-in and requires a logged-in exact CLI. It currently remains a failing
-release gate until an exact official build supports the required host command:
+The real test is opt-in and requires a logged-in exact CLI:
 
 ```sh
 MESH_DEVTUNNEL_E2E=1 \

@@ -403,7 +403,7 @@ function validateTunnelSummary(tunnel: Record<string, unknown>): void {
 	assertOptionalString(tunnel.currentDownloadRate);
 	assertOptionalString(tunnel.uploadTotal);
 	assertOptionalString(tunnel.downloadTotal);
-	assertOptionalArray(tunnel.accessControl);
+	assertOptionalEmptyAccessControl(tunnel.accessControl);
 }
 
 function decodeOwnedAnonymousAccessEntry(value: unknown): Date {
@@ -472,13 +472,16 @@ function validatePortRecord(port: Record<string, unknown>): void {
 	assertOptionalStringArray(port.labels);
 	assertOptionalNullableString(port.description);
 	assertOptionalNonnegativeInteger(port.clientConnections);
-	assertOptionalArray(port.accessControl);
+	assertOptionalEmptyAccessControl(port.accessControl);
 	assertOptionalString(port.status);
 }
 
-function assertOptionalArray(value: unknown): void {
-	if (value !== undefined && !Array.isArray(value)) {
-		throw new DevTunnelDecodeError('UNKNOWN_SHAPE', 'Dev Tunnel output contained an invalid array field.');
+function assertOptionalEmptyAccessControl(value: unknown): void {
+	if (value !== undefined && (!Array.isArray(value) || value.length !== 0)) {
+		throw new DevTunnelDecodeError(
+			'ACCESS_INVALID',
+			'Dev Tunnel show must not contain tunnel-wide or inline port access entries.',
+		);
 	}
 }
 

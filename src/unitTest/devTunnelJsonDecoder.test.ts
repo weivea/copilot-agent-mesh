@@ -157,6 +157,36 @@ suite('DevTunnelJsonDecoder', () => {
 		);
 	});
 
+	test('rejects tunnel-wide and inline port access drift', () => {
+		const tunnelAccess = createHostedFixture();
+		(tunnelAccess.tunnel as Record<string, unknown>).accessControl = [{
+			type: 'Anonymous',
+			subjects: [],
+			scopes: ['connect'],
+		}];
+		assert.throws(
+			() => decodeDevTunnelShowJson(JSON.stringify(tunnelAccess), {
+				expectedTunnelId,
+				expectedPort,
+			}),
+			(error: unknown) => hasCode(error, 'ACCESS_INVALID'),
+		);
+
+		const portAccess = createHostedFixture();
+		(portAccess.tunnel.ports[0] as Record<string, unknown>).accessControl = [{
+			type: 'Anonymous',
+			subjects: [],
+			scopes: ['connect'],
+		}];
+		assert.throws(
+			() => decodeDevTunnelShowJson(JSON.stringify(portAccess), {
+				expectedTunnelId,
+				expectedPort,
+			}),
+			(error: unknown) => hasCode(error, 'ACCESS_INVALID'),
+		);
+	});
+
 	test('rejects an invalid non-target port shape', () => {
 		const fixture = createHostedFixture();
 		(fixture.tunnel.ports as Array<Record<string, unknown>>).unshift({});

@@ -61,6 +61,8 @@ suite('DevTunnelCliProvider', () => {
 			'port create',
 			'access create',
 			'show came2etest.jpe1',
+			'access list',
+			'show came2etest.jpe1',
 		]);
 		assert.equal(store.value?.provisioned, true);
 		assert.equal(provider.getStatus().state, 'ready');
@@ -92,6 +94,31 @@ suite('DevTunnelCliProvider', () => {
 			(error: unknown) => hasProviderCode(error, 'CLI_UNSUPPORTED'),
 		);
 		assert.equal(runner.commands.some((args) => args[0] === 'create'), false);
+	});
+
+	test('revalidates the exact executable hash before a fallback restart', async () => {
+		const runner = new FakeRunner();
+		let verifications = 0;
+		const provider = createProvider(runner, new MemoryStore(), {
+			binaryVerifier: async () => {
+				verifications += 1;
+				return verifications <= 2;
+			},
+			random: () => 0,
+			restartBaseDelayMs: 1,
+		});
+		await provider.ensureHosted(request);
+
+		runner.hosts[0].finish({ exitCode: 1, signal: null });
+		await waitFor(() => provider.getStatus().state === 'circuit-open');
+
+		assert.equal(verifications, 3);
+		assert.equal(runner.hosts.length, 1);
+		const status = provider.getStatus();
+		assert.equal(status.state, 'circuit-open');
+		if (status.state === 'circuit-open') {
+			assert.equal(status.code, 'CLI_UNSUPPORTED');
+		}
 	});
 
 	test('constructs the default runner boundary from the verified official basename', async () => {
@@ -149,6 +176,48 @@ suite('DevTunnelCliProvider', () => {
 		);
 		assert.equal(runner.commands.some((args) => args[0] === 'show'), false);
 		assert.equal(runner.hosts.length, 0);
+	});
+
+	test('rejects an extra port before using the exact-build host fallback', async () => {
+		const runner = new FakeRunner();
+		runner.extraPort = true;
+		const provider = createProvider(runner, new MemoryStore());
+
+		await assert.rejects(
+			provider.ensureHosted(request),
+			(error: unknown) => hasProviderCode(error, 'CLI_UNSUPPORTED'),
+		);
+
+		assert.equal(runner.hosts.length, 0);
+		assert.equal(provider.getStatus().state, 'circuit-open');
+	});
+
+	test('rejects ACE drift before using the exact-build host fallback', async () => {
+		const runner = new FakeRunner();
+		runner.extraAccessEntry = true;
+		const provider = createProvider(runner, new MemoryStore());
+
+		await assert.rejects(
+			provider.ensureHosted(request),
+			(error: unknown) => hasProviderCode(error, 'CLI_UNSUPPORTED'),
+		);
+
+		assert.equal(runner.hosts.length, 0);
+		assert.equal(provider.getStatus().state, 'circuit-open');
+	});
+
+	test('rejects tunnel-wide ACE drift before using the exact-build host fallback', async () => {
+		const runner = new FakeRunner();
+		runner.tunnelAccessEntry = true;
+		const provider = createProvider(runner, new MemoryStore());
+
+		await assert.rejects(
+			provider.ensureHosted(request),
+			(error: unknown) => hasProviderCode(error, 'CLI_UNSUPPORTED'),
+		);
+
+		assert.equal(runner.hosts.length, 0);
+		assert.equal(provider.getStatus().state, 'circuit-open');
 	});
 
 	test('cancels a pending restart when stopped during backoff', async () => {
@@ -210,6 +279,8 @@ suite('DevTunnelCliProvider', () => {
 		});
 		const runner = new FakeRunner();
 		const provider = createProvider(runner, new MemoryStore(), {
+			random: () => 0,
+			restartBaseDelayMs: 1,
 			wssProbe: async (
 				_forwardingOrigin,
 				_path,
@@ -256,6 +327,9 @@ suite('DevTunnelCliProvider', () => {
 		const provider = createProvider(runner, new MemoryStore());
 		await provider.ensureHosted(request);
 		runner.accessExpiration = '2026-09-08T01:00:00.000Z';
+		const accessListsBeforeRenewal = runner.commands.filter(
+			(args) => args.slice(0, 2).join(' ') === 'access list',
+		).length;
 
 		const [first, second] = await Promise.all([
 			provider.renewAccess(),
@@ -264,7 +338,8 @@ suite('DevTunnelCliProvider', () => {
 
 		assert.deepStrictEqual(second, first);
 		assert.equal(
-			runner.commands.filter((args) => args.slice(0, 2).join(' ') === 'access list').length,
+			runner.commands.filter((args) => args.slice(0, 2).join(' ') === 'access list').length
+				- accessListsBeforeRenewal,
 			1,
 		);
 		assert.equal(
@@ -272,6 +347,67 @@ suite('DevTunnelCliProvider', () => {
 			1,
 		);
 		await provider.stop();
+	});
+
+	test('reloads persisted ownership metadata before renewing access', async () => {
+		const runner = new FakeRunner();
+		const store = new MemoryStore();
+		const provider = createProvider(runner, store);
+		await provider.ensureHosted(request);
+		const persistedExpiration = '2026-09-02T01:00:00.000Z';
+		assert.ok(store.value);
+		store.value = {
+			...store.value,
+			accessExpiresAt: persistedExpiration,
+		};
+		runner.listedAccessExpiration = persistedExpiration;
+		runner.accessExpiration = '2026-09-09T01:00:00.000Z';
+
+		const renewed = await provider.renewAccess();
+
+		assert.equal(renewed.accessExpiresAt, runner.accessExpiration);
+		await provider.stop();
+	});
+
+	test('cancels a queued renewal with its original lifecycle generation', async () => {
+		let reachProbe: (() => void) | undefined;
+		const probeReached = new Promise<void>((resolve) => {
+			reachProbe = resolve;
+		});
+		const runner = new FakeRunner();
+		const provider = createProvider(runner, new MemoryStore(), {
+			wssProbe: async (
+				_forwardingOrigin,
+				_path,
+				_requestMessage,
+				_expectedResponse,
+				options,
+			) => new Promise<void>((_resolve, reject) => {
+				reachProbe?.();
+				const abort = (): void => reject(new DevTunnelProviderError(
+					'WSS_PROBE_FAILED',
+					'Injected WSS abort.',
+					true,
+				));
+				options?.signal?.addEventListener('abort', abort, { once: true });
+			}),
+		});
+		const starting = provider.ensureHosted(request);
+		await probeReached;
+		const deletesBeforeRenewal = runner.commands.filter(
+			(args) => args.slice(0, 2).join(' ') === 'access delete',
+		).length;
+		const renewal = provider.renewAccess();
+
+		await provider.stop();
+		await assert.rejects(starting);
+		await assert.rejects(renewal);
+
+		assert.equal(
+			runner.commands.filter((args) => args.slice(0, 2).join(' ') === 'access delete').length,
+			deletesBeforeRenewal,
+		);
+		assert.equal(provider.getStatus().state, 'stopped');
 	});
 
 	test('refuses to delete when the current ACE set is not uniquely provider-owned', async () => {
@@ -386,8 +522,27 @@ suite('DevTunnelCliProvider', () => {
 		runner.hosts[0].finish({ exitCode: 1, signal: null });
 		await waitFor(() => provider.getStatus().state === 'circuit-open');
 
-		assert.equal(runner.hosts.length, 2);
-		assert.equal(runner.hosts[1].stopCount, 1);
+		assert.equal(runner.hosts.length, 1);
+		const status = provider.getStatus();
+		assert.equal(status.state, 'circuit-open');
+		if (status.state === 'circuit-open') {
+			assert.equal(status.code, 'CLI_UNSUPPORTED');
+		}
+	});
+
+	test('revalidates ACE ownership before a restarted fallback host', async () => {
+		const runner = new FakeRunner();
+		const provider = createProvider(runner, new MemoryStore(), {
+			random: () => 0,
+			restartBaseDelayMs: 1,
+		});
+		await provider.ensureHosted(request);
+		runner.extraAccessEntry = true;
+
+		runner.hosts[0].finish({ exitCode: 1, signal: null });
+		await waitFor(() => provider.getStatus().state === 'circuit-open');
+
+		assert.equal(runner.hosts.length, 1);
 		const status = provider.getStatus();
 		assert.equal(status.state, 'circuit-open');
 		if (status.state === 'circuit-open') {
@@ -424,12 +579,14 @@ suite('DevTunnelCliProvider', () => {
 		runner.hosts[0].finish({ exitCode: 1, signal: null });
 		await assert.rejects(
 			starting,
-			(error: unknown) => hasProviderCode(error, 'CLI_UNSUPPORTED'),
+			(error: unknown) => hasProviderCode(error, 'HOST_START_FAILED'),
 		);
 
 		assert.equal(readinessAborted, true);
 		assert.equal(runner.hosts[0].stopCount, 1);
-		assert.equal(provider.getStatus().state, 'circuit-open');
+		await waitFor(() => runner.hosts.length === 2);
+		assert.equal(provider.getStatus().state, 'backoff');
+		await provider.stop();
 	});
 
 	test('does not publish ready when the host exits during hosted-state persistence', async () => {
@@ -444,11 +601,12 @@ suite('DevTunnelCliProvider', () => {
 
 		await assert.rejects(
 			provider.ensureHosted(request),
-			(error: unknown) => hasProviderCode(error, 'CLI_UNSUPPORTED'),
+			(error: unknown) => hasProviderCode(error, 'HOST_START_FAILED'),
 		);
 
-		assert.equal(provider.getStatus().state, 'circuit-open');
+		assert.notEqual(provider.getStatus().state, 'circuit-open');
 		assert.equal(runner.hosts[0].stopCount, 1);
+		await provider.stop();
 	});
 });
 
@@ -460,12 +618,14 @@ class FakeRunner {
 	accessListTimeout = false;
 	failAccessCreate = false;
 	extraAccessEntry = false;
+	extraPort = false;
 	hasPort = true;
 	invalidShow = false;
 	pauseCreate = false;
 	pausePortCreate = false;
 	showNotFound = false;
 	showTimeout = false;
+	tunnelAccessEntry = false;
 	private createContinuation: (() => void) | undefined;
 	private createReached: (() => void) | undefined;
 	private readonly createReachedPromise = new Promise<void>((resolve) => {
@@ -580,7 +740,11 @@ class FakeRunner {
 					unknown: true,
 				}));
 			}
-			return result(JSON.stringify(hostedFixture(this.hasPort)));
+			return result(JSON.stringify(hostedFixture(
+				this.hasPort,
+				this.extraPort,
+				this.tunnelAccessEntry,
+			)));
 		}
 		throw new Error(`Unexpected fake command: ${args.join(' ')}`);
 	}
@@ -621,8 +785,6 @@ class FakeRunner {
 		assert.deepStrictEqual(args, [
 			'host',
 			tunnelId,
-			'--port-number',
-			String(request.localPort),
 		]);
 		const host = new FakeOwnedHost(this.hosts.length + 100);
 		this.hosts.push(host);
@@ -713,7 +875,7 @@ function createMetadata(overrides: Partial<TunnelMetadata> = {}): TunnelMetadata
 	};
 }
 
-function hostedFixture(hasPort = true) {
+function hostedFixture(hasPort = true, extraPort = false, tunnelAccessEntry = false) {
 	const fixture = {
 		tunnel: {
 			tunnelId,
@@ -729,11 +891,24 @@ function hostedFixture(hasPort = true) {
 				protocol: 'http',
 				portUri: 'https://fixture-43123.jpe1.devtunnels.ms/',
 			}],
-			accessControl: [],
+			accessControl: [] as unknown[],
 		},
 	};
 	if (!hasPort) {
 		delete (fixture.tunnel as Partial<typeof fixture.tunnel>).ports;
+	} else if (extraPort) {
+		fixture.tunnel.ports.push({
+			portNumber: request.localPort + 1,
+			protocol: 'http',
+			portUri: 'https://fixture-43124.jpe1.devtunnels.ms/',
+		});
+	}
+	if (tunnelAccessEntry) {
+		fixture.tunnel.accessControl.push({
+			type: 'Anonymous',
+			subjects: [],
+			scopes: ['connect'],
+		});
 	}
 	return fixture;
 }

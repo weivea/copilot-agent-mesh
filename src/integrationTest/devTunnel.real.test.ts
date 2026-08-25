@@ -118,6 +118,7 @@ test('real Dev Tunnel lifecycle', { timeout: 180_000 }, async () => {
 			);
 		}
 		assert.equal(activeRunner.hosts.length, 1);
+		assert.deepStrictEqual(activeRunner.hostArguments, [['host', hosted.tunnelId]]);
 		await activeRunner.hosts[0].stop();
 		await waitFor(
 			() => activeRunner.hosts.length >= 2
@@ -145,6 +146,10 @@ test('real Dev Tunnel lifecycle', { timeout: 180_000 }, async () => {
 		if (restartedStatus.state === 'ready') {
 			assert.equal(restartedStatus.tunnel.forwardingOrigin, firstOrigin);
 		}
+		assert.deepStrictEqual(activeRunner.hostArguments, [
+			['host', hosted.tunnelId],
+			['host', hosted.tunnelId],
+		]);
 
 	} finally {
 		let cleanupFailure: unknown;
@@ -194,6 +199,7 @@ test('real Dev Tunnel lifecycle', { timeout: 180_000 }, async () => {
 		build: SUPPORTED_DEVTUNNEL_BUILD,
 		cleanup: 'confirmed-by-owned-id',
 		health: 'https-204',
+		hostCommand: 'id-only-after-strict-invariants',
 		hostRestart: 'passed',
 		runnerBasename: requireRunner(runner).allowedExecutableBasename,
 		status: 'passed',
@@ -202,6 +208,7 @@ test('real Dev Tunnel lifecycle', { timeout: 180_000 }, async () => {
 });
 
 class RecordingRunner {
+	readonly hostArguments: string[][] = [];
 	readonly hosts: OwnedChildProcess[] = [];
 	lastPortStatus = '<absent>';
 	lastShowShape = '<absent>';
@@ -252,6 +259,7 @@ class RecordingRunner {
 	}
 	async startOwned(executable: string, args: readonly string[]): Promise<OwnedChildProcess> {
 		const host = await this.runner.startOwned(executable, args);
+		this.hostArguments.push([...args]);
 		this.hosts.push(host);
 		return host;
 	}
