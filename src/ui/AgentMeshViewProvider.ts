@@ -1,165 +1,257 @@
-import { randomBytes } from 'crypto';
+import { randomBytes, randomUUID } from 'crypto';
 
 import * as vscode from 'vscode';
 
-import { MESH_PROTOCOL_VERSION } from '../../shared/protocol';
+import { DashboardFacade, UnavailableDashboardFacade } from './DashboardFacade';
+import {
+	assertSafeDashboardOutboundMessage,
+	DASHBOARD_MESSAGE_VERSION,
+	DashboardInboundMessage,
+	DashboardOutboundMessage,
+	parseDashboardInboundMessage,
+} from './DashboardMessages';
+import { DashboardPresenter } from './DashboardPresenter';
 
-export class AgentMeshViewProvider implements vscode.WebviewViewProvider {
+interface ViewInstance {
+	readonly id: string;
+	readonly view: vscode.WebviewView;
+	readonly subscriptions: vscode.Disposable[];
+	disposed: boolean;
+}
+
+export const DASHBOARD_COMMANDS = {
+	configureDevice: 'copilotAgentMesh.configureDevice',
+	refresh: 'copilotAgentMesh.refreshDashboard',
+} as const;
+
+export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
 	public static readonly viewType = 'copilotAgentMesh.dashboard';
 
-	private view: vscode.WebviewView | undefined;
+	private readonly instances = new Map<string, ViewInstance>();
+	private readonly presenter = new DashboardPresenter();
+	private readonly extensionUri: vscode.Uri;
+
+	public constructor(
+		private readonly facade: DashboardFacade = new UnavailableDashboardFacade(),
+		extensionUri?: vscode.Uri,
+	) {
+		this.extensionUri = extensionUri ?? getOwnExtensionUri();
+	}
 
 	public resolveWebviewView(webviewView: vscode.WebviewView): void {
-		this.view = webviewView;
-		webviewView.webview.options = {
-			enableScripts: false,
-		};
-		webviewView.webview.html = this.getHtml(webviewView.webview);
-		webviewView.onDidDispose(() => {
-			if (this.view === webviewView) {
-				this.view = undefined;
+		for (const existing of this.instances.values()) {
+			if (existing.view === webviewView) {
+				this.disposeInstance(existing);
 			}
-		});
+		}
+		const instance: ViewInstance = {
+			id: randomUUID(),
+			view: webviewView,
+			subscriptions: [],
+			disposed: false,
+		};
+		this.instances.set(instance.id, instance);
+
+		const mediaRoot = vscode.Uri.joinPath(this.extensionUri, 'media');
+		webviewView.webview.options = {
+			enableScripts: true,
+			localResourceRoots: [mediaRoot],
+		};
+		webviewView.webview.html = createDashboardHtml(
+			webviewView.webview,
+			mediaRoot,
+			instance.id,
+			randomBytes(16).toString('base64'),
+		);
+		instance.subscriptions.push(
+			webviewView.webview.onDidReceiveMessage((message: unknown) => {
+				void this.receive(instance, message);
+			}),
+			webviewView.onDidDispose(() => this.disposeInstance(instance)),
+			this.facade.onDidChange(() => {
+				void this.publish(instance);
+			}),
+		);
 	}
 
 	public refresh(): void {
-		if (this.view !== undefined) {
-			this.view.webview.html = this.getHtml(this.view.webview);
+		for (const instance of this.instances.values()) {
+			void this.publish(instance);
 		}
 	}
 
-	private getHtml(webview: vscode.Webview): string {
-		const nonce = randomBytes(16).toString('base64');
-		const configuredName = vscode.workspace
-			.getConfiguration('copilotAgentMesh')
-			.get<string>('deviceName', '')
-			.trim();
-		const deviceName = configuredName.length > 0 ? configuredName : 'Not configured';
+	public dispose(): void {
+		for (const instance of [...this.instances.values()]) {
+			this.disposeInstance(instance);
+		}
+	}
 
-		return `<!DOCTYPE html>
+	private async receive(instance: ViewInstance, value: unknown): Promise<void> {
+		if (instance.disposed) {
+			return;
+		}
+		const message = parseDashboardInboundMessage(value);
+		if (message === undefined || message.uiInstanceId !== instance.id) {
+			await this.postError(instance, 'INVALID_MESSAGE', 'The dashboard rejected an invalid message.');
+			return;
+		}
+		if (message.type === 'ready') {
+			await this.publish(instance);
+			return;
+		}
+
+		try {
+			await this.dispatch(message);
+			await this.publish(instance);
+		} catch {
+			await this.postError(
+				instance,
+				'ACTION_FAILED',
+				'The dashboard action failed. Refresh for the latest service error and suggested action.',
+			);
+		}
+	}
+
+	private async dispatch(message: Extract<DashboardInboundMessage, { type: 'action' }>): Promise<void> {
+		switch (message.action) {
+			case 'configureDevice':
+				await this.facade.configureDeviceName();
+				return;
+			case 'registerWorkspace':
+				await this.facade.registerCurrentWorkspace();
+				return;
+			case 'removeWorkspace':
+				await this.facade.removeWorkspace(requireTarget(message));
+				return;
+			case 'startListener':
+				await this.facade.startListener();
+				return;
+			case 'stopListener':
+				await this.facade.stopListener();
+				return;
+			case 'copyConnectionUrl':
+				await this.facade.copyConnectionUrl();
+				return;
+			case 'addPeer':
+				await this.facade.addPeer();
+				return;
+			case 'removePeer':
+				await this.facade.removePeer(requireTarget(message));
+				return;
+			case 'runTask':
+				await this.facade.runTask(message.peerId, message.workspaceId);
+				return;
+			case 'cancelTask':
+				await this.facade.cancelTask(requireTarget(message));
+				return;
+			case 'answerTaskInput':
+				await this.facade.answerTaskInput(requireTarget(message));
+				return;
+			case 'refresh':
+				return;
+		}
+	}
+
+	private async publish(instance: ViewInstance): Promise<void> {
+		if (instance.disposed) {
+			return;
+		}
+		try {
+			const model = this.presenter.present(await this.facade.getSnapshot());
+			const message: DashboardOutboundMessage = {
+				version: DASHBOARD_MESSAGE_VERSION,
+				uiInstanceId: instance.id,
+				type: 'dashboard.snapshot',
+				model,
+			};
+			await this.safePost(instance, message);
+		} catch {
+			await this.postError(
+				instance,
+				'UNSAFE_VIEW_MODEL',
+				'The dashboard rejected an invalid service snapshot.',
+			);
+		}
+	}
+
+	private async postError(
+		instance: ViewInstance,
+		code: 'INVALID_MESSAGE' | 'ACTION_FAILED' | 'UNSAFE_VIEW_MODEL',
+		message: string,
+	): Promise<void> {
+		await this.safePost(instance, {
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: instance.id,
+			type: 'dashboard.error',
+			code,
+			message,
+		});
+	}
+
+	private async safePost(instance: ViewInstance, message: DashboardOutboundMessage): Promise<void> {
+		if (instance.disposed) {
+			return;
+		}
+		assertSafeDashboardOutboundMessage(message);
+		await instance.view.webview.postMessage(message);
+	}
+
+	private disposeInstance(instance: ViewInstance): void {
+		if (instance.disposed) {
+			return;
+		}
+		instance.disposed = true;
+		this.instances.delete(instance.id);
+		for (const subscription of instance.subscriptions.splice(0)) {
+			subscription.dispose();
+		}
+	}
+}
+
+export function createDashboardHtml(
+	webview: vscode.Webview,
+	mediaRoot: vscode.Uri,
+	uiInstanceId: string,
+	nonce: string,
+): string {
+	const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, 'dashboard.js'));
+	const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, 'dashboard.css'));
+	return `<!DOCTYPE html>
 <html lang="en">
 <head>
 	<meta charset="UTF-8">
-	<meta
-		http-equiv="Content-Security-Policy"
-		content="default-src 'none'; style-src 'nonce-${nonce}';"
-	>
+	<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource}; script-src 'nonce-${nonce}' ${webview.cspSource};">
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<style nonce="${nonce}">
-		body {
-			padding: 0 14px 24px;
-			color: var(--vscode-foreground);
-			background: var(--vscode-sideBar-background);
-			font-family: var(--vscode-font-family);
-			font-size: var(--vscode-font-size);
-		}
-
-		h2 {
-			margin: 22px 0 8px;
-			font-size: 11px;
-			font-weight: 600;
-			letter-spacing: 0.08em;
-			text-transform: uppercase;
-		}
-
-		.card {
-			padding: 10px 12px;
-			border: 1px solid var(--vscode-widget-border);
-			border-radius: 4px;
-			background: var(--vscode-editorWidget-background);
-		}
-
-		dl {
-			display: grid;
-			grid-template-columns: max-content 1fr;
-			gap: 6px 12px;
-			margin: 0;
-		}
-
-		dt {
-			color: var(--vscode-descriptionForeground);
-		}
-
-		dd {
-			min-width: 0;
-			margin: 0;
-			overflow-wrap: anywhere;
-		}
-
-		.empty {
-			margin: 0;
-			color: var(--vscode-descriptionForeground);
-		}
-
-		.status {
-			display: inline-flex;
-			align-items: center;
-			gap: 6px;
-		}
-
-		.status::before {
-			width: 7px;
-			height: 7px;
-			border-radius: 50%;
-			background: var(--vscode-disabledForeground);
-			content: "";
-		}
-	</style>
+	<link rel="stylesheet" href="${styleUri}">
+	<title>Copilot Agent Mesh</title>
 </head>
-<body>
-	<h2>This Device</h2>
-	<section class="card">
-		<dl>
-			<dt>Name</dt>
-			<dd>${escapeHtml(deviceName)}</dd>
-			<dt>Platform</dt>
-			<dd>${escapeHtml(getPlatformLabel())}</dd>
-			<dt>Listener</dt>
-			<dd><span class="status">Not started</span></dd>
-			<dt>Protocol</dt>
-			<dd>v${MESH_PROTOCOL_VERSION}</dd>
-		</dl>
-	</section>
-
-	<h2>Shared Workspaces</h2>
-	<section class="card">
-		<p class="empty">No workspaces registered yet.</p>
-	</section>
-
-	<h2>Remote Devices</h2>
-	<section class="card">
-		<p class="empty">No peer connections configured yet.</p>
-	</section>
-
-	<h2>Tasks</h2>
-	<section class="card">
-		<p class="empty">No delegated tasks yet.</p>
-	</section>
+<body data-ui-instance-id="${uiInstanceId}">
+	<header><h1>Copilot Agent Mesh</h1><button data-action="refresh" title="Refresh">Refresh</button></header>
+	<main>
+		<section aria-labelledby="device-heading"><h2 id="device-heading">This Device</h2><div id="device" class="card loading">Loading...</div></section>
+		<section aria-labelledby="listener-heading"><h2 id="listener-heading">Listener</h2><div id="listener" class="card loading">Loading...</div></section>
+		<section aria-labelledby="workspaces-heading"><h2 id="workspaces-heading">Shared Workspaces</h2><div id="workspaces" class="stack loading">Loading...</div><button data-action="registerWorkspace">Add Current Workspace</button></section>
+		<section aria-labelledby="peers-heading"><h2 id="peers-heading">Remote Devices</h2><div id="peers" class="stack loading">Loading...</div><button data-action="addPeer">Add Connection</button></section>
+		<section aria-labelledby="tasks-heading"><h2 id="tasks-heading">Tasks</h2><div id="tasks" class="stack loading">Loading...</div><button data-action="runTask">Run Task</button></section>
+		<section aria-labelledby="errors-heading"><h2 id="errors-heading">Errors</h2><div id="errors" class="stack"></div></section>
+	</main>
+	<div id="announcement" role="status" aria-live="polite"></div>
+	<script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;
+}
+
+function requireTarget(message: Extract<DashboardInboundMessage, { type: 'action' }>): string {
+	if (message.targetId === undefined) {
+		throw new Error(`Dashboard action ${message.action} requires a target.`);
 	}
+	return message.targetId;
 }
 
-function getPlatformLabel(): string {
-	const platformNames: Partial<Record<NodeJS.Platform, string>> = {
-		darwin: 'macOS',
-		linux: 'Linux',
-		win32: 'Windows',
-	};
-
-	return `${platformNames[process.platform] ?? process.platform} ${process.arch}`;
-}
-
-function escapeHtml(value: string): string {
-	return value.replace(/[&<>"']/g, (character) => {
-		const entities: Record<string, string> = {
-			'&': '&amp;',
-			'<': '&lt;',
-			'>': '&gt;',
-			'"': '&quot;',
-			"'": '&#39;',
-		};
-
-		return entities[character];
-	});
+function getOwnExtensionUri(): vscode.Uri {
+	const extension = vscode.extensions.getExtension('weivea.copilot-agent-mesh');
+	if (extension === undefined) {
+		throw new Error('Unable to resolve the Copilot Agent Mesh extension URI.');
+	}
+	return extension.extensionUri;
 }
