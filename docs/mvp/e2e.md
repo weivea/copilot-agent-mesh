@@ -1,7 +1,7 @@
 # MVP real two-instance E2E
 
-> Evidence date: 2026-08-25  
-> Baseline: local `mvp-e2e-base` at `06775c7e2e8a18f7771507e4a739fad0b865d9a0`  
+> Evidence date: 2026-08-25
+> Baseline: local `mvp-e2e-base` at `06775c7e2e8a18f7771507e4a739fad0b865d9a0`
 > Platform: macOS arm64, VS Code `1.134.0`
 
 ## Opt-in boundary
@@ -11,6 +11,14 @@ public Dev Tunnel and may consume Copilot quota:
 
 ```sh
 MESH_TWO_DEVICE_E2E=1 npm run test:two-instance-real
+```
+
+The fallback cleanup path is independently exercisable:
+
+```sh
+MESH_TWO_DEVICE_E2E=1 \
+MESH_TWO_DEVICE_E2E_FORCE_FALLBACK_CLEANUP=1 \
+npm run test:two-instance-real
 ```
 
 The harness downloads the official `devtunnel 1.0.2030+fc9273aa0f` macOS arm64 binary
@@ -34,13 +42,21 @@ The file IPC and automatic local task approval exist only when
    and wait until the production directory reports the Worker online and the opaque
    workspace.
 4. Delegate through `TaskCoordinator -> Gateway -> WorkerTaskService`.
-5. Start and cancel one accepted task through the real remote cancellation route.
-6. Start a non-destructive AHP task. A fresh profile without an explicit authentication
-   mapping must terminate as failed with stable `AGENT_AUTH_REQUIRED`; this is a
-   verified boundary, not a successful Agent turn.
+5. Start a cancellation probe. Cancellation is counted only after the task emits
+   `agentStarted`, the Worker records the production `AgentTaskHandle.cancel()` call,
+   and the task reaches `cancelled`. If authentication fails before `agentStarted`,
+   cancellation is reported blocked and is not claimed as covered.
+6. With an authenticated runtime, start a separate non-destructive AHP completion
+   task. A fresh profile without an explicit authentication mapping terminates as
+   failed with stable `AGENT_AUTH_REQUIRED`; this is a verified boundary, not a
+   successful Agent turn.
 7. Stop the listener, re-verify exact CLI/build/hash and persisted ownership metadata,
    delete only the exact owned Tunnel ID, and require the versioned exact not-found
-   response.
+   response. The harness retains exact ID, ownership label, executable path, control
+   path, and global-storage path until confirmation. If in-host cleanup fails, the
+   harness uses the hash-verified CLI with strict decoder ownership checks and exact-ID
+   not-found confirmation. If that also fails, profiles/control/metadata are retained
+   and the command exits nonzero.
 8. Close both hosts and confirm that their VS Code, Gateway, AHP, and Tunnel processes
    no longer reference an owned runtime path. Remove both profiles, extension
    directories, controls, workspace, and downloaded binary.
@@ -58,9 +74,9 @@ The real run reached all transport and production task boundaries:
 - two Development Hosts paired through the real public Tunnel;
 - Coordinator observed one online Worker and its registered workspace;
 - production Agent Host probe reported available and enabled;
-- remote cancellation emitted `agentStartRequested`, `cancelRequested`, and
-  `cancelConfirmed`, ending in `cancelled`;
-- the non-destructive AHP task ended in failed state with `AGENT_AUTH_REQUIRED`;
+- the isolated unauthenticated profile failed before `agentStarted`, so runtime-handle
+  cancellation is explicitly blocked rather than claimed;
+- the non-destructive AHP boundary ended in failed state with `AGENT_AUTH_REQUIRED`;
 - owned Tunnel deletion, process shutdown, and profile removal were confirmed.
 
 The E2E exposed and fixed a production defect: the listener generated a 55-character
@@ -99,7 +115,7 @@ only `MESH_TWO_INSTANCE_E2E_OK` and forbids file changes and commands.
 | 6 | Add, save, and delete a connection | Partial | Real add/pair/save passed. Peer deletion is covered offline but was not exercised in this real run. |
 | 7 | Connection state, heartbeat, and workspace list UI | Pass | Production dashboard/directory observed the peer online and its workspace over the real Tunnel. |
 | 8 | Four mesh language-model tools | Partial | Offline extension/tool suites cover all four tools; real delegation/cancel used the same `TaskCoordinator`, but an authenticated Copilot did not invoke the LM tools. |
-| 9 | macOS arm64 Worker invokes built-in Copilot over AHP | Blocked | Real production AHP launched and probed, but the isolated profile had no explicit VS Code authentication mapping/session; task failed correctly with `AGENT_AUTH_REQUIRED` before Session/turn completion. |
+| 9 | macOS arm64 Worker invokes built-in Copilot over AHP | Blocked | Real production AHP launched and probed, but the isolated profile had no explicit VS Code authentication mapping/session; task failed correctly with `AGENT_AUTH_REQUIRED` before `agentStarted`, runtime-handle cancellation, Session completion, or `turnComplete`. |
 | 10 | Coordinator UI shows task state/output summary | Partial | Real `cancelled` and auth failure states were observable through production snapshots; no authenticated text output or visual UI assertion was available. |
 | 11 | `mesh_get_task` returns completion result to Copilot | Partial | Real result polling traversed Coordinator/Gateway/Worker; authenticated Copilot tool invocation and a completed AHP result remain blocked by item 9. |
 | 12 | Multiple workspaces, one writer per workspace | Partial | Lease/concurrency behavior passes offline; this real run registered one temporary workspace. |

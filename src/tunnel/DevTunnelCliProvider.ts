@@ -414,6 +414,7 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 		if (process.env.MESH_TWO_DEVICE_E2E !== '1') {
 			throw new Error('Owned Tunnel deletion is available only to the opted-in two-device E2E.');
 		}
+
 		await this.stop();
 		const metadata = await this.stateStore.load();
 		if (metadata === undefined) {
@@ -430,6 +431,7 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 				'The persisted Tunnel does not satisfy exact owned-resource deletion invariants.',
 			);
 		}
+
 		const capability = await this.probe();
 		if (!capability.supported || capability.build !== metadata.build) {
 			throw permanent('CLI_UNSUPPORTED', 'The exact trusted Dev Tunnel CLI is unavailable for cleanup.');
@@ -472,6 +474,42 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 			'CLI_COMMAND_FAILED',
 			'Owned Tunnel deletion was not confirmed by the exact versioned not-found response.',
 		);
+	}
+
+	async ownedMetadataForE2e(): Promise<{
+		readonly build: string;
+		readonly decoderRevision: string;
+		readonly executablePath: string;
+		readonly localPort: number;
+		readonly ownershipLabel: string;
+		readonly tunnelId: string;
+	}> {
+		if (process.env.MESH_TWO_DEVICE_E2E !== '1') {
+			throw new Error('Owned Tunnel metadata is available only to the opted-in two-device E2E.');
+		}
+		const metadata = await this.stateStore.load();
+		if (metadata === undefined) {
+			throw permanent('TUNNEL_METADATA_INVALID', 'No owned Tunnel metadata is available.');
+		}
+		if (
+			metadata.build !== SUPPORTED_DEVTUNNEL_BUILD
+			|| metadata.decoderRevision !== DEVTUNNEL_DECODER_REVISION
+			|| !metadata.ownershipLabel.startsWith('copilot-agent-mesh-')
+			|| !metadata.tunnelId.startsWith(`${metadata.tunnelAlias}.`)
+		) {
+			throw permanent('TUNNEL_METADATA_INVALID', 'Owned Tunnel metadata failed exact invariants.');
+		}
+		if (!await this.binaryVerifier(this.requireTrustedExecutable())) {
+			throw permanent('CLI_UNSUPPORTED', 'The owned Tunnel executable no longer matches its exact hash.');
+		}
+		return {
+			build: metadata.build,
+			decoderRevision: metadata.decoderRevision,
+			executablePath: this.requireTrustedExecutable(),
+			localPort: metadata.localPort,
+			ownershipLabel: metadata.ownershipLabel,
+			tunnelId: metadata.tunnelId,
+		};
 	}
 
 	private async ensureHostedOnce(request: TunnelRequest): Promise<HostedTunnel> {

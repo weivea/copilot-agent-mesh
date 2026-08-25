@@ -306,6 +306,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			listener,
 			runtime,
 			tunnel,
+			workerTasks,
 		);
 		if (ownership.isOwner()) {
 			await peerManager.restore();

@@ -77,6 +77,7 @@ export class RemoteTaskRunner implements TaskService {
 	private readonly id: () => string;
 	private readonly now: () => Date;
 	private startMutation = Promise.resolve();
+	private readonly runtimeHandleCancellationRequests = new Set<string>();
 	private disposed = false;
 
 	public constructor(
@@ -250,12 +251,24 @@ export class RemoteTaskRunner implements TaskService {
 		} else {
 			this.scheduleCancellationDeadline(running);
 			try {
+				if (process.env.MESH_TWO_DEVICE_E2E === '1') {
+					this.runtimeHandleCancellationRequests.add(taskId);
+				}
 				await running.handle.cancel();
 			} catch {
 				await this.failCancellation(authenticatedPeerId, taskId);
 			}
 		}
 		return this.snapshot(updated);
+	}
+
+	public runtimeHandleCancellationObservedForE2e(taskId: string): boolean {
+		if (process.env.MESH_TWO_DEVICE_E2E !== '1') {
+			throw new Error('Runtime cancellation evidence is available only to the opted-in two-device E2E.');
+		}
+		const observed = this.runtimeHandleCancellationRequests.has(taskId);
+		this.runtimeHandleCancellationRequests.delete(taskId);
+		return observed;
 	}
 
 	public async answer(

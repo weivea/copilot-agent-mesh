@@ -1,6 +1,7 @@
 import type * as vscode from 'vscode';
 
 import type { ListenerService } from '../application/ListenerService';
+import type { WorkerTaskService } from '../application/RemoteTaskRunner';
 import type { TaskCoordinator } from '../application/TaskCoordinator';
 import type { AgentRuntime } from '../agentHost/AgentRuntime';
 import type { DevTunnelCliProvider } from '../tunnel/DevTunnelCliProvider';
@@ -17,6 +18,7 @@ export function createTwoDeviceE2eApi(
 	listener: ListenerService,
 	runtime: AgentRuntime,
 	tunnel: DevTunnelCliProvider,
+	workerTasks: WorkerTaskService,
 ): TwoDeviceE2eApi | undefined {
 	if (process.env.MESH_TWO_DEVICE_E2E !== '1') {
 		return undefined;
@@ -82,6 +84,12 @@ export function createTwoDeviceE2eApi(
 						controller.abort();
 					}
 				}
+				case 'task.runtimeCancelObserved':
+					return {
+						observed: workerTasks.runtimeHandleCancellationObservedForE2e(
+							requiredString(params, 'taskId'),
+						),
+					};
 				case 'runtime.probe':
 					return runtime.probe();
 				case 'auth.check': {
@@ -97,6 +105,8 @@ export function createTwoDeviceE2eApi(
 					return listener.snapshot();
 				case 'tunnel.cleanup':
 					return { cleanup: await tunnel.deleteOwnedForE2e() };
+				case 'tunnel.metadata':
+					return tunnel.ownedMetadataForE2e();
 				default:
 					throw new Error(`Unsupported two-device E2E action: ${action}`);
 			}

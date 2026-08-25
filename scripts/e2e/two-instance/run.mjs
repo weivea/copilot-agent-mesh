@@ -13,6 +13,7 @@ import {
 	writeFile,
 } from 'node:fs/promises';
 import { tmpdir, homedir } from 'node:os';
+import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -25,8 +26,15 @@ import {
 const expectedDevTunnelSha256 = '004f3cc8ebcce61223bacac80d31937eb2e92eaee9a05600a1cb62fb5f775afe';
 const devTunnelUrl = 'https://tunnelsassetsprod.blob.core.windows.net/cli/1.0.2030+fc9273aa0f/osx-arm64-devtunnel';
 const terminalStates = new Set(['completed', 'failed', 'cancelled', 'timedOut']);
+const forceFallbackCleanup = process.env.MESH_TWO_DEVICE_E2E_FORCE_FALLBACK_CLEANUP === '1';
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, '../../..');
+const require = createRequire(import.meta.url);
+const {
+	decodeDevTunnelShowJson,
+	isExactDevTunnelNotFound,
+	SUPPORTED_DEVTUNNEL_BUILD,
+} = require(join(repoRoot, 'out/src/tunnel/DevTunnelJsonDecoder.js'));
 
 if (process.env.MESH_TWO_DEVICE_E2E !== '1') {
 	throw new Error('MESH_TWO_DEVICE_E2E=1 is required because this test creates a public Dev Tunnel and may invoke Agent Host.');
@@ -50,6 +58,7 @@ let downloadedDevTunnel = false;
 let workerRun;
 let coordinatorRun;
 let tunnelCleanup = 'not-attempted';
+let tunnelCleanupMethod = 'in-host';
 let authOutcome = { state: 'not-run' };
 let cancelOutcome = { state: 'not-run' };
 let directory;
@@ -60,6 +69,9 @@ let profilesRemoved = false;
 let ownedProcessesStopped = false;
 let hostFailures = [];
 let baselineConfiguredDevTunnelPids = new Set();
+let ownedTunnel;
+let cleanupFailure;
+let listenerStartAttempted = false;
 
 try {
 	await Promise.all([
@@ -96,7 +108,17 @@ try {
 	if (!workerWorkspace?.workspaceId || workerWorkspace.name !== 'temporary-workspace') {
 		throw new Error('Worker did not register the temporary workspace.');
 	}
+	listenerStartAttempted = true;
 	await request(worker, 'listener.start', {}, 120_000);
+	ownedTunnel = await request(worker, 'tunnel.metadata');
+	await writeFile(join(worker.control, 'owned-tunnel.json'), `${JSON.stringify({
+		...ownedTunnel,
+		controlPath: worker.control,
+		globalStoragePath: join(
+			worker.userData,
+			'User/globalStorage/weivea.copilot-agent-mesh',
+		),
+	})}\n`, { mode: 0o600 });
 	const invitationResponse = await request(worker, 'listener.invite');
 	invitation = invitationResponse.connectionUrl;
 	if (typeof invitation !== 'string' || !invitation.startsWith('https://')) {
@@ -111,6 +133,12 @@ try {
 		throw new Error('The production Agent Host runtime did not pass its real probe.');
 	}
 
+	const authProvider = process.env.MESH_TWO_DEVICE_E2E_AUTH_PROVIDER ?? 'github';
+	const authScopes = parseStringArray(process.env.MESH_TWO_DEVICE_E2E_AUTH_SCOPES_JSON, []);
+	const authAvailability = await request(worker, 'auth.check', {
+		providerId: authProvider,
+		scopes: authScopes,
+	});
 	const cancelTask = await request(coordinator, 'task.start', {
 		peerId: target.peerId,
 		workspaceId: workerWorkspace.workspaceId,
@@ -118,37 +146,43 @@ try {
 		prompt: 'Wait for cancellation. Do not modify files or run commands.',
 		acceptanceCriteria: ['Cancellation is confirmed through the real remote task chain.'],
 	});
-	await waitForTaskEvent(cancelTask.taskId, 'agentStartRequested', 30_000);
-	await request(coordinator, 'task.cancel', { taskId: cancelTask.taskId });
-	const cancelled = await waitForTask(cancelTask.taskId, 60_000);
-	if (cancelled.snapshot.status !== 'cancelled') {
-		throw new Error(`Real cancellation finished as ${cancelled.snapshot.status}.`);
-	}
-	const cancellationEvents = cancelled.events.map((event) => event.type);
-	for (const required of ['agentStartRequested', 'cancelRequested', 'cancelConfirmed']) {
-		if (!cancellationEvents.includes(required)) {
-			throw new Error(`Real cancellation did not emit ${required}.`);
+	const cancelReady = await waitForTaskEventOrTerminal(cancelTask.taskId, 'agentStarted', 60_000);
+	if (cancelReady.kind === 'event') {
+		await request(coordinator, 'task.cancel', { taskId: cancelTask.taskId });
+		const cancelled = await waitForTask(cancelTask.taskId, 60_000);
+		if (cancelled.snapshot.status !== 'cancelled') {
+			throw new Error(`Real cancellation finished as ${cancelled.snapshot.status}.`);
 		}
-	}
-	cancelOutcome = { state: 'cancelled', eventTypes: cancellationEvents };
-
-	const authProvider = process.env.MESH_TWO_DEVICE_E2E_AUTH_PROVIDER ?? 'github';
-	const authScopes = parseStringArray(process.env.MESH_TWO_DEVICE_E2E_AUTH_SCOPES_JSON, []);
-	const authAvailability = await request(worker, 'auth.check', {
-		providerId: authProvider,
-		scopes: authScopes,
-	});
-	const authTask = await request(coordinator, 'task.start', {
-		peerId: target.peerId,
-		workspaceId: workerWorkspace.workspaceId,
-		title: 'Two-instance real AHP probe',
-		prompt: 'Reply with exactly MESH_TWO_INSTANCE_E2E_OK. Do not modify files or run commands.',
-		acceptanceCriteria: ['Authoritative AHP turnComplete is observed when authentication is available.'],
-	});
-	const authResult = await waitForTask(authTask.taskId, 180_000);
-	if (authResult.snapshot.status === 'completed') {
-		if (!authResult.events.some((event) => event.type === 'completed')) {
-			throw new Error('The completed task lacks the authoritative completion event.');
+		const cancellationEvents = cancelled.events.map((event) => event.type);
+		for (const required of ['agentStarted', 'cancelRequested', 'cancelConfirmed']) {
+			if (!cancellationEvents.includes(required)) {
+				throw new Error(`Real cancellation did not emit ${required}.`);
+			}
+		}
+		const runtimeCancellation = await request(worker, 'task.runtimeCancelObserved', {
+			taskId: cancelTask.taskId,
+		});
+		if (runtimeCancellation.observed !== true) {
+			throw new Error('Worker did not observe AgentTaskHandle.cancel().');
+		}
+		cancelOutcome = {
+			state: 'cancelled',
+			eventTypes: cancellationEvents,
+			runtimeHandleCancelObserved: true,
+		};
+		const authTask = await request(coordinator, 'task.start', {
+			peerId: target.peerId,
+			workspaceId: workerWorkspace.workspaceId,
+			title: 'Two-instance real AHP probe',
+			prompt: 'Reply with exactly MESH_TWO_INSTANCE_E2E_OK. Do not modify files or run commands.',
+			acceptanceCriteria: ['Authoritative AHP turnComplete is observed when authentication is available.'],
+		});
+		const authResult = await waitForTask(authTask.taskId, 180_000);
+		if (
+			authResult.snapshot.status !== 'completed'
+			|| !authResult.events.some((event) => event.type === 'completed')
+		) {
+			throw new Error('Authenticated AHP did not produce authoritative turnComplete.');
 		}
 		authOutcome = {
 			state: 'turnComplete',
@@ -156,8 +190,8 @@ try {
 			eventTypes: authResult.events.map((event) => event.type),
 		};
 	} else if (
-		authResult.snapshot.status === 'failed'
-		&& authResult.snapshot.failure?.code === 'AGENT_AUTH_REQUIRED'
+		cancelReady.value.snapshot.status === 'failed'
+		&& cancelReady.value.snapshot.failure?.code === 'AGENT_AUTH_REQUIRED'
 	) {
 		if (
 			process.env.MESH_TWO_DEVICE_E2E_AUTH_RESOURCE
@@ -171,21 +205,40 @@ try {
 			code: 'AGENT_AUTH_REQUIRED',
 			authSessionAvailable: authAvailability.available === true,
 		};
+		cancelOutcome = {
+			state: 'blocked',
+			code: 'AGENT_AUTH_REQUIRED',
+			reason: 'AgentTaskHandle was not acquired; cancellation was not claimed.',
+		};
 	} else {
-		throw new Error(`Real AHP task ended unexpectedly: ${JSON.stringify(authResult.snapshot.failure ?? authResult.snapshot.status)}`);
+		throw new Error(
+			`Cancellation probe ended before agentStarted: ${JSON.stringify(
+				cancelReady.value.snapshot.failure ?? cancelReady.value.snapshot.status,
+			)}`,
+		);
 	}
 
 	await request(worker, 'listener.stop');
-	const cleanup = await request(worker, 'tunnel.cleanup', {}, 60_000);
-	tunnelCleanup = cleanup.cleanup;
-	if (!['deleted', 'already-absent'].includes(tunnelCleanup)) {
-		throw new Error('Owned Tunnel cleanup was not confirmed.');
+	if (forceFallbackCleanup) {
+		tunnelCleanup = 'fallback-required';
+	} else {
+		const cleanup = await request(worker, 'tunnel.cleanup', {}, 60_000);
+		tunnelCleanup = cleanup.cleanup;
+		if (!['deleted', 'already-absent'].includes(tunnelCleanup)) {
+			throw new Error('Owned Tunnel cleanup was not confirmed.');
+		}
 	}
 } finally {
 	invitation = undefined;
-	if (!['deleted', 'already-absent'].includes(tunnelCleanup)) {
+	if (
+		!forceFallbackCleanup
+		&& !['deleted', 'already-absent'].includes(tunnelCleanup)
+	) {
 		await request(worker, 'listener.stop', {}, 15_000).catch(() => undefined);
-		const cleanup = await request(worker, 'tunnel.cleanup', {}, 45_000).catch(() => undefined);
+		const cleanup = await request(worker, 'tunnel.cleanup', {}, 45_000).catch((error) => {
+			cleanupFailure = error;
+			return undefined;
+		});
 		if (cleanup?.cleanup) {
 			tunnelCleanup = cleanup.cleanup;
 		}
@@ -230,25 +283,62 @@ try {
 	ownedProcessesStopped = listOwnedProcesses(ownedMarkers).length === 0
 		&& configuredLeaks.length === 0;
 
-	for (const path of [worker.userData, worker.extensions, worker.control, coordinator.userData, coordinator.extensions, coordinator.control, workspace]) {
-		await rm(path, { recursive: true, force: true });
+	if (
+		!['deleted', 'already-absent'].includes(tunnelCleanup)
+		&& ownedTunnel !== undefined
+	) {
+		try {
+			tunnelCleanup = await fallbackDeleteOwnedTunnel(ownedTunnel);
+			tunnelCleanupMethod = 'exact-cli-fallback';
+			cleanupFailure = undefined;
+		} catch (error) {
+			cleanupFailure = error;
+		}
 	}
-	profilesRemoved = await allAbsent([
-		worker.userData,
-		worker.extensions,
-		worker.control,
-		coordinator.userData,
-		coordinator.extensions,
-		coordinator.control,
-		workspace,
-	]);
-	if (downloadedDevTunnel && devTunnelPath) {
-		await rm(devTunnelPath, { force: true });
+	const cleanupConfirmed = ['deleted', 'already-absent'].includes(tunnelCleanup);
+	if (cleanupConfirmed || !listenerStartAttempted) {
+		for (const path of [
+			worker.userData,
+			worker.extensions,
+			worker.control,
+			coordinator.userData,
+			coordinator.extensions,
+			coordinator.control,
+			workspace,
+		]) {
+			await rm(path, { recursive: true, force: true });
+		}
+		profilesRemoved = await allAbsent([
+			worker.userData,
+			worker.extensions,
+			worker.control,
+			coordinator.userData,
+			coordinator.extensions,
+			coordinator.control,
+			workspace,
+		]);
+		if (downloadedDevTunnel && devTunnelPath) {
+			await rm(devTunnelPath, { force: true });
+		}
 	}
 	await sanitizeLogs();
-	await rm(runtimeRoot, { recursive: true, force: true });
+	if (cleanupConfirmed || !listenerStartAttempted) {
+		await rm(runtimeRoot, { recursive: true, force: true });
+	} else {
+		await writeFile(join(evidenceRoot, 'cleanup-failure.json'), `${JSON.stringify({
+			cleanup: 'unconfirmed',
+			metadataRetained: true,
+			errorCode: 'CLEANUP_UNCONFIRMED',
+		})}\n`, { mode: 0o600 });
+	}
 }
 
+if (!['deleted', 'already-absent'].includes(tunnelCleanup) && listenerStartAttempted) {
+	throw new Error(
+		`Owned Tunnel cleanup was not confirmed; exact metadata and profiles were retained under ${runtimeRoot}.`,
+		{ cause: cleanupFailure },
+	);
+}
 if (!ownedProcessesStopped || !profilesRemoved) {
 	throw new Error('Owned process or isolated profile cleanup was not confirmed.');
 }
@@ -263,6 +353,7 @@ const evidence = {
 		build: '1.0.2030+fc9273aa0f',
 		sha256: expectedDevTunnelSha256,
 		cleanup: tunnelCleanup,
+		cleanupMethod: tunnelCleanupMethod,
 	},
 	instances: {
 		worker: 'isolated',
@@ -406,15 +497,15 @@ async function waitForTask(taskId, timeoutMs) {
 	throw new Error(`Task ${taskId} did not become terminal (last state ${latest?.snapshot?.status ?? 'unknown'}).`);
 }
 
-async function waitForTaskEvent(taskId, expectedEvent, timeoutMs) {
+async function waitForTaskEventOrTerminal(taskId, expectedEvent, timeoutMs) {
 	const deadline = Date.now() + timeoutMs;
 	do {
 		const latest = await request(coordinator, 'task.get', { taskId });
 		if (latest.events.some((event) => event.type === expectedEvent)) {
-			return latest;
+			return { kind: 'event', value: latest };
 		}
 		if (terminalStates.has(latest.snapshot.status)) {
-			throw new Error(`Task became ${latest.snapshot.status} before ${expectedEvent}.`);
+			return { kind: 'terminal', value: latest };
 		}
 		await delay(50);
 	} while (Date.now() < deadline);
@@ -440,11 +531,71 @@ async function prepareDevTunnel() {
 		await writeFile(path, Buffer.from(await response.arrayBuffer()), { mode: 0o700 });
 		await chmod(path, 0o700);
 	}
+	await verifyExactDevTunnel(path);
+	return { path, downloaded: !configured };
+}
+
+async function fallbackDeleteOwnedTunnel(metadata) {
+	if (
+		metadata?.build !== SUPPORTED_DEVTUNNEL_BUILD
+		|| typeof metadata.executablePath !== 'string'
+		|| typeof metadata.localPort !== 'number'
+		|| typeof metadata.ownershipLabel !== 'string'
+		|| typeof metadata.tunnelId !== 'string'
+	) {
+		throw new Error('Retained owned Tunnel metadata is incomplete.');
+	}
+	await verifyExactDevTunnel(metadata.executablePath);
+	let shown = runDevTunnel(metadata.executablePath, ['show', metadata.tunnelId, '--json'], [0, 2]);
+	if (isExactDevTunnelNotFound(metadata.build, shown, metadata.tunnelId)) {
+		return 'already-absent';
+	}
+	if (shown.exitCode !== 0) {
+		throw new Error('Exact-ID Tunnel inspection did not return a strict owned resource.');
+	}
+	decodeDevTunnelShowJson(metadata.build, shown.stdout, {
+		expectedOwnershipLabel: metadata.ownershipLabel,
+		expectedPort: metadata.localPort,
+		expectedTunnelId: metadata.tunnelId,
+		requireForwardingUri: false,
+	});
+	runDevTunnel(metadata.executablePath, ['delete', metadata.tunnelId], [0]);
+	const deadline = Date.now() + 30_000;
+	do {
+		shown = runDevTunnel(metadata.executablePath, ['show', metadata.tunnelId, '--json'], [0, 2]);
+		if (isExactDevTunnelNotFound(metadata.build, shown, metadata.tunnelId)) {
+			return 'deleted';
+		}
+		await delay(250);
+	} while (Date.now() < deadline);
+	throw new Error('Fallback cleanup did not receive the strict versioned exact-ID not-found response.');
+}
+
+async function verifyExactDevTunnel(path) {
 	const digest = createHash('sha256').update(await readFile(path)).digest('hex');
 	if (digest !== expectedDevTunnelSha256) {
 		throw new Error('The Dev Tunnel executable SHA-256 does not match the exact supported build.');
 	}
-	return { path, downloaded: !configured };
+}
+
+function runDevTunnel(executable, args, acceptedExitCodes) {
+	const result = spawnSync(executable, args, {
+		encoding: 'utf8',
+		maxBuffer: 256 * 1024,
+		timeout: 30_000,
+	});
+	if (result.error) {
+		throw result.error;
+	}
+	const exitCode = result.status ?? -1;
+	if (!acceptedExitCodes.includes(exitCode)) {
+		throw new Error(`Exact Dev Tunnel ${args[0]} command exited ${exitCode}.`);
+	}
+	return {
+		exitCode,
+		stdout: result.stdout ?? '',
+		stderr: result.stderr ?? '',
+	};
 }
 
 async function waitForFile(path, timeoutMs) {

@@ -123,6 +123,14 @@ suite('DevTunnelCliProvider', () => {
 			const runner = new FakeRunner();
 			const provider = createProvider(runner, new MemoryStore());
 			await provider.ensureHosted(request);
+			assert.deepStrictEqual(await provider.ownedMetadataForE2e(), {
+				build: SUPPORTED_DEVTUNNEL_BUILD,
+				decoderRevision: DEVTUNNEL_DECODER_REVISION,
+				executablePath: '/verified/devtunnel',
+				localPort: request.localPort,
+				ownershipLabel: request.ownershipLabel,
+				tunnelId,
+			});
 			assert.equal(await provider.deleteOwnedForE2e(), 'deleted');
 			assert.deepStrictEqual(
 				runner.commands.filter((args) => args[0] === 'delete'),
