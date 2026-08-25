@@ -1,7 +1,7 @@
 # Preview release engineering
 
 > Version: `0.1.0` pre-release
-> Baseline: `06775c7e2e8a18f7771507e4a739fad0b865d9a0`
+> Implementation evidence through: `26431763836ce0016285c4e873bebef7ec9f4a40`
 > Gate status: G0 **No-Go**
 
 This document describes a reproducible evaluation package. It does not authorize
@@ -106,7 +106,7 @@ cleanup review; the success path may consume Copilot quota.
 
 ## Manual release checklist
 
-1. Confirm `git merge-base HEAD mvp-e2e-base` is the recorded baseline.
+1. Confirm the worktree is clean and record the current commit SHA.
 2. Run `npm ci`, `npm audit --audit-level=high`, and `npm run verify`.
 3. Run `npm run smoke:vsix` without enabling Worker settings.
 4. Record the commit SHA, VSIX SHA-256, and verified archive listing.

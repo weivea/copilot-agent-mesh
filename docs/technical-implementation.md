@@ -1,9 +1,14 @@
 # Copilot Agent Mesh 技术实施方案
 
-> 状态：Draft<br>
-> 日期：2026-08-24<br>
+> 状态：0.1.0 Preview 实施基线；持续维护<br>
+> 日期：2026-08-25<br>
 > 依据：[产品需求文档 v0.3](../copilot-agent-mesh-prd.md)<br>
 > 首版范围：本机桌面 Workspace；不支持 SSH、WSL、Dev Containers、Codespaces 或 vscode.dev
+
+> 当前实现已包含本文的 Domain、Storage、Gateway、Pairing、Peer、Dev Tunnel、
+> Production Tools、Dashboard、Agent Host/AHP 和 Composition Root。真实双实例
+> E2E 已通过传输与任务边界；authenticated AHP `turnComplete` 仍需显式账户映射
+> 和用户认证，因此 Gate G0 保持 No-Go。
 
 ## 1. 结论
 

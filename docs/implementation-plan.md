@@ -4,8 +4,8 @@
 > x64 和其他架构在 peer client 可用时仅支持 Coordinator。本文其余跨平台
 > Worker 条目是未来目标，不是当前 Marketplace Preview 声明。
 
-> 状态：Phase 0 evaluated; Gate G0 No-Go<br>
-> 日期：2026-08-24<br>
+> 状态：0.1.0 Preview MVP 已实现；Gate G0 No-Go<br>
+> 日期：2026-08-25<br>
 > 依据：[PRD v0.3](../copilot-agent-mesh-prd.md) 与 [技术实施方案](./technical-implementation.md)<br>
 > 兼容性 Gate：[Compatibility Matrix](./compatibility-matrix.md)<br>
 > 计划方式：按技术 Gate 推进，不以未经验证的日历日期承诺
@@ -28,22 +28,21 @@
 
 已完成：
 
-- TypeScript VS Code Extension Scaffold。
-- npm、esbuild、TypeScript、ESLint 和 Extension Host Test。
-- Activity Bar Webview View 骨架。
-- 设备名设置。
-- 初始协议常量。
-- PRD 已明确 Git 操作完全由远端 Agent 决定。
+- Runtime Schema、Task Reducer、Workspace Lease、原子文件和恢复存储。
+- Device/Workspace 持久化、本机 Guard 和跨窗口 Application Owner fencing。
+- Loopback Gateway、Pairing、Peer、Heartbeat、重连和任务 RPC。
+- 精确版本 Dev Tunnel Provider、HTTPS/WSS Readiness、续期和精确清理。
+- Production Agent Host/AHP Runtime、认证边界、Session/Chat/Terminal/Input 映射。
+- 五个 Production Language Model Tools 和安全交互 Dashboard。
+- TaskCoordinator、WorkerTaskService、Composition Root 和启动/关闭恢复。
+- 双实例真实 E2E、三平台离线 CI、Preview VSIX 和隔离安装 activation smoke。
 
-尚未实现：
+Preview 后续 Gate：
 
-- Runtime Schema 和领域状态机。
-- Device/Workspace 持久化。
-- Gateway、认证、Peer、Dev Tunnel。
-- Agent Host/AHP。
-- Language Model Tools。
-- 交互 Dashboard。
-- 分层测试、CI、VSIX 打包。
+- 使用显式 VS Code Authentication Mapping 完成真实 AHP `turnComplete` E2E。
+- 在真实 Copilot 会话中验证五个 Tool 的自动选择与完成结果消费。
+- Windows/Linux Worker 的进程树所有权、Dev Tunnel 版本和完整 E2E。
+- 多 Workspace 真实并发、重启恢复和人工 UI 验收扩展矩阵。
 
 ## 3. 决策 Gate
 

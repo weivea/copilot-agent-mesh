@@ -20,6 +20,32 @@ back to an unowned process or unvalidated tunnel build.
 
 See [Preview release and installation](./docs/mvp/release.md) for packaging, installation, and verification instructions.
 
+## Implemented Preview capabilities
+
+- Register trusted local Workspaces by opaque ID.
+- Start a loopback Gateway and an exact-build Microsoft Dev Tunnel.
+- Pair devices with one-time invitations and application-layer mutual authentication.
+- Discover peers and Workspaces, then delegate, poll, cancel, and answer tasks.
+- Run the production Agent Host/AHP adapter with explicit VS Code authentication.
+- Use five Copilot tools: list workers, delegate, get, cancel, and answer.
+- Operate the listener, peers, Workspaces, and tasks from the Activity Bar Dashboard.
+- Persist task state and recovery data with bounded journals, workspace leases, and
+  cross-window ownership fencing.
+
+The real two-instance E2E passes Tunnel lifecycle, pairing, Workspace discovery,
+delegation, polling, and exact resource cleanup. A disposable unauthenticated profile
+correctly stops at `AGENT_AUTH_REQUIRED`; follow
+[the authenticated continuation](./docs/mvp/e2e.md#manual-authenticated-continuation)
+to exercise a real `turnComplete`.
+
+## Install the local Preview
+
+```bash
+npm ci
+npm run package:vsix
+code --install-extension artifacts/copilot-agent-mesh-0.1.0-preview.vsix
+```
+
 Project documents:
 
 - [Product requirements](./copilot-agent-mesh-prd.md)

@@ -8,10 +8,15 @@
 
 > 工作名称：Copilot Agent Mesh  
 > 文档版本：v0.3<br>
-> 状态：Draft / 可用于创建项目  
-> 日期：2026-08-24  
+> 状态：0.1.0 Preview 已实现；G0 仍为 No-Go<br>
+> 日期：2026-08-25<br>
 > 产品形态：个人使用的 VS Code Desktop 扩展  
 > Preview 支持平台：Coordinator 可运行于支持 peer client 的桌面平台；Worker 仅 macOS arm64
+
+> 实施快照：真实双实例 E2E 已覆盖 Dev Tunnel、配对、Workspace 发现、任务委派、
+> 查询和精确资源清理。隔离 Worker Profile 因没有显式 VS Code Authentication
+> Session，在真实 AHP Turn 前返回 `AGENT_AUTH_REQUIRED`；因此本文描述的完整
+> authenticated Agent 闭环仍是 Preview Gate，而不是已完成的 G0 声明。
 
 ## 1. 产品摘要
 
