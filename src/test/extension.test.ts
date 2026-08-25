@@ -60,8 +60,16 @@ suite('Copilot Agent Mesh', () => {
 
 		assert.ok(commands.some(({ command }) => command === 'copilotAgentMesh.configureDevice'));
 		assert.ok(commands.some(({ command }) => command === 'copilotAgentMesh.refreshDashboard'));
+		assert.ok(commands.some(({ command }) => command === 'copilotAgentMesh.runAgentHostTask'));
 		assert.ok(views.some(({ id }) => id === 'copilotAgentMesh.dashboard'));
 		assert.deepStrictEqual(manifest.extensionKind, ['ui']);
+	});
+
+	test('keeps the real Agent Host runtime disabled by default', () => {
+		const manifest = getExtension().packageJSON;
+		const properties = manifest.contributes.configuration.properties as Record<string, { default?: unknown }>;
+
+		assert.strictEqual(properties['copilotAgentMesh.experimental.agentHost']?.default, false);
 	});
 
 	test('prepares confirmation copy and returns compact structured text', async () => {

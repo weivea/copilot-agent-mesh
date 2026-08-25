@@ -126,6 +126,11 @@
         "title": "Refresh Dashboard",
         "category": "Copilot Agent Mesh",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "copilotAgentMesh.runAgentHostTask",
+        "title": "Run Agent Host Task",
+        "category": "Copilot Agent Mesh"
       }
     ],
     "menus": {
@@ -150,6 +155,43 @@
           "default": "",
           "scope": "machine",
           "markdownDescription": "The name used to identify this device to trusted peers."
+        },
+        "copilotAgentMesh.codePath": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "markdownDescription": "Optional VS Code CLI path used by the experimental Agent Host runtime."
+        },
+        "copilotAgentMesh.experimental.agentHost": {
+          "type": "boolean",
+          "default": false,
+          "scope": "machine",
+          "markdownDescription": "Enable the real Agent Host/AHP runtime. This may consume Copilot quota."
+        },
+        "copilotAgentMesh.experimental.authenticationProviders": {
+          "type": "object",
+          "default": {},
+          "scope": "machine",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "providerId": {
+                "type": "string"
+              },
+              "scopes": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "providerId",
+              "scopes"
+            ],
+            "additionalProperties": false
+          },
+          "markdownDescription": "Maps an AHP protected-resource or authorization-server URL to a VS Code authentication provider ID and exact scopes. No provider or scope is inferred."
         }
       }
     }
@@ -171,6 +213,7 @@
     "test:extension": "npm run compile-tests && npm run compile && vscode-test",
     "test": "npm run test:unit && npm run test:component && npm run test:extension",
     "spike:dev-tunnel": "npm run test:dev-tunnel-real",
+    "test:agent-host-e2e": "npm run compile-tests && node out/src/e2e/agentHost.e2e.js",
     "spike:agent-host": "npm run compile-tests && node out/src/spikes/agentHostSpike.js"
   },
   "devDependencies": {
