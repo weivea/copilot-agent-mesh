@@ -522,7 +522,7 @@ class AhpTask implements AgentTaskHandle {
 		this.sessionCreated = true;
 		this.throwIfTerminalError();
 
-		const sessionSubscription = await this.connection.subscribe(this.sessionUri);
+		const sessionSubscription = await this.connection.subscribe(this.sessionUri, this.generation.abort.signal);
 		this.throwIfTerminalError();
 		if (sessionSubscription.snapshot !== undefined) {
 			this.applySnapshot(sessionSubscription.snapshot);
@@ -536,7 +536,7 @@ class AhpTask implements AgentTaskHandle {
 		this.throwIfTerminalError();
 		this.chatUri = defaultChat;
 
-		const chatSubscription = await this.connection.subscribe(defaultChat);
+		const chatSubscription = await this.connection.subscribe(defaultChat, this.generation.abort.signal);
 		this.throwIfTerminalError();
 		if (chatSubscription.snapshot !== undefined) {
 			this.applySnapshot(chatSubscription.snapshot);
@@ -608,6 +608,12 @@ class AhpTask implements AgentTaskHandle {
 		this.recoveryAbort?.abort();
 		this.generation.valid = false;
 		this.generation.abort.abort();
+		const startupStopped = new AgentRuntimeError(
+			'TASK_EXECUTION_FAILED',
+			'The Agent Host task was disposed during startup.',
+		);
+		this.readyReject?.(startupStopped);
+		this.defaultChatReject?.(startupStopped);
 		if (this.cancellationTimer !== undefined) {
 			clearTimeout(this.cancellationTimer);
 		}
@@ -1261,7 +1267,11 @@ class AhpTask implements AgentTaskHandle {
 					this.handleEnvelope(action, false);
 				}
 				const missing = result.missing ?? [];
-				if (missing.includes(this.sessionUri) || missing.includes(this.chatUri ?? '')) {
+				if (
+					missing.includes(rootUri)
+					|| missing.includes(this.sessionUri)
+					|| missing.includes(this.chatUri ?? '')
+				) {
 					throw new RecoveryUnavailableCause('The Agent Host no longer has the task session.');
 				}
 				for (const uri of missing) {

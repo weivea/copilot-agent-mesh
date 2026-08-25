@@ -481,6 +481,22 @@ test('startup observes terminal actions delivered immediately after turn dispatc
 	assert.equal(launcher.host.disposed, true);
 });
 
+test('disposing runtime rejects pending Session readiness without waiting for timeout', async () => {
+	const transport = new FakeAhpTransport();
+	transport.sessionStartsPending = true;
+	const launcher = new FakeLauncher();
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+	const started = runtime.start(taskRequest());
+	await waitForCondition(() => transport.subscribedUris.some((uri) => uri.startsWith('ahp-session:')));
+
+	await runtime.dispose();
+	await assert.rejects(
+		started,
+		(error: unknown) => error instanceof AgentRuntimeError && error.code === 'TASK_EXECUTION_FAILED',
+	);
+	assert.equal(launcher.host.disposed, true);
+});
+
 test('runtime reconnects with the recovery descriptor and fails truthfully on host crash', async () => {
 	const first = new FakeAhpTransport();
 	const recovered = new FakeAhpTransport();
@@ -652,6 +668,25 @@ test('runtime preserves non-missing recovery connection failures', async () => {
 	assert.equal(failed.type, 'failed');
 	if (failed.type === 'failed') {
 		assert.equal(failed.error.code, 'AGENT_UNAVAILABLE');
+	}
+	await handle.dispose();
+});
+
+test('recovery fails rather than taking over without the root subscription', async () => {
+	const first = new FakeAhpTransport();
+	const recovered = new FakeAhpTransport();
+	recovered.reconnectResult = { type: 'replay', actions: [], missing: ['ahp-root://'] };
+	const runtime = createRuntime(new FakeLauncher(), new FakeConnectionFactory([first, recovered]));
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+	recovered.created = first.created;
+
+	first.failChat();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	const failed = await nextEvent(handle.events);
+	assert.equal(failed.type, 'failed');
+	if (failed.type === 'failed') {
+		assert.equal(failed.error.code, 'TASK_RECOVERY_UNAVAILABLE');
 	}
 	await handle.dispose();
 });
@@ -1432,6 +1467,7 @@ class FakeAhpTransport implements AhpConnection {
 	completeAfterChatSubscribe = false;
 	completeAfterTurnDispatch = false;
 	ignoreSubscribeAbort = false;
+	sessionStartsPending = false;
 	notificationDuringInitialize: readonly ProtectedResource[] = [];
 	rootAttachedBeforeInitialize = false;
 	disposeSessionCalls = 0;
@@ -1554,10 +1590,10 @@ class FakeAhpTransport implements AhpConnection {
 						provider: 'dynamic-provider',
 						title: 'Task',
 						status: 1,
-						lifecycle: 'ready',
+						lifecycle: this.sessionStartsPending ? 'creating' : 'ready',
 						activeClients: [],
 						chats: [],
-						defaultChat: 'ahp-chat:/default',
+						defaultChat: this.sessionStartsPending ? undefined : 'ahp-chat:/default',
 					},
 				} as Snapshot,
 				subscription: this.queue(uri),

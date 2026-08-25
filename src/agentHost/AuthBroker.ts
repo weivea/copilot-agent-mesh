@@ -93,13 +93,13 @@ export class VscodeAuthBroker implements AuthBroker {
 				);
 			}
 			throwIfAborted(request.signal);
-
-			function throwIfAborted(signal?: AbortSignal): void {
-				if (signal?.aborted === true) {
-					throw new DOMException('Authentication was aborted.', 'AbortError');
-				}
-			}
 		}
+	}
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+	if (signal?.aborted === true) {
+		throw new DOMException('Authentication was aborted.', 'AbortError');
 	}
 }
 
