@@ -27,6 +27,7 @@ import type { FileTaskStore } from '../tasks/FileTaskStore';
 import type { WorkspaceLeaseManager } from '../tasks/WorkspaceLeaseManager';
 import type { WorkspaceRegistry, LocalWorkspace } from '../workspaces/WorkspaceRegistry';
 import type { LocalDesktopWorkspaceGuard } from './LocalDesktopWorkspaceGuard';
+import type { WorkerOwnership } from '../storage/WorkerOwnerLock';
 
 const activeStates = new Set<string>(ACTIVE_TASK_STATUSES);
 const defaultCancellationDeadlineMs = 15_000;
@@ -49,6 +50,7 @@ export interface RemoteTaskRunnerOptions {
 	readonly now?: () => Date;
 	readonly notificationSink?: TaskNotificationSink;
 	readonly onDidChange?: () => void;
+	readonly ownership?: WorkerOwnership;
 }
 
 interface RunningTask {
@@ -93,6 +95,7 @@ export class RemoteTaskRunner implements TaskService {
 	}
 
 	public async initialize(): Promise<void> {
+		await this.options.ownership?.assertOwner();
 		this.guard.assertAllowed({ requireWorkspace: false });
 		const active = await this.store.listForRecovery();
 		this.leases.restoreFromTaskRecords(active);
@@ -121,6 +124,7 @@ export class RemoteTaskRunner implements TaskService {
 		params: TaskStartParams,
 	): Promise<TaskSnapshot> {
 		this.assertActive();
+		await this.options.ownership?.assertOwner();
 		this.guard.assertAllowed();
 		const previous = (await this.store.list()).find((record) =>
 			record.peerId === authenticatedPeerId
@@ -206,6 +210,7 @@ export class RemoteTaskRunner implements TaskService {
 		afterEventSeq?: number,
 	): Promise<TaskSnapshot | TaskSnapshotAfterEventSeq> {
 		this.assertActive();
+		await this.options.ownership?.assertOwner();
 		this.guard.assertAllowed({ requireWorkspace: false });
 		const record = await this.requireOwned(authenticatedPeerId, taskId);
 		return afterEventSeq === undefined
@@ -215,6 +220,7 @@ export class RemoteTaskRunner implements TaskService {
 
 	public async cancel(authenticatedPeerId: string, taskId: string): Promise<TaskSnapshot> {
 		this.assertActive();
+		await this.options.ownership?.assertOwner();
 		this.guard.assertAllowed({ requireWorkspace: false });
 		const record = await this.requireOwned(authenticatedPeerId, taskId);
 		if (!activeStates.has(record.state)) {
@@ -260,6 +266,7 @@ export class RemoteTaskRunner implements TaskService {
 		answer: string,
 	): Promise<TaskSnapshot> {
 		this.assertActive();
+		await this.options.ownership?.assertOwner();
 		this.guard.assertAllowed({ requireWorkspace: false });
 		const record = await this.requireOwned(authenticatedPeerId, taskId);
 		if (record.answeredInputs[inputId] === answerId) {

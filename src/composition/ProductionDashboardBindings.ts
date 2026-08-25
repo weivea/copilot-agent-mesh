@@ -15,6 +15,7 @@ import type { FileTaskStore } from '../tasks/FileTaskStore';
 import type { WorkspaceLeaseManager } from '../tasks/WorkspaceLeaseManager';
 import type { MeshWorkerDirectorySnapshot } from '../../shared/toolProtocol';
 import type { WorkerPlatformSupport } from '../application/WorkerPlatformSupport';
+import type { WorkerOwnership } from '../storage/WorkerOwnerLock';
 import type {
 	DashboardServiceBindings,
 	DashboardSnapshot,
@@ -41,6 +42,7 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 		private readonly runtime: AgentRuntime,
 		private readonly guard: LocalDesktopWorkspaceGuard,
 		private readonly workerPlatform: WorkerPlatformSupport,
+		private readonly ownership: WorkerOwnership,
 	) {
 		this.subscriptions.push(
 			listener.onDidChange(() => changed.fire()),
@@ -81,7 +83,7 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 		const connections = new Map(
 			this.peers.listConnections().map((connection) => [connection.profileId, connection.snapshot()]),
 		);
-		const workerRecords = await this.workerTasks.list();
+		const workerRecords = this.ownership.isOwner() ? await this.workerTasks.list() : [];
 		const coordinatorTasks = this.coordinator.listKnownTasks();
 		const workspaceNames = new Map(
 			localWorkspaces.map((workspace) => [workspace.workspaceId, workspace.name]),
@@ -122,6 +124,7 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 				})),
 		];
 		const workerPlatformSupported = this.workerPlatform.supported;
+		const workerOwnedHere = this.ownership.isOwner();
 		const listenerError = !workerPlatformSupported
 			? [{
 				code: this.workerPlatform.listenerCode,
@@ -138,7 +141,13 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 			message: 'Worker Preview task execution requires macOS arm64. Coordinator features remain available.',
 			action: 'Use a macOS arm64 device to host Worker tasks.',
 		}];
+		const ownershipError = workerOwnedHere ? [] : [{
+			code: 'WORKER_OWNED_BY_ANOTHER_WINDOW',
+			message: 'Another VS Code window owns Worker and Listener services for this extension storage.',
+			action: 'Use this window as a Coordinator, or close the owner window and reload this window to acquire ownership.',
+		}];
 		const listenerUnsupported = !workerPlatformSupported
+			|| !workerOwnedHere
 			|| listener.error?.code === 'CLI_UNSUPPORTED';
 		const tunnelReady = listener.tunnel.state === 'ready';
 		return {
@@ -155,8 +164,12 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 					? {
 						state: 'unavailable',
 						label: 'Unsupported',
-						detail: listener.error?.message ?? this.workerPlatform.listenerMessage,
-						action: 'Use macOS arm64 to host a Worker; Coordinator features remain available.',
+						detail: !workerOwnedHere
+							? 'Another VS Code window owns Worker and Listener services.'
+							: listener.error?.message ?? this.workerPlatform.listenerMessage,
+						action: !workerOwnedHere
+							? 'This window remains Coordinator-only until ownership is released.'
+							: 'Use macOS arm64 to host a Worker; Coordinator features remain available.',
 					}
 					: listener.state === 'running'
 						? { state: 'ready', label: 'Ready', detail: 'Loopback gateway is accepting authenticated peers.' }
@@ -167,8 +180,12 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 					? {
 						state: 'unavailable',
 						label: 'Unsupported',
-						detail: listener.error?.message ?? this.workerPlatform.listenerMessage,
-						action: 'Use macOS arm64 for Worker Preview listener hosting.',
+						detail: !workerOwnedHere
+							? 'Another VS Code window owns the Worker tunnel.'
+							: listener.error?.message ?? this.workerPlatform.listenerMessage,
+						action: !workerOwnedHere
+							? 'Use the owner window to manage the Listener.'
+							: 'Use macOS arm64 for Worker Preview listener hosting.',
 					}
 					: tunnelReady
 						? { state: 'ready', label: 'Ready', detail: 'Exact-build Dev Tunnel is hosted.' }
@@ -190,14 +207,18 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 					: {
 						state: 'unavailable',
 						label: runtimeProbe.featureEnabled ? 'Unavailable' : 'Disabled',
-						detail: !workerPlatformSupported
+						detail: !workerOwnedHere
+							? 'Another VS Code window owns Worker task execution; this window is Coordinator-only.'
+							: !workerPlatformSupported
 							? 'Worker Preview execution is unavailable. macOS arm64 is required; Coordinator features remain available.'
 							: 'Enable the Agent Host feature after satisfying the AHP compatibility gate.',
-						action: !workerPlatformSupported
+						action: !workerOwnedHere
+							? 'Use the owner window for Worker tasks.'
+							: !workerPlatformSupported
 							? 'Use macOS arm64 for Worker Preview execution.'
 							: 'Configure copilotAgentMesh.experimental.agentHost.',
 					},
-				canStart: !listenerUnsupported
+				canStart: workerOwnedHere && !listenerUnsupported
 					&& (listener.state === 'stopped' || listener.state === 'error'),
 				canStop: listener.state === 'running' || listener.state === 'starting',
 				canCopyConnectionUrl: listener.state === 'running',
@@ -225,7 +246,7 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 				};
 			}),
 			tasks,
-			errors: [...listenerError, ...agentPlatformError],
+			errors: [...listenerError, ...agentPlatformError, ...ownershipError],
 		};
 	}
 

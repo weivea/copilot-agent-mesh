@@ -31,6 +31,7 @@ import type { WorkerPlatformSupport } from '../application/WorkerPlatformSupport
 import type { TaskStartParams } from '../gateway/GatewayRouter';
 import type { LocalWorkspace, WorkspaceRegistry } from '../workspaces/WorkspaceRegistry';
 import { canonicalTaskRequestHash } from '../domain/task';
+import type { WorkerOwnership } from '../storage/WorkerOwnerLock';
 
 const configurationSection = 'copilotAgentMesh';
 const taskApprovalStateKey = 'copilotAgentMesh.taskApprovals';
@@ -181,6 +182,7 @@ export function createVscodeAgentRuntime(
 	guard: LocalDesktopWorkspaceGuard,
 	approval: FirstTaskConfirmation,
 	workerPlatform: WorkerPlatformSupport,
+	ownership: WorkerOwnership,
 ): AgentRuntime {
 	const configuration = vscodeApi.workspace.getConfiguration(configurationSection);
 	const launcher = new AgentHostLauncher({
@@ -199,7 +201,7 @@ export function createVscodeAgentRuntime(
 		workspaceResolver: new RegistryWorkspaceResolver(workspaces),
 		configResolver: new VscodeSessionConfigurationResolver(vscodeApi),
 	});
-	return new GuardedAgentRuntime(runtime, guard, workerPlatform);
+	return new GuardedAgentRuntime(runtime, guard, workerPlatform, ownership);
 }
 
 class RegistryWorkspaceResolver implements WorkspaceResolver {
@@ -224,27 +226,29 @@ class GuardedAgentRuntime implements AgentRuntime {
 		private readonly delegate: AgentRuntime,
 		private readonly guard: LocalDesktopWorkspaceGuard,
 		private readonly workerPlatform: WorkerPlatformSupport,
+		private readonly ownership: WorkerOwnership,
 	) {}
 
-	public probe(): Promise<AgentRuntimeProbe> {
+	public async probe(): Promise<AgentRuntimeProbe> {
 		this.guard.assertAllowed({ requireWorkspace: false });
-		if (!this.workerPlatform.supported) {
-			return Promise.resolve({
+		if (!this.workerPlatform.supported || !this.ownership.isOwner()) {
+			return {
 				available: false,
 				featureEnabled: false,
 				reason: this.workerPlatform.agentCode,
-			});
+			};
 		}
 		return this.delegate.probe();
 	}
 
-	public start(request: AgentTaskRequest): Promise<AgentTaskHandle> {
+	public async start(request: AgentTaskRequest): Promise<AgentTaskHandle> {
 		this.guard.assertAllowed({ requireWorkspace: false });
+		await this.ownership.assertOwner();
 		if (!this.workerPlatform.supported) {
-			return Promise.reject(new AgentRuntimeError(
+			throw new AgentRuntimeError(
 				this.workerPlatform.agentCode,
 				this.workerPlatform.agentMessage,
-			));
+			);
 		}
 		this.guard.assertAllowed();
 		return this.delegate.start(request);
@@ -255,8 +259,15 @@ class GuardedAgentRuntime implements AgentRuntime {
 	}
 }
 
-class VscodeSessionConfigurationResolver implements SessionConfigurationResolver {
-	public constructor(private readonly vscodeApi: typeof vscode) {}
+interface DynamicCompletionItem extends vscode.QuickPickItem {
+	readonly completionValue: string;
+}
+
+export class VscodeSessionConfigurationResolver implements SessionConfigurationResolver {
+	public constructor(
+		private readonly vscodeApi: typeof vscode,
+		private readonly completionDebounceMs = 150,
+	) {}
 
 	public async resolve(
 		request: Parameters<SessionConfigurationResolver['resolve']>[0],
@@ -274,16 +285,14 @@ class VscodeSessionConfigurationResolver implements SessionConfigurationResolver
 				throw configRequired(`Agent configuration property "${id}" cannot be configured.`);
 			}
 			if (property.enumDynamic === true) {
-				const items = await request.completions(id, values, '');
-				const selected = await this.vscodeApi.window.showQuickPick(
-					items.slice(0, 100).map((item) => ({ label: item.label, value: item.value })),
-					{ title: property.title, ignoreFocusOut: true },
+				const value = await this.selectDynamicCompletion(
+					id,
+					property.title,
+					values,
+					request.completions,
 				);
-				if (selected === undefined) {
-					throw configRequired('Agent session configuration was cancelled.');
-				}
-				validateSessionConfigValue(id, property, selected.value);
-				values[id] = selected.value;
+				validateSessionConfigValue(id, property, value);
+				values[id] = value;
 				continue;
 			}
 			const choices = property.enum?.map((value, index) => ({
@@ -326,6 +335,147 @@ class VscodeSessionConfigurationResolver implements SessionConfigurationResolver
 		}
 		return values;
 	}
+
+	private selectDynamicCompletion(
+		propertyId: string,
+		title: string | undefined,
+		values: Readonly<Record<string, unknown>>,
+		completions: Parameters<SessionConfigurationResolver['resolve']>[0]['completions'],
+	): Promise<string> {
+		const picker = this.vscodeApi.window.createQuickPick<DynamicCompletionItem>();
+		picker.title = title;
+		picker.placeholder = 'Type to search all available values';
+		picker.ignoreFocusOut = true;
+		picker.matchOnDescription = true;
+		picker.matchOnDetail = true;
+		picker.keepScrollPosition = true;
+		let debounce: NodeJS.Timeout | undefined;
+		let activeRequest: CompletionRequest | undefined;
+		let pendingRequest: CompletionRequest | undefined;
+		let queuedRequest: CompletionRequest | undefined;
+		let revision = 0;
+		let settled = false;
+		const subscriptions: vscode.Disposable[] = [];
+
+		return new Promise<string>((resolve, reject) => {
+			const updateBusy = (): void => {
+				picker.busy = activeRequest !== undefined
+					|| pendingRequest !== undefined
+					|| queuedRequest !== undefined;
+			};
+			const cleanup = (): void => {
+				if (debounce !== undefined) {
+					clearTimeout(debounce);
+					debounce = undefined;
+				}
+				activeRequest?.controller.abort();
+				pendingRequest?.controller.abort();
+				queuedRequest?.controller.abort();
+				pendingRequest = undefined;
+				queuedRequest = undefined;
+				for (const subscription of subscriptions.splice(0)) {
+					subscription.dispose();
+				}
+				picker.dispose();
+			};
+			const finish = (operation: () => void): void => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				cleanup();
+				operation();
+			};
+			const pump = (): void => {
+				if (settled || activeRequest !== undefined || queuedRequest === undefined) {
+					updateBusy();
+					return;
+				}
+				const request = queuedRequest;
+				queuedRequest = undefined;
+				activeRequest = request;
+				updateBusy();
+				void completions(
+					propertyId,
+					values,
+					request.query,
+					request.controller.signal,
+				).then(
+					(items) => {
+						if (
+							settled
+							|| request.controller.signal.aborted
+							|| request.revision !== revision
+						) {
+							return;
+						}
+						picker.items = items.map((item) => ({
+							label: item.label,
+							description: item.value === item.label ? undefined : item.value,
+							completionValue: item.value,
+						}));
+					},
+					(error: unknown) => {
+						if (!request.controller.signal.aborted && request.revision === revision) {
+							finish(() => reject(error));
+						}
+					},
+				).finally(() => {
+					if (activeRequest === request) {
+						activeRequest = undefined;
+					}
+					pump();
+				});
+			};
+			const schedule = (query: string, immediate = false): void => {
+				revision += 1;
+				if (debounce !== undefined) {
+					clearTimeout(debounce);
+					debounce = undefined;
+				}
+				activeRequest?.controller.abort();
+				pendingRequest?.controller.abort();
+				queuedRequest?.controller.abort();
+				const request: CompletionRequest = {
+					query,
+					revision,
+					controller: new AbortController(),
+				};
+				pendingRequest = request;
+				queuedRequest = undefined;
+				updateBusy();
+				debounce = setTimeout(() => {
+					debounce = undefined;
+					if (pendingRequest === request && !request.controller.signal.aborted) {
+						pendingRequest = undefined;
+						queuedRequest = request;
+						pump();
+					}
+				}, immediate ? 0 : this.completionDebounceMs);
+			};
+
+			subscriptions.push(
+				picker.onDidChangeValue((query) => schedule(query)),
+				picker.onDidAccept(() => {
+					const selected = picker.selectedItems[0] ?? picker.activeItems[0];
+					if (selected !== undefined) {
+						finish(() => resolve(selected.completionValue));
+					}
+				}),
+				picker.onDidHide(() => {
+					finish(() => reject(configRequired('Agent session configuration was cancelled.')));
+				}),
+			);
+			picker.show();
+			schedule('', true);
+		});
+	}
+}
+
+interface CompletionRequest {
+	readonly query: string;
+	readonly revision: number;
+	readonly controller: AbortController;
 }
 
 async function resolveAuthenticationProvider(

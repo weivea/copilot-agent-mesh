@@ -6,6 +6,7 @@ import type {
 } from '../tunnel/DevTunnelProvider';
 import type { LocalDesktopWorkspaceGuard } from './LocalDesktopWorkspaceGuard';
 import type { WorkerPlatformSupport } from './WorkerPlatformSupport';
+import type { WorkerOwnership } from '../storage/WorkerOwnerLock';
 
 const listenerStateKey = 'copilotAgentMesh.listener';
 const probeRequest = 'mesh-readiness-probe';
@@ -36,6 +37,7 @@ export interface ListenerServiceOptions {
 	readonly tunnelExpiration?: `${number}h` | `${number}d`;
 	readonly configuredPort?: () => number | undefined;
 	readonly workerPlatform?: WorkerPlatformSupport;
+	readonly ownership?: WorkerOwnership;
 }
 
 export interface ListenerGateway {
@@ -61,6 +63,7 @@ export class ListenerService {
 	private operation: Promise<void> = Promise.resolve();
 	private lastError: ListenerSnapshot['error'];
 	private disposed = false;
+	private ownsResources = false;
 
 	public constructor(
 		private readonly deviceId: string,
@@ -73,6 +76,7 @@ export class ListenerService {
 	) {}
 
 	public async restore(): Promise<void> {
+		await this.options.ownership?.assertOwner();
 		this.guard.assertAllowed({ requireWorkspace: false });
 		const persisted = this.read();
 		if (persisted.enabled) {
@@ -82,23 +86,33 @@ export class ListenerService {
 
 	public start(): Promise<void> {
 		this.guard.assertAllowed({ requireWorkspace: false });
-		return this.serialize(() => this.startCore());
+		return this.serialize(async () => {
+			await this.options.ownership?.assertOwner();
+			await this.startCore();
+		});
 	}
 
 	public stop(): Promise<void> {
 		this.guard.assertAllowed({ requireWorkspace: false });
-		return this.serialize(() => this.stopCore(true));
+		return this.serialize(async () => {
+			if (!this.ownsResources) {
+				await this.options.ownership?.assertOwner();
+			}
+			await this.stopCore(true);
+		});
 	}
 
 	public restart(): Promise<void> {
 		this.guard.assertAllowed({ requireWorkspace: false });
 		return this.serialize(async () => {
+			await this.options.ownership?.assertOwner();
 			await this.stopCore(false);
 			await this.startCore();
 		});
 	}
 
 	public async createConnectionUrl(): Promise<string> {
+		await this.options.ownership?.assertOwner();
 		this.guard.assertAllowed({ requireWorkspace: false });
 		if (this.state !== 'running' || this.hosted === undefined) {
 			throw new Error('Start the listener before creating a connection URL.');
@@ -121,6 +135,9 @@ export class ListenerService {
 		method: string,
 		params: Record<string, unknown>,
 	): Promise<void> {
+		if (!this.ownsResources) {
+			return Promise.resolve();
+		}
 		return this.gateway?.notifyPeer(peerId, method, params) ?? Promise.resolve();
 	}
 
@@ -131,6 +148,11 @@ export class ListenerService {
 
 	public async dispose(): Promise<void> {
 		if (this.disposed) {
+			return;
+		}
+		if (!this.ownsResources && this.options.ownership?.isOwner() === false) {
+			this.disposed = true;
+			this.listeners.clear();
 			return;
 		}
 		await this.serialize(() => this.disposeCore());
@@ -146,6 +168,7 @@ export class ListenerService {
 		if (this.gateway !== undefined || this.hosted !== undefined) {
 			await this.stopCore(false);
 		}
+		this.ownsResources = true;
 		this.state = 'starting';
 		this.lastError = undefined;
 		this.changed();
@@ -306,6 +329,7 @@ export class ListenerService {
 		this.state = 'stopped';
 		this.lastError = undefined;
 		this.disposed = true;
+		this.ownsResources = false;
 		this.listeners.clear();
 	}
 

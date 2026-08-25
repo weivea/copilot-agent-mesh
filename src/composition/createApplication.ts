@@ -31,6 +31,7 @@ import {
 	VscodePeerProfileStore,
 	VscodeSecretStore,
 } from '../storage/VscodeStorageAdapters';
+import { WorkerOwnerLock } from '../storage/WorkerOwnerLock';
 import { FileTaskStore } from '../tasks/FileTaskStore';
 import { WorkspaceLeaseManager } from '../tasks/WorkspaceLeaseManager';
 import { registerMeshTaskTools } from '../tools/taskTools';
@@ -148,6 +149,10 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		);
 		const storageRoot = vscode.Uri.joinPath(context.globalStorageUri, 'mesh-state');
 		await vscode.workspace.fs.createDirectory(storageRoot);
+		const ownership = await WorkerOwnerLock.acquire(context.globalStorageUri.fsPath, {
+			instanceId: randomUUID(),
+		});
+		cleanup.push(() => ownership.dispose());
 		const files = new AtomicFileStore(storageRoot.fsPath, new NodeAtomicFileSystem(), ids);
 		const taskStore = new FileTaskStore(files, systemClock);
 
@@ -176,6 +181,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			guard,
 			approvals,
 			workerPlatform,
+			ownership,
 		);
 		cleanup.push(() => runtime.dispose());
 		let listenerService: ListenerService | undefined;
@@ -189,6 +195,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			approvals,
 			{
 				onDidChange: () => changeEvents.fire(),
+				ownership,
 				notificationSink: {
 					publish: (record, event) => listenerService?.publish(
 						record.peerId,
@@ -204,7 +211,9 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			},
 		);
 		cleanup.push(() => workerTasks.dispose());
-		await workerTasks.initialize();
+		if (ownership.isOwner()) {
+			await workerTasks.initialize();
+		}
 
 		const router = new GatewayRouter(device, workspaceService, workerTasks);
 		const tunnelPath = configuration.get<string>('devTunnelPath', '').trim();
@@ -225,10 +234,28 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			() => new GatewayServer(pairing, router),
 			state,
 			guard,
-			{ configuredPort, workerPlatform },
+			{ configuredPort, workerPlatform, ownership },
 		);
 		listenerService = listener;
 		cleanup.push(() => listener.dispose());
+		const ownershipLoss = ownership.onDidLoseOwnership(() => {
+			void Promise.allSettled([
+				workerTasks.dispose(),
+				listener.dispose(),
+			]).then((results) => {
+				for (const result of results) {
+					if (result.status === 'rejected') {
+						logger.error(
+							'ownership',
+							'Worker ownership-loss cleanup did not complete.',
+							result.reason,
+						);
+					}
+				}
+				changeEvents.fire();
+			});
+		});
+		cleanup.push(() => ownershipLoss.dispose());
 
 		const coordinator = new TaskCoordinator(
 			peerManager,
@@ -251,13 +278,16 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			runtime,
 			guard,
 			workerPlatform,
+			ownership,
 		);
 		cleanup.push(() => bindings.dispose());
 		const dashboardFacade = new ServiceDashboardFacade(bindings);
 		const dashboard = new AgentMeshViewProvider(dashboardFacade, context.extensionUri);
 		cleanup.push(() => dashboard.dispose());
 		await peerManager.restore();
-		await restoreListener(listener, configuration, logger);
+		if (ownership.isOwner()) {
+			await restoreListener(listener, configuration, logger);
+		}
 		await coordinator.refreshKnownTasks().catch((error: unknown) => {
 			logger.error('coordinator', 'Task status recovery did not complete.', error);
 		});
@@ -292,6 +322,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		context.subscriptions.push(...contributions);
 		logger.log('info', 'application', 'Copilot Agent Mesh application started.', {
 			protocolVersion: deviceProfile.protocolVersion,
+			workerOwner: ownership.isOwner(),
 		});
 
 		let disposal: Promise<void> | undefined;
