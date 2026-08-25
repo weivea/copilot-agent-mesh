@@ -7,6 +7,14 @@ import {
 	MESH_PROTOCOL_VERSION,
 	TASK_STATUSES,
 } from '../../shared/protocol';
+import { TaskToolFacade } from '../tools/taskToolFacade';
+import {
+	MeshAnswerTaskTool,
+	MeshCancelTaskTool,
+	MeshDelegateTaskTool,
+	MeshGetTaskTool,
+	MeshListWorkersTool,
+} from '../tools/taskTools';
 import {
 	MESH_SPIKE_ECHO_TOOL_NAME,
 	SpikeEchoCoordinator,
@@ -119,10 +127,106 @@ suite('Copilot Agent Mesh', () => {
 	test('provides the global WebSocket required by the pinned AHP transport', () => {
 		assert.strictEqual(typeof globalThis.WebSocket, 'function');
 	});
+
+	test('all production tools contain tokenizer failures without retrying the tokenizer', async () => {
+		const taskId = '00000000-0000-4000-8000-000000000003';
+		const facade = createTaskToolFacade();
+		let tokenizerCalls = 0;
+		const tokenizationOptions: vscode.LanguageModelToolTokenizationOptions = {
+			tokenBudget: 100,
+			countTokens: async () => {
+				tokenizerCalls += 1;
+				throw new Error('tokenizer unavailable with secret detail');
+			},
+		};
+		const invocationBase = {
+			toolInvocationToken: undefined,
+			tokenizationOptions,
+		};
+		const cancellation = new vscode.CancellationTokenSource();
+		try {
+			const results = await Promise.all([
+				new MeshListWorkersTool(facade).invoke({
+					...invocationBase,
+					input: {},
+				}, cancellation.token),
+				new MeshDelegateTaskTool(facade).invoke({
+					...invocationBase,
+					input: {
+						peerId: '00000000-0000-4000-8000-000000000001',
+						workspaceId: '00000000-0000-4000-8000-000000000002',
+						title: 'Tokenizer containment',
+						prompt: 'Verify the invocation catch boundary.',
+					},
+				}, cancellation.token),
+				new MeshGetTaskTool(facade).invoke({
+					...invocationBase,
+					input: { taskId },
+				}, cancellation.token),
+				new MeshCancelTaskTool(facade).invoke({
+					...invocationBase,
+					input: { taskId },
+				}, cancellation.token),
+				new MeshAnswerTaskTool(facade).invoke({
+					...invocationBase,
+					input: {
+						taskId,
+						inputId: '00000000-0000-4000-8000-000000000005',
+						answerId: '00000000-0000-4000-8000-000000000006',
+						answer: 'Proceed.',
+					},
+				}, cancellation.token),
+			]);
+
+			assert.equal(tokenizerCalls, 5);
+			for (const result of results) {
+				const [part] = result.content;
+				assert.ok(part instanceof vscode.LanguageModelTextPart);
+				assert.deepStrictEqual(JSON.parse(part.value), {
+					status: 'error',
+					error: {
+						code: 'INTERNAL_ERROR',
+						message: 'The mesh operation failed without a safe diagnostic.',
+						retryable: false,
+					},
+				});
+				assert.doesNotMatch(part.value, /secret|tokenizer unavailable/);
+			}
+		} finally {
+			cancellation.dispose();
+		}
+	});
 });
 
 function getExtension(): vscode.Extension<unknown> {
 	const extension = vscode.extensions.getExtension('weivea.copilot-agent-mesh');
 	assert.ok(extension, 'The Copilot Agent Mesh extension should be available.');
 	return extension;
+}
+
+function createTaskToolFacade(): TaskToolFacade {
+	const delegationRequestId = '00000000-0000-4000-8000-000000000004';
+	const taskId = '00000000-0000-4000-8000-000000000003';
+	return {
+		listWorkers: async () => ({ workers: [] }),
+		persistDelegationIntent: async () => ({
+			delegationRequestId,
+			taskId,
+			recovered: false,
+		}),
+		waitForDelegationAcceptance: async () => ({ status: 'accepted' }),
+		getTask: async ({ afterEventSequence }) => ({
+			snapshot: {
+				taskId,
+				status: 'running',
+				title: 'Tokenizer containment',
+				updatedAt: '2026-08-25T00:00:00.000Z',
+			},
+			eventCursor: afterEventSequence ?? 0,
+			events: [],
+			truncated: false,
+		}),
+		cancelOwnedTask: async () => ({ taskId, status: 'cancelled' }),
+		answerOwnedTask: async () => ({ taskId, status: 'running' }),
+	};
 }

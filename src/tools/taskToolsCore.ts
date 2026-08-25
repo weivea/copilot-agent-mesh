@@ -318,7 +318,11 @@ export class TaskToolsCore {
 		}
 
 		try {
-			const read = parseTaskReadResult(outcome.value, input.maxEvents);
+			const read = parseTaskReadResult(
+				outcome.value,
+				input.maxEvents,
+				input.afterEventSequence,
+			);
 			if (read.snapshot.taskId !== input.taskId) {
 				return this.errorResult('OUTPUT_INVALID');
 			}
@@ -839,7 +843,7 @@ export function parseGetTaskInput(
 	const taskId = expectIdentifier(input.taskId, 'taskId');
 	const afterEventSequence = input.afterEventSequence === undefined
 		? undefined
-		: expectInteger(input.afterEventSequence, 'afterEventSequence', 0, Number.MAX_SAFE_INTEGER);
+		: expectInteger(input.afterEventSequence, 'afterEventSequence', 0, Number.MAX_SAFE_INTEGER - 1);
 	const maxEvents = input.maxEvents === undefined
 		? 20
 		: expectInteger(input.maxEvents, 'maxEvents', 1, TASK_TOOL_LIMITS.maxEvents);
@@ -977,14 +981,53 @@ function parseDelegationAcceptance(value: unknown): void {
 	}
 }
 
-function parseTaskReadResult(value: unknown, requestedMaxEvents: number): TaskToolReadResult {
+function parseTaskReadResult(
+	value: unknown,
+	requestedMaxEvents: number,
+	afterEventSequence?: number,
+): TaskToolReadResult {
 	const read = expectRecord(value, 'task read result');
 	expectExactKeys(read, ['snapshot', 'eventCursor', 'events', 'eventGap', 'truncated']);
 	const events = expectArray(read.events, 'events', requestedMaxEvents).map(parseTaskEvent);
 	const eventGap = read.eventGap === undefined ? undefined : parseEventGap(read.eventGap);
+	const eventCursor = expectInteger(read.eventCursor, 'eventCursor', 0, Number.MAX_SAFE_INTEGER);
+	for (let index = 0; index < events.length; index += 1) {
+		const event = events[index];
+		const previousSequence = index === 0 ? afterEventSequence : events[index - 1].sequence;
+		if (previousSequence !== undefined && event.sequence <= previousSequence) {
+			throw new Error('task events must be strictly increasing and newer than the requested cursor.');
+		}
+	}
+	const lastSequence = events.at(-1)?.sequence;
+	if (afterEventSequence !== undefined && eventCursor < afterEventSequence) {
+		throw new Error('eventCursor cannot precede afterEventSequence.');
+	}
+	if (lastSequence !== undefined && eventCursor < lastSequence) {
+		throw new Error('eventCursor cannot precede the last returned event.');
+	}
+	if (eventGap !== undefined) {
+		if (eventGap.expectedFrom >= eventGap.availableFrom) {
+			throw new Error('eventGap must identify a non-empty forward gap.');
+		}
+		if (
+			afterEventSequence !== undefined
+			&& eventGap.expectedFrom !== afterEventSequence + 1
+		) {
+			throw new Error('eventGap.expectedFrom must follow afterEventSequence.');
+		}
+		if (events.length > 0 && events[0].sequence !== eventGap.availableFrom) {
+			throw new Error('the first returned event must match eventGap.availableFrom.');
+		}
+	} else if (
+		afterEventSequence !== undefined
+		&& events.length > 0
+		&& events[0].sequence !== afterEventSequence + 1
+	) {
+		throw new Error('a discontinuous event sequence requires eventGap metadata.');
+	}
 	return {
 		snapshot: parseTaskSnapshot(read.snapshot),
-		eventCursor: expectInteger(read.eventCursor, 'eventCursor', 0, Number.MAX_SAFE_INTEGER),
+		eventCursor,
 		events,
 		...(eventGap === undefined ? {} : { eventGap }),
 		truncated: expectBoolean(read.truncated, 'truncated'),

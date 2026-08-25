@@ -46,7 +46,7 @@ export const MESH_TOOL_MANIFEST_DESCRIPTORS: readonly ToolManifestDescriptor[] =
 		displayName: 'Delegate Mesh Task',
 		toolReferenceName: 'meshDelegateTask',
 		canBeReferencedInPrompt: true,
-		modelDescription: 'Delegates a coding task to a selected Copilot Agent Mesh peer and opaque workspace. Returns after worker acceptance with a pending task ID; use mesh_get_task to poll. Do not use this tool for Git, branch, worktree, commit, push, or pull request management.',
+		modelDescription: 'Delegates a coding task to a selected Copilot Agent Mesh peer and opaque workspace. Returns after worker acceptance with a pending task ID; use mesh_get_task to poll. Under a small token budget, compact JSON uses s state (0 accepted pending, 1 reconcile the same intent, 2 error, 3 persistence pending), t taskId, d delegationRequestId, e stable error code, and r retry/reconciliation flag; s=1 or s=3 with r=1 means retry the exact same intent. Do not use this tool for Git, branch, worktree, commit, push, or pull request management.',
 		userDescription: 'Start an asynchronous coding task on a selected trusted worker and workspace.',
 		tags: ['copilot-agent-mesh'],
 		inputSchema: {

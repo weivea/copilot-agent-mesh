@@ -43,17 +43,17 @@ abstract class TaskToolBase {
 		]);
 	}
 
-	protected internalError(
-		options?: vscode.LanguageModelToolInvocationOptions<unknown>,
-	): Promise<vscode.LanguageModelToolResult> {
-		return this.result({
-			status: 'error',
-			error: {
-				code: 'INTERNAL_ERROR',
-				message: 'The mesh operation failed without a safe diagnostic.',
-				retryable: false,
-			},
-		}, options);
+	protected internalError(): vscode.LanguageModelToolResult {
+		return new vscode.LanguageModelToolResult([
+			new vscode.LanguageModelTextPart(JSON.stringify({
+				status: 'error',
+				error: {
+					code: 'INTERNAL_ERROR',
+					message: 'The mesh operation failed without a safe diagnostic.',
+					retryable: false,
+				},
+			})),
+		]);
 	}
 }
 
@@ -63,9 +63,9 @@ export class MeshListWorkersTool extends TaskToolBase implements vscode.Language
 		token: vscode.CancellationToken,
 	): Promise<vscode.LanguageModelToolResult> {
 		try {
-			return this.result(await this.core().listWorkers(options.input, token), options);
+			return await this.result(await this.core().listWorkers(options.input, token), options);
 		} catch {
-			return this.internalError(options);
+			return this.internalError();
 		}
 	}
 }
@@ -90,9 +90,9 @@ export class MeshDelegateTaskTool extends TaskToolBase implements vscode.Languag
 		token: vscode.CancellationToken,
 	): Promise<vscode.LanguageModelToolResult> {
 		try {
-			return this.result(await this.core().delegateTask(options.input, token), options);
+			return await this.result(await this.core().delegateTask(options.input, token), options);
 		} catch {
-			return this.internalError(options);
+			return this.internalError();
 		}
 	}
 }
@@ -103,9 +103,9 @@ export class MeshGetTaskTool extends TaskToolBase implements vscode.LanguageMode
 		token: vscode.CancellationToken,
 	): Promise<vscode.LanguageModelToolResult> {
 		try {
-			return this.result(await this.core().getTask(options.input, token), options);
+			return await this.result(await this.core().getTask(options.input, token), options);
 		} catch {
-			return this.internalError(options);
+			return this.internalError();
 		}
 	}
 }
@@ -130,9 +130,9 @@ export class MeshCancelTaskTool extends TaskToolBase implements vscode.LanguageM
 		token: vscode.CancellationToken,
 	): Promise<vscode.LanguageModelToolResult> {
 		try {
-			return this.result(await this.core().cancelTask(options.input, token), options);
+			return await this.result(await this.core().cancelTask(options.input, token), options);
 		} catch {
-			return this.internalError(options);
+			return this.internalError();
 		}
 	}
 }
@@ -157,9 +157,9 @@ export class MeshAnswerTaskTool extends TaskToolBase implements vscode.LanguageM
 		token: vscode.CancellationToken,
 	): Promise<vscode.LanguageModelToolResult> {
 		try {
-			return this.result(await this.core().answerTask(options.input, token), options);
+			return await this.result(await this.core().answerTask(options.input, token), options);
 		} catch {
-			return this.internalError(options);
+			return this.internalError();
 		}
 	}
 }

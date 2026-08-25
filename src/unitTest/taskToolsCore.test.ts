@@ -233,16 +233,21 @@ suite('TaskToolsCore', () => {
 				summary: 'x'.repeat(8_000),
 			},
 			events: Array.from({ length: 10 }, (_, index) => ({
-				sequence: index + 1,
+				sequence: index + 4,
 				type: 'progress',
 				at: '2026-08-25T00:00:00.000Z',
 				summary: `event-${index}-${'y'.repeat(200)}`,
 			})),
+			eventCursor: 13,
 			eventGap: { expectedFrom: 1, availableFrom: 4 },
 		};
 		const core = new TaskToolsCore(facade, { outputByteLimit: 1_200 });
 
-		const result = await core.getTask({ taskId: TASK_ID, maxEvents: 10 });
+		const result = await core.getTask({
+			taskId: TASK_ID,
+			afterEventSequence: 0,
+			maxEvents: 10,
+		});
 		const bytes = Buffer.byteLength(JSON.stringify(result), 'utf8');
 
 		assert.equal(result.status, 'ok');
@@ -250,6 +255,59 @@ suite('TaskToolsCore', () => {
 		assert.deepStrictEqual(result.eventGap, { expectedFrom: 1, availableFrom: 4 });
 		assert.ok(bytes <= 1_200);
 		assert.ok((result.events as readonly unknown[]).length < 10);
+	});
+
+	test('rejects inconsistent task event ordering, cursors, and gaps', async () => {
+		const facade = new RecordingFacade();
+		const core = new TaskToolsCore(facade);
+		const baseEvent = {
+			type: 'progress',
+			at: '2026-08-25T00:00:00.000Z',
+			summary: 'Progress.',
+		};
+		const cases: readonly TaskToolReadResult[] = [
+			{
+				...facade.taskRead,
+				eventCursor: 6,
+				events: [
+					{ ...baseEvent, sequence: 6 },
+					{ ...baseEvent, sequence: 6 },
+				],
+			},
+			{
+				...facade.taskRead,
+				eventCursor: 5,
+				events: [{ ...baseEvent, sequence: 6 }],
+			},
+			{
+				...facade.taskRead,
+				eventCursor: 4,
+				events: [],
+			},
+			{
+				...facade.taskRead,
+				eventCursor: 7,
+				events: [{ ...baseEvent, sequence: 7 }],
+				eventGap: { expectedFrom: 7, availableFrom: 7 },
+			},
+			{
+				...facade.taskRead,
+				eventCursor: 8,
+				events: [{ ...baseEvent, sequence: 8 }],
+				eventGap: { expectedFrom: 5, availableFrom: 8 },
+			},
+		];
+
+		for (const taskRead of cases) {
+			facade.taskRead = taskRead;
+			const result = await core.getTask({
+				taskId: TASK_ID,
+				afterEventSequence: 5,
+				maxEvents: 10,
+			});
+			assert.equal(result.status, 'error');
+			assert.equal((result.error as Record<string, unknown>).code, 'OUTPUT_INVALID');
+		}
 	});
 
 	test('progressively bounds maximum pending input while preserving the answer contract', async () => {
@@ -758,6 +816,12 @@ suite('Mesh tool manifest contract', () => {
 		for (const descriptor of MESH_TOOL_MANIFEST_DESCRIPTORS) {
 			assert.equal(descriptor.inputSchema.additionalProperties, false);
 		}
+		const delegateDescriptor = MESH_TOOL_MANIFEST_DESCRIPTORS.find(
+			({ name }) => name === MESH_TOOL_NAMES.delegateTask,
+		);
+		assert.ok(delegateDescriptor);
+		assert.match(delegateDescriptor.modelDescription, /s state/);
+		assert.match(delegateDescriptor.modelDescription, /retry the exact same intent/);
 	});
 
 	test('exports the cold implicit activation contract for every tool', () => {
