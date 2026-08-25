@@ -113,6 +113,16 @@ suite('Dashboard', () => {
 			'1vscode-remote://ssh-remote+host/home/alice',
 			'1https://user:pass@example.test',
 			'1://host/home/alice',
+			'file:tmp',
+			'1file:tmp',
+			'https:user:pass@example.test',
+			'1https:user:pass@example.test',
+			'https:///etc',
+			'https:////secret',
+			'https://',
+			'https://?query=value',
+			'HTTPS%3A%2F%2F%2Fetc',
+			'1HTTPS%3A%2F%2F%2Fetc',
 		]) {
 			assert.throws(() => assertSafeDashboardOutboundMessage({
 				...base,
@@ -129,7 +139,7 @@ suite('Dashboard', () => {
 		}));
 		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({
 			...base,
-			model: withTaskSummary(snapshot(), 'tokenCount: 12'),
+			model: withTaskSummary(snapshot(), 'tokenCount = 12'),
 		}));
 	});
 

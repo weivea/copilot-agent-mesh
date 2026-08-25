@@ -55,7 +55,9 @@ their decoded pathname, query keys/values, and fragment are recursively subjecte
 to the same path and secret checks; any URL userinfo is rejected. URI schemes are
 canonicalized and parsed generically, with non-HTTP(S) schemes rejected fail
 closed so prefixed VS Code, remote, file, malformed, and unknown URI tokens cannot
-bypass path checks.
+bypass path checks. Every `scheme:` form is inspected. Before URL parsing,
+HTTP(S) must have the exact raw `scheme://host` authority shape with two slashes
+and a non-empty host segment.
 
 The webview loads `media/dashboard.js` and `media/dashboard.css` through
 `asWebviewUri`. Its resource roots contain only `media/`, scripts are enabled, and

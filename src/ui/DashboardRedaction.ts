@@ -219,10 +219,10 @@ function extractUriCandidates(value: string): string[] {
 		while (schemeEnd < value.length && isUriSchemeCharacter(value[schemeEnd])) {
 			schemeEnd += 1;
 		}
-		if (value[schemeEnd] !== ':' || value[schemeEnd + 1] !== '/') {
+		if (value[schemeEnd] !== ':') {
 			continue;
 		}
-		let end = schemeEnd + 2;
+		let end = schemeEnd + 1;
 		while (end < value.length && !isUrlTerminator(value[end])) {
 			end += 1;
 		}
@@ -240,6 +240,17 @@ function extractUriCandidates(value: string): string[] {
 }
 
 function containsUnsafeUri(candidate: string, depth: number): boolean {
+	const separator = candidate.indexOf(':');
+	if (separator <= 0) {
+		return true;
+	}
+	const rawProtocol = candidate.slice(0, separator).toLowerCase();
+	if (rawProtocol !== 'https' && rawProtocol !== 'http') {
+		return true;
+	}
+	if (!hasStrictHttpAuthority(candidate, separator)) {
+		return true;
+	}
 	let parsed: URL;
 	try {
 		parsed = new URL(candidate);
@@ -265,6 +276,28 @@ function containsUnsafeUri(candidate: string, depth: number): boolean {
 	}
 	const fragment = parsed.hash.startsWith('#') ? parsed.hash.slice(1) : parsed.hash;
 	return fragment.length > 0 && containsUnsafeDashboardTextAtDepth(fragment, depth);
+}
+
+function hasStrictHttpAuthority(candidate: string, separator: number): boolean {
+	const authorityStart = separator + 3;
+	if (
+		candidate[separator + 1] !== '/'
+		|| candidate[separator + 2] !== '/'
+		|| candidate[authorityStart] === undefined
+		|| candidate[authorityStart] === '/'
+	) {
+		return false;
+	}
+	let authorityEnd = authorityStart;
+	while (
+		authorityEnd < candidate.length
+		&& candidate[authorityEnd] !== '/'
+		&& candidate[authorityEnd] !== '?'
+		&& candidate[authorityEnd] !== '#'
+	) {
+		authorityEnd += 1;
+	}
+	return authorityEnd > authorityStart;
 }
 
 function isUriSchemeCharacter(character: string): boolean {
