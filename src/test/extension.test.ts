@@ -53,6 +53,7 @@ suite('Copilot Agent Mesh', () => {
 		assert.ok(commands.some(({ command }) => command === 'copilotAgentMesh.configureDevice'));
 		assert.ok(commands.some(({ command }) => command === 'copilotAgentMesh.refreshDashboard'));
 		assert.ok(views.some(({ id }) => id === 'copilotAgentMesh.dashboard'));
+		assert.deepStrictEqual(manifest.extensionKind, ['ui']);
 	});
 
 	test('prepares confirmation copy and returns compact structured text', async () => {
