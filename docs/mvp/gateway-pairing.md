@@ -29,7 +29,8 @@ The extension composition root should adapt VS Code `SecretStorage` to this inte
 pending-enrollment, and peer metadata use `PairingRecordStore`; coordinator profiles use
 `PeerProfileStore`. `PairingRecordStore.commitPeer` must atomically activate the peer while
 removing its pending record and invitation. Durable adapters must preserve each method's ordering
-and failure semantics.
+and failure semantics. The active peer record retains `enrollmentId` and `transcriptHash` so an
+already-applied commit can be proof-verified and acknowledged idempotently.
 
 Composition wiring is intentionally outside this module. The extension host should:
 
@@ -80,14 +81,27 @@ Comparisons validate length before `timingSafeEqual`.
 Enrollment is two-phase:
 
 1. Worker persists a pending record and root key before returning `enrollmentId`.
-2. Coordinator persists its root key/profile before sending the commit proof.
+2. Coordinator persists its root key, transcript metadata, and commit proof before sending commit.
 3. Worker activates the peer, then consumes the invitation.
 
-If the final response is lost, the coordinator retains the candidate root key and profile, then
-uses bounded full-jitter reconnect attempts to confirm the worker's committed peer idempotently.
-An initial `AUTH_FAILED` can mean the worker commit is still completing, so it does not delete the
-candidate key or fall back to invitation enrollment. Pairing material is removed only after
-reconnect confirms the committed peer.
+`mesh.enrollmentCommit` accepts the original session-bound request and a sessionless recovery
+request. Both verify the persisted proof; duplicate requests for the same pending or active
+enrollment are idempotent. Commit and expiry pruning are serialized so pruning cannot delete a root
+while that root is becoming active.
+
+If commit delivery or its response is unknown, the coordinator retains the candidate root and
+profile and uses bounded full-jitter reconnect attempts. A retry first attempts normal peer
+authentication. If the worker has not activated the peer, it re-sends the persisted commit proof
+without relying on the expired socket session. Explicit authentication or protocol rejection is
+terminal for a new addition and rolls back its profile, socket, invitation secret, root, and commit
+proof. Delivery/availability failures remain retryable.
+
+Pending profiles persist only `enrollmentId`, transcript hash, worker-authored expiry, and opaque
+references to the candidate root and commit proof. The coordinator does not compare the worker's
+absolute timestamp with its own clock. The worker authoritatively rejects an expired recovery
+commit, after which the connection enters `rePairRequired`. Potentially-active candidate key
+material is retained rather than risking deletion of a root whose commit acknowledgement was lost;
+the user must create a new invitation and pair again.
 
 ## Security and resource limits
 
@@ -101,12 +115,14 @@ reconnect confirms the committed peer.
   no userinfo, and a 32-byte base64url fragment secret.
 
 Profiles contain only endpoint/device/invitation identifiers and opaque `SecretStore` references.
-After enrollment they contain peer ID and credential reference only. Secrets are excluded from
+After enrollment they contain peer ID and credential reference only. Pending enrollment profiles
+also contain the non-secret recovery metadata described above. Secrets are excluded from
 profile/state/error text and are never added to the WebSocket URL.
 
 ## Testing
 
 `npm run test:component` uses real loopback WebSockets and injected boundary services. It covers
-health, pairing, wrong secrets, replay, lost commit response recovery, protocol mismatch, binary,
-batch and size rejection, pong timeout, restart reconnect, and deterministic resource disposal.
-It is part of the default `npm test` sequence.
+health, pairing, wrong secrets, replay, duplicate and undelivered commits, commit/prune races,
+terminal rollback, pending expiry, protocol mismatch, binary, batch and size rejection, pong
+timeout, restart reconnect, and deterministic resource disposal. It is part of the default
+`npm test` sequence.

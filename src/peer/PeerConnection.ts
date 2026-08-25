@@ -118,6 +118,8 @@ export class PeerConnection {
 					? 'authFailed'
 					: error.reason === 'PROTOCOL_INCOMPATIBLE'
 						? 'incompatible'
+						: error.reason === 'REPAIR_REQUIRED'
+							? 'rePairRequired'
 						: 'offline'
 				: 'offline');
 			throw error;

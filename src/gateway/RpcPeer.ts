@@ -189,11 +189,18 @@ export class RpcPeer {
 			return authenticated.result;
 		}
 		if (request.method === 'mesh.enrollmentCommit') {
-			assertExactParams(request.params, ['sessionId', 'enrollmentId', 'proof']);
+			const hasSession = Object.hasOwn(request.params, 'sessionId');
+			assertExactParams(
+				request.params,
+				hasSession
+					? ['sessionId', 'enrollmentId', 'peerId', 'proof']
+					: ['enrollmentId', 'peerId', 'proof'],
+			);
 			const peerId = await this.pairing.commit(
 				this.connectionId,
-				stringValue(request.params.sessionId),
+				hasSession ? stringValue(request.params.sessionId) : undefined,
 				stringValue(request.params.enrollmentId),
+				stringValue(request.params.peerId),
 				stringValue(request.params.proof),
 			);
 			this.markAuthenticated(peerId);

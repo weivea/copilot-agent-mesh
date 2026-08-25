@@ -25,6 +25,8 @@ export class GatewayServer {
 	private readonly globalLimit: number;
 	private readonly perSourceLimit: number;
 	private started = false;
+	private disposed = false;
+	private starting: Promise<GatewayAddress> | undefined;
 	private stopping: Promise<void> | undefined;
 
 	public constructor(
@@ -95,9 +97,12 @@ export class GatewayServer {
 		});
 	}
 
-	public async start(preferredPort?: number): Promise<GatewayAddress> {
-		if (this.started) {
+	public start(preferredPort?: number): Promise<GatewayAddress> {
+		if (this.started || this.starting !== undefined) {
 			throw new Error('Gateway server is already started.');
+		}
+		if (this.disposed) {
+			throw new Error('Gateway server is disposed.');
 		}
 		if (preferredPort !== undefined && (
 			!Number.isInteger(preferredPort)
@@ -106,6 +111,11 @@ export class GatewayServer {
 		)) {
 			throw new Error('Preferred gateway port is invalid.');
 		}
+		this.starting = this.startCore(preferredPort);
+		return this.starting;
+	}
+
+	private async startCore(preferredPort?: number): Promise<GatewayAddress> {
 		await new Promise<void>((resolve, reject) => {
 			const onError = (error: Error): void => {
 				this.httpServer.off('listening', onListening);
@@ -131,21 +141,23 @@ export class GatewayServer {
 		if (this.stopping !== undefined) {
 			return this.stopping;
 		}
+		this.disposed = true;
 		this.stopping = this.stop();
 		return this.stopping;
 	}
 
 	private async stop(): Promise<void> {
+		await this.starting?.catch(() => undefined);
 		for (const peer of [...this.peers]) {
 			peer.close();
 		}
 		for (const client of this.webSocketServer.clients) {
 			client.terminate();
 		}
-		await new Promise<void>((resolve) => {
-			this.webSocketServer.close(() => resolve());
-		});
 		if (this.started) {
+			await new Promise<void>((resolve) => {
+				this.webSocketServer.close(() => resolve());
+			});
 			await new Promise<void>((resolve, reject) => {
 				this.httpServer.close((error) => {
 					if (error === undefined) {

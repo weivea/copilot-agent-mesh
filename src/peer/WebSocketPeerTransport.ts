@@ -28,6 +28,14 @@ export interface PeerSession {
 	close(): Promise<void>;
 }
 
+function finiteNumberField(value: Record<string, unknown>, field: string): number {
+	const result = value[field];
+	if (typeof result !== 'number' || !Number.isFinite(result)) {
+		throw new PeerTransportError('CONNECTION_FAILED', 'Peer returned an invalid response.');
+	}
+	return result;
+}
+
 export interface PeerTransport {
 	connect(
 		profile: PeerProfile,
@@ -36,6 +44,48 @@ export interface PeerTransport {
 		profiles: PeerProfileStore,
 		signal: AbortSignal,
 	): Promise<PeerSession>;
+}
+
+function isPendingEnrollment(profile: PeerProfile): profile is PeerProfile & Required<Pick<
+	PeerProfile,
+	| 'peerId'
+	| 'credentialKeyRef'
+	| 'pendingEnrollmentId'
+	| 'pendingTranscriptHash'
+	| 'pendingCommitProofKeyRef'
+	| 'pendingExpiresAt'
+>> {
+	return profile.peerId !== undefined
+		&& profile.credentialKeyRef !== undefined
+		&& profile.pendingEnrollmentId !== undefined
+		&& profile.pendingTranscriptHash !== undefined
+		&& profile.pendingCommitProofKeyRef !== undefined
+		&& profile.pendingExpiresAt !== undefined;
+}
+
+async function completeEnrollment(
+	profile: PeerProfile,
+	secrets: SecretStore,
+	profiles: PeerProfileStore,
+): Promise<PeerProfile> {
+	if (profile.peerId === undefined || profile.credentialKeyRef === undefined) {
+		throw new PeerTransportError('AUTH_FAILED', 'Peer credentials are unavailable.');
+	}
+	if (profile.pendingCommitProofKeyRef !== undefined) {
+		await secrets.delete(profile.pendingCommitProofKeyRef);
+	}
+	if (profile.pairingSecretKeyRef !== undefined) {
+		await secrets.delete(profile.pairingSecretKeyRef);
+	}
+	const completed: PeerProfile = {
+		id: profile.id,
+		rpcEndpoint: profile.rpcEndpoint,
+		workerDeviceId: profile.workerDeviceId,
+		peerId: profile.peerId,
+		credentialKeyRef: profile.credentialKeyRef,
+	};
+	await profiles.store(completed);
+	return completed;
 }
 
 export interface WebSocketPeerTransportOptions {
@@ -47,11 +97,44 @@ export interface WebSocketPeerTransportOptions {
 
 export class PeerTransportError extends Error {
 	public constructor(
-		public readonly reason: 'AUTH_FAILED' | 'PROTOCOL_INCOMPATIBLE' | 'CONNECTION_FAILED',
+		public readonly reason:
+			| 'AUTH_FAILED'
+			| 'PROTOCOL_INCOMPATIBLE'
+			| 'CONNECTION_FAILED'
+			| 'REPAIR_REQUIRED',
 		message: string,
 	) {
 		super(message);
 		this.name = 'PeerTransportError';
+	}
+}
+
+async function retryPendingCommit(
+	client: RpcWebSocketClient,
+	profile: PeerProfile & Required<Pick<
+		PeerProfile,
+		| 'peerId'
+		| 'pendingEnrollmentId'
+		| 'pendingCommitProofKeyRef'
+		| 'pendingExpiresAt'
+	>>,
+	secrets: SecretStore,
+): Promise<void> {
+	const proof = await secrets.get(profile.pendingCommitProofKeyRef);
+	if (proof === undefined) {
+		throw new PeerTransportError(
+			'REPAIR_REQUIRED',
+			'Enrollment recovery credential is unavailable; pairing is required again.',
+		);
+	}
+	const committed = objectResult(await client.request('mesh.enrollmentCommit', {
+		enrollmentId: profile.pendingEnrollmentId,
+		peerId: profile.peerId,
+		proof,
+	}));
+	assertExactFields(committed, ['committed', 'peerId']);
+	if (committed.committed !== true || committed.peerId !== profile.peerId) {
+		throw new PeerTransportError('AUTH_FAILED', 'Enrollment commit was not confirmed.');
 	}
 }
 
@@ -81,33 +164,24 @@ export class WebSocketPeerTransport implements PeerTransport {
 		if (profile.peerId !== undefined && profile.credentialKeyRef !== undefined) {
 			const client = await this.open(profile.rpcEndpoint, signal);
 			try {
-				await this.reconnect(client, profile, coordinatorDeviceId, secrets);
-				let connectedProfile = profile;
-				if (profile.pairingSecretKeyRef !== undefined) {
-					connectedProfile = {
-						id: profile.id,
-						rpcEndpoint: profile.rpcEndpoint,
-						workerDeviceId: profile.workerDeviceId,
-						peerId: profile.peerId,
-						credentialKeyRef: profile.credentialKeyRef,
-					};
-					await profiles.store(connectedProfile);
-					await secrets.delete(profile.pairingSecretKeyRef);
+				try {
+					await this.reconnect(client, profile, coordinatorDeviceId, secrets);
+				} catch (error: unknown) {
+					const normalized = normalizeTransportError(error);
+					if (normalized.reason !== 'AUTH_FAILED' || !isPendingEnrollment(profile)) {
+						throw normalized;
+					}
+					await retryPendingCommit(client, profile, secrets);
 				}
+				const connectedProfile = hasProvisionalEnrollmentMetadata(profile)
+					? await completeEnrollment(profile, secrets, profiles)
+					: profile;
 				return client.toSession(connectedProfile, this.heartbeatIntervalMs, this.now);
 			} catch (error: unknown) {
 				await client.close();
-				const normalized = normalizeTransportError(error);
-				if (normalized.reason === 'AUTH_FAILED'
-					&& profile.invitationId !== undefined
-					&& profile.pairingSecretKeyRef !== undefined) {
-					throw new PeerTransportError(
-						'CONNECTION_FAILED',
-						'Enrollment commit confirmation is pending.',
-					);
-				}
-				throw normalized;
+				throw normalizeTransportError(error);
 			}
+
 		}
 		return this.enroll(profile, coordinatorDeviceId, secrets, profiles, signal);
 	}
@@ -156,9 +230,10 @@ export class WebSocketPeerTransport implements PeerTransport {
 				sessionId: transcript.sessionId,
 				proof: encodeBase64Url(enrollmentProof(secret, 'mesh/client-proof/v1', transcript)),
 			}));
-			assertExactFields(authentication, ['enrollmentId', 'peerId', 'pendingProof']);
+			assertExactFields(authentication, ['enrollmentId', 'peerId', 'expiresAt', 'pendingProof']);
 			const enrollmentId = stringField(authentication, 'enrollmentId');
 			const peerId = identifierField(authentication, 'peerId');
+			const expiresAt = finiteNumberField(authentication, 'expiresAt');
 			const rootKey = derivePeerRoot(secret, transcript);
 			const hash = enrollmentTranscriptHash(transcript);
 			const pendingProof = decodeFixedBase64Url(authentication.pendingProof, 32, 'pending proof');
@@ -169,49 +244,53 @@ export class WebSocketPeerTransport implements PeerTransport {
 				throw new PeerTransportError('AUTH_FAILED', 'Pairing authentication failed.');
 			}
 			const credentialKeyRef = `mesh.remotePeer.${profile.id}`;
+			const commitProofKeyRef = `mesh.remoteCommit.${profile.id}`;
+			const commitProof = encodeBase64Url(hmac(
+				rootKey,
+				'mesh/enrollment-commit/v1',
+				enrollmentId,
+				hash,
+			));
 			await secrets.store(credentialKeyRef, encodeBase64Url(rootKey));
-			candidate = {
-				...profile,
-				peerId,
-				credentialKeyRef,
-			};
-			await profiles.store(candidate);
+			try {
+				await secrets.store(commitProofKeyRef, commitProof);
+				candidate = {
+					...profile,
+					peerId,
+					credentialKeyRef,
+					pendingEnrollmentId: enrollmentId,
+					pendingTranscriptHash: encodeBase64Url(hash),
+					pendingCommitProofKeyRef: commitProofKeyRef,
+					pendingExpiresAt: expiresAt,
+				};
+				await profiles.store(candidate);
+			} catch (error: unknown) {
+				await secrets.delete(commitProofKeyRef);
+				await secrets.delete(credentialKeyRef);
+				throw error;
+			}
 			try {
 				const committed = objectResult(await client.request('mesh.enrollmentCommit', {
 					sessionId: transcript.sessionId,
 					enrollmentId,
-					proof: encodeBase64Url(hmac(
-						rootKey,
-						'mesh/enrollment-commit/v1',
-						enrollmentId,
-						hash,
-					)),
+					peerId,
+					proof: commitProof,
 				}));
 				assertExactFields(committed, ['committed', 'peerId']);
 				if (committed.committed !== true || committed.peerId !== peerId) {
 					throw new PeerTransportError('AUTH_FAILED', 'Enrollment commit was not confirmed.');
 				}
-			} catch {
-				await client.close();
-				client = await this.open(profile.rpcEndpoint, signal);
-				try {
-					await this.reconnect(client, candidate, coordinatorDeviceId, secrets);
-				} catch {
-					throw new PeerTransportError(
-						'CONNECTION_FAILED',
-						'Enrollment commit confirmation is pending.',
-					);
+			} catch (error: unknown) {
+				const normalized = normalizeTransportError(error);
+				if (normalized.reason !== 'CONNECTION_FAILED') {
+					throw normalized;
 				}
+				throw new PeerTransportError(
+					'CONNECTION_FAILED',
+					'Enrollment commit confirmation is pending.',
+				);
 			}
-			const completed: PeerProfile = {
-				id: candidate.id,
-				rpcEndpoint: candidate.rpcEndpoint,
-				workerDeviceId: candidate.workerDeviceId,
-				peerId: candidate.peerId,
-				credentialKeyRef: candidate.credentialKeyRef,
-			};
-			await profiles.store(completed);
-			await secrets.delete(profile.pairingSecretKeyRef);
+			const completed = await completeEnrollment(candidate, secrets, profiles);
 			return client.toSession(completed, this.heartbeatIntervalMs, this.now);
 		} catch (error: unknown) {
 			await client.close();
@@ -283,6 +362,15 @@ export class WebSocketPeerTransport implements PeerTransport {
 	}
 }
 
+function hasProvisionalEnrollmentMetadata(profile: PeerProfile): boolean {
+	return profile.invitationId !== undefined
+		|| profile.pairingSecretKeyRef !== undefined
+		|| profile.pendingEnrollmentId !== undefined
+		|| profile.pendingTranscriptHash !== undefined
+		|| profile.pendingCommitProofKeyRef !== undefined
+		|| profile.pendingExpiresAt !== undefined;
+}
+
 class RpcWebSocketClient {
 	private readonly pending = new Map<string, {
 		resolve(value: unknown): void;
@@ -295,10 +383,17 @@ class RpcWebSocketClient {
 	private constructor(
 		private readonly socket: WebSocket,
 		private readonly requestTimeoutMs: number,
+		private readonly signal: AbortSignal,
 	) {
+		if (signal.aborted) {
+			socket.terminate();
+			this.closed = true;
+			return;
+		}
 		socket.on('message', (data, isBinary) => this.receive(data, isBinary));
 		socket.once('close', () => this.handleClose());
 		socket.once('error', () => this.handleClose());
+		signal.addEventListener('abort', this.abort, { once: true });
 	}
 
 	public static open(
@@ -309,13 +404,15 @@ class RpcWebSocketClient {
 		return new Promise((resolve, reject) => {
 			const fail = (): void => {
 				cleanup();
+				socket.once('error', () => undefined);
 				socket.terminate();
 				reject(new PeerTransportError('CONNECTION_FAILED', 'Unable to open peer connection.'));
 			};
 			const abort = (): void => fail();
 			const opened = (): void => {
+				const client = new RpcWebSocketClient(socket, requestTimeoutMs, signal);
 				cleanup();
-				resolve(new RpcWebSocketClient(socket, requestTimeoutMs));
+				resolve(client);
 			};
 			const cleanup = (): void => {
 				socket.off('open', opened);
@@ -481,6 +578,7 @@ class RpcWebSocketClient {
 			pending.reject(new PeerTransportError(
 				reason === 'PROTOCOL_INCOMPATIBLE' ? 'PROTOCOL_INCOMPATIBLE'
 					: reason === 'AUTH_FAILED' ? 'AUTH_FAILED'
+						: reason === 'ENROLLMENT_EXPIRED' ? 'REPAIR_REQUIRED'
 						: 'CONNECTION_FAILED',
 				typeof error.message === 'string' ? error.message : 'Peer request failed.',
 			));
@@ -494,6 +592,7 @@ class RpcWebSocketClient {
 			return;
 		}
 		this.closed = true;
+		this.signal.removeEventListener('abort', this.abort);
 		for (const pending of this.pending.values()) {
 			clearTimeout(pending.timer);
 			pending.reject(new PeerTransportError('CONNECTION_FAILED', 'Peer connection closed.'));
@@ -504,6 +603,13 @@ class RpcWebSocketClient {
 		}
 		this.closeListeners.clear();
 	}
+
+	private readonly abort = (): void => {
+		if (!this.closed) {
+			this.socket.terminate();
+			this.handleClose();
+		}
+	};
 }
 
 function assertHello(

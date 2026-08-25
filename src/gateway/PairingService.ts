@@ -38,6 +38,8 @@ export interface PeerRecord {
 	readonly peerId: string;
 	readonly coordinatorDeviceId: string;
 	readonly rootKeyRef: string;
+	readonly enrollmentId: string;
+	readonly transcriptHash: string;
 	readonly createdAt: number;
 }
 
@@ -152,7 +154,7 @@ export class PairingService {
 	private readonly id: () => string;
 	private readonly sessions = new Map<string, AuthenticationSession>();
 	private readonly usedNonces = new Map<string, number>();
-	private invitationCreation = Promise.resolve();
+	private recordMutation = Promise.resolve();
 
 	public constructor(
 		public readonly workerDeviceId: string,
@@ -169,17 +171,7 @@ export class PairingService {
 	}
 
 	public async createInvitation(origin: string): Promise<CreatedInvitation> {
-		const previous = this.invitationCreation;
-		let release!: () => void;
-		this.invitationCreation = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-		await previous;
-		try {
-			return await this.createInvitationLocked(origin);
-		} finally {
-			release();
-		}
+		return this.mutateRecords(() => this.createInvitationLocked(origin));
 	}
 
 	private async createInvitationLocked(origin: string): Promise<CreatedInvitation> {
@@ -216,11 +208,13 @@ export class PairingService {
 	}
 
 	public async revokeInvitation(invitationId: string): Promise<void> {
-		const record = await this.records.getInvitation(invitationId);
-		if (record !== undefined) {
-			await this.secretStore.delete(record.secretKeyRef);
-			await this.records.deleteInvitation(invitationId);
-		}
+		await this.mutateRecords(async () => {
+			const record = await this.records.getInvitation(invitationId);
+			if (record !== undefined) {
+				await this.secretStore.delete(record.secretKeyRef);
+				await this.records.deleteInvitation(invitationId);
+			}
+		});
 	}
 
 	public async hello(connectionId: string, params: HelloParams): Promise<Record<string, unknown>> {
@@ -338,6 +332,7 @@ export class PairingService {
 		const hash = enrollmentTranscriptHash(session.transcript);
 		const rootKey = derivePeerRoot(session.secret, session.transcript);
 		const rootKeyRef = `mesh.peer.${peerId}`;
+		const pendingExpiresAt = this.now() + this.pendingTtlMs;
 		await this.secretStore.store(rootKeyRef, encodeBase64Url(rootKey));
 		try {
 			await this.records.storePending({
@@ -347,7 +342,7 @@ export class PairingService {
 				invitationId: session.transcript.invitationId,
 				transcriptHash: encodeBase64Url(hash),
 				rootKeyRef,
-				expiresAt: this.now() + this.pendingTtlMs,
+				expiresAt: pendingExpiresAt,
 			});
 		} catch (error: unknown) {
 			await this.secretStore.delete(rootKeyRef);
@@ -359,6 +354,7 @@ export class PairingService {
 			result: {
 				enrollmentId,
 				peerId,
+				expiresAt: pendingExpiresAt,
 				pendingProof: encodeBase64Url(hmac(
 					rootKey,
 					'mesh/enrollment-pending/v1',
@@ -371,50 +367,82 @@ export class PairingService {
 
 	public async commit(
 		connectionId: string,
-		sessionId: string,
+		sessionId: string | undefined,
 		enrollmentId: string,
+		peerId: string,
 		encodedProof: string,
 	): Promise<string> {
-		const session = this.getSession(connectionId, sessionId);
-		if (session.mode !== 'enrollment' || session.enrollmentId !== enrollmentId) {
+		return this.mutateRecords(() => this.commitLocked(
+			connectionId,
+			sessionId,
+			enrollmentId,
+			peerId,
+			encodedProof,
+		));
+	}
+
+	private async commitLocked(
+		connectionId: string,
+		sessionId: string | undefined,
+		enrollmentId: string,
+		peerId: string,
+		encodedProof: string,
+	): Promise<string> {
+		const session = sessionId === undefined || !this.sessions.has(sessionId)
+			? undefined
+			: this.getSession(connectionId, sessionId);
+		if (session !== undefined && (
+			session.mode !== 'enrollment'
+			|| session.enrollmentId !== enrollmentId
+			|| session.peerId !== peerId
+		)) {
 			throw new PairingProtocolError('AUTH_FAILED', 'Enrollment commit failed.');
 		}
 		const pending = await this.records.getPending(enrollmentId);
-		if (pending === undefined || pending.expiresAt <= this.now()) {
+		if (pending === undefined) {
+			const active = await this.records.getPeer(peerId);
+			if (active === undefined || active.enrollmentId !== enrollmentId) {
+				throw new PairingProtocolError(
+					'ENROLLMENT_EXPIRED',
+					'Enrollment confirmation expired; pairing is required again.',
+				);
+			}
+			await this.verifyCommitProof(active, enrollmentId, encodedProof, sessionId, session);
+			return active.peerId;
+		}
+		if (pending.peerId !== peerId) {
 			throw new PairingProtocolError('AUTH_FAILED', 'Enrollment commit failed.');
 		}
-		const encodedRoot = await this.secretStore.get(pending.rootKeyRef);
-		if (encodedRoot === undefined) {
-			throw new PairingProtocolError('AUTH_FAILED', 'Enrollment commit failed.');
+		if (pending.expiresAt <= this.now()) {
+			throw new PairingProtocolError(
+				'ENROLLMENT_EXPIRED',
+				'Enrollment confirmation expired; pairing is required again.',
+			);
 		}
-		const rootKey = decodeFixedBase64Url(encodedRoot, SECRET_BYTES, 'peer credential');
-		const hash = decodeFixedBase64Url(pending.transcriptHash, 32, 'transcript hash');
-		const expected = hmac(rootKey, 'mesh/enrollment-commit/v1', enrollmentId, hash);
-		let proof: Buffer;
-		try {
-			proof = decodeFixedBase64Url(encodedProof, 32, 'commit proof');
-		} catch {
-			this.authenticationFailed(sessionId, session);
-		}
-		if (!safeEqual(proof, expected)) {
-			this.authenticationFailed(sessionId, session);
-		}
+		await this.verifyCommitProof(pending, enrollmentId, encodedProof, sessionId, session);
 		const peer: PeerRecord = {
 			peerId: pending.peerId,
 			coordinatorDeviceId: pending.coordinatorDeviceId,
 			rootKeyRef: pending.rootKeyRef,
+			enrollmentId: pending.enrollmentId,
+			transcriptHash: pending.transcriptHash,
 			createdAt: this.now(),
 		};
 		const invitation = await this.records.getInvitation(pending.invitationId);
 		if (!await this.records.commitPeer(peer, pending)) {
-			await this.secretStore.delete(pending.rootKeyRef);
-			await this.records.deletePending(pending.enrollmentId);
-			throw new PairingProtocolError('AUTH_FAILED', 'Enrollment invitation was already consumed.');
+			const active = await this.records.getPeer(peerId);
+			if (active === undefined
+				|| active.enrollmentId !== enrollmentId
+				|| active.rootKeyRef !== pending.rootKeyRef) {
+				throw new PairingProtocolError('AUTH_FAILED', 'Enrollment invitation was already consumed.');
+			}
 		}
 		if (invitation !== undefined) {
 			await this.secretStore.delete(invitation.secretKeyRef);
 		}
-		this.sessions.delete(sessionId);
+		if (sessionId !== undefined) {
+			this.sessions.delete(sessionId);
+		}
 		return pending.peerId;
 	}
 
@@ -466,9 +494,40 @@ export class PairingService {
 		throw new PairingProtocolError('AUTH_FAILED', 'Authentication proof is invalid.');
 	}
 
+	private async verifyCommitProof(
+		record: Pick<PendingPeerRecord, 'rootKeyRef' | 'transcriptHash'>,
+		enrollmentId: string,
+		encodedProof: string,
+		sessionId?: string,
+		session?: AuthenticationSession,
+	): Promise<void> {
+		const encodedRoot = await this.secretStore.get(record.rootKeyRef);
+		if (encodedRoot === undefined) {
+			throw new PairingProtocolError('AUTH_FAILED', 'Enrollment commit failed.');
+		}
+		const rootKey = decodeFixedBase64Url(encodedRoot, SECRET_BYTES, 'peer credential');
+		const hash = decodeFixedBase64Url(record.transcriptHash, 32, 'transcript hash');
+		const expected = hmac(rootKey, 'mesh/enrollment-commit/v1', enrollmentId, hash);
+		let proof: Buffer;
+		try {
+			proof = decodeFixedBase64Url(encodedProof, 32, 'commit proof');
+		} catch {
+			if (sessionId !== undefined && session !== undefined) {
+				this.authenticationFailed(sessionId, session);
+			}
+			throw new PairingProtocolError('AUTH_FAILED', 'Enrollment commit failed.');
+		}
+		if (!safeEqual(proof, expected)) {
+			if (sessionId !== undefined && session !== undefined) {
+				this.authenticationFailed(sessionId, session);
+			}
+			throw new PairingProtocolError('AUTH_FAILED', 'Enrollment commit failed.');
+		}
+	}
+
 	private async prune(): Promise<void> {
 		const now = this.now();
-		await this.pruneExpiredRecords(now);
+		await this.mutateRecords(() => this.pruneExpiredRecords(now));
 		for (const [nonce, expiresAt] of this.usedNonces) {
 			if (expiresAt <= now) {
 				this.usedNonces.delete(nonce);
@@ -490,9 +549,26 @@ export class PairingService {
 		}
 		for (const pending of await this.records.listPending()) {
 			if (pending.expiresAt <= now) {
-				await this.secretStore.delete(pending.rootKeyRef);
+				const active = await this.records.getPeer(pending.peerId);
+				if (active === undefined || active.rootKeyRef !== pending.rootKeyRef) {
+					await this.secretStore.delete(pending.rootKeyRef);
+				}
 				await this.records.deletePending(pending.enrollmentId);
 			}
+		}
+	}
+
+	private async mutateRecords<T>(operation: () => Promise<T>): Promise<T> {
+		const previous = this.recordMutation;
+		let release!: () => void;
+		this.recordMutation = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		await previous;
+		try {
+			return await operation();
+		} finally {
+			release();
 		}
 	}
 }

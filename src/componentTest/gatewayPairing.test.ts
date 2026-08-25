@@ -1,5 +1,5 @@
 import * as assert from 'node:assert/strict';
-import { request as httpRequest } from 'node:http';
+import { createServer as createHttpServer, request as httpRequest } from 'node:http';
 import { connect as connectTcp } from 'node:net';
 import { suite, test } from 'node:test';
 
@@ -24,10 +24,16 @@ import {
 	InMemoryPairingRecordStore,
 	PairingService,
 	type CreatedInvitation,
+	type PairingRecordStore,
+	type PeerRecord,
+	type PendingPeerRecord,
 } from '../gateway/PairingService';
 import { InMemorySecretStore } from '../gateway/SecretStore';
 import { PeerConnectionManager } from '../peer/PeerConnectionManager';
-import { InMemoryPeerProfileStore } from '../peer/PeerProfile';
+import {
+	InMemoryPeerProfileStore,
+	type PeerProfileStore,
+} from '../peer/PeerProfile';
 import { WebSocketPeerTransport } from '../peer/WebSocketPeerTransport';
 
 suite('Gateway pairing component', { concurrency: 1 }, () => {
@@ -56,6 +62,27 @@ suite('Gateway pairing component', { concurrency: 1 }, () => {
 			await client.close();
 		} finally {
 			await fixture.dispose();
+		}
+	});
+
+	test('dispose waits for an in-flight start and releases the selected port', async () => {
+		const fixture = createGatewayDependencies();
+		const gateway = new GatewayServer(fixture.pairing, fixture.router);
+		const start = gateway.start();
+		const dispose = gateway.dispose();
+		const address = await start;
+		await dispose;
+
+		const probe = createHttpServer();
+		try {
+			await new Promise<void>((resolve, reject) => {
+				probe.once('error', reject);
+				probe.listen(address.port, '127.0.0.1', resolve);
+			});
+		} finally {
+			await new Promise<void>((resolve, reject) => {
+				probe.close((error) => error === undefined ? resolve() : reject(error));
+			});
 		}
 	});
 
@@ -174,6 +201,7 @@ suite('Gateway pairing component', { concurrency: 1 }, () => {
 			client.sendWithoutWaiting('mesh.enrollmentCommit', {
 				sessionId: enrollment.transcript.sessionId,
 				enrollmentId: enrollment.enrollmentId,
+				peerId: enrollment.peerId,
 				proof: encodeBase64Url(hmac(
 					enrollment.rootKey,
 					'mesh/enrollment-commit/v1',
@@ -202,6 +230,132 @@ suite('Gateway pairing component', { concurrency: 1 }, () => {
 			}
 		} finally {
 			client.terminate();
+			await fixture.dispose();
+		}
+	});
+
+	test('makes duplicate commits idempotent without deleting the active root', async () => {
+		const fixture = await createFixture();
+		const invitation = await fixture.invitation();
+		const client = await RawClient.open(fixture.endpoint);
+		try {
+			const enrollment = await beginEnrollment(
+				client,
+				invitation.invitationId,
+				secretFrom(invitation),
+				'duplicate-commit-coordinator',
+			);
+			const params = {
+				sessionId: enrollment.transcript.sessionId,
+				enrollmentId: enrollment.enrollmentId,
+				peerId: enrollment.peerId,
+				proof: encodeBase64Url(hmac(
+					enrollment.rootKey,
+					'mesh/enrollment-commit/v1',
+					enrollment.enrollmentId,
+					enrollment.transcriptHash,
+				)),
+			};
+			const [first, second] = await Promise.all([
+				client.request('mesh.enrollmentCommit', params),
+				client.request('mesh.enrollmentCommit', params),
+			]);
+			assert.deepStrictEqual(first, { committed: true, peerId: enrollment.peerId });
+			assert.deepStrictEqual(second, { committed: true, peerId: enrollment.peerId });
+			assert.ok(await fixture.secrets.get(`mesh.peer.${enrollment.peerId}`));
+			assert.equal(
+				(await fixture.records.getPeer(enrollment.peerId))?.rootKeyRef,
+				`mesh.peer.${enrollment.peerId}`,
+			);
+		} finally {
+			await client.close();
+			await fixture.dispose();
+		}
+	});
+
+	test('serializes expiry pruning with an in-flight commit and retains its active root', async () => {
+		let now = 1_000;
+		const records = new BlockingCommitRecordStore();
+		const fixture = await createFixture({
+			now: () => now,
+			pendingTtlMs: 10,
+			records,
+		});
+		const invitation = await fixture.invitation();
+		const commitClient = await RawClient.open(fixture.endpoint);
+		const pruneClient = await RawClient.open(fixture.endpoint);
+		try {
+			const enrollment = await beginEnrollment(
+				commitClient,
+				invitation.invitationId,
+				secretFrom(invitation),
+				'prune-race-coordinator',
+			);
+			now = 1_005;
+			const commit = commitEnrollment(commitClient, enrollment);
+			await records.commitStarted;
+			now = 1_011;
+			const prune = pruneClient.request('mesh.hello', {
+				protocolMin: 1,
+				protocolMax: 1,
+				coordinatorDeviceId: 'prune-trigger',
+				clientNonce: randomBase64Url(NONCE_BYTES),
+				invitationId: 'missing-invitation',
+			});
+			await delay(10);
+			records.releaseCommit();
+			await commit;
+			await assert.rejects(prune, (error: unknown) => rpcReason(error) === 'AUTH_FAILED');
+			assert.ok(await fixture.secrets.get(`mesh.peer.${enrollment.peerId}`));
+			assert.equal(
+				(await fixture.records.getPeer(enrollment.peerId))?.rootKeyRef,
+				`mesh.peer.${enrollment.peerId}`,
+			);
+		} finally {
+			records.releaseCommit();
+			await commitClient.close();
+			await pruneClient.close();
+			await fixture.dispose();
+		}
+	});
+
+	test('rolls back a new add when enrollment commit is terminally rejected', async () => {
+		const fixture = await createFixture({ rejectCommit: true });
+		const profiles = new InMemoryPeerProfileStore();
+		const manager = new PeerConnectionManager(
+			'terminal-commit-coordinator',
+			profiles,
+			fixture.secrets,
+			new WebSocketPeerTransport({
+				requestTimeoutMs: 500,
+				webSocketFactory: (url) => new WebSocket(url.replace(/^wss:/u, 'ws:')),
+			}),
+			{ id: () => 'terminal-commit-profile' },
+		);
+		try {
+			const invitation = await fixture.invitation();
+			await assert.rejects(
+				manager.add(invitation.url),
+				(error: unknown) => (
+					error instanceof Error && error.message === 'Enrollment invitation was already consumed.'
+				),
+			);
+			assert.deepStrictEqual(await profiles.list(), []);
+			assert.equal(manager.get('terminal-commit-profile'), undefined);
+			assert.equal(
+				await fixture.secrets.get('mesh.remoteInvitation.terminal-commit-profile'),
+				undefined,
+			);
+			assert.equal(
+				await fixture.secrets.get('mesh.remotePeer.terminal-commit-profile'),
+				undefined,
+			);
+			assert.equal(
+				await fixture.secrets.get('mesh.remoteCommit.terminal-commit-profile'),
+				undefined,
+			);
+		} finally {
+			await manager.dispose();
 			await fixture.dispose();
 		}
 	});
@@ -252,6 +406,167 @@ suite('Gateway pairing component', { concurrency: 1 }, () => {
 			assert.equal(completed?.invitationId, undefined);
 			assert.equal(completed?.pairingSecretKeyRef, undefined);
 			assert.ok(await fixture.secrets.get(completed.credentialKeyRef));
+		} finally {
+			await manager.dispose();
+			await fixture.dispose();
+		}
+	});
+
+	test('re-sends a persisted commit that was never delivered', async () => {
+		const fixture = await createFixture();
+		const profiles = new InMemoryPeerProfileStore();
+		const transport = new WebSocketPeerTransport({
+			requestTimeoutMs: 20,
+			heartbeatIntervalMs: 25,
+			webSocketFactory: dropFirstRpcMethod('mesh.enrollmentCommit'),
+		});
+		const manager = new PeerConnectionManager(
+			'undelivered-coordinator',
+			profiles,
+			fixture.secrets,
+			transport,
+			{
+				id: () => 'undelivered-profile',
+				random: () => 0.5,
+				reconnectBaseMs: 10,
+				reconnectMaxMs: 20,
+				stableOnlineMs: 40,
+			},
+		);
+		try {
+			const invitation = await fixture.invitation();
+			await assert.rejects(manager.add(invitation.url));
+			const candidate = await profiles.get('undelivered-profile');
+			assert.ok(candidate?.pendingEnrollmentId);
+			assert.ok(candidate?.pendingCommitProofKeyRef);
+			assert.ok(await fixture.secrets.get(candidate.pendingCommitProofKeyRef));
+
+			await waitFor(
+				() => manager.get('undelivered-profile')?.snapshot().state === 'online',
+				1_000,
+			);
+			const completed = await profiles.get('undelivered-profile');
+			assert.equal(completed?.pendingEnrollmentId, undefined);
+			assert.equal(completed?.pendingCommitProofKeyRef, undefined);
+			assert.ok(completed?.credentialKeyRef);
+		} finally {
+			await manager.dispose();
+			await fixture.dispose();
+		}
+	});
+
+	test('lets the worker authoritatively expire pending commits despite coordinator clock skew', async () => {
+		const fixture = await createFixture();
+		const profiles = new InMemoryPeerProfileStore();
+		const transport = new WebSocketPeerTransport({
+			requestTimeoutMs: 20,
+			heartbeatIntervalMs: 25,
+			now: () => Date.now() + 24 * 60 * 60_000,
+			webSocketFactory: dropFirstRpcMethod('mesh.enrollmentCommit'),
+		});
+		const manager = new PeerConnectionManager(
+			'skewed-clock-coordinator',
+			profiles,
+			fixture.secrets,
+			transport,
+			{
+				id: () => 'skewed-clock-profile',
+				random: () => 0.5,
+				reconnectBaseMs: 10,
+				reconnectMaxMs: 20,
+			},
+		);
+		try {
+			const invitation = await fixture.invitation();
+			await assert.rejects(manager.add(invitation.url));
+			await waitFor(
+				() => manager.get('skewed-clock-profile')?.snapshot().state === 'online',
+				1_000,
+			);
+		} finally {
+			await manager.dispose();
+			await fixture.dispose();
+		}
+	});
+
+	test('does not rewrite a durable profile during ordinary authenticated reconnect', async () => {
+		const fixture = await createFixture();
+		const profiles = new InMemoryPeerProfileStore();
+		const transport = new WebSocketPeerTransport({
+			requestTimeoutMs: 500,
+			heartbeatIntervalMs: 25,
+			webSocketFactory: (url) => new WebSocket(url.replace(/^wss:/u, 'ws:')),
+		});
+		const manager = new PeerConnectionManager(
+			'read-only-profile-coordinator',
+			profiles,
+			fixture.secrets,
+			transport,
+			{ id: () => 'read-only-profile' },
+		);
+		let session: Awaited<ReturnType<WebSocketPeerTransport['connect']>> | undefined;
+		try {
+			const invitation = await fixture.invitation();
+			await manager.add(invitation.url);
+			await manager.disconnect('read-only-profile');
+			const profile = await profiles.get('read-only-profile');
+			assert.ok(profile);
+			const readOnlyProfiles: PeerProfileStore = {
+				get: (id) => profiles.get(id),
+				list: () => profiles.list(),
+				store: async () => {
+					throw new Error('An ordinary reconnect must not rewrite the profile.');
+				},
+				delete: (id) => profiles.delete(id),
+			};
+			session = await transport.connect(
+				profile,
+				'read-only-profile-coordinator',
+				fixture.secrets,
+				readOnlyProfiles,
+				new AbortController().signal,
+			);
+			assert.equal(session.profile.id, 'read-only-profile');
+		} finally {
+			await session?.close();
+			await manager.dispose();
+			await fixture.dispose();
+		}
+	});
+
+	test('surfaces re-pairing after pending enrollment expires without deleting the candidate root', async () => {
+		const fixture = await createFixture({ pendingTtlMs: 25 });
+		const profiles = new InMemoryPeerProfileStore();
+		const transport = new WebSocketPeerTransport({
+			requestTimeoutMs: 10,
+			heartbeatIntervalMs: 25,
+			webSocketFactory: dropFirstRpcMethod('mesh.enrollmentCommit'),
+		});
+		const manager = new PeerConnectionManager(
+			'expired-coordinator',
+			profiles,
+			fixture.secrets,
+			transport,
+			{
+				id: () => 'expired-profile',
+				random: () => 1,
+				reconnectBaseMs: 40,
+				reconnectMaxMs: 40,
+				stableOnlineMs: 40,
+			},
+		);
+		try {
+			const invitation = await fixture.invitation();
+			await assert.rejects(manager.add(invitation.url));
+			await waitFor(
+				() => manager.get('expired-profile')?.snapshot().state === 'rePairRequired',
+				1_000,
+			);
+			const candidate = await profiles.get('expired-profile');
+			assert.ok(candidate?.credentialKeyRef);
+			assert.ok(await fixture.secrets.get(candidate.credentialKeyRef));
+			assert.ok(candidate.pendingCommitProofKeyRef);
+			assert.ok(await fixture.secrets.get(candidate.pendingCommitProofKeyRef));
 		} finally {
 			await manager.dispose();
 			await fixture.dispose();
@@ -373,34 +688,22 @@ interface FixtureOptions {
 	readonly heartbeatIntervalMs?: number;
 	readonly heartbeatTimeoutMs?: number;
 	readonly commitDelayMs?: number;
+	readonly pendingTtlMs?: number;
+	readonly rejectCommit?: boolean;
+	readonly records?: PairingRecordStore;
+	readonly now?: () => number;
 }
 
 async function createFixture(options: FixtureOptions = {}) {
-	const secrets = new InMemorySecretStore();
-	const records = options.commitDelayMs === undefined
-		? new InMemoryPairingRecordStore()
-		: new DelayedPendingRecordStore(options.commitDelayMs);
-	const pairing = new PairingService('worker-device', secrets, records);
-	const devicePeers: string[] = [];
-	const taskPeers: string[] = [];
-	const router = new GatewayRouter(
-		{
-			getInfo: async (peerId) => {
-				devicePeers.push(peerId);
-				return { deviceId: 'worker-device' };
-			},
-		},
-		{ list: async () => [{ workspaceId: 'workspace-1' }] },
-		{
-			start: async (peerId: string, params: TaskStartParams) => {
-				taskPeers.push(peerId);
-				return params;
-			},
-			get: async (peerId, taskId) => ({ peerId, taskId }),
-			cancel: async (peerId, taskId) => ({ peerId, taskId }),
-			answer: async (peerId, taskId) => ({ peerId, taskId }),
-		},
-	);
+	const dependencies = createGatewayDependencies(options);
+	const {
+		secrets,
+		records,
+		pairing,
+		devicePeers,
+		taskPeers,
+		router,
+	} = dependencies;
 	const gatewayOptions = {
 		handshakeTimeoutMs: 500,
 		heartbeatIntervalMs: options.heartbeatIntervalMs ?? 100,
@@ -453,6 +756,48 @@ async function createFixture(options: FixtureOptions = {}) {
 	};
 }
 
+function createGatewayDependencies(options: FixtureOptions = {}) {
+	const secrets = new InMemorySecretStore();
+	const records = options.records
+		?? (options.rejectCommit === true
+			? new RejectingCommitRecordStore()
+			: options.commitDelayMs === undefined
+				? new InMemoryPairingRecordStore()
+				: new DelayedPendingRecordStore(options.commitDelayMs));
+	const pairing = new PairingService('worker-device', secrets, records, {
+		pendingTtlMs: options.pendingTtlMs,
+		now: options.now,
+	});
+	const devicePeers: string[] = [];
+	const taskPeers: string[] = [];
+	const router = new GatewayRouter(
+		{
+			getInfo: async (peerId) => {
+				devicePeers.push(peerId);
+				return { deviceId: 'worker-device' };
+			},
+		},
+		{ list: async () => [{ workspaceId: 'workspace-1' }] },
+		{
+			start: async (peerId: string, params: TaskStartParams) => {
+				taskPeers.push(peerId);
+				return params;
+			},
+			get: async (peerId, taskId) => ({ peerId, taskId }),
+			cancel: async (peerId, taskId) => ({ peerId, taskId }),
+			answer: async (peerId, taskId) => ({ peerId, taskId }),
+		},
+	);
+	return {
+		records,
+		secrets,
+		pairing,
+		router,
+		devicePeers,
+		taskPeers,
+	};
+}
+
 class DelayedPendingRecordStore extends InMemoryPairingRecordStore {
 	public constructor(private readonly delayMs: number) {
 		super();
@@ -463,6 +808,40 @@ class DelayedPendingRecordStore extends InMemoryPairingRecordStore {
 	): Promise<Awaited<ReturnType<InMemoryPairingRecordStore['getPending']>>> {
 		await delay(this.delayMs);
 		return super.getPending(id);
+	}
+}
+
+class RejectingCommitRecordStore extends InMemoryPairingRecordStore {
+	public override async commitPeer(): Promise<boolean> {
+		return false;
+	}
+}
+
+class BlockingCommitRecordStore extends InMemoryPairingRecordStore {
+	private markCommitStarted!: () => void;
+	private unblockCommit!: () => void;
+	private released = false;
+	public readonly commitStarted = new Promise<void>((resolve) => {
+		this.markCommitStarted = resolve;
+	});
+	private readonly commitGate = new Promise<void>((resolve) => {
+		this.unblockCommit = resolve;
+	});
+
+	public releaseCommit(): void {
+		if (!this.released) {
+			this.released = true;
+			this.unblockCommit();
+		}
+	}
+
+	public override async commitPeer(
+		record: PeerRecord,
+		pending: PendingPeerRecord,
+	): Promise<boolean> {
+		this.markCommitStarted();
+		await this.commitGate;
+		return super.commitPeer(record, pending);
 	}
 }
 
@@ -483,6 +862,35 @@ function malformedUpgrade(port: number): Promise<void> {
 			);
 		});
 	});
+}
+
+function dropFirstRpcMethod(method: string): (url: string) => WebSocket {
+	let dropped = false;
+	return (url) => {
+		const socket = new WebSocket(url.replace(/^wss:/u, 'ws:'), {
+			perMessageDeflate: false,
+		});
+		const send = socket.send;
+		socket.send = ((data: WebSocket.Data, ...args: unknown[]) => {
+			let request: { method?: unknown } | undefined;
+			try {
+				request = JSON.parse(String(data)) as { method?: unknown };
+			} catch {
+				// The real transport handles invalid JSON; this hook only identifies one request.
+			}
+			if (!dropped && request?.method === method) {
+				dropped = true;
+				const lastArgument = args.at(-1);
+				const callback = typeof lastArgument === 'function'
+					? lastArgument as (error?: Error) => void
+					: undefined;
+				queueMicrotask(() => callback?.());
+				return;
+			}
+			Reflect.apply(send, socket, [data, ...args]);
+		}) as WebSocket['send'];
+		return socket;
+	};
 }
 
 interface Enrollment {
@@ -552,6 +960,7 @@ async function commitEnrollment(client: RawClient, enrollment: Enrollment): Prom
 	await client.request('mesh.enrollmentCommit', {
 		sessionId: enrollment.transcript.sessionId,
 		enrollmentId: enrollment.enrollmentId,
+		peerId: enrollment.peerId,
 		proof: encodeBase64Url(hmac(
 			enrollment.rootKey,
 			'mesh/enrollment-commit/v1',

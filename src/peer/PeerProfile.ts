@@ -4,7 +4,8 @@ export type PeerConnectionState =
 	| 'busy'
 	| 'offline'
 	| 'authFailed'
-	| 'incompatible';
+	| 'incompatible'
+	| 'rePairRequired';
 
 export interface PeerProfile {
 	readonly id: string;
@@ -14,6 +15,10 @@ export interface PeerProfile {
 	readonly pairingSecretKeyRef?: string;
 	readonly peerId?: string;
 	readonly credentialKeyRef?: string;
+	readonly pendingEnrollmentId?: string;
+	readonly pendingTranscriptHash?: string;
+	readonly pendingCommitProofKeyRef?: string;
+	readonly pendingExpiresAt?: number;
 }
 
 export interface PeerProfileStore {
