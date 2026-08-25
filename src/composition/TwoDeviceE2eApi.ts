@@ -141,7 +141,7 @@ export function createTwoDeviceE2eApi(
 						if (remote !== undefined) {
 							return toE2eTaskReadResult(remote);
 						}
-						return options.localTasks.getTask(
+						return await options.localTasks.getTask(
 							{ taskId, maxEvents: 100 },
 							controller.signal,
 						);
@@ -181,7 +181,7 @@ export function createTwoDeviceE2eApi(
 					const controller = deadline(30_000);
 					try {
 						const taskId = requiredString(params, 'taskId');
-						return options.localTasks.cancelOwnedTask(
+						return await options.localTasks.cancelOwnedTask(
 							{ taskId },
 							controller.signal,
 						);
@@ -196,7 +196,7 @@ export function createTwoDeviceE2eApi(
 						const inputId = requiredString(params, 'inputId');
 						const answerId = optionalString(params, 'answerId') ?? randomUUID();
 						const answer = requiredString(params, 'answer');
-						return options.localTasks.answerOwnedTask({
+						return await options.localTasks.answerOwnedTask({
 							taskId,
 							inputId,
 							answerId,
