@@ -1,24 +1,32 @@
+const maximumCanonicalLength = 4096;
+const maximumDecodeRounds = 4;
+const credentialKeys = [
+	'authorization',
+	'credential',
+	'password',
+	'secret',
+	'tkn',
+	'token',
+] as const;
+
 export function redactRemoteText(value: string): string {
 	return containsUnsafeDashboardText(value) ? '[redacted sensitive details]' : value;
 }
 
 export function containsUnsafeDashboardText(value: string): boolean {
-	const lower = decodePercentEncoding(value).toLowerCase();
+	const canonical = canonicalizePercentEncoding(value);
+	if (canonical === undefined) {
+		return true;
+	}
+	const lower = canonical.toLowerCase();
 	if (
 		lower.includes('file://')
-		|| lower.includes('secret=')
-		|| lower.includes('secret:')
-		|| lower.includes('token=')
-		|| lower.includes('token:')
-		|| lower.includes('credential=')
-		|| lower.includes('credential:')
-		|| lower.includes('password=')
-		|| lower.includes('password:')
 		|| lower.includes('api_key=')
 		|| lower.includes('api-key=')
 		|| lower.includes('bearer ')
 		|| lower.includes('ghp_')
 		|| lower.includes('github_pat_')
+		|| containsCredentialAssignment(lower)
 	) {
 		return true;
 	}
@@ -107,10 +115,66 @@ function isAsciiLetter(character: string): boolean {
 	return (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
 }
 
-function decodePercentEncoding(value: string): string {
-	try {
-		return decodeURIComponent(value);
-	} catch {
-		return value;
+function canonicalizePercentEncoding(value: string): string | undefined {
+	if (value.length > maximumCanonicalLength) {
+		return undefined;
 	}
+	let canonical = value;
+	for (let round = 0; round < maximumDecodeRounds && canonical.includes('%'); round += 1) {
+		let decoded: string;
+		try {
+			decoded = decodeURIComponent(canonical);
+		} catch {
+			return undefined;
+		}
+		if (decoded.length > maximumCanonicalLength) {
+			return undefined;
+		}
+		if (decoded === canonical) {
+			return canonical;
+		}
+		canonical = decoded;
+	}
+	return canonical.includes('%') ? undefined : canonical;
+}
+
+function containsCredentialAssignment(value: string): boolean {
+	for (const key of credentialKeys) {
+		let searchFrom = 0;
+		while (searchFrom < value.length) {
+			const index = value.indexOf(key, searchFrom);
+			if (index < 0) {
+				break;
+			}
+			searchFrom = index + key.length;
+			const before = index === 0 ? undefined : value[index - 1];
+			const after = value[searchFrom];
+			if ((before !== undefined && isIdentifierCharacter(before)) || isIdentifierCharacter(after)) {
+				continue;
+			}
+			let cursor = searchFrom;
+			while (cursor < value.length && isCredentialPadding(value[cursor])) {
+				cursor += 1;
+			}
+			if (value[cursor] === '=' || value[cursor] === ':') {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+function isCredentialPadding(character: string): boolean {
+	return character === '"' || character === '\'' || character.trim().length === 0;
+}
+
+function isIdentifierCharacter(character: string | undefined): boolean {
+	if (character === undefined) {
+		return false;
+	}
+	const code = character.charCodeAt(0);
+	return isAsciiLetter(character)
+		|| (code >= 48 && code <= 57)
+		|| character === '_'
+		|| character === '-';
 }

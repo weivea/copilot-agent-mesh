@@ -44,7 +44,10 @@ newer state.
 The presenter redacts path-bearing remote summaries, component details, and
 errors. The outbound guard independently rejects POSIX, Windows, UNC, file URI,
 and relative source-path forms in any string. This defense is applied after
-strict ViewModel shape validation and before every `postMessage`.
+strict ViewModel shape validation and before every `postMessage`. Secret checks
+canonicalize percent encoding for a bounded number of rounds and fail closed on
+malformed or oversized input before recognizing JSON, quoted, and whitespace
+credential assignments.
 
 The webview loads `media/dashboard.js` and `media/dashboard.css` through
 `asWebviewUri`. Its resource roots contain only `media/`, scripts are enabled, and

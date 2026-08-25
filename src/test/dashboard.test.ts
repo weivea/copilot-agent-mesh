@@ -81,7 +81,15 @@ suite('Dashboard', () => {
 			'media/dashboard.css',
 			'https://example.test/connect#secret=hidden',
 			'#secret%3Dhidden',
+			'#secret%253Dhidden',
+			'#secret%25253Dhidden',
+			'{"password":"hunter2"}',
+			'{ "PaSsWoRd" : "hunter2" }',
+			'credential = private-value',
+			'Authorization : private-value',
+			'tkn\t=\tprivate-value',
 			'token: ghp_example',
+			'malformed=%E0%A4%A',
 		]) {
 			assert.throws(() => assertSafeDashboardOutboundMessage({
 				...base,
@@ -100,7 +108,7 @@ suite('Dashboard', () => {
 				gateway: { ...source.listener.gateway, detail: 'Gateway failed at C:\\mesh\\gateway.json' },
 			},
 			tasks: source.tasks.map((task) => ({ ...task, summary: 'Changed src/auth.ts' })),
-			errors: [{ code: 'TASK_FAILED', message: 'Could not read file:///tmp/private.txt' }],
+			errors: [{ code: 'TASK_FAILED', message: '{"credential" : "private-value"}' }],
 		});
 
 		assert.strictEqual(model.listener.gateway.detail, '[redacted sensitive details]');
