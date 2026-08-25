@@ -42,6 +42,38 @@ class MemoryState implements StateStore {
 	}
 }
 
+class BlockingState extends MemoryState {
+	private nextUpdateBlock:
+		| {
+			readonly entered: () => void;
+			readonly wait: Promise<void>;
+		}
+		| undefined;
+
+	public blockNextUpdate(): { readonly entered: Promise<void>; readonly release: () => void } {
+		let signalEntered!: () => void;
+		let release!: () => void;
+		const entered = new Promise<void>((resolve) => {
+			signalEntered = resolve;
+		});
+		const wait = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		this.nextUpdateBlock = { entered: signalEntered, wait };
+		return { entered, release };
+	}
+
+	public override async update(key: string, value: unknown): Promise<void> {
+		const block = this.nextUpdateBlock;
+		this.nextUpdateBlock = undefined;
+		if (block !== undefined) {
+			block.entered();
+			await block.wait;
+		}
+		await super.update(key, value);
+	}
+}
+
 class SequenceIds implements IdGenerator {
 	private index = 0;
 
@@ -200,14 +232,14 @@ describe('foundation storage', () => {
 			new SequenceIds([IDS.workspace]),
 			fixedClock,
 			resolver,
-			(workspaceLeaseKey) => leases.isLeased(workspaceLeaseKey),
+			leases,
 		);
 		const workspace = await registry.register({
 			localUri: 'file:///Users/example/secret-project',
 			name: 'Project',
 			capabilityTags: ['backend'],
 		});
-		const wire = registry.listForWire();
+		const wire = await registry.listForWire();
 		assert.strictEqual(workspace.workspaceId, IDS.workspace);
 		assert.strictEqual(JSON.stringify(wire).includes('/Users/example'), false);
 		assert.strictEqual('localUri' in wire[0], false);
@@ -218,9 +250,11 @@ describe('foundation storage', () => {
 			}),
 			TypeError,
 		);
-		assert.strictEqual(registry.leaseKey(IDS.workspace), 'device:1:inode:2');
-		leases.acquire(registry.leaseKey(IDS.workspace), IDS.peer, IDS.task);
-		assert.strictEqual(registry.listForWire()[0].busy, true);
+		assert.strictEqual(
+			await registry.acquireLease(IDS.workspace, IDS.peer, IDS.task),
+			'device:1:inode:2',
+		);
+		assert.strictEqual((await registry.listForWire())[0].busy, true);
 		await assert.rejects(
 			registry.setEnabled(IDS.workspace, false),
 			(error) => error instanceof Error && error.message.includes('active task'),
@@ -238,6 +272,7 @@ describe('foundation storage', () => {
 			new SequenceIds([IDS.workspace]),
 			fixedClock,
 			resolver,
+			new WorkspaceLeaseManager(),
 		);
 		const first = await registry.register({
 			localUri: 'file:///workspace/../alias',
@@ -250,11 +285,133 @@ describe('foundation storage', () => {
 		assert.strictEqual(first.workspaceId, second.workspaceId);
 		assert.strictEqual(first.localUri, 'file:///canonical/project');
 		assert.strictEqual(first.fileIdentity, 'device:10:inode:20');
-		assert.deepStrictEqual(resolver.inputs, [
-			'file:///alias',
-			'file:///other/symlink',
+		assert.strictEqual(resolver.inputs[0], 'file:///alias');
+		assert.strictEqual(resolver.inputs.includes('file:///other/symlink'), true);
+		assert.strictEqual(JSON.stringify(await registry.listForWire()).includes('inode'), false);
+	});
+
+	test('persists the latest authoritative identity when registration revalidation changes twice', async () => {
+		const resolutions = [
+			{ canonicalUri: 'file:///canonical/one', identity: 'identity:one' },
+			{ canonicalUri: 'file:///canonical/two', identity: 'identity:two' },
+			{ canonicalUri: 'file:///canonical/three', identity: 'identity:three' },
+		];
+		let resolutionIndex = 0;
+		const registry = new WorkspaceRegistry(
+			new MemoryState(),
+			new SequenceIds([IDS.workspace]),
+			fixedClock,
+			new FakeFileIdentityResolver(() =>
+				resolutions[Math.min(resolutionIndex++, resolutions.length - 1)],
+			),
+			new WorkspaceLeaseManager(),
+		);
+		const input = { localUri: 'file:///registered/link', name: 'Moving target' };
+		await registry.register(input);
+		const updated = await registry.register(input);
+		assert.strictEqual(updated.fileIdentity, 'identity:three');
+		assert.strictEqual(updated.localUri, 'file:///canonical/three');
+		assert.strictEqual((await registry.listLocal())[0].fileIdentity, 'identity:three');
+	});
+
+	test('disables a retargeted leased URI and atomically adopts its new identity after release', async () => {
+		const state = new MemoryState();
+		const leases = new WorkspaceLeaseManager();
+		let resolved = {
+			canonicalUri: 'file:///canonical/original',
+			identity: 'device:1:inode:old',
+		};
+		const registry = new WorkspaceRegistry(
+			state,
+			new SequenceIds([IDS.workspace]),
+			fixedClock,
+			new FakeFileIdentityResolver(() => resolved),
+			leases,
+		);
+		const input = { localUri: 'file:///registered/link', name: 'Retargetable' };
+		const original = await registry.register(input);
+		await registry.acquireLease(original.workspaceId, IDS.peer, IDS.task);
+		resolved = {
+			canonicalUri: 'file:///canonical/replacement',
+			identity: 'device:1:inode:new',
+		};
+		await assert.rejects(
+			registry.register(input),
+			(error) => error instanceof Error && error.message.includes('identity changed'),
+		);
+		await assert.rejects(
+			registry.acquireLease(original.workspaceId, IDS.peer, IDS.otherTask),
+			(error) => error instanceof Error && error.message === 'Workspace is disabled.',
+		);
+		const [disabled] = await registry.listLocal();
+		assert.strictEqual(disabled.enabled, false);
+		assert.strictEqual(disabled.fileIdentity, original.fileIdentity);
+		leases.release(original.fileIdentity, IDS.peer, IDS.task);
+		const replaced = await registry.register(input);
+		assert.strictEqual(replaced.workspaceId, original.workspaceId);
+		assert.strictEqual(replaced.fileIdentity, resolved.identity);
+		assert.strictEqual(replaced.localUri, resolved.canonicalUri);
+		assert.strictEqual(replaced.enabled, false);
+		await registry.setEnabled(replaced.workspaceId, true);
+		assert.strictEqual(
+			await registry.acquireLease(replaced.workspaceId, IDS.peer, IDS.otherTask),
+			resolved.identity,
+		);
+	});
+
+	test('rejects invalid canonical resolver output on every workspace use', async () => {
+		let resolved = {
+			canonicalUri: 'file:///canonical/project',
+			identity: 'device:1:inode:2',
+		};
+		const registry = new WorkspaceRegistry(
+			new MemoryState(),
+			new SequenceIds([IDS.workspace]),
+			fixedClock,
+			new FakeFileIdentityResolver(() => resolved),
+			new WorkspaceLeaseManager(),
+		);
+		const workspace = await registry.register({
+			localUri: 'file:///registered/project',
+			name: 'Project',
+		});
+		resolved = { canonicalUri: 'https://example.com/not-local', identity: '' };
+		await assert.rejects(registry.resolveEnabled(workspace.workspaceId), TypeError);
+		await assert.rejects(registry.listForWire(), TypeError);
+	});
+
+	test('serializes concurrent registry mutations without losing updates', async () => {
+		const state = new BlockingState();
+		const resolver = new FakeFileIdentityResolver((localUri) => ({
+			canonicalUri: localUri,
+			identity: `identity:${localUri}`,
+		}));
+		const registry = new WorkspaceRegistry(
+			state,
+			new SequenceIds([IDS.workspace, IDS.otherWorkspace]),
+			fixedClock,
+			resolver,
+			new WorkspaceLeaseManager(),
+		);
+		const [first, second] = await Promise.all([
+			registry.register({ localUri: 'file:///one', name: 'One' }),
+			registry.register({ localUri: 'file:///two', name: 'Two' }),
 		]);
-		assert.strictEqual(JSON.stringify(registry.listForWire()).includes('inode'), false);
+		assert.strictEqual((await registry.listLocal()).length, 2);
+		const blockedUpdate = state.blockNextUpdate();
+		const disabling = registry.setEnabled(first.workspaceId, false);
+		await blockedUpdate.entered;
+		const removing = registry.remove(second.workspaceId);
+		blockedUpdate.release();
+		await Promise.all([disabling, removing]);
+		const remaining = await registry.listLocal();
+		assert.deepStrictEqual(remaining.map((workspace) => ({
+			workspaceId: workspace.workspaceId,
+			enabled: workspace.enabled,
+		})), [{
+			workspaceId: first.workspaceId,
+			enabled: false,
+		}]);
 	});
 
 	test('preserves the previous file when an atomic replace is interrupted', async () => {
@@ -505,6 +662,7 @@ describe('foundation storage', () => {
 			await tasks.create({
 				...createAcceptedTask(taskRequest(), AT),
 				state: 'completed',
+				summary: 'Completed',
 				eventSeq: 1,
 				events: [{
 					eventSeq: 1,

@@ -100,7 +100,9 @@ export function taskReducer(record: TaskRecord, event: TaskDomainEvent): TaskRec
 			assertActive(record, event);
 			return transition(record, event, {
 				state: 'failed',
+				cancellationDeadline: undefined,
 				pendingInput: undefined,
+				summary: undefined,
 				failure: {
 					code: event.code,
 					message: event.message,
@@ -111,7 +113,9 @@ export function taskReducer(record: TaskRecord, event: TaskDomainEvent): TaskRec
 			assertActive(record, event);
 			return transition(record, event, {
 				state: 'timedOut',
+				cancellationDeadline: undefined,
 				pendingInput: undefined,
+				summary: undefined,
 				failure: {
 					code: 'TASK_TIMED_OUT',
 					message: event.message,

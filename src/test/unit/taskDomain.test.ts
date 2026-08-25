@@ -4,6 +4,7 @@ import { describe, test } from 'node:test';
 import {
 	ACTIVE_TASK_STATUSES,
 	PROTOCOL_LIMITS,
+	persistedTaskRecordSchema,
 	rpcSuccessResponseSchema,
 	taskSnapshotSchema,
 	taskSnapshotAfterEventSeqSchema,
@@ -191,12 +192,6 @@ describe('task domain', () => {
 				inputId: IDS.input,
 				prompt: '\0'.repeat(PROTOCOL_LIMITS.taskAnswerBytes),
 			},
-			summary: '\0'.repeat(PROTOCOL_LIMITS.terminalSummaryBytes),
-			failure: {
-				code: '\0'.repeat(128),
-				message: '\0'.repeat(PROTOCOL_LIMITS.errorMessageBytes),
-				retryable: true,
-			},
 		};
 		assert.strictEqual(taskSnapshotSchema.safeParse(snapshot).success, true);
 		assert.strictEqual(taskSnapshotSchema.safeParse({
@@ -265,19 +260,27 @@ describe('task domain', () => {
 
 	test('allows every active state to fail or time out', () => {
 		for (const state of ACTIVE_TASK_STATUSES) {
-			const record = { ...createAcceptedTask(taskRequest(), AT), state };
-			assert.strictEqual(taskReducer(record, {
+			const record = {
+				...createAcceptedTask(taskRequest(), AT),
+				state,
+				...(state === 'cancelling' ? { cancellationDeadline: DEADLINE } : {}),
+			};
+			const failed = taskReducer(record, {
 				type: 'failed',
 				at: LATER,
 				code: 'TEST_FAILURE',
 				message: 'Failed',
 				retryable: false,
-			}).state, 'failed');
-			assert.strictEqual(taskReducer(record, {
+			});
+			const timedOut = taskReducer(record, {
 				type: 'timedOut',
 				at: LATER,
 				message: 'Timed out',
-			}).state, 'timedOut');
+			});
+			assert.strictEqual(failed.state, 'failed');
+			assert.strictEqual(timedOut.state, 'timedOut');
+			assert.strictEqual(persistedTaskRecordSchema.safeParse(failed).success, true);
+			assert.strictEqual(persistedTaskRecordSchema.safeParse(timedOut).success, true);
 		}
 	});
 
@@ -380,6 +383,7 @@ describe('task domain', () => {
 		const cancelling = {
 			...createAcceptedTask(taskRequest(), AT),
 			state: 'cancelling' as const,
+			cancellationDeadline: DEADLINE,
 		};
 		const cancelled = taskReducer(cancelling, {
 			type: 'cancelConfirmed',

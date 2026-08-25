@@ -94,7 +94,10 @@ export const persistedTaskRecordSchema = persistedTaskRecordObjectSchema
 function validateTaskState(
 	record: {
 		readonly state: z.infer<typeof taskStatusSchema>;
+		readonly cancellationDeadline?: string;
 		readonly pendingInput?: z.infer<typeof pendingInputSchema>;
+		readonly summary?: string;
+		readonly failure?: z.infer<typeof taskFailureSchema>;
 	},
 	context: z.RefinementCtx,
 ): void {
@@ -114,6 +117,40 @@ function validateTaskState(
 			code: 'custom',
 			path: ['pendingInput'],
 			message: 'Only needsInput or recovering tasks may retain pending input',
+		});
+	}
+	const cancellationState = record.state === 'cancelling' || record.state === 'cancelled';
+	if (cancellationState !== (record.cancellationDeadline !== undefined)) {
+		context.addIssue({
+			code: 'custom',
+			path: ['cancellationDeadline'],
+			message: 'Only cancelling or cancelled tasks must include a cancellation deadline',
+		});
+	}
+	const failureState = record.state === 'failed' || record.state === 'timedOut';
+	if (failureState !== (record.failure !== undefined)) {
+		context.addIssue({
+			code: 'custom',
+			path: ['failure'],
+			message: 'Only failed or timedOut tasks must include failure details',
+		});
+	}
+	if (record.state === 'completed' && record.summary === undefined) {
+		context.addIssue({
+			code: 'custom',
+			path: ['summary'],
+			message: 'Completed tasks must include a summary',
+		});
+	}
+	if (
+		record.summary !== undefined
+		&& record.state !== 'completed'
+		&& record.state !== 'cancelled'
+	) {
+		context.addIssue({
+			code: 'custom',
+			path: ['summary'],
+			message: 'Only completed or cancelled tasks may include a terminal summary',
 		});
 	}
 }

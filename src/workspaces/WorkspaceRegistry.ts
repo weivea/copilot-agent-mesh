@@ -6,6 +6,7 @@ import {
 	PROTOCOL_LIMITS,
 	utf8String,
 	uuidSchema,
+	workspaceListResultSchema,
 	type WorkspaceSummary,
 } from '../../shared/protocol';
 import { MeshDomainError } from '../domain/errors';
@@ -15,6 +16,7 @@ const WORKSPACE_REGISTRY_KEY = 'copilotAgentMesh.workspaceRegistry';
 
 const localWorkspaceSchema = z.strictObject({
 	workspaceId: uuidSchema,
+	registeredUri: z.string().url().refine((value) => new URL(value).protocol === 'file:', 'Workspace URI must use file:'),
 	localUri: z.string().url().refine((value) => new URL(value).protocol === 'file:', 'Workspace URI must use file:'),
 	fileIdentity: utf8String(1_024, 'workspace file identity', 1),
 	name: utf8String(PROTOCOL_LIMITS.nameBytes, 'workspace name', 1),
@@ -26,7 +28,7 @@ const localWorkspaceSchema = z.strictObject({
 
 const workspaceRegistrySchema = z.strictObject({
 	schemaVersion: z.literal(1),
-	workspaces: z.array(localWorkspaceSchema),
+	workspaces: z.array(localWorkspaceSchema).max(PROTOCOL_LIMITS.workspaceListCount),
 });
 
 export type LocalWorkspace = z.infer<typeof localWorkspaceSchema>;
@@ -46,126 +48,334 @@ export interface FileIdentityResolver {
 	resolve(localUri: string): Promise<ResolvedFileIdentity>;
 }
 
+export interface WorkspaceLeaseCoordinator {
+	isLeased(workspaceLeaseKey: string): boolean;
+	acquire(workspaceLeaseKey: string, peerId: string, taskId: string): void;
+}
+
 export class WorkspaceRegistry {
+	private operationQueue: Promise<void> = Promise.resolve();
+
 	public constructor(
 		private readonly state: StateStore,
 		private readonly ids: IdGenerator,
 		private readonly clock: Clock,
 		private readonly fileIdentityResolver: FileIdentityResolver,
-		private readonly isWorkspaceLeased: (workspaceLeaseKey: string) => boolean = () => false,
+		private readonly workspaceLeases: WorkspaceLeaseCoordinator,
 	) {}
 
-	public listLocal(): readonly LocalWorkspace[] {
-		return this.read().workspaces;
+	public listLocal(): Promise<readonly LocalWorkspace[]> {
+		return this.runExclusive(async () =>
+			(await this.revalidateAllUnlocked()).workspaces,
+		);
 	}
 
-	public listForWire(): readonly WorkspaceSummary[] {
-		return this.read().workspaces.map((workspace) => ({
-			workspaceId: workspace.workspaceId,
-			name: workspace.name,
-			capabilityTags: [...workspace.capabilityTags],
-			enabled: workspace.enabled,
-			busy: this.isWorkspaceLeased(workspace.fileIdentity),
-		}));
+	public listForWire(): Promise<readonly WorkspaceSummary[]> {
+		return this.runExclusive(async () => {
+			const workspaces = (await this.revalidateAllUnlocked()).workspaces.map((workspace) => ({
+				workspaceId: workspace.workspaceId,
+				name: workspace.name,
+				capabilityTags: [...workspace.capabilityTags],
+				enabled: workspace.enabled,
+				busy: this.workspaceLeases.isLeased(workspace.fileIdentity),
+			}));
+			return workspaceListResultSchema.parse({ workspaces }).workspaces;
+		});
 	}
 
-	public resolveEnabled(workspaceId: string): LocalWorkspace {
+	public resolveEnabled(workspaceId: string): Promise<LocalWorkspace> {
+		return this.runExclusive(() => this.resolveEnabledUnlocked(workspaceId));
+	}
+
+	private async resolveEnabledUnlocked(workspaceId: string): Promise<LocalWorkspace> {
 		const parsedId = uuidSchema.safeParse(workspaceId);
-		const workspace = parsedId.success
-			? this.read().workspaces.find((candidate) => candidate.workspaceId === parsedId.data)
-			: undefined;
-		if (workspace === undefined) {
+		const registry = this.read();
+		const index = parsedId.success
+			? registry.workspaces.findIndex((candidate) => candidate.workspaceId === parsedId.data)
+			: -1;
+		if (index < 0) {
 			throw new MeshDomainError('WORKSPACE_NOT_FOUND', 'Workspace not found.');
 		}
+		const { workspace } = await this.revalidateWorkspaceUnlocked(registry, index);
 		if (!workspace.enabled) {
 			throw new MeshDomainError('WORKSPACE_DISABLED', 'Workspace is disabled.');
 		}
 		return workspace;
 	}
 
-	public leaseKey(workspaceId: string): string {
-		return this.resolveEnabled(workspaceId).fileIdentity;
+	public acquireLease(
+		workspaceId: string,
+		peerId: string,
+		taskId: string,
+	): Promise<string> {
+		return this.runExclusive(async () => {
+			const workspace = await this.resolveEnabledUnlocked(workspaceId);
+			this.workspaceLeases.acquire(workspace.fileIdentity, peerId, taskId);
+			return workspace.fileIdentity;
+		});
 	}
 
 	public async register(input: RegisterWorkspaceInput): Promise<LocalWorkspace> {
-		const lexicalUri = normalizeLocalFileUri(input.localUri);
-		const resolvedIdentity = await this.fileIdentityResolver.resolve(lexicalUri);
-		const canonicalUri = normalizeLocalFileUri(resolvedIdentity.canonicalUri);
+		return this.runExclusive(async () => {
+			const registry = await this.revalidateAllUnlocked();
+			const candidate = await this.resolveRegistrationInput(input);
+			const sameRegistrationIndex = registry.workspaces.findIndex(
+				(workspace) => workspace.registeredUri === candidate.registeredUri,
+			);
+			if (sameRegistrationIndex >= 0) {
+				const previous = registry.workspaces[sameRegistrationIndex];
+				if (
+					previous.fileIdentity === candidate.fileIdentity
+					&& previous.localUri === candidate.localUri
+				) {
+					return previous;
+				}
+				const identityChanged = previous.fileIdentity !== candidate.fileIdentity;
+				if (identityChanged && this.workspaceLeases.isLeased(previous.fileIdentity)) {
+					await this.disableWorkspaceUnlocked(registry, sameRegistrationIndex);
+					throw new MeshDomainError(
+						'WORKSPACE_BUSY',
+						'Workspace identity changed while an active task is using it.',
+					);
+				}
+				const collision = identityChanged
+					? registry.workspaces.find(
+					(workspace, index) =>
+						index !== sameRegistrationIndex
+						&& workspace.fileIdentity === candidate.fileIdentity,
+					)
+					: undefined;
+				if (collision !== undefined) {
+					await this.disableWorkspaceUnlocked(registry, sameRegistrationIndex);
+					return collision;
+				}
+				const updated = localWorkspaceSchema.parse({
+					...previous,
+					...candidate,
+					updatedAt: this.clock.now().toISOString(),
+				});
+				const workspaces = [...registry.workspaces];
+				workspaces[sameRegistrationIndex] = updated;
+				await this.write(workspaces);
+				return updated;
+			}
+			const existing = registry.workspaces.find(
+				(workspace) => workspace.fileIdentity === candidate.fileIdentity,
+			);
+			if (existing !== undefined) {
+				return existing;
+			}
+			if (registry.workspaces.length >= PROTOCOL_LIMITS.workspaceListCount) {
+				throw new TypeError(
+					`Workspace registry cannot contain more than ${PROTOCOL_LIMITS.workspaceListCount} entries.`,
+				);
+			}
+			const at = this.clock.now().toISOString();
+			const workspace = localWorkspaceSchema.parse({
+				...candidate,
+				workspaceId: this.ids.next(),
+				enabled: true,
+				createdAt: at,
+				updatedAt: at,
+			});
+			await this.write([...registry.workspaces, workspace]);
+			return workspace;
+		});
+	}
+
+	public async setEnabled(workspaceId: string, enabled: boolean): Promise<LocalWorkspace> {
+		return this.runExclusive(async () => {
+			const parsedId = uuidSchema.safeParse(workspaceId);
+			const registry = this.read();
+			const index = parsedId.success
+				? registry.workspaces.findIndex((workspace) => workspace.workspaceId === parsedId.data)
+				: -1;
+			if (index < 0) {
+				throw new MeshDomainError('WORKSPACE_NOT_FOUND', 'Workspace not found.');
+			}
+			const refreshed = await this.revalidateWorkspaceUnlocked(registry, index);
+			const current = refreshed.workspace;
+			if (!enabled && this.workspaceLeases.isLeased(current.fileIdentity)) {
+				throw new MeshDomainError('WORKSPACE_BUSY', 'An active task is using this workspace.');
+			}
+			if (enabled && !current.enabled) {
+				const liveIdentity = await this.resolveFileIdentity(current.registeredUri);
+				if (
+					liveIdentity.localUri !== current.localUri
+					|| liveIdentity.fileIdentity !== current.fileIdentity
+				) {
+					throw new MeshDomainError(
+						'WORKSPACE_BUSY',
+						'Workspace identity must stabilize before it can be enabled.',
+					);
+				}
+			}
+			if (
+				enabled
+				&& refreshed.registry.workspaces.some((workspace) =>
+					workspace.workspaceId !== current.workspaceId
+					&& workspace.fileIdentity === current.fileIdentity
+					&& workspace.enabled,
+				)
+			) {
+				throw new MeshDomainError(
+					'WORKSPACE_BUSY',
+					'Another workspace registration resolves to the same filesystem identity.',
+				);
+			}
+			const updated = localWorkspaceSchema.parse({
+				...current,
+				enabled,
+				updatedAt: this.clock.now().toISOString(),
+			});
+			const workspaces = [...refreshed.registry.workspaces];
+			const refreshedIndex = workspaces.findIndex(
+				(workspace) => workspace.workspaceId === current.workspaceId,
+			);
+			workspaces[refreshedIndex] = updated;
+			await this.write(workspaces);
+			return updated;
+		});
+	}
+
+	public async remove(workspaceId: string): Promise<void> {
+		return this.runExclusive(async () => {
+			const parsedId = uuidSchema.safeParse(workspaceId);
+			const registry = this.read();
+			const index = parsedId.success
+				? registry.workspaces.findIndex((workspace) => workspace.workspaceId === parsedId.data)
+				: -1;
+			if (index < 0) {
+				throw new MeshDomainError('WORKSPACE_NOT_FOUND', 'Workspace not found.');
+			}
+			const refreshed = await this.revalidateWorkspaceUnlocked(registry, index);
+			if (this.workspaceLeases.isLeased(refreshed.workspace.fileIdentity)) {
+				throw new MeshDomainError('WORKSPACE_BUSY', 'An active task is using this workspace.');
+			}
+			await this.write(refreshed.registry.workspaces.filter(
+				(workspace) => workspace.workspaceId !== refreshed.workspace.workspaceId,
+			));
+		});
+	}
+
+	private async resolveRegistrationInput(
+		input: RegisterWorkspaceInput,
+	): Promise<Pick<LocalWorkspace, 'registeredUri' | 'localUri' | 'fileIdentity' | 'name' | 'capabilityTags'>> {
+		const registeredUri = normalizeLocalFileUri(input.localUri);
+		const identity = await this.resolveFileIdentity(registeredUri);
 		const candidate = localWorkspaceSchema.pick({
+			registeredUri: true,
 			localUri: true,
 			fileIdentity: true,
 			name: true,
 			capabilityTags: true,
 		}).safeParse({
 			...input,
-			localUri: canonicalUri,
-			fileIdentity: resolvedIdentity.identity,
+			registeredUri,
+			...identity,
 			capabilityTags: input.capabilityTags ?? [],
 		});
 		if (!candidate.success) {
 			throw new TypeError(`Invalid local workspace: ${candidate.error.message}`);
 		}
-
-		const registry = this.read();
-		const existing = registry.workspaces.find(
-			(workspace) => workspace.fileIdentity === candidate.data.fileIdentity,
-		);
-		if (existing !== undefined) {
-			return existing;
-		}
-
-		const at = this.clock.now().toISOString();
-		const workspace = localWorkspaceSchema.parse({
-			...candidate.data,
-			workspaceId: this.ids.next(),
-			enabled: true,
-			createdAt: at,
-			updatedAt: at,
-		});
-		await this.write([...registry.workspaces, workspace]);
-		return workspace;
+		return candidate.data;
 	}
 
-	public async setEnabled(workspaceId: string, enabled: boolean): Promise<LocalWorkspace> {
-		const registry = this.read();
-		const parsedId = uuidSchema.safeParse(workspaceId);
-		const index = parsedId.success
-			? registry.workspaces.findIndex((workspace) => workspace.workspaceId === parsedId.data)
-			: -1;
-		if (index < 0) {
-			throw new MeshDomainError('WORKSPACE_NOT_FOUND', 'Workspace not found.');
+	private async resolveFileIdentity(
+		registeredUri: string,
+	): Promise<Pick<LocalWorkspace, 'localUri' | 'fileIdentity'>> {
+		const resolved = await this.fileIdentityResolver.resolve(
+			normalizeLocalFileUri(registeredUri),
+		);
+		const candidate = localWorkspaceSchema.pick({
+			localUri: true,
+			fileIdentity: true,
+		}).safeParse({
+			localUri: normalizeLocalFileUri(resolved.canonicalUri),
+			fileIdentity: resolved.identity,
+		});
+		if (!candidate.success) {
+			throw new TypeError(`Invalid resolved workspace identity: ${candidate.error.message}`);
 		}
-		if (!enabled && this.isWorkspaceLeased(registry.workspaces[index].fileIdentity)) {
-			throw new MeshDomainError('WORKSPACE_BUSY', 'An active task is using this workspace.');
+		return candidate.data;
+	}
+
+	private async revalidateAllUnlocked(): Promise<z.infer<typeof workspaceRegistrySchema>> {
+		let registry = this.read();
+		for (const workspace of [...registry.workspaces]) {
+			const index = registry.workspaces.findIndex(
+				(candidate) => candidate.workspaceId === workspace.workspaceId,
+			);
+			if (index >= 0) {
+				registry = (await this.revalidateWorkspaceUnlocked(registry, index)).registry;
+			}
+		}
+		return registry;
+	}
+
+	private async revalidateWorkspaceUnlocked(
+		registry: z.infer<typeof workspaceRegistrySchema>,
+		index: number,
+	): Promise<{
+		readonly registry: z.infer<typeof workspaceRegistrySchema>;
+		readonly workspace: LocalWorkspace;
+	}> {
+		const previous = registry.workspaces[index];
+		const identity = await this.resolveFileIdentity(previous.registeredUri);
+		if (
+			previous.localUri === identity.localUri
+			&& previous.fileIdentity === identity.fileIdentity
+		) {
+			return { registry, workspace: previous };
+		}
+		const identityChanged = previous.fileIdentity !== identity.fileIdentity;
+		const collision = identityChanged && registry.workspaces.some((workspace, candidateIndex) =>
+			candidateIndex !== index && workspace.fileIdentity === identity.fileIdentity,
+		);
+		if (
+			identityChanged
+			&& (this.workspaceLeases.isLeased(previous.fileIdentity) || collision)
+		) {
+			const disabled = await this.disableWorkspaceUnlocked(registry, index);
+			return { registry: disabled.registry, workspace: disabled.workspace };
 		}
 		const updated = localWorkspaceSchema.parse({
-			...registry.workspaces[index],
-			enabled,
+			...previous,
+			...identity,
 			updatedAt: this.clock.now().toISOString(),
 		});
 		const workspaces = [...registry.workspaces];
 		workspaces[index] = updated;
 		await this.write(workspaces);
-		return updated;
+		return {
+			registry: { schemaVersion: 1, workspaces },
+			workspace: updated,
+		};
 	}
 
-	public async remove(workspaceId: string): Promise<void> {
-		const registry = this.read();
-		const parsedId = uuidSchema.safeParse(workspaceId);
-		const normalizedId = parsedId.success ? parsedId.data : undefined;
-		const existing = registry.workspaces.find(
-			(workspace) => workspace.workspaceId === normalizedId,
-		);
-		if (existing !== undefined && this.isWorkspaceLeased(existing.fileIdentity)) {
-			throw new MeshDomainError('WORKSPACE_BUSY', 'An active task is using this workspace.');
+	private async disableWorkspaceUnlocked(
+		registry: z.infer<typeof workspaceRegistrySchema>,
+		index: number,
+	): Promise<{
+		readonly registry: z.infer<typeof workspaceRegistrySchema>;
+		readonly workspace: LocalWorkspace;
+	}> {
+		const previous = registry.workspaces[index];
+		if (!previous.enabled) {
+			return { registry, workspace: previous };
 		}
-		const workspaces = registry.workspaces.filter(
-			(workspace) => workspace.workspaceId !== normalizedId,
-		);
-		if (workspaces.length === registry.workspaces.length) {
-			throw new MeshDomainError('WORKSPACE_NOT_FOUND', 'Workspace not found.');
-		}
+		const disabled = localWorkspaceSchema.parse({
+			...previous,
+			enabled: false,
+			updatedAt: this.clock.now().toISOString(),
+		});
+		const workspaces = [...registry.workspaces];
+		workspaces[index] = disabled;
 		await this.write(workspaces);
+		return {
+			registry: { schemaVersion: 1, workspaces },
+			workspace: disabled,
+		};
 	}
 
 	private read(): z.infer<typeof workspaceRegistrySchema> {
@@ -186,6 +396,15 @@ export class WorkspaceRegistry {
 			workspaces,
 		});
 		return this.state.update(WORKSPACE_REGISTRY_KEY, registry);
+	}
+
+	private runExclusive<T>(operation: () => Promise<T>): Promise<T> {
+		const result = this.operationQueue.then(operation, operation);
+		this.operationQueue = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
 	}
 }
 

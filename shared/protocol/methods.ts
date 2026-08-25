@@ -1,7 +1,7 @@
 import { z } from 'zod';
 
 import { GATEWAY_METHODS, MESH_PROTOCOL_VERSION } from './constants';
-import { PROTOCOL_LIMITS, utf8String } from './limits';
+import { PROTOCOL_LIMITS, utf8ByteLength, utf8String } from './limits';
 import {
 	deviceInfoSchema,
 	taskSnapshotAfterEventSeqSchema,
@@ -101,15 +101,32 @@ export const methodParamsSchemas = {
 	[GATEWAY_METHODS.taskAnswer]: taskAnswerParamsSchema,
 } as const;
 
+export const workspaceListResultSchema = z.strictObject({
+	workspaces: z.array(workspaceSummarySchema).max(PROTOCOL_LIMITS.workspaceListCount),
+}).superRefine((result, context) => {
+	const maximalEnvelope = {
+		jsonrpc: '2.0',
+		id: 'x'.repeat(PROTOCOL_LIMITS.identifierBytes),
+		result,
+	};
+	if (
+		utf8ByteLength(JSON.stringify(maximalEnvelope))
+		>= PROTOCOL_LIMITS.frameBytes
+	) {
+		context.addIssue({
+			code: 'custom',
+			message: 'Serialized workspace.list response exceeds the JSON-RPC frame limit',
+		});
+	}
+});
+
 export const methodResultSchemas = {
 	[GATEWAY_METHODS.hello]: helloResultSchema,
 	[GATEWAY_METHODS.authenticate]: authenticateResultSchema,
 	[GATEWAY_METHODS.enrollmentCommit]: enrollmentCommitResultSchema,
 	[GATEWAY_METHODS.ping]: pingResultSchema,
 	[GATEWAY_METHODS.deviceGetInfo]: deviceInfoSchema,
-	[GATEWAY_METHODS.workspaceList]: z.strictObject({
-		workspaces: z.array(workspaceSummarySchema),
-	}),
+	[GATEWAY_METHODS.workspaceList]: workspaceListResultSchema,
 	[GATEWAY_METHODS.taskStart]: taskSnapshotSchema,
 	[GATEWAY_METHODS.taskGet]: z.union([
 		taskSnapshotSchema,

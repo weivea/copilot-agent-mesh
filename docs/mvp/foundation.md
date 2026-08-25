@@ -36,6 +36,11 @@ Terminal states are `completed`, `failed`, `cancelled`, and `timedOut`.
   cancellation begins cannot overwrite `cancelling`.
 - Pending input survives agent recovery, but is cleared whenever the task
   leaves `needsInput` for a non-answerable state.
+- Persisted records and snapshots require cancellation deadlines only for
+  `cancelling`/`cancelled`, failure details only for `failed`/`timedOut`, and a
+  summary for `completed`. `task.completed` notifications carry a terminal
+  snapshot whose task ID, sequence, timestamp, and failure exactly match the
+  outer notification.
 - Task access is scoped to the authenticated owner. A different peer receives
   the same `TASK_NOT_FOUND` result as a missing task.
 - Workspace leases are owned by the compound `(peerId, taskId)` identity, so
@@ -57,6 +62,11 @@ Device IDs remain stable across reloads and renames. Workspace IDs are generated
 opaque identifiers. Workspace registration lexically normalizes file URIs, then
 uses an injected `FileIdentityResolver` to resolve aliases and symbolic links.
 The resolver's canonical filesystem identity is the deduplication and lease key.
+Every list, resolution, registration, enable/disable, removal, and lease
+acquisition revalidates that identity. Identity changes replace an unleased
+record or disable a stale leased/colliding record. Revalidation and lease
+acquisition are atomic under the same mutation queue, so an old and new identity
+cannot both be leased through the registry.
 
 `AtomicFileStore` uses a temporary file, file sync, atomic rename, and directory
 sync where the platform supports it. New directories are created one level at a
@@ -81,6 +91,9 @@ unambiguous. Every task read API applies retention with the injected clock and
 atomically rewrites a changed journal, including terminal tasks that receive no
 later transitions.
 
+`workspace.list` is limited to 32 entries and validates its complete serialized
+JSON-RPC response against the 1 MiB frame limit.
+
 Persisted task records contain identifiers, owner, workspace, canonical request
 hash, state, bounded summaries/events, and recovery metadata. They do not
 contain the full prompt or raw output by default.
@@ -97,6 +110,7 @@ contain the full prompt or raw output by default.
 | `LocalDesktopWorkspaceGuard` | Reusable runtime entry-point policy |
 | `DeviceProfileStore` | Stable local device identity |
 | `WorkspaceRegistry` | Local URI registry and opaque wire summaries |
+| `WorkspaceRegistry.acquireLease` | Atomic identity revalidation and lease acquisition |
 | `FileTaskStore` | Validated authoritative task persistence |
 | `WorkspaceLeaseManager` | One active task per workspace and restart rebuild |
 | `taskReducer` | Pure task transition function |

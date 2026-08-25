@@ -15,9 +15,11 @@ import {
 	taskStartParamsSchema,
 	utf8ByteLength,
 	webviewOutboundMessageSchema,
+	workspaceListResultSchema,
 } from '../../../shared/protocol';
 import { createAcceptedTask } from '../../domain/task';
-import { AT, IDS, taskRequest } from './fixtures';
+import { taskReducer } from '../../domain/taskReducer';
+import { AT, DEADLINE, IDS, LATER, taskRequest } from './fixtures';
 
 function helloRequest(): object {
 	return {
@@ -137,6 +139,89 @@ describe('protocol schemas', () => {
 		}).success, true);
 	});
 
+	test('requires task.completed outer metadata and failure to match a terminal snapshot', () => {
+		const running = {
+			...createAcceptedTask(taskRequest(), AT),
+			state: 'running' as const,
+		};
+		const completed = taskReducer(running, {
+			type: 'completed',
+			at: LATER,
+			summary: 'Done',
+		});
+		const {
+			answeredInputs: _answeredInputs,
+			recoveryDescriptor: _recoveryDescriptor,
+			workspaceLeaseKey: _workspaceLeaseKey,
+			...wireRecord
+		} = completed;
+		const snapshot = { ...wireRecord, deviceId: IDS.device };
+		const notification = {
+			jsonrpc: '2.0',
+			method: 'task.completed',
+			params: {
+				taskId: snapshot.taskId,
+				eventSeq: snapshot.eventSeq,
+				at: snapshot.updatedAt,
+				snapshot,
+			},
+		};
+		assert.strictEqual(rpcNotificationSchema.safeParse(notification).success, true);
+		for (const mismatch of [
+			{ taskId: IDS.otherTask },
+			{ eventSeq: snapshot.eventSeq + 1 },
+			{ at: AT },
+		]) {
+			assert.strictEqual(rpcNotificationSchema.safeParse({
+				...notification,
+				params: { ...notification.params, ...mismatch },
+			}).success, false);
+		}
+		assert.strictEqual(rpcNotificationSchema.safeParse({
+			...notification,
+			params: {
+				...notification.params,
+				snapshot: { ...snapshot, state: 'running', summary: undefined },
+			},
+		}).success, false);
+
+		const failed = taskReducer(running, {
+			type: 'failed',
+			at: LATER,
+			code: 'FAILED',
+			message: 'Failed',
+			retryable: false,
+		});
+		const {
+			answeredInputs: _failedAnswers,
+			recoveryDescriptor: _failedRecovery,
+			workspaceLeaseKey: _failedLeaseKey,
+			...failedWireRecord
+		} = failed;
+		const failedSnapshot = { ...failedWireRecord, deviceId: IDS.device };
+		assert.strictEqual(rpcNotificationSchema.safeParse({
+			jsonrpc: '2.0',
+			method: 'task.completed',
+			params: {
+				taskId: failedSnapshot.taskId,
+				eventSeq: failedSnapshot.eventSeq,
+				at: failedSnapshot.updatedAt,
+				snapshot: failedSnapshot,
+				failure: failedSnapshot.failure,
+			},
+		}).success, true);
+		assert.strictEqual(rpcNotificationSchema.safeParse({
+			jsonrpc: '2.0',
+			method: 'task.completed',
+			params: {
+				taskId: failedSnapshot.taskId,
+				eventSeq: failedSnapshot.eventSeq,
+				at: failedSnapshot.updatedAt,
+				snapshot: failedSnapshot,
+			},
+		}).success, false);
+	});
+
 	test('persisted records reject full prompt and raw output fields', () => {
 		const record = createAcceptedTask(taskRequest(), AT);
 		assert.strictEqual(persistedTaskRecordSchema.safeParse(record).success, true);
@@ -169,6 +254,56 @@ describe('protocol schemas', () => {
 				sessionId: 'session-1',
 				prompt: 'must not persist',
 			},
+		}).success, false);
+	});
+
+	test('enforces task status-specific cancellation, failure, and summary fields', () => {
+		const record = createAcceptedTask(taskRequest(), AT);
+		const failure = { code: 'FAILED', message: 'Failed', retryable: false };
+		const cases: readonly [unknown, boolean][] = [
+			[{ ...record, state: 'cancelling' }, false],
+			[{ ...record, state: 'cancelling', cancellationDeadline: DEADLINE }, true],
+			[{ ...record, cancellationDeadline: DEADLINE }, false],
+			[{ ...record, state: 'cancelled' }, false],
+			[{ ...record, state: 'cancelled', cancellationDeadline: DEADLINE }, true],
+			[{ ...record, state: 'failed' }, false],
+			[{ ...record, state: 'failed', failure }, true],
+			[{ ...record, state: 'timedOut', failure }, true],
+			[{ ...record, state: 'running', failure }, false],
+			[{ ...record, state: 'completed' }, false],
+			[{ ...record, state: 'completed', summary: 'Done' }, true],
+			[{ ...record, state: 'running', summary: 'Not terminal' }, false],
+		];
+		for (const [candidate, expected] of cases) {
+			assert.strictEqual(persistedTaskRecordSchema.safeParse(candidate).success, expected);
+		}
+	});
+
+	test('bounds workspace.list count and its complete serialized response', () => {
+		const workspace = {
+			workspaceId: IDS.workspace,
+			name: '\0'.repeat(PROTOCOL_LIMITS.nameBytes),
+			capabilityTags: Array.from(
+				{ length: 32 },
+				() => '\0'.repeat(64),
+			),
+			enabled: true,
+			busy: true,
+		};
+		const result = {
+			workspaces: Array.from(
+				{ length: PROTOCOL_LIMITS.workspaceListCount },
+				() => workspace,
+			),
+		};
+		assert.strictEqual(workspaceListResultSchema.safeParse(result).success, true);
+		assert.ok(utf8ByteLength(JSON.stringify({
+			jsonrpc: '2.0',
+			id: 'x'.repeat(PROTOCOL_LIMITS.identifierBytes),
+			result,
+		})) < PROTOCOL_LIMITS.frameBytes);
+		assert.strictEqual(workspaceListResultSchema.safeParse({
+			workspaces: [...result.workspaces, workspace],
 		}).success, false);
 	});
 
