@@ -252,7 +252,7 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 		workspaceResolver: trustedWorkspaceResolver(),
 		configResolver: {
 			resolve: async ({ completions }) => {
-				const options = await completions('model', { target: 'workspace' });
+				const options = await completions('model', { target: 'workspace' }, 'test');
 				completedDynamicConfig = true;
 				return { model: options[0]?.value };
 			},
@@ -270,6 +270,7 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 		scopes: ['agent:run'],
 	}]);
 	assert.equal(completedDynamicConfig, true);
+	assert.deepEqual(transport.completionQueries, ['test']);
 	assert.equal(transport.created?.provider, 'dynamic-provider');
 	assert.deepEqual(transport.created?.workingDirectories, [workspaceUri]);
 	assert.equal(transport.dispatched[0]?.action.type, 'chat/turnStarted');
@@ -392,6 +393,23 @@ test('runtime attaches the root subscription before initialize and preserves not
 		&& resources.some(({ resource }) => resource === initializationOnlyResource.resource),
 	));
 	await handle.dispose();
+});
+
+test('non-interactive dynamic Session config fails with a stable configuration boundary', async () => {
+	const transport = new FakeAhpTransport();
+	const runtime = new AhpAgentRuntime({
+		enabled: () => true,
+		launcher: new FakeLauncher(),
+		connections: new FakeConnectionFactory([transport]),
+		authBroker: new RecordingAuthBroker(),
+		confirmation: { confirm: async () => 'once' },
+		workspaceResolver: trustedWorkspaceResolver(),
+	});
+
+	await assert.rejects(
+		runtime.start(taskRequest()),
+		(error: unknown) => error instanceof AgentRuntimeError && error.code === 'AGENT_CONFIG_REQUIRED',
+	);
 });
 
 test('start failure cleans the task, AHP connection, and owned host without losing the auth error', async () => {
@@ -565,6 +583,23 @@ test('dispose propagates abort to blocked recovery authentication and waits for 
 	await handle.dispose();
 	assert.equal(broker.recoveryAborted, true);
 	assert.equal(recovered.shutdownCalls, 1);
+	assert.equal(launcher.host.disposed, true);
+});
+
+test('dispose aborts auth notifications and prevents a late token submission', async () => {
+	const transport = new FakeAhpTransport();
+	const broker = new LateTokenAuthBroker();
+	const launcher = new FakeLauncher();
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]), broker);
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+	assert.equal(transport.authenticated.length, 1);
+
+	transport.emitRootAuth([protectedResource]);
+	await waitForCondition(() => broker.notificationStarted);
+	await handle.dispose();
+	assert.equal(broker.latePushRejected, true);
+	assert.equal(transport.authenticated.length, 1);
 	assert.equal(launcher.host.disposed, true);
 });
 
@@ -1391,6 +1426,30 @@ class AbortableRecoveryAuthBroker implements AuthBroker {
 	}
 }
 
+class LateTokenAuthBroker implements AuthBroker {
+	notificationStarted = false;
+	latePushRejected = false;
+
+	async authenticate(
+		request: AuthenticationRequest,
+		pushToken: (resource: string, token: string, scopes: readonly string[]) => Promise<void>,
+	): Promise<void> {
+		if (request.reason !== 'tokenInvalid') {
+			for (const resource of request.resources.filter(({ required }) => required !== false)) {
+				await pushToken(resource.resource, 'test-token', resource.scopes_supported ?? []);
+			}
+			return;
+		}
+		this.notificationStarted = true;
+		await new Promise<void>((resolve) => request.signal?.addEventListener('abort', () => resolve(), { once: true }));
+		try {
+			await pushToken(protectedResource.resource, 'late-token', protectedResource.scopes_supported ?? []);
+		} catch {
+			this.latePushRejected = true;
+		}
+	}
+}
+
 class FakeLauncher implements AgentHostLauncherLike {
 	readonly host = new FakeHost();
 	launchCalls = 0;
@@ -1476,6 +1535,7 @@ class FakeAhpTransport implements AhpConnection {
 	failRootDuringConfig = false;
 	resolveConfigCalls = 0;
 	readonly subscribedUris: string[] = [];
+	readonly completionQueries: string[] = [];
 	readonly unsubscribedUris: string[] = [];
 	private readonly attachedUris = new Set<string>();
 	private readonly queues = new Map<string, FakeSubscription>();
@@ -1671,7 +1731,14 @@ class FakeAhpTransport implements AhpConnection {
 		};
 	}
 
-	async sessionConfigCompletions(): Promise<readonly { readonly value: string; readonly label: string }[]> {
+	async sessionConfigCompletions(
+		_provider: string,
+		_workingDirectory: string,
+		_config: Readonly<Record<string, unknown>>,
+		_property: string,
+		query: string,
+	): Promise<readonly { readonly value: string; readonly label: string }[]> {
+		this.completionQueries.push(query);
 		return [{ value: 'test-model', label: 'Test Model' }];
 	}
 

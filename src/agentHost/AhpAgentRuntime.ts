@@ -82,6 +82,7 @@ export interface AhpConnection {
 		workingDirectory: string,
 		config: Readonly<Record<string, unknown>>,
 		property: string,
+		query: string,
 	): Promise<readonly { readonly value: string; readonly label: string }[]>;
 	createSession(params: {
 		readonly sessionUri: string;
@@ -105,9 +106,12 @@ export interface SessionConfigurationResolver {
 	resolve(request: {
 		readonly schema: SessionConfigSchema;
 		readonly values: Readonly<Record<string, unknown>>;
+		readonly interactive: boolean;
 		readonly completions: (
 			property: string,
 			currentValues: Readonly<Record<string, unknown>>,
+			query: string,
+			signal?: AbortSignal,
 		) => Promise<readonly {
 			readonly value: string;
 			readonly label: string;
@@ -331,12 +335,14 @@ class SdkAhpConnection implements AhpConnection {
 		workingDirectory: string,
 		config: Readonly<Record<string, unknown>>,
 		property: string,
+		query: string,
 	): Promise<readonly { readonly value: string; readonly label: string }[]> {
 		const result = await this.client.sessionConfigCompletions({
 			provider,
 			workingDirectory,
 			config: { ...config },
 			property,
+			query,
 		});
 		return result.items;
 	}
@@ -398,7 +404,13 @@ class DefaultSessionConfigurationResolver implements SessionConfigurationResolve
 			} else if (property.enum?.length === 1) {
 				values[id] = property.enum[0];
 			} else if (property.enumDynamic === true) {
-				const options = await request.completions(id, values);
+				if (!request.interactive) {
+					throw new AgentRuntimeError(
+						'AGENT_CONFIG_REQUIRED',
+						`Agent session configuration requires an interactive value for: ${id}.`,
+					);
+				}
+				const options = await request.completions(id, values, '');
 				if (options.length === 1) {
 					values[id] = options[0]?.value;
 				}
@@ -443,6 +455,7 @@ class AhpTask implements AgentTaskHandle {
 	private disposePromise: Promise<void> | undefined;
 	private readonly authenticationInFlight = new WeakMap<AhpConnection, Map<string, AuthenticationInFlight>>();
 	private readonly pendingAuthNotifications = new Set<Promise<void>>();
+	private readonly authenticationAbort = new AbortController();
 	private terminalError: AgentRuntimeError | undefined;
 	private rootTerminals: readonly TerminalInfo[] = [];
 	private readonly terminalSubscriptionUpdates = new Map<AhpConnection, Promise<void>>();
@@ -606,6 +619,7 @@ class AhpTask implements AgentTaskHandle {
 		this.disposed = true;
 		const recovery = this.recoveryPromise;
 		this.recoveryAbort?.abort();
+		this.authenticationAbort.abort();
 		this.generation.valid = false;
 		this.generation.abort.abort();
 		const startupStopped = new AgentRuntimeError(
@@ -626,6 +640,7 @@ class AhpTask implements AgentTaskHandle {
 					run: () => recovery,
 				}], failures);
 			}
+			await this.drainAuthNotificationsForDispose();
 			await collectCleanupFailures(
 				[...this.subscriptions].map(([uri, subscription]) => ({
 					label: `close subscription ${safeCleanupResource(uri)}`,
@@ -691,12 +706,19 @@ class AhpTask implements AgentTaskHandle {
 			const next = await this.configResolver.resolve({
 				schema: resolved.schema,
 				values: resolved.values,
-				completions: (property, currentValues) => this.connection.sessionConfigCompletions(
-					provider.provider,
-					this.request.workspace.uri,
-					currentValues,
-					property,
-				),
+				interactive: this.request.allowInteractiveAuthentication === true,
+				completions: async (property, currentValues, query, signal) => {
+					throwIfAborted(signal);
+					const completions = await this.connection.sessionConfigCompletions(
+						provider.provider,
+						this.request.workspace.uri,
+						currentValues,
+						property,
+						query,
+					);
+					throwIfAborted(signal);
+					return completions;
+				},
 			});
 			if (stableJson(next) === stableJson(config)) {
 				throw new AgentRuntimeError(
@@ -730,7 +752,7 @@ class AhpTask implements AgentTaskHandle {
 		reason: 'initial' | 'challenge' | 'tokenInvalid',
 		interactive: boolean,
 		connection = this.connection,
-		signal?: AbortSignal,
+		signal: AbortSignal = this.authenticationAbort.signal,
 	): Promise<void> {
 		let connectionAuthentication = this.authenticationInFlight.get(connection);
 		if (connectionAuthentication === undefined) {
@@ -762,12 +784,18 @@ class AhpTask implements AgentTaskHandle {
 			return existing.promise;
 		}
 		const operation = (async () => {
+			throwIfAborted(signal);
 			if (existing !== undefined) {
 				await existing.promise.catch(() => undefined);
+				throwIfAborted(signal);
 			}
 			await this.authBroker.authenticate(
 				{ resources: [resource], interactive, reason, signal },
-				(resourceUrl, token, scopes) => connection.authenticate(resourceUrl, token, scopes),
+				async (resourceUrl, token, scopes) => {
+					throwIfAborted(signal);
+					await connection.authenticate(resourceUrl, token, scopes);
+					throwIfAborted(signal);
+				},
 			);
 		})();
 		const current = { reason, interactive, promise: operation };
@@ -1194,6 +1222,12 @@ class AhpTask implements AgentTaskHandle {
 		}
 	}
 
+	private async drainAuthNotificationsForDispose(): Promise<void> {
+		while (this.pendingAuthNotifications.size > 0) {
+			await Promise.allSettled([...this.pendingAuthNotifications]);
+		}
+	}
+
 	private startRecovery(): void {
 		if (this.recoveryPromise !== undefined || this.disposed || this.terminal) {
 			return;
@@ -1313,7 +1347,7 @@ class AhpTask implements AgentTaskHandle {
 						'tokenInvalid',
 						this.request.allowInteractiveAuthentication === true,
 						candidate,
-						signal,
+						AbortSignal.any([signal, this.authenticationAbort.signal]),
 					),
 					signal,
 				);

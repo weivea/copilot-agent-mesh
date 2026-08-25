@@ -70,9 +70,9 @@ export function activate(context: vscode.ExtensionContext): AgentMeshExtensionAp
 	);
 	const runAgentHostTask = vscode.commands.registerCommand(runAgentHostTaskCommand, async () => {
 		try {
-			const workspace = vscode.workspace.workspaceFolders?.find(({ uri }) => uri.scheme === 'file');
+			const workspace = await selectTaskWorkspace();
 			if (workspace === undefined) {
-				throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'Open a local file workspace before starting an Agent Host task.');
+				return;
 			}
 			const prompt = await vscode.window.showInputBox({
 				title: 'Run Copilot Agent Mesh Task',
@@ -133,6 +133,34 @@ export function activate(context: vscode.ExtensionContext): AgentMeshExtensionAp
 	return { agentRuntime };
 }
 
+async function selectTaskWorkspace(): Promise<vscode.WorkspaceFolder | undefined> {
+	const localFolders = vscode.workspace.workspaceFolders?.filter(({ uri }) => uri.scheme === 'file') ?? [];
+	if (localFolders.length === 0) {
+		throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'Open a local file workspace before starting an Agent Host task.');
+	}
+	const activeUri = vscode.window.activeTextEditor?.document.uri;
+	const activeFolder = activeUri === undefined ? undefined : vscode.workspace.getWorkspaceFolder(activeUri);
+	if (activeFolder?.uri.scheme === 'file' && localFolders.some(({ uri }) => uri.toString() === activeFolder.uri.toString())) {
+		return activeFolder;
+	}
+	if (localFolders.length === 1) {
+		return localFolders[0];
+	}
+	const selected = await vscode.window.showQuickPick(
+		localFolders.map((folder) => ({
+			label: folder.name,
+			description: folder.uri.fsPath,
+			folder,
+		})),
+		{
+			title: 'Select Agent Host Workspace',
+			placeHolder: 'Choose the local workspace for this task',
+			ignoreFocusOut: true,
+		},
+	);
+	return selected?.folder;
+}
+
 export async function deactivate(): Promise<void> {
 	await agentRuntimeLifecycle.dispose();
 }
@@ -189,6 +217,12 @@ class VscodeSessionConfigurationResolver implements SessionConfigurationResolver
 			if (values[id] !== undefined) {
 				continue;
 			}
+			if (!request.interactive) {
+				throw new AgentRuntimeError(
+					'AGENT_CONFIG_REQUIRED',
+					`Agent session configuration requires interactive input for "${id}".`,
+				);
+			}
 			const property = request.schema.properties[id];
 			if (property === undefined) {
 				throw new AgentRuntimeError('AGENT_CONFIG_REQUIRED', `Agent configuration property "${id}" is unavailable.`);
@@ -199,9 +233,16 @@ class VscodeSessionConfigurationResolver implements SessionConfigurationResolver
 					`Agent configuration property "${id}" is read-only and has no resolved value.`,
 				);
 			}
-			const choices = property.enumDynamic === true
-				? await request.completions(id, values)
-				: property.enum?.map((value, index) => ({
+			if (property.enumDynamic === true) {
+				const selected = await this.pickDynamicValue(request, id, values, property.title);
+				if (selected === undefined) {
+					throw new AgentRuntimeError('AGENT_CONFIG_REQUIRED', 'Agent session configuration was cancelled.');
+				}
+				validateSessionConfigValue(id, property, selected);
+				values[id] = selected;
+				continue;
+			}
+			const choices = property.enum?.map((value, index) => ({
 					value,
 					label: property.enumLabels?.[index] ?? String(value),
 				}));
@@ -241,6 +282,85 @@ class VscodeSessionConfigurationResolver implements SessionConfigurationResolver
 			values[id] = parseSessionConfigInput(id, property, entered);
 		}
 		return values;
+	}
+
+	private pickDynamicValue(
+		request: Parameters<SessionConfigurationResolver['resolve']>[0],
+		property: string,
+		values: Readonly<Record<string, unknown>>,
+		title: string,
+	): Promise<string | undefined> {
+		const picker = vscode.window.createQuickPick<{ readonly label: string; readonly value: string }>();
+		picker.title = title;
+		picker.ignoreFocusOut = true;
+		picker.matchOnDescription = true;
+		picker.placeholder = 'Type to search';
+		return new Promise<string | undefined>((resolve, reject) => {
+			let settled = false;
+			let timer: NodeJS.Timeout | undefined;
+			let requestAbort: AbortController | undefined;
+			const disposables: vscode.Disposable[] = [];
+			const cleanup = () => {
+				if (timer !== undefined) {
+					clearTimeout(timer);
+				}
+				requestAbort?.abort();
+				for (const disposable of disposables) {
+					disposable.dispose();
+				}
+				picker.dispose();
+			};
+			const finish = (value: string | undefined) => {
+				if (!settled) {
+					settled = true;
+					cleanup();
+					resolve(value);
+				}
+			};
+			const fail = (error: unknown) => {
+				if (!settled) {
+					settled = true;
+					cleanup();
+					reject(error instanceof AgentRuntimeError
+						? error
+						: new AgentRuntimeError('AGENT_CONFIG_REQUIRED', 'Dynamic agent configuration lookup failed.'));
+				}
+			};
+			const update = (query: string) => {
+				if (timer !== undefined) {
+					clearTimeout(timer);
+				}
+				requestAbort?.abort();
+				const abort = new AbortController();
+				requestAbort = abort;
+				timer = setTimeout(() => {
+					picker.busy = true;
+					void request.completions(property, values, query.slice(0, 256), abort.signal).then(
+						(items) => {
+							if (!abort.signal.aborted && !settled) {
+								picker.items = items.slice(0, 100);
+							}
+						},
+						(error: unknown) => {
+							if (!abort.signal.aborted) {
+								fail(error);
+							}
+						},
+					).finally(() => {
+						if (requestAbort === abort && !settled) {
+							picker.busy = false;
+						}
+					});
+				}, 150);
+			};
+			disposables.push(
+				picker.onDidChangeValue(update),
+				picker.onDidAccept(() => finish(picker.selectedItems[0]?.value)),
+				picker.onDidHide(() => finish(undefined)),
+			);
+			update('');
+			picker.show();
+		});
 	}
 }
 

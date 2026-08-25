@@ -68,13 +68,24 @@ The fake AHP component covers initialize, protected-resource authentication, dyn
 
 The real test is explicit and uses a temporary non-sensitive workspace:
 
+The authentication-boundary smoke test may finish at the stable, cleanup-safe `AGENT_AUTH_REQUIRED` boundary:
+
 ```bash
-MESH_AGENT_HOST_E2E=1 \
+MESH_AGENT_HOST_AUTH_E2E=1 \
 MESH_CODE_CLI=/usr/local/bin/code \
-npm run test:agent-host-e2e
+npm run test:agent-host-auth-e2e
 ```
 
-It requests a no-file-change response and accepts success only when an authoritative `turnComplete` accompanies accumulated output equal to `MESH_AGENT_HOST_E2E_OK`. The stable `AGENT_AUTH_REQUIRED` boundary is accepted only after error-free runtime cleanup when the non-interactive harness cannot obtain a VS Code authentication session. It must not run in ordinary CI because a successful turn may consume Copilot quota.
+The separate success-turn test requires an explicit ephemeral token and never accepts an authentication boundary as success:
+
+```bash
+MESH_AGENT_HOST_SUCCESS_E2E=1 \
+MESH_AGENT_HOST_E2E_TOKEN=... \
+MESH_CODE_CLI=/usr/local/bin/code \
+npm run test:agent-host-success-e2e
+```
+
+Both request a no-file-change response. The success-turn command exits successfully only when an authoritative `turnComplete` accompanies accumulated output equal to `MESH_AGENT_HOST_E2E_OK`; every blocked, partial, or mismatched result is nonzero. Neither command runs in ordinary CI because a successful turn may consume Copilot quota.
 
 ## Verified result
 

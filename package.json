@@ -213,7 +213,8 @@
     "test:extension": "npm run compile-tests && npm run compile && vscode-test",
     "test": "npm run test:unit && npm run test:component && npm run test:extension",
     "spike:dev-tunnel": "npm run test:dev-tunnel-real",
-    "test:agent-host-e2e": "npm run compile-tests && node out/src/e2e/agentHost.e2e.js",
+    "test:agent-host-auth-e2e": "npm run compile-tests && node out/src/e2e/agentHost.e2e.js auth-boundary",
+    "test:agent-host-success-e2e": "npm run compile-tests && node out/src/e2e/agentHost.e2e.js success-turn",
     "spike:agent-host": "npm run compile-tests && node out/src/spikes/agentHostSpike.js"
   },
   "devDependencies": {
