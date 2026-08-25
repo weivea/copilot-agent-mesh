@@ -101,6 +101,12 @@ export class PeerConnection {
 					this.unexpectedlyClosed();
 				}
 			});
+			if (this.session !== session) {
+				throw new PeerTransportError(
+					'CONNECTION_FAILED',
+					'Peer connection closed before activation.',
+				);
+			}
 			this.setState('online');
 		} catch (error: unknown) {
 			if (controller.signal.aborted) {

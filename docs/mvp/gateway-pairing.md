@@ -31,6 +31,20 @@ pending-enrollment, and peer metadata use `PairingRecordStore`; coordinator prof
 removing its pending record and invitation. Durable adapters must preserve each method's ordering
 and failure semantics.
 
+Composition wiring is intentionally outside this module. The extension host should:
+
+1. Adapt VS Code `SecretStorage` to `SecretStore`.
+2. Adapt non-sensitive durable state to `PairingRecordStore` and `PeerProfileStore`.
+3. Construct `PairingService`, then inject it and a `GatewayRouter` into `GatewayServer`.
+4. Inject real `DeviceService`, `WorkspaceService`, and `TaskService` implementations into
+   `GatewayRouter`.
+5. Construct `WebSocketPeerTransport` and `PeerConnectionManager` for coordinator connections.
+6. Register `GatewayServer.dispose()` and `PeerConnectionManager.dispose()` with extension
+   deactivation.
+
+The composition root owns persisted preferred-port lookup/update. It must not put invitation or peer
+key material in `globalState`, logs, webview state, or service DTOs.
+
 `GatewayRouter` accepts implementations of:
 
 - `DeviceService.getInfo(authenticatedPeerId)`
@@ -69,8 +83,11 @@ Enrollment is two-phase:
 2. Coordinator persists its root key/profile before sending the commit proof.
 3. Worker activates the peer, then consumes the invitation.
 
-If the final response is lost, the coordinator immediately tries reconnect authentication with
-the derived key. Failed recovery removes the unconfirmed coordinator credential.
+If the final response is lost, the coordinator retains the candidate root key and profile, then
+uses bounded full-jitter reconnect attempts to confirm the worker's committed peer idempotently.
+An initial `AUTH_FAILED` can mean the worker commit is still completing, so it does not delete the
+candidate key or fall back to invitation enrollment. Pairing material is removed only after
+reconnect confirms the committed peer.
 
 ## Security and resource limits
 

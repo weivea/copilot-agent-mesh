@@ -101,21 +101,9 @@ export class WebSocketPeerTransport implements PeerTransport {
 				if (normalized.reason === 'AUTH_FAILED'
 					&& profile.invitationId !== undefined
 					&& profile.pairingSecretKeyRef !== undefined) {
-					const enrollmentProfile: PeerProfile = {
-						id: profile.id,
-						rpcEndpoint: profile.rpcEndpoint,
-						workerDeviceId: profile.workerDeviceId,
-						invitationId: profile.invitationId,
-						pairingSecretKeyRef: profile.pairingSecretKeyRef,
-					};
-					await secrets.delete(profile.credentialKeyRef);
-					await profiles.store(enrollmentProfile);
-					return this.enroll(
-						enrollmentProfile,
-						coordinatorDeviceId,
-						secrets,
-						profiles,
-						signal,
+					throw new PeerTransportError(
+						'CONNECTION_FAILED',
+						'Enrollment commit confirmation is pending.',
 					);
 				}
 				throw normalized;
@@ -208,10 +196,11 @@ export class WebSocketPeerTransport implements PeerTransport {
 				client = await this.open(profile.rpcEndpoint, signal);
 				try {
 					await this.reconnect(client, candidate, coordinatorDeviceId, secrets);
-				} catch (error: unknown) {
-					await secrets.delete(credentialKeyRef);
-					await profiles.store(profile);
-					throw error;
+				} catch {
+					throw new PeerTransportError(
+						'CONNECTION_FAILED',
+						'Enrollment commit confirmation is pending.',
+					);
 				}
 			}
 			const completed: PeerProfile = {
@@ -375,6 +364,9 @@ class RpcWebSocketClient {
 		heartbeatIntervalMs: number,
 		now: () => number,
 	): PeerSession {
+		if (this.closed || this.socket.readyState !== WebSocket.OPEN) {
+			throw new PeerTransportError('CONNECTION_FAILED', 'Peer connection closed before activation.');
+		}
 		const client = this;
 		let lastHeartbeatAt: number | undefined;
 		let latencyMs: number | undefined;
@@ -408,15 +400,21 @@ class RpcWebSocketClient {
 				return latencyMs;
 			},
 			request: (method, params) => client.request(method, params),
-			onClose: (listener) => {
-				client.closeListeners.add(listener);
-				return () => client.closeListeners.delete(listener);
-			},
+			onClose: (listener) => client.onClose(listener),
 			close: async () => {
 				stopHeartbeat();
 				await client.close();
 			},
 		};
+	}
+
+	private onClose(listener: () => void): () => void {
+		if (this.closed) {
+			listener();
+			return () => undefined;
+		}
+		this.closeListeners.add(listener);
+		return () => this.closeListeners.delete(listener);
 	}
 
 	public close(): Promise<void> {
@@ -425,9 +423,15 @@ class RpcWebSocketClient {
 			return Promise.resolve();
 		}
 		return new Promise((resolve) => {
-			this.socket.once('close', () => resolve());
+			let timer: NodeJS.Timeout | undefined;
+			this.socket.once('close', () => {
+				if (timer !== undefined) {
+					clearTimeout(timer);
+				}
+				resolve();
+			});
 			this.socket.close(1000, 'Peer disconnected.');
-			const timer = setTimeout(() => this.socket.terminate(), 1_000);
+			timer = setTimeout(() => this.socket.terminate(), 1_000);
 			timer.unref();
 		});
 	}

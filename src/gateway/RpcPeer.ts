@@ -217,7 +217,9 @@ export class RpcPeer {
 	}
 
 	private markAuthenticated(peerId: string): void {
-		if (this.authenticatedPeerId !== undefined) {
+		if (this.authenticatedPeerId !== undefined
+			|| this.disposed
+			|| this.socket.readyState !== WebSocket.OPEN) {
 			return;
 		}
 		this.authenticatedPeerId = peerId;

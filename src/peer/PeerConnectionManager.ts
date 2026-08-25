@@ -24,12 +24,14 @@ interface ManagedPeer {
 
 export class PeerConnectionManager {
 	private readonly peers = new Map<string, ManagedPeer>();
+	private readonly inflight = new Set<Promise<unknown>>();
 	private readonly reconnectBaseMs: number;
 	private readonly reconnectMaxMs: number;
 	private readonly stableOnlineMs: number;
 	private readonly random: () => number;
 	private readonly id: () => string;
 	private disposed = false;
+	private disposing: Promise<void> | undefined;
 
 	public constructor(
 		private readonly coordinatorDeviceId: string,
@@ -45,34 +47,41 @@ export class PeerConnectionManager {
 		this.id = options.id ?? randomUUID;
 	}
 
-	public async add(connectionUrl: string): Promise<PeerConnection> {
+	public add(connectionUrl: string): Promise<PeerConnection> {
 		this.assertActive();
+		return this.track(this.addCore(connectionUrl));
+	}
+
+	private async addCore(connectionUrl: string): Promise<PeerConnection> {
 		const parsed = parseConnectionUrl(connectionUrl);
 		const id = this.id();
 		const pairingSecretKeyRef = `mesh.remoteInvitation.${id}`;
-		await this.secrets.store(pairingSecretKeyRef, parsed.secret);
-		const profile: PeerProfile = {
-			id,
-			rpcEndpoint: parsed.rpcEndpoint,
-			workerDeviceId: parsed.workerDeviceId,
-			invitationId: parsed.invitationId,
-			pairingSecretKeyRef,
-		};
 		try {
+			await this.secrets.store(pairingSecretKeyRef, parsed.secret);
+			this.assertActive();
+			const profile: PeerProfile = {
+				id,
+				rpcEndpoint: parsed.rpcEndpoint,
+				workerDeviceId: parsed.workerDeviceId,
+				invitationId: parsed.invitationId,
+				pairingSecretKeyRef,
+			};
 			await this.profiles.store(profile);
-		} catch (error: unknown) {
-			await this.secrets.delete(pairingSecretKeyRef);
-			throw error;
-		}
-		const managed = this.createManaged(id);
-		this.peers.set(id, managed);
-		try {
+			this.assertActive();
+			const managed = this.createManaged(id);
+			this.peers.set(id, managed);
 			await managed.connection.connect();
+			this.assertActive();
 			this.markStableLater(managed);
 			return managed.connection;
 		} catch (error: unknown) {
-			if (managed.connection.snapshot().state === 'offline') {
-				this.scheduleReconnect(managed);
+			if (this.disposed || !this.peers.has(id)) {
+				await this.rollbackAddedPeer(id, pairingSecretKeyRef);
+			} else {
+				const managed = this.peers.get(id);
+				if (managed?.connection.snapshot().state === 'offline') {
+					this.scheduleReconnect(managed);
+				}
 			}
 			throw error;
 		}
@@ -94,12 +103,21 @@ export class PeerConnectionManager {
 		return this.peers.get(profileId)?.connection;
 	}
 
-	public async connect(profileId: string): Promise<void> {
+	public connect(profileId: string): Promise<void> {
 		this.assertActive();
+		return this.track(this.connectCore(profileId));
+	}
+
+	private async connectCore(profileId: string): Promise<void> {
 		const managed = await this.ensureManaged(profileId);
+		this.assertActive();
 		managed.enabled = true;
 		this.clearReconnect(managed);
 		await managed.connection.connect();
+		if (this.disposed) {
+			await managed.connection.disconnect();
+			this.assertActive();
+		}
 		this.markStableLater(managed);
 	}
 
@@ -133,18 +151,21 @@ export class PeerConnectionManager {
 		}
 	}
 
-	public async dispose(): Promise<void> {
-		if (this.disposed) {
-			return;
+	public dispose(): Promise<void> {
+		if (this.disposing !== undefined) {
+			return this.disposing;
 		}
+		this.disposing = this.disposeCore();
+		return this.disposing;
+	}
+
+	private async disposeCore(): Promise<void> {
 		this.disposed = true;
-		const disconnects: Promise<void>[] = [];
-		for (const managed of this.peers.values()) {
-			managed.enabled = false;
-			this.clearTimers(managed);
-			disconnects.push(managed.connection.disconnect());
+		await this.disconnectAll();
+		while (this.inflight.size > 0) {
+			await Promise.allSettled([...this.inflight]);
 		}
-		await Promise.all(disconnects);
+		await this.disconnectAll();
 		this.peers.clear();
 	}
 
@@ -174,6 +195,11 @@ export class PeerConnectionManager {
 		}
 		if (await this.profiles.get(profileId) === undefined) {
 			throw new Error('Peer profile does not exist.');
+		}
+		this.assertActive();
+		const concurrentlyCreated = this.peers.get(profileId);
+		if (concurrentlyCreated !== undefined) {
+			return concurrentlyCreated;
 		}
 		const managed = this.createManaged(profileId);
 		this.peers.set(profileId, managed);
@@ -239,6 +265,59 @@ export class PeerConnectionManager {
 		if (managed.stableTimer !== undefined) {
 			clearTimeout(managed.stableTimer);
 			managed.stableTimer = undefined;
+		}
+	}
+
+	private track<T>(operation: Promise<T>): Promise<T> {
+		let tracked!: Promise<T>;
+		tracked = operation.finally(() => {
+			this.inflight.delete(tracked);
+		});
+		this.inflight.add(tracked);
+		return tracked;
+	}
+
+	private async disconnectAll(): Promise<void> {
+		const disconnects: Promise<void>[] = [];
+		for (const managed of this.peers.values()) {
+			managed.enabled = false;
+			this.clearTimers(managed);
+			disconnects.push(managed.connection.disconnect());
+		}
+		await Promise.all(disconnects);
+	}
+
+	private async rollbackAddedPeer(id: string, pairingSecretKeyRef: string): Promise<void> {
+		let cleanupFailed = false;
+		const cleanup = async (operation: () => Promise<unknown>): Promise<void> => {
+			try {
+				await operation();
+			} catch {
+				cleanupFailed = true;
+			}
+		};
+		await cleanup(() => this.secrets.delete(pairingSecretKeyRef));
+		const managed = this.peers.get(id);
+		if (managed !== undefined) {
+			managed.enabled = false;
+			this.clearTimers(managed);
+			await cleanup(() => managed.connection.disconnect());
+			this.peers.delete(id);
+		}
+		let profile: PeerProfile | undefined;
+		try {
+			profile = await this.profiles.get(id);
+		} catch {
+			cleanupFailed = true;
+		}
+		for (const secretRef of [profile?.pairingSecretKeyRef, profile?.credentialKeyRef]) {
+			if (secretRef !== undefined && secretRef !== pairingSecretKeyRef) {
+				await cleanup(() => this.secrets.delete(secretRef));
+			}
+		}
+		await cleanup(() => this.profiles.delete(id));
+		if (cleanupFailed) {
+			throw new Error('Failed to completely roll back the peer profile.');
 		}
 	}
 

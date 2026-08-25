@@ -206,52 +206,54 @@ suite('Gateway pairing component', { concurrency: 1 }, () => {
 		}
 	});
 
-	test('retries enrollment after a restart persisted an uncommitted candidate credential', async () => {
-		const fixture = await createFixture();
-		let session: Awaited<ReturnType<WebSocketPeerTransport['connect']>> | undefined;
+	test('retains the candidate root and retries until a delayed commit is confirmed', async () => {
+		const fixture = await createFixture({ commitDelayMs: 80 });
+		const profiles = new InMemoryPeerProfileStore();
+		const transport = new WebSocketPeerTransport({
+			requestTimeoutMs: 20,
+			heartbeatIntervalMs: 25,
+			webSocketFactory: (url) => new WebSocket(url.replace(/^wss:/u, 'ws:'), {
+				perMessageDeflate: false,
+			}),
+		});
+		const manager = new PeerConnectionManager(
+			'delayed-coordinator',
+			profiles,
+			fixture.secrets,
+			transport,
+			{
+				id: () => 'delayed-profile',
+				random: () => 0.5,
+				reconnectBaseMs: 10,
+				reconnectMaxMs: 20,
+				stableOnlineMs: 40,
+			},
+		);
 		try {
 			const invitation = await fixture.invitation();
-			const secret = secretFrom(invitation);
-			const interrupted = await RawClient.open(fixture.endpoint);
-			const enrollment = await beginEnrollment(
-				interrupted,
-				invitation.invitationId,
-				secret,
-				'interrupted-coordinator',
+			await assert.rejects(
+				manager.add(invitation.url),
+				(error: unknown) => error instanceof Error,
 			);
-			await interrupted.close();
-
-			const profiles = new InMemoryPeerProfileStore();
-			const pairingSecretKeyRef = 'mesh.remoteInvitation.interrupted';
-			const credentialKeyRef = 'mesh.remotePeer.interrupted';
-			await fixture.secrets.store(pairingSecretKeyRef, encodeBase64Url(secret));
-			await fixture.secrets.store(credentialKeyRef, encodeBase64Url(enrollment.rootKey));
-			await profiles.store({
-				id: 'interrupted',
-				rpcEndpoint: fixture.endpoint,
-				workerDeviceId: 'worker-device',
-				invitationId: invitation.invitationId,
-				pairingSecretKeyRef,
-				peerId: enrollment.peerId,
-				credentialKeyRef,
-			});
-			const transport = new WebSocketPeerTransport({ requestTimeoutMs: 500 });
-			session = await transport.connect(
-				(await profiles.get('interrupted'))!,
-				'interrupted-coordinator',
-				fixture.secrets,
-				profiles,
-				new AbortController().signal,
+			const candidate = await profiles.get('delayed-profile');
+			assert.ok(candidate?.peerId);
+			assert.ok(candidate?.credentialKeyRef);
+			assert.ok(candidate?.pairingSecretKeyRef);
+			assert.ok(
+				await fixture.secrets.get(candidate.credentialKeyRef),
+				'candidate root must not be removed after the first AUTH_FAILED',
 			);
-			assert.deepStrictEqual(await session.request('device.getInfo', {}), {
-				deviceId: 'worker-device',
-			});
-			const completed = await profiles.get('interrupted');
-			assert.ok(completed?.peerId);
+			await waitFor(
+				() => manager.get('delayed-profile')?.snapshot().state === 'online',
+				1_000,
+			);
+			const completed = await profiles.get('delayed-profile');
+			assert.ok(completed?.credentialKeyRef);
 			assert.equal(completed?.invitationId, undefined);
 			assert.equal(completed?.pairingSecretKeyRef, undefined);
+			assert.ok(await fixture.secrets.get(completed.credentialKeyRef));
 		} finally {
-			await session?.close();
+			await manager.dispose();
 			await fixture.dispose();
 		}
 	});
@@ -370,11 +372,14 @@ suite('Gateway pairing component', { concurrency: 1 }, () => {
 interface FixtureOptions {
 	readonly heartbeatIntervalMs?: number;
 	readonly heartbeatTimeoutMs?: number;
+	readonly commitDelayMs?: number;
 }
 
 async function createFixture(options: FixtureOptions = {}) {
 	const secrets = new InMemorySecretStore();
-	const records = new InMemoryPairingRecordStore();
+	const records = options.commitDelayMs === undefined
+		? new InMemoryPairingRecordStore()
+		: new DelayedPendingRecordStore(options.commitDelayMs);
 	const pairing = new PairingService('worker-device', secrets, records);
 	const devicePeers: string[] = [];
 	const taskPeers: string[] = [];
@@ -446,6 +451,19 @@ async function createFixture(options: FixtureOptions = {}) {
 			await gateway.dispose();
 		},
 	};
+}
+
+class DelayedPendingRecordStore extends InMemoryPairingRecordStore {
+	public constructor(private readonly delayMs: number) {
+		super();
+	}
+
+	public override async getPending(
+		id: string,
+	): Promise<Awaited<ReturnType<InMemoryPairingRecordStore['getPending']>>> {
+		await delay(this.delayMs);
+		return super.getPending(id);
+	}
 }
 
 function malformedUpgrade(port: number): Promise<void> {
