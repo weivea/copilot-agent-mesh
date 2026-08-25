@@ -16,6 +16,7 @@ export class AgentRuntimeError extends Error {
 		message: string,
 		readonly retryable = false,
 		cause?: unknown,
+		readonly cleanupFailed = false,
 	) {
 		super(message, { cause });
 		this.name = 'AgentRuntimeError';

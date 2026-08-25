@@ -381,6 +381,7 @@ class AhpTask implements AgentTaskHandle {
 	private readonly clientId = `copilot-agent-mesh-${randomUUID()}`;
 	private readonly sessionUri = `ahp-session:/${randomUUID()}`;
 	private readonly subscriptions = new Map<string, AhpSubscription>();
+	private readonly staleConnections = new Set<AhpConnection>();
 	private connection: AhpConnection;
 	private chatUri: string | undefined;
 	private turnId: string | undefined;
@@ -399,9 +400,11 @@ class AhpTask implements AgentTaskHandle {
 	private cancellationTimer: NodeJS.Timeout | undefined;
 	private exitSubscription: { dispose(): void } | undefined;
 	private disposePromise: Promise<void> | undefined;
-	private readonly authenticationInFlight = new Map<string, Promise<void>>();
+	private readonly authenticationInFlight = new WeakMap<AhpConnection, Map<string, Promise<void>>>();
 	private readonly pendingAuthNotifications = new Set<Promise<void>>();
 	private terminalError: AgentRuntimeError | undefined;
+	private rootTerminals: readonly TerminalInfo[] = [];
+	private terminalSubscriptionUpdate = Promise.resolve();
 
 	constructor(
 		private readonly request: ResolvedAgentTaskRequest,
@@ -438,6 +441,7 @@ class AhpTask implements AgentTaskHandle {
 		}
 		const root = parseRootState(rootSnapshot);
 		this.provider = selectProvider(root.agents, this.request.providerId);
+		this.rootTerminals = root.terminals ?? [];
 		this.startSubscription(rootUri, rootSubscription);
 		await this.authenticate(this.provider.protectedResources ?? [], 'initial', this.request.allowInteractiveAuthentication === true);
 		await Promise.resolve();
@@ -477,7 +481,7 @@ class AhpTask implements AgentTaskHandle {
 			this.applySnapshot(chatSubscription.snapshot);
 		}
 		this.addSubscription(defaultChat, chatSubscription.subscription);
-		await this.subscribeOwnedTerminals(root.terminals ?? []);
+		await this.scheduleOwnedTerminals(this.rootTerminals, this.connection, this.subscriptions, true);
 
 		this.turnId = randomUUID();
 		this.connection.dispatch(defaultChat, {
@@ -557,6 +561,16 @@ class AhpTask implements AgentTaskHandle {
 			await collectCleanupFailures([
 				{ label: 'shutdown AHP connection', run: () => this.connection.shutdown() },
 			], failures);
+			await collectCleanupFailures(
+				[...this.staleConnections].map((connection) => ({
+					label: 'shutdown stale AHP connection',
+					run: async () => {
+						await connection.shutdown();
+						this.staleConnections.delete(connection);
+					},
+				})),
+				failures,
+			);
 			await collectCleanupFailures([
 				{ label: 'dispose owned Agent Host', run: () => this.host.dispose() },
 			], failures);
@@ -624,10 +638,15 @@ class AhpTask implements AgentTaskHandle {
 		interactive: boolean,
 		connection = this.connection,
 	): Promise<void> {
+		let connectionAuthentication = this.authenticationInFlight.get(connection);
+		if (connectionAuthentication === undefined) {
+			connectionAuthentication = new Map<string, Promise<void>>();
+			this.authenticationInFlight.set(connection, connectionAuthentication);
+		}
 		const pending = new Set<Promise<void>>();
 		const fresh = new Map<string, ProtectedResource>();
 		for (const resource of resources.filter(({ required }) => required !== false)) {
-			const existing = this.authenticationInFlight.get(resource.resource);
+			const existing = connectionAuthentication.get(resource.resource);
 			if (existing === undefined) {
 				fresh.set(resource.resource, resource);
 			} else {
@@ -641,7 +660,7 @@ class AhpTask implements AgentTaskHandle {
 				(resource, token, scopes) => connection.authenticate(resource, token, scopes),
 			);
 			for (const resource of fresh.keys()) {
-				this.authenticationInFlight.set(resource, operation);
+				connectionAuthentication.set(resource, operation);
 			}
 			pending.add(operation);
 		}
@@ -650,8 +669,8 @@ class AhpTask implements AgentTaskHandle {
 		} finally {
 			if (operation !== undefined) {
 				for (const resource of fresh.keys()) {
-					if (this.authenticationInFlight.get(resource) === operation) {
-						this.authenticationInFlight.delete(resource);
+					if (connectionAuthentication.get(resource) === operation) {
+						connectionAuthentication.delete(resource);
 					}
 				}
 			}
@@ -700,7 +719,7 @@ class AhpTask implements AgentTaskHandle {
 		));
 	}
 
-	private handleEnvelope(envelope: ActionEnvelope): void {
+	private handleEnvelope(envelope: ActionEnvelope, subscribeRootTerminals = true): void {
 		this.lastSeenServerSeq = Math.max(this.lastSeenServerSeq, envelope.serverSeq);
 		const action = envelope.action;
 		if (envelope.channel === rootUri) {
@@ -712,7 +731,15 @@ class AhpTask implements AgentTaskHandle {
 				}
 				this.provider = selected;
 			} else if (action.type === 'root/terminalsChanged') {
-				void this.subscribeOwnedTerminals(action.terminals);
+				this.rootTerminals = action.terminals;
+				if (subscribeRootTerminals) {
+					void this.scheduleOwnedTerminals(
+						action.terminals,
+						this.connection,
+						this.subscriptions,
+						true,
+					).catch((error: unknown) => this.fail(normalizeRuntimeError(error)));
+				}
 			}
 		}
 		if (envelope.channel === this.sessionUri) {
@@ -741,7 +768,7 @@ class AhpTask implements AgentTaskHandle {
 		}
 	}
 
-	private applySnapshot(snapshot: Snapshot): void {
+	private applySnapshot(snapshot: Snapshot, subscribeRootTerminals = true): void {
 		this.lastSeenServerSeq = Math.max(this.lastSeenServerSeq, snapshot.fromSeq);
 		if (snapshot.resource === this.sessionUri) {
 			const state = snapshot.state as SessionState;
@@ -768,7 +795,15 @@ class AhpTask implements AgentTaskHandle {
 				throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'The selected Agent Host provider disappeared.');
 			}
 			this.provider = selected ?? this.provider;
-			void this.subscribeOwnedTerminals(root.terminals ?? []);
+			this.rootTerminals = root.terminals ?? [];
+			if (subscribeRootTerminals) {
+				void this.scheduleOwnedTerminals(
+					this.rootTerminals,
+					this.connection,
+					this.subscriptions,
+					true,
+				).catch((error: unknown) => this.fail(normalizeRuntimeError(error)));
+			}
 			return;
 		}
 		if (snapshot.resource === this.chatUri) {
@@ -878,20 +913,49 @@ class AhpTask implements AgentTaskHandle {
 		}), sessionReadyTimeoutMs, 'The Agent Host session did not publish a default chat.');
 	}
 
-	private async subscribeOwnedTerminals(terminals: readonly TerminalInfo[]): Promise<void> {
+	private async subscribeOwnedTerminals(
+		terminals: readonly TerminalInfo[],
+		connection: AhpConnection,
+		subscriptions: Map<string, AhpSubscription>,
+		startPumps: boolean,
+	): Promise<void> {
 		const owned = terminals.filter(({ claim }) =>
 			claim.kind === 'session' && claim.session === this.sessionUri,
 		);
+		const ownedResources = new Set(owned.map(({ resource }) => resource));
+		for (const [uri, subscription] of subscriptions) {
+			if (uri.startsWith('ahp-terminal:') && !ownedResources.has(uri)) {
+				subscriptions.delete(uri);
+				await subscription.close();
+				await connection.unsubscribe(uri);
+			}
+		}
 		for (const terminal of owned) {
-			if (this.subscriptions.has(terminal.resource)) {
+			if (subscriptions.has(terminal.resource)) {
 				continue;
 			}
-			const result = await this.connection.subscribe(terminal.resource);
+			const result = await connection.subscribe(terminal.resource);
 			if (result.snapshot !== undefined) {
-				this.applySnapshot(result.snapshot);
+				this.applySnapshot(result.snapshot, false);
 			}
-			this.addSubscription(terminal.resource, result.subscription);
+			subscriptions.set(terminal.resource, result.subscription);
+			if (startPumps) {
+				this.startSubscription(terminal.resource, result.subscription);
+			}
 		}
+	}
+
+	private scheduleOwnedTerminals(
+		terminals: readonly TerminalInfo[],
+		connection: AhpConnection,
+		subscriptions: Map<string, AhpSubscription>,
+		startPumps: boolean,
+	): Promise<void> {
+		const update = this.terminalSubscriptionUpdate.then(() =>
+			this.subscribeOwnedTerminals(terminals, connection, subscriptions, startPumps),
+		);
+		this.terminalSubscriptionUpdate = update.catch(() => undefined);
+		return update;
 	}
 
 	private async handleAuthNotification(params: unknown): Promise<void> {
@@ -930,6 +994,7 @@ class AhpTask implements AgentTaskHandle {
 		this.events.push({ type: 'progress', message: 'Reconnecting to Agent Host.' });
 		let candidate: AhpConnection | undefined;
 		const recoveredSubscriptions = new Map<string, AhpSubscription>();
+		let recoveredTerminals: readonly TerminalInfo[] | undefined;
 		try {
 			candidate = await this.connectionFactory.connect(this.host.endpoint);
 			for (const uri of this.subscriptions.keys()) {
@@ -942,10 +1007,18 @@ class AhpTask implements AgentTaskHandle {
 			);
 			if (result.type === 'replay') {
 				for (const action of result.actions ?? []) {
-					this.handleEnvelope(action);
+					if (action.channel === rootUri && action.action.type === 'root/terminalsChanged') {
+						recoveredTerminals = action.action.terminals;
+					}
+					this.handleEnvelope(action, false);
 				}
-				if ((result.missing ?? []).includes(this.sessionUri) || (result.missing ?? []).includes(this.chatUri ?? '')) {
+				const missing = result.missing ?? [];
+				if (missing.includes(this.sessionUri) || missing.includes(this.chatUri ?? '')) {
 					throw new RecoveryUnavailableCause('The Agent Host no longer has the task session.');
+				}
+				for (const uri of missing) {
+					await recoveredSubscriptions.get(uri)?.close();
+					recoveredSubscriptions.delete(uri);
 				}
 			} else {
 				const snapshots = result.snapshots ?? [];
@@ -961,7 +1034,10 @@ class AhpTask implements AgentTaskHandle {
 					}
 				}
 				for (const snapshot of snapshots) {
-					this.applySnapshot(snapshot);
+					if (snapshot.resource === rootUri) {
+						recoveredTerminals = parseRootState(snapshot).terminals ?? [];
+					}
+					this.applySnapshot(snapshot, false);
 				}
 			}
 			const sessions = await candidate.listSessions();
@@ -976,11 +1052,24 @@ class AhpTask implements AgentTaskHandle {
 					candidate,
 				);
 			}
-			await this.connection.shutdown().catch(() => undefined);
+			if (recoveredTerminals !== undefined) {
+				await this.scheduleOwnedTerminals(
+					recoveredTerminals,
+					candidate,
+					recoveredSubscriptions,
+					false,
+				);
+			}
+			const previousConnection = this.connection;
 			this.connection = candidate;
 			this.subscriptions.clear();
 			for (const [uri, subscription] of recoveredSubscriptions) {
 				this.addSubscription(uri, subscription);
+			}
+			try {
+				await previousConnection.shutdown();
+			} catch {
+				this.staleConnections.add(previousConnection);
 			}
 			this.events.push({ type: 'progress', message: 'Agent Host connection recovered.' });
 		} catch (error) {
@@ -1183,6 +1272,7 @@ function cleanupFailure(failures: readonly string[]): AgentRuntimeError {
 			unique.map((label) => new Error(`Cleanup failed: ${label}.`)),
 			'One or more Agent Host resources could not be released.',
 		),
+		true,
 	);
 }
 
@@ -1195,6 +1285,7 @@ function combineRuntimeErrors(primary: AgentRuntimeError, cleanup: AgentRuntimeE
 			new AgentRuntimeError(primary.code, primary.message, primary.retryable),
 			new AgentRuntimeError(cleanup.code, cleanup.message, cleanup.retryable, cleanup.cause),
 		], 'The Agent Host operation and its resource cleanup both failed.'),
+		true,
 	);
 }
 

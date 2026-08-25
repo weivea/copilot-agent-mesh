@@ -51,7 +51,7 @@ An authentication attempt is successful only after the Agent Host accepts `authe
 
 The adapter exposes stable codes including `AGENT_UNAVAILABLE`, `AGENT_AUTH_REQUIRED`, `AGENT_AUTH_FAILED`, `AGENT_CONFIG_REQUIRED`, `TASK_EXECUTION_FAILED`, `TASK_CANCELLATION_UNCONFIRMED`, and `TASK_RECOVERY_UNAVAILABLE`. Messages are bounded and token-bearing URL/query or JSON fragments are redacted.
 
-macOS and Linux use dedicated POSIX process groups and terminate only the owned group. Windows fails closed until a Job Object controller is available. The token file remains until owned-host shutdown because the target build has not proved an earlier safe deletion point.
+macOS and Linux use dedicated POSIX process groups and terminate only the owned group. Launcher shutdown aborts and awaits in-flight launches before releasing resources. A failed termination remains tracked and retryable; the instance directory is not removed until process-group termination succeeds. Windows fails closed until a Job Object controller is available. The token file remains until owned-host shutdown because the target build has not proved an earlier safe deletion point.
 
 ## Tests
 
@@ -72,7 +72,7 @@ MESH_CODE_CLI=/usr/local/bin/code \
 npm run test:agent-host-e2e
 ```
 
-It requests a no-file-change response and accepts either an authoritative `turnComplete` or the stable `AGENT_AUTH_REQUIRED` boundary when the non-interactive harness cannot obtain a VS Code authentication session. It must not run in ordinary CI because a successful turn may consume Copilot quota.
+It requests a no-file-change response and accepts success only when an authoritative `turnComplete` accompanies accumulated output equal to `MESH_AGENT_HOST_E2E_OK`. The stable `AGENT_AUTH_REQUIRED` boundary is accepted only after error-free runtime cleanup when the non-interactive harness cannot obtain a VS Code authentication session. It must not run in ordinary CI because a successful turn may consume Copilot quota.
 
 ## Verified result
 

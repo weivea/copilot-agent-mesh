@@ -48,8 +48,18 @@ export interface AgentHostLauncherLike {
 	dispose(): Promise<void>;
 }
 
+interface OwnedResource {
+	dispose(): Promise<void>;
+}
+
+interface InFlightLaunch {
+	readonly controller: AbortController;
+	readonly promise: Promise<LaunchedAgentHost>;
+}
+
 export class AgentHostLauncher implements AgentHostLauncherLike {
-	private readonly launched = new Set<LaunchedAgentHost>();
+	private readonly owned = new Set<OwnedResource>();
+	private readonly inFlight = new Set<InFlightLaunch>();
 	private disposed = false;
 
 	constructor(private readonly options: AgentHostLauncherOptions) {}
@@ -64,10 +74,20 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 		}
 	}
 
-	async launch(): Promise<LaunchedAgentHost> {
+	launch(): Promise<LaunchedAgentHost> {
 		if (this.disposed) {
-			throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'The Agent Host launcher has been disposed.');
+			return Promise.reject(new AgentRuntimeError('AGENT_UNAVAILABLE', 'The Agent Host launcher has been disposed.'));
 		}
+		const controller = new AbortController();
+		let operation: InFlightLaunch;
+		const promise = this.launchOwned(controller.signal).finally(() => this.inFlight.delete(operation));
+		operation = { controller, promise };
+		this.inFlight.add(operation);
+		return promise;
+	}
+
+	private async launchOwned(signal: AbortSignal): Promise<LaunchedAgentHost> {
+		throwIfLaunchAborted(signal);
 		try {
 			assertOwnedProcessControlSupported();
 		} catch {
@@ -77,9 +97,10 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 			);
 		}
 
-		const code = await discoverCodeCli(this.options.configuredCodeCli).catch(() => {
+		const code = await discoverCodeCli(this.options.configuredCodeCli, signal).catch(() => {
 			throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'A compatible VS Code command-line interface was not found.');
 		});
+		throwIfLaunchAborted(signal);
 		await mkdir(this.options.storageRoot, { recursive: true });
 		const ownedRoot = await mkdtemp(join(this.options.storageRoot, 'instance-'));
 		const userDataDir = join(ownedRoot, 'user-data');
@@ -88,6 +109,7 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 		const token = randomBytes(32).toString('hex');
 		let processGroupId: number | undefined;
 		let host: ChildProcess | undefined;
+		let launched: OwnedAgentHost | undefined;
 
 		try {
 			await Promise.all([
@@ -95,7 +117,8 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 				mkdir(serverDataDir),
 				writeFile(tokenFile, token, { encoding: 'utf8', mode: 0o600 }),
 			]);
-			const baseline = await discoverEndpoints(code.executable, userDataDir, commandTimeoutMs);
+			throwIfLaunchAborted(signal);
+			const baseline = await discoverEndpoints(code.executable, userDataDir, commandTimeoutMs, signal);
 			const baselineInstanceIds = new Set(baseline.endpoints.map(({ instanceId }) => instanceId));
 
 			host = spawn(code.executable, [
@@ -142,16 +165,18 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 					if (host?.exitCode !== null) {
 						throw new Error('The Agent Host exited before publishing its endpoint.');
 					}
-					ownedPids = await readOwnedProcessGroup(processGroupId!);
-					return discoverEndpoints(code.executable, userDataDir, remainingMs);
+					throwIfLaunchAborted(signal);
+					ownedPids = await readOwnedProcessGroup(processGroupId!, signal);
+					return discoverEndpoints(code.executable, userDataDir, remainingMs, signal);
 				},
 				ownedPids: () => ownedPids,
 				expectedToken: token,
 				timeoutMs: this.options.startupTimeoutMs ?? startupTimeoutMs,
 				pollIntervalMs: 500,
+				signal,
 			});
 
-			const launched = new OwnedAgentHost(
+			launched = new OwnedAgentHost(
 				host,
 				processGroupId,
 				ownedRoot,
@@ -159,35 +184,78 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 				code.version,
 				endpoint.registryProtocolVersion,
 				token,
-				() => this.launched.delete(launched),
+				{
+					terminate: terminateOwnedProcessGroup,
+					remove: (path) => rm(path, { recursive: true, force: true }),
+				},
+				() => this.owned.delete(launched!),
 			);
-			this.launched.add(launched);
+			this.owned.add(launched);
+			if (this.disposed || signal.aborted) {
+				await launched.dispose();
+				throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'The Agent Host launch was cancelled during shutdown.');
+			}
 			return launched;
 		} catch (error) {
+			if (launched !== undefined) {
+				throw normalizeLaunchError(error, token);
+			}
+			let cleanupError: AgentRuntimeError | undefined;
 			if (processGroupId !== undefined) {
-				await terminateOwnedProcessGroup(processGroupId, shutdownGraceMs).catch(() => undefined);
+				const cleanup = new RetainedLaunchCleanup(
+					processGroupId,
+					ownedRoot,
+					token,
+					{
+						terminate: terminateOwnedProcessGroup,
+						remove: (path) => rm(path, { recursive: true, force: true }),
+					},
+					() => this.owned.delete(cleanup),
+				);
+				this.owned.add(cleanup);
+				try {
+					await cleanup.dispose();
+				} catch (cleanupFailure) {
+					cleanupError = normalizeLaunchError(cleanupFailure, token);
+				}
+			} else {
+				try {
+					await rm(ownedRoot, { recursive: true, force: true });
+				} catch (cleanupFailure) {
+					cleanupError = normalizeLaunchError(cleanupFailure, token);
+				}
 			}
-			await rm(ownedRoot, { recursive: true, force: true }).catch(() => undefined);
-			if (error instanceof AgentRuntimeError) {
-				throw error;
-			}
-			throw new AgentRuntimeError(
-				'AGENT_UNAVAILABLE',
-				sanitizeError(error, [token]).message,
-			);
+			const primary = normalizeLaunchError(error, token);
+			throw cleanupError === undefined ? primary : combineLaunchErrors(primary, cleanupError);
 		}
 	}
 
 	async dispose(): Promise<void> {
 		this.disposed = true;
-		await Promise.all([...this.launched].map((host) => host.dispose()));
+		for (const launch of this.inFlight) {
+			launch.controller.abort();
+		}
+		await Promise.allSettled([...this.inFlight].map(({ promise }) => promise));
+		const results = await Promise.allSettled([...this.owned].map((resource) => resource.dispose()));
+		if (results.some(({ status }) => status === 'rejected')) {
+			throw new AgentRuntimeError(
+				'AGENT_UNAVAILABLE',
+				'One or more owned Agent Host resources could not be shut down and remain tracked for retry.',
+			);
+		}
 	}
 }
 
-class OwnedAgentHost implements LaunchedAgentHost {
+export interface AgentHostCleanupDependencies {
+	terminate(processGroupId: number, graceMs: number): Promise<void>;
+	remove(path: string): Promise<void>;
+}
+
+export class OwnedAgentHost implements LaunchedAgentHost {
 	private readonly exitListeners = new Set<(error: AgentRuntimeError) => void>();
 	private disposing = false;
 	private disposed = false;
+	private disposal: Promise<void> | undefined;
 
 	constructor(
 		private readonly child: ChildProcess,
@@ -197,6 +265,7 @@ class OwnedAgentHost implements LaunchedAgentHost {
 		readonly version: string,
 		readonly registryProtocolVersion: string,
 		private readonly token: string,
+		private readonly cleanup: AgentHostCleanupDependencies,
 		private readonly didDispose: () => void,
 	) {
 		child.once('exit', (code, signal) => {
@@ -219,32 +288,91 @@ class OwnedAgentHost implements LaunchedAgentHost {
 		return { dispose: () => this.exitListeners.delete(listener) };
 	}
 
-	async dispose(): Promise<void> {
+	dispose(): Promise<void> {
 		if (this.disposed) {
-			return;
+			return Promise.resolve();
 		}
+		this.disposal ??= this.disposeOwned().finally(() => {
+			if (!this.disposed) {
+				this.disposal = undefined;
+			}
+		});
+		return this.disposal;
+	}
+
+	private async disposeOwned(): Promise<void> {
 		this.disposing = true;
-		const errors: Error[] = [];
 		try {
-			await terminateOwnedProcessGroup(this.processGroupId, shutdownGraceMs);
+			await this.cleanup.terminate(this.processGroupId, shutdownGraceMs);
 		} catch (error) {
-			errors.push(sanitizeError(error, [this.token]));
+			this.disposing = false;
+			throw new AgentRuntimeError(
+				'AGENT_UNAVAILABLE',
+				'The owned Agent Host process group could not be terminated and remains tracked for retry.',
+				false,
+				sanitizeError(error, [this.token]),
+				true,
+			);
 		}
 		try {
-			await rm(this.ownedRoot, { recursive: true, force: true });
+			await this.cleanup.remove(this.ownedRoot);
 		} catch (error) {
-			errors.push(sanitizeError(error, [this.token]));
+			this.disposing = false;
+			throw new AgentRuntimeError(
+				'AGENT_UNAVAILABLE',
+				'The owned Agent Host data could not be removed and remains tracked for retry.',
+				false,
+				sanitizeError(error, [this.token]),
+				true,
+			);
 		}
 		this.disposed = true;
 		this.exitListeners.clear();
 		this.didDispose();
-		if (errors.length > 0) {
-			throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'The owned Agent Host could not be completely shut down.');
-		}
 	}
 }
 
-async function discoverCodeCli(configuredCodeCli?: string): Promise<{
+class RetainedLaunchCleanup implements OwnedResource {
+	private disposed = false;
+	private disposal: Promise<void> | undefined;
+
+	constructor(
+		private readonly processGroupId: number,
+		private readonly ownedRoot: string,
+		private readonly token: string,
+		private readonly cleanup: AgentHostCleanupDependencies,
+		private readonly didDispose: () => void,
+	) {}
+
+	dispose(): Promise<void> {
+		if (this.disposed) {
+			return Promise.resolve();
+		}
+		this.disposal ??= this.disposeOwned().finally(() => {
+			if (!this.disposed) {
+				this.disposal = undefined;
+			}
+		});
+		return this.disposal;
+	}
+
+	private async disposeOwned(): Promise<void> {
+		try {
+			await this.cleanup.terminate(this.processGroupId, shutdownGraceMs);
+		} catch (error) {
+			throw normalizeLaunchError(error, this.token);
+		}
+		try {
+			await this.cleanup.remove(this.ownedRoot);
+		} catch (error) {
+			throw normalizeLaunchError(error, this.token);
+		}
+		this.disposed = true;
+		this.didDispose();
+	}
+}
+
+async function discoverCodeCli(configuredCodeCli?: string, signal?: AbortSignal): Promise<{
 	readonly executable: string;
 	readonly version: string;
 	readonly commit: string;
@@ -254,10 +382,12 @@ async function discoverCodeCli(configuredCodeCli?: string): Promise<{
 		? defaultCodeCliCandidates()
 		: [configuredCodeCli];
 	for (const executable of candidates) {
+		throwIfLaunchAborted(signal);
 		try {
 			const lines = (await runOwnedCommand(executable, ['--version'], {
 				timeoutMs: commandTimeoutMs,
 				maxOutputBytes: 16 * 1024,
+				signal,
 			})).trim().split(/\r?\n/u);
 			if (lines.length >= 3 && lines[0] && lines[1] && lines[2]) {
 				return {
@@ -289,11 +419,12 @@ async function discoverEndpoints(
 	codeCli: string,
 	userDataDir: string,
 	timeoutMs: number,
+	signal?: AbortSignal,
 ): Promise<AgentHostEndpointDocument> {
 	const stdout = await runOwnedCommand(
 		codeCli,
 		['agent', 'endpoints', '--user-data-dir', userDataDir],
-		{ timeoutMs, maxOutputBytes: 1024 * 1024 },
+		{ timeoutMs, maxOutputBytes: 1024 * 1024, signal },
 	);
 	const document = parseEndpointDocument(stdout);
 	if (resolve(document.userDataPath) !== resolve(userDataDir)) {
@@ -302,10 +433,11 @@ async function discoverEndpoints(
 	return document;
 }
 
-async function readOwnedProcessGroup(processGroupId: number): Promise<Set<number>> {
+async function readOwnedProcessGroup(processGroupId: number, signal?: AbortSignal): Promise<Set<number>> {
 	const stdout = await runOwnedCommand('ps', ['-axo', 'pid=,pgid='], {
 		timeoutMs: commandTimeoutMs,
 		maxOutputBytes: 1024 * 1024,
+		signal,
 	});
 	return new Set(stdout
 		.split(/\r?\n/u)
@@ -313,4 +445,33 @@ async function readOwnedProcessGroup(processGroupId: number): Promise<Set<number
 		.filter((pair) => pair.length === 2 && pair[1] === processGroupId)
 		.map((pair) => pair[0])
 		.filter((pid): pid is number => pid !== undefined && Number.isInteger(pid) && pid > 0));
+}
+
+function throwIfLaunchAborted(signal: AbortSignal | undefined): void {
+	if (signal?.aborted) {
+		throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'The Agent Host launch was cancelled during shutdown.');
+	}
+}
+
+function normalizeLaunchError(error: unknown, token: string): AgentRuntimeError {
+	if (error instanceof AgentRuntimeError) {
+		return error;
+	}
+	return new AgentRuntimeError(
+		'AGENT_UNAVAILABLE',
+		sanitizeError(error, [token]).message,
+	);
+}
+
+function combineLaunchErrors(primary: AgentRuntimeError, cleanup: AgentRuntimeError): AgentRuntimeError {
+	return new AgentRuntimeError(
+		primary.code,
+		`${primary.message} Owned Agent Host cleanup also failed and remains tracked for retry.`,
+		primary.retryable,
+		new AggregateError([
+			new AgentRuntimeError(primary.code, primary.message, primary.retryable),
+			new AgentRuntimeError(cleanup.code, cleanup.message, cleanup.retryable, cleanup.cause),
+		], 'Agent Host launch and cleanup both failed.'),
+		true,
+	);
 }

@@ -44,6 +44,7 @@ async function main(): Promise<void> {
 		configResolver: new E2eConfigurationResolver(),
 	});
 
+	let outcome: Record<string, string> | undefined;
 	try {
 		await import('node:fs/promises').then(({ mkdir }) => mkdir(workspace));
 		const handle = await runtime.start({
@@ -54,9 +55,13 @@ async function main(): Promise<void> {
 			allowInteractiveAuthentication: false,
 		});
 		let completed = false;
+		let output = '';
 		for await (const event of handle.events) {
 			if (event.type === 'failed') {
 				throw event.error;
+			}
+			if (event.type === 'output') {
+				output += event.text;
 			}
 			if (event.type === 'completed') {
 				completed = true;
@@ -66,21 +71,30 @@ async function main(): Promise<void> {
 		if (!completed) {
 			throw new Error('The real Agent Host turn ended without turnComplete.');
 		}
-		console.log(JSON.stringify({ outcome: 'turnComplete', workspace: 'temporary-non-sensitive' }));
+		if (output.trim() !== 'MESH_AGENT_HOST_E2E_OK') {
+			throw new Error('The real Agent Host response did not exactly match the expected non-destructive marker.');
+		}
+		outcome = { outcome: 'turnComplete', workspace: 'temporary-non-sensitive' };
 	} catch (error) {
-		if (error instanceof AgentRuntimeError && error.code === 'AGENT_AUTH_REQUIRED') {
-			console.log(JSON.stringify({
+		if (error instanceof AgentRuntimeError
+			&& error.code === 'AGENT_AUTH_REQUIRED'
+			&& !error.cleanupFailed) {
+			outcome = {
 				outcome: 'blocked',
 				code: error.code,
 				reason: error.message,
-			}));
-			return;
+			};
+		} else {
+			throw error;
 		}
-		throw error;
 	} finally {
-		await runtime.dispose().catch(() => undefined);
+		await runtime.dispose();
 		await rm(root, { recursive: true, force: true });
 	}
+	if (outcome === undefined) {
+		throw new Error('The real Agent Host E2E completed without an outcome.');
+	}
+	console.log(JSON.stringify(outcome));
 }
 
 class E2eConfigurationResolver implements SessionConfigurationResolver {

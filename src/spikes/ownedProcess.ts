@@ -20,6 +20,7 @@ export interface RunOwnedCommandOptions {
 	maxOutputBytes?: number;
 	terminationGraceMs?: number;
 	platform?: NodeJS.Platform;
+	signal?: AbortSignal;
 }
 
 export function assertOwnedProcessControlSupported(
@@ -71,6 +72,7 @@ export function runOwnedCommand(
 
 		const cleanup = () => {
 			clearTimeout(timer);
+			options.signal?.removeEventListener('abort', handleAbort);
 			child.stdout?.removeAllListeners('data');
 			child.stderr?.removeAllListeners('data');
 			child.stdout?.destroy();
@@ -137,6 +139,15 @@ export function runOwnedCommand(
 				));
 			});
 		};
+		const handleAbort = () => finalize(new OwnedCommandError(
+			`${commandLabel(executable, args)} was cancelled.`,
+			processGroupId,
+		));
+		if (options.signal?.aborted) {
+			handleAbort();
+		} else {
+			options.signal?.addEventListener('abort', handleAbort, { once: true });
+		}
 
 		const recordOutput = (chunk: Buffer, keep: boolean) => {
 			outputBytes += chunk.byteLength;

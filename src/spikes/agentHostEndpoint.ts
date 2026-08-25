@@ -114,6 +114,7 @@ export async function waitForOwnedStandaloneEndpoint(options: {
 	expectedToken: string;
 	timeoutMs: number;
 	pollIntervalMs: number;
+	signal?: AbortSignal;
 	now?: () => number;
 	sleep?: (milliseconds: number) => Promise<void>;
 }): Promise<SelectedAgentHostEndpoint> {
@@ -122,6 +123,7 @@ export async function waitForOwnedStandaloneEndpoint(options: {
 	const deadline = now() + options.timeoutMs;
 
 	do {
+		throwIfAborted(options.signal);
 		const remainingMs = Math.max(1, deadline - now());
 		const document = await options.discover(remainingMs);
 		try {
@@ -139,13 +141,42 @@ export async function waitForOwnedStandaloneEndpoint(options: {
 		if (now() >= deadline) {
 			break;
 		}
-		await sleep(options.pollIntervalMs);
+		await abortableSleep(sleep, options.pollIntervalMs, options.signal);
 	} while (now() <= deadline);
 
 	throw new EndpointSelectionError(
 		'NO_OWNED_ENDPOINT',
 		`Timed out after ${options.timeoutMs}ms waiting for the owned Agent Host endpoint.`,
 	);
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+	if (signal?.aborted) {
+		throw new Error('Agent Host endpoint discovery was cancelled.');
+	}
+}
+
+async function abortableSleep(
+	sleep: (milliseconds: number) => Promise<void>,
+	milliseconds: number,
+	signal: AbortSignal | undefined,
+): Promise<void> {
+	if (signal === undefined) {
+		await sleep(milliseconds);
+		return;
+	}
+	throwIfAborted(signal);
+	let rejectAbort: ((error: Error) => void) | undefined;
+	const aborted = new Promise<never>((_resolve, reject) => {
+		rejectAbort = reject;
+	});
+	const handleAbort = () => rejectAbort?.(new Error('Agent Host endpoint discovery was cancelled.'));
+	signal.addEventListener('abort', handleAbort, { once: true });
+	try {
+		await Promise.race([sleep(milliseconds), aborted]);
+	} finally {
+		signal.removeEventListener('abort', handleAbort);
+	}
 }
 
 export function redactSecrets(value: string, secrets: readonly string[] = []): string {
