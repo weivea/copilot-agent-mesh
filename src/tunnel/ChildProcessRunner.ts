@@ -34,6 +34,17 @@ export interface ChildProcessRunOptions {
 	readonly maxOutputBytes?: number;
 }
 
+export interface OwnedChildProcessExit {
+	readonly exitCode: number | null;
+	readonly signal: NodeJS.Signals | null;
+}
+
+export interface OwnedChildProcess {
+	readonly pid: number;
+	readonly exit: Promise<OwnedChildProcessExit>;
+	stop(): Promise<void>;
+}
+
 export interface ChildProcessRunnerOptions {
 	readonly allowedExecutableBasenames?: readonly string[];
 	readonly defaultTimeoutMs?: number;
@@ -350,6 +361,137 @@ export class ChildProcessRunner {
 				resolveClose?.();
 			});
 		});
+	}
+
+	startOwned(
+		executable: string,
+		args: readonly string[],
+	): Promise<OwnedChildProcess> {
+		const executableName = basename(executable).toLowerCase();
+		if (!this.allowedExecutableBasenames.has(executableName)) {
+			return Promise.reject(new ChildProcessExecutionError(
+				'EXECUTABLE_NOT_ALLOWED',
+				'The requested executable is not allowed.',
+			));
+		}
+		const terminateProcessTree = this.terminateProcessTree;
+		const isProcessTreeAlive = this.isProcessTreeAlive;
+		if (terminateProcessTree === undefined || isProcessTreeAlive === undefined) {
+			return Promise.reject(new ChildProcessExecutionError(
+				'PROCESS_TREE_UNSUPPORTED',
+				'Owned process-tree termination is unavailable on this platform.',
+			));
+		}
+
+		const child = spawn(executable, [...args], {
+			detached: this.platform !== 'win32',
+			shell: false,
+			windowsHide: true,
+			stdio: ['ignore', 'ignore', 'ignore'],
+		});
+
+		return new Promise((resolve, reject) => {
+			let settled = false;
+			let stopping: Promise<void> | undefined;
+			let resolveExit: ((result: OwnedChildProcessExit) => void) | undefined;
+			const exit = new Promise<OwnedChildProcessExit>((resolveExitPromise) => {
+				resolveExit = resolveExitPromise;
+			});
+			const stop = (): Promise<void> => {
+				stopping ??= this.stopOwnedProcess(
+					child.pid,
+					terminateProcessTree,
+					isProcessTreeAlive,
+				);
+				return stopping;
+			};
+
+			child.once('spawn', () => {
+				if (settled || child.pid === undefined) {
+					return;
+				}
+				settled = true;
+				resolve({
+					pid: child.pid,
+					exit,
+					stop,
+				});
+			});
+			child.once('error', () => {
+				if (!settled) {
+					settled = true;
+					reject(new ChildProcessExecutionError(
+						'PROCESS_START_FAILED',
+						'The process could not be started.',
+					));
+				}
+				resolveExit?.({ exitCode: null, signal: null });
+			});
+			child.once('exit', (exitCode, signal) => {
+				resolveExit?.({ exitCode, signal });
+				child.unref();
+			});
+		});
+	}
+
+	private async stopOwnedProcess(
+		pid: number | undefined,
+		terminateProcessTree: (pid: number, signal: NodeJS.Signals) => void,
+		isProcessTreeAlive: (pid: number) => boolean,
+	): Promise<void> {
+		if (pid === undefined) {
+			return;
+		}
+		const signal = (processSignal: NodeJS.Signals): boolean => {
+			try {
+				terminateProcessTree(pid, processSignal);
+				return true;
+			} catch (error: unknown) {
+				if (isProcessMissingError(error)) {
+					return false;
+				}
+				throw toProcessTreeTerminationError(error);
+			}
+		};
+		const isAlive = (): boolean => {
+			try {
+				return isProcessTreeAlive(pid);
+			} catch (error: unknown) {
+				if (isProcessMissingError(error)) {
+					return false;
+				}
+				if (isProcessPermissionError(error)) {
+					return true;
+				}
+				throw toProcessTreeTerminationError(error);
+			}
+		};
+		const waitUntil = async (deadline: number): Promise<boolean> => {
+			while (isAlive()) {
+				const remainingMs = deadline - Date.now();
+				if (remainingMs <= 0) {
+					return false;
+				}
+				await delay(Math.min(this.terminationPollMs, remainingMs));
+			}
+			return true;
+		};
+
+		if (!signal('SIGTERM')) {
+			return;
+		}
+		if (await waitUntil(Date.now() + this.terminationGraceMs)) {
+			return;
+		}
+		if (!signal('SIGKILL')) {
+			return;
+		}
+		if (!await waitUntil(Date.now() + this.terminationConfirmationMs)) {
+			throw new ChildProcessExecutionError(
+				'PROCESS_TREE_TERMINATION_FAILED',
+				'The owned process tree remained alive after forced termination.',
+			);
+		}
 	}
 }
 

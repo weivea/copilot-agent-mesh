@@ -264,6 +264,22 @@ suite('ChildProcessRunner', () => {
 		);
 	});
 
+	test('starts and stops one long-lived owned process group', {
+		skip: process.platform === 'win32',
+	}, async () => {
+		const runner = createNodeRunner();
+		const owned = await runner.startOwned(
+			process.execPath,
+			['-e', 'setInterval(() => undefined, 1000);'],
+		);
+
+		await owned.stop();
+		const exited = await owned.exit;
+
+		assert.equal(exited.signal, 'SIGTERM');
+		assertProcessGroupGone(owned.pid);
+	});
+
 	test('redacts URL fragments, tokens, authorization, and JSON secrets', () => {
 		const redacted = redactProcessText(
 			'https://example.test/connect#secret=value?x=1 '

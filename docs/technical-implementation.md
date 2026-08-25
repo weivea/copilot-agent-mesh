@@ -657,7 +657,7 @@ spawn(executable, args, {
 - `portForwardingUris` 与历史 `portUri` 只能出现在各自版本 Adapter 中，不能用 Permissive Union 混合接受。
 - Hosting/Create 永远需要已登录用户；登录过期、CLI/Schema/Access 不兼容属于 Non-retryable，停止重启循环并进入明确 UI 状态。
 
-调研时可见的候选基线 Build 为 `1.0.2030+fc9273aa0f`；它只是 Phase 0 的首个测试目标，不在兼容测试完成前声明为已支持。[Homebrew Metadata](https://formulae.brew.sh/api/cask/devtunnel.json) · [Windows Manifest](https://raw.githubusercontent.com/microsoft/winget-pkgs/master/manifests/m/Microsoft/devtunnel/1.0.2030+fc9273aa0f/Microsoft.devtunnel.installer.yaml)
+macOS arm64 已验证 Build `1.0.2030+fc9273aa0f`，其 exact decoder 使用单值 `portUri`；其他 OS/Arch 必须分别锁定 executable hash、fixture 和真实集成结果后才能加入 allowlist。[Homebrew Metadata](https://formulae.brew.sh/api/cask/devtunnel.json) · [Windows Manifest](https://raw.githubusercontent.com/microsoft/winget-pkgs/master/manifests/m/Microsoft/devtunnel/1.0.2030+fc9273aa0f/Microsoft.devtunnel.installer.yaml)
 
 ### 11.2 生命周期
 

@@ -167,9 +167,10 @@
     "lint": "eslint src shared",
     "test:unit": "npm run compile-tests && node --test out/src/unitTest/*.test.js out/src/test/unit/*.test.js",
     "test:component": "npm run compile-tests && node --test out/src/componentTest/*.test.js",
+    "test:dev-tunnel-real": "npm run compile-tests && node --test out/src/integrationTest/devTunnel.real.test.js",
     "test:extension": "npm run compile-tests && npm run compile && vscode-test",
     "test": "npm run test:unit && npm run test:component && npm run test:extension",
-    "spike:dev-tunnel": "npm run compile-tests && node out/src/spikes/devTunnelSpike.js",
+    "spike:dev-tunnel": "npm run test:dev-tunnel-real",
     "spike:agent-host": "npm run compile-tests && node out/src/spikes/agentHostSpike.js"
   },
   "devDependencies": {

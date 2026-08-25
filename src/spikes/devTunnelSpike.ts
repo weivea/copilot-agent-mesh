@@ -4,7 +4,7 @@ import {
 	ChildProcessExecutionError,
 	ChildProcessRunner,
 } from '../tunnel/ChildProcessRunner';
-import { OBSERVED_DEVTUNNEL_BUILD } from '../tunnel/DevTunnelJsonDecoder';
+import { LEGACY_UNSUPPORTED_DEVTUNNEL_BUILD } from '../tunnel/DevTunnelJsonDecoder';
 
 const e2eFlag = 'MESH_DEVTUNNEL_E2E';
 
@@ -19,7 +19,7 @@ async function main(): Promise<void> {
 		timeoutMs: 15_000,
 		maxOutputBytes: 32 * 1024,
 	});
-	const expectedLine = `Tunnel CLI version: ${OBSERVED_DEVTUNNEL_BUILD}`;
+	const expectedLine = `Tunnel CLI version: ${LEGACY_UNSUPPORTED_DEVTUNNEL_BUILD}`;
 	if (!version.stdout.split(/\r?\n/u).includes(expectedLine)) {
 		throw new Error('CLI_UNSUPPORTED: the Dev Tunnel build does not match the observed decoder revision.');
 	}
@@ -33,7 +33,7 @@ async function main(): Promise<void> {
 		status: 'blocked',
 		code: 'CLI_UNSUPPORTED',
 		executable: basename(executable),
-		build: OBSERVED_DEVTUNNEL_BUILD,
+		build: LEGACY_UNSUPPORTED_DEVTUNNEL_BUILD,
 		reason: 'This build emits non-JSON text for create --json and has not passed hosted URI, health, or WSS validation.',
 	}));
 	process.exitCode = 2;

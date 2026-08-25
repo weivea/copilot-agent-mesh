@@ -1,0 +1,25 @@
+{
+  "tunnel": {
+    "tunnelId": "came2efixt.jpe1",
+    "hostConnections": 1,
+    "clientConnections": 0,
+    "labels": [
+      "copilot-agent-mesh-e2e-fixture"
+    ],
+    "tunnelExpiration": "<redacted>",
+    "description": "<redacted>",
+    "currentUploadRate": "<redacted>",
+    "currentDownloadRate": "<redacted>",
+    "uploadTotal": "<redacted>",
+    "downloadTotal": "<redacted>",
+    "ports": [
+      {
+        "portNumber": 43123,
+        "protocol": "http",
+        "portUri": "https://fixture-43123.jpe1.devtunnels.ms/",
+        "status": "<redacted>"
+      }
+    ],
+    "accessControl": []
+  }
+}
