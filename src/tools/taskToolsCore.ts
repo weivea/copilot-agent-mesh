@@ -240,27 +240,35 @@ export class TaskToolsCore {
 			return this.cancelledResult();
 		}
 
-		let persisted: PersistedDelegationIntent;
-		try {
-			persisted = parsePersistedIntent(await this.facade.persistDelegationIntent(input));
-		} catch (error) {
-			return this.errorFromUnknown(error);
-		}
-
-		if (cancellation.isCancellationRequested) {
-			return this.delegateWaitResult('cancelled', persisted);
-		}
-
+		let persisted: PersistedDelegationIntent | undefined;
+		const durablePersistence = Promise.resolve()
+			.then(() => this.facade.persistDelegationIntent(input))
+			.then((value) => {
+				try {
+					return parsePersistedIntent(value);
+				} catch {
+					throw new TaskToolFacadeError('OUTPUT_INVALID');
+				}
+			});
 		const outcome = await this.runBounded(
-			(signal) => this.facade.waitForDelegationAcceptance({
-				delegationRequestId: persisted.delegationRequestId,
-				taskId: persisted.taskId,
-			}, signal),
+			async (signal) => {
+				persisted = await durablePersistence;
+				if (signal.aborted) {
+					throw new TaskToolFacadeError('CANCELLED', true);
+				}
+				return this.facade.waitForDelegationAcceptance({
+					delegationRequestId: persisted.delegationRequestId,
+					taskId: persisted.taskId,
+				}, signal);
+			},
 			TASK_TOOL_DEADLINES_MS.delegateTask,
 			cancellation,
 		);
 
 		if (outcome.kind === 'success') {
+			if (persisted === undefined) {
+				return this.errorResult('INTERNAL_ERROR');
+			}
 			try {
 				parseDelegationAcceptance(outcome.value);
 			} catch {
@@ -276,7 +284,13 @@ export class TaskToolsCore {
 			});
 		}
 		if (outcome.kind === 'cancelled' || outcome.kind === 'timeout') {
+			if (persisted === undefined) {
+				return this.delegatePersistencePendingResult(outcome.kind);
+			}
 			return this.delegateWaitResult(outcome.kind, persisted);
+		}
+		if (persisted === undefined) {
+			return this.errorFromUnknown(outcome.error);
 		}
 		return this.delegateFailureFromUnknown(persisted, outcome.error);
 	}
@@ -449,6 +463,17 @@ export class TaskToolsCore {
 					: 'Worker acceptance was not confirmed before the application deadline; the durable delegation remains available for polling or explicit cancellation.',
 				retryable: true,
 			},
+		});
+	}
+
+	private delegatePersistencePendingResult(waitStatus: 'cancelled' | 'timeout'): ToolJsonResult {
+		return this.fitResult({
+			status: 'pending',
+			phase: 'persisting',
+			waitStatus,
+			reconciliationPending: true,
+			retrySameIntent: true,
+			retryTool: MESH_TOOL_NAMES.delegateTask,
 		});
 	}
 
@@ -854,8 +879,23 @@ export async function serializeToolResultToTokenBudget(
 			await countTokens('');
 			return '';
 		}
+		const smallerSerialized = JSON.stringify(smaller);
+		if (smallerSerialized === serialized) {
+			for (const fallback of [
+				'{"status":"error","error":{"code":"OUTPUT_TOO_LARGE"}}',
+				'{"status":"error"}',
+				'{}',
+				'',
+			]) {
+				if (await countTokens(fallback) <= normalizedBudget) {
+					return fallback;
+				}
+			}
+			await countTokens('');
+			return '';
+		}
 		candidate = smaller;
-		serialized = JSON.stringify(candidate);
+		serialized = smallerSerialized;
 	}
 	await countTokens(serialized);
 	return serialized;
@@ -1215,16 +1255,16 @@ function shrinkToolResult(value: ToolJsonResult): ToolJsonResult | undefined {
 			) {
 				return {
 					status: typeof value.status === 'string' ? value.status : 'ok',
-					task: {
+					snapshot: {
 						taskId: snapshot.taskId,
 						status: 'needsInput',
 						pendingInput: {
 							inputId: pendingInput.inputId,
 							prompt: pendingInput.prompt,
-							answerTool: MESH_TOOL_NAMES.answerTask,
 						},
-						truncated: true,
 					},
+					answerTool: MESH_TOOL_NAMES.answerTask,
+					truncated: true,
 				};
 			}
 		}

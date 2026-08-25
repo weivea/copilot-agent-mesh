@@ -88,8 +88,9 @@ suite('TaskToolsCore', () => {
 		const cancellation = new ManualCancellation();
 		const core = new TaskToolsCore(facade);
 		const invocation = core.delegateTask(delegationInput(), cancellation);
-		await Promise.resolve();
-		await Promise.resolve();
+		for (let index = 0; index < 10 && facade.acceptanceWaits === 0; index += 1) {
+			await Promise.resolve();
+		}
 
 		cancellation.cancel();
 		const result = await invocation;
@@ -120,6 +121,81 @@ suite('TaskToolsCore', () => {
 		assert.equal(result.pollTool, MESH_TOOL_NAMES.getTask);
 		assert.equal(result.cancelTool, MESH_TOOL_NAMES.cancelTask);
 		assert.equal(facade.cancelCalls, 0);
+	});
+
+	test('bounds an unresolved durable persistence wait at the overall delegate deadline', async () => {
+		const facade = new RecordingFacade();
+		facade.persistence = new Promise(() => undefined);
+		const clock = new ManualClock();
+		const core = new TaskToolsCore(facade, { clock });
+		const invocation = core.delegateTask(delegationInput());
+		await Promise.resolve();
+		await Promise.resolve();
+
+		clock.advanceBy(15_000);
+		const result = await invocation;
+
+		assert.deepStrictEqual(result, {
+			status: 'pending',
+			phase: 'persisting',
+			waitStatus: 'timeout',
+			reconciliationPending: true,
+			retrySameIntent: true,
+			retryTool: MESH_TOOL_NAMES.delegateTask,
+		});
+		assert.equal(facade.acceptanceWaits, 0);
+		assert.equal(clock.activeTimers, 0);
+	});
+
+	test('cancels only the caller wait while durable persistence continues', async () => {
+		const facade = new RecordingFacade();
+		facade.persistence = new Promise(() => undefined);
+		const clock = new ManualClock();
+		const cancellation = new ManualCancellation();
+		const core = new TaskToolsCore(facade, { clock });
+		const invocation = core.delegateTask(delegationInput(), cancellation);
+		await Promise.resolve();
+		await Promise.resolve();
+
+		cancellation.cancel();
+		const result = await invocation;
+
+		assert.equal(result.status, 'pending');
+		assert.equal(result.phase, 'persisting');
+		assert.equal(result.waitStatus, 'cancelled');
+		assert.equal(result.reconciliationPending, true);
+		assert.equal(facade.acceptanceWaits, 0);
+		assert.equal(clock.activeTimers, 0);
+	});
+
+	test('recovers the same durable IDs when persistence resolves after caller timeout', async () => {
+		const facade = new RecordingFacade();
+		const persistence = new Deferred<PersistedDelegationIntent>();
+		facade.persistence = persistence.promise;
+		const clock = new ManualClock();
+		const core = new TaskToolsCore(facade, { clock });
+		const firstInvocation = core.delegateTask(delegationInput());
+		await Promise.resolve();
+		await Promise.resolve();
+		clock.advanceBy(15_000);
+		const first = await firstInvocation;
+
+		persistence.resolve({
+			delegationRequestId: 'request-durable',
+			taskId: 'task-durable',
+			recovered: true,
+		});
+		await Promise.resolve();
+		await Promise.resolve();
+		const retry = await core.delegateTask(delegationInput());
+
+		assert.equal(first.status, 'pending');
+		assert.equal(retry.status, 'pending');
+		assert.equal(retry.delegationRequestId, 'request-durable');
+		assert.equal(retry.taskId, 'task-durable');
+		assert.equal(retry.recovered, true);
+		assert.equal(facade.persistCalls, 2);
+		assert.equal(facade.acceptanceWaits, 1);
 	});
 
 	test('a duplicate retry relies on durable Facade recovery and keeps the same IDs', async () => {
@@ -438,8 +514,8 @@ suite('TaskToolsCore', () => {
 			countCharacters,
 		);
 		const parsed = JSON.parse(atThreeHundred) as Record<string, unknown>;
-		const task = parsed.task as Record<string, unknown>;
-		const pendingInput = task.pendingInput as Record<string, unknown>;
+		const snapshot = parsed.snapshot as Record<string, unknown>;
+		const pendingInput = snapshot.pendingInput as Record<string, unknown>;
 		const exactBoundary = await serializeToolResultToTokenBudget(
 			coreResult,
 			atThreeHundred.length,
@@ -453,12 +529,12 @@ suite('TaskToolsCore', () => {
 
 		assert.ok(atThreeHundred.length <= 300);
 		assert.equal(parsed.status, 'ok');
-		assert.equal(task.taskId, taskId);
-		assert.equal(task.status, 'needsInput');
-		assert.equal(task.truncated, true);
+		assert.equal(snapshot.taskId, taskId);
+		assert.equal(snapshot.status, 'needsInput');
 		assert.equal(pendingInput.inputId, inputId);
 		assert.equal(pendingInput.prompt, 'q');
-		assert.equal(pendingInput.answerTool, MESH_TOOL_NAMES.answerTask);
+		assert.equal(parsed.answerTool, MESH_TOOL_NAMES.answerTask);
+		assert.equal(parsed.truncated, true);
 		assert.equal(exactBoundary, atThreeHundred);
 		assert.ok(belowBoundary.length <= atThreeHundred.length - 1);
 	});
@@ -536,6 +612,7 @@ class RecordingFacade implements TaskToolFacade {
 		taskId: 'task-1',
 		recovered: false,
 	};
+	persistence?: Promise<PersistedDelegationIntent>;
 	acceptance: Promise<DelegationAcceptance> = Promise.resolve({ status: 'accepted' });
 	taskRead: TaskToolReadResult = {
 		snapshot: {
@@ -573,7 +650,7 @@ class RecordingFacade implements TaskToolFacade {
 	async persistDelegationIntent(_intent: DelegationIntentInput): Promise<PersistedDelegationIntent> {
 		this.persistCalls += 1;
 		this.callOrder.push('persist');
-		return this.persisted;
+		return this.persistence ?? this.persisted;
 	}
 
 	async waitForDelegationAcceptance(
@@ -672,5 +749,21 @@ class ManualCancellation implements ToolCancellation {
 		for (const listener of this.listeners) {
 			listener();
 		}
+	}
+}
+
+class Deferred<T> {
+	readonly promise: Promise<T>;
+	private resolvePromise: ((value: T) => void) | undefined;
+
+	constructor() {
+		this.promise = new Promise<T>((resolve) => {
+			this.resolvePromise = resolve;
+		});
+	}
+
+	resolve(value: T): void {
+		this.resolvePromise?.(value);
+		this.resolvePromise = undefined;
 	}
 }

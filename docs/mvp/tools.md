@@ -37,6 +37,14 @@ remote cancellation method. Once `persistDelegationIntent` resolves, the result
 retains `delegationRequestId` and `taskId` so the durable task can be polled or
 explicitly cancelled.
 
+The delegate's 15-second budget covers both durable intent persistence and the
+worker acceptance wait. Persistence itself is deliberately not given an abort
+signal: if the caller budget or cancellation wins first, the durable promise
+continues in the background and the Tool returns `pending`,
+`reconciliationPending: true`, and `retrySameIntent: true`. Retrying the exact
+intent lets the Facade recover the IDs after persistence completes instead of
+creating another task.
+
 ## Facade integration
 
 `TaskToolFacade` is the production seam for the future `TaskCoordinator` and
