@@ -475,6 +475,7 @@
     "test:unit": "npm run compile-tests && node --test out/src/unitTest/*.test.js out/src/test/unit/*.test.js",
     "test:component": "npm run compile-tests && node --test out/src/componentTest/*.test.js",
     "test:dev-tunnel-real": "npm run compile-tests && node --test out/src/integrationTest/devTunnel.real.test.js",
+    "test:two-instance-real": "npm run compile-tests && npm run package && node scripts/e2e/two-instance/run.mjs",
     "test:extension": "npm run compile-tests && npm run compile && vscode-test",
     "test": "npm run test:unit && npm run test:component && npm run test:extension",
     "verify": "npm run test:unit && npm run test:component && npm run test:extension && npm run package:vsix",

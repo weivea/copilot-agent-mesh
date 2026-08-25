@@ -103,6 +103,40 @@ suite('DevTunnelCliProvider', () => {
 		assert.equal(provider.getStatus().state, 'circuit-open');
 	});
 
+	test('rejects ownership labels above the official 50-character limit before provisioning', async () => {
+		const runner = new FakeRunner();
+		const provider = createProvider(runner, new MemoryStore());
+		await assert.rejects(
+			provider.ensureHosted({
+				...request,
+				ownershipLabel: `copilot-agent-mesh-${'a'.repeat(32)}`,
+			}),
+			/50-character service limit/u,
+		);
+		assert.equal(runner.commands.length, 0);
+	});
+
+	test('deletes only an exact owned E2E tunnel and confirms exact not-found', async () => {
+		const previous = process.env.MESH_TWO_DEVICE_E2E;
+		process.env.MESH_TWO_DEVICE_E2E = '1';
+		try {
+			const runner = new FakeRunner();
+			const provider = createProvider(runner, new MemoryStore());
+			await provider.ensureHosted(request);
+			assert.equal(await provider.deleteOwnedForE2e(), 'deleted');
+			assert.deepStrictEqual(
+				runner.commands.filter((args) => args[0] === 'delete'),
+				[['delete', tunnelId]],
+			);
+		} finally {
+			if (previous === undefined) {
+				delete process.env.MESH_TWO_DEVICE_E2E;
+			} else {
+				process.env.MESH_TWO_DEVICE_E2E = previous;
+			}
+		}
+	});
+
 	test('fails closed when the exact build executable hash is not allowlisted', async () => {
 		const runner = new FakeRunner();
 		const provider = createProvider(runner, new MemoryStore(), {
@@ -947,6 +981,10 @@ class FakeRunner {
 				this.extraPort,
 				this.tunnelAccessEntry,
 			)));
+		}
+		if (args[0] === 'delete') {
+			this.showNotFound = true;
+			return result('');
 		}
 		throw new Error(`Unexpected fake command: ${args.join(' ')}`);
 	}

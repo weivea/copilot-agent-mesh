@@ -51,6 +51,10 @@ import {
 	createVscodeAgentRuntime,
 	VscodeLocalTaskApproval,
 } from './VscodeAgentRuntime';
+import {
+	createTwoDeviceE2eApi,
+	type TwoDeviceE2eApi,
+} from './TwoDeviceE2eApi';
 
 export const APPLICATION_COMMANDS = {
 	registerWorkspace: 'copilotAgentMesh.registerWorkspace',
@@ -72,6 +76,7 @@ export interface AgentMeshExtensionApi {
 	readonly coordinator: TaskCoordinator;
 	readonly workerTasks: WorkerTaskService;
 	readonly listener: ListenerService;
+	readonly twoDeviceE2e?: TwoDeviceE2eApi;
 }
 
 export interface Application {
@@ -294,6 +299,14 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		const dashboardFacade = new ServiceDashboardFacade(bindings);
 		const dashboard = new AgentMeshViewProvider(dashboardFacade, context.extensionUri);
 		cleanup.push(() => dashboard.dispose());
+		const twoDeviceE2e = createTwoDeviceE2eApi(
+			vscode,
+			bindings,
+			coordinator,
+			listener,
+			runtime,
+			tunnel,
+		);
 		if (ownership.isOwner()) {
 			await peerManager.restore();
 			await restoreListener(listener, configuration, logger);
@@ -340,7 +353,13 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 
 		let disposal: Promise<void> | undefined;
 		const application: Application = {
-			api: { agentRuntime: runtime, coordinator, workerTasks, listener },
+			api: {
+				agentRuntime: runtime,
+				coordinator,
+				workerTasks,
+				listener,
+				...(twoDeviceE2e === undefined ? {} : { twoDeviceE2e }),
+			},
 			dispose: () => {
 				if (disposal === undefined) {
 					disposal = disposeApplication(contributions, cleanup, logger);

@@ -301,6 +301,15 @@ test('unsupported ListenerService fails before probing with stable CLI_UNSUPPORT
 	await listener.dispose();
 });
 
+test('ListenerService creates an exact service-compatible ownership label', async () => {
+	const tunnel = new RecordingTunnel();
+	const listener = createListener(tunnel, new RecordingGateway(), new RecordingPairing());
+	await listener.start();
+	assert.equal(tunnel.lastRequest?.ownershipLabel, 'copilot-agent-mesh-0000000000004000800000000000000');
+	assert.equal(tunnel.lastRequest?.ownershipLabel.length, 50);
+	await listener.dispose();
+});
+
 test('ListenerService dispose succeeds after a prior stop failure and releases all ownership', async () => {
 	const tunnel = new RecordingTunnel();
 	tunnel.stopFailures = 1;
@@ -435,6 +444,7 @@ class RecordingTunnel implements DevTunnelProvider {
 	public stopCalls = 0;
 	public stopFailures = 0;
 	public ensureFailures = 0;
+	public lastRequest: TunnelRequest | undefined;
 	private status: DevTunnelRuntimeStatus = { state: 'stopped' };
 
 	public async probe(): Promise<TunnelCapability> {
@@ -443,6 +453,7 @@ class RecordingTunnel implements DevTunnelProvider {
 	}
 
 	public async ensureHosted(request: TunnelRequest): Promise<HostedTunnel> {
+		this.lastRequest = request;
 		if (this.ensureFailures > 0) {
 			this.ensureFailures -= 1;
 			throw new Error('tunnel startup failed');

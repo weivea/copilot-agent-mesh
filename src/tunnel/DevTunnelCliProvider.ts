@@ -49,6 +49,16 @@ interface DevTunnelCommandRunner {
 	startOwned(executable: string, args: readonly string[]): Promise<OwnedChildProcess>;
 }
 
+class DevTunnelCommandFailure extends Error {
+	constructor(
+		readonly operation: string,
+		readonly execution: ChildProcessExecutionError,
+	) {
+		super(execution.message, { cause: execution });
+		this.name = 'DevTunnelCommandFailure';
+	}
+}
+
 export interface DevTunnelCliProviderOptions {
 	readonly architecture?: string;
 	readonly binaryVerifier?: (executable: string) => Promise<boolean>;
@@ -398,6 +408,70 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 
 	dispose(): Promise<void> {
 		return this.stop();
+	}
+
+	async deleteOwnedForE2e(): Promise<'deleted' | 'already-absent'> {
+		if (process.env.MESH_TWO_DEVICE_E2E !== '1') {
+			throw new Error('Owned Tunnel deletion is available only to the opted-in two-device E2E.');
+		}
+		await this.stop();
+		const metadata = await this.stateStore.load();
+		if (metadata === undefined) {
+			return 'already-absent';
+		}
+		if (
+			metadata.build !== SUPPORTED_DEVTUNNEL_BUILD
+			|| metadata.decoderRevision !== DEVTUNNEL_DECODER_REVISION
+			|| !metadata.ownershipLabel.startsWith('copilot-agent-mesh-')
+			|| !metadata.tunnelId.startsWith(`${metadata.tunnelAlias}.`)
+		) {
+			throw permanent(
+				'TUNNEL_METADATA_INVALID',
+				'The persisted Tunnel does not satisfy exact owned-resource deletion invariants.',
+			);
+		}
+		const capability = await this.probe();
+		if (!capability.supported || capability.build !== metadata.build) {
+			throw permanent('CLI_UNSUPPORTED', 'The exact trusted Dev Tunnel CLI is unavailable for cleanup.');
+		}
+		const shown = await this.run(
+			['show', metadata.tunnelId, '--json'],
+			commandTimeoutMs,
+			commandMaxOutputBytes,
+			undefined,
+			[2],
+		);
+		if (isExactDevTunnelNotFound(metadata.build, shown, metadata.tunnelId)) {
+			return 'already-absent';
+		}
+		if (shown.exitCode !== 0) {
+			throw transient('CLI_COMMAND_FAILED', 'Owned Tunnel cleanup could not inspect the exact resource.');
+		}
+		decodeDevTunnelShowJson(metadata.build, shown.stdout, {
+			expectedOwnershipLabel: metadata.ownershipLabel,
+			expectedPort: metadata.localPort,
+			expectedTunnelId: metadata.tunnelId,
+			requireForwardingUri: false,
+		});
+		await this.run(['delete', metadata.tunnelId]);
+		const deadline = Date.now() + commandTimeoutMs;
+		do {
+			const confirmation = await this.run(
+				['show', metadata.tunnelId, '--json'],
+				commandTimeoutMs,
+				commandMaxOutputBytes,
+				undefined,
+				[2],
+			);
+			if (isExactDevTunnelNotFound(metadata.build, confirmation, metadata.tunnelId)) {
+				return 'deleted';
+			}
+			await new Promise((resolve) => setTimeout(resolve, 250));
+		} while (Date.now() < deadline);
+		throw transient(
+			'CLI_COMMAND_FAILED',
+			'Owned Tunnel deletion was not confirmed by the exact versioned not-found response.',
+		);
 	}
 
 	private async ensureHostedOnce(request: TunnelRequest): Promise<HostedTunnel> {
@@ -977,19 +1051,26 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 		}
 	}
 
-	private run(
+	private async run(
 		args: readonly string[],
 		timeoutMs = commandTimeoutMs,
 		maxOutputBytes = commandMaxOutputBytes,
 		signal?: AbortSignal,
 		acceptedExitCodes?: readonly number[],
 	): Promise<ChildProcessResult> {
-		return this.requireCommandRunner().run(this.requireTrustedExecutable(), args, {
-			acceptedExitCodes,
-			timeoutMs,
-			maxOutputBytes,
-			signal,
-		});
+		try {
+			return await this.requireCommandRunner().run(this.requireTrustedExecutable(), args, {
+				acceptedExitCodes,
+				timeoutMs,
+				maxOutputBytes,
+				signal,
+			});
+		} catch (error) {
+			if (error instanceof ChildProcessExecutionError) {
+				throw new DevTunnelCommandFailure(args[0] ?? 'unknown', error);
+			}
+			throw error;
+		}
 	}
 
 	private async showTunnel(
@@ -1082,8 +1163,10 @@ function validateRequest(request: TunnelRequest): void {
 	if (!/^[a-z][a-z0-9]{5,48}$/u.test(request.tunnelAlias)) {
 		throw new RangeError('tunnelAlias must be 6-49 lowercase alphanumeric characters.');
 	}
-	if (!/^copilot-agent-mesh-[a-z0-9-]{1,48}$/u.test(request.ownershipLabel)) {
-		throw new RangeError('ownershipLabel must use the Copilot Agent Mesh ownership prefix.');
+	if (!/^copilot-agent-mesh-[a-z0-9-]{1,31}$/u.test(request.ownershipLabel)) {
+		throw new RangeError(
+			'ownershipLabel must use the Copilot Agent Mesh ownership prefix and fit the 50-character service limit.',
+		);
 	}
 	if (
 		!isSafeOriginRelativePath(request.healthPath)
@@ -1176,6 +1259,18 @@ function parseDuration(duration: `${number}h` | `${number}d`): number {
 function toProviderError(error: unknown): DevTunnelProviderError {
 	if (error instanceof DevTunnelProviderError) {
 		return error;
+	}
+	if (error instanceof DevTunnelCommandFailure) {
+		if (error.execution.code === 'PROCESS_TIMEOUT') {
+			return transient('CLI_COMMAND_FAILED', `The Dev Tunnel CLI ${error.operation} command timed out.`);
+		}
+		if (error.execution.code === 'PROCESS_EXIT_NONZERO') {
+			return transient(
+				'CLI_COMMAND_FAILED',
+				`The Dev Tunnel CLI ${error.operation} command failed transiently.`,
+			);
+		}
+		return permanent('CLI_COMMAND_FAILED', `The Dev Tunnel CLI ${error.operation} command failed.`);
 	}
 	if (error instanceof ChildProcessExecutionError) {
 		if (error.code === 'PROCESS_TIMEOUT') {

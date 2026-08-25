@@ -203,12 +203,13 @@ export class ListenerService {
 				enabled: true,
 				preferredPort: address.port,
 			});
-			const suffix = this.deviceId.replaceAll('-', '').slice(0, 18);
+			const compactDeviceId = this.deviceId.replaceAll('-', '');
+			const suffix = compactDeviceId.slice(0, 18);
 			this.hosted = await this.tunnel.ensureHosted({
 				accessDuration: this.options.accessDuration ?? '1d',
 				healthPath: '/healthz',
 				localPort: address.port,
-				ownershipLabel: `copilot-agent-mesh-${this.deviceId}`,
+				ownershipLabel: `copilot-agent-mesh-${compactDeviceId.slice(0, 31)}`,
 				tunnelAlias: `cam${suffix}`,
 				tunnelExpiration: this.options.tunnelExpiration ?? '30d',
 				wssExpectedResponse: probeResponse,
