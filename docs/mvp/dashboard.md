@@ -48,11 +48,14 @@ strict ViewModel shape validation and before every `postMessage`. Secret checks
 canonicalize percent encoding for a bounded number of rounds and fail closed on
 malformed or oversized input before recognizing JSON, quoted, and whitespace
 credential assignments, including normalized compound keys such as access token,
-client secret, API key, private key, and refresh token. HTTP(S) values are parsed;
+client secret, auth token, ID token, API key, private key, and refresh token.
+Credential keys use explicit sensitive suffixes so ordinary fields such as
+`tokenCount` remain valid. HTTP(S) values are parsed;
 their decoded pathname, query keys/values, and fragment are recursively subjected
 to the same path and secret checks; any URL userinfo is rejected. URI schemes are
 canonicalized and parsed generically, with non-HTTP(S) schemes rejected fail
-closed so VS Code, remote, file, and unknown URIs cannot bypass path checks.
+closed so prefixed VS Code, remote, file, malformed, and unknown URI tokens cannot
+bypass path checks.
 
 The webview loads `media/dashboard.js` and `media/dashboard.css` through
 `asWebviewUri`. Its resource roots contain only `media/`, scripts are enabled, and

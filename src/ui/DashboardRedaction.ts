@@ -1,19 +1,16 @@
 const maximumCanonicalLength = 4096;
 const maximumDecodeRounds = 4;
 const maximumUriInspectionDepth = 4;
-const normalizedCredentialKeys = new Set([
-	'accesstoken',
+const sensitiveCredentialKeySuffixes = [
 	'apikey',
 	'authorization',
-	'clientsecret',
 	'credential',
 	'password',
 	'privatekey',
-	'refreshtoken',
 	'secret',
 	'tkn',
 	'token',
-]);
+] as const;
 
 export function redactRemoteText(value: string): string {
 	return containsUnsafeDashboardText(value) ? '[redacted sensitive details]' : value;
@@ -176,7 +173,7 @@ function containsCredentialAssignment(value: string): boolean {
 			continue;
 		}
 		const normalized = normalizeCredentialKey(value.slice(cursor + 1, keyEnd));
-		if (normalizedCredentialKeys.has(normalized)) {
+		if (isSensitiveCredentialKey(normalized)) {
 			return true;
 		}
 	}
@@ -208,10 +205,14 @@ function normalizeCredentialKey(value: string): string {
 	return normalized;
 }
 
+function isSensitiveCredentialKey(value: string): boolean {
+	return sensitiveCredentialKeySuffixes.some((suffix) => value.endsWith(suffix));
+}
+
 function extractUriCandidates(value: string): string[] {
-	const candidates: string[] = [];
+	const candidates = new Set<string>();
 	for (let start = 0; start < value.length; start += 1) {
-		if (!isAsciiLetter(value[start]) || (start > 0 && isUriSchemeCharacter(value[start - 1]))) {
+		if (!isAsciiLetter(value[start])) {
 			continue;
 		}
 		let schemeEnd = start + 1;
@@ -230,11 +231,12 @@ function extractUriCandidates(value: string): string[] {
 			candidate = candidate.slice(0, -1);
 		}
 		if (candidate.length > 0) {
-			candidates.push(candidate);
+			candidates.add(candidate);
 		}
 		start = Math.max(start, end - 1);
 	}
-	return candidates;
+	addSchemeDelimiterTokens(value, candidates);
+	return [...candidates];
 }
 
 function containsUnsafeUri(candidate: string, depth: number): boolean {
@@ -274,6 +276,29 @@ function isUriSchemeCharacter(character: string): boolean {
 		|| character === '+'
 		|| character === '-'
 		|| character === '.';
+}
+
+function addSchemeDelimiterTokens(value: string, candidates: Set<string>): void {
+	let searchFrom = 0;
+	while (searchFrom < value.length) {
+		const delimiter = value.indexOf('://', searchFrom);
+		if (delimiter < 0) {
+			return;
+		}
+		let start = delimiter - 1;
+		while (start >= 0 && !isUrlTerminator(value[start])) {
+			start -= 1;
+		}
+		let end = delimiter + 3;
+		while (end < value.length && !isUrlTerminator(value[end])) {
+			end += 1;
+		}
+		const candidate = value.slice(start + 1, end);
+		if (candidate.length > 0) {
+			candidates.add(candidate);
+		}
+		searchFrom = delimiter + 3;
+	}
 }
 
 function isUrlTerminator(character: string): boolean {

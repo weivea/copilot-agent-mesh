@@ -91,6 +91,9 @@ suite('Dashboard', () => {
 			'api_key = private-value',
 			'private-key: private-value',
 			'refresh_token%253Dprivate-value',
+			'auth_token = private-value',
+			'id_token: private-value',
+			'oauthAccessToken = private-value',
 			'credential = private-value',
 			'Authorization : private-value',
 			'tkn\t=\tprivate-value',
@@ -107,6 +110,9 @@ suite('Dashboard', () => {
 			'vscode-remote%3A%2F%2Fssh-remote%2Bhost%2Fhome%2Falice',
 			'VSCODE://file/Users/alice',
 			'custom-scheme://host/home/alice',
+			'1vscode-remote://ssh-remote+host/home/alice',
+			'1https://user:pass@example.test',
+			'1://host/home/alice',
 		]) {
 			assert.throws(() => assertSafeDashboardOutboundMessage({
 				...base,
@@ -120,6 +126,10 @@ suite('Dashboard', () => {
 		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({
 			...base,
 			model: withTaskSummary(snapshot(), 'HTTPS://EXAMPLE.TEST'),
+		}));
+		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({
+			...base,
+			model: withTaskSummary(snapshot(), 'tokenCount: 12'),
 		}));
 	});
 
