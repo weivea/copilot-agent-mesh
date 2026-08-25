@@ -1,5 +1,5 @@
 import * as assert from 'node:assert/strict';
-import { mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, test } from 'node:test';
@@ -76,6 +76,138 @@ test('only one Extension Host owns Worker services and non-owner disposal cannot
 	await second.dispose();
 	await first.assertOwner();
 	await first.dispose();
+});
+
+test('owner record is atomically published and a concurrent reader cannot orphan the mutex', async () => {
+	const root = await makeDirectory();
+	const candidateReady = deferred<void>();
+	const publishCandidate = deferred<void>();
+	const ownerAcquisition = WorkerOwnerLock.acquire(root, {
+		pid: 101,
+		instanceId: 'publishing-window',
+		token: 'publishing-token',
+		pidAlive: (pid) => pid === 101 || pid === 202 || pid === 303,
+		heartbeatMs: 60_000,
+		onOwnerCandidateReady: async () => {
+			candidateReady.resolve(undefined);
+			await publishCandidate.promise;
+		},
+	});
+	await candidateReady.promise;
+	await assert.rejects(readFile(join(root, 'worker-owner.lock')), /ENOENT/u);
+	const contender = await WorkerOwnerLock.acquire(root, {
+		pid: 202,
+		instanceId: 'concurrent-window',
+		token: 'concurrent-token',
+		pidAlive: (pid) => pid === 101 || pid === 202 || pid === 303,
+		heartbeatMs: 60_000,
+	});
+	assert.equal(contender.isOwner(), false);
+	publishCandidate.resolve(undefined);
+	const owner = await ownerAcquisition;
+	assert.equal(owner.isOwner(), true);
+	await assert.rejects(readFile(join(root, 'worker-owner.takeover')), /ENOENT/u);
+	await contender.dispose();
+	await owner.dispose();
+
+	const next = await WorkerOwnerLock.acquire(root, {
+		pid: 303,
+		instanceId: 'next-window',
+		token: 'next-token',
+		pidAlive: (pid) => pid === 303,
+		heartbeatMs: 60_000,
+	});
+	assert.equal(next.isOwner(), true);
+	await next.dispose();
+});
+
+test('failed no-replace publication releases its own takeover mutex', async () => {
+	const root = await makeDirectory();
+	await writeFile(join(root, 'worker-owner.lock'), '', { mode: 0o600 });
+	const blocked = await WorkerOwnerLock.acquire(root, {
+		pid: 202,
+		instanceId: 'blocked-window',
+		token: 'blocked-token',
+		pidAlive: () => false,
+		heartbeatMs: 60_000,
+	});
+	assert.equal(blocked.isOwner(), false);
+	await assert.rejects(readFile(join(root, 'worker-owner.takeover')), /ENOENT/u);
+	await blocked.dispose();
+	await unlink(join(root, 'worker-owner.lock'));
+	const next = await WorkerOwnerLock.acquire(root, {
+		pid: 303,
+		instanceId: 'next-window',
+		token: 'next-token',
+		pidAlive: (pid) => pid === 303,
+		heartbeatMs: 60_000,
+	});
+	assert.equal(next.isOwner(), true);
+	await next.dispose();
+});
+
+test('mutex initialization failure releases the acquired inode', async () => {
+	const root = await makeDirectory();
+	await assert.rejects(
+		WorkerOwnerLock.acquire(root, {
+			pid: 202,
+			instanceId: 'failing-window',
+			token: 'failing-token',
+			pidAlive: () => false,
+			heartbeatMs: 60_000,
+			onTakeoverMutexOpened: async () => {
+				throw new Error('Injected mutex initialization failure.');
+			},
+		}),
+		/Injected mutex initialization failure/u,
+	);
+	await assert.rejects(readFile(join(root, 'worker-owner.takeover')), /ENOENT/u);
+	const next = await WorkerOwnerLock.acquire(root, {
+		pid: 303,
+		instanceId: 'next-window',
+		token: 'next-token',
+		pidAlive: (pid) => pid === 303,
+		heartbeatMs: 60_000,
+	});
+	assert.equal(next.isOwner(), true);
+	await next.dispose();
+});
+
+test('mutex release never deletes a replacement token', async () => {
+	const root = await makeDirectory();
+	const now = Date.parse('2026-08-25T00:00:01.000Z');
+	await writeOwnerRecord(root, {
+		pid: 101,
+		instanceId: 'dead-window',
+		token: 'dead-token',
+		generation: 'dead-generation',
+		at: new Date(now - 1_000).toISOString(),
+	});
+	const takeoverPath = join(root, 'worker-owner.takeover');
+	const contender = await WorkerOwnerLock.acquire(root, {
+		pid: 202,
+		instanceId: 'contender-window',
+		token: 'contender-token',
+		now: () => now,
+		ttlMs: 100,
+		heartbeatMs: 60_000,
+		pidAlive: () => false,
+		onTakeoverMutexReleaseClaimed: async () => {
+			await writeFile(takeoverPath, JSON.stringify({
+				schemaVersion: 1,
+				pid: 404,
+				instanceId: 'replacement-window',
+				token: 'replacement-token',
+				createdAt: new Date(now).toISOString(),
+			}));
+		},
+	});
+	assert.equal(contender.isOwner(), true);
+	assert.equal(
+		JSON.parse(await readFile(takeoverPath, 'utf8')).token,
+		'replacement-token',
+	);
+	await contender.dispose();
 });
 
 test('stale owner lock can be atomically taken over without old-token deletion', async () => {

@@ -44,8 +44,11 @@ The mutable Mesh application is exclusive across VS Code windows that share the 
 `globalStorageUri`. Activation acquires an atomic owner lock containing a process ID, instance
 ID, generation, token, and heartbeat. A stale takeover first acquires a separate `O_EXCL`
 mutex, then re-reads the exact observed generation/token before replacing it. Concurrent
-contenders remain passive, and an orphaned takeover mutex fails closed. Takeover also requires
-both an expired heartbeat and a dead owner process.
+contenders remain passive, and an orphaned takeover mutex fails closed. Owner records are fully
+written and synced through a private candidate inode before a no-replace hard link publishes
+them, so readers never observe a partially initialized record. Every non-crash mutex exit removes
+only its own on-disk token. Takeover also requires both an expired heartbeat and a dead owner
+process.
 
 Later Extension Hosts are read-only Coordinator dashboards. They do not restore or mutate peer
 connections, delegation intents, workspace registrations or leases, Worker tasks, Listener,
