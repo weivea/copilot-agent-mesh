@@ -466,16 +466,34 @@ async function requestTaskAnswer(request: AgentInputRequest): Promise<AgentTaskA
 				};
 		}
 		const choice = await vscode.window.showWarningMessage(request.prompt, { modal: true }, 'Approve', 'Deny');
-		return { requestId: request.requestId, outcome: choice === 'Approve' ? 'accept' : 'decline' };
+		return {
+			requestId: request.requestId,
+			outcome: choice === 'Approve' ? 'accept' : choice === 'Deny' ? 'decline' : 'cancel',
+		};
 	}
 	if ((request.fields?.length ?? 0) === 0) {
-		const urlText = request.url === undefined ? '' : `\n\nReview URL: ${safeElicitationUrlText(request.url)}`;
-		const choice = await vscode.window.showWarningMessage(
+		const reviewUri = request.url === undefined ? undefined : parseElicitationUrl(request.url);
+		if (request.url !== undefined && reviewUri === undefined) {
+			await vscode.window.showErrorMessage('The Agent Host requested an invalid or unsupported review URL.');
+			return { requestId: request.requestId, outcome: 'cancel' };
+		}
+		const urlText = reviewUri === undefined ? '' : `\n\nReview URL: ${reviewUri.toString(true)}`;
+		let choice = await vscode.window.showWarningMessage(
 			`${request.prompt}${urlText}`,
 			{ modal: true },
+			...(reviewUri === undefined ? [] : ['Open URL'] as const),
 			'Accept',
 			'Decline',
 		);
+		if (choice === 'Open URL' && reviewUri !== undefined) {
+			await vscode.env.openExternal(reviewUri);
+			choice = await vscode.window.showWarningMessage(
+				`${request.prompt}${urlText}`,
+				{ modal: true },
+				'Accept',
+				'Decline',
+			);
+		}
 		return {
 			requestId: request.requestId,
 			outcome: choice === 'Accept' ? 'accept' : choice === 'Decline' ? 'decline' : 'cancel',
@@ -579,14 +597,18 @@ async function requestTaskAnswer(request: AgentInputRequest): Promise<AgentTaskA
 	return { requestId: request.requestId, outcome: 'accept', values };
 }
 
-function safeElicitationUrlText(value: string): string {
+function parseElicitationUrl(value: string): vscode.Uri | undefined {
 	try {
 		const url = new URL(value);
-		if (url.protocol !== 'https:' && url.protocol !== 'http:') {
-			return '[unsupported URL]';
+		if (
+			(url.protocol !== 'https:' && url.protocol !== 'http:')
+			|| url.username.length > 0
+			|| url.password.length > 0
+		) {
+			return undefined;
 		}
-		return `${url.origin}${url.pathname}`;
+		return vscode.Uri.parse(url.toString(), true);
 	} catch {
-		return '[invalid URL]';
+		return undefined;
 	}
 }

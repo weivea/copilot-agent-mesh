@@ -583,6 +583,9 @@ class AhpTask implements AgentTaskHandle {
 				|| dispatchGeneration.subscriptions.get(defaultChat) === undefined
 			) {
 				await this.releaseStartupSubscription(defaultChat, subscribedGeneration);
+				if (dispatchGeneration !== subscribedGeneration) {
+					await this.releaseStartupSubscription(defaultChat, dispatchGeneration);
+				}
 				continue;
 			}
 			this.turnId = randomUUID();
@@ -986,6 +989,10 @@ class AhpTask implements AgentTaskHandle {
 			return;
 		}
 		generation.subscriptions.delete(uri);
+		if (!generation.valid) {
+			await subscription.close().catch(() => undefined);
+			return;
+		}
 		await subscription.close();
 		await generation.connection.unsubscribe(uri);
 	}
