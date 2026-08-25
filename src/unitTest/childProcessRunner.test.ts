@@ -264,6 +264,19 @@ suite('ChildProcessRunner', () => {
 		);
 	});
 
+	test('returns bounded output for an explicitly accepted nonzero exit', async () => {
+		const runner = createNodeRunner();
+		const result = await runner.run(
+			process.execPath,
+			['-e', 'process.stderr.write(\"not-found\"); process.exit(2);'],
+			{ acceptedExitCodes: [2] },
+		);
+
+		assert.equal(result.exitCode, 2);
+		assert.equal(result.stdout, '');
+		assert.equal(result.stderr, 'not-found');
+	});
+
 	test('starts and stops one long-lived owned process group', {
 		skip: process.platform === 'win32',
 	}, async () => {

@@ -13,7 +13,10 @@ import {
 	OwnedChildProcess,
 } from '../tunnel/ChildProcessRunner';
 import { DevTunnelCliProvider } from '../tunnel/DevTunnelCliProvider';
-import { SUPPORTED_DEVTUNNEL_BUILD } from '../tunnel/DevTunnelJsonDecoder';
+import {
+	isExactDevTunnelNotFound,
+	SUPPORTED_DEVTUNNEL_BUILD,
+} from '../tunnel/DevTunnelJsonDecoder';
 import {
 	DevTunnelStateStore,
 	TunnelMetadata,
@@ -29,7 +32,7 @@ test('real Dev Tunnel lifecycle', { timeout: 180_000 }, async () => {
 		`${optInFlag}=1 is required because this test creates a public Dev Tunnel resource.`,
 	);
 	const executable = process.env.MESH_DEVTUNNEL_PATH ?? 'devtunnel';
-	const runner = new RecordingRunner(new ChildProcessRunner());
+	let runner: RecordingRunner | undefined;
 	const store = new MemoryStore();
 	const gateway = createServer((request, response) => {
 		if (request.method === 'GET' && request.url === '/healthz') {
@@ -75,7 +78,16 @@ test('real Dev Tunnel lifecycle', { timeout: 180_000 }, async () => {
 		wssProbeRequest: 'mesh-probe',
 	};
 	const provider = new DevTunnelCliProvider({
-		commandRunner: runner,
+		commandRunnerFactory: (allowedExecutableBasename) => {
+			const created = new RecordingRunner(
+				new ChildProcessRunner({
+					allowedExecutableBasenames: [allowedExecutableBasename],
+				}),
+				allowedExecutableBasename,
+			);
+			runner = created;
+			return created;
+		},
 		executable,
 		maxRestartAttempts: 5,
 		random: () => 0,
@@ -88,6 +100,7 @@ test('real Dev Tunnel lifecycle', { timeout: 180_000 }, async () => {
 	let cleanupConfirmed = false;
 	try {
 		const hosted = await provider.ensureHosted(request);
+		const activeRunner = requireRunner(runner);
 		assert.equal(hosted.build, SUPPORTED_DEVTUNNEL_BUILD);
 		assert.equal(new URL(hosted.forwardingOrigin).protocol, 'https:');
 
@@ -97,23 +110,23 @@ test('real Dev Tunnel lifecycle', { timeout: 180_000 }, async () => {
 		const firstOrigin = hosted.forwardingOrigin;
 		const fixtureOutput = process.env.MESH_DEVTUNNEL_FIXTURE_OUT;
 		if (fixtureOutput !== undefined) {
-			const shown = await runner.runVerified(['show', hosted.tunnelId, '--json']);
+			const shown = await activeRunner.runVerified(['show', hosted.tunnelId, '--json']);
 			await writeFile(
 				fixtureOutput,
 				sanitizeHostedFixture(shown.stdout, hosted.tunnelId, request.localPort),
 				{ encoding: 'utf8', flag: 'wx' },
 			);
 		}
-		assert.equal(runner.hosts.length, 1);
-		await runner.hosts[0].stop();
+		assert.equal(activeRunner.hosts.length, 1);
+		await activeRunner.hosts[0].stop();
 		await waitFor(
-			() => runner.hosts.length >= 2
+			() => activeRunner.hosts.length >= 2
 				&& ['ready', 'circuit-open'].includes(provider.getStatus().state),
 			60_000,
 			() => {
 				const status = provider.getStatus();
 				return JSON.stringify({
-					hosts: runner.hosts.length,
+					hosts: activeRunner.hosts.length,
 					state: status.state,
 					code: status.state === 'circuit-open' ? status.code : undefined,
 					message: status.state === 'circuit-open' ? status.message : undefined,
@@ -125,8 +138,8 @@ test('real Dev Tunnel lifecycle', { timeout: 180_000 }, async () => {
 			restartedStatus.state,
 			'ready',
 			restartedStatus.state === 'circuit-open'
-				? `${restartedStatus.message}; observed port status: ${runner.lastPortStatus}`
-					+ `; observed shape: ${runner.lastShowShape}`
+				? `${restartedStatus.message}; observed port status: ${activeRunner.lastPortStatus}`
+					+ `; observed shape: ${activeRunner.lastShowShape}`
 				: undefined,
 		);
 		if (restartedStatus.state === 'ready') {
@@ -148,9 +161,14 @@ test('real Dev Tunnel lifecycle', { timeout: 180_000 }, async () => {
 			&& metadata.tunnelId.startsWith(`${request.tunnelAlias}.`)
 		) {
 			try {
-				await runner.runVerified(['delete', metadata.tunnelId]);
-				await assert.rejects(runner.runVerified(['show', metadata.tunnelId, '--json']));
+				const activeRunner = requireRunner(runner);
+				await activeRunner.runVerified(['delete', metadata.tunnelId]);
+				await confirmOwnedTunnelDeleted(activeRunner, metadata);
 				cleanupConfirmed = true;
+				console.log(JSON.stringify({
+					build: metadata.build,
+					cleanup: 'confirmed-by-owned-id-and-exact-not-found',
+				}));
 			} catch (error: unknown) {
 				cleanupFailure ??= error;
 			}
@@ -177,6 +195,7 @@ test('real Dev Tunnel lifecycle', { timeout: 180_000 }, async () => {
 		cleanup: 'confirmed-by-owned-id',
 		health: 'https-204',
 		hostRestart: 'passed',
+		runnerBasename: requireRunner(runner).allowedExecutableBasename,
 		status: 'passed',
 		wss: 'passed',
 	}));
@@ -188,7 +207,10 @@ class RecordingRunner {
 	lastShowShape = '<absent>';
 	private verifiedExecutable: string | undefined;
 
-	constructor(private readonly runner: ChildProcessRunner) {}
+	constructor(
+		private readonly runner: ChildProcessRunner,
+		readonly allowedExecutableBasename: string,
+	) {}
 
 	async run(
 		executable: string,
@@ -197,7 +219,7 @@ class RecordingRunner {
 	): Promise<ChildProcessResult> {
 		this.verifiedExecutable = executable;
 		const result = await this.runner.run(executable, args, options);
-		if (args[0] === 'show') {
+		if (args[0] === 'show' && result.exitCode === 0) {
 			const parsed = JSON.parse(result.stdout) as {
 				tunnel?: { ports?: Array<{ status?: unknown }> };
 			};
@@ -219,18 +241,53 @@ class RecordingRunner {
 		return result;
 	}
 
-	runVerified(args: readonly string[]): Promise<ChildProcessResult> {
+	runVerified(
+		args: readonly string[],
+		options?: ChildProcessRunOptions,
+	): Promise<ChildProcessResult> {
 		if (this.verifiedExecutable === undefined) {
 			throw new Error('The Dev Tunnel executable has not been verified by the provider.');
 		}
-		return this.run(this.verifiedExecutable, args);
+		return this.run(this.verifiedExecutable, args, options);
 	}
-
 	async startOwned(executable: string, args: readonly string[]): Promise<OwnedChildProcess> {
 		const host = await this.runner.startOwned(executable, args);
 		this.hosts.push(host);
 		return host;
 	}
+}
+
+function requireRunner(runner: RecordingRunner | undefined): RecordingRunner {
+	assert.ok(runner, 'The provider did not construct its hash-gated process runner.');
+	return runner;
+}
+
+async function confirmOwnedTunnelDeleted(
+	runner: RecordingRunner,
+	metadata: TunnelMetadata,
+): Promise<void> {
+	const deadline = Date.now() + 30_000;
+	let lastObservation = 'no response';
+	do {
+		try {
+			const shown = await runner.runVerified(
+				['show', metadata.tunnelId, '--json'],
+				{ acceptedExitCodes: [2] },
+			);
+			if (isExactDevTunnelNotFound(metadata.build, shown, metadata.tunnelId)) {
+				return;
+			}
+			lastObservation = `exit ${shown.exitCode}`;
+		} catch {
+			lastObservation = 'transient command failure';
+		}
+		if (Date.now() < deadline) {
+			await new Promise((resolve) => setTimeout(resolve, 500));
+		}
+	} while (Date.now() < deadline);
+	throw new Error(
+		`Owned tunnel cleanup never returned the exact versioned not-found response (${lastObservation}).`,
+	);
 }
 
 class MemoryStore implements DevTunnelStateStore {

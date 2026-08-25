@@ -29,6 +29,7 @@ export interface ChildProcessResult {
 }
 
 export interface ChildProcessRunOptions {
+	readonly acceptedExitCodes?: readonly number[];
 	readonly signal?: AbortSignal;
 	readonly timeoutMs?: number;
 	readonly maxOutputBytes?: number;
@@ -125,11 +126,17 @@ export class ChildProcessRunner {
 
 		const timeoutMs = options.timeoutMs ?? this.defaultTimeoutMs;
 		const maxOutputBytes = options.maxOutputBytes ?? this.defaultMaxOutputBytes;
+		const acceptedExitCodes = new Set(options.acceptedExitCodes ?? []);
 		if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
 			return Promise.reject(new RangeError('timeoutMs must be a positive safe integer.'));
 		}
 		if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes <= 0) {
 			return Promise.reject(new RangeError('maxOutputBytes must be a positive safe integer.'));
+		}
+		if (
+			[...acceptedExitCodes].some((code) => !Number.isSafeInteger(code) || code <= 0)
+		) {
+			return Promise.reject(new RangeError('acceptedExitCodes must contain positive safe integers.'));
 		}
 
 		const child = spawn(executable, [...args], {
@@ -146,6 +153,7 @@ export class ChildProcessRunner {
 			let closeObserved = false;
 			let finalError: ChildProcessExecutionError | undefined;
 			let finalizing = false;
+			let observedExitCode = 0;
 			let resolveClose: (() => void) | undefined;
 			let settled = false;
 			let timeoutTimer: NodeJS.Timeout | undefined;
@@ -179,7 +187,7 @@ export class ChildProcessRunner {
 					return;
 				}
 				const result = {
-					exitCode: 0,
+					exitCode: observedExitCode,
 					stdout: Buffer.concat(stdoutChunks).toString('utf8'),
 					stderr: Buffer.concat(stderrChunks).toString('utf8'),
 				};
@@ -348,6 +356,11 @@ export class ChildProcessRunner {
 			)));
 			child.once('exit', (exitCode) => {
 				if (exitCode !== 0) {
+					if (exitCode !== null && acceptedExitCodes.has(exitCode)) {
+						observedExitCode = exitCode;
+						finalize();
+						return;
+					}
 					finalize(new ChildProcessExecutionError(
 						'PROCESS_EXIT_NONZERO',
 						`The process exited with code ${exitCode ?? 'unknown'}.`,

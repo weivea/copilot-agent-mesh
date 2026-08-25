@@ -5,7 +5,7 @@
 
 ## Compatibility gate
 
-The provider supports exactly `devtunnel 1.0.2030+fc9273aa0f` on the validated
+The strict JSON provider targets exactly `devtunnel 1.0.2030+fc9273aa0f` on the validated
 macOS arm64 path. The official Homebrew cask currently resolves that build to:
 
 - URL: `https://tunnelsassetsprod.blob.core.windows.net/cli/1.0.2030+fc9273aa0f/osx-arm64-devtunnel`
@@ -16,12 +16,24 @@ macOS arm64 path. The official Homebrew cask currently resolves that build to:
 
 The installed global CLI is only probed. The provider never runs an installer or changes
 the user's global CLI. A downloaded exact binary may be selected explicitly with
-`MESH_DEVTUNNEL_PATH` for the opt-in test.
+`MESH_DEVTUNNEL_PATH` for the opt-in test. After hashing the resolved executable, the
+provider creates a runner allowlist for its exact basename, including the official
+`osx-arm64-devtunnel` download name.
 
 Build `1.0.2006+dd9fe5139f` remains unsupported because `create --json` emits ordinary
 text before the JSON document. Build 2030 fixes that issue. Its hosted `show --json`
 contract uses the single `portUri` field; the decoder intentionally rejects
 `portForwardingUris` rather than accepting a permissive cross-version union.
+
+The complete lifecycle gate is currently **NO-GO**. The required command
+`host <qualified-id> --port-number <fixed-port>` exits on the official 2030 build with
+`Invalid arguments. Batch update of ports is not supported. Add, update, or delete ports
+individually instead.` This occurs with both an already configured port and an empty
+persistent tunnel. The same command without `--port-number` works but is intentionally not
+used because it does not satisfy fixed-port host scoping. Homebrew and the public release
+channels currently expose no newer exact build. The provider reports permanent
+`CLI_UNSUPPORTED`, does not silently drop the port argument, and does not upgrade the global
+CLI.
 
 ## Lifecycle
 
@@ -40,14 +52,20 @@ contract uses the single `portUri` field; the decoder intentionally rejects
 8. A real WSS request/response probe with the same anti-phishing header.
 
 The store records the exact build, decoder revision, qualified tunnel ID, fixed port,
-ownership label, tunnel expiration, ACE index, and ACE expiration. Renewal uses the
-validated order `access delete --index 0` followed by a new port-scoped anonymous ACE.
-A failed renewal opens `TUNNEL_ACCESS_EXPIRED` and does not retry indefinitely.
+ownership label, tunnel expiration, ACE index, and ACE expiration. Before renewal deletes
+anything, `access list --port-number <fixed-port> --json` must contain exactly the persisted
+index-zero anonymous/connect ACE with the persisted expiration. Renewal then uses
+`access delete --index 0` followed by a new port-scoped anonymous ACE. Ownership mismatch
+or a failure after deletion starts opens `TUNNEL_ACCESS_EXPIRED`; a timeout or network
+failure while inspecting the ACE remains transient and performs no deletion.
 
-An unexpected host exit starts full-jitter bounded backoff and repeats JSON discovery,
+The host command always includes `--port-number <fixed-port>`, and `show --json` must contain
+no additional ports. An unexpected host exit starts full-jitter bounded backoff and repeats JSON discovery,
 HTTPS health, and WSS probes. Permanent build, schema, login, missing-resource, and
 expired-access failures open the circuit breaker. `stop()` cancels pending restart timers
-and terminates only the owned process group. It does not delete the persistent tunnel.
+plus in-flight CLI, JSON discovery, HTTPS, WSS, and backoff work, and terminates only the
+owned process group. A stopped generation cannot publish later state. It does not delete
+the persistent tunnel.
 
 If the persisted port differs from the requested port, or no longer serves the expected
 loopback health endpoint, startup fails with `PORT_MIGRATION_REQUIRED` or `PORT_CONFLICT`.
@@ -62,19 +80,21 @@ Offline tests are the default:
 npm run test:unit
 ```
 
-The real test is opt-in and requires a logged-in exact CLI:
+The real test is opt-in and requires a logged-in exact CLI. It currently remains a failing
+release gate until an exact official build supports the required host command:
 
 ```sh
 MESH_DEVTUNNEL_E2E=1 \
-MESH_DEVTUNNEL_PATH=/path/to/devtunnel-1.0.2030 \
+MESH_DEVTUNNEL_PATH=/path/to/osx-arm64-devtunnel \
 npm run test:dev-tunnel-real
 ```
 
 It starts a loopback fake agent endpoint, verifies real HTTPS `204` and WSS transport,
 renews the ACE, kills and restarts the owned host while preserving the public URI, and
 deletes only the unique tunnel ID recorded by its in-memory ownership store. Cleanup is
-confirmed by an exact-ID `show --json` failure; the test never uses `list --json` or
-wildcard cleanup.
+confirmed only by build 2030's exact exit-2, empty-stdout, cluster-qualified not-found
+response from exact-ID `show --json`; timeout, network failure, and any other transient
+error fail the test. The test never uses `list --json` or wildcard cleanup.
 
 The fixture at
 `docs/mvp/fixtures/devtunnel-show-1.0.2030-hosted.sanitized.json` was captured from that

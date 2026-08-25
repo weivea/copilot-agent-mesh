@@ -54,6 +54,17 @@ export interface DecodedAccess {
 	readonly index: 0;
 }
 
+export interface DecodeAccessListOptions {
+	readonly expectedExpiration: string;
+	readonly expectedIndex: number;
+}
+
+export interface DevTunnelCommandOutput {
+	readonly exitCode: number;
+	readonly stderr: string;
+	readonly stdout: string;
+}
+
 const allowedRootKeys = new Set(['tunnel']);
 const allowedTunnelKeys = new Set([
 	'accessControl',
@@ -157,24 +168,7 @@ export function decodeDevTunnelAccessCreateJson(
 	if (!Array.isArray(root.accessControlEntries) || root.accessControlEntries.length !== 1) {
 		throw new DevTunnelDecodeError('ACCESS_INVALID', 'Dev Tunnel did not create exactly one access entry.');
 	}
-	const entry = requireRecord(
-		root.accessControlEntries[0],
-		'ACCESS_INVALID',
-		'Dev Tunnel access entry must be an object.',
-	);
-	assertKnownKeys(entry, allowedAccessEntryKeys);
-	if (
-		entry.type !== 'Anonymous'
-		|| !Array.isArray(entry.subjects)
-		|| entry.subjects.length !== 0
-		|| !Array.isArray(entry.scopes)
-		|| entry.scopes.length !== 1
-		|| entry.scopes[0] !== 'connect'
-		|| typeof entry.expiration !== 'string'
-	) {
-		throw new DevTunnelDecodeError('ACCESS_INVALID', 'Dev Tunnel created an unexpected access entry.');
-	}
-	const expiration = new Date(entry.expiration);
+	const expiration = decodeOwnedAnonymousAccessEntry(root.accessControlEntries[0]);
 	if (!Number.isFinite(expiration.valueOf()) || expiration.valueOf() <= now.valueOf()) {
 		throw new DevTunnelDecodeError('ACCESS_INVALID', 'Dev Tunnel access expiration is invalid.');
 	}
@@ -182,6 +176,36 @@ export function decodeDevTunnelAccessCreateJson(
 		expiresAt: expiration.toISOString(),
 		index: 0,
 	};
+}
+
+export function decodeDevTunnelAccessListJson(
+	build: string,
+	raw: string,
+	options: DecodeAccessListOptions,
+): void {
+	assertSupportedBuild(build);
+	const root = parseRoot(raw, new Set(['accessControlEntries']));
+	if (
+		options.expectedIndex !== 0
+		|| !Array.isArray(root.accessControlEntries)
+		|| root.accessControlEntries.length !== 1
+	) {
+		throw new DevTunnelDecodeError(
+			'ACCESS_INVALID',
+			'The port must have exactly one provider-owned access entry at index zero.',
+		);
+	}
+	const expiration = decodeOwnedAnonymousAccessEntry(root.accessControlEntries[0]);
+	const expectedExpiration = new Date(options.expectedExpiration);
+	if (
+		!Number.isFinite(expectedExpiration.valueOf())
+		|| expiration.toISOString() !== expectedExpiration.toISOString()
+	) {
+		throw new DevTunnelDecodeError(
+			'ACCESS_INVALID',
+			'The provider-owned access entry expiration no longer matches metadata.',
+		);
+	}
 }
 
 export function decodeDevTunnelAccessDeleteJson(build: string, raw: string): void {
@@ -232,8 +256,7 @@ export function decodeDevTunnelShowJson(
 		validatePortRecord(record);
 		return record;
 	});
-	const matchingPorts = ports.filter((port) => port.portNumber === options.expectedPort);
-	if (matchingPorts.length === 0 && options.allowMissingPort === true) {
+	if (ports.length === 0 && options.allowMissingPort === true) {
 		return {
 			tunnelId: options.expectedTunnelId,
 			port: options.expectedPort,
@@ -241,6 +264,13 @@ export function decodeDevTunnelShowJson(
 			protocol: 'http',
 		};
 	}
+	if (ports.length !== 1) {
+		throw new DevTunnelDecodeError(
+			'PORT_NOT_FOUND',
+			'Dev Tunnel output must contain exactly the one provider-owned port.',
+		);
+	}
+	const matchingPorts = ports.filter((port) => port.portNumber === options.expectedPort);
 	if (matchingPorts.length !== 1) {
 		throw new DevTunnelDecodeError('PORT_NOT_FOUND', 'Dev Tunnel output did not contain one matching port.');
 	}
@@ -278,6 +308,26 @@ export function decodeDevTunnelShowJson(
 
 export function computeSanitizedFixtureHash(raw: string): string {
 	return createHash('sha256').update(raw, 'utf8').digest('hex');
+}
+
+export function isExactDevTunnelNotFound(
+	build: string,
+	output: DevTunnelCommandOutput,
+	expectedTunnelId: string,
+): boolean {
+	if (build !== SUPPORTED_DEVTUNNEL_BUILD || output.exitCode !== 2 || output.stdout !== '') {
+		return false;
+	}
+	const separator = expectedTunnelId.lastIndexOf('.');
+	if (separator <= 0 || separator === expectedTunnelId.length - 1) {
+		return false;
+	}
+	const alias = expectedTunnelId.slice(0, separator);
+	const cluster = expectedTunnelId.slice(separator + 1);
+	if (!/^[a-z][a-z0-9]{5,48}$/u.test(alias) || !/^[a-z0-9]+$/u.test(cluster)) {
+		return false;
+	}
+	return output.stderr === `Tunnel not found in ${cluster}: ${alias}\n`;
 }
 
 function assertSupportedBuild(build: string): void {
@@ -354,6 +404,31 @@ function validateTunnelSummary(tunnel: Record<string, unknown>): void {
 	assertOptionalString(tunnel.uploadTotal);
 	assertOptionalString(tunnel.downloadTotal);
 	assertOptionalArray(tunnel.accessControl);
+}
+
+function decodeOwnedAnonymousAccessEntry(value: unknown): Date {
+	const entry = requireRecord(
+		value,
+		'ACCESS_INVALID',
+		'Dev Tunnel access entry must be an object.',
+	);
+	assertKnownKeys(entry, allowedAccessEntryKeys);
+	if (
+		entry.type !== 'Anonymous'
+		|| !Array.isArray(entry.subjects)
+		|| entry.subjects.length !== 0
+		|| !Array.isArray(entry.scopes)
+		|| entry.scopes.length !== 1
+		|| entry.scopes[0] !== 'connect'
+		|| typeof entry.expiration !== 'string'
+	) {
+		throw new DevTunnelDecodeError('ACCESS_INVALID', 'Dev Tunnel returned an unexpected access entry.');
+	}
+	const expiration = new Date(entry.expiration);
+	if (!Number.isFinite(expiration.valueOf())) {
+		throw new DevTunnelDecodeError('ACCESS_INVALID', 'Dev Tunnel access expiration is invalid.');
+	}
+	return expiration;
 }
 
 function requireRecord(

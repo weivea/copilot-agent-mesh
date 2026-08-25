@@ -6,9 +6,11 @@ import { suite, test } from 'node:test';
 import {
 	computeSanitizedFixtureHash,
 	DEVTUNNEL_HOSTED_FIXTURE_SHA256,
+	decodeDevTunnelAccessListJson,
 	decodeDevTunnelShowJson as decodeDevTunnelShowForBuild,
 	DevTunnelDecodeError,
 	LEGACY_UNSUPPORTED_DEVTUNNEL_BUILD,
+	isExactDevTunnelNotFound,
 	SUPPORTED_DEVTUNNEL_BUILD,
 } from '../tunnel/DevTunnelJsonDecoder';
 
@@ -126,6 +128,35 @@ suite('DevTunnelJsonDecoder', () => {
 		);
 	});
 
+	test('rejects any additional valid tunnel port', () => {
+		const fixture = createHostedFixture();
+		(fixture.tunnel.ports as Array<Record<string, unknown>>).push({
+			portNumber: 43124,
+			protocol: 'http',
+			portUri: 'https://fixture-43124.asse.devtunnels.ms/',
+		});
+
+		assert.throws(
+			() => decodeDevTunnelShowJson(JSON.stringify(fixture), { expectedTunnelId, expectedPort }),
+			(error: unknown) => hasCode(error, 'PORT_NOT_FOUND'),
+		);
+	});
+
+	test('does not treat a different existing port as a missing requested port', () => {
+		const fixture = createHostedFixture();
+		(fixture.tunnel.ports as Array<Record<string, unknown>>)[0].portNumber = 43124;
+
+		assert.throws(
+			() => decodeDevTunnelShowForBuild(SUPPORTED_DEVTUNNEL_BUILD, JSON.stringify(fixture), {
+				allowMissingPort: true,
+				expectedTunnelId,
+				expectedPort,
+				requireForwardingUri: false,
+			}),
+			(error: unknown) => hasCode(error, 'PORT_NOT_FOUND'),
+		);
+	});
+
 	test('rejects an invalid non-target port shape', () => {
 		const fixture = createHostedFixture();
 		(fixture.tunnel.ports as Array<Record<string, unknown>>).unshift({});
@@ -187,6 +218,61 @@ suite('DevTunnelJsonDecoder', () => {
 			);
 		});
 	}
+
+	test('requires one exact provider-owned ACE before deletion', () => {
+		const expiration = '2026-08-27T01:45:25.005839Z';
+		const entry = {
+			type: 'Anonymous',
+			subjects: [],
+			scopes: ['connect'],
+			expiration,
+		};
+
+		assert.doesNotThrow(() => decodeDevTunnelAccessListJson(
+			SUPPORTED_DEVTUNNEL_BUILD,
+			JSON.stringify({ accessControlEntries: [entry] }),
+			{ expectedExpiration: expiration, expectedIndex: 0 },
+		));
+		assert.throws(
+			() => decodeDevTunnelAccessListJson(
+				SUPPORTED_DEVTUNNEL_BUILD,
+				JSON.stringify({ accessControlEntries: [entry, entry] }),
+				{ expectedExpiration: expiration, expectedIndex: 0 },
+			),
+			(error: unknown) => hasCode(error, 'ACCESS_INVALID'),
+		);
+		assert.throws(
+			() => decodeDevTunnelAccessListJson(
+				SUPPORTED_DEVTUNNEL_BUILD,
+				JSON.stringify({ accessControlEntries: [entry] }),
+				{ expectedExpiration: '2026-08-27T02:45:25.005839Z', expectedIndex: 0 },
+			),
+			(error: unknown) => hasCode(error, 'ACCESS_INVALID'),
+		);
+	});
+
+	test('recognizes only the exact build-specific not-found response', () => {
+		const exact = {
+			exitCode: 2,
+			stdout: '',
+			stderr: 'Tunnel not found in jpe1: came2etest\n',
+		};
+		assert.equal(isExactDevTunnelNotFound(
+			SUPPORTED_DEVTUNNEL_BUILD,
+			exact,
+			'came2etest.jpe1',
+		), true);
+		assert.equal(isExactDevTunnelNotFound(
+			SUPPORTED_DEVTUNNEL_BUILD,
+			{ ...exact, stderr: 'network unavailable\n' },
+			'came2etest.jpe1',
+		), false);
+		assert.equal(isExactDevTunnelNotFound(
+			LEGACY_UNSUPPORTED_DEVTUNNEL_BUILD,
+			exact,
+			'came2etest.jpe1',
+		), false);
+	});
 });
 
 function createHostedFixture() {

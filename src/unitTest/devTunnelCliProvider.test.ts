@@ -2,11 +2,16 @@ import * as assert from 'node:assert/strict';
 import { suite, test } from 'node:test';
 
 import {
+	ChildProcessExecutionError,
+	ChildProcessRunOptions,
 	ChildProcessResult,
 	OwnedChildProcess,
 	OwnedChildProcessExit,
 } from '../tunnel/ChildProcessRunner';
-import { DevTunnelCliProvider } from '../tunnel/DevTunnelCliProvider';
+import {
+	DevTunnelCliProvider,
+	DevTunnelCliProviderOptions,
+} from '../tunnel/DevTunnelCliProvider';
 import {
 	DEVTUNNEL_DECODER_REVISION,
 	SUPPORTED_DEVTUNNEL_BUILD,
@@ -89,6 +94,34 @@ suite('DevTunnelCliProvider', () => {
 		assert.equal(runner.commands.some((args) => args[0] === 'create'), false);
 	});
 
+	test('constructs the default runner boundary from the verified official basename', async () => {
+		const runner = new FakeRunner();
+		let allowedBasename: string | undefined;
+		const provider = new DevTunnelCliProvider({
+			architecture: 'arm64',
+			binaryVerifier: async () => true,
+			commandRunnerFactory: (basename) => {
+				allowedBasename = basename;
+				return runner;
+			},
+			executable: '/download/osx-arm64-devtunnel',
+			healthProbe: async () => undefined,
+			localHealthProbe: async () => undefined,
+			now: () => now,
+			platform: 'darwin',
+			resolveExecutable: async () => '/verified/osx-arm64-devtunnel',
+			showPollIntervalMs: 1,
+			showTimeoutMs: 100,
+			stateStore: new MemoryStore(),
+			wssProbe: async () => undefined,
+		});
+
+		await provider.ensureHosted(request);
+
+		assert.equal(allowedBasename, 'osx-arm64-devtunnel');
+		await provider.stop();
+	});
+
 	test('rejects a differing concurrent request instead of coalescing it', async () => {
 		const runner = new FakeRunner();
 		runner.pauseCreate = true;
@@ -124,6 +157,7 @@ suite('DevTunnelCliProvider', () => {
 			random: () => 0.9,
 			restartBaseDelayMs: 50,
 		});
+
 		await provider.ensureHosted(request);
 
 		runner.hosts[0].finish({ exitCode: 1, signal: null });
@@ -133,6 +167,73 @@ suite('DevTunnelCliProvider', () => {
 
 		assert.equal(runner.hosts.length, 1);
 		assert.equal(provider.getStatus().state, 'stopped');
+	});
+
+	test('aborts an in-flight create without overwriting stopped state', async () => {
+		const runner = new FakeRunner();
+		runner.pauseCreate = true;
+		const store = new MemoryStore();
+		const provider = createProvider(runner, store);
+		const starting = provider.ensureHosted(request);
+		await runner.waitForCreate();
+
+		await provider.stop();
+		await assert.rejects(starting);
+
+		assert.equal(provider.getStatus().state, 'stopped');
+		assert.equal(store.value, undefined);
+		assert.equal(runner.commands.some((args) => args.slice(0, 2).join(' ') === 'port create'), false);
+		assert.equal(runner.hosts.length, 0);
+	});
+
+	test('aborts in-flight port configuration before access or host side effects', async () => {
+		const runner = new FakeRunner();
+		runner.pausePortCreate = true;
+		const store = new MemoryStore();
+		const provider = createProvider(runner, store);
+		const starting = provider.ensureHosted(request);
+		await runner.waitForPortCreate();
+
+		await provider.stop();
+		await assert.rejects(starting);
+
+		assert.equal(provider.getStatus().state, 'stopped');
+		assert.equal(store.value?.provisioned, false);
+		assert.equal(runner.commands.some((args) => args.slice(0, 2).join(' ') === 'access create'), false);
+		assert.equal(runner.hosts.length, 0);
+	});
+
+	test('aborts WSS readiness and keeps the stopped lifecycle authoritative', async () => {
+		let reachProbe: (() => void) | undefined;
+		const probeReached = new Promise<void>((resolve) => {
+			reachProbe = resolve;
+		});
+		const runner = new FakeRunner();
+		const provider = createProvider(runner, new MemoryStore(), {
+			wssProbe: async (
+				_forwardingOrigin,
+				_path,
+				_requestMessage,
+				_expectedResponse,
+				options,
+			) => new Promise<void>((_resolve, reject) => {
+				reachProbe?.();
+				const abort = (): void => reject(new DevTunnelProviderError(
+					'WSS_PROBE_FAILED',
+					'Injected WSS abort.',
+					true,
+				));
+				options?.signal?.addEventListener('abort', abort, { once: true });
+			}),
+		});
+		const starting = provider.ensureHosted(request);
+		await probeReached;
+
+		await provider.stop();
+		await assert.rejects(starting);
+
+		assert.equal(provider.getStatus().state, 'stopped');
+		assert.equal(runner.hosts[0].stopCount, 1);
 	});
 
 	test('renews the owned port-scoped ACE and persists its expiration', async () => {
@@ -148,6 +249,95 @@ suite('DevTunnelCliProvider', () => {
 		assert.ok(runner.commands.some((args) => args.slice(0, 2).join(' ') === 'access delete'));
 		assert.equal(store.value?.accessExpiresAt, runner.accessExpiration);
 		await provider.stop();
+	});
+
+	test('serializes concurrent access renewals', async () => {
+		const runner = new FakeRunner();
+		const provider = createProvider(runner, new MemoryStore());
+		await provider.ensureHosted(request);
+		runner.accessExpiration = '2026-09-08T01:00:00.000Z';
+
+		const [first, second] = await Promise.all([
+			provider.renewAccess(),
+			provider.renewAccess(),
+		]);
+
+		assert.deepStrictEqual(second, first);
+		assert.equal(
+			runner.commands.filter((args) => args.slice(0, 2).join(' ') === 'access list').length,
+			1,
+		);
+		assert.equal(
+			runner.commands.filter((args) => args.slice(0, 2).join(' ') === 'access delete').length,
+			1,
+		);
+		await provider.stop();
+	});
+
+	test('refuses to delete when the current ACE set is not uniquely provider-owned', async () => {
+		const runner = new FakeRunner();
+		const provider = createProvider(runner, new MemoryStore());
+		await provider.ensureHosted(request);
+		runner.extraAccessEntry = true;
+
+		await assert.rejects(
+			provider.renewAccess(),
+			(error: unknown) => hasProviderCode(error, 'TUNNEL_ACCESS_EXPIRED'),
+		);
+
+		assert.equal(runner.commands.some((args) => args.slice(0, 2).join(' ') === 'access delete'), false);
+		assert.equal(provider.getStatus().state, 'circuit-open');
+	});
+
+	test('keeps a pre-delete access-list timeout transient', async () => {
+		const runner = new FakeRunner();
+		const provider = createProvider(runner, new MemoryStore());
+		await provider.ensureHosted(request);
+		runner.accessListTimeout = true;
+
+		await assert.rejects(
+			provider.renewAccess(),
+			(error: unknown) => {
+				assert.ok(error instanceof DevTunnelProviderError);
+				assert.equal(error.code, 'CLI_COMMAND_FAILED');
+				assert.equal(error.retryable, true);
+				return true;
+			},
+		);
+
+		assert.equal(runner.commands.some((args) => args.slice(0, 2).join(' ') === 'access delete'), false);
+		assert.equal(provider.getStatus().state, 'ready');
+		await provider.stop();
+	});
+
+	test('classifies only exact show not-found as permanent', async () => {
+		const missingRunner = new FakeRunner();
+		missingRunner.showNotFound = true;
+		const missingProvider = createProvider(
+			missingRunner,
+			new MemoryStore(createMetadata()),
+		);
+		await assert.rejects(
+			missingProvider.ensureHosted(request),
+			(error: unknown) => hasProviderCode(error, 'TUNNEL_NOT_FOUND'),
+		);
+
+		const timeoutRunner = new FakeRunner();
+		timeoutRunner.showTimeout = true;
+		const timeoutProvider = createProvider(
+			timeoutRunner,
+			new MemoryStore(createMetadata()),
+		);
+		await assert.rejects(
+			timeoutProvider.ensureHosted(request),
+			(error: unknown) => {
+				assert.ok(error instanceof DevTunnelProviderError);
+				assert.equal(error.code, 'CLI_COMMAND_FAILED');
+				assert.equal(error.retryable, true);
+				return true;
+			},
+		);
+		assert.notEqual(timeoutProvider.getStatus().state, 'circuit-open');
 	});
 
 	test('resumes an owned tunnel interrupted before fixed-port provisioning', async () => {
@@ -204,25 +394,95 @@ suite('DevTunnelCliProvider', () => {
 			assert.equal(status.code, 'CLI_UNSUPPORTED');
 		}
 	});
+
+	test('cancels readiness when the owned host exits before WSS succeeds', async () => {
+		let reachProbe: (() => void) | undefined;
+		const probeReached = new Promise<void>((resolve) => {
+			reachProbe = resolve;
+		});
+		let readinessAborted = false;
+		const runner = new FakeRunner();
+		const provider = createProvider(runner, new MemoryStore(), {
+			wssProbe: async (
+				_forwardingOrigin,
+				_path,
+				_requestMessage,
+				_expectedResponse,
+				options,
+			) => new Promise<void>((_resolve, reject) => {
+				reachProbe?.();
+				const abort = (): void => {
+					readinessAborted = true;
+					reject(new DevTunnelProviderError('WSS_PROBE_FAILED', 'Injected WSS abort.', true));
+				};
+				options?.signal?.addEventListener('abort', abort, { once: true });
+			}),
+		});
+		const starting = provider.ensureHosted(request);
+		await probeReached;
+
+		runner.hosts[0].finish({ exitCode: 1, signal: null });
+		await assert.rejects(
+			starting,
+			(error: unknown) => hasProviderCode(error, 'CLI_UNSUPPORTED'),
+		);
+
+		assert.equal(readinessAborted, true);
+		assert.equal(runner.hosts[0].stopCount, 1);
+		assert.equal(provider.getStatus().state, 'circuit-open');
+	});
+
+	test('does not publish ready when the host exits during hosted-state persistence', async () => {
+		const runner = new FakeRunner();
+		const store = new MemoryStore();
+		store.beforeSave = (metadata) => {
+			if (metadata.forwardingOrigin !== undefined) {
+				runner.hosts[0].finish({ exitCode: 1, signal: null });
+			}
+		};
+		const provider = createProvider(runner, store);
+
+		await assert.rejects(
+			provider.ensureHosted(request),
+			(error: unknown) => hasProviderCode(error, 'CLI_UNSUPPORTED'),
+		);
+
+		assert.equal(provider.getStatus().state, 'circuit-open');
+		assert.equal(runner.hosts[0].stopCount, 1);
+	});
 });
 
 class FakeRunner {
 	readonly commands: string[][] = [];
 	readonly hosts: FakeOwnedHost[] = [];
 	accessExpiration = '2026-09-01T01:00:00.000Z';
+	listedAccessExpiration = '2026-09-01T01:00:00.000Z';
+	accessListTimeout = false;
 	failAccessCreate = false;
+	extraAccessEntry = false;
 	hasPort = true;
 	invalidShow = false;
 	pauseCreate = false;
+	pausePortCreate = false;
+	showNotFound = false;
+	showTimeout = false;
 	private createContinuation: (() => void) | undefined;
 	private createReached: (() => void) | undefined;
 	private readonly createReachedPromise = new Promise<void>((resolve) => {
 		this.createReached = resolve;
 	});
+	private portCreateReached: (() => void) | undefined;
+	private readonly portCreateReachedPromise = new Promise<void>((resolve) => {
+		this.portCreateReached = resolve;
+	});
 
 	constructor(private readonly build = SUPPORTED_DEVTUNNEL_BUILD) {}
 
-	async run(_executable: string, args: readonly string[]): Promise<ChildProcessResult> {
+	async run(
+		_executable: string,
+		args: readonly string[],
+		options?: ChildProcessRunOptions,
+	): Promise<ChildProcessResult> {
 		this.commands.push([...args]);
 		const command = args.slice(0, 2).join(' ');
 		if (args[0] === '--version') {
@@ -234,9 +494,7 @@ class FakeRunner {
 		if (args[0] === 'create') {
 			this.createReached?.();
 			if (this.pauseCreate) {
-				await new Promise<void>((resolve) => {
-					this.createContinuation = resolve;
-				});
+				await this.waitForCreateContinuation(options?.signal);
 			}
 			return result(JSON.stringify({
 				tunnel: {
@@ -253,6 +511,10 @@ class FakeRunner {
 			}));
 		}
 		if (command === 'port create') {
+			this.portCreateReached?.();
+			if (this.pausePortCreate) {
+				await this.waitForCreateContinuation(options?.signal);
+			}
 			this.hasPort = true;
 			return result(JSON.stringify({
 				port: {
@@ -264,10 +526,31 @@ class FakeRunner {
 				},
 			}));
 		}
+		if (command === 'access list') {
+			if (this.accessListTimeout) {
+				throw new ChildProcessExecutionError('PROCESS_TIMEOUT', 'Injected access-list timeout.');
+			}
+			const entries = [{
+				type: 'Anonymous',
+				subjects: [],
+				scopes: ['connect'],
+				expiration: this.listedAccessExpiration,
+			}];
+			if (this.extraAccessEntry) {
+				entries.push({
+					type: 'Anonymous',
+					subjects: [],
+					scopes: ['connect'],
+					expiration: this.listedAccessExpiration,
+				});
+			}
+			return result(JSON.stringify({ accessControlEntries: entries }));
+		}
 		if (command === 'access create') {
 			if (this.failAccessCreate) {
 				throw new Error('Injected access create failure.');
 			}
+			this.listedAccessExpiration = this.accessExpiration;
 			return result(JSON.stringify({
 				accessControlEntries: [{
 					type: 'Anonymous',
@@ -281,6 +564,16 @@ class FakeRunner {
 			return result(JSON.stringify({ accessControlEntries: [] }));
 		}
 		if (args[0] === 'show') {
+			if (this.showTimeout) {
+				throw new ChildProcessExecutionError('PROCESS_TIMEOUT', 'Injected show timeout.');
+			}
+			if (this.showNotFound) {
+				return {
+					exitCode: 2,
+					stdout: '',
+					stderr: 'Tunnel not found in jpe1: came2etest\n',
+				};
+			}
 			if (this.invalidShow) {
 				return result(JSON.stringify({
 					...hostedFixture(),
@@ -296,12 +589,41 @@ class FakeRunner {
 		return this.createReachedPromise;
 	}
 
+	waitForPortCreate(): Promise<void> {
+		return this.portCreateReachedPromise;
+	}
+
 	continueCreate(): void {
 		this.createContinuation?.();
 	}
 
+	private waitForCreateContinuation(signal?: AbortSignal): Promise<void> {
+		return new Promise((resolve, reject) => {
+			const abort = (): void => {
+				signal?.removeEventListener('abort', abort);
+				reject(new ChildProcessExecutionError(
+					'PROCESS_ABORTED',
+					'Injected create abort.',
+				));
+			};
+			this.createContinuation = () => {
+				signal?.removeEventListener('abort', abort);
+				resolve();
+			};
+			signal?.addEventListener('abort', abort, { once: true });
+			if (signal?.aborted === true) {
+				abort();
+			}
+		});
+	}
+
 	async startOwned(_executable: string, args: readonly string[]): Promise<OwnedChildProcess> {
-		assert.deepStrictEqual(args, ['host', tunnelId]);
+		assert.deepStrictEqual(args, [
+			'host',
+			tunnelId,
+			'--port-number',
+			String(request.localPort),
+		]);
 		const host = new FakeOwnedHost(this.hosts.length + 100);
 		this.hosts.push(host);
 		return host;
@@ -330,6 +652,8 @@ class FakeOwnedHost implements OwnedChildProcess {
 }
 
 class MemoryStore implements DevTunnelStateStore {
+	beforeSave: ((metadata: TunnelMetadata) => void) | undefined;
+
 	constructor(public value?: TunnelMetadata) {}
 
 	async load(): Promise<TunnelMetadata | undefined> {
@@ -337,6 +661,7 @@ class MemoryStore implements DevTunnelStateStore {
 	}
 
 	async save(metadata: TunnelMetadata): Promise<void> {
+		this.beforeSave?.(metadata);
 		this.value = metadata;
 	}
 }
@@ -348,6 +673,7 @@ function createProvider(
 		readonly binaryVerifier?: () => Promise<boolean>;
 		readonly random?: () => number;
 		readonly restartBaseDelayMs?: number;
+		readonly wssProbe?: DevTunnelCliProviderOptions['wssProbe'];
 	} = {},
 ): DevTunnelCliProvider {
 	return new DevTunnelCliProvider({
@@ -366,7 +692,7 @@ function createProvider(
 		showPollIntervalMs: 1,
 		showTimeoutMs: 100,
 		stateStore: store,
-		wssProbe: async () => undefined,
+		wssProbe: overrides.wssProbe ?? (async () => undefined),
 	});
 }
 

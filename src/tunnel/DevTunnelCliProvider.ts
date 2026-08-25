@@ -10,10 +10,12 @@ import {
 	DEVTUNNEL_EXECUTABLE_SHA256,
 	decodeDevTunnelAccessCreateJson,
 	decodeDevTunnelAccessDeleteJson,
+	decodeDevTunnelAccessListJson,
 	decodeDevTunnelCreateJson,
 	decodeDevTunnelPortCreateJson,
 	decodeDevTunnelShowJson,
 	DevTunnelDecodeError,
+	isExactDevTunnelNotFound,
 	LEGACY_UNSUPPORTED_DEVTUNNEL_BUILD,
 	SUPPORTED_DEVTUNNEL_BUILD,
 } from './DevTunnelJsonDecoder';
@@ -35,7 +37,7 @@ import {
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { realpath } from 'node:fs/promises';
-import { delimiter, isAbsolute, join } from 'node:path';
+import { basename, delimiter, isAbsolute, join } from 'node:path';
 
 interface DevTunnelCommandRunner {
 	run(
@@ -50,6 +52,7 @@ export interface DevTunnelCliProviderOptions {
 	readonly architecture?: string;
 	readonly binaryVerifier?: (executable: string) => Promise<boolean>;
 	readonly commandRunner?: DevTunnelCommandRunner;
+	readonly commandRunnerFactory?: (allowedExecutableBasename: string) => DevTunnelCommandRunner;
 	readonly executable?: string;
 	readonly healthProbe?: typeof probeDevTunnelHealth;
 	readonly localHealthProbe?: typeof probeLoopbackHealth;
@@ -77,7 +80,10 @@ const knownVersionLines = new Map([
 export class DevTunnelCliProvider implements DevTunnelProvider {
 	private readonly architecture: string;
 	private readonly binaryVerifier: (executable: string) => Promise<boolean>;
-	private readonly commandRunner: DevTunnelCommandRunner;
+	private commandRunner: DevTunnelCommandRunner | undefined;
+	private readonly commandRunnerFactory: (
+		allowedExecutableBasename: string,
+	) => DevTunnelCommandRunner;
 	private readonly executable: string;
 	private readonly healthProbe: typeof probeDevTunnelHealth;
 	private readonly localHealthProbe: typeof probeLoopbackHealth;
@@ -97,7 +103,9 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 	private inFlightRequest: TunnelRequest | undefined;
 	private host: OwnedChildProcess | undefined;
 	private lifecycleGeneration = 0;
+	private lifecycleAbortController: AbortController | undefined;
 	private metadata: TunnelMetadata | undefined;
+	private renewalPromise: Promise<TunnelMetadata> | undefined;
 	private request: TunnelRequest | undefined;
 	private restartAttempt = 0;
 	private restartTimer: NodeJS.Timeout | undefined;
@@ -108,7 +116,12 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 	constructor(options: DevTunnelCliProviderOptions) {
 		this.architecture = options.architecture ?? process.arch;
 		this.binaryVerifier = options.binaryVerifier ?? verifyOfficialExecutable;
-		this.commandRunner = options.commandRunner ?? new ChildProcessRunner();
+		this.commandRunner = options.commandRunner;
+		this.commandRunnerFactory = options.commandRunnerFactory ?? (
+			(allowedExecutableBasename) => new ChildProcessRunner({
+				allowedExecutableBasenames: [allowedExecutableBasename],
+			})
+		);
 		this.executable = options.executable ?? 'devtunnel';
 		this.healthProbe = options.healthProbe ?? probeDevTunnelHealth;
 		this.localHealthProbe = options.localHealthProbe ?? probeLoopbackHealth;
@@ -140,7 +153,7 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 		return this.status;
 	}
 
-	async probe(): Promise<TunnelCapability> {
+	async probe(signal?: AbortSignal): Promise<TunnelCapability> {
 		if (this.platform !== 'darwin' || this.architecture !== 'arm64') {
 			return {
 				loggedIn: false,
@@ -151,6 +164,7 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 		let trustedExecutable: string;
 		try {
 			trustedExecutable = await this.resolveExecutable(this.executable);
+			throwIfAborted(signal);
 			if (!await this.binaryVerifier(trustedExecutable)) {
 				return {
 					loggedIn: false,
@@ -158,6 +172,7 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 					reason: 'CLI_UNSUPPORTED',
 				};
 			}
+			throwIfAborted(signal);
 		} catch {
 			return {
 				loggedIn: false,
@@ -166,9 +181,10 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 			};
 		}
 		this.trustedExecutable = trustedExecutable;
+		this.commandRunner ??= this.commandRunnerFactory(basename(trustedExecutable));
 		let version: ChildProcessResult;
 		try {
-			version = await this.run(['--version'], 15_000, 32 * 1024);
+			version = await this.run(['--version'], 15_000, 32 * 1024, signal);
 		} catch {
 			return {
 				loggedIn: false,
@@ -179,7 +195,7 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 		const build = decodeVersion(version.stdout);
 		let loggedIn = false;
 		try {
-			await this.run(['user', 'show'], 15_000, 32 * 1024);
+			await this.run(['user', 'show'], 15_000, 32 * 1024, signal);
 			loggedIn = true;
 		} catch {
 			loggedIn = false;
@@ -225,7 +241,28 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 	}
 
 	async renewAccess(): Promise<TunnelMetadata> {
+		if (this.renewalPromise !== undefined) {
+			return this.renewalPromise;
+		}
+		const renewal = this.renewAccessOnce();
+		const tracked = renewal.finally(() => {
+			if (this.renewalPromise === tracked) {
+				this.renewalPromise = undefined;
+			}
+		});
+		this.renewalPromise = tracked;
+		return tracked;
+	}
+
+	private async renewAccessOnce(): Promise<TunnelMetadata> {
+		const generation = this.lifecycleGeneration;
+		const signal = this.lifecycleAbortController?.signal;
+		if (signal === undefined) {
+			throw permanent('HOST_START_FAILED', 'No active Dev Tunnel lifecycle can renew access.');
+		}
+		this.assertLifecycleActive(generation);
 		const metadata = this.metadata ?? await this.stateStore.load();
+		this.assertLifecycleActive(generation);
 		if (metadata === undefined) {
 			throw permanent('TUNNEL_METADATA_INVALID', 'No owned Dev Tunnel metadata exists.');
 		}
@@ -237,7 +274,23 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 			);
 			throw permanent('TUNNEL_ACCESS_EXPIRED', 'The owned anonymous access entry has expired.');
 		}
+		let destructiveRenewalStarted = false;
 		try {
+			this.assertLifecycleActive(generation);
+			const listed = await this.run([
+				'access',
+				'list',
+				metadata.tunnelId,
+				'--port-number',
+				String(metadata.localPort),
+				'--json',
+			], commandTimeoutMs, commandMaxOutputBytes, signal);
+			decodeDevTunnelAccessListJson(metadata.build, listed.stdout, {
+				expectedExpiration: metadata.accessExpiresAt,
+				expectedIndex: metadata.accessIndex,
+			});
+			this.assertLifecycleActive(generation);
+			destructiveRenewalStarted = true;
 			const deleted = await this.run([
 				'access',
 				'delete',
@@ -247,33 +300,42 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 				'--index',
 				String(metadata.accessIndex),
 				'--json',
-			]);
+			], commandTimeoutMs, commandMaxOutputBytes, signal);
 			decodeDevTunnelAccessDeleteJson(metadata.build, deleted.stdout);
-			const access = await this.createAccess(metadata);
+			const access = await this.createAccess(metadata, generation, signal);
 			const renewed: TunnelMetadata = {
 				...metadata,
 				accessExpiresAt: access.expiresAt,
 				accessIndex: access.index,
 			};
+			this.assertLifecycleActive(generation);
 			await this.stateStore.save(renewed);
+			this.assertLifecycleActive(generation);
 			this.metadata = renewed;
 			return renewed;
 		} catch (error: unknown) {
+			if (!this.lifecycleIsActive(generation)) {
+				throw toProviderError(error);
+			}
+			const providerError = toProviderError(error);
+			if (!destructiveRenewalStarted && providerError.retryable) {
+				throw providerError;
+			}
+			const failureMessage = destructiveRenewalStarted
+				? 'The owned access entry was revoked but could not be renewed.'
+				: 'The existing access entry no longer matches provider ownership metadata.';
 			await this.openCircuitAndStop(
 				'TUNNEL_ACCESS_EXPIRED',
-				'The owned access entry was revoked but could not be renewed.',
+				failureMessage,
 			);
-			throw error instanceof DevTunnelProviderError
-				? error
-				: permanent(
-					'TUNNEL_ACCESS_EXPIRED',
-					'The owned access entry was revoked but could not be renewed.',
-				);
+			throw permanent('TUNNEL_ACCESS_EXPIRED', failureMessage);
 		}
 	}
 
 	async stop(): Promise<void> {
 		this.stopRequested = true;
+		this.lifecycleAbortController?.abort();
+		this.lifecycleAbortController = undefined;
 		this.lifecycleGeneration += 1;
 		this.clearRestartTimer();
 		const host = this.host;
@@ -291,9 +353,13 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 	private async ensureHostedOnce(request: TunnelRequest): Promise<HostedTunnel> {
 		this.stopRequested = false;
 		const generation = ++this.lifecycleGeneration;
+		const abortController = new AbortController();
+		this.lifecycleAbortController = abortController;
+		const signal = abortController.signal;
 		this.status = { state: 'starting' };
 		try {
-			const capability = await this.probe();
+			const capability = await this.probe(signal);
+			this.assertLifecycleActive(generation);
 			if (!capability.supported) {
 				if (capability.reason === 'LOGIN_REQUIRED') {
 					throw permanent('LOGIN_REQUIRED', 'Dev Tunnel CLI login is required.');
@@ -305,21 +371,24 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 			}
 
 			let metadata = await this.stateStore.load();
+			this.assertLifecycleActive(generation);
 			if (metadata !== undefined) {
 				validateMetadata(metadata, request);
 			}
-			await this.localHealthProbe(request.localPort, request.healthPath);
+			await this.localHealthProbe(request.localPort, request.healthPath, { signal });
+			this.assertLifecycleActive(generation);
 			let portExists = false;
 			if (metadata !== undefined) {
-				portExists = await this.validateExistingTunnel(metadata);
+				portExists = await this.validateExistingTunnel(metadata, generation, signal);
 			} else {
-				metadata = await this.createTunnel(request);
+				metadata = await this.createTunnel(request, generation, signal);
 			}
+			this.assertLifecycleActive(generation);
 			this.metadata = metadata;
 			this.request = request;
 
 			if (!metadata.provisioned) {
-				metadata = await this.provisionPortAndAccess(metadata, portExists);
+				metadata = await this.provisionPortAndAccess(metadata, portExists, generation, signal);
 			}
 			const accessExpiresAt = new Date(metadata.accessExpiresAt);
 			if (!Number.isFinite(accessExpiresAt.valueOf()) || accessExpiresAt.valueOf() <= this.now().valueOf()) {
@@ -330,26 +399,28 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 				metadata = await this.renewAccess();
 			}
 
-			const hosted = await this.startAndProbe(metadata, request, generation);
+			const hosted = await this.startAndProbe(metadata, request, generation, signal);
+			this.assertLifecycleActive(generation);
 			this.metadata = hosted;
 			this.restartAttempt = 0;
 			this.status = { state: 'ready', tunnel: hosted };
 			return hosted;
 		} catch (error: unknown) {
 			const providerError = toProviderError(error);
-			if (!providerError.retryable) {
+			const lifecycleActive = this.lifecycleIsActive(generation);
+			if (lifecycleActive && !providerError.retryable) {
 				this.openCircuit(providerError.code, providerError.message);
-			}
-			const host = this.host;
-			this.host = undefined;
-			if (host !== undefined) {
-				await host.stop();
 			}
 			throw providerError;
 		}
 	}
 
-	private async createTunnel(request: TunnelRequest): Promise<TunnelMetadata> {
+	private async createTunnel(
+		request: TunnelRequest,
+		generation: number,
+		signal: AbortSignal,
+	): Promise<TunnelMetadata> {
+		this.assertLifecycleActive(generation);
 		const created = await this.run([
 			'create',
 			request.tunnelAlias,
@@ -358,7 +429,7 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 			'--expiration',
 			request.tunnelExpiration,
 			'--json',
-		]);
+		], commandTimeoutMs, commandMaxOutputBytes, signal);
 		const decoded = decodeDevTunnelCreateJson(
 			SUPPORTED_DEVTUNNEL_BUILD,
 			created.stdout,
@@ -379,15 +450,20 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 			tunnelExpiresAt: addDuration(now, request.tunnelExpiration).toISOString(),
 			tunnelId: decoded.tunnelId,
 		};
+		this.assertLifecycleActive(generation);
 		await this.stateStore.save(metadata);
+		this.assertLifecycleActive(generation);
 		return metadata;
 	}
 
 	private async provisionPortAndAccess(
 		metadata: TunnelMetadata,
 		portExists: boolean,
+		generation: number,
+		signal: AbortSignal,
 	): Promise<TunnelMetadata> {
 		if (!portExists) {
+			this.assertLifecycleActive(generation);
 			const port = await this.run([
 				'port',
 				'create',
@@ -397,28 +473,37 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 				'--protocol',
 				'http',
 				'--json',
-			]);
+			], commandTimeoutMs, commandMaxOutputBytes, signal);
 			decodeDevTunnelPortCreateJson(
 				metadata.build,
 				port.stdout,
 				metadata.tunnelId,
 				metadata.localPort,
 			);
+			this.assertLifecycleActive(generation);
 			await this.stateStore.save(metadata);
+			this.assertLifecycleActive(generation);
 		}
-		const access = await this.createAccess(metadata);
+		const access = await this.createAccess(metadata, generation, signal);
 		const provisioned: TunnelMetadata = {
 			...metadata,
 			accessExpiresAt: access.expiresAt,
 			accessIndex: access.index,
 			provisioned: true,
 		};
+		this.assertLifecycleActive(generation);
 		await this.stateStore.save(provisioned);
+		this.assertLifecycleActive(generation);
 		this.metadata = provisioned;
 		return provisioned;
 	}
 
-	private async createAccess(metadata: TunnelMetadata) {
+	private async createAccess(
+		metadata: TunnelMetadata,
+		generation: number,
+		signal: AbortSignal,
+	) {
+		this.assertLifecycleActive(generation);
 		const access = await this.run([
 			'access',
 			'create',
@@ -429,20 +514,19 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 			'--expiration',
 			metadata.accessDuration,
 			'--json',
-		]);
+		], commandTimeoutMs, commandMaxOutputBytes, signal);
+		this.assertLifecycleActive(generation);
 		return decodeDevTunnelAccessCreateJson(metadata.build, access.stdout, this.now());
 	}
 
-	private async validateExistingTunnel(metadata: TunnelMetadata): Promise<boolean> {
-		let shown: ChildProcessResult;
-		try {
-			shown = await this.run(['show', metadata.tunnelId, '--json']);
-		} catch {
-			throw permanent(
-				'TUNNEL_NOT_FOUND',
-				'The persistent owned tunnel is unavailable; explicit recreation and peer re-pairing are required.',
-			);
-		}
+	private async validateExistingTunnel(
+		metadata: TunnelMetadata,
+		generation: number,
+		signal: AbortSignal,
+	): Promise<boolean> {
+		this.assertLifecycleActive(generation);
+		const shown = await this.showTunnel(metadata, signal);
+		this.assertLifecycleActive(generation);
 		const decoded = decodeDevTunnelShowJson(metadata.build, shown.stdout, {
 			allowMissingPort: !metadata.provisioned,
 			expectedOwnershipLabel: metadata.ownershipLabel,
@@ -457,44 +541,112 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 		metadata: TunnelMetadata,
 		request: TunnelRequest,
 		generation: number,
+		signal: AbortSignal,
 	): Promise<HostedTunnel> {
+		this.assertLifecycleActive(generation);
 		if (this.host !== undefined) {
 			throw permanent('HOST_START_FAILED', 'An owned Dev Tunnel host is already running.');
 		}
-		const host = await this.commandRunner.startOwned(
+		const host = await this.requireCommandRunner().startOwned(
 			this.requireTrustedExecutable(),
-			['host', metadata.tunnelId],
+			['host', metadata.tunnelId, '--port-number', String(metadata.localPort)],
 		);
-		this.host = host;
-		const readiness = this.discoverAndProbe(metadata, request);
-		const forwardingOrigin = await Promise.race([
-			readiness,
-			host.exit.then(() => {
-				throw transient('HOST_START_FAILED', 'The owned Dev Tunnel host exited before readiness.');
-			}),
-		]);
-		if (generation !== this.lifecycleGeneration || this.stopRequested) {
+		if (!this.lifecycleIsActive(generation)) {
 			await host.stop();
-			throw permanent('HOST_START_FAILED', 'Dev Tunnel hosting was stopped before readiness.');
+			this.assertLifecycleActive(generation);
 		}
-		const hosted: HostedTunnel = {
-			...metadata,
-			forwardingOrigin,
-			status: 'ready',
-		};
-		await this.stateStore.save(hosted);
-		this.watchHostExit(host, generation);
-		return hosted;
+		this.host = host;
+		let readyPublished = false;
+		let hostExited = false;
+		const hostExit = host.exit.then(() => {
+			hostExited = true;
+			if (
+				readyPublished
+				&& this.host === host
+				&& this.lifecycleIsActive(generation)
+				&& this.status.state !== 'circuit-open'
+			) {
+				this.host = undefined;
+				this.scheduleRestart(generation);
+			}
+		});
+		const readinessAbortController = new AbortController();
+		const abortReadiness = (): void => readinessAbortController.abort();
+		signal.addEventListener('abort', abortReadiness, { once: true });
+		if (signal.aborted) {
+			abortReadiness();
+		}
+		const readiness = this.discoverAndProbe(
+			metadata,
+			request,
+			generation,
+			readinessAbortController.signal,
+		);
+		let forwardingOrigin: string;
+		try {
+			forwardingOrigin = await Promise.race([
+				readiness,
+				hostExit.then(() => {
+					throw permanent(
+						'CLI_UNSUPPORTED',
+						`Dev Tunnel ${metadata.build} exited when hosting the preconfigured persistent tunnel`
+							+ ` with required --port-number ${metadata.localPort}. The official build currently`
+							+ ' rejects this flow as an unsupported batch port update; validate a newer exact'
+							+ ' build before retrying. The provider did not change the global CLI.',
+					);
+				}),
+			]);
+		} catch (error: unknown) {
+			abortReadiness();
+			await readiness.catch(() => undefined);
+			if (this.host === host) {
+				this.host = undefined;
+				await host.stop();
+			}
+			throw error;
+		} finally {
+			signal.removeEventListener('abort', abortReadiness);
+		}
+		try {
+			if (!this.lifecycleIsActive(generation)) {
+				throw permanent('HOST_START_FAILED', 'Dev Tunnel hosting was stopped before readiness.');
+			}
+			const hosted: HostedTunnel = {
+				...metadata,
+				forwardingOrigin,
+				status: 'ready',
+			};
+			this.assertLifecycleActive(generation);
+			await this.stateStore.save(hosted);
+			this.assertLifecycleActive(generation);
+			if (hostExited) {
+				throw permanent(
+					'CLI_UNSUPPORTED',
+					`Dev Tunnel ${metadata.build} exited after readiness but before the host became authoritative.`,
+				);
+			}
+			readyPublished = true;
+			return hosted;
+		} catch (error: unknown) {
+			if (this.host === host) {
+				this.host = undefined;
+				await host.stop();
+			}
+			throw error;
+		}
 	}
 
 	private async discoverAndProbe(
 		metadata: TunnelMetadata,
 		request: TunnelRequest,
+		generation: number,
+		signal: AbortSignal,
 	): Promise<string> {
 		const deadline = Date.now() + this.showTimeoutMs;
 		let lastReadinessError: DevTunnelProviderError | undefined;
 		while (Date.now() < deadline) {
-			const shown = await this.run(['show', metadata.tunnelId, '--json']);
+			this.assertLifecycleActive(generation);
+			const shown = await this.showTunnel(metadata, signal);
 			const decoded = decodeDevTunnelShowJson(metadata.build, shown.stdout, {
 				expectedOwnershipLabel: metadata.ownershipLabel,
 				expectedPort: metadata.localPort,
@@ -503,13 +655,19 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 			});
 			if (decoded.forwardingOrigin !== undefined) {
 				try {
-					await this.healthProbe(decoded.forwardingOrigin, request.healthPath);
+					await this.healthProbe(
+						decoded.forwardingOrigin,
+						request.healthPath,
+						{ signal },
+					);
 					await this.wssProbe(
 						decoded.forwardingOrigin,
 						request.wssPath,
 						request.wssProbeRequest,
 						request.wssExpectedResponse,
+						{ signal },
 					);
+					this.assertLifecycleActive(generation);
 					return decoded.forwardingOrigin;
 				} catch (error: unknown) {
 					const providerError = toProviderError(error);
@@ -519,27 +677,12 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 					lastReadinessError = providerError;
 				}
 			}
-			await delay(this.showPollIntervalMs);
+			await delay(this.showPollIntervalMs, signal);
 		}
 		throw lastReadinessError ?? transient(
 			'HTTPS_HEALTH_FAILED',
 			'Dev Tunnel did not publish a forwarding URI before timeout.',
 		);
-	}
-
-	private watchHostExit(host: OwnedChildProcess, generation: number): void {
-		void host.exit.then(() => {
-			if (
-				this.host !== host
-				|| this.stopRequested
-				|| generation !== this.lifecycleGeneration
-				|| this.status.state === 'circuit-open'
-			) {
-				return;
-			}
-			this.host = undefined;
-			this.scheduleRestart(generation);
-		});
 	}
 
 	private scheduleRestart(generation: number): void {
@@ -561,6 +704,7 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 		);
 		const delayMs = Math.floor(this.random() * ceiling);
 		const retryAt = new Date(this.now().valueOf() + delayMs).toISOString();
+		this.assertLifecycleActive(generation);
 		this.status = { state: 'backoff', attempt: this.restartAttempt, retryAt };
 		this.restartTimer = setTimeout(() => {
 			this.restartTimer = undefined;
@@ -571,25 +715,27 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 	private async restart(generation: number): Promise<void> {
 		const metadata = this.metadata;
 		const request = this.request;
+		const signal = this.lifecycleAbortController?.signal;
 		if (
 			metadata === undefined
 			|| request === undefined
+			|| signal === undefined
 			|| this.stopRequested
 			|| generation !== this.lifecycleGeneration
 		) {
 			return;
 		}
 		try {
-			const hosted = await this.startAndProbe(metadata, request, generation);
+			const hosted = await this.startAndProbe(metadata, request, generation, signal);
+			this.assertLifecycleActive(generation);
 			this.metadata = hosted;
 			this.restartAttempt = 0;
 			this.status = { state: 'ready', tunnel: hosted };
 		} catch (error: unknown) {
 			const providerError = toProviderError(error);
-			const failedHost = this.host;
-			this.host = undefined;
-			if (failedHost !== undefined) {
-				await failedHost.stop().catch(() => undefined);
+			const lifecycleActive = this.lifecycleIsActive(generation);
+			if (!lifecycleActive) {
+				return;
 			}
 			if (!providerError.retryable) {
 				this.openCircuit(providerError.code, providerError.message);
@@ -601,6 +747,7 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 
 	private openCircuit(code: DevTunnelProviderError['code'], message?: string): void {
 		this.clearRestartTimer();
+		this.lifecycleAbortController?.abort();
 		this.status = { state: 'circuit-open', code, message };
 	}
 
@@ -609,6 +756,7 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 		message: string,
 	): Promise<void> {
 		this.lifecycleGeneration += 1;
+		this.lifecycleAbortController?.abort();
 		this.openCircuit(code, message);
 		const host = this.host;
 		this.host = undefined;
@@ -628,11 +776,53 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 		args: readonly string[],
 		timeoutMs = commandTimeoutMs,
 		maxOutputBytes = commandMaxOutputBytes,
+		signal?: AbortSignal,
+		acceptedExitCodes?: readonly number[],
 	): Promise<ChildProcessResult> {
-		return this.commandRunner.run(this.requireTrustedExecutable(), args, {
+		return this.requireCommandRunner().run(this.requireTrustedExecutable(), args, {
+			acceptedExitCodes,
 			timeoutMs,
 			maxOutputBytes,
+			signal,
 		});
+	}
+
+	private async showTunnel(
+		metadata: TunnelMetadata,
+		signal: AbortSignal,
+	): Promise<ChildProcessResult> {
+		const shown = await this.run(
+			['show', metadata.tunnelId, '--json'],
+			commandTimeoutMs,
+			commandMaxOutputBytes,
+			signal,
+			[2],
+		);
+		if (shown.exitCode === 0) {
+			return shown;
+		}
+		if (isExactDevTunnelNotFound(metadata.build, shown, metadata.tunnelId)) {
+			throw permanent(
+				'TUNNEL_NOT_FOUND',
+				'The persistent owned tunnel is unavailable; explicit recreation and peer re-pairing are required.',
+			);
+		}
+		throw transient(
+			'CLI_COMMAND_FAILED',
+			'Dev Tunnel show failed without the exact versioned not-found response.',
+		);
+	}
+
+	private lifecycleIsActive(generation: number): boolean {
+		return !this.stopRequested
+			&& generation === this.lifecycleGeneration
+			&& this.lifecycleAbortController?.signal.aborted === false;
+	}
+
+	private assertLifecycleActive(generation: number): void {
+		if (!this.lifecycleIsActive(generation)) {
+			throw permanent('HOST_START_FAILED', 'The Dev Tunnel lifecycle was stopped.');
+		}
 	}
 
 	private requireTrustedExecutable(): string {
@@ -640,6 +830,13 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 			throw permanent('CLI_UNSUPPORTED', 'The Dev Tunnel executable has not passed verification.');
 		}
 		return this.trustedExecutable;
+	}
+
+	private requireCommandRunner(): DevTunnelCommandRunner {
+		if (this.commandRunner === undefined) {
+			throw permanent('CLI_UNSUPPORTED', 'The trusted Dev Tunnel process runner is unavailable.');
+		}
+		return this.commandRunner;
 	}
 }
 
@@ -761,9 +958,13 @@ function toProviderError(error: unknown): DevTunnelProviderError {
 		return error;
 	}
 	if (error instanceof ChildProcessExecutionError) {
-		return error.code === 'PROCESS_TIMEOUT'
-			? transient('CLI_COMMAND_FAILED', 'The Dev Tunnel CLI command timed out.')
-			: permanent('CLI_COMMAND_FAILED', 'The Dev Tunnel CLI command failed.');
+		if (error.code === 'PROCESS_TIMEOUT') {
+			return transient('CLI_COMMAND_FAILED', 'The Dev Tunnel CLI command timed out.');
+		}
+		if (error.code === 'PROCESS_EXIT_NONZERO') {
+			return transient('CLI_COMMAND_FAILED', 'The Dev Tunnel CLI command failed transiently.');
+		}
+		return permanent('CLI_COMMAND_FAILED', 'The Dev Tunnel CLI command failed.');
 	}
 	if (error instanceof DevTunnelDecodeError) {
 		return permanent(
@@ -788,8 +989,37 @@ function transient(
 	return new DevTunnelProviderError(code, message, true);
 }
 
-function delay(milliseconds: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, milliseconds));
+function delay(milliseconds: number, signal?: AbortSignal): Promise<void> {
+	if (signal?.aborted === true) {
+		return Promise.reject(new ChildProcessExecutionError(
+			'PROCESS_ABORTED',
+			'The Dev Tunnel lifecycle was cancelled.',
+		));
+	}
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(() => {
+			signal?.removeEventListener('abort', abort);
+			resolve();
+		}, milliseconds);
+		const abort = (): void => {
+			clearTimeout(timer);
+			signal?.removeEventListener('abort', abort);
+			reject(new ChildProcessExecutionError(
+				'PROCESS_ABORTED',
+				'The Dev Tunnel lifecycle was cancelled.',
+			));
+		};
+		signal?.addEventListener('abort', abort, { once: true });
+	});
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+	if (signal?.aborted === true) {
+		throw new ChildProcessExecutionError(
+			'PROCESS_ABORTED',
+			'The Dev Tunnel lifecycle was cancelled.',
+		);
+	}
 }
 
 async function verifyOfficialExecutable(path: string): Promise<boolean> {
