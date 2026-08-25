@@ -30,7 +30,9 @@ pending-enrollment, and peer metadata use `PairingRecordStore`; coordinator prof
 `PeerProfileStore`. `PairingRecordStore.commitPeer` must atomically activate the peer while
 removing its pending record and invitation. Durable adapters must preserve each method's ordering
 and failure semantics. The active peer record retains `enrollmentId` and `transcriptHash` so an
-already-applied commit can be proof-verified and acknowledged idempotently.
+already-applied commit can be proof-verified and acknowledged idempotently. It also retains
+`cleanupPending` and the opaque invitation-secret reference until `completePeerCleanup` durably
+records successful secret deletion. `listPeers` lets startup/normal pruning retry this cleanup.
 
 Composition wiring is intentionally outside this module. The extension host should:
 
@@ -87,7 +89,9 @@ Enrollment is two-phase:
 `mesh.enrollmentCommit` accepts the original session-bound request and a sessionless recovery
 request. Both verify the persisted proof; duplicate requests for the same pending or active
 enrollment are idempotent. Commit and expiry pruning are serialized so pruning cannot delete a root
-while that root is becoming active.
+while that root is becoming active. A commit is not acknowledged until invitation-secret deletion
+and the active record's cleanup transition both complete; duplicate commit and prune paths retry
+either interrupted step.
 
 If commit delivery or its response is unknown, the coordinator retains the candidate root and
 profile and uses bounded full-jitter reconnect attempts. A retry first attempts normal peer
@@ -103,6 +107,11 @@ commit, after which the connection enters `rePairRequired`. Potentially-active c
 material is retained rather than risking deletion of a root whose commit acknowledgement was lost;
 the user must create a new invitation and pair again.
 
+Candidate profile writes use read-after-error reconciliation because a durable store may apply a
+write before reporting failure. Exact candidate state is treated as persisted and remains
+repairable; candidate keys are deleted only when the previous profile is read back unchanged.
+Unknown or conflicting readback preserves keys and fails closed.
+
 ## Security and resource limits
 
 - Pre-authentication: 64 KiB frames, 8 messages per 10 seconds, 30-second deadline.
@@ -111,6 +120,10 @@ the user must create a new invitation and pair again.
 - Outbox: serialized UTF-8 accounting, 256 KiB or 128 events, including `bufferedAmount`.
 - Post-authentication: WS ping every 10 seconds; terminate after 30 seconds without pong.
 - Reconnect: full jitter, exponential ceiling from 1 to 30 seconds; reset only after 30 stable seconds.
+- Handshake lifecycle: every async hello boundary checks its connection generation; socket disposal
+  prevents late session publication, and per-session timers actively remove state at the 30-second TTL.
+- Manager lifecycle: add, connect, background retries, and restore are tracked; dispose waits for
+  in-flight profile listing and rejects late peer publication.
 - URL parser: `https`/`wss`, exact connect path, protocol `v=1`, single device/invite/secret fields,
   no userinfo, and a 32-byte base64url fragment secret.
 

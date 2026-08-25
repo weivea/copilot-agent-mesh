@@ -94,13 +94,21 @@ export class PeerConnectionManager {
 		}
 	}
 
-	public async restore(): Promise<void> {
+	public restore(): Promise<void> {
 		this.assertActive();
-		for (const profile of await this.profiles.list()) {
+		return this.track(this.restoreCore());
+	}
+
+	private async restoreCore(): Promise<void> {
+		const profiles = await this.profiles.list();
+		this.assertActive();
+		for (const profile of profiles) {
+			this.assertActive();
 			if (this.peers.has(profile.id)) {
 				continue;
 			}
 			const managed = this.createManaged(profile.id, isProvisionalProfile(profile));
+			this.assertActive();
 			this.peers.set(profile.id, managed);
 			this.launchTryConnect(managed);
 		}
@@ -121,6 +129,7 @@ export class PeerConnectionManager {
 		managed.enabled = true;
 		this.clearReconnect(managed);
 		await managed.connection.connect();
+		managed.provisional = false;
 		if (this.disposed) {
 			await managed.connection.disconnect();
 			this.assertActive();

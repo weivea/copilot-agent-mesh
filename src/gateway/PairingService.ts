@@ -41,6 +41,8 @@ export interface PeerRecord {
 	readonly enrollmentId: string;
 	readonly transcriptHash: string;
 	readonly createdAt: number;
+	readonly invitationSecretKeyRef?: string;
+	readonly cleanupPending?: boolean;
 }
 
 export interface PairingRecordStore {
@@ -52,8 +54,10 @@ export interface PairingRecordStore {
 	getPending(enrollmentId: string): Promise<PendingPeerRecord | undefined>;
 	storePending(record: PendingPeerRecord): Promise<void>;
 	deletePending(enrollmentId: string): Promise<void>;
+	listPeers(): Promise<readonly PeerRecord[]>;
 	getPeer(peerId: string): Promise<PeerRecord | undefined>;
 	commitPeer(record: PeerRecord, pending: PendingPeerRecord): Promise<boolean>;
+	completePeerCleanup(peerId: string, enrollmentId: string): Promise<boolean>;
 }
 
 export class InMemoryPairingRecordStore implements PairingRecordStore {
@@ -88,13 +92,32 @@ export class InMemoryPairingRecordStore implements PairingRecordStore {
 	public async getPeer(id: string): Promise<PeerRecord | undefined> {
 		return this.peers.get(id);
 	}
+	public async listPeers(): Promise<readonly PeerRecord[]> {
+		return [...this.peers.values()];
+	}
 	public async commitPeer(record: PeerRecord, pending: PendingPeerRecord): Promise<boolean> {
-		if (!this.invitations.has(pending.invitationId)) {
+		const invitation = this.invitations.get(pending.invitationId);
+		if (invitation === undefined
+			|| record.cleanupPending !== true
+			|| record.invitationSecretKeyRef !== invitation.secretKeyRef) {
 			return false;
 		}
 		this.peers.set(record.peerId, record);
 		this.invitations.delete(pending.invitationId);
 		this.pending.delete(pending.enrollmentId);
+		return true;
+	}
+	public async completePeerCleanup(peerId: string, enrollmentId: string): Promise<boolean> {
+		const peer = this.peers.get(peerId);
+		if (peer === undefined || peer.enrollmentId !== enrollmentId) {
+			return false;
+		}
+		const {
+			invitationSecretKeyRef: _invitationSecretKeyRef,
+			cleanupPending: _cleanupPending,
+			...completed
+		} = peer;
+		this.peers.set(peerId, completed);
 		return true;
 	}
 }
@@ -105,6 +128,7 @@ interface EnrollmentSession {
 	readonly expiresAt: number;
 	readonly transcript: EnrollmentTranscript;
 	readonly secret: Buffer;
+	readonly expirationTimer: NodeJS.Timeout;
 	failures: number;
 	enrollmentId?: string;
 	peerId?: string;
@@ -116,10 +140,14 @@ interface ReconnectSession {
 	readonly expiresAt: number;
 	readonly transcript: ReconnectTranscript;
 	readonly rootKey: Buffer;
+	readonly expirationTimer: NodeJS.Timeout;
 	failures: number;
 }
 
 type AuthenticationSession = EnrollmentSession | ReconnectSession;
+type AuthenticationSessionWithoutTimer =
+	| Omit<EnrollmentSession, 'expirationTimer'>
+	| Omit<ReconnectSession, 'expirationTimer'>;
 
 export interface PairingServiceOptions {
 	readonly invitationTtlMs?: number;
@@ -154,6 +182,10 @@ export class PairingService {
 	private readonly id: () => string;
 	private readonly sessions = new Map<string, AuthenticationSession>();
 	private readonly usedNonces = new Map<string, number>();
+	private readonly activeConnections = new Set<string>();
+	private readonly closedConnections = new Set<string>();
+	private readonly connectionGenerations = new Map<string, number>();
+	private readonly inFlightHellos = new Map<string, number>();
 	private recordMutation = Promise.resolve();
 
 	public constructor(
@@ -217,9 +249,32 @@ export class PairingService {
 		});
 	}
 
+	public registerConnection(connectionId: string): void {
+		this.closedConnections.delete(connectionId);
+		this.activeConnections.add(connectionId);
+		this.connectionGenerations.set(
+			connectionId,
+			(this.connectionGenerations.get(connectionId) ?? 0) + 1,
+		);
+	}
+
 	public async hello(connectionId: string, params: HelloParams): Promise<Record<string, unknown>> {
 		this.assertHello(params);
+		const generation = this.beginHello(connectionId);
+		try {
+			return await this.helloCore(connectionId, params, generation);
+		} finally {
+			this.endHello(connectionId);
+		}
+	}
+
+	private async helloCore(
+		connectionId: string,
+		params: HelloParams,
+		generation: number,
+	): Promise<Record<string, unknown>> {
 		await this.prune();
+		this.assertConnectionOpen(connectionId, generation);
 		if (params.protocolMin > 1 || params.protocolMax < 1) {
 			throw new PairingProtocolError('PROTOCOL_INCOMPATIBLE', 'No compatible Mesh protocol version.');
 		}
@@ -232,10 +287,12 @@ export class PairingService {
 		const expiresAt = this.now() + this.handshakeTtlMs;
 		if (params.invitationId !== undefined) {
 			const invitation = await this.records.getInvitation(params.invitationId);
+			this.assertConnectionOpen(connectionId, generation);
 			if (invitation === undefined || invitation.expiresAt <= this.now()) {
 				throw new PairingProtocolError('AUTH_FAILED', 'Pairing authentication failed.');
 			}
 			const encodedSecret = await this.secretStore.get(invitation.secretKeyRef);
+			this.assertConnectionOpen(connectionId, generation);
 			if (encodedSecret === undefined) {
 				throw new PairingProtocolError('AUTH_FAILED', 'Pairing authentication failed.');
 			}
@@ -249,8 +306,14 @@ export class PairingService {
 				clientNonce: params.clientNonce,
 				serverNonce,
 			};
-			this.sessions.set(sessionId, {
-				mode: 'enrollment', connectionId, expiresAt, transcript, secret, failures: 0,
+			this.assertConnectionOpen(connectionId, generation);
+			this.storeSession(sessionId, {
+				mode: 'enrollment',
+				connectionId,
+				expiresAt,
+				transcript,
+				secret,
+				failures: 0,
 			});
 			return {
 				mode: 'enrollment',
@@ -262,10 +325,12 @@ export class PairingService {
 			};
 		}
 		const peer = await this.records.getPeer(params.peerId!);
+		this.assertConnectionOpen(connectionId, generation);
 		if (peer === undefined || peer.coordinatorDeviceId !== params.coordinatorDeviceId) {
 			throw new PairingProtocolError('AUTH_FAILED', 'Peer authentication failed.');
 		}
 		const encodedRoot = await this.secretStore.get(peer.rootKeyRef);
+		this.assertConnectionOpen(connectionId, generation);
 		if (encodedRoot === undefined) {
 			throw new PairingProtocolError('AUTH_FAILED', 'Peer authentication failed.');
 		}
@@ -279,8 +344,14 @@ export class PairingService {
 			clientNonce: params.clientNonce,
 			serverNonce,
 		};
-		this.sessions.set(sessionId, {
-			mode: 'reconnect', connectionId, expiresAt, transcript, rootKey, failures: 0,
+		this.assertConnectionOpen(connectionId, generation);
+		this.storeSession(sessionId, {
+			mode: 'reconnect',
+			connectionId,
+			expiresAt,
+			transcript,
+			rootKey,
+			failures: 0,
 		});
 		return {
 			mode: 'reconnect',
@@ -317,7 +388,7 @@ export class PairingService {
 			if (!safeEqual(proof, expected)) {
 				this.authenticationFailed(sessionId, session);
 			}
-			this.sessions.delete(sessionId);
+			this.deleteSession(sessionId);
 			return {
 				result: { authenticated: true, peerId: session.transcript.peerId },
 				peerId: session.transcript.peerId,
@@ -408,6 +479,10 @@ export class PairingService {
 				);
 			}
 			await this.verifyCommitProof(active, enrollmentId, encodedProof, sessionId, session);
+			await this.cleanupCommittedPeer(active);
+			if (sessionId !== undefined) {
+				this.deleteSession(sessionId);
+			}
 			return active.peerId;
 		}
 		if (pending.peerId !== peerId) {
@@ -420,6 +495,7 @@ export class PairingService {
 			);
 		}
 		await this.verifyCommitProof(pending, enrollmentId, encodedProof, sessionId, session);
+		const invitation = await this.records.getInvitation(pending.invitationId);
 		const peer: PeerRecord = {
 			peerId: pending.peerId,
 			coordinatorDeviceId: pending.coordinatorDeviceId,
@@ -427,8 +503,9 @@ export class PairingService {
 			enrollmentId: pending.enrollmentId,
 			transcriptHash: pending.transcriptHash,
 			createdAt: this.now(),
+			invitationSecretKeyRef: invitation?.secretKeyRef,
+			cleanupPending: invitation !== undefined,
 		};
-		const invitation = await this.records.getInvitation(pending.invitationId);
 		if (!await this.records.commitPeer(peer, pending)) {
 			const active = await this.records.getPeer(peerId);
 			if (active === undefined
@@ -436,22 +513,29 @@ export class PairingService {
 				|| active.rootKeyRef !== pending.rootKeyRef) {
 				throw new PairingProtocolError('AUTH_FAILED', 'Enrollment invitation was already consumed.');
 			}
-		}
-		if (invitation !== undefined) {
-			await this.secretStore.delete(invitation.secretKeyRef);
+			await this.cleanupCommittedPeer(active);
+		} else {
+			await this.cleanupCommittedPeer(peer);
 		}
 		if (sessionId !== undefined) {
-			this.sessions.delete(sessionId);
+			this.deleteSession(sessionId);
 		}
 		return pending.peerId;
 	}
 
 	public disposeConnection(connectionId: string): void {
+		this.activeConnections.delete(connectionId);
+		this.closedConnections.add(connectionId);
+		this.connectionGenerations.set(
+			connectionId,
+			(this.connectionGenerations.get(connectionId) ?? 0) + 1,
+		);
 		for (const [id, session] of this.sessions) {
 			if (session.connectionId === connectionId) {
-				this.sessions.delete(id);
+				this.deleteSession(id);
 			}
 		}
+		this.cleanupConnectionState(connectionId);
 	}
 
 	private assertHello(params: HelloParams): void {
@@ -481,6 +565,9 @@ export class PairingService {
 		if (session === undefined
 			|| session.connectionId !== connectionId
 			|| session.expiresAt <= this.now()) {
+			if (session !== undefined && session.expiresAt <= this.now()) {
+				this.deleteSession(sessionId);
+			}
 			throw new PairingProtocolError('AUTH_FAILED', 'Authentication session is invalid.');
 		}
 		return session;
@@ -489,7 +576,7 @@ export class PairingService {
 	private authenticationFailed(sessionId: string, session: AuthenticationSession): never {
 		session.failures += 1;
 		if (session.failures >= 5) {
-			this.sessions.delete(sessionId);
+			this.deleteSession(sessionId);
 		}
 		throw new PairingProtocolError('AUTH_FAILED', 'Authentication proof is invalid.');
 	}
@@ -535,12 +622,92 @@ export class PairingService {
 		}
 		for (const [id, session] of this.sessions) {
 			if (session.expiresAt <= now) {
-				this.sessions.delete(id);
+				this.deleteSession(id);
 			}
 		}
 	}
 
+	private async cleanupCommittedPeer(peer: PeerRecord): Promise<void> {
+		if (peer.cleanupPending !== true) {
+			return;
+		}
+		if (peer.invitationSecretKeyRef !== undefined) {
+			await this.secretStore.delete(peer.invitationSecretKeyRef);
+		}
+		if (!await this.records.completePeerCleanup(peer.peerId, peer.enrollmentId)) {
+			throw new Error('Failed to persist peer credential cleanup.');
+		}
+	}
+
+	private storeSession(
+		sessionId: string,
+		session: AuthenticationSessionWithoutTimer,
+	): void {
+		this.deleteSession(sessionId);
+		const expirationTimer = setTimeout(() => {
+			const current = this.sessions.get(sessionId);
+			if (current?.expirationTimer === expirationTimer) {
+				this.sessions.delete(sessionId);
+			}
+		}, Math.max(0, session.expiresAt - this.now()));
+		expirationTimer.unref();
+		this.sessions.set(sessionId, { ...session, expirationTimer } as AuthenticationSession);
+	}
+
+	private deleteSession(sessionId: string): void {
+		const session = this.sessions.get(sessionId);
+		if (session !== undefined) {
+			clearTimeout(session.expirationTimer);
+			this.sessions.delete(sessionId);
+		}
+	}
+
+	private assertConnectionOpen(connectionId: string, generation: number): void {
+		if (!this.activeConnections.has(connectionId)
+			|| this.closedConnections.has(connectionId)
+			|| (this.connectionGenerations.get(connectionId) ?? 0) !== generation) {
+			throw new PairingProtocolError('AUTH_FAILED', 'Authentication connection is closed.');
+		}
+	}
+
+	private beginHello(connectionId: string): number {
+		const generation = this.connectionGenerations.get(connectionId);
+		if (generation === undefined) {
+			throw new PairingProtocolError('AUTH_FAILED', 'Authentication connection is closed.');
+		}
+		this.assertConnectionOpen(connectionId, generation);
+		this.inFlightHellos.set(
+			connectionId,
+			(this.inFlightHellos.get(connectionId) ?? 0) + 1,
+		);
+		return generation;
+	}
+
+	private endHello(connectionId: string): void {
+		const remaining = (this.inFlightHellos.get(connectionId) ?? 1) - 1;
+		if (remaining > 0) {
+			this.inFlightHellos.set(connectionId, remaining);
+			return;
+		}
+		this.inFlightHellos.delete(connectionId);
+		this.cleanupConnectionState(connectionId);
+	}
+
+	private cleanupConnectionState(connectionId: string): void {
+		if (this.activeConnections.has(connectionId)
+			|| (this.inFlightHellos.get(connectionId) ?? 0) > 0) {
+			return;
+		}
+		this.closedConnections.delete(connectionId);
+		this.connectionGenerations.delete(connectionId);
+	}
+
 	private async pruneExpiredRecords(now: number): Promise<void> {
+		for (const peer of await this.records.listPeers()) {
+			if (peer.cleanupPending === true) {
+				await this.cleanupCommittedPeer(peer);
+			}
+		}
 		for (const invitation of await this.records.listInvitations()) {
 			if (invitation.expiresAt <= now) {
 				await this.secretStore.delete(invitation.secretKeyRef);

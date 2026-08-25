@@ -455,6 +455,63 @@ test('PeerConnectionManager reports and awaits a background rollback failure on 
 	assert.ok(await storedSecrets.get('background-credential'));
 });
 
+test('PeerConnectionManager dispose waits for restore list and prevents late peer publication', async () => {
+	const profile: PeerProfile = {
+		id: 'late-restore-profile',
+		rpcEndpoint: 'wss://worker.example/agent-mesh/rpc',
+		workerDeviceId: 'worker',
+		peerId: 'peer',
+		credentialKeyRef: 'credential',
+	};
+	let releaseList!: () => void;
+	let markListStarted!: () => void;
+	const listStarted = new Promise<void>((resolve) => {
+		markListStarted = resolve;
+	});
+	const listGate = new Promise<void>((resolve) => {
+		releaseList = resolve;
+	});
+	const profiles: PeerProfileStore = {
+		get: async () => profile,
+		list: async () => {
+			markListStarted();
+			await listGate;
+			return [profile];
+		},
+		store: async () => undefined,
+		delete: async () => undefined,
+	};
+	let connectCalls = 0;
+	const transport: PeerTransport = {
+		connect: async () => {
+			connectCalls += 1;
+			throw new Error('Restore must not connect after disposal.');
+		},
+	};
+	const manager = new PeerConnectionManager(
+		'coordinator',
+		profiles,
+		new InMemorySecretStore(),
+		transport,
+	);
+
+	const restore = manager.restore();
+	await listStarted;
+	const dispose = manager.dispose();
+	let disposed = false;
+	void dispose.then(() => {
+		disposed = true;
+	});
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	assert.equal(disposed, false);
+	releaseList();
+
+	await assert.rejects(restore, /disposed/u);
+	await dispose;
+	assert.equal(connectCalls, 0);
+	assert.equal(manager.get(profile.id), undefined);
+});
+
 async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	while (!predicate()) {

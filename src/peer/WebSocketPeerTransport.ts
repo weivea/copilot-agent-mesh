@@ -263,10 +263,33 @@ export class WebSocketPeerTransport implements PeerTransport {
 					pendingCommitProofKeyRef: commitProofKeyRef,
 					pendingExpiresAt: expiresAt,
 				};
-				await profiles.store(candidate);
+				try {
+					await profiles.store(candidate);
+				} catch (error: unknown) {
+					const persisted = await reconcileProfileStore(
+						profiles,
+						profile,
+						candidate,
+					);
+					if (persisted === 'previous') {
+						await deleteCandidateSecrets(
+							secrets,
+							credentialKeyRef,
+							commitProofKeyRef,
+						);
+						throw error;
+					}
+					if (persisted === 'unknown') {
+						throw new PeerTransportError(
+							'CONNECTION_FAILED',
+							'Enrollment profile persistence could not be confirmed.',
+						);
+					}
+				}
 			} catch (error: unknown) {
-				await secrets.delete(commitProofKeyRef);
-				await secrets.delete(credentialKeyRef);
+				if (candidate === undefined) {
+					await deleteCandidateSecrets(secrets, credentialKeyRef, commitProofKeyRef);
+				}
 				throw error;
 			}
 			try {
@@ -369,6 +392,53 @@ function hasProvisionalEnrollmentMetadata(profile: PeerProfile): boolean {
 		|| profile.pendingTranscriptHash !== undefined
 		|| profile.pendingCommitProofKeyRef !== undefined
 		|| profile.pendingExpiresAt !== undefined;
+}
+
+async function reconcileProfileStore(
+	profiles: PeerProfileStore,
+	previous: PeerProfile,
+	candidate: PeerProfile,
+): Promise<'candidate' | 'previous' | 'unknown'> {
+	let persisted: PeerProfile | undefined;
+	try {
+		persisted = await profiles.get(candidate.id);
+	} catch {
+		return 'unknown';
+	}
+	if (profilesEqual(persisted, candidate)) {
+		return 'candidate';
+	}
+	return profilesEqual(persisted, previous) ? 'previous' : 'unknown';
+}
+
+function profilesEqual(left: PeerProfile | undefined, right: PeerProfile): boolean {
+	return left !== undefined
+		&& left.id === right.id
+		&& left.rpcEndpoint === right.rpcEndpoint
+		&& left.workerDeviceId === right.workerDeviceId
+		&& left.invitationId === right.invitationId
+		&& left.pairingSecretKeyRef === right.pairingSecretKeyRef
+		&& left.peerId === right.peerId
+		&& left.credentialKeyRef === right.credentialKeyRef
+		&& left.pendingEnrollmentId === right.pendingEnrollmentId
+		&& left.pendingTranscriptHash === right.pendingTranscriptHash
+		&& left.pendingCommitProofKeyRef === right.pendingCommitProofKeyRef
+		&& left.pendingExpiresAt === right.pendingExpiresAt;
+}
+
+async function deleteCandidateSecrets(
+	secrets: SecretStore,
+	credentialKeyRef: string,
+	commitProofKeyRef: string,
+): Promise<void> {
+	const results = await Promise.allSettled([
+		secrets.delete(commitProofKeyRef),
+		secrets.delete(credentialKeyRef),
+	]);
+	const failures = results.flatMap((result) => result.status === 'rejected' ? [result.reason] : []);
+	if (failures.length > 0) {
+		throw new AggregateError(failures, 'Failed to remove unpersisted enrollment credentials.');
+	}
 }
 
 class RpcWebSocketClient {

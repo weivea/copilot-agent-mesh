@@ -73,6 +73,7 @@ export class RpcPeer {
 		this.outboxMaxEvents = options.outboxMaxEvents ?? 128;
 		this.now = options.now ?? Date.now;
 		this.lastPongAt = this.now();
+		this.pairing.registerConnection(this.connectionId);
 		this.handshakeTimer = setTimeout(
 			() => this.close(1008, 'Authentication deadline exceeded.'),
 			options.handshakeTimeoutMs ?? 30_000,

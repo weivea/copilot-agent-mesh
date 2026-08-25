@@ -28,7 +28,10 @@ import {
 	type PeerRecord,
 	type PendingPeerRecord,
 } from '../gateway/PairingService';
-import { InMemorySecretStore } from '../gateway/SecretStore';
+import {
+	InMemorySecretStore,
+	type SecretStore,
+} from '../gateway/SecretStore';
 import { PeerConnectionManager } from '../peer/PeerConnectionManager';
 import {
 	InMemoryPeerProfileStore,
@@ -273,6 +276,59 @@ suite('Gateway pairing component', { concurrency: 1 }, () => {
 		}
 	});
 
+	test('persists active cleanup state until an idempotent commit removes the invitation secret', async () => {
+		const secrets = new FailOnceInvitationDeleteSecretStore();
+		const fixture = await createFixture({ secrets });
+		const invitation = await fixture.invitation();
+		const client = await RawClient.open(fixture.endpoint);
+		try {
+			const enrollment = await beginEnrollment(
+				client,
+				invitation.invitationId,
+				secretFrom(invitation),
+				'cleanup-retry-coordinator',
+			);
+			const params = {
+				sessionId: enrollment.transcript.sessionId,
+				enrollmentId: enrollment.enrollmentId,
+				peerId: enrollment.peerId,
+				proof: encodeBase64Url(hmac(
+					enrollment.rootKey,
+					'mesh/enrollment-commit/v1',
+					enrollment.enrollmentId,
+					enrollment.transcriptHash,
+				)),
+			};
+			await assert.rejects(client.request('mesh.enrollmentCommit', params));
+			const pendingCleanup = await fixture.records.getPeer(enrollment.peerId);
+			assert.equal(pendingCleanup?.cleanupPending, true);
+			assert.equal(
+				pendingCleanup?.invitationSecretKeyRef,
+				`mesh.invitation.${invitation.invitationId}`,
+			);
+			assert.ok(await secrets.get(`mesh.invitation.${invitation.invitationId}`));
+
+			assert.deepStrictEqual(
+				await client.request('mesh.enrollmentCommit', {
+					enrollmentId: enrollment.enrollmentId,
+					peerId: enrollment.peerId,
+					proof: params.proof,
+				}),
+				{ committed: true, peerId: enrollment.peerId },
+			);
+			const completed = await fixture.records.getPeer(enrollment.peerId);
+			assert.equal(completed?.cleanupPending, undefined);
+			assert.equal(completed?.invitationSecretKeyRef, undefined);
+			assert.equal(
+				await secrets.get(`mesh.invitation.${invitation.invitationId}`),
+				undefined,
+			);
+		} finally {
+			await client.close();
+			await fixture.dispose();
+		}
+	});
+
 	test('serializes expiry pruning with an in-flight commit and retains its active root', async () => {
 		let now = 1_000;
 		const records = new BlockingCommitRecordStore();
@@ -449,6 +505,84 @@ suite('Gateway pairing component', { concurrency: 1 }, () => {
 			assert.equal(completed?.pendingEnrollmentId, undefined);
 			assert.equal(completed?.pendingCommitProofKeyRef, undefined);
 			assert.ok(completed?.credentialKeyRef);
+		} finally {
+			await manager.dispose();
+			await fixture.dispose();
+		}
+	});
+
+	test('reconciles a candidate profile write that persisted before reporting failure', async () => {
+		const fixture = await createFixture();
+		const storedProfiles = new InMemoryPeerProfileStore();
+		const profiles = new WriteThenThrowCandidateProfileStore(storedProfiles);
+		const manager = new PeerConnectionManager(
+			'profile-reconcile-coordinator',
+			profiles,
+			fixture.secrets,
+			new WebSocketPeerTransport({
+				requestTimeoutMs: 20,
+				heartbeatIntervalMs: 25,
+				webSocketFactory: dropFirstRpcMethod('mesh.enrollmentCommit'),
+			}),
+			{
+				id: () => 'profile-reconcile',
+				random: () => 0.5,
+				reconnectBaseMs: 10,
+				reconnectMaxMs: 20,
+			},
+		);
+		try {
+			const invitation = await fixture.invitation();
+			await assert.rejects(manager.add(invitation.url));
+			const candidate = await storedProfiles.get('profile-reconcile');
+			assert.ok(candidate?.pendingEnrollmentId);
+			assert.ok(candidate.credentialKeyRef);
+			assert.ok(await fixture.secrets.get(candidate.credentialKeyRef));
+			await waitFor(
+				() => manager.get('profile-reconcile')?.snapshot().state === 'online',
+				1_000,
+			);
+		} finally {
+			await manager.dispose();
+			await fixture.dispose();
+		}
+	});
+
+	test('deletes candidate keys only after confirming the profile write did not persist', async () => {
+		const fixture = await createFixture();
+		const storedProfiles = new InMemoryPeerProfileStore();
+		const profiles = new RejectCandidateProfileStore(storedProfiles);
+		const manager = new PeerConnectionManager(
+			'profile-reject-coordinator',
+			profiles,
+			fixture.secrets,
+			new WebSocketPeerTransport({
+				requestTimeoutMs: 500,
+				webSocketFactory: (url) => new WebSocket(url.replace(/^wss:/u, 'ws:')),
+			}),
+			{
+				id: () => 'profile-reject',
+				random: () => 1,
+				reconnectBaseMs: 60_000,
+				reconnectMaxMs: 60_000,
+			},
+		);
+		try {
+			const invitation = await fixture.invitation();
+			await assert.rejects(
+				manager.add(invitation.url),
+				(error: unknown) => error instanceof Error,
+			);
+			const previous = await storedProfiles.get('profile-reject');
+			assert.equal(previous?.pendingEnrollmentId, undefined);
+			assert.equal(
+				await fixture.secrets.get('mesh.remotePeer.profile-reject'),
+				undefined,
+			);
+			assert.equal(
+				await fixture.secrets.get('mesh.remoteCommit.profile-reject'),
+				undefined,
+			);
 		} finally {
 			await manager.dispose();
 			await fixture.dispose();
@@ -691,6 +825,7 @@ interface FixtureOptions {
 	readonly pendingTtlMs?: number;
 	readonly rejectCommit?: boolean;
 	readonly records?: PairingRecordStore;
+	readonly secrets?: SecretStore;
 	readonly now?: () => number;
 }
 
@@ -757,7 +892,7 @@ async function createFixture(options: FixtureOptions = {}) {
 }
 
 function createGatewayDependencies(options: FixtureOptions = {}) {
-	const secrets = new InMemorySecretStore();
+	const secrets = options.secrets ?? new InMemorySecretStore();
 	const records = options.records
 		?? (options.rejectCommit === true
 			? new RejectingCommitRecordStore()
@@ -842,6 +977,61 @@ class BlockingCommitRecordStore extends InMemoryPairingRecordStore {
 		this.markCommitStarted();
 		await this.commitGate;
 		return super.commitPeer(record, pending);
+	}
+}
+
+class FailOnceInvitationDeleteSecretStore extends InMemorySecretStore {
+	private failed = false;
+
+	public override async delete(key: string): Promise<void> {
+		if (!this.failed && key.startsWith('mesh.invitation.')) {
+			this.failed = true;
+			throw new Error('Injected invitation secret deletion failure.');
+		}
+		await super.delete(key);
+	}
+}
+
+class WriteThenThrowCandidateProfileStore implements PeerProfileStore {
+	private failed = false;
+
+	public constructor(private readonly delegate: InMemoryPeerProfileStore) {}
+
+	public get(id: string) {
+		return this.delegate.get(id);
+	}
+	public list() {
+		return this.delegate.list();
+	}
+	public delete(id: string) {
+		return this.delegate.delete(id);
+	}
+	public async store(profile: Parameters<PeerProfileStore['store']>[0]): Promise<void> {
+		await this.delegate.store(profile);
+		if (!this.failed && profile.pendingEnrollmentId !== undefined) {
+			this.failed = true;
+			throw new Error('Candidate write result was unknown.');
+		}
+	}
+}
+
+class RejectCandidateProfileStore implements PeerProfileStore {
+	public constructor(private readonly delegate: InMemoryPeerProfileStore) {}
+
+	public get(id: string) {
+		return this.delegate.get(id);
+	}
+	public list() {
+		return this.delegate.list();
+	}
+	public delete(id: string) {
+		return this.delegate.delete(id);
+	}
+	public async store(profile: Parameters<PeerProfileStore['store']>[0]): Promise<void> {
+		if (profile.pendingEnrollmentId !== undefined) {
+			throw new Error('Candidate write failed.');
+		}
+		await this.delegate.store(profile);
 	}
 }
 
