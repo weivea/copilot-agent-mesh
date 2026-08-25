@@ -1,6 +1,6 @@
 const maximumCanonicalLength = 4096;
 const maximumDecodeRounds = 4;
-const maximumUrlInspectionDepth = 4;
+const maximumUriInspectionDepth = 4;
 const normalizedCredentialKeys = new Set([
 	'accesstoken',
 	'apikey',
@@ -40,13 +40,13 @@ function containsUnsafeDashboardTextAtDepth(value: string, depth: number): boole
 	) {
 		return true;
 	}
-	const urls = extractUrlCandidates(canonical);
-	if (urls.length > 0) {
-		if (depth >= maximumUrlInspectionDepth) {
+	const uris = extractUriCandidates(canonical);
+	if (uris.length > 0) {
+		if (depth >= maximumUriInspectionDepth) {
 			return true;
 		}
-		for (const candidate of urls) {
-			if (containsUnsafeUrl(candidate, depth + 1)) {
+		for (const candidate of uris) {
+			if (containsUnsafeUri(candidate, depth + 1)) {
 				return true;
 			}
 		}
@@ -208,18 +208,20 @@ function normalizeCredentialKey(value: string): string {
 	return normalized;
 }
 
-function extractUrlCandidates(value: string): string[] {
-	const lower = value.toLowerCase();
+function extractUriCandidates(value: string): string[] {
 	const candidates: string[] = [];
-	let searchFrom = 0;
-	while (searchFrom < value.length) {
-		const httpsIndex = lower.indexOf('https://', searchFrom);
-		const httpIndex = lower.indexOf('http://', searchFrom);
-		const start = firstAvailableIndex(httpsIndex, httpIndex);
-		if (start < 0) {
-			break;
+	for (let start = 0; start < value.length; start += 1) {
+		if (!isAsciiLetter(value[start]) || (start > 0 && isUriSchemeCharacter(value[start - 1]))) {
+			continue;
 		}
-		let end = start;
+		let schemeEnd = start + 1;
+		while (schemeEnd < value.length && isUriSchemeCharacter(value[schemeEnd])) {
+			schemeEnd += 1;
+		}
+		if (value[schemeEnd] !== ':' || value[schemeEnd + 1] !== '/') {
+			continue;
+		}
+		let end = schemeEnd + 2;
 		while (end < value.length && !isUrlTerminator(value[end])) {
 			end += 1;
 		}
@@ -230,12 +232,12 @@ function extractUrlCandidates(value: string): string[] {
 		if (candidate.length > 0) {
 			candidates.push(candidate);
 		}
-		searchFrom = Math.max(end, start + 1);
+		start = Math.max(start, end - 1);
 	}
 	return candidates;
 }
 
-function containsUnsafeUrl(candidate: string, depth: number): boolean {
+function containsUnsafeUri(candidate: string, depth: number): boolean {
 	let parsed: URL;
 	try {
 		parsed = new URL(candidate);
@@ -263,14 +265,15 @@ function containsUnsafeUrl(candidate: string, depth: number): boolean {
 	return fragment.length > 0 && containsUnsafeDashboardTextAtDepth(fragment, depth);
 }
 
-function firstAvailableIndex(first: number, second: number): number {
-	if (first < 0) {
-		return second;
+function isUriSchemeCharacter(character: string): boolean {
+	if (isAsciiLetter(character)) {
+		return true;
 	}
-	if (second < 0) {
-		return first;
-	}
-	return Math.min(first, second);
+	const code = character.charCodeAt(0);
+	return (code >= 48 && code <= 57)
+		|| character === '+'
+		|| character === '-'
+		|| character === '.';
 }
 
 function isUrlTerminator(character: string): boolean {

@@ -102,6 +102,11 @@ suite('Dashboard', () => {
 			'https://user:pass@example.test',
 			'https://user%3Apass@example.test',
 			'https://user%253Apass@example.test',
+			'vscode-remote://ssh-remote+host/home/alice',
+			'vscode://file/Users/alice',
+			'vscode-remote%3A%2F%2Fssh-remote%2Bhost%2Fhome%2Falice',
+			'VSCODE://file/Users/alice',
+			'custom-scheme://host/home/alice',
 		]) {
 			assert.throws(() => assertSafeDashboardOutboundMessage({
 				...base,
@@ -111,6 +116,10 @@ suite('Dashboard', () => {
 		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({
 			...base,
 			model: withTaskSummary(snapshot(), 'https://example.test'),
+		}));
+		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({
+			...base,
+			model: withTaskSummary(snapshot(), 'HTTPS://EXAMPLE.TEST'),
 		}));
 	});
 
