@@ -134,6 +134,9 @@
 		if (task.summary) {
 			card.append(textElement('p', task.summary, 'summary'));
 		}
+		if (task.summaryTruncated) {
+			card.append(textElement('p', 'Summary truncated for display.', 'action-hint'));
+		}
 		if (task.error) {
 			card.append(renderError(task.error));
 		}

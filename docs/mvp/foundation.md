@@ -62,11 +62,16 @@ Device IDs remain stable across reloads and renames. Workspace IDs are generated
 opaque identifiers. Workspace registration lexically normalizes file URIs, then
 uses an injected `FileIdentityResolver` to resolve aliases and symbolic links.
 The resolver's canonical filesystem identity is the deduplication and lease key.
-Every list, resolution, registration, enable/disable, removal, and lease
+Every live list, resolution, registration, enable/disable, removal, and lease
 acquisition revalidates that identity. Identity changes replace an unleased
-record or disable a stale leased/colliding record. Revalidation and lease
-acquisition are atomic under the same mutation queue, so an old and new identity
-cannot both be leased through the registry.
+record or disable a leased/colliding record. If `realpath` or `stat` reports that
+a workspace is missing or inaccessible, its local record becomes sticky
+`stale`/disabled state. Other workspaces remain listable, stale workspaces cannot
+be leased, and an unleased stale record can be removed. A path becoming
+accessible again does not silently reactivate it: `revalidate` or `register`
+must explicitly clear stale state before it can be enabled. Revalidation and
+lease acquisition are atomic under the same mutation queue, so an old and new
+identity cannot both be leased through the registry.
 
 `AtomicFileStore` uses a temporary file, file sync, atomic rename, and directory
 sync where the platform supports it. New directories are created one level at a

@@ -8,6 +8,7 @@ import type {
 	PersistedDelegationIntent,
 	TaskActionReceipt,
 	TaskToolReadResult,
+	TaskToolSnapshot,
 } from '../../shared/toolProtocol';
 import { TaskToolFacade, TaskToolFacadeError } from '../tools/taskToolFacade';
 import {
@@ -240,6 +241,7 @@ suite('TaskToolsCore', () => {
 			})),
 			eventCursor: 13,
 			eventGap: { expectedFrom: 1, availableFrom: 4 },
+			truncated: true,
 		};
 		const core = new TaskToolsCore(facade, { outputByteLimit: 1_200 });
 
@@ -252,9 +254,14 @@ suite('TaskToolsCore', () => {
 
 		assert.equal(result.status, 'ok');
 		assert.equal(result.truncated, true);
-		assert.deepStrictEqual(result.eventGap, { expectedFrom: 1, availableFrom: 4 });
 		assert.ok(bytes <= 1_200);
-		assert.ok((result.events as readonly unknown[]).length < 10);
+		const events = result.events as Array<Record<string, unknown>>;
+		assert.ok(events.length < 10);
+		assert.equal((result.eventGap as Record<string, unknown>).expectedFrom, 1);
+		assert.equal(
+			(result.eventGap as Record<string, unknown>).availableFrom,
+			events[0]?.sequence ?? 14,
+		);
 	});
 
 	test('rejects inconsistent task event ordering, cursors, and gaps', async () => {
@@ -273,6 +280,21 @@ suite('TaskToolsCore', () => {
 					{ ...baseEvent, sequence: 6 },
 					{ ...baseEvent, sequence: 6 },
 				],
+			},
+			{
+				...facade.taskRead,
+				eventCursor: 7,
+				events: [
+					{ ...baseEvent, sequence: 6 },
+					{ ...baseEvent, sequence: 8 },
+				],
+				truncated: true,
+			},
+			{
+				...facade.taskRead,
+				eventCursor: 8,
+				events: [{ ...baseEvent, sequence: 8 }],
+				truncated: true,
 			},
 			{
 				...facade.taskRead,
@@ -295,6 +317,13 @@ suite('TaskToolsCore', () => {
 				eventCursor: 8,
 				events: [{ ...baseEvent, sequence: 8 }],
 				eventGap: { expectedFrom: 5, availableFrom: 8 },
+			},
+			{
+				...facade.taskRead,
+				eventCursor: 8,
+				events: [{ ...baseEvent, sequence: 8 }],
+				eventGap: { expectedFrom: 6, availableFrom: 8 },
+				truncated: false,
 			},
 		];
 
@@ -452,7 +481,14 @@ suite('TaskToolsCore', () => {
 		const facade = new RecordingFacade();
 		facade.taskRead = {
 			...facade.taskRead,
-			snapshot: { ...facade.taskRead.snapshot, status: 'recovering' },
+			snapshot: {
+				...facade.taskRead.snapshot,
+				status: 'recovering',
+				pendingInput: {
+					inputId: INPUT_ID,
+					prompt: 'Recovery is waiting for a previously requested choice.',
+				},
+			},
 		};
 		facade.cancelStatus = 'cancelling';
 		const core = new TaskToolsCore(facade);
@@ -461,12 +497,22 @@ suite('TaskToolsCore', () => {
 		const cancel = await core.cancelTask({ taskId: TASK_ID });
 
 		assert.equal((read.snapshot as Record<string, unknown>).status, 'recovering');
+		assert.equal(
+			((read.snapshot as Record<string, unknown>).pendingInput as Record<string, unknown>).inputId,
+			INPUT_ID,
+		);
+		assert.equal(read.answerTool, undefined);
 		assert.equal(cancel.taskStatus, 'cancelling');
 	});
 
 	test('rejects snapshots whose pending input contradicts task status', async () => {
 		const facade = new RecordingFacade();
 		const core = new TaskToolsCore(facade);
+		const terminalFailure = {
+			code: 'TASK_EXECUTION_FAILED',
+			message: 'The task did not finish.',
+			retryable: false,
+		};
 		facade.taskRead = {
 			...facade.taskRead,
 			snapshot: {
@@ -483,7 +529,6 @@ suite('TaskToolsCore', () => {
 			'accepted',
 			'startingAgent',
 			'running',
-			'recovering',
 			'cancelling',
 			'completed',
 			'failed',
@@ -499,6 +544,9 @@ suite('TaskToolsCore', () => {
 						inputId: INPUT_ID,
 						prompt: 'Contradictory input.',
 					},
+					...((status === 'failed' || status === 'timedOut')
+						? { failure: terminalFailure }
+						: {}),
 				},
 			};
 			const contradictory = await core.getTask({ taskId: TASK_ID });
@@ -582,6 +630,79 @@ suite('TaskToolsCore', () => {
 		assert.doesNotMatch(serialized, /secret|token|Users|workspace/);
 	});
 
+	test('requires Foundation failure details only for failed and timedOut snapshots', async () => {
+		const facade = new RecordingFacade();
+		const core = new TaskToolsCore(facade);
+		const failure = {
+			code: 'TASK_EXECUTION_FAILED',
+			message: 'The remote coding agent exited unexpectedly.',
+			retryable: true,
+		};
+
+		for (const status of ['failed', 'timedOut'] as const) {
+			facade.taskRead = {
+				...facade.taskRead,
+				snapshot: { ...facade.taskRead.snapshot, status, failure },
+			};
+			const result = await core.getTask({ taskId: TASK_ID });
+			assert.deepStrictEqual((result.snapshot as Record<string, unknown>).failure, failure);
+		}
+
+		const invalidSnapshots: readonly TaskToolSnapshot[] = [
+			{ ...facade.taskRead.snapshot, status: 'running', failure },
+			{ ...facade.taskRead.snapshot, status: 'failed', failure: undefined },
+			{ ...facade.taskRead.snapshot, status: 'timedOut', failure: undefined },
+			{ ...facade.taskRead.snapshot, status: 'failed', failure: { ...failure, code: 'E'.repeat(129) } },
+			{ ...facade.taskRead.snapshot, status: 'failed', failure: { ...failure, message: 'x'.repeat(2_049) } },
+		];
+		for (const snapshot of invalidSnapshots) {
+			facade.taskRead = { ...facade.taskRead, snapshot };
+			const result = await core.getTask({ taskId: TASK_ID });
+			assert.equal(result.status, 'error');
+			assert.equal((result.error as Record<string, unknown>).code, 'OUTPUT_INVALID');
+		}
+	});
+
+	test('preserves task failure code and retryability during byte and token contraction', async () => {
+		const facade = new RecordingFacade();
+		const failure = {
+			code: 'E'.repeat(128),
+			message: '🙂'.repeat(512),
+			retryable: true,
+		};
+		facade.taskRead = {
+			...facade.taskRead,
+			snapshot: {
+				...facade.taskRead.snapshot,
+				status: 'failed',
+				summary: 's'.repeat(16 * 1024),
+				failure,
+			},
+		};
+		const result = await new TaskToolsCore(facade, { outputByteLimit: 1_024 }).getTask({ taskId: TASK_ID });
+		const byteFailure = ((result.snapshot as Record<string, unknown>).failure as Record<string, unknown>);
+		const serialized = await serializeToolResultToTokenBudget(
+			result,
+			400,
+			async (text) => text.length,
+		);
+		const tokenFailure = (((JSON.parse(serialized) as Record<string, unknown>).snapshot as Record<string, unknown>)
+			.failure as Record<string, unknown>);
+
+		assert.equal(byteFailure.code, failure.code);
+		assert.equal(byteFailure.retryable, true);
+		assert.equal(tokenFailure.code, failure.code);
+		assert.equal(tokenFailure.retryable, true);
+		assert.equal(
+			Buffer.from(String(byteFailure.message), 'utf8').toString('utf8'),
+			byteFailure.message,
+		);
+		assert.equal(
+			Buffer.from(String(tokenFailure.message), 'utf8').toString('utf8'),
+			tokenFailure.message,
+		);
+	});
+
 	test('rejects malformed Facade output instead of forwarding it', async () => {
 		const facade = new RecordingFacade();
 		const workerWithPath = {
@@ -606,7 +727,10 @@ suite('TaskToolsCore', () => {
 	test('uses an exact tokenizer budget and truncates task events', async () => {
 		const result = {
 			status: 'ok',
-			events: Array.from({ length: 8 }, (_, index) => ({ summary: `event-${index}-${'x'.repeat(80)}` })),
+			events: Array.from({ length: 8 }, (_, index) => ({
+				sequence: index + 1,
+				summary: `event-${index}-${'x'.repeat(80)}`,
+			})),
 			truncated: false,
 		};
 		const countTokens = async (text: string): Promise<number> => text.length;
@@ -617,6 +741,12 @@ suite('TaskToolsCore', () => {
 		assert.equal(fitted.status, 'ok');
 		assert.equal(fitted.truncated, true);
 		assert.ok((fitted.events as readonly unknown[]).length < result.events.length);
+		assert.equal((fitted.eventGap as Record<string, unknown>).expectedFrom, 1);
+		const fittedEvents = fitted.events as Array<Record<string, unknown>>;
+		assert.equal(
+			(fitted.eventGap as Record<string, unknown>).availableFrom,
+			fittedEvents[0]?.sequence ?? result.events.length + 1,
+		);
 		assert.ok(await countTokens(serialized) <= 220);
 	});
 
@@ -821,6 +951,12 @@ suite('Mesh tool manifest contract', () => {
 		assert.ok(delegateDescriptor);
 		assert.match(delegateDescriptor.modelDescription, /s state/);
 		assert.match(delegateDescriptor.modelDescription, /retry the exact same intent/);
+		const getDescriptor = MESH_TOOL_MANIFEST_DESCRIPTORS.find(
+			({ name }) => name === MESH_TOOL_NAMES.getTask,
+		);
+		assert.ok(getDescriptor);
+		assert.match(getDescriptor.modelDescription, /only needsInput snapshots expose mesh_answer_task/);
+		assert.match(getDescriptor.modelDescription, /Failed and timedOut snapshots include safe failure/);
 	});
 
 	test('exports the cold implicit activation contract for every tool', () => {
@@ -877,9 +1013,9 @@ class RecordingFacade implements TaskToolFacade {
 			updatedAt: '2026-08-25T00:00:00.000Z',
 			phase: 'implementation',
 		},
-		eventCursor: 2,
+		eventCursor: 1,
 		events: [{
-			sequence: 2,
+			sequence: 1,
 			type: 'progress',
 			at: '2026-08-25T00:00:00.000Z',
 			summary: 'Implementing.',

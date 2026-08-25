@@ -31,6 +31,20 @@ function and shrinks events, worker lists, and optional snapshot fields to the
 actual token budget. If even the smallest JSON result does not fit, the adapter
 returns an empty `LanguageModelTextPart` rather than exceeding the budget.
 
+Task event sequences are positive and strictly contiguous. Without truncation,
+the cursor equals the last returned event sequence, or the requested `after`
+cursor when no events are returned. Dropping leading events for byte or token
+budgets creates or advances `eventGap.expectedFrom` and
+`eventGap.availableFrom`; only this explicit gap/truncation contract explains a
+cursor jump.
+
+Snapshots accept Foundation's recoverable pending-input state, but
+`mesh_answer_task` remains exposed only while the task is `needsInput`.
+Terminal and all other states reject pending input. `failed` and `timedOut`
+snapshots require bounded failure details (`code`, message up to 2 KiB, and
+`retryable`); every other state forbids them. Output shrinking may omit the
+message but preserves the stable code and retryability.
+
 Every peer, workspace, delegation, task, input, answer, and artifact identifier
 is a canonical lowercase UUID (`8-4-4-4-12` hexadecimal form). Runtime parsing
 rejects uppercase, escaped control characters, suffixes, and arbitrary opaque

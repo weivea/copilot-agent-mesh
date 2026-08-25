@@ -73,7 +73,7 @@ export const MESH_TOOL_MANIFEST_DESCRIPTORS: readonly ToolManifestDescriptor[] =
 		displayName: 'Get Mesh Task',
 		toolReferenceName: 'meshGetTask',
 		canBeReferencedInPrompt: true,
-		modelDescription: 'Returns a bounded snapshot and event summary for an asynchronous Copilot Agent Mesh task, including event-gap and truncation indicators. Never returns a raw transcript.',
+		modelDescription: 'Returns a bounded snapshot and event summary for an asynchronous Copilot Agent Mesh task, including event-gap and truncation indicators. Event sequences are positive and consecutive unless eventGap or truncation identifies omitted leading events. Recovering snapshots may retain pending input, but only needsInput snapshots expose mesh_answer_task. Failed and timedOut snapshots include safe failure code, message, and retryable fields. Never returns a raw transcript.',
 		userDescription: 'Check a delegated task status and bounded results.',
 		tags: ['copilot-agent-mesh'],
 		inputSchema: {

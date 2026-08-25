@@ -68,7 +68,8 @@ suite('Dashboard', () => {
 			uiInstanceId: 'instance-1',
 			type: 'dashboard.snapshot' as const,
 		};
-		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({ ...base, model: snapshot() }));
+		const safeModel = new DashboardPresenter().present(snapshot());
+		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({ ...base, model: safeModel }));
 		for (const unsafeText of [
 			'/tmp',
 			'Failed at /tmp',
@@ -105,6 +106,10 @@ suite('Dashboard', () => {
 			'{"api key":"private-value"}',
 			'{"private key" : "private-value"}',
 			'{"client-secret":"private-value"}',
+			'https://example.test/?credentials[password]=private-value',
+			'https://example.test/?credentials%5Bpassword%5D=private-value',
+			'https://example.test/?api+key=private-value',
+			'https://example.test/?nested=api%2Bkey%3Dprivate-value',
 			'malformed=%E0%A4%A',
 			'https://x/#/Users/person/private-project',
 			'https://x/?location=C%3A%5CUsers%5Cperson%5Cprivate',
@@ -138,20 +143,20 @@ suite('Dashboard', () => {
 		]) {
 			assert.throws(() => assertSafeDashboardOutboundMessage({
 				...base,
-				model: withTaskSummary(snapshot(), unsafeText),
+				model: withTaskSummary(safeModel, unsafeText),
 			}));
 		}
 		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({
 			...base,
-			model: withTaskSummary(snapshot(), 'https://example.test'),
+			model: withTaskSummary(safeModel, 'https://example.test'),
 		}));
 		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({
 			...base,
-			model: withTaskSummary(snapshot(), 'HTTPS://EXAMPLE.TEST'),
+			model: withTaskSummary(safeModel, 'HTTPS://EXAMPLE.TEST'),
 		}));
 		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({
 			...base,
-			model: withTaskSummary(snapshot(), 'tokenCount = 12'),
+			model: withTaskSummary(safeModel, 'tokenCount = 12'),
 		}));
 	});
 
@@ -173,6 +178,46 @@ suite('Dashboard', () => {
 		assert.strictEqual(model.errors[0].message, '[redacted sensitive details]');
 		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({
 			version: 1,
+			uiInstanceId: 'instance-1',
+			type: 'dashboard.snapshot',
+			model,
+		}));
+	});
+
+	test('presents every Foundation task state and safely truncates valid UTF-8 summaries', () => {
+		const source = snapshot();
+		const presenter = new DashboardPresenter();
+		const summary = '🙂'.repeat(4_096);
+		const states: DashboardSnapshot['tasks'][number]['state'][] = [
+			'accepted',
+			'startingAgent',
+			'running',
+			'needsInput',
+			'recovering',
+			'cancelling',
+			'completed',
+			'failed',
+			'cancelled',
+			'timedOut',
+		];
+		const model = presenter.present({
+			...source,
+			tasks: states.map((state, index) => ({
+				...source.tasks[0],
+				taskId: `task-${index + 1}`,
+				state,
+				summary,
+				summaryTruncated: index === 0,
+			})),
+		});
+
+		assert.strictEqual(model.tasks.length, states.length);
+		for (const task of model.tasks) {
+			assert.strictEqual(Buffer.byteLength(task.summary ?? '', 'utf8'), 2 * 1_024);
+			assert.strictEqual(task.summaryTruncated, true);
+		}
+		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({
+			version: DASHBOARD_MESSAGE_VERSION,
 			uiInstanceId: 'instance-1',
 			type: 'dashboard.snapshot',
 			model,
@@ -527,10 +572,13 @@ function snapshot(): DashboardSnapshot {
 	};
 }
 
-function withTaskSummary(value: DashboardSnapshot, summary: string): DashboardSnapshot {
+function withTaskSummary(
+	value: ReturnType<DashboardPresenter['present']>,
+	summary: string,
+): ReturnType<DashboardPresenter['present']> {
 	return {
 		...value,
-		tasks: value.tasks.map((task) => ({ ...task, summary })),
+		tasks: value.tasks.map((task) => ({ ...task, summary, summaryTruncated: false })),
 	};
 }
 

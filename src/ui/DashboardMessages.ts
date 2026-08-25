@@ -1,5 +1,6 @@
 import { DashboardViewModel } from './DashboardPresenter';
 import { containsUnsafeDashboardText } from './DashboardRedaction';
+import { TASK_STATUSES, utf8ByteLength } from '../../shared/protocol';
 
 export const DASHBOARD_MESSAGE_VERSION = 1 as const;
 
@@ -160,23 +161,14 @@ function assertDashboardViewModel(model: unknown): asserts model is DashboardVie
 		assertExactRecord(
 			task,
 			['taskId', 'title', 'peerName', 'workspaceName', 'state', 'canCancel', 'needsInput'],
-			['phase', 'summary', 'error'],
+			['phase', 'summary', 'summaryTruncated', 'error'],
 		);
 		assertIdentifier(task.taskId);
 		assertStrings(task, ['title', 'peerName', 'workspaceName']);
-		assertEnum(task.state, [
-			'created',
-			'accepted',
-			'startingAgent',
-			'running',
-			'needsInput',
-			'completed',
-			'failed',
-			'cancelled',
-			'timedOut',
-		]);
+		assertEnum(task.state, TASK_STATUSES);
 		assertBoolean(task.canCancel);
 		assertBoolean(task.needsInput);
+		assertBoolean(task.summaryTruncated);
 		assertOptionalString(task.phase);
 		assertOptionalString(task.summary);
 		if (task.error !== undefined) {
@@ -190,7 +182,7 @@ function assertDashboardViewModel(model: unknown): asserts model is DashboardVie
 
 function assertSafeValue(value: unknown, location: string): void {
 	if (typeof value === 'string') {
-		if (value.length > 2048) {
+		if (utf8ByteLength(value) > 2 * 1_024) {
 			throw new Error(`Dashboard value exceeds the safe bound at ${location}.`);
 		}
 		if (containsUnsafeDashboardText(value)) {

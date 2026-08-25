@@ -1,4 +1,4 @@
-const maximumCanonicalLength = 4096;
+const maximumCanonicalLength = 16 * 1024;
 const maximumDecodeRounds = 4;
 const maximumUriInspectionDepth = 4;
 const sensitiveCredentialKeySuffixes = [
@@ -183,7 +183,7 @@ function containsCredentialAssignment(value: string): boolean {
 		const keyEnd = cursor + 1;
 		while (
 			cursor >= 0
-			&& (isIdentifierCharacter(value[cursor]) || value[cursor].trim().length === 0)
+			&& isCredentialKeyCharacter(value[cursor])
 		) {
 			cursor -= 1;
 		}
@@ -202,6 +202,14 @@ function isCredentialPadding(character: string): boolean {
 	return character === '"' || character === '\'' || character.trim().length === 0;
 }
 
+function isCredentialKeyCharacter(character: string): boolean {
+	return isIdentifierCharacter(character)
+		|| character.trim().length === 0
+		|| character === '['
+		|| character === ']'
+		|| character === '+';
+}
+
 function isIdentifierCharacter(character: string | undefined): boolean {
 	if (character === undefined) {
 		return false;
@@ -216,11 +224,22 @@ function isIdentifierCharacter(character: string | undefined): boolean {
 function normalizeCredentialKey(value: string): string {
 	let normalized = '';
 	for (const character of value) {
-		if (character !== '_' && character !== '-' && character.trim().length > 0) {
+		const code = character.charCodeAt(0);
+		if (isAsciiLetter(character) || (code >= 48 && code <= 57)) {
 			normalized += character.toLowerCase();
 		}
 	}
 	return normalized;
+}
+
+function containsUnsafeFormKey(value: string, depth: number): boolean {
+	const normalized = normalizeFormComponent(value);
+	return isSensitiveCredentialKey(normalizeCredentialKey(normalized))
+		|| containsUnsafeDashboardTextAtDepth(normalized, depth);
+}
+
+function normalizeFormComponent(value: string): string {
+	return value.replaceAll('+', ' ');
 }
 
 function isSensitiveCredentialKey(value: string): boolean {
@@ -286,8 +305,8 @@ function containsUnsafeUri(candidate: string, depth: number): boolean {
 	}
 	for (const [key, value] of parsed.searchParams) {
 		if (
-			containsUnsafeDashboardTextAtDepth(key, depth)
-			|| containsUnsafeDashboardTextAtDepth(value, depth)
+			containsUnsafeFormKey(key, depth)
+			|| containsUnsafeDashboardTextAtDepth(normalizeFormComponent(value), depth)
 		) {
 			return true;
 		}

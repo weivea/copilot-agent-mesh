@@ -7,6 +7,7 @@ import {
 	TASK_TOOL_LIMITS,
 	TaskActionReceipt,
 	TaskArtifactReference,
+	TaskFailureSummary,
 	TaskPendingInputSummary,
 	TaskToolErrorCode,
 	TaskToolEvent,
@@ -326,7 +327,7 @@ export class TaskToolsCore {
 			if (read.snapshot.taskId !== input.taskId) {
 				return this.errorResult('OUTPUT_INVALID');
 			}
-			return this.boundTaskResult(read);
+			return this.boundTaskResult(read, input.afterEventSequence ?? 0);
 		} catch {
 			return this.errorResult('OUTPUT_INVALID');
 		}
@@ -622,7 +623,7 @@ export class TaskToolsCore {
 		return this.fitResult(result);
 	}
 
-	private boundTaskResult(read: TaskToolReadResult): ToolJsonResult {
+	private boundTaskResult(read: TaskToolReadResult, afterEventSequence: number): ToolJsonResult {
 		const result: {
 			status: string;
 			snapshot: TaskToolSnapshot;
@@ -651,16 +652,26 @@ export class TaskToolsCore {
 								: { choices: [...read.snapshot.pendingInput.choices] }),
 						},
 					}),
+				...(read.snapshot.failure === undefined
+					? {}
+					: { failure: { ...read.snapshot.failure } }),
 			},
 			eventCursor: read.eventCursor,
 			events: read.events.map((event) => ({ ...event })),
 			...(read.eventGap === undefined ? {} : { eventGap: { ...read.eventGap } }),
-			...(read.snapshot.pendingInput === undefined ? {} : { answerTool: MESH_TOOL_NAMES.answerTask }),
+			...(read.snapshot.status === 'needsInput' ? { answerTool: MESH_TOOL_NAMES.answerTask } : {}),
 			truncated: read.truncated,
 		};
 
 		while (utf8JsonBytes(result) > this.outputByteLimit && result.events.length > 0) {
-			result.events.shift();
+			const removed = result.events.shift();
+			if (removed === undefined) {
+				break;
+			}
+			result.eventGap = {
+				expectedFrom: result.eventGap?.expectedFrom ?? afterEventSequence + 1,
+				availableFrom: removed.sequence + 1,
+			};
 			result.truncated = true;
 		}
 		while (
@@ -729,6 +740,20 @@ export class TaskToolsCore {
 				validation: Buffer.byteLength(validationSummary, 'utf8') > 128
 					? { ...result.snapshot.validation, summary: halveUtf8(validationSummary, 128) }
 					: { status: result.snapshot.validation.status },
+			};
+			result.truncated = true;
+		}
+		while (
+			utf8JsonBytes(result) > this.outputByteLimit
+			&& result.snapshot.failure !== undefined
+			&& Buffer.byteLength(result.snapshot.failure.message, 'utf8') > 1
+		) {
+			result.snapshot = {
+				...result.snapshot,
+				failure: {
+					...result.snapshot.failure,
+					message: halveUtf8(result.snapshot.failure.message, 1),
+				},
 			};
 			result.truncated = true;
 		}
@@ -991,38 +1016,41 @@ function parseTaskReadResult(
 	const events = expectArray(read.events, 'events', requestedMaxEvents).map(parseTaskEvent);
 	const eventGap = read.eventGap === undefined ? undefined : parseEventGap(read.eventGap);
 	const eventCursor = expectInteger(read.eventCursor, 'eventCursor', 0, Number.MAX_SAFE_INTEGER);
+	const truncated = expectBoolean(read.truncated, 'truncated');
+	const requestedCursor = afterEventSequence ?? 0;
 	for (let index = 0; index < events.length; index += 1) {
 		const event = events[index];
-		const previousSequence = index === 0 ? afterEventSequence : events[index - 1].sequence;
-		if (previousSequence !== undefined && event.sequence <= previousSequence) {
-			throw new Error('task events must be strictly increasing and newer than the requested cursor.');
+		const previousSequence = index === 0
+			? (eventGap?.availableFrom ?? requestedCursor + 1) - 1
+			: events[index - 1].sequence;
+		if (event.sequence !== previousSequence + 1) {
+			throw new Error('task events must be strictly consecutive and newer than the requested cursor.');
 		}
 	}
 	const lastSequence = events.at(-1)?.sequence;
-	if (afterEventSequence !== undefined && eventCursor < afterEventSequence) {
+	if (eventCursor < requestedCursor) {
 		throw new Error('eventCursor cannot precede afterEventSequence.');
 	}
 	if (lastSequence !== undefined && eventCursor < lastSequence) {
 		throw new Error('eventCursor cannot precede the last returned event.');
 	}
+	if (!truncated && eventCursor !== (lastSequence ?? requestedCursor)) {
+		throw new Error('an untruncated eventCursor must equal the returned cursor.');
+	}
 	if (eventGap !== undefined) {
+		if (!truncated) {
+			throw new Error('eventGap requires a truncated task read result.');
+		}
 		if (eventGap.expectedFrom >= eventGap.availableFrom) {
 			throw new Error('eventGap must identify a non-empty forward gap.');
 		}
-		if (
-			afterEventSequence !== undefined
-			&& eventGap.expectedFrom !== afterEventSequence + 1
-		) {
+		if (eventGap.expectedFrom !== requestedCursor + 1) {
 			throw new Error('eventGap.expectedFrom must follow afterEventSequence.');
 		}
 		if (events.length > 0 && events[0].sequence !== eventGap.availableFrom) {
 			throw new Error('the first returned event must match eventGap.availableFrom.');
 		}
-	} else if (
-		afterEventSequence !== undefined
-		&& events.length > 0
-		&& events[0].sequence !== afterEventSequence + 1
-	) {
+	} else if (!truncated && events.length > 0 && events[0].sequence !== requestedCursor + 1) {
 		throw new Error('a discontinuous event sequence requires eventGap metadata.');
 	}
 	return {
@@ -1030,7 +1058,7 @@ function parseTaskReadResult(
 		eventCursor,
 		events,
 		...(eventGap === undefined ? {} : { eventGap }),
-		truncated: expectBoolean(read.truncated, 'truncated'),
+		truncated,
 	};
 }
 
@@ -1046,6 +1074,7 @@ function parseTaskSnapshot(value: unknown): TaskToolSnapshot {
 		'validation',
 		'artifacts',
 		'pendingInput',
+		'failure',
 	]);
 	const status = expectTaskStatus(snapshot.status);
 	const phase = optionalString(snapshot.phase, 'phase', 256);
@@ -1057,11 +1086,16 @@ function parseTaskSnapshot(value: unknown): TaskToolSnapshot {
 	const pendingInput = snapshot.pendingInput === undefined
 		? undefined
 		: parsePendingInput(snapshot.pendingInput);
+	const failure = snapshot.failure === undefined ? undefined : parseTaskFailure(snapshot.failure);
 	if (status === 'needsInput' && pendingInput === undefined) {
 		throw new Error('needsInput task snapshot must include pendingInput.');
 	}
-	if (status !== 'needsInput' && pendingInput !== undefined) {
-		throw new Error('pendingInput is only valid for a needsInput task snapshot.');
+	if (pendingInput !== undefined && status !== 'needsInput' && status !== 'recovering') {
+		throw new Error('pendingInput is only valid for a needsInput or recovering task snapshot.');
+	}
+	const failureStatus = status === 'failed' || status === 'timedOut';
+	if (failureStatus !== (failure !== undefined)) {
+		throw new Error('failure is required only for failed or timedOut task snapshots.');
 	}
 	return {
 		taskId: expectIdentifier(snapshot.taskId, 'taskId'),
@@ -1073,6 +1107,7 @@ function parseTaskSnapshot(value: unknown): TaskToolSnapshot {
 		...(validation === undefined ? {} : { validation }),
 		...(artifacts === undefined ? {} : { artifacts }),
 		...(pendingInput === undefined ? {} : { pendingInput }),
+		...(failure === undefined ? {} : { failure }),
 	};
 }
 
@@ -1080,7 +1115,7 @@ function parseTaskEvent(value: unknown): TaskToolEvent {
 	const event = expectRecord(value, 'task event');
 	expectExactKeys(event, ['sequence', 'type', 'at', 'summary']);
 	return {
-		sequence: expectInteger(event.sequence, 'sequence', 0, Number.MAX_SAFE_INTEGER),
+		sequence: expectInteger(event.sequence, 'sequence', 1, Number.MAX_SAFE_INTEGER),
 		type: expectString(event.type, 'event type', 128),
 		at: expectTimestamp(event.at, 'event time'),
 		summary: expectString(event.summary, 'event summary', 16 * 1024),
@@ -1091,8 +1126,18 @@ function parseEventGap(value: unknown): TaskToolReadResult['eventGap'] {
 	const gap = expectRecord(value, 'event gap');
 	expectExactKeys(gap, ['expectedFrom', 'availableFrom']);
 	return {
-		expectedFrom: expectInteger(gap.expectedFrom, 'expectedFrom', 0, Number.MAX_SAFE_INTEGER),
-		availableFrom: expectInteger(gap.availableFrom, 'availableFrom', 0, Number.MAX_SAFE_INTEGER),
+		expectedFrom: expectInteger(gap.expectedFrom, 'expectedFrom', 1, Number.MAX_SAFE_INTEGER),
+		availableFrom: expectInteger(gap.availableFrom, 'availableFrom', 1, Number.MAX_SAFE_INTEGER),
+	};
+}
+
+function parseTaskFailure(value: unknown): TaskFailureSummary {
+	const failure = expectRecord(value, 'task failure');
+	expectExactKeys(failure, ['code', 'message', 'retryable']);
+	return {
+		code: expectString(failure.code, 'failure code', TASK_TOOL_LIMITS.failureCodeBytes),
+		message: expectString(failure.message, 'failure message', TASK_TOOL_LIMITS.errorMessageBytes),
+		retryable: expectBoolean(failure.retryable, 'failure retryable'),
 	};
 }
 
@@ -1228,11 +1273,17 @@ function boundedUtf8(value: string, maxBytes: number): string {
 	if (Buffer.byteLength(value, 'utf8') <= maxBytes) {
 		return value;
 	}
-	let end = Math.min(value.length, maxBytes);
-	while (end > 0 && Buffer.byteLength(value.slice(0, end), 'utf8') > maxBytes) {
-		end -= 1;
+	let result = '';
+	let bytes = 0;
+	for (const character of value) {
+		const characterBytes = Buffer.byteLength(character, 'utf8');
+		if (bytes + characterBytes > maxBytes) {
+			break;
+		}
+		result += character;
+		bytes += characterBytes;
 	}
-	return value.slice(0, end);
+	return result;
 }
 
 function halveUtf8(value: string, minimumBytes: number): string {
@@ -1246,9 +1297,12 @@ function shrinkToolResult(value: ToolJsonResult): ToolJsonResult | undefined {
 		return compactDelegation;
 	}
 	if (Array.isArray(value.events) && value.events.length > 0) {
+		const [removed, ...events] = value.events;
+		const eventGap = leadingEventGap(value.eventGap, removed);
 		return {
 			...value,
-			events: value.events.slice(1),
+			events,
+			...(eventGap === undefined ? {} : { eventGap }),
 			truncated: true,
 		};
 	}
@@ -1273,6 +1327,19 @@ function shrinkToolResult(value: ToolJsonResult): ToolJsonResult | undefined {
 			const { phase: _phase, ...withoutPhase } = snapshot;
 			return { ...value, snapshot: withoutPhase, truncated: true };
 		}
+		if (isRecord(snapshot.failure) && typeof snapshot.failure.message === 'string' && snapshot.failure.message.length > 1) {
+			return {
+				...value,
+				snapshot: {
+					...snapshot,
+					failure: {
+						...snapshot.failure,
+						message: halveUtf8(snapshot.failure.message, 1),
+					},
+				},
+				truncated: true,
+			};
+		}
 		if (isRecord(snapshot.validation) && snapshot.validation.summary !== undefined) {
 			const { summary: _summary, ...compactValidation } = snapshot.validation;
 			return {
@@ -1281,6 +1348,7 @@ function shrinkToolResult(value: ToolJsonResult): ToolJsonResult | undefined {
 				truncated: true,
 			};
 		}
+
 		if (snapshot.validation !== undefined) {
 			const { validation: _validation, ...withoutValidation } = snapshot;
 			return { ...value, snapshot: withoutValidation, truncated: true };
@@ -1342,6 +1410,28 @@ function shrinkToolResult(value: ToolJsonResult): ToolJsonResult | undefined {
 				};
 			}
 		}
+		if (
+			(snapshot.status === 'failed' || snapshot.status === 'timedOut')
+			&& typeof snapshot.taskId === 'string'
+			&& isRecord(snapshot.failure)
+			&& typeof snapshot.failure.code === 'string'
+			&& typeof snapshot.failure.message === 'string'
+			&& typeof snapshot.failure.retryable === 'boolean'
+		) {
+			return {
+				status: typeof value.status === 'string' ? value.status : 'ok',
+				snapshot: {
+					taskId: snapshot.taskId,
+					status: snapshot.status,
+					failure: {
+						code: snapshot.failure.code,
+						message: snapshot.failure.message,
+						retryable: snapshot.failure.retryable,
+					},
+				},
+				truncated: true,
+			};
+		}
 	}
 	if (isRecord(value.error) && (value.error.message !== undefined || value.error.retryable !== undefined)) {
 		const { message: _message, retryable: _retryable, ...compactError } = value.error;
@@ -1352,6 +1442,21 @@ function shrinkToolResult(value: ToolJsonResult): ToolJsonResult | undefined {
 		return withoutRecovered;
 	}
 	return undefined;
+}
+
+function leadingEventGap(value: unknown, removed: unknown): Record<string, number> | undefined {
+	const sequence = isRecord(removed) ? removed.sequence : undefined;
+	if (typeof sequence !== 'number' || !Number.isSafeInteger(sequence) || sequence <= 0) {
+		return undefined;
+	}
+	const expectedFrom = isRecord(value) && Number.isSafeInteger(value.expectedFrom)
+		&& (value.expectedFrom as number) > 0
+		? value.expectedFrom as number
+		: sequence;
+	return {
+		expectedFrom,
+		availableFrom: sequence + 1,
+	};
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

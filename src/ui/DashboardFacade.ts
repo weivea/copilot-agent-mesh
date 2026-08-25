@@ -1,17 +1,10 @@
 import * as vscode from 'vscode';
 
+import type { TaskStatus } from '../../shared/protocol';
+
 export type ListenerState = 'stopped' | 'starting' | 'running' | 'stopping' | 'error' | 'unavailable';
 export type PeerState = 'connecting' | 'online' | 'busy' | 'offline' | 'authFailed' | 'incompatible';
-export type TaskState =
-	| 'created'
-	| 'accepted'
-	| 'startingAgent'
-	| 'running'
-	| 'needsInput'
-	| 'completed'
-	| 'failed'
-	| 'cancelled'
-	| 'timedOut';
+export type TaskState = TaskStatus;
 
 export interface ComponentSnapshot {
 	readonly state: 'ready' | 'stopped' | 'error' | 'unavailable';
@@ -61,6 +54,7 @@ export interface DashboardSnapshot {
 		readonly state: TaskState;
 		readonly phase?: string;
 		readonly summary?: string;
+		readonly summaryTruncated?: boolean;
 		readonly canCancel: boolean;
 		readonly needsInput: boolean;
 		readonly error?: {

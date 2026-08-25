@@ -22,6 +22,7 @@ const localWorkspaceSchema = z.strictObject({
 	name: utf8String(PROTOCOL_LIMITS.nameBytes, 'workspace name', 1),
 	capabilityTags: z.array(utf8String(64, 'capability tag', 1)).max(32),
 	enabled: z.boolean(),
+	stale: z.boolean().default(false),
 	createdAt: z.string().datetime({ offset: true }),
 	updatedAt: z.string().datetime({ offset: true }),
 });
@@ -87,6 +88,15 @@ export class WorkspaceRegistry {
 		return this.runExclusive(() => this.resolveEnabledUnlocked(workspaceId));
 	}
 
+	public revalidate(workspaceId: string): Promise<LocalWorkspace> {
+		return this.runExclusive(async () => {
+			const registry = this.read();
+			const index = this.findWorkspaceIndex(registry, workspaceId);
+			const refreshed = await this.revalidateWorkspaceUnlocked(registry, index, true);
+			return refreshed.workspace;
+		});
+	}
+
 	private async resolveEnabledUnlocked(workspaceId: string): Promise<LocalWorkspace> {
 		const parsedId = uuidSchema.safeParse(workspaceId);
 		const registry = this.read();
@@ -127,6 +137,7 @@ export class WorkspaceRegistry {
 				if (
 					previous.fileIdentity === candidate.fileIdentity
 					&& previous.localUri === candidate.localUri
+					&& !previous.stale
 				) {
 					return previous;
 				}
@@ -152,6 +163,7 @@ export class WorkspaceRegistry {
 				const updated = localWorkspaceSchema.parse({
 					...previous,
 					...candidate,
+					stale: false,
 					updatedAt: this.clock.now().toISOString(),
 				});
 				const workspaces = [...registry.workspaces];
@@ -175,6 +187,7 @@ export class WorkspaceRegistry {
 				...candidate,
 				workspaceId: this.ids.next(),
 				enabled: true,
+				stale: false,
 				createdAt: at,
 				updatedAt: at,
 			});
@@ -195,6 +208,12 @@ export class WorkspaceRegistry {
 			}
 			const refreshed = await this.revalidateWorkspaceUnlocked(registry, index);
 			const current = refreshed.workspace;
+			if (enabled && current.stale) {
+				throw new MeshDomainError(
+					'WORKSPACE_DISABLED',
+					'Workspace must be explicitly revalidated or registered before it can be enabled.',
+				);
+			}
 			if (!enabled && this.workspaceLeases.isLeased(current.fileIdentity)) {
 				throw new MeshDomainError('WORKSPACE_BUSY', 'An active task is using this workspace.');
 			}
@@ -316,15 +335,29 @@ export class WorkspaceRegistry {
 	private async revalidateWorkspaceUnlocked(
 		registry: z.infer<typeof workspaceRegistrySchema>,
 		index: number,
+		force = false,
 	): Promise<{
 		readonly registry: z.infer<typeof workspaceRegistrySchema>;
 		readonly workspace: LocalWorkspace;
 	}> {
 		const previous = registry.workspaces[index];
-		const identity = await this.resolveFileIdentity(previous.registeredUri);
+		if (previous.stale && !force) {
+			return { registry, workspace: previous };
+		}
+		let identity: Pick<LocalWorkspace, 'localUri' | 'fileIdentity'>;
+		try {
+			identity = await this.resolveFileIdentity(previous.registeredUri);
+		} catch (error) {
+			if (!isWorkspaceUnavailableError(error)) {
+				throw error;
+			}
+			const stale = await this.markWorkspaceStaleUnlocked(registry, index);
+			return { registry: stale.registry, workspace: stale.workspace };
+		}
 		if (
 			previous.localUri === identity.localUri
 			&& previous.fileIdentity === identity.fileIdentity
+			&& !previous.stale
 		) {
 			return { registry, workspace: previous };
 		}
@@ -342,6 +375,7 @@ export class WorkspaceRegistry {
 		const updated = localWorkspaceSchema.parse({
 			...previous,
 			...identity,
+			stale: false,
 			updatedAt: this.clock.now().toISOString(),
 		});
 		const workspaces = [...registry.workspaces];
@@ -350,6 +384,32 @@ export class WorkspaceRegistry {
 		return {
 			registry: { schemaVersion: 1, workspaces },
 			workspace: updated,
+		};
+	}
+
+	private async markWorkspaceStaleUnlocked(
+		registry: z.infer<typeof workspaceRegistrySchema>,
+		index: number,
+	): Promise<{
+		readonly registry: z.infer<typeof workspaceRegistrySchema>;
+		readonly workspace: LocalWorkspace;
+	}> {
+		const previous = registry.workspaces[index];
+		if (previous.stale && !previous.enabled) {
+			return { registry, workspace: previous };
+		}
+		const stale = localWorkspaceSchema.parse({
+			...previous,
+			enabled: false,
+			stale: true,
+			updatedAt: this.clock.now().toISOString(),
+		});
+		const workspaces = [...registry.workspaces];
+		workspaces[index] = stale;
+		await this.write(workspaces);
+		return {
+			registry: { schemaVersion: 1, workspaces },
+			workspace: stale,
 		};
 	}
 
@@ -390,6 +450,20 @@ export class WorkspaceRegistry {
 		return parsed.data;
 	}
 
+	private findWorkspaceIndex(
+		registry: z.infer<typeof workspaceRegistrySchema>,
+		workspaceId: string,
+	): number {
+		const parsedId = uuidSchema.safeParse(workspaceId);
+		const index = parsedId.success
+			? registry.workspaces.findIndex((workspace) => workspace.workspaceId === parsedId.data)
+			: -1;
+		if (index < 0) {
+			throw new MeshDomainError('WORKSPACE_NOT_FOUND', 'Workspace not found.');
+		}
+		return index;
+	}
+
 	private write(workspaces: readonly LocalWorkspace[]): Promise<void> {
 		const registry = workspaceRegistrySchema.parse({
 			schemaVersion: 1,
@@ -406,6 +480,20 @@ export class WorkspaceRegistry {
 		);
 		return result;
 	}
+}
+
+function isWorkspaceUnavailableError(error: unknown): boolean {
+	if (typeof error !== 'object' || error === null || !('code' in error)) {
+		return false;
+	}
+	return new Set([
+		'EACCES',
+		'ELOOP',
+		'ENOENT',
+		'ENOTDIR',
+		'EPERM',
+		'ESTALE',
+	]).has(String(error.code));
 }
 
 function normalizeLocalFileUri(value: string): string {

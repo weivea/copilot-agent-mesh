@@ -10,6 +10,7 @@ export const TASK_TOOL_LIMITS = {
 	acceptanceCriteriaCount: 32,
 	acceptanceCriterionBytes: 4 * 1024,
 	answerBytes: 32 * 1024,
+	failureCodeBytes: 128,
 	errorMessageBytes: 2 * 1024,
 	maxWorkers: 128,
 	maxWorkspacesPerWorker: 128,
@@ -115,6 +116,12 @@ export interface TaskPendingInputSummary {
 	readonly choices?: readonly string[];
 }
 
+export interface TaskFailureSummary {
+	readonly code: string;
+	readonly message: string;
+	readonly retryable: boolean;
+}
+
 export interface TaskToolSnapshot {
 	readonly taskId: string;
 	readonly status: TaskStatus;
@@ -125,6 +132,7 @@ export interface TaskToolSnapshot {
 	readonly validation?: TaskValidationSummary;
 	readonly artifacts?: readonly TaskArtifactReference[];
 	readonly pendingInput?: TaskPendingInputSummary;
+	readonly failure?: TaskFailureSummary;
 }
 
 export interface TaskToolEvent {

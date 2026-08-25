@@ -380,6 +380,85 @@ describe('foundation storage', () => {
 		await assert.rejects(registry.listForWire(), TypeError);
 	});
 
+	test('isolates inaccessible workspaces and keeps them stale until explicit revalidation', async () => {
+		const state = new MemoryState();
+		const leases = new WorkspaceLeaseManager();
+		const unavailable = new Set<string>();
+		const resolver = new FakeFileIdentityResolver((localUri) => {
+			if (unavailable.has(localUri)) {
+				throw Object.assign(new Error('workspace unavailable'), { code: 'ENOENT' });
+			}
+			return {
+				canonicalUri: localUri,
+				identity: `identity:${localUri}`,
+			};
+		});
+		const registry = new WorkspaceRegistry(
+			state,
+			new SequenceIds([IDS.workspace, IDS.otherWorkspace]),
+			fixedClock,
+			resolver,
+			leases,
+		);
+		const missing = await registry.register({ localUri: 'file:///missing', name: 'Missing' });
+		const available = await registry.register({ localUri: 'file:///available', name: 'Available' });
+		unavailable.add(missing.registeredUri);
+
+		const wire = await registry.listForWire();
+		assert.deepStrictEqual(wire.map(({ workspaceId, enabled }) => ({ workspaceId, enabled })), [
+			{ workspaceId: missing.workspaceId, enabled: false },
+			{ workspaceId: available.workspaceId, enabled: true },
+		]);
+		const stale = (await registry.listLocal()).find(
+			(workspace) => workspace.workspaceId === missing.workspaceId,
+		);
+		assert.strictEqual(stale?.stale, true);
+		assert.strictEqual(stale?.enabled, false);
+		await assert.rejects(
+			registry.acquireLease(missing.workspaceId, IDS.peer, IDS.task),
+			(error) => error instanceof Error && error.message === 'Workspace is disabled.',
+		);
+
+		unavailable.delete(missing.registeredUri);
+		const missingCallsBeforeStickyList = resolver.inputs.filter(
+			(input) => input === missing.registeredUri,
+		).length;
+		assert.strictEqual((await registry.listLocal())[0].stale, true);
+		assert.strictEqual(
+			resolver.inputs.filter((input) => input === missing.registeredUri).length,
+			missingCallsBeforeStickyList,
+		);
+		const revalidated = await registry.revalidate(missing.workspaceId);
+		assert.strictEqual(revalidated.stale, false);
+		assert.strictEqual(revalidated.enabled, false);
+		await registry.setEnabled(missing.workspaceId, true);
+		assert.strictEqual(
+			await registry.acquireLease(missing.workspaceId, IDS.peer, IDS.task),
+			missing.fileIdentity,
+		);
+	});
+
+	test('allows an unleased stale workspace to be removed', async () => {
+		let unavailable = false;
+		const registry = new WorkspaceRegistry(
+			new MemoryState(),
+			new SequenceIds([IDS.workspace]),
+			fixedClock,
+			new FakeFileIdentityResolver((localUri) => {
+				if (unavailable) {
+					throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+				}
+				return { canonicalUri: localUri, identity: `identity:${localUri}` };
+			}),
+			new WorkspaceLeaseManager(),
+		);
+		const workspace = await registry.register({ localUri: 'file:///restricted', name: 'Restricted' });
+		unavailable = true;
+		await registry.listForWire();
+		await registry.remove(workspace.workspaceId);
+		assert.deepStrictEqual(await registry.listLocal(), []);
+	});
+
 	test('serializes concurrent registry mutations without losing updates', async () => {
 		const state = new BlockingState();
 		const resolver = new FakeFileIdentityResolver((localUri) => ({

@@ -34,7 +34,8 @@ The webview sends only action names and bounded opaque IDs. Connection URLs,
 pairing secrets, task prompts, complete output, answers, credentials, and local
 paths never cross the message bus. Both directions are runtime validated, and
 outbound messages are rejected when they contain forbidden fields, local path
-shapes, secret URL fragments, or oversized strings.
+shapes, secret URL fragments, or oversized strings. Foundation's complete task
+state set is reused directly, including `recovering` and `cancelling`.
 
 Each resolved view receives a new `uiInstanceId`. Messages from stale instances
 are rejected, resolve/dispose cleanup is idempotent, and snapshot reads are
@@ -62,6 +63,12 @@ HTTP(S) must have the exact raw `scheme://host` authority shape with two slashes
 and a non-empty host segment. URI candidates are checked in raw form before each
 bounded percent-decoding round, C0 input is rejected, and decoded path, query,
 and fragment components recursively pass through the same guard.
+Query components use form-urlencoded `+` normalization before recursive
+inspection. Bracketed keys such as `credentials[password]` and form keys such as
+`api+key` are therefore treated as credentials. A valid task summary may use the
+Foundation 16 KiB limit; the presenter truncates that field at a UTF-8 code-point
+boundary to the 2 KiB UI limit and carries `summaryTruncated` so the webview shows
+that the displayed summary is incomplete.
 
 The webview loads `media/dashboard.js` and `media/dashboard.css` through
 `asWebviewUri`. Its resource roots contain only `media/`, scripts are enabled, and
