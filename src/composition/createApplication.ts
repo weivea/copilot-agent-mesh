@@ -2,7 +2,6 @@ import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
 
 import * as vscode from 'vscode';
-import { GATEWAY_NOTIFICATIONS } from '../../shared/protocol';
 
 import { DeviceService } from '../application/DeviceService';
 import { ListenerService } from '../application/ListenerService';
@@ -17,6 +16,7 @@ import { GatewayRouter } from '../gateway/GatewayRouter';
 import { GatewayServer } from '../gateway/GatewayServer';
 import { PairingService } from '../gateway/PairingService';
 import { StructuredLogger } from '../logging/StructuredLogger';
+import { createTaskNotificationSink } from './TaskNotificationPublisher';
 import { PeerConnectionManager } from '../peer/PeerConnectionManager';
 import { WebSocketPeerTransport } from '../peer/WebSocketPeerTransport';
 import {
@@ -219,18 +219,9 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			{
 				onDidChange: () => changeEvents.fire(),
 				ownership,
-				notificationSink: {
-					publish: (record, event) => listenerService?.publish(
-						record.peerId,
-						GATEWAY_NOTIFICATIONS.taskStateChanged,
-						{
-							taskId: record.taskId,
-							eventSeq: record.eventSeq,
-							at: event.at,
-							state: record.state,
-						},
-					),
-				},
+				notificationSink: createTaskNotificationSink(
+					(peerId, method, params) => listenerService?.publish(peerId, method, params),
+				),
 				e2eCapability,
 			},
 		);

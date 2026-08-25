@@ -398,6 +398,11 @@ connection.draining
 
 每任务最多发送 10 个非终态 Output Event/秒。Outbox 按**序列化后的 UTF-8 Byte**计数，分 Terminal/Control/Progress/Output 优先级，并同时检查 `ws.bufferedAmount`。普通 Progress/Output 使用 256 KiB / 128 events 水位；压力下按 Task 合并 Progress，将非终态 Output 替换为每次压力周期一次的 `truncated: true` 通知，后续 Output 明确 Backpressure。Critical/Response 保留容量，允许一个不超过 1 MiB 的合法 Snapshot Frame；Socket + Queue 总量始终限制在 1 MiB + 256 KiB 和 144 events，超过 1 MiB 的单 Frame 以 `1009` 拒绝。Terminal Snapshot 永不因普通流量被丢弃；Critical 容量仍不可用时以 `1013` 关闭，等待重连后 `task.get` 恢复。
 
+Production Task Notification Sink 必须按 Domain Event 发出专门的 `task.progress` 和
+`task.output`，其中 runtime 裁剪使用 `task.output.truncated = true`。只有状态/control
+转换使用 `task.stateChanged`；terminal 状态因此保持 Critical，而高频 progress/output
+进入普通流量的合并、裁剪和 Backpressure 路径。
+
 ### 7.7 Heartbeat 和重连
 
 - 认证完成后每 10 秒发 WS Ping。

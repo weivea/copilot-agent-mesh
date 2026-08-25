@@ -14,8 +14,10 @@ import {
 	type AgentTaskRequest,
 } from '../agentHost/AgentRuntime';
 import { createAcceptedTask } from '../domain/task';
+import { taskReducer, type TaskDomainEvent } from '../domain/taskReducer';
 import { LocalDesktopWorkspaceGuard } from '../application/LocalDesktopWorkspaceGuard';
 import { WorkerTaskService } from '../application/RemoteTaskRunner';
+import { createTaskNotificationSink } from '../composition/TaskNotificationPublisher';
 import { GatewayRouter } from '../gateway/GatewayRouter';
 import { GatewayServer } from '../gateway/GatewayServer';
 import {
@@ -45,6 +47,7 @@ const delegationRequestId = '00000000-0000-4000-8000-000000000004';
 const taskId = '00000000-0000-4000-8000-000000000005';
 const inputId = '00000000-0000-4000-8000-000000000006';
 const answerId = '00000000-0000-4000-8000-000000000007';
+const pressureTaskId = '00000000-0000-4000-8000-00000000000a';
 
 test('real loopback composes pairing, workspace, accepted task, input, get, and cancellation', async () => {
 	const state = new MemoryState();
@@ -74,6 +77,9 @@ test('real loopback composes pairing, workspace, accepted task, input, get, and 
 		workspaceFolders: [{ uriScheme: 'file' }],
 	}));
 	const persistedNotifications: number[] = [];
+	const productionNotifications = createTaskNotificationSink(
+		(peerId, method, params) => liveGateway?.notifyPeer(peerId, method, params),
+	);
 	const runner = new WorkerTaskService(
 		workerDeviceId,
 		runtime,
@@ -89,16 +95,7 @@ test('real loopback composes pairing, workspace, accepted task, input, get, and 
 					const persisted = await tasks.getOwned(record.peerId, record.taskId);
 					assert.equal(persisted?.eventSeq, record.eventSeq);
 					persistedNotifications.push(record.eventSeq);
-					await liveGateway?.notifyPeer(
-						record.peerId,
-						GATEWAY_NOTIFICATIONS.taskStateChanged,
-						{
-							taskId: record.taskId,
-							eventSeq: record.eventSeq,
-							at: event.at,
-							state: record.state,
-						},
-					);
+					await productionNotifications.publish(record, event);
 				},
 			},
 		},
@@ -106,10 +103,11 @@ test('real loopback composes pairing, workspace, accepted task, input, get, and 
 	await runner.initialize();
 
 	const secrets = new InMemorySecretStore();
+	const pairingRecords = new InMemoryPairingRecordStore();
 	const pairing = new PairingService(
 		workerDeviceId,
 		secrets,
-		new InMemoryPairingRecordStore(),
+		pairingRecords,
 	);
 	const router = new GatewayRouter(
 		{ getInfo: async () => ({ deviceId: workerDeviceId }) },
@@ -138,11 +136,12 @@ test('real loopback composes pairing, workspace, accepted task, input, get, and 
 	try {
 		const invitation = await pairing.createInvitation('https://worker.example.test');
 		const connection = await manager.add(invitation.url);
-		const notifications: string[] = [];
+		const notifications: Array<{
+			readonly method: string;
+			readonly params: Readonly<Record<string, unknown>>;
+		}> = [];
 		connection.onNotification((method, params) => {
-			if (method === GATEWAY_NOTIFICATIONS.taskStateChanged) {
-				notifications.push(String(params.state));
-			}
+			notifications.push({ method, params });
 		});
 		assert.equal(connection.snapshot().state, 'online');
 		assert.deepStrictEqual(await connection.request('workspace.list', {}), {
@@ -154,6 +153,56 @@ test('real loopback composes pairing, workspace, accepted task, input, get, and 
 				busy: false,
 			}],
 		});
+
+		const at = '2026-08-25T00:00:00.000Z';
+		const authenticatedPeerId = (await pairingRecords.listPeers())[0]?.peerId;
+		assert.ok(authenticatedPeerId);
+		let pressureRecord = createAcceptedTask({
+			peerId: authenticatedPeerId,
+			delegationRequestId: answerId,
+			taskId: pressureTaskId,
+			workspaceId,
+			workspaceLeaseKey: 'file:pressure',
+			title: 'Notification pressure',
+			prompt: 'Exercise the production notification mapper.',
+			acceptanceCriteria: [],
+			workerDeadline: '2099-08-25T01:00:00.000Z',
+		}, at);
+		pressureRecord = taskReducer(pressureRecord, { type: 'agentStartRequested', at });
+		pressureRecord = taskReducer(pressureRecord, { type: 'agentStarted', at });
+		const pressurePublishes: Promise<void>[] = [];
+		for (let index = 0; index < 200; index += 1) {
+			const event: TaskDomainEvent = {
+				type: 'progress',
+				at,
+				summary: `Progress ${index}`,
+			};
+			pressureRecord = taskReducer(pressureRecord, event);
+			pressurePublishes.push(Promise.resolve(
+				productionNotifications.publish(pressureRecord, event),
+			));
+		}
+		await Promise.all(pressurePublishes);
+		const completed: TaskDomainEvent = {
+			type: 'completed',
+			at,
+			summary: 'Pressure task completed.',
+		};
+		pressureRecord = taskReducer(pressureRecord, completed);
+		await productionNotifications.publish(pressureRecord, completed);
+		await waitForNotification(
+			notifications,
+			GATEWAY_NOTIFICATIONS.taskStateChanged,
+			(params) => params.taskId === pressureTaskId && params.state === 'completed',
+		);
+		assert.equal(connection.snapshot().state, 'online');
+		assert.ok(notifications.some(({ method, params }) =>
+			method === GATEWAY_NOTIFICATIONS.taskProgress
+			&& params.taskId === pressureTaskId));
+		assert.equal(notifications.some(({ method, params }) =>
+			method === GATEWAY_NOTIFICATIONS.taskStateChanged
+			&& params.taskId === pressureTaskId
+			&& params.state === 'running'), false);
 
 		const accepted = await connection.request('task.start', {
 			delegationRequestId,
@@ -205,8 +254,21 @@ test('real loopback composes pairing, workspace, accepted task, input, get, and 
 		assert.equal(cancelling.state, 'cancelling');
 		await waitForTaskState(connection, 'cancelled');
 		assert.ok(persistedNotifications.length >= 5);
-		assert.ok(notifications.includes('needsInput'));
-		assert.ok(notifications.includes('cancelled'));
+		assert.ok(notifications.some(({ method, params }) =>
+			method === GATEWAY_NOTIFICATIONS.taskStateChanged
+			&& params.state === 'needsInput'));
+		assert.ok(notifications.some(({ method, params }) =>
+			method === GATEWAY_NOTIFICATIONS.taskOutput
+			&& params.taskId === taskId
+			&& params.output === 'Runtime output.'));
+		assert.equal(notifications.some(({ method, params }) =>
+			(method === GATEWAY_NOTIFICATIONS.taskProgress
+				|| method === GATEWAY_NOTIFICATIONS.taskOutput)
+			&& params.taskId === taskId
+			&& (params.summary === '' || params.output === '')), false);
+		assert.ok(notifications.some(({ method, params }) =>
+			method === GATEWAY_NOTIFICATIONS.taskStateChanged
+			&& params.state === 'cancelled'));
 	} finally {
 		await manager.dispose();
 		await gateway.dispose();
@@ -528,6 +590,28 @@ async function waitForRunnerState(
 	throw new Error(`Task did not reach ${state}.`);
 }
 
+async function waitForNotification(
+	notifications: readonly {
+		readonly method: string;
+		readonly params: Readonly<Record<string, unknown>>;
+	}[],
+	method: string,
+	predicate: (params: Readonly<Record<string, unknown>>) => boolean,
+): Promise<void> {
+	for (let attempt = 0; attempt < 100; attempt += 1) {
+		if (notifications.some((notification) =>
+			notification.method === method && predicate(notification.params))) {
+			return;
+		}
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	throw new Error(
+		`Notification ${method} was not received; observed ${notifications
+			.map((notification) => `${notification.method}:${String(notification.params.state ?? '')}`)
+			.join(', ')}.`,
+	);
+}
+
 class StubAgentRuntime implements AgentRuntime {
 	public starts = 0;
 	public readonly answers: AgentTaskAnswer[] = [];
@@ -585,7 +669,10 @@ class StubTaskHandle implements AgentTaskHandle {
 	) {}
 
 	public requestInput(): void {
-		this.events.push({
+		void this.events.push({ type: 'progress', message: '' });
+		void this.events.push({ type: 'output', text: '' });
+		void this.events.push({ type: 'output', text: 'Runtime output.' });
+		void this.events.push({
 			type: 'inputRequired',
 			request: {
 				requestId: this.requestId,
