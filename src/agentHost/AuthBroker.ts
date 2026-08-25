@@ -53,7 +53,10 @@ export class VscodeAuthBroker implements AuthBroker {
 	): Promise<void> {
 		for (const resource of request.resources.filter(({ required }) => required !== false)) {
 			throwIfAborted(request.signal);
-			const mapping = await this.resolveProvider(resource);
+			const mapping = await abortableAuthentication(
+				Promise.resolve(this.resolveProvider(resource)),
+				request.signal,
+			);
 			throwIfAborted(request.signal);
 			if (mapping === undefined || mapping.providerId.length === 0) {
 				throw authRequired(resource, 'No VS Code authentication provider is configured for this protected resource.');
@@ -64,15 +67,18 @@ export class VscodeAuthBroker implements AuthBroker {
 				detail: `Copilot Agent Mesh needs access to ${resource.resource_name ?? resource.resource}.`,
 			};
 			let session = request.interactive && request.reason !== 'initial'
-				? await this.authentication.getSession(mapping.providerId, scopes, {
+				? await abortableAuthentication(this.authentication.getSession(mapping.providerId, scopes, {
 					forceNewSession: presentation,
-				})
-				: await this.authentication.getSession(mapping.providerId, scopes, { silent: true });
+				}), request.signal)
+				: await abortableAuthentication(
+					this.authentication.getSession(mapping.providerId, scopes, { silent: true }),
+					request.signal,
+				);
 			throwIfAborted(request.signal);
 			if (session === undefined && request.interactive && request.reason === 'initial') {
-				session = await this.authentication.getSession(mapping.providerId, scopes, {
+				session = await abortableAuthentication(this.authentication.getSession(mapping.providerId, scopes, {
 					createIfNone: presentation,
-				});
+				}), request.signal);
 				throwIfAborted(request.signal);
 			}
 			if (session === undefined || session.accessToken.length === 0) {
@@ -101,6 +107,34 @@ function throwIfAborted(signal?: AbortSignal): void {
 	if (signal?.aborted === true) {
 		throw new DOMException('Authentication was aborted.', 'AbortError');
 	}
+}
+
+function abortableAuthentication<T>(operation: PromiseLike<T>, signal?: AbortSignal): Promise<T> {
+	throwIfAborted(signal);
+	if (signal === undefined) {
+		return Promise.resolve(operation);
+	}
+	return new Promise<T>((resolve, reject) => {
+		const handleAbort = () => {
+			signal.removeEventListener('abort', handleAbort);
+			reject(new DOMException('Authentication was aborted.', 'AbortError'));
+		};
+		signal.addEventListener('abort', handleAbort, { once: true });
+		void Promise.resolve(operation).then(
+			(value) => {
+				signal.removeEventListener('abort', handleAbort);
+				if (!signal.aborted) {
+					resolve(value);
+				}
+			},
+			(error: unknown) => {
+				signal.removeEventListener('abort', handleAbort);
+				if (!signal.aborted) {
+					reject(error);
+				}
+			},
+		);
+	});
 }
 
 export class UnavailableAuthBroker implements AuthBroker {

@@ -210,7 +210,15 @@ export class AhpAgentRuntime implements AgentRuntime {
 	}
 
 	dispose(): Promise<void> {
-		this.disposePromise ??= this.disposeResources();
+		if (this.disposePromise === undefined) {
+			const operation = this.disposeResources();
+			this.disposePromise = operation;
+			void operation.catch(() => {
+				if (this.disposePromise === operation) {
+					this.disposePromise = undefined;
+				}
+			});
+		}
 		return this.disposePromise;
 	}
 
@@ -535,31 +543,22 @@ class AhpTask implements AgentTaskHandle {
 		this.sessionCreated = true;
 		this.throwIfTerminalError();
 
-		const sessionSubscription = await this.connection.subscribe(this.sessionUri, this.generation.abort.signal);
-		this.throwIfTerminalError();
-		if (sessionSubscription.snapshot !== undefined) {
-			this.applySnapshot(sessionSubscription.snapshot);
-		}
-		this.throwIfTerminalError();
-		this.addSubscription(this.sessionUri, sessionSubscription.subscription);
+		await this.ensureStartupSubscription(this.sessionUri);
 		const [_, defaultChat] = await Promise.all([
 			this.waitForReady(),
 			this.waitForDefaultChat(),
 		]);
 		this.throwIfTerminalError();
+		await this.waitForStartupRecovery();
 		this.chatUri = defaultChat;
 
-		const chatSubscription = await this.connection.subscribe(defaultChat, this.generation.abort.signal);
-		this.throwIfTerminalError();
-		if (chatSubscription.snapshot !== undefined) {
-			this.applySnapshot(chatSubscription.snapshot);
-		}
-		this.throwIfTerminalError();
-		this.addSubscription(defaultChat, chatSubscription.subscription);
-		await this.scheduleOwnedTerminals(this.rootTerminals, this.generation, true);
+		await this.ensureStartupSubscription(defaultChat);
+		const generation = await this.waitForStartupRecovery();
+		await this.scheduleOwnedTerminals(this.rootTerminals, generation, true);
 		this.throwIfTerminalError();
 
 		this.turnId = randomUUID();
+		await this.waitForStartupRecovery();
 		this.throwIfTerminalError();
 		this.dispatchTracked(defaultChat, {
 			type: 'chat/turnStarted',
@@ -611,7 +610,15 @@ class AhpTask implements AgentTaskHandle {
 	}
 
 	dispose(): Promise<void> {
-		this.disposePromise ??= this.disposeResources();
+		if (this.disposePromise === undefined) {
+			const operation = this.disposeResources();
+			this.disposePromise = operation;
+			void operation.catch(() => {
+				if (this.disposePromise === operation) {
+					this.disposePromise = undefined;
+				}
+			});
+		}
 		return this.disposePromise;
 	}
 
@@ -684,11 +691,11 @@ class AhpTask implements AgentTaskHandle {
 			], failures);
 		} finally {
 			this.events.close();
-			this.didDispose();
 		}
 		if (failures.length > 0) {
 			throw cleanupFailure(failures);
 		}
+		this.didDispose();
 	}
 
 	private async resolveConfig(): Promise<Readonly<Record<string, unknown>>> {
@@ -854,6 +861,56 @@ class AhpTask implements AgentTaskHandle {
 	private addSubscription(uri: string, subscription: AhpSubscription): void {
 		this.subscriptions.set(uri, subscription);
 		this.startSubscription(uri, subscription, this.generation);
+	}
+
+	private async ensureStartupSubscription(uri: string): Promise<void> {
+		while (true) {
+			const generation = await this.waitForStartupRecovery();
+			if (generation.subscriptions.has(uri)) {
+				return;
+			}
+			let result: { readonly snapshot?: Snapshot; readonly subscription: AhpSubscription };
+			try {
+				result = await generation.connection.subscribe(uri, generation.abort.signal);
+			} catch (error) {
+				await Promise.resolve();
+				if (!generation.valid || this.recoveryPromise !== undefined || this.recovering) {
+					await this.waitForStartupRecovery();
+					continue;
+				}
+				throw error;
+			}
+			if (!this.isCurrentGeneration(generation)) {
+				await result.subscription.close().catch(() => undefined);
+				await generation.connection.unsubscribe(uri).catch(() => undefined);
+				continue;
+			}
+			if (result.snapshot !== undefined) {
+				this.applySnapshot(result.snapshot);
+			}
+			this.throwIfTerminalError();
+			if (!this.isCurrentGeneration(generation)) {
+				await result.subscription.close().catch(() => undefined);
+				await generation.connection.unsubscribe(uri).catch(() => undefined);
+				continue;
+			}
+			generation.subscriptions.set(uri, result.subscription);
+			this.startSubscription(uri, result.subscription, generation);
+			return;
+		}
+	}
+
+	private async waitForStartupRecovery(): Promise<ConnectionGeneration> {
+		const recovery = this.recoveryPromise;
+		if (recovery !== undefined) {
+			await recovery;
+		}
+		this.throwIfTerminalError();
+		if (this.recovering) {
+			await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+			return this.waitForStartupRecovery();
+		}
+		return this.generation;
 	}
 
 	private startSubscription(

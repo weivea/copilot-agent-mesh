@@ -36,6 +36,9 @@ async function main(): Promise<void> {
 	if (successTurn && (token === undefined || token.length === 0)) {
 		throw new Error(`The success-turn E2E requires ${tokenVariable}.`);
 	}
+	if (successTurn) {
+		delete process.env[tokenVariable];
+	}
 
 	console.warn(`Opt-in Agent Host ${mode} E2E enabled. A successful turn may consume Copilot quota.`);
 	const root = await mkdtemp(join(tmpdir(), 'copilot-agent-mesh-runtime-e2e-'));

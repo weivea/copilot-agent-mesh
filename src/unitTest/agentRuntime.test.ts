@@ -1117,6 +1117,31 @@ test('VS Code auth broker is silent-first, requires explicit interaction, and on
 	);
 });
 
+test('VS Code auth broker aborts an in-flight authentication prompt without submitting a token', async () => {
+	const abort = new AbortController();
+	let submitted = false;
+	const broker = new VscodeAuthBroker(
+		{
+			getSession: () => new Promise(() => undefined),
+		},
+		() => ({ providerId: 'configured-provider', scopes: ['agent:run'] }),
+	);
+	const authentication = broker.authenticate(
+		{
+			resources: [protectedResource],
+			interactive: true,
+			reason: 'tokenInvalid',
+			signal: abort.signal,
+		},
+		async () => {
+			submitted = true;
+		},
+	);
+	abort.abort();
+	await assert.rejects(authentication, (error: unknown) => error instanceof DOMException && error.name === 'AbortError');
+	assert.equal(submitted, false);
+});
+
 test('event mapper reports authoritative turn completion and bounded terminal summaries', () => {
 	const mapper = new AhpEventMapper();
 	assert.deepEqual(mapper.map(envelope('ahp-chat:/default', {

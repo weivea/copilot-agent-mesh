@@ -14,6 +14,7 @@ import {
 	parseSessionConfigInput,
 	validateSessionConfigValue,
 } from './agentHost/SessionConfigValue';
+import { planWorkspaceSelection } from './agentHost/WorkspaceSelection';
 import {
 	AgentRuntimeError,
 	AgentRuntimeLifecycle,
@@ -135,19 +136,21 @@ export function activate(context: vscode.ExtensionContext): AgentMeshExtensionAp
 
 async function selectTaskWorkspace(): Promise<vscode.WorkspaceFolder | undefined> {
 	const localFolders = vscode.workspace.workspaceFolders?.filter(({ uri }) => uri.scheme === 'file') ?? [];
-	if (localFolders.length === 0) {
-		throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'Open a local file workspace before starting an Agent Host task.');
-	}
 	const activeUri = vscode.window.activeTextEditor?.document.uri;
 	const activeFolder = activeUri === undefined ? undefined : vscode.workspace.getWorkspaceFolder(activeUri);
-	if (activeFolder?.uri.scheme === 'file' && localFolders.some(({ uri }) => uri.toString() === activeFolder.uri.toString())) {
-		return activeFolder;
+	const plan = planWorkspaceSelection(
+		localFolders,
+		activeFolder?.uri.scheme === 'file' ? activeFolder : undefined,
+		(left, right) => left.uri.toString() === right.uri.toString(),
+	);
+	if (plan.kind === 'unavailable') {
+		throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'Open a local file workspace before starting an Agent Host task.');
 	}
-	if (localFolders.length === 1) {
-		return localFolders[0];
+	if (plan.kind === 'selected') {
+		return plan.workspace;
 	}
 	const selected = await vscode.window.showQuickPick(
-		localFolders.map((folder) => ({
+		plan.workspaces.map((folder) => ({
 			label: folder.name,
 			description: folder.uri.fsPath,
 			folder,
@@ -297,6 +300,7 @@ class VscodeSessionConfigurationResolver implements SessionConfigurationResolver
 		picker.placeholder = 'Type to search';
 		return new Promise<string | undefined>((resolve, reject) => {
 			let settled = false;
+			let resultsReady = false;
 			let timer: NodeJS.Timeout | undefined;
 			let requestAbort: AbortController | undefined;
 			const disposables: vscode.Disposable[] = [];
@@ -331,14 +335,17 @@ class VscodeSessionConfigurationResolver implements SessionConfigurationResolver
 					clearTimeout(timer);
 				}
 				requestAbort?.abort();
+				picker.items = [];
+				picker.busy = true;
+				resultsReady = false;
 				const abort = new AbortController();
 				requestAbort = abort;
 				timer = setTimeout(() => {
-					picker.busy = true;
 					void request.completions(property, values, query.slice(0, 256), abort.signal).then(
 						(items) => {
 							if (!abort.signal.aborted && !settled) {
 								picker.items = items.slice(0, 100);
+								resultsReady = true;
 							}
 						},
 						(error: unknown) => {
@@ -355,7 +362,12 @@ class VscodeSessionConfigurationResolver implements SessionConfigurationResolver
 			};
 			disposables.push(
 				picker.onDidChangeValue(update),
-				picker.onDidAccept(() => finish(picker.selectedItems[0]?.value)),
+				picker.onDidAccept(() => {
+					const selected = picker.selectedItems[0];
+					if (resultsReady && selected !== undefined) {
+						finish(selected.value);
+					}
+				}),
 				picker.onDidHide(() => finish(undefined)),
 			);
 			update('');
