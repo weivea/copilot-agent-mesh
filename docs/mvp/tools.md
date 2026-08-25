@@ -1,8 +1,8 @@
 # Production Language Model Tools
 
-The MVP tool surface is implemented in `src/tools` and is intentionally
-decoupled from the current coordinator, peer, gateway, and extension activation
-work. Production wiring supplies one `TaskToolFacade`; the tool classes never
+The MVP tool surface is implemented in `src/tools` and remains decoupled through
+`TaskToolFacade`. Production composition supplies `TaskCoordinator`, backed by
+persisted delegation intents and real peer RPC; the tool classes never
 create tasks, simulate workers, inspect workspace files, or manage repository
 state.
 

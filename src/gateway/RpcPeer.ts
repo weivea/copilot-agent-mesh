@@ -6,6 +6,9 @@ import WebSocket, { type RawData } from 'ws';
 import { GatewayRouter, GatewayValidationError } from './GatewayRouter';
 import { PairingProtocolError } from './PairingCrypto';
 import { PairingService } from './PairingService';
+import { MeshDomainError } from '../domain/errors';
+import { AgentRuntimeError } from '../agentHost/AgentRuntime';
+import { MESH_ERROR_CODES, type MeshErrorReason } from '../../shared/protocol';
 
 const textDecoder = new TextDecoder('utf-8', { fatal: true });
 
@@ -97,10 +100,18 @@ export class RpcPeer {
 			this.socket.close(code, reason);
 			return;
 		}
+
 		if (this.socket.readyState !== WebSocket.CLOSED) {
 			this.socket.terminate();
 		}
 		this.dispose();
+	}
+
+	public notifyPeer(peerId: string, method: string, params: Record<string, unknown>): Promise<void> {
+		if (this.authenticatedPeerId !== peerId || this.disposed) {
+			return Promise.resolve();
+		}
+		return this.send({ jsonrpc: '2.0', method, params });
 	}
 
 	public dispose(): void {
@@ -285,6 +296,21 @@ export class RpcPeer {
 			await this.sendError(id, -32602, 'Invalid params.');
 			return;
 		}
+		if (error instanceof MeshDomainError) {
+			await this.sendError(id, error.code, error.message, error.reason, error.retryable);
+			return;
+		}
+		if (error instanceof AgentRuntimeError) {
+			const reason = isMeshErrorReason(error.code) ? error.code : 'TASK_EXECUTION_FAILED';
+			await this.sendError(
+				id,
+				MESH_ERROR_CODES[reason],
+				error.message,
+				reason,
+				error.retryable,
+			);
+			return;
+		}
 		if (error instanceof RpcFailure) {
 			await this.sendError(id, error.code, error.message, error.reason);
 			return;
@@ -297,6 +323,7 @@ export class RpcPeer {
 		code: number,
 		message: string,
 		reason?: string,
+		retryable?: boolean,
 	): Promise<void> {
 		return this.send({
 			jsonrpc: '2.0',
@@ -304,7 +331,7 @@ export class RpcPeer {
 			error: {
 				code,
 				message,
-				...(reason === undefined ? {} : { data: { reason } }),
+				...(reason === undefined ? {} : { data: { reason, retryable } }),
 			},
 		});
 	}
@@ -348,6 +375,10 @@ export class RpcPeer {
 			this.flush();
 		});
 	}
+}
+
+function isMeshErrorReason(value: string): value is MeshErrorReason {
+	return Object.hasOwn(MESH_ERROR_CODES, value);
 }
 
 class RpcFailure extends Error {

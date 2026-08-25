@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 
 import WebSocket, { type RawData } from 'ws';
 
+import { rpcNotificationSchema } from '../../shared/protocol';
 import {
 	decodeFixedBase64Url,
 	derivePeerRoot,
@@ -24,6 +25,7 @@ export interface PeerSession {
 	readonly lastHeartbeatAt?: number;
 	readonly latencyMs?: number;
 	request(method: string, params: Record<string, unknown>): Promise<unknown>;
+	onNotification?(listener: (method: string, params: Record<string, unknown>) => void): () => void;
 	onClose(listener: () => void): () => void;
 	close(): Promise<void>;
 }
@@ -106,6 +108,17 @@ export class PeerTransportError extends Error {
 	) {
 		super(message);
 		this.name = 'PeerTransportError';
+	}
+}
+
+export class PeerRpcError extends Error {
+	public constructor(
+		public readonly reason: string,
+		public readonly retryable: boolean,
+		message: string,
+	) {
+		super(message);
+		this.name = 'PeerRpcError';
 	}
 }
 
@@ -448,6 +461,10 @@ class RpcWebSocketClient {
 		timer: NodeJS.Timeout;
 	}>();
 	private readonly closeListeners = new Set<() => void>();
+	private readonly notificationListeners = new Set<(
+		method: string,
+		params: Record<string, unknown>,
+	) => void>();
 	private closed = false;
 
 	private constructor(
@@ -567,6 +584,10 @@ class RpcWebSocketClient {
 				return latencyMs;
 			},
 			request: (method, params) => client.request(method, params),
+			onNotification: (listener) => {
+				client.notificationListeners.add(listener);
+				return () => client.notificationListeners.delete(listener);
+			},
 			onClose: (listener) => client.onClose(listener),
 			close: async () => {
 				stopHeartbeat();
@@ -620,6 +641,13 @@ class RpcWebSocketClient {
 			return;
 		}
 		const response = value as Record<string, unknown>;
+		const notification = rpcNotificationSchema.safeParse(value);
+		if (notification.success) {
+			for (const listener of this.notificationListeners) {
+				listener(notification.data.method, notification.data.params);
+			}
+			return;
+		}
 		const hasResult = Object.hasOwn(response, 'result');
 		const hasError = Object.hasOwn(response, 'error');
 		if (response.jsonrpc !== '2.0'
@@ -642,9 +670,21 @@ class RpcWebSocketClient {
 		this.pending.delete(response.id);
 		if (hasError) {
 			const error = response.error as Record<string, unknown>;
-			const reason = typeof error.data === 'object' && error.data !== null
-				? (error.data as Record<string, unknown>).reason
+			const data = typeof error.data === 'object' && error.data !== null
+				? error.data as Record<string, unknown>
 				: undefined;
+			const reason = data?.reason;
+			if (
+				typeof reason === 'string'
+				&& !['PROTOCOL_INCOMPATIBLE', 'AUTH_FAILED', 'ENROLLMENT_EXPIRED'].includes(reason)
+			) {
+				pending.reject(new PeerRpcError(
+					reason,
+					data?.retryable === true,
+					typeof error.message === 'string' ? error.message : 'Peer request failed.',
+				));
+				return;
+			}
 			pending.reject(new PeerTransportError(
 				reason === 'PROTOCOL_INCOMPATIBLE' ? 'PROTOCOL_INCOMPATIBLE'
 					: reason === 'AUTH_FAILED' ? 'AUTH_FAILED'
@@ -672,6 +712,7 @@ class RpcWebSocketClient {
 			listener();
 		}
 		this.closeListeners.clear();
+		this.notificationListeners.clear();
 	}
 
 	private readonly abort = (): void => {

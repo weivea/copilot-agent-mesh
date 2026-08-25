@@ -11,6 +11,10 @@ import { compactTaskEventJournal } from './taskEvents';
 export type TaskDomainEvent =
 	| { readonly type: 'agentStartRequested'; readonly at: string }
 	| { readonly type: 'agentStarted'; readonly at: string; readonly recoveryDescriptor?: RecoveryDescriptor }
+	| { readonly type: 'progress'; readonly at: string; readonly summary: string }
+	| { readonly type: 'output'; readonly at: string; readonly summary: string }
+	| { readonly type: 'tool'; readonly at: string; readonly summary: string }
+	| { readonly type: 'terminal'; readonly at: string; readonly summary: string }
 	| { readonly type: 'inputRequired'; readonly at: string; readonly inputId: string; readonly prompt: string }
 	| { readonly type: 'inputAnswered'; readonly at: string; readonly inputId: string; readonly answerId: string }
 	| { readonly type: 'recoveryStarted'; readonly at: string }
@@ -45,6 +49,16 @@ export function taskReducer(record: TaskRecord, event: TaskDomainEvent): TaskRec
 						: 'running',
 					recoveryDescriptor: event.recoveryDescriptor ?? record.recoveryDescriptor,
 				},
+			);
+		case 'progress':
+		case 'output':
+		case 'tool':
+		case 'terminal':
+			return transition(
+				requireState(record, event, ['running', 'needsInput', 'recovering', 'cancelling']),
+				event,
+				{},
+				event.summary,
 			);
 		case 'inputRequired':
 			return transition(
@@ -146,6 +160,7 @@ function transition(
 	record: TaskRecord,
 	event: TaskDomainEvent,
 	changes: Partial<TaskRecord> = {},
+	summary?: string,
 ): TaskRecord {
 	return compactTaskEventJournal({
 		...record,
@@ -158,6 +173,7 @@ function transition(
 				eventSeq: record.eventSeq + 1,
 				at: event.at,
 				type: event.type,
+				...(summary === undefined ? {} : { summary }),
 			},
 		],
 	}, event.at);

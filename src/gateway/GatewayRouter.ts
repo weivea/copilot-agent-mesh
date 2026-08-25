@@ -14,8 +14,8 @@ export interface TaskStartParams {
 	readonly workspaceId: string;
 	readonly title: string;
 	readonly prompt: string;
-	readonly acceptanceCriteria?: readonly string[];
-	readonly deadlineAt?: string;
+	readonly acceptanceCriteria: readonly string[];
+	readonly workerDeadline: string;
 }
 
 export interface TaskService {
@@ -97,21 +97,29 @@ export class GatewayRouter {
 function validateTaskStart(params: unknown): TaskStartParams {
 	const value = assertObject(
 		params,
-		['delegationRequestId', 'taskId', 'workspaceId', 'title', 'prompt'],
-		['acceptanceCriteria', 'deadlineAt'],
+		[
+			'delegationRequestId',
+			'taskId',
+			'workspaceId',
+			'title',
+			'prompt',
+			'acceptanceCriteria',
+			'workerDeadline',
+		],
+		[],
 	);
 	const criteria = value.acceptanceCriteria;
-	if (criteria !== undefined && (
+	if (
 		!Array.isArray(criteria)
 		|| criteria.length > 32
 		|| criteria.some((item) => typeof item !== 'string' || Buffer.byteLength(item) > 4 * 1024)
-	)) {
+	) {
 		throw new GatewayValidationError();
 	}
-	if (value.deadlineAt !== undefined && (
-		typeof value.deadlineAt !== 'string'
-		|| !Number.isFinite(Date.parse(value.deadlineAt))
-	)) {
+	if (
+		typeof value.workerDeadline !== 'string'
+		|| !Number.isFinite(Date.parse(value.workerDeadline))
+	) {
 		throw new GatewayValidationError();
 	}
 	return {
@@ -120,8 +128,8 @@ function validateTaskStart(params: unknown): TaskStartParams {
 		workspaceId: identifier(value.workspaceId),
 		title: boundedString(value.title, 256, false),
 		prompt: boundedString(value.prompt, 128 * 1024, false),
-		acceptanceCriteria: criteria as readonly string[] | undefined,
-		deadlineAt: value.deadlineAt as string | undefined,
+		acceptanceCriteria: criteria as readonly string[],
+		workerDeadline: value.workerDeadline,
 	};
 }
 

@@ -33,6 +33,12 @@ export class PeerConnectionManager {
 	private readonly random: () => number;
 	private readonly id: () => string;
 	private readonly backgroundFailures: unknown[] = [];
+	private readonly listeners = new Set<() => void>();
+	private readonly notificationListeners = new Set<(
+		profileId: string,
+		method: string,
+		params: Record<string, unknown>,
+	) => void>();
 	private disposed = false;
 	private disposing: Promise<void> | undefined;
 
@@ -116,6 +122,26 @@ export class PeerConnectionManager {
 
 	public get(profileId: string): PeerConnection | undefined {
 		return this.peers.get(profileId)?.connection;
+	}
+
+	public listConnections(): readonly PeerConnection[] {
+		return [...this.peers.values()].map(({ connection }) => connection);
+	}
+
+	public onDidChange(listener: () => void): () => void {
+		this.listeners.add(listener);
+		return () => this.listeners.delete(listener);
+	}
+
+	public onNotification(
+		listener: (
+			profileId: string,
+			method: string,
+			params: Record<string, unknown>,
+		) => void,
+	): () => void {
+		this.notificationListeners.add(listener);
+		return () => this.notificationListeners.delete(listener);
 	}
 
 	public connect(profileId: string): Promise<void> {
@@ -219,8 +245,20 @@ export class PeerConnectionManager {
 			if (snapshot.state === 'online') {
 				this.markStableLater(managed);
 			}
+			this.fireChanged();
+		});
+		connection.onNotification((method, params) => {
+			for (const listener of this.notificationListeners) {
+				listener(profileId, method, params);
+			}
 		});
 		return managed;
+	}
+
+	private fireChanged(): void {
+		for (const listener of this.listeners) {
+			listener();
+		}
 	}
 
 	private async ensureManaged(profileId: string): Promise<ManagedPeer> {

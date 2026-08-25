@@ -19,6 +19,10 @@ export interface PeerConnectionSnapshot {
 
 export class PeerConnection {
 	private readonly listeners = new Set<(snapshot: PeerConnectionSnapshot) => void>();
+	private readonly notificationListeners = new Set<(
+		method: string,
+		params: Record<string, unknown>,
+	) => void>();
 	private session: PeerSession | undefined;
 	private controller: AbortController | undefined;
 	private connecting: Promise<void> | undefined;
@@ -47,6 +51,13 @@ export class PeerConnection {
 	public onStateChanged(listener: (snapshot: PeerConnectionSnapshot) => void): () => void {
 		this.listeners.add(listener);
 		return () => this.listeners.delete(listener);
+	}
+
+	public onNotification(
+		listener: (method: string, params: Record<string, unknown>) => void,
+	): () => void {
+		this.notificationListeners.add(listener);
+		return () => this.notificationListeners.delete(listener);
 	}
 
 	public connect(): Promise<void> {
@@ -91,6 +102,11 @@ export class PeerConnection {
 				return;
 			}
 			this.session = session;
+			session.onNotification?.((method, params) => {
+				for (const listener of this.notificationListeners) {
+					listener(method, params);
+				}
+			});
 			session.onClose(() => {
 				if (this.session !== session) {
 					return;

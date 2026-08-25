@@ -1,0 +1,67 @@
+# MVP application composition
+
+`src/composition/createApplication.ts` is the production composition root. The extension
+entry point creates one `Application`; asynchronous deactivation awaits
+`Application.dispose()`. Activation does not install a simulated worker or spike tool.
+
+## Production graph
+
+The application creates:
+
+- `VscodeGlobalStateStore` for non-sensitive device, workspace, tunnel, peer, listener,
+  task-approval, and delegation metadata. Mesh never calls `setKeysForSync`.
+- `VscodeSecretStore` for invitations, enrollment proofs, peer roots, and temporary
+  coordinator pairing credentials.
+- `AtomicFileStore` rooted below `ExtensionContext.globalStorageUri` and `FileTaskStore`
+  for authoritative task records and event journals.
+- `DeviceService`, `WorkspaceService`, `WorkerTaskService`, `TaskCoordinator`, and
+  `ListenerService`.
+- `PairingService`, `GatewayServer`, `PeerConnectionManager`,
+  `DevTunnelCliProvider`, and the feature-gated `AhpAgentRuntime`.
+- `ProductionDashboardBindings`, `ServiceDashboardFacade`, the Dashboard view, and the
+  five production Language Model Tools.
+
+Every command and public service crosses `LocalDesktopWorkspaceGuard`. Listener, peer,
+coordinator, and metadata-only operations do not require an open folder, but still reject a
+remote Extension Host or untrusted workspace. Workspace registration and worker execution
+also require an all-local `file:` workspace.
+
+## Task lifecycle
+
+The coordinator persists a semantic-hash `DelegationIntent`, UUID task ID, UUID delegation
+ID, and deadline before sending `task.start`. Lost acknowledgements retry the same IDs.
+Worker start verifies ownership, resolves only an opaque registered workspace ID, checks the
+Agent Host feature/probe, acquires the workspace lease, and atomically persists `accepted`
+before launching `AgentRuntime.start`.
+
+The first task for a peer/workspace pair requires local confirmation. “Always allow” stores
+only the non-sensitive pair grant; each accepted task is still explicitly pre-authorized for
+the runtime confirmation boundary. Runtime progress, bounded output, input, cancellation,
+and terminal reducer events are persisted before change notifications. `task.get` reports
+retained event gaps, and cancel has a worker deadline that fails with
+`TASK_CANCELLATION_UNCONFIRMED` if no terminal confirmation arrives.
+
+On startup, peers reconnect, the prior listener is restored, coordinator task snapshots are
+reconciled, and worker task leases are rebuilt. Because the current `AgentRuntime` contract
+does not expose process-independent resume, active worker records fail honestly with
+`TASK_RECOVERY_UNAVAILABLE` instead of starting a duplicate agent.
+
+## Listener and compatibility
+
+`ListenerService` creates a fresh loopback-only `GatewayServer` for every start/restart and
+then asks `DevTunnelCliProvider` to host that exact port. The provider enforces the exact
+validated build, binary hash, login, JSON decoder, HTTPS health, and WSS readiness gates.
+Connection URL creation is allowed only while hosted and creates a new one-time invitation;
+the URL is written to the clipboard inside the Extension Host and never posted to the
+webview.
+
+Real tasks require `copilotAgentMesh.experimental.agentHost`. Disabled or unavailable AHP
+returns the stable `AGENT_UNAVAILABLE` boundary. The extension never substitutes a fake
+production runtime.
+
+## Shutdown
+
+Disposal first unregisters commands, tools, and the view, then closes the listener, drains
+worker handles, disconnects coordinator peers, disposes the Agent runtime and owned child
+processes, and finally closes the structured redacted log. Cleanup is idempotent and
+aggregate failures are returned to asynchronous deactivation.

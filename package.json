@@ -42,54 +42,195 @@
   "contributes": {
     "languageModelTools": [
       {
-        "name": "mesh_spike_echo",
-        "displayName": "Mesh Spike Echo",
-        "toolReferenceName": "meshSpikeEcho",
+        "name": "mesh_list_workers",
+        "displayName": "List Mesh Workers",
+        "toolReferenceName": "meshListWorkers",
         "canBeReferencedInPrompt": true,
-        "modelDescription": "Starts a local simulated asynchronous mesh task and returns a structured pending result after a configurable acknowledgement delay. Use only to validate the Copilot Agent Mesh tool workflow.",
-        "userDescription": "Validate the asynchronous Copilot Agent Mesh tool workflow without calling a model or accessing workspace files.",
+        "modelDescription": "Lists currently available Copilot Agent Mesh peers and their opaque workspaces. Call this before delegating when the target peer or workspace is not already known.",
+        "userDescription": "List available remote worker devices and workspaces without exposing filesystem paths.",
         "tags": [
-          "copilot-agent-mesh",
-          "spike"
+          "copilot-agent-mesh"
+        ],
+        "inputSchema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "mesh_delegate_task",
+        "displayName": "Delegate Mesh Task",
+        "toolReferenceName": "meshDelegateTask",
+        "canBeReferencedInPrompt": true,
+        "modelDescription": "Delegates a coding task to a selected Copilot Agent Mesh peer and opaque workspace. Returns after worker acceptance with a pending task ID; use mesh_get_task to poll. Under a small token budget, compact JSON uses s state (0 accepted pending, 1 reconcile the same intent, 2 error, 3 persistence pending), t taskId, d delegationRequestId, e stable error code, and r retry/reconciliation flag; s=1 or s=3 with r=1 means retry the exact same intent. Do not use this tool for Git, branch, worktree, commit, push, or pull request management.",
+        "userDescription": "Start an asynchronous coding task on a selected trusted worker and workspace.",
+        "tags": [
+          "copilot-agent-mesh"
         ],
         "inputSchema": {
           "type": "object",
           "properties": {
-            "message": {
+            "peerId": {
+              "type": "string",
+              "minLength": 36,
+              "maxLength": 36,
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+              "description": "Opaque peer ID returned by mesh_list_workers."
+            },
+            "workspaceId": {
+              "type": "string",
+              "minLength": 36,
+              "maxLength": 36,
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+              "description": "Opaque workspace ID returned by mesh_list_workers."
+            },
+            "title": {
               "type": "string",
               "minLength": 1,
-              "maxLength": 200,
-              "description": "A short, non-sensitive message for the spike tool to echo."
+              "maxLength": 256,
+              "description": "Short task title (maximum 256 UTF-8 bytes)."
             },
-            "delaySeconds": {
-              "type": "number",
-              "enum": [
-                5,
-                15,
-                30
-              ],
-              "default": 5,
-              "description": "Simulated worker acknowledgement delay in seconds."
-            },
-            "confirmationBudgetSeconds": {
-              "type": "number",
-              "enum": [
-                5,
-                15,
-                30
-              ],
-              "default": 15,
-              "description": "Application-level acknowledgement wait budget in seconds."
-            },
-            "delegationRequestId": {
+            "prompt": {
               "type": "string",
               "minLength": 1,
-              "maxLength": 128,
-              "description": "Optional stable request ID used to reconcile a retry without starting a second task."
+              "maxLength": 131072,
+              "description": "Exact task prompt (maximum 128 KiB UTF-8)."
+            },
+            "acceptanceCriteria": {
+              "type": "array",
+              "maxItems": 32,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096
+              },
+              "description": "Optional acceptance criteria; each item is limited to 4 KiB UTF-8."
+            },
+            "timeoutMinutes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1440
             }
           },
           "required": [
-            "message"
+            "peerId",
+            "workspaceId",
+            "title",
+            "prompt"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "mesh_get_task",
+        "displayName": "Get Mesh Task",
+        "toolReferenceName": "meshGetTask",
+        "canBeReferencedInPrompt": true,
+        "modelDescription": "Returns a bounded snapshot and event summary for an asynchronous Copilot Agent Mesh task, including event-gap and truncation indicators. Event sequences are positive and consecutive; eventGap identifies every omitted leading event, while eventCursor always equals the last returned sequence or the requested afterEventSequence for an empty window. Recovering snapshots may retain pending input, but only needsInput snapshots expose mesh_answer_task. Failed and timedOut snapshots include safe failure code, message, and retryable fields. Never returns a raw transcript.",
+        "userDescription": "Check a delegated task status and bounded results.",
+        "tags": [
+          "copilot-agent-mesh"
+        ],
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "taskId": {
+              "type": "string",
+              "minLength": 36,
+              "maxLength": 36,
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+              "description": "Task ID returned by mesh_delegate_task."
+            },
+            "afterEventSequence": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "maxEvents": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20
+            }
+          },
+          "required": [
+            "taskId"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "mesh_cancel_task",
+        "displayName": "Cancel Mesh Task",
+        "toolReferenceName": "meshCancelTask",
+        "canBeReferencedInPrompt": true,
+        "modelDescription": "Requests cancellation of a task owned by this coordinator. This is the only mesh tool that turns a caller cancellation intent into a remote task cancellation request.",
+        "userDescription": "Request cancellation of a delegated task.",
+        "tags": [
+          "copilot-agent-mesh"
+        ],
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "taskId": {
+              "type": "string",
+              "minLength": 36,
+              "maxLength": 36,
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+              "description": "Owned task ID to cancel."
+            }
+          },
+          "required": [
+            "taskId"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "mesh_answer_task",
+        "displayName": "Answer Mesh Task",
+        "toolReferenceName": "meshAnswerTask",
+        "canBeReferencedInPrompt": true,
+        "modelDescription": "Answers a pending question or approval request for a task owned by this coordinator. Use the exact task and input IDs from mesh_get_task plus a stable caller-generated answer ID for idempotent retries.",
+        "userDescription": "Send an answer to a delegated task that is waiting for input.",
+        "tags": [
+          "copilot-agent-mesh"
+        ],
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "taskId": {
+              "type": "string",
+              "minLength": 36,
+              "maxLength": 36,
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+              "description": "Owned task ID waiting for input."
+            },
+            "inputId": {
+              "type": "string",
+              "minLength": 36,
+              "maxLength": 36,
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+              "description": "Pending input ID returned by mesh_get_task."
+            },
+            "answerId": {
+              "type": "string",
+              "minLength": 36,
+              "maxLength": 36,
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+              "description": "Stable answer ID used for idempotent retries."
+            },
+            "answer": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768,
+              "description": "Answer text (maximum 32 KiB UTF-8)."
+            }
+          },
+          "required": [
+            "taskId",
+            "inputId",
+            "answerId",
+            "answer"
           ],
           "additionalProperties": false
         }
@@ -128,8 +269,69 @@
         "icon": "$(refresh)"
       },
       {
-        "command": "copilotAgentMesh.runAgentHostTask",
-        "title": "Run Agent Host Task",
+        "command": "copilotAgentMesh.registerWorkspace",
+        "title": "Register Current Workspace",
+        "category": "Copilot Agent Mesh",
+        "icon": "$(add)"
+      },
+      {
+        "command": "copilotAgentMesh.removeWorkspace",
+        "title": "Remove Workspace",
+        "category": "Copilot Agent Mesh"
+      },
+      {
+        "command": "copilotAgentMesh.enableWorkspace",
+        "title": "Enable Workspace",
+        "category": "Copilot Agent Mesh"
+      },
+      {
+        "command": "copilotAgentMesh.disableWorkspace",
+        "title": "Disable Workspace",
+        "category": "Copilot Agent Mesh"
+      },
+      {
+        "command": "copilotAgentMesh.startListener",
+        "title": "Start Listener",
+        "category": "Copilot Agent Mesh",
+        "icon": "$(radio-tower)"
+      },
+      {
+        "command": "copilotAgentMesh.stopListener",
+        "title": "Stop Listener",
+        "category": "Copilot Agent Mesh",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "copilotAgentMesh.copyConnectionUrl",
+        "title": "Copy Connection URL",
+        "category": "Copilot Agent Mesh",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "copilotAgentMesh.addPeer",
+        "title": "Add Peer",
+        "category": "Copilot Agent Mesh",
+        "icon": "$(link)"
+      },
+      {
+        "command": "copilotAgentMesh.removePeer",
+        "title": "Remove Peer",
+        "category": "Copilot Agent Mesh"
+      },
+      {
+        "command": "copilotAgentMesh.runTask",
+        "title": "Run Remote Task",
+        "category": "Copilot Agent Mesh",
+        "icon": "$(play)"
+      },
+      {
+        "command": "copilotAgentMesh.cancelTask",
+        "title": "Cancel Task",
+        "category": "Copilot Agent Mesh"
+      },
+      {
+        "command": "copilotAgentMesh.answerTask",
+        "title": "Answer Task Input",
         "category": "Copilot Agent Mesh"
       }
     ],
@@ -141,9 +343,24 @@
           "group": "navigation@1"
         },
         {
-          "command": "copilotAgentMesh.refreshDashboard",
+          "command": "copilotAgentMesh.registerWorkspace",
           "when": "view == copilotAgentMesh.dashboard",
           "group": "navigation@2"
+        },
+        {
+          "command": "copilotAgentMesh.startListener",
+          "when": "view == copilotAgentMesh.dashboard",
+          "group": "navigation@3"
+        },
+        {
+          "command": "copilotAgentMesh.copyConnectionUrl",
+          "when": "view == copilotAgentMesh.dashboard",
+          "group": "navigation@4"
+        },
+        {
+          "command": "copilotAgentMesh.refreshDashboard",
+          "when": "view == copilotAgentMesh.dashboard",
+          "group": "navigation@9"
         }
       ]
     },
@@ -192,6 +409,37 @@
             "additionalProperties": false
           },
           "markdownDescription": "Maps an AHP protected-resource or authorization-server URL to a VS Code authentication provider ID and exact scopes. No provider or scope is inferred."
+        },
+        "copilotAgentMesh.devTunnelPath": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "markdownDescription": "Optional path to the exact supported Dev Tunnel CLI executable. The extension never installs or upgrades the CLI."
+        },
+        "copilotAgentMesh.listener.port": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 65535,
+          "scope": "machine",
+          "markdownDescription": "Preferred loopback Gateway port. Use 0 to restore the last owned port or allocate one on first start."
+        },
+        "copilotAgentMesh.listener.autoStart": {
+          "type": "boolean",
+          "default": false,
+          "scope": "machine",
+          "markdownDescription": "Start the persisted listener during local Extension Host activation."
+        },
+        "copilotAgentMesh.workspace.capabilityTags": {
+          "type": "array",
+          "default": [],
+          "scope": "machine",
+          "maxItems": 32,
+          "items": {
+            "type": "string",
+            "maxLength": 64
+          },
+          "markdownDescription": "Capability tags published for newly registered workspaces. Paths and credentials must not be used as tags."
         }
       }
     }

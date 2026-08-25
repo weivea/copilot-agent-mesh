@@ -16,10 +16,9 @@ import {
 	MeshListWorkersTool,
 } from '../tools/taskTools';
 import {
-	MESH_SPIKE_ECHO_TOOL_NAME,
-	SpikeEchoCoordinator,
-} from '../tools/spikeEchoCore';
-import { MeshSpikeEchoTool } from '../tools/spikeEchoTool';
+	MESH_RUNTIME_TOOL_NAMES,
+	MESH_TOOL_NAMES,
+} from '../tools/toolManifest';
 
 suite('Copilot Agent Mesh', () => {
 	test('cold host has an implicit activation path for the contributed tool', async () => {
@@ -28,16 +27,12 @@ suite('Copilot Agent Mesh', () => {
 
 		assert.strictEqual(extension.isActive, false);
 		assert.strictEqual(extension.packageJSON.activationEvents.length, 0);
-		assert.deepStrictEqual(manifestTools.map(({ name }) => name), [MESH_SPIKE_ECHO_TOOL_NAME]);
+		assert.deepStrictEqual(manifestTools.map(({ name }) => name), MESH_RUNTIME_TOOL_NAMES);
 
 		const cancellation = new vscode.CancellationTokenSource();
 		try {
-			const invocation = vscode.lm.invokeTool(MESH_SPIKE_ECHO_TOOL_NAME, {
-				input: {
-					message: 'cold activation probe',
-					delaySeconds: 5,
-					confirmationBudgetSeconds: 5,
-				},
+			const invocation = vscode.lm.invokeTool(MESH_TOOL_NAMES.listWorkers, {
+				input: {},
 				toolInvocationToken: undefined,
 			}, cancellation.token);
 			setTimeout(() => cancellation.cancel(), 0);
@@ -49,7 +44,9 @@ suite('Copilot Agent Mesh', () => {
 		}
 
 		assert.strictEqual(extension.isActive, true);
-		assert.ok(vscode.lm.tools.some(({ name }) => name === MESH_SPIKE_ECHO_TOOL_NAME));
+		assert.ok(MESH_RUNTIME_TOOL_NAMES.every(
+			(name) => vscode.lm.tools.some((tool) => tool.name === name),
+		));
 	});
 
 	test('contributes the dashboard and setup commands', () => {
@@ -60,7 +57,9 @@ suite('Copilot Agent Mesh', () => {
 
 		assert.ok(commands.some(({ command }) => command === 'copilotAgentMesh.configureDevice'));
 		assert.ok(commands.some(({ command }) => command === 'copilotAgentMesh.refreshDashboard'));
-		assert.ok(commands.some(({ command }) => command === 'copilotAgentMesh.runAgentHostTask'));
+		assert.ok(commands.some(({ command }) => command === 'copilotAgentMesh.runTask'));
+		assert.ok(commands.some(({ command }) => command === 'copilotAgentMesh.startListener'));
+		assert.ok(commands.some(({ command }) => command === 'copilotAgentMesh.registerWorkspace'));
 		assert.ok(views.some(({ id }) => id === 'copilotAgentMesh.dashboard'));
 		assert.deepStrictEqual(manifest.extensionKind, ['ui']);
 	});
@@ -70,52 +69,6 @@ suite('Copilot Agent Mesh', () => {
 		const properties = manifest.contributes.configuration.properties as Record<string, { default?: unknown }>;
 
 		assert.strictEqual(properties['copilotAgentMesh.experimental.agentHost']?.default, false);
-	});
-
-	test('prepares confirmation copy and returns compact structured text', async () => {
-		let idsAllocated = 0;
-		let tasksStarted = 0;
-		const coordinator = new SpikeEchoCoordinator({
-			clock: {
-				sleep: (delayMs) => delayMs === 5_000
-					? Promise.resolve()
-					: new Promise(() => undefined),
-			},
-			newId: () => `id-${++idsAllocated}`,
-			onTaskStarted: () => tasksStarted += 1,
-		});
-		const tool = new MeshSpikeEchoTool(coordinator);
-		const cancellation = new vscode.CancellationTokenSource();
-		const input = {
-			message: 'structured result probe',
-			delaySeconds: 5 as const,
-			confirmationBudgetSeconds: 15 as const,
-			delegationRequestId: 'text-result-request',
-		};
-
-		const prepared = tool.prepareInvocation({ input }, cancellation.token);
-		assert.match(String(prepared.confirmationMessages?.message), /no workspace files are accessed/);
-		assert.equal(idsAllocated, 0);
-		assert.equal(tasksStarted, 0);
-
-		const result = await tool.invoke({
-			input,
-			toolInvocationToken: undefined,
-		}, cancellation.token);
-		cancellation.dispose();
-		assert.equal(idsAllocated, 1);
-		assert.equal(tasksStarted, 1);
-		const [part] = result.content;
-		assert.ok(part instanceof vscode.LanguageModelTextPart);
-		assert.deepStrictEqual(JSON.parse(part.value), {
-			status: 'pending',
-			delegationRequestId: 'text-result-request',
-			taskId: 'id-1',
-			pollTool: 'mesh_get_task',
-			cancelTool: 'mesh_cancel_task',
-			echo: 'structured result probe',
-			delaySeconds: 5,
-		});
 	});
 
 	test('activates successfully', async () => {

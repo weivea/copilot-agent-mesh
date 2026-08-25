@@ -141,9 +141,20 @@ export class GatewayServer {
 		if (this.stopping !== undefined) {
 			return this.stopping;
 		}
+
 		this.disposed = true;
 		this.stopping = this.stop();
 		return this.stopping;
+	}
+
+	public async notifyPeer(
+		peerId: string,
+		method: string,
+		params: Record<string, unknown>,
+	): Promise<void> {
+		await Promise.all(
+			[...this.peers].map((peer) => peer.notifyPeer(peerId, method, params)),
+		);
 	}
 
 	private async stop(): Promise<void> {
