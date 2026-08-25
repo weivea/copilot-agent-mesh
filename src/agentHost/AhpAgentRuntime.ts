@@ -40,6 +40,13 @@ interface AuthenticationInFlight {
 	readonly promise: Promise<void>;
 }
 
+interface ConnectionGeneration {
+	readonly connection: AhpConnection;
+	readonly subscriptions: Map<string, AhpSubscription>;
+	readonly abort: AbortController;
+	valid: boolean;
+}
+
 export interface AhpSubscriptionEvent {
 	readonly type: 'action' | 'authRequired';
 	readonly params: unknown;
@@ -64,7 +71,7 @@ export interface AhpConnection {
 		readonly missing?: readonly string[];
 	}>;
 	attachSubscription(uri: string): AhpSubscription;
-	subscribe(uri: string): Promise<{ readonly snapshot?: Snapshot; readonly subscription: AhpSubscription }>;
+	subscribe(uri: string, signal?: AbortSignal): Promise<{ readonly snapshot?: Snapshot; readonly subscription: AhpSubscription }>;
 	authenticate(resource: string, token: string, scopes: readonly string[]): Promise<void>;
 	resolveSessionConfig(provider: string, workingDirectory: string, config: Readonly<Record<string, unknown>>): Promise<{
 		readonly schema: SessionConfigSchema;
@@ -91,7 +98,7 @@ export interface AhpConnection {
 }
 
 export interface AhpConnectionFactory {
-	connect(endpoint: URL): Promise<AhpConnection>;
+	connect(endpoint: URL, signal?: AbortSignal): Promise<AhpConnection>;
 }
 
 export interface SessionConfigurationResolver {
@@ -145,6 +152,7 @@ export class AhpAgentRuntime implements AgentRuntime {
 		}
 		validateRequest(request);
 		const workspace = await this.options.workspaceResolver.resolve(request.workspaceId);
+		this.throwIfDisposed();
 		if (workspace === undefined) {
 			throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'The requested workspace is not registered on this device.');
 		}
@@ -153,12 +161,19 @@ export class AhpAgentRuntime implements AgentRuntime {
 		if (await this.options.confirmation.confirm(resolvedRequest) === 'deny') {
 			throw new AgentRuntimeError('TASK_EXECUTION_FAILED', 'The local user denied this task.');
 		}
+		this.throwIfDisposed();
 
 		const host = await this.options.launcher.launch();
+		if (this.disposed) {
+			const cleanup = await cleanupDetachedResources(host, undefined);
+			const error = new AgentRuntimeError('AGENT_UNAVAILABLE', 'The production Agent Host runtime was disposed during startup.');
+			throw cleanup === undefined ? error : combineRuntimeErrors(error, cleanup);
+		}
 		let connection: AhpConnection | undefined;
 		let task: AhpTask | undefined;
 		try {
 			connection = await this.options.connections.connect(host.endpoint);
+			this.throwIfDisposed();
 			const createdTask = new AhpTask(
 				resolvedRequest,
 				host,
@@ -172,6 +187,7 @@ export class AhpAgentRuntime implements AgentRuntime {
 			task = createdTask;
 			this.tasks.add(createdTask);
 			await createdTask.start();
+			this.throwIfDisposed();
 			return createdTask;
 		} catch (error) {
 			const primary = normalizeRuntimeError(error);
@@ -211,22 +227,32 @@ export class AhpAgentRuntime implements AgentRuntime {
 			throw cleanupFailure(failures);
 		}
 	}
+
+	private throwIfDisposed(): void {
+		if (this.disposed) {
+			throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'The production Agent Host runtime has been disposed.');
+		}
+	}
 }
 
 export class SdkAhpConnectionFactory implements AhpConnectionFactory {
-	async connect(endpoint: URL): Promise<AhpConnection> {
+	async connect(endpoint: URL, signal?: AbortSignal): Promise<AhpConnection> {
 		if (typeof globalThis.WebSocket !== 'function') {
 			throw new AgentRuntimeError(
 				'AGENT_UNAVAILABLE',
 				'The VS Code Extension Host does not provide the WebSocket transport required by AHP.',
 			);
 		}
-		const socket = await connectWebSocket(endpoint, 10_000);
+		const socket = await connectWebSocket(endpoint, 10_000, signal);
 		const [{ AhpClient }, { WebSocketTransport }, protocol] = await Promise.all([
 			import('@microsoft/agent-host-protocol/client'),
 			import('@microsoft/agent-host-protocol/ws'),
 			import('@microsoft/agent-host-protocol'),
 		]);
+		if (signal?.aborted === true) {
+			socket.close();
+			throw new RecoveryStoppedCause();
+		}
 		const client = new AhpClient(WebSocketTransport.fromSocket(socket), { requestTimeoutMs: 30_000 });
 		client.connect();
 		return new SdkAhpConnection(client, protocol.SUPPORTED_PROTOCOL_VERSIONS);
@@ -264,8 +290,17 @@ class SdkAhpConnection implements AhpConnection {
 		return adaptSubscription(this.client.attachSubscription(uri));
 	}
 
-	async subscribe(uri: string): Promise<{ readonly snapshot?: Snapshot; readonly subscription: AhpSubscription }> {
+	async subscribe(uri: string, signal?: AbortSignal): Promise<{
+		readonly snapshot?: Snapshot;
+		readonly subscription: AhpSubscription;
+	}> {
+		throwIfAborted(signal);
 		const result = await this.client.subscribe(uri);
+		if (signal?.aborted === true) {
+			await result.subscription.close().catch(() => undefined);
+			await this.client.unsubscribe(uri).catch(() => undefined);
+			throw new RecoveryStoppedCause();
+		}
 		return { snapshot: result.result.snapshot, subscription: adaptSubscription(result.subscription) };
 	}
 
@@ -410,13 +445,16 @@ class AhpTask implements AgentTaskHandle {
 	private readonly pendingAuthNotifications = new Set<Promise<void>>();
 	private terminalError: AgentRuntimeError | undefined;
 	private rootTerminals: readonly TerminalInfo[] = [];
-	private readonly terminalSubscriptionUpdates = new WeakMap<AhpConnection, Promise<void>>();
+	private readonly terminalSubscriptionUpdates = new Map<AhpConnection, Promise<void>>();
 	private readonly unacknowledgedDispatches = new Map<number, {
 		readonly channel: string;
 		readonly action: unknown;
 		readonly requestId?: string;
 	}>();
 	private nextClientSeq = 1;
+	private recoveryAbort: AbortController | undefined;
+	private recoveryPromise: Promise<void> | undefined;
+	private generation: ConnectionGeneration;
 
 	constructor(
 		private readonly request: ResolvedAgentTaskRequest,
@@ -430,6 +468,12 @@ class AhpTask implements AgentTaskHandle {
 	) {
 		this.taskId = request.taskId;
 		this.connection = connection;
+		this.generation = {
+			connection,
+			subscriptions: this.subscriptions,
+			abort: new AbortController(),
+			valid: true,
+		};
 	}
 
 	get recovery(): AgentRecoveryDescriptor {
@@ -446,6 +490,7 @@ class AhpTask implements AgentTaskHandle {
 		const rootSubscription = this.connection.attachSubscription(rootUri);
 		this.subscriptions.set(rootUri, rootSubscription);
 		const initialized = await this.connection.initialize(this.clientId);
+		this.throwIfTerminalError();
 		this.lastSeenServerSeq = initialized.serverSeq;
 		const rootSnapshot = initialized.snapshots.find(({ resource }) => resource === rootUri);
 		if (rootSnapshot === undefined) {
@@ -454,13 +499,13 @@ class AhpTask implements AgentTaskHandle {
 		const root = parseRootState(rootSnapshot);
 		this.provider = selectProvider(root.agents, this.request.providerId);
 		this.rootTerminals = root.terminals ?? [];
-		this.startSubscription(rootUri, rootSubscription, this.connection, this.subscriptions);
+		this.startSubscription(rootUri, rootSubscription, this.generation);
 		await this.authenticate(this.provider.protectedResources ?? [], 'initial', this.request.allowInteractiveAuthentication === true);
-		await Promise.resolve();
+		this.throwIfTerminalError();
+		await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+		this.throwIfTerminalError();
 		await this.drainAuthNotifications();
-		if (this.terminalError !== undefined) {
-			throw this.terminalError;
-		}
+		this.throwIfTerminalError();
 
 		const config = await this.resolveConfig();
 		this.throwIfTerminalError();
@@ -478,24 +523,31 @@ class AhpTask implements AgentTaskHandle {
 		this.throwIfTerminalError();
 
 		const sessionSubscription = await this.connection.subscribe(this.sessionUri);
+		this.throwIfTerminalError();
 		if (sessionSubscription.snapshot !== undefined) {
 			this.applySnapshot(sessionSubscription.snapshot);
 		}
+		this.throwIfTerminalError();
 		this.addSubscription(this.sessionUri, sessionSubscription.subscription);
 		const [_, defaultChat] = await Promise.all([
 			this.waitForReady(),
 			this.waitForDefaultChat(),
 		]);
+		this.throwIfTerminalError();
 		this.chatUri = defaultChat;
 
 		const chatSubscription = await this.connection.subscribe(defaultChat);
+		this.throwIfTerminalError();
 		if (chatSubscription.snapshot !== undefined) {
 			this.applySnapshot(chatSubscription.snapshot);
 		}
+		this.throwIfTerminalError();
 		this.addSubscription(defaultChat, chatSubscription.subscription);
-		await this.scheduleOwnedTerminals(this.rootTerminals, this.connection, this.subscriptions, true);
+		await this.scheduleOwnedTerminals(this.rootTerminals, this.generation, true);
+		this.throwIfTerminalError();
 
 		this.turnId = randomUUID();
+		this.throwIfTerminalError();
 		this.dispatchTracked(defaultChat, {
 			type: 'chat/turnStarted',
 			turnId: this.turnId,
@@ -505,7 +557,11 @@ class AhpTask implements AgentTaskHandle {
 				origin: { kind: 'user' },
 			},
 		});
+		this.throwIfTerminalError();
+		await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+		this.throwIfTerminalError();
 		this.events.push({ type: 'progress', message: 'Agent turn started.' });
+		this.throwIfTerminalError();
 	}
 
 	async cancel(): Promise<void> {
@@ -548,12 +604,22 @@ class AhpTask implements AgentTaskHandle {
 
 	private async disposeResources(): Promise<void> {
 		this.disposed = true;
+		const recovery = this.recoveryPromise;
+		this.recoveryAbort?.abort();
+		this.generation.valid = false;
+		this.generation.abort.abort();
 		if (this.cancellationTimer !== undefined) {
 			clearTimeout(this.cancellationTimer);
 		}
 		this.exitSubscription?.dispose();
 		const failures: string[] = [];
 		try {
+			if (recovery !== undefined) {
+				await collectCleanupFailures([{
+					label: 'stop in-flight AHP recovery',
+					run: () => recovery,
+				}], failures);
+			}
 			await collectCleanupFailures(
 				[...this.subscriptions].map(([uri, subscription]) => ({
 					label: `close subscription ${safeCleanupResource(uri)}`,
@@ -575,6 +641,13 @@ class AhpTask implements AgentTaskHandle {
 			await collectCleanupFailures([
 				{ label: 'shutdown AHP connection', run: () => this.connection.shutdown() },
 			], failures);
+			const terminalUpdates = this.terminalSubscriptionUpdates.get(this.connection);
+			if (terminalUpdates !== undefined) {
+				await collectCleanupFailures([{
+					label: 'settle terminal subscription updates',
+					run: () => terminalUpdates,
+				}], failures);
+			}
 			await collectCleanupFailures(
 				[...this.staleConnections].map((connection) => ({
 					label: 'shutdown stale AHP connection',
@@ -651,6 +724,7 @@ class AhpTask implements AgentTaskHandle {
 		reason: 'initial' | 'challenge' | 'tokenInvalid',
 		interactive: boolean,
 		connection = this.connection,
+		signal?: AbortSignal,
 	): Promise<void> {
 		let connectionAuthentication = this.authenticationInFlight.get(connection);
 		if (connectionAuthentication === undefined) {
@@ -665,6 +739,7 @@ class AhpTask implements AgentTaskHandle {
 				interactive,
 				connection,
 				connectionAuthentication!,
+				signal,
 			)));
 	}
 
@@ -674,6 +749,7 @@ class AhpTask implements AgentTaskHandle {
 		interactive: boolean,
 		connection: AhpConnection,
 		connectionAuthentication: Map<string, AuthenticationInFlight>,
+		signal?: AbortSignal,
 	): Promise<void> {
 		const existing = connectionAuthentication.get(resource.resource);
 		if (existing !== undefined && authenticationCovers(existing, reason, interactive)) {
@@ -684,7 +760,7 @@ class AhpTask implements AgentTaskHandle {
 				await existing.promise.catch(() => undefined);
 			}
 			await this.authBroker.authenticate(
-				{ resources: [resource], interactive, reason },
+				{ resources: [resource], interactive, reason, signal },
 				(resourceUrl, token, scopes) => connection.authenticate(resourceUrl, token, scopes),
 			);
 		})();
@@ -743,46 +819,42 @@ class AhpTask implements AgentTaskHandle {
 
 	private addSubscription(uri: string, subscription: AhpSubscription): void {
 		this.subscriptions.set(uri, subscription);
-		this.startSubscription(uri, subscription, this.connection, this.subscriptions);
+		this.startSubscription(uri, subscription, this.generation);
 	}
 
 	private startSubscription(
 		uri: string,
 		subscription: AhpSubscription,
-		connection: AhpConnection,
-		subscriptions: Map<string, AhpSubscription>,
+		generation: ConnectionGeneration,
 	): void {
-		void this.pumpSubscription(uri, subscription, connection, subscriptions);
+		void this.pumpSubscription(uri, subscription, generation);
 	}
 
 	private async pumpSubscription(
 		uri: string,
 		subscription: AhpSubscription,
-		connection: AhpConnection,
-		subscriptions: Map<string, AhpSubscription>,
+		generation: ConnectionGeneration,
 	): Promise<void> {
 		try {
 			for await (const event of subscription) {
 				if (
 					this.disposed
-					|| connection !== this.connection
-					|| subscriptions !== this.subscriptions
-					|| subscriptions.get(uri) !== subscription
+					|| !this.isCurrentGeneration(generation)
+					|| generation.subscriptions.get(uri) !== subscription
 				) {
 					return;
 				}
 				if (event.type === 'action') {
 					this.handleEnvelope(event.params as ActionEnvelope);
 				} else {
-					this.trackAuthNotification(event.params, connection);
+					this.trackAuthNotification(event.params, generation.connection);
 				}
 			}
 			if (
 				!this.disposed
 				&& !this.terminal
-				&& connection === this.connection
-				&& subscriptions === this.subscriptions
-				&& subscriptions.get(uri) === subscription
+				&& this.isCurrentGeneration(generation)
+				&& generation.subscriptions.get(uri) === subscription
 			) {
 				this.handleSubscriptionLoss();
 			}
@@ -790,17 +862,20 @@ class AhpTask implements AgentTaskHandle {
 			if (
 				!this.disposed
 				&& !this.terminal
-				&& connection === this.connection
-				&& subscriptions === this.subscriptions
+				&& this.isCurrentGeneration(generation)
 			) {
 				this.handleSubscriptionLoss();
 			}
 		}
 	}
 
+	private isCurrentGeneration(generation: ConnectionGeneration): boolean {
+		return generation.valid && generation === this.generation;
+	}
+
 	private handleSubscriptionLoss(): void {
 		if (this.sessionCreated) {
-			void this.recover();
+			this.startRecovery();
 			return;
 		}
 		this.fail(new AgentRuntimeError(
@@ -824,12 +899,7 @@ class AhpTask implements AgentTaskHandle {
 			} else if (action.type === 'root/terminalsChanged') {
 				this.rootTerminals = action.terminals;
 				if (subscribeRootTerminals) {
-					void this.scheduleOwnedTerminals(
-						action.terminals,
-						this.connection,
-						this.subscriptions,
-						true,
-					).catch((error: unknown) => this.fail(normalizeRuntimeError(error)));
+					this.scheduleCurrentOwnedTerminals(action.terminals);
 				}
 			}
 		}
@@ -888,12 +958,7 @@ class AhpTask implements AgentTaskHandle {
 			this.provider = selected ?? this.provider;
 			this.rootTerminals = root.terminals ?? [];
 			if (subscribeRootTerminals) {
-				void this.scheduleOwnedTerminals(
-					this.rootTerminals,
-					this.connection,
-					this.subscriptions,
-					true,
-				).catch((error: unknown) => this.fail(normalizeRuntimeError(error)));
+				this.scheduleCurrentOwnedTerminals(this.rootTerminals);
 			}
 			return;
 		}
@@ -1006,10 +1071,12 @@ class AhpTask implements AgentTaskHandle {
 
 	private async subscribeOwnedTerminals(
 		terminals: readonly TerminalInfo[],
-		connection: AhpConnection,
-		subscriptions: Map<string, AhpSubscription>,
+		generation: ConnectionGeneration,
 		startPumps: boolean,
+		signal: AbortSignal = generation.abort.signal,
 	): Promise<void> {
+		const { connection, subscriptions } = generation;
+		throwIfAborted(signal);
 		const owned = terminals.filter(({ claim }) =>
 			claim.kind === 'session' && claim.session === this.sessionUri,
 		);
@@ -1018,15 +1085,22 @@ class AhpTask implements AgentTaskHandle {
 			if (uri.startsWith('ahp-terminal:') && !ownedResources.has(uri)) {
 				subscriptions.delete(uri);
 				await subscription.close();
+				throwIfAborted(signal);
 				await connection.unsubscribe(uri);
+				throwIfAborted(signal);
 			}
 		}
 		for (const terminal of owned) {
 			if (subscriptions.has(terminal.resource)) {
 				continue;
 			}
-			const result = await connection.subscribe(terminal.resource);
-			if (startPumps && connection !== this.connection) {
+			const result = await connection.subscribe(terminal.resource, signal);
+			if (
+				this.disposed
+				|| signal.aborted
+				|| !generation.valid
+				|| (startPumps && !this.isCurrentGeneration(generation))
+			) {
 				await result.subscription.close().catch(() => undefined);
 				await connection.unsubscribe(terminal.resource).catch(() => undefined);
 				continue;
@@ -1036,23 +1110,50 @@ class AhpTask implements AgentTaskHandle {
 			}
 			subscriptions.set(terminal.resource, result.subscription);
 			if (startPumps) {
-				this.startSubscription(terminal.resource, result.subscription, connection, subscriptions);
+				this.startSubscription(terminal.resource, result.subscription, generation);
 			}
 		}
 	}
 
 	private scheduleOwnedTerminals(
 		terminals: readonly TerminalInfo[],
-		connection: AhpConnection,
-		subscriptions: Map<string, AhpSubscription>,
+		generation: ConnectionGeneration,
 		startPumps: boolean,
+		signal?: AbortSignal,
 	): Promise<void> {
+		const { connection } = generation;
 		const previous = this.terminalSubscriptionUpdates.get(connection) ?? Promise.resolve();
 		const update = previous.then(() =>
-			this.subscribeOwnedTerminals(terminals, connection, subscriptions, startPumps),
+			this.subscribeOwnedTerminals(terminals, generation, startPumps, signal),
 		);
-		this.terminalSubscriptionUpdates.set(connection, update.catch(() => undefined));
+		const tracked = update.catch(() => undefined);
+		this.terminalSubscriptionUpdates.set(connection, tracked);
+		void tracked.then(() => {
+			if (this.terminalSubscriptionUpdates.get(connection) === tracked) {
+				this.terminalSubscriptionUpdates.delete(connection);
+			}
+		});
 		return update;
+	}
+
+	private scheduleCurrentOwnedTerminals(terminals: readonly TerminalInfo[]): void {
+		const generation = this.generation;
+		void this.scheduleOwnedTerminals(terminals, generation, true)
+			.catch((error: unknown) => this.handleTerminalSubscriptionFailure(error, generation));
+	}
+
+	private handleTerminalSubscriptionFailure(
+		error: unknown,
+		generation: ConnectionGeneration,
+	): void {
+		if (
+			!this.disposed
+			&& !this.terminal
+			&& this.isCurrentGeneration(generation)
+			&& !this.recovering
+		) {
+			this.fail(normalizeRuntimeError(error));
+		}
 	}
 
 	private async handleAuthNotification(params: unknown, connection: AhpConnection): Promise<void> {
@@ -1087,27 +1188,73 @@ class AhpTask implements AgentTaskHandle {
 		}
 	}
 
-	private async recover(): Promise<void> {
-		if (this.recovering || this.disposed || this.terminal) {
+	private startRecovery(): void {
+		if (this.recoveryPromise !== undefined || this.disposed || this.terminal) {
 			return;
 		}
+		const abort = new AbortController();
+		this.recoveryAbort = abort;
+		const operation = this.recover(abort.signal);
+		this.recoveryPromise = operation;
+		const clear = () => {
+			if (this.recoveryPromise === operation) {
+				this.recoveryPromise = undefined;
+				this.recoveryAbort = undefined;
+			}
+		};
+		void operation.then(clear, clear);
+		void operation.catch(() => undefined);
+	}
+
+	private async recover(signal: AbortSignal): Promise<void> {
 		this.recovering = true;
 		this.events.push({ type: 'progress', message: 'Reconnecting to Agent Host.' });
+		const previousConnection = this.connection;
+		const previousGeneration = this.generation;
+		previousGeneration.valid = false;
+		previousGeneration.abort.abort();
+		const previousShutdown = previousConnection.shutdown();
+		void previousShutdown.catch(() => undefined);
 		let candidate: AhpConnection | undefined;
+		let candidateGeneration: ConnectionGeneration | undefined;
+		let candidateAbortShutdown: Promise<void> | undefined;
+		let abortCandidate: (() => void) | undefined;
 		const recoveredSubscriptions = new Map<string, AhpSubscription>();
-		let recoveredTerminals: readonly TerminalInfo[] | undefined;
+		let recoveredTerminals: readonly TerminalInfo[] = this.rootTerminals;
 		try {
-			candidate = await this.connectionFactory.connect(this.host.endpoint);
+			candidate = await this.awaitRecoveryStep(
+				this.connectionFactory.connect(this.host.endpoint, signal),
+				signal,
+			);
+			candidateGeneration = {
+				connection: candidate,
+				subscriptions: recoveredSubscriptions,
+				abort: new AbortController(),
+				valid: true,
+			};
+			abortCandidate = () => {
+				candidateGeneration!.valid = false;
+				candidateGeneration!.abort.abort();
+				candidateAbortShutdown ??= candidate!.shutdown();
+				void candidateAbortShutdown.catch(() => undefined);
+			};
+			signal.addEventListener('abort', abortCandidate, { once: true });
+			this.throwIfRecoveryStopped(signal);
 			for (const uri of this.subscriptions.keys()) {
+				this.throwIfRecoveryStopped(signal);
 				recoveredSubscriptions.set(uri, candidate.attachSubscription(uri));
 			}
-			const result = await candidate.reconnect(
-				this.clientId,
-				this.lastSeenServerSeq,
-				[...this.subscriptions.keys()],
+			const result = await this.awaitRecoveryStep(
+				candidate.reconnect(
+					this.clientId,
+					this.lastSeenServerSeq,
+					[...this.subscriptions.keys()],
+				),
+				signal,
 			);
 			if (result.type === 'replay') {
 				for (const action of result.actions ?? []) {
+					this.throwIfRecoveryStopped(signal);
 					if (action.channel === rootUri && action.action.type === 'root/terminalsChanged') {
 						recoveredTerminals = action.action.terminals;
 					}
@@ -1118,7 +1265,10 @@ class AhpTask implements AgentTaskHandle {
 					throw new RecoveryUnavailableCause('The Agent Host no longer has the task session.');
 				}
 				for (const uri of missing) {
-					await recoveredSubscriptions.get(uri)?.close();
+					const subscription = recoveredSubscriptions.get(uri);
+					if (subscription !== undefined) {
+						await this.awaitRecoveryStep(subscription.close(), signal);
+					}
 					recoveredSubscriptions.delete(uri);
 				}
 			} else {
@@ -1130,52 +1280,69 @@ class AhpTask implements AgentTaskHandle {
 				}
 				for (const [uri, subscription] of recoveredSubscriptions) {
 					if (!snapshotResources.has(uri)) {
-						await subscription.close();
+						await this.awaitRecoveryStep(subscription.close(), signal);
 						recoveredSubscriptions.delete(uri);
 					}
 				}
 				for (const snapshot of snapshots) {
+					this.throwIfRecoveryStopped(signal);
 					if (snapshot.resource === rootUri) {
 						recoveredTerminals = parseRootState(snapshot).terminals ?? [];
 					}
 					this.applySnapshot(snapshot, false);
 				}
 			}
-			const sessions = await candidate.listSessions();
+			const sessions = await this.awaitRecoveryStep(candidate.listSessions(), signal);
 			if (!sessions.some(({ resource }) => resource === this.sessionUri)) {
 				throw new RecoveryUnavailableCause('The Agent Host session is missing after reconnect.');
 			}
 			if (this.provider !== undefined) {
-				await this.authenticate(
-					this.provider.protectedResources ?? [],
-					'tokenInvalid',
-					this.request.allowInteractiveAuthentication === true,
-					candidate,
+				await this.awaitRecoveryStep(
+					this.authenticate(
+						this.provider.protectedResources ?? [],
+						'tokenInvalid',
+						this.request.allowInteractiveAuthentication === true,
+						candidate,
+						signal,
+					),
+					signal,
 				);
 			}
-			if (recoveredTerminals !== undefined) {
-				await this.scheduleOwnedTerminals(
+			await this.awaitRecoveryStep(
+				this.scheduleOwnedTerminals(
 					recoveredTerminals,
-					candidate,
-					recoveredSubscriptions,
+					candidateGeneration,
 					false,
-				);
-			}
+					signal,
+				),
+				signal,
+			);
+			this.throwIfRecoveryStopped(signal);
 			this.resendUnacknowledged(candidate);
-			const previousConnection = this.connection;
-			this.connection = candidate;
-			this.subscriptions = recoveredSubscriptions;
+			this.throwIfRecoveryStopped(signal);
 			try {
-				await previousConnection.shutdown();
-			} catch {
+				await this.awaitRecoveryStep(previousShutdown, signal);
+			} catch (error) {
+				if (error instanceof RecoveryStoppedCause) {
+					throw error;
+				}
 				this.staleConnections.add(previousConnection);
 			}
+			const previousTerminalUpdates = this.terminalSubscriptionUpdates.get(previousConnection);
+			if (previousTerminalUpdates !== undefined) {
+				await this.awaitRecoveryStep(previousTerminalUpdates, signal);
+			}
+			this.throwIfRecoveryStopped(signal);
+			this.connection = candidate;
+			this.subscriptions = recoveredSubscriptions;
+			this.generation = candidateGeneration;
 			this.recovering = false;
 			for (const [uri, subscription] of recoveredSubscriptions) {
-				this.startSubscription(uri, subscription, candidate, recoveredSubscriptions);
+				this.startSubscription(uri, subscription, candidateGeneration);
 			}
 			this.events.push({ type: 'progress', message: 'Agent Host connection recovered.' });
 		} catch (error) {
+			const stopped = error instanceof RecoveryStoppedCause || signal.aborted || this.disposed || this.terminal;
 			let failure = error instanceof RecoveryUnavailableCause
 				? new AgentRuntimeError(
 					'TASK_RECOVERY_UNAVAILABLE',
@@ -1183,14 +1350,44 @@ class AhpTask implements AgentTaskHandle {
 				)
 				: normalizeRuntimeError(error);
 			if (candidate !== undefined && candidate !== this.connection) {
-				const cleanup = await cleanupRecoveryCandidate(candidate, recoveredSubscriptions);
+				if (candidateGeneration !== undefined) {
+					candidateGeneration.valid = false;
+					candidateGeneration.abort.abort();
+				}
+				const cleanup = await cleanupRecoveryCandidate(
+					candidate,
+					recoveredSubscriptions,
+					candidateAbortShutdown,
+				);
 				if (cleanup !== undefined) {
 					failure = combineRuntimeErrors(failure, cleanup);
+					if (stopped) {
+						throw failure;
+					}
 				}
 			}
-			this.fail(failure);
+			if (!stopped) {
+				this.fail(failure);
+			}
 		} finally {
+			if (abortCandidate !== undefined) {
+				signal.removeEventListener('abort', abortCandidate);
+			}
+			await previousShutdown.catch(() => undefined);
+			await this.terminalSubscriptionUpdates.get(previousConnection)?.catch(() => undefined);
 			this.recovering = false;
+		}
+	}
+
+	private async awaitRecoveryStep<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+		const result = await operation;
+		this.throwIfRecoveryStopped(signal);
+		return result;
+	}
+
+	private throwIfRecoveryStopped(signal: AbortSignal): void {
+		if (signal.aborted || this.disposed || this.terminal) {
+			throw new RecoveryStoppedCause();
 		}
 	}
 
@@ -1204,6 +1401,9 @@ class AhpTask implements AgentTaskHandle {
 	private throwIfTerminalError(): void {
 		if (this.terminalError !== undefined) {
 			throw this.terminalError;
+		}
+		if (this.disposed || this.terminal) {
+			throw new AgentRuntimeError('TASK_EXECUTION_FAILED', 'The Agent Host task stopped during startup.');
 		}
 	}
 
@@ -1323,6 +1523,7 @@ function authenticationCovers(
 }
 
 class RecoveryUnavailableCause extends Error {}
+class RecoveryStoppedCause extends Error {}
 
 interface CleanupOperation {
 	readonly label: string;
@@ -1348,6 +1549,7 @@ async function cleanupDetachedResources(
 async function cleanupRecoveryCandidate(
 	connection: AhpConnection,
 	subscriptions: ReadonlyMap<string, AhpSubscription>,
+	shutdown?: Promise<void>,
 ): Promise<AgentRuntimeError | undefined> {
 	const failures: string[] = [];
 	await collectCleanupFailures(
@@ -1358,7 +1560,7 @@ async function cleanupRecoveryCandidate(
 		failures,
 	);
 	await collectCleanupFailures([
-		{ label: 'shutdown recovery AHP connection', run: () => connection.shutdown() },
+		{ label: 'shutdown recovery AHP connection', run: () => shutdown ?? connection.shutdown() },
 	], failures);
 	return failures.length === 0 ? undefined : cleanupFailure(failures);
 }
@@ -1444,8 +1646,12 @@ function stableJson(value: Readonly<Record<string, unknown>>): string {
 	return JSON.stringify(Object.fromEntries(entries));
 }
 
-function connectWebSocket(endpoint: URL, timeoutMs: number): Promise<WebSocket> {
+function connectWebSocket(endpoint: URL, timeoutMs: number, signal?: AbortSignal): Promise<WebSocket> {
 	return new Promise((resolveSocket, reject) => {
+		if (signal?.aborted === true) {
+			reject(new RecoveryStoppedCause());
+			return;
+		}
 		const socket = new globalThis.WebSocket(endpoint);
 		const timer = setTimeout(() => {
 			cleanup();
@@ -1457,6 +1663,7 @@ function connectWebSocket(endpoint: URL, timeoutMs: number): Promise<WebSocket> 
 			socket.removeEventListener('open', handleOpen);
 			socket.removeEventListener('error', handleError);
 			socket.removeEventListener('close', handleClose);
+			signal?.removeEventListener('abort', handleAbort);
 		};
 		const handleOpen = () => {
 			cleanup();
@@ -1470,10 +1677,22 @@ function connectWebSocket(endpoint: URL, timeoutMs: number): Promise<WebSocket> 
 			cleanup();
 			reject(new AgentRuntimeError('AGENT_UNAVAILABLE', 'The Agent Host WebSocket closed before opening.'));
 		};
+		const handleAbort = () => {
+			cleanup();
+			socket.close();
+			reject(new RecoveryStoppedCause());
+		};
 		socket.addEventListener('open', handleOpen);
 		socket.addEventListener('error', handleError);
 		socket.addEventListener('close', handleClose);
+		signal?.addEventListener('abort', handleAbort, { once: true });
 	});
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+	if (signal?.aborted === true) {
+		throw new RecoveryStoppedCause();
+	}
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {

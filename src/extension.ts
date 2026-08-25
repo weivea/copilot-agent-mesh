@@ -10,6 +10,11 @@ import {
 } from './agentHost/AhpAgentRuntime';
 import { AgentHostLauncher } from './agentHost/AgentHostLauncher';
 import {
+	formatSessionConfigDefault,
+	parseSessionConfigInput,
+	validateSessionConfigValue,
+} from './agentHost/SessionConfigValue';
+import {
 	AgentRuntimeError,
 	AgentRuntimeLifecycle,
 	type AgentInputValue,
@@ -188,6 +193,12 @@ class VscodeSessionConfigurationResolver implements SessionConfigurationResolver
 			if (property === undefined) {
 				throw new AgentRuntimeError('AGENT_CONFIG_REQUIRED', `Agent configuration property "${id}" is unavailable.`);
 			}
+			if (property.readOnly === true) {
+				throw new AgentRuntimeError(
+					'AGENT_CONFIG_REQUIRED',
+					`Agent configuration property "${id}" is read-only and has no resolved value.`,
+				);
+			}
 			const choices = property.enumDynamic === true
 				? await request.completions(id, values)
 				: property.enum?.map((value, index) => ({
@@ -202,6 +213,7 @@ class VscodeSessionConfigurationResolver implements SessionConfigurationResolver
 				if (selected === undefined) {
 					throw new AgentRuntimeError('AGENT_CONFIG_REQUIRED', 'Agent session configuration was cancelled.');
 				}
+				validateSessionConfigValue(id, property, selected.value);
 				values[id] = selected.value;
 				continue;
 			}
@@ -213,19 +225,20 @@ class VscodeSessionConfigurationResolver implements SessionConfigurationResolver
 				if (selected === undefined) {
 					throw new AgentRuntimeError('AGENT_CONFIG_REQUIRED', 'Agent session configuration was cancelled.');
 				}
+				validateSessionConfigValue(id, property, selected.value);
 				values[id] = selected.value;
 				continue;
 			}
 			const entered = await vscode.window.showInputBox({
 				title: property.title,
 				prompt: property.description,
-				value: property.default === undefined ? undefined : String(property.default),
+				value: formatSessionConfigDefault(id, property),
 				ignoreFocusOut: true,
 			});
 			if (entered === undefined) {
 				throw new AgentRuntimeError('AGENT_CONFIG_REQUIRED', 'Agent session configuration was cancelled.');
 			}
-			values[id] = property.type === 'number' ? Number(entered) : entered;
+			values[id] = parseSessionConfigInput(id, property, entered);
 		}
 		return values;
 	}

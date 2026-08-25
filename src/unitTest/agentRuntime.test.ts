@@ -453,6 +453,34 @@ test('root connection loss before Session creation fails startup instead of ente
 	assert.equal(transport.shutdownCalls, 1);
 });
 
+test('startup never dispatches a turn or returns a handle after the task becomes terminal', async () => {
+	const transport = new FakeAhpTransport();
+	transport.completeAfterChatSubscribe = true;
+	const launcher = new FakeLauncher();
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+
+	await assert.rejects(
+		runtime.start(taskRequest()),
+		(error: unknown) => error instanceof AgentRuntimeError && error.code === 'TASK_EXECUTION_FAILED',
+	);
+	assert.equal(transport.dispatched.length, 0);
+	assert.equal(launcher.host.disposed, true);
+});
+
+test('startup observes terminal actions delivered immediately after turn dispatch', async () => {
+	const transport = new FakeAhpTransport();
+	transport.completeAfterTurnDispatch = true;
+	const launcher = new FakeLauncher();
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+
+	await assert.rejects(
+		runtime.start(taskRequest()),
+		(error: unknown) => error instanceof AgentRuntimeError && error.code === 'TASK_EXECUTION_FAILED',
+	);
+	assert.equal(transport.dispatched.length, 1);
+	assert.equal(launcher.host.disposed, true);
+});
+
 test('runtime reconnects with the recovery descriptor and fails truthfully on host crash', async () => {
 	const first = new FakeAhpTransport();
 	const recovered = new FakeAhpTransport();
@@ -485,6 +513,43 @@ test('runtime reconnects with the recovery descriptor and fails truthfully on ho
 		assert.equal(failed.error.code, 'TASK_RECOVERY_UNAVAILABLE');
 	}
 	await handle.dispose();
+});
+
+test('dispose aborts and awaits in-flight recovery before releasing owned resources', async () => {
+	const first = new FakeAhpTransport();
+	const recovered = new FakeAhpTransport();
+	recovered.blockReconnect();
+	const launcher = new FakeLauncher();
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([first, recovered]));
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+	recovered.created = first.created;
+
+	first.failChat();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	await handle.dispose();
+	assert.equal(recovered.shutdownCalls, 1);
+	assert.equal(launcher.host.disposed, true);
+});
+
+test('dispose propagates abort to blocked recovery authentication and waits for it to settle', async () => {
+	const first = new FakeAhpTransport();
+	const recovered = new FakeAhpTransport();
+	recovered.reconnectResult = { type: 'replay', actions: [], missing: [] };
+	const broker = new AbortableRecoveryAuthBroker();
+	const launcher = new FakeLauncher();
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([first, recovered]), broker);
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+	recovered.created = first.created;
+
+	first.failChat();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	await waitForCondition(() => broker.recoveryStarted);
+	await handle.dispose();
+	assert.equal(broker.recoveryAborted, true);
+	assert.equal(recovered.shutdownCalls, 1);
+	assert.equal(launcher.host.disposed, true);
 });
 
 test('recovery resends unacknowledged turn and input actions with their original client sequences', async () => {
@@ -664,6 +729,7 @@ test('terminal subscription updates are serialized independently per connection 
 	const first = new FakeAhpTransport();
 	const recovered = new FakeAhpTransport();
 	first.blockSubscribe('ahp-terminal:/old');
+	recovered.blockReconnect();
 	const runtime = createRuntime(new FakeLauncher(), new FakeConnectionFactory([first, recovered]));
 	const handle = await runtime.start(taskRequest());
 	await nextEvent(handle.events);
@@ -692,11 +758,75 @@ test('terminal subscription updates are serialized independently per connection 
 
 	first.failChat();
 	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	first.failSubscribe('ahp-terminal:/old');
+	recovered.releaseReconnect();
 	await waitForCondition(() => recovered.subscribedUris.includes('ahp-terminal:/candidate'));
-	first.releaseSubscribe('ahp-terminal:/old');
-	await waitForCondition(() => first.subscribedUris.includes('ahp-terminal:/old'));
+	recovered.emitChat({
+		type: 'chat/delta',
+		turnId: 'turn-1',
+		partId: 'after-stale-terminal-error',
+		content: 'still recovered',
+	});
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	assert.equal((await nextEvent(handle.events)).type, 'output');
 	assert.equal(recovered.subscribedUris.includes('ahp-terminal:/old'), false);
 	await handle.dispose();
+});
+
+test('recovery always reconciles the latest known terminals when replay has no root update', async () => {
+	const first = new FakeAhpTransport();
+	const recovered = new FakeAhpTransport();
+	recovered.reconnectResult = { type: 'replay', actions: [], missing: [] };
+	const runtime = createRuntime(new FakeLauncher(), new FakeConnectionFactory([first, recovered]));
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+	recovered.created = first.created;
+	first.blockSubscribe('ahp-terminal:/latest');
+	first.emitRootAction({
+		type: 'root/terminalsChanged',
+		terminals: [{
+			resource: 'ahp-terminal:/latest',
+			label: 'Latest terminal',
+			claim: { kind: 'session', session: handle.recovery.sessionUri },
+		}],
+	});
+	await waitForCondition(() => first.subscribeAttempts.includes('ahp-terminal:/latest'));
+
+	first.failChat();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	await waitForCondition(() => recovered.subscribedUris.includes('ahp-terminal:/latest'));
+	first.releaseSubscribe('ahp-terminal:/latest');
+	await handle.dispose();
+});
+
+test('dispose cancels and awaits terminal subscription updates and cleans a late subscription', async () => {
+	const transport = new FakeAhpTransport();
+	transport.ignoreSubscribeAbort = true;
+	const launcher = new FakeLauncher();
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+	transport.blockSubscribe('ahp-terminal:/late');
+	transport.emitRootAction({
+		type: 'root/terminalsChanged',
+		terminals: [{
+			resource: 'ahp-terminal:/late',
+			label: 'Late terminal',
+			claim: { kind: 'session', session: handle.recovery.sessionUri },
+		}],
+	});
+	await waitForCondition(() => transport.subscribeAttempts.includes('ahp-terminal:/late'));
+
+	let disposed = false;
+	const disposal = handle.dispose().then(() => {
+		disposed = true;
+	});
+	await new Promise<void>((resolve) => setTimeout(resolve, 5));
+	assert.equal(disposed, false);
+	transport.releaseSubscribe('ahp-terminal:/late');
+	await disposal;
+	assert.equal(transport.unsubscribedUris.includes('ahp-terminal:/late'), true);
+	assert.equal(launcher.host.disposed, true);
 });
 
 test('authentication deduplication is scoped to each AHP connection', async () => {
@@ -1186,6 +1316,7 @@ class BlockingConnectionAuthBroker implements AuthBroker {
 				this.reject = reject;
 			});
 		}
+
 		for (const resource of request.resources.filter(({ required }) => required !== false)) {
 			await pushToken(resource.resource, 'test-token', resource.scopes_supported ?? []);
 		}
@@ -1197,6 +1328,31 @@ class BlockingConnectionAuthBroker implements AuthBroker {
 
 	rejectBlocked(error: Error): void {
 		this.reject?.(error);
+	}
+}
+
+class AbortableRecoveryAuthBroker implements AuthBroker {
+	recoveryStarted = false;
+	recoveryAborted = false;
+
+	async authenticate(
+		request: AuthenticationRequest,
+		pushToken: (resource: string, token: string, scopes: readonly string[]) => Promise<void>,
+	): Promise<void> {
+		if (request.reason === 'tokenInvalid') {
+			this.recoveryStarted = true;
+			await new Promise<void>((_resolve, reject) => {
+				const handleAbort = () => {
+					this.recoveryAborted = true;
+					reject(new DOMException('Authentication aborted.', 'AbortError'));
+				};
+				request.signal?.addEventListener('abort', handleAbort, { once: true });
+			});
+			return;
+		}
+		for (const resource of request.resources.filter(({ required }) => required !== false)) {
+			await pushToken(resource.resource, 'test-token', resource.scopes_supported ?? []);
+		}
 	}
 }
 
@@ -1273,6 +1429,9 @@ class FakeAhpTransport implements AhpConnection {
 		snapshots: [],
 	};
 	iterativeConfig = false;
+	completeAfterChatSubscribe = false;
+	completeAfterTurnDispatch = false;
+	ignoreSubscribeAbort = false;
 	notificationDuringInitialize: readonly ProtectedResource[] = [];
 	rootAttachedBeforeInitialize = false;
 	disposeSessionCalls = 0;
@@ -1285,10 +1444,12 @@ class FakeAhpTransport implements AhpConnection {
 	private readonly attachedUris = new Set<string>();
 	private readonly queues = new Map<string, FakeSubscription>();
 	private reconnectRelease: (() => void) | undefined;
+	private reconnectReject: ((error: Error) => void) | undefined;
 	private reconnectBarrier: Promise<void> | undefined;
 	private readonly subscribeBarriers = new Map<string, {
 		readonly promise: Promise<void>;
 		readonly release: () => void;
+		readonly reject: (error: Error) => void;
 	}>();
 	readonly subscribeAttempts: string[] = [];
 
@@ -1329,8 +1490,9 @@ class FakeAhpTransport implements AhpConnection {
 	}
 
 	blockReconnect(): void {
-		this.reconnectBarrier = new Promise<void>((resolve) => {
+		this.reconnectBarrier = new Promise<void>((resolve, reject) => {
 			this.reconnectRelease = resolve;
+			this.reconnectReject = reject;
 		});
 	}
 
@@ -1341,14 +1503,21 @@ class FakeAhpTransport implements AhpConnection {
 
 	blockSubscribe(uri: string): void {
 		let release: () => void = () => undefined;
-		const promise = new Promise<void>((resolve) => {
+		let rejectBarrier: (error: Error) => void = () => undefined;
+		const promise = new Promise<void>((resolve, reject) => {
 			release = resolve;
+			rejectBarrier = reject;
 		});
-		this.subscribeBarriers.set(uri, { promise, release });
+		this.subscribeBarriers.set(uri, { promise, release, reject: rejectBarrier });
 	}
 
 	releaseSubscribe(uri: string): void {
 		this.subscribeBarriers.get(uri)?.release();
+		this.subscribeBarriers.delete(uri);
+	}
+
+	failSubscribe(uri: string): void {
+		this.subscribeBarriers.get(uri)?.reject(new Error('stale terminal subscription failed'));
 		this.subscribeBarriers.delete(uri);
 	}
 
@@ -1357,9 +1526,23 @@ class FakeAhpTransport implements AhpConnection {
 		return this.queue(uri);
 	}
 
-	async subscribe(uri: string): Promise<{ readonly snapshot?: Snapshot; readonly subscription: AhpSubscription }> {
+	async subscribe(uri: string, signal?: AbortSignal): Promise<{
+		readonly snapshot?: Snapshot;
+		readonly subscription: AhpSubscription;
+	}> {
 		this.subscribeAttempts.push(uri);
-		await this.subscribeBarriers.get(uri)?.promise;
+		const barrier = this.subscribeBarriers.get(uri);
+		const handleAbort = () => barrier?.reject(new DOMException('Subscription aborted.', 'AbortError'));
+		if (!this.ignoreSubscribeAbort) {
+			signal?.addEventListener('abort', handleAbort, { once: true });
+		}
+		try {
+			await barrier?.promise;
+		} finally {
+			if (!this.ignoreSubscribeAbort) {
+				signal?.removeEventListener('abort', handleAbort);
+			}
+		}
 		this.subscribedUris.push(uri);
 		if (uri.startsWith('ahp-session:')) {
 			return {
@@ -1379,6 +1562,13 @@ class FakeAhpTransport implements AhpConnection {
 				} as Snapshot,
 				subscription: this.queue(uri),
 			};
+		}
+		if (this.completeAfterChatSubscribe && uri.startsWith('ahp-chat:')) {
+			queueMicrotask(() => this.emitChat({
+				type: 'chat/turnComplete',
+				turnId: 'premature-turn',
+				duration: 0,
+			}));
 		}
 		return {
 			snapshot: {
@@ -1470,6 +1660,13 @@ class FakeAhpTransport implements AhpConnection {
 				clientSeq: sequence,
 			});
 		}
+		if (this.completeAfterTurnDispatch && record.type === 'chat/turnStarted') {
+			queueMicrotask(() => this.emitChat({
+				type: 'chat/turnComplete',
+				turnId: record.turnId,
+				duration: 0,
+			}));
+		}
 		return sequence;
 	}
 
@@ -1484,6 +1681,7 @@ class FakeAhpTransport implements AhpConnection {
 
 	async shutdown(): Promise<void> {
 		this.shutdownCalls += 1;
+		this.reconnectReject?.(new Error('connection shut down'));
 		for (const queue of this.queues.values()) {
 			queue.finish();
 		}

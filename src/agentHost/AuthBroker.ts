@@ -14,6 +14,7 @@ export interface AuthenticationRequest {
 	readonly resources: readonly ProtectedResource[];
 	readonly interactive: boolean;
 	readonly reason: 'initial' | 'challenge' | 'tokenInvalid';
+	readonly signal?: AbortSignal;
 }
 
 export interface AuthenticationMapping {
@@ -51,7 +52,9 @@ export class VscodeAuthBroker implements AuthBroker {
 		pushToken: (resource: string, token: string, scopes: readonly string[]) => Promise<void>,
 	): Promise<void> {
 		for (const resource of request.resources.filter(({ required }) => required !== false)) {
+			throwIfAborted(request.signal);
 			const mapping = await this.resolveProvider(resource);
+			throwIfAborted(request.signal);
 			if (mapping === undefined || mapping.providerId.length === 0) {
 				throw authRequired(resource, 'No VS Code authentication provider is configured for this protected resource.');
 			}
@@ -65,10 +68,12 @@ export class VscodeAuthBroker implements AuthBroker {
 					forceNewSession: presentation,
 				})
 				: await this.authentication.getSession(mapping.providerId, scopes, { silent: true });
+			throwIfAborted(request.signal);
 			if (session === undefined && request.interactive && request.reason === 'initial') {
 				session = await this.authentication.getSession(mapping.providerId, scopes, {
 					createIfNone: presentation,
 				});
+				throwIfAborted(request.signal);
 			}
 			if (session === undefined || session.accessToken.length === 0) {
 				throw authRequired(
@@ -86,6 +91,13 @@ export class VscodeAuthBroker implements AuthBroker {
 					'AGENT_AUTH_FAILED',
 					`The Agent Host rejected authentication for ${safeResourceName(resource)}.`,
 				);
+			}
+			throwIfAborted(request.signal);
+
+			function throwIfAborted(signal?: AbortSignal): void {
+				if (signal?.aborted === true) {
+					throw new DOMException('Authentication was aborted.', 'AbortError');
+				}
 			}
 		}
 	}
