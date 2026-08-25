@@ -143,9 +143,22 @@ export class AgentRuntimeLifecycle {
 			return this.disposal;
 		}
 		const runtime = this.runtime;
-		this.runtime = undefined;
-		this.disposal = runtime?.dispose() ?? Promise.resolve();
-		return this.disposal;
+		const operation = runtime?.dispose() ?? Promise.resolve();
+		const disposal = operation.then(
+			() => {
+				if (this.runtime === runtime) {
+					this.runtime = undefined;
+				}
+			},
+			(error: unknown) => {
+				if (this.disposal === disposal) {
+					this.disposal = undefined;
+				}
+				throw error;
+			},
+		);
+		this.disposal = disposal;
+		return disposal;
 	}
 }
 

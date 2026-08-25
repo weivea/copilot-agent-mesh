@@ -117,6 +117,7 @@ export class AhpEventMapper {
 					type: 'tool',
 					name: action.toolCallId,
 					status: action.result.success ? 'completed' : 'failed',
+					summary: optionalText(action.result.pastTenseMessage, 1_024),
 				}];
 			case 'chat/toolCallAuthRequired':
 				return this.mapToolAuthentication(envelope.channel, action);

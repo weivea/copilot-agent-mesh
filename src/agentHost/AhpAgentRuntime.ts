@@ -476,6 +476,20 @@ class AhpTask implements AgentTaskHandle {
 	private recoveryAbort: AbortController | undefined;
 	private recoveryPromise: Promise<void> | undefined;
 	private generation: ConnectionGeneration;
+	private subscriptionCleanup: Map<string, {
+		readonly subscription: AhpSubscription;
+		closed: boolean;
+		unsubscribed: boolean;
+	}> | undefined;
+	private terminalUpdatesSettled = false;
+	private sessionDisposed = false;
+	private connectionShutdown = false;
+	private hostDisposed = false;
+	private readonly shutdownConnections = new WeakSet<AhpConnection>();
+	private readonly connectionShutdownOperations = new WeakMap<AhpConnection, Promise<void>>();
+	private readonly deliveredResponsePartLengths = new Map<string, number>();
+	private readonly deliveredResponsePartStates = new Set<string>();
+	private readonly deliveredResponsePartOrdinals = new Map<string, number>();
 
 	constructor(
 		private readonly request: ResolvedAgentTaskRequest,
@@ -544,22 +558,29 @@ class AhpTask implements AgentTaskHandle {
 		this.throwIfTerminalError();
 
 		await this.ensureStartupSubscription(this.sessionUri);
-		const [_, defaultChat] = await Promise.all([
+		await Promise.all([
 			this.waitForReady(),
 			this.waitForDefaultChat(),
 		]);
 		this.throwIfTerminalError();
 		await this.waitForStartupRecovery();
-		this.chatUri = defaultChat;
-
-		await this.ensureStartupSubscription(defaultChat);
-		const generation = await this.waitForStartupRecovery();
-		await this.scheduleOwnedTerminals(this.rootTerminals, generation, true);
-		this.throwIfTerminalError();
+		let defaultChat: string;
+		while (true) {
+			defaultChat = await this.ensureStartupChatSubscription();
+			const generation = await this.waitForStartupRecovery();
+			await this.scheduleOwnedTerminals(this.rootTerminals, generation, true);
+			await this.waitForStartupRecovery();
+			this.throwIfTerminalError();
+			if (this.sessionDefaultChat === defaultChat && this.subscriptions.has(defaultChat)) {
+				break;
+			}
+			await this.releaseStartupSubscription(defaultChat);
+		}
 
 		this.turnId = randomUUID();
 		await this.waitForStartupRecovery();
 		this.throwIfTerminalError();
+		this.chatUri = defaultChat;
 		this.dispatchTracked(defaultChat, {
 			type: 'chat/turnStarted',
 			turnId: this.turnId,
@@ -569,11 +590,11 @@ class AhpTask implements AgentTaskHandle {
 				origin: { kind: 'user' },
 			},
 		});
-		this.throwIfTerminalError();
+		this.throwIfTerminalFailure();
 		await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
-		this.throwIfTerminalError();
+		this.throwIfTerminalFailure();
 		this.events.push({ type: 'progress', message: 'Agent turn started.' });
-		this.throwIfTerminalError();
+		this.throwIfTerminalFailure();
 	}
 
 	async cancel(): Promise<void> {
@@ -639,62 +660,96 @@ class AhpTask implements AgentTaskHandle {
 			clearTimeout(this.cancellationTimer);
 		}
 		this.exitSubscription?.dispose();
-		const failures: string[] = [];
-		try {
-			if (recovery !== undefined) {
-				await collectCleanupFailures([{
-					label: 'stop in-flight AHP recovery',
-					run: () => recovery,
-				}], failures);
-			}
-			await this.drainAuthNotificationsForDispose();
-			await collectCleanupFailures(
-				[...this.subscriptions].map(([uri, subscription]) => ({
-					label: `close subscription ${safeCleanupResource(uri)}`,
-					run: () => subscription.close(),
-				})),
-				failures,
-			);
-			await collectCleanupFailures(
-				[...this.subscriptions.keys()].map((uri) => ({
-					label: `unsubscribe ${safeCleanupResource(uri)}`,
-					run: () => this.connection.unsubscribe(uri),
-				})),
-				failures,
-			);
-			this.subscriptions.clear();
-			await collectCleanupFailures([
-				{ label: 'dispose AHP session', run: () => this.connection.disposeSession(this.sessionUri) },
-			], failures);
-			await collectCleanupFailures([
-				{ label: 'shutdown AHP connection', run: () => this.connection.shutdown() },
-			], failures);
+		this.events.close();
+		if (recovery !== undefined) {
+			await runCleanupPhase([{
+				label: 'stop in-flight AHP recovery',
+				run: () => recovery,
+			}]);
+		}
+		await this.drainAuthNotificationsForDispose();
+		if (!this.terminalUpdatesSettled) {
 			const terminalUpdates = this.terminalSubscriptionUpdates.get(this.connection);
 			if (terminalUpdates !== undefined) {
-				await collectCleanupFailures([{
+				await runCleanupPhase([{
 					label: 'settle terminal subscription updates',
 					run: () => terminalUpdates,
-				}], failures);
+				}]);
 			}
-			await collectCleanupFailures(
-				[...this.staleConnections].map((connection) => ({
-					label: 'shutdown stale AHP connection',
-					run: async () => {
-						await connection.shutdown();
-						this.staleConnections.delete(connection);
-					},
-				})),
-				failures,
-			);
-			await collectCleanupFailures([
-				{ label: 'dispose owned Agent Host', run: () => this.host.dispose() },
-			], failures);
-		} finally {
-			this.events.close();
+			this.terminalUpdatesSettled = true;
 		}
-		if (failures.length > 0) {
-			throw cleanupFailure(failures);
+
+		this.subscriptionCleanup ??= new Map([...this.subscriptions].map(([uri, subscription]) => [
+			uri,
+			{ subscription, closed: false, unsubscribed: this.shutdownConnections.has(this.connection) },
+		]));
+		await runCleanupPhase(
+			[...this.subscriptionCleanup]
+				.filter(([, state]) => !state.closed)
+				.map(([uri, state]) => ({
+						label: `close subscription ${safeCleanupResource(uri)}`,
+						run: async () => {
+							await state.subscription.close();
+							state.closed = true;
+						},
+					})),
+		);
+		await runCleanupPhase(
+			[...this.subscriptionCleanup]
+				.filter(([, state]) => !state.unsubscribed)
+				.map(([uri, state]) => ({
+						label: `unsubscribe ${safeCleanupResource(uri)}`,
+						run: async () => {
+							await this.connection.unsubscribe(uri);
+							state.unsubscribed = true;
+						},
+					})),
+		);
+		this.subscriptions.clear();
+
+		if (!this.sessionDisposed && this.shutdownConnections.has(this.connection)) {
+			this.sessionDisposed = true;
 		}
+		if (!this.sessionDisposed) {
+			await runCleanupPhase([{
+				label: 'dispose AHP session',
+				run: async () => {
+					await this.connection.disposeSession(this.sessionUri);
+					this.sessionDisposed = true;
+				},
+			}]);
+		}
+		const detachedCleanup: CleanupOperation[] = [];
+		if (!this.connectionShutdown && this.shutdownConnections.has(this.connection)) {
+			this.connectionShutdown = true;
+		}
+		if (!this.connectionShutdown) {
+			detachedCleanup.push({
+				label: 'shutdown AHP connection',
+				run: async () => {
+					await this.shutdownConnection(this.connection);
+					this.connectionShutdown = true;
+				},
+			});
+		}
+		detachedCleanup.push(
+			...[...this.staleConnections].map((connection) => ({
+				label: 'shutdown stale AHP connection',
+				run: async () => {
+					await this.shutdownConnection(connection);
+				},
+			})),
+		);
+		if (!this.hostDisposed) {
+			detachedCleanup.push({
+				label: 'dispose owned Agent Host',
+				run: async () => {
+					await this.host.dispose();
+					this.hostDisposed = true;
+				},
+			});
+		}
+		await runCleanupPhase(detachedCleanup);
 		this.didDispose();
 	}
 
@@ -858,17 +913,13 @@ class AhpTask implements AgentTaskHandle {
 		}
 	}
 
-	private addSubscription(uri: string, subscription: AhpSubscription): void {
-		this.subscriptions.set(uri, subscription);
-		this.startSubscription(uri, subscription, this.generation);
-	}
-
 	private async ensureStartupSubscription(uri: string): Promise<void> {
 		while (true) {
 			const generation = await this.waitForStartupRecovery();
 			if (generation.subscriptions.has(uri)) {
 				return;
 			}
+
 			let result: { readonly snapshot?: Snapshot; readonly subscription: AhpSubscription };
 			try {
 				result = await generation.connection.subscribe(uri, generation.abort.signal);
@@ -898,6 +949,26 @@ class AhpTask implements AgentTaskHandle {
 			this.startSubscription(uri, result.subscription, generation);
 			return;
 		}
+	}
+
+	private async ensureStartupChatSubscription(): Promise<string> {
+		const defaultChat = this.sessionDefaultChat;
+		if (defaultChat === undefined) {
+			throw new AgentRuntimeError('TASK_EXECUTION_FAILED', 'The recovered Agent Host Session has no default Chat.');
+		}
+		await this.ensureStartupSubscription(defaultChat);
+		return defaultChat;
+	}
+
+	private async releaseStartupSubscription(uri: string): Promise<void> {
+		const generation = await this.waitForStartupRecovery();
+		const subscription = generation.subscriptions.get(uri);
+		if (subscription === undefined) {
+			return;
+		}
+		generation.subscriptions.delete(uri);
+		await subscription.close();
+		await generation.connection.unsubscribe(uri);
 	}
 
 	private async waitForStartupRecovery(): Promise<ConnectionGeneration> {
@@ -938,7 +1009,7 @@ class AhpTask implements AgentTaskHandle {
 				if (event.type === 'action') {
 					this.handleEnvelope(event.params as ActionEnvelope);
 				} else {
-					this.trackAuthNotification(event.params, generation.connection);
+					this.trackAuthNotification(event.params, generation);
 				}
 			}
 			if (
@@ -1008,7 +1079,66 @@ class AhpTask implements AgentTaskHandle {
 				this.defaultChatResolve?.(action.defaultChat);
 			}
 		}
+		this.trackDeliveredResponseAction(action);
 		this.emitMappedEvents(this.mapper.map(envelope));
+	}
+
+	private trackDeliveredResponseAction(action: ActionEnvelope['action']): void {
+		if ((action.type === 'chat/delta' || action.type === 'chat/reasoning') && typeof action.partId === 'string') {
+			this.deliveredResponsePartLengths.set(
+				action.partId,
+				(this.deliveredResponsePartLengths.get(action.partId) ?? 0) + action.content.length,
+			);
+			return;
+		}
+		if (action.type === 'chat/responsePart') {
+			this.trackDeliveredResponsePart(action.part);
+			return;
+		}
+		if (action.type === 'chat/inputRequested') {
+			this.deliveredResponsePartStates.add(`input:${action.request.id}`);
+			return;
+		}
+		if ('toolCallId' in action && typeof action.toolCallId === 'string') {
+			const status = action.type === 'chat/toolCallStart'
+				? 'streaming'
+				: action.type === 'chat/toolCallReady'
+					? action.confirmed === undefined ? 'pending-confirmation' : 'running'
+					: action.type === 'chat/toolCallAuthRequired'
+						? 'auth-required'
+						: action.type === 'chat/toolCallComplete'
+							? action.requiresResultConfirmation === true ? 'pending-result-confirmation' : 'completed'
+							: undefined;
+			if (status !== undefined) {
+				this.deliveredResponsePartStates.add(`tool:${action.toolCallId}:${status}`);
+			}
+		}
+	}
+
+	private trackDeliveredResponsePart(value: unknown): void {
+		if (!isRecord(value)) {
+			return;
+		}
+		if (
+			(value.kind === 'markdown' || value.kind === 'reasoning')
+			&& typeof value.id === 'string'
+			&& typeof value.content === 'string'
+		) {
+			this.deliveredResponsePartLengths.set(value.id, value.content.length);
+			return;
+		}
+		const identity = responsePartIdentity(value);
+		if (identity !== undefined) {
+			this.deliveredResponsePartStates.add(identity);
+			return;
+		}
+		const ordinalIdentity = responsePartOrdinalIdentity(value);
+		if (ordinalIdentity !== undefined) {
+			this.deliveredResponsePartOrdinals.set(
+				ordinalIdentity,
+				(this.deliveredResponsePartOrdinals.get(ordinalIdentity) ?? 0) + 1,
+			);
+		}
 	}
 
 	private emitMappedEvents(events: readonly AgentRuntimeEvent[]): void {
@@ -1064,9 +1194,7 @@ class AhpTask implements AgentTaskHandle {
 		}
 		const activeTurn = isRecord(value.activeTurn) ? value.activeTurn : undefined;
 		if (activeTurn !== undefined && activeTurn.id === this.turnId && Array.isArray(activeTurn.responseParts)) {
-			for (const part of activeTurn.responseParts) {
-				this.restorePendingResponsePart(chatUri, part);
-			}
+			this.restoreResponseParts(chatUri, activeTurn.responseParts);
 			return;
 		}
 		if (!Array.isArray(value.turns)) {
@@ -1077,6 +1205,9 @@ class AhpTask implements AgentTaskHandle {
 		);
 		if (!isRecord(turn)) {
 			return;
+		}
+		if (Array.isArray(turn.responseParts)) {
+			this.restoreResponseParts(chatUri, turn.responseParts);
 		}
 		if (turn.state === 'complete') {
 			this.emitMappedEvents([{ type: 'completed' }]);
@@ -1093,10 +1224,68 @@ class AhpTask implements AgentTaskHandle {
 		}
 	}
 
-	private restorePendingResponsePart(chatUri: string, value: unknown): void {
+	private restoreResponseParts(chatUri: string, parts: readonly unknown[]): void {
+		const snapshotOrdinals = new Map<string, number>();
+		for (let index = 0; index < parts.length; index += 1) {
+			const part = parts[index];
+			const ordinalIdentity = isRecord(part) ? responsePartOrdinalIdentity(part) : undefined;
+			const ordinal = ordinalIdentity === undefined
+				? undefined
+				: (snapshotOrdinals.get(ordinalIdentity) ?? 0) + 1;
+			if (ordinalIdentity !== undefined && ordinal !== undefined) {
+				snapshotOrdinals.set(ordinalIdentity, ordinal);
+			}
+			this.restoreResponsePart(chatUri, part, index, ordinalIdentity, ordinal);
+		}
+	}
+
+	private restoreResponsePart(
+		chatUri: string,
+		value: unknown,
+		index: number,
+		ordinalIdentity?: string,
+		ordinal?: number,
+	): void {
 		if (!isRecord(value)) {
 			return;
 		}
+		if (
+			(value.kind === 'markdown' || value.kind === 'reasoning')
+			&& typeof value.id === 'string'
+			&& typeof value.content === 'string'
+		) {
+			const deliveredLength = this.deliveredResponsePartLengths.get(value.id) ?? 0;
+			const content = deliveredLength <= value.content.length
+				? value.content.slice(deliveredLength)
+				: value.content;
+			this.deliveredResponsePartLengths.set(value.id, value.content.length);
+			if (content.length > 0) {
+				this.emitMappedEvents([value.kind === 'markdown'
+					? { type: 'output', text: content }
+					: { type: 'progress', message: content }]);
+			}
+			return;
+		}
+		if (ordinalIdentity !== undefined && ordinal !== undefined) {
+			if ((this.deliveredResponsePartOrdinals.get(ordinalIdentity) ?? 0) >= ordinal) {
+				return;
+			}
+			this.deliveredResponsePartOrdinals.set(ordinalIdentity, ordinal);
+		}
+		const identity = responsePartIdentity(value)
+			?? (ordinalIdentity === undefined ? `snapshot:${this.turnId ?? 'unknown'}:${index}` : undefined);
+		if (identity === undefined) {
+			this.emitMappedEvents(this.mapper.map(envelopeFromSnapshot(chatUri, {
+				type: 'chat/responsePart',
+				turnId: this.turnId,
+				part: value,
+			}, this.lastSeenServerSeq)));
+			return;
+		}
+		if (this.deliveredResponsePartStates.has(identity)) {
+			return;
+		}
+		this.deliveredResponsePartStates.add(identity);
 		if (value.kind === 'inputRequest' && isRecord(value.request) && value.response === undefined) {
 			this.handleEnvelope(envelopeFromSnapshot(chatUri, {
 				type: 'chat/inputRequested',
@@ -1105,6 +1294,11 @@ class AhpTask implements AgentTaskHandle {
 			return;
 		}
 		if (value.kind !== 'toolCall' || !isRecord(value.toolCall)) {
+			this.emitMappedEvents(this.mapper.map(envelopeFromSnapshot(chatUri, {
+				type: 'chat/responsePart',
+				turnId: this.turnId,
+				part: value,
+			}, this.lastSeenServerSeq)));
 			return;
 		}
 		const tool = value.toolCall;
@@ -1136,6 +1330,28 @@ class AhpTask implements AgentTaskHandle {
 				type: 'chat/toolCallAuthRequired',
 				...common,
 				auth: tool.auth,
+			}, this.lastSeenServerSeq));
+		} else if (tool.status === 'completed') {
+			this.handleEnvelope(envelopeFromSnapshot(chatUri, {
+				type: 'chat/toolCallComplete',
+				...common,
+				result: {
+					success: tool.success,
+					pastTenseMessage: tool.pastTenseMessage,
+					content: tool.content,
+					structuredContent: tool.structuredContent,
+					error: tool.error,
+				},
+				requiresResultConfirmation: false,
+			}, this.lastSeenServerSeq));
+		} else if (tool.status === 'streaming' || tool.status === 'running') {
+			this.handleEnvelope(envelopeFromSnapshot(chatUri, {
+				type: 'chat/toolCallStart',
+				...common,
+				toolName: tool.toolName,
+				displayName: tool.displayName,
+				intention: tool.intention,
+				contributor: tool.contributor,
 			}, this.lastSeenServerSeq));
 		}
 	}
@@ -1247,7 +1463,7 @@ class AhpTask implements AgentTaskHandle {
 		}
 	}
 
-	private async handleAuthNotification(params: unknown, connection: AhpConnection): Promise<void> {
+	private async handleAuthNotification(params: unknown, generation: ConnectionGeneration): Promise<void> {
 		const resources = readResourcesFromNotification(params);
 		if (resources.length === 0) {
 			return;
@@ -1257,17 +1473,18 @@ class AhpTask implements AgentTaskHandle {
 				resources,
 				'tokenInvalid',
 				this.request.allowInteractiveAuthentication === true,
-				connection,
+				generation.connection,
+				AbortSignal.any([this.authenticationAbort.signal, generation.abort.signal]),
 			);
 		} catch (error) {
-			if (connection === this.connection && !this.recovering) {
+			if (this.isCurrentGeneration(generation) && !this.recovering) {
 				this.fail(normalizeRuntimeError(error));
 			}
 		}
 	}
 
-	private trackAuthNotification(params: unknown, connection: AhpConnection): void {
-		const operation = this.handleAuthNotification(params, connection);
+	private trackAuthNotification(params: unknown, generation: ConnectionGeneration): void {
+		const operation = this.handleAuthNotification(params, generation);
 		this.pendingAuthNotifications.add(operation);
 		const clear = () => this.pendingAuthNotifications.delete(operation);
 		void operation.then(clear, clear);
@@ -1283,6 +1500,27 @@ class AhpTask implements AgentTaskHandle {
 		while (this.pendingAuthNotifications.size > 0) {
 			await Promise.allSettled([...this.pendingAuthNotifications]);
 		}
+	}
+
+	private shutdownConnection(connection: AhpConnection): Promise<void> {
+		if (this.shutdownConnections.has(connection)) {
+			return Promise.resolve();
+		}
+		const existing = this.connectionShutdownOperations.get(connection);
+		if (existing !== undefined) {
+			return existing;
+		}
+		const operation = connection.shutdown().then(() => {
+			this.shutdownConnections.add(connection);
+			this.staleConnections.delete(connection);
+		});
+		this.connectionShutdownOperations.set(connection, operation);
+		void operation.finally(() => {
+			if (this.connectionShutdownOperations.get(connection) === operation) {
+				this.connectionShutdownOperations.delete(connection);
+			}
+		}).catch(() => undefined);
+		return operation;
 	}
 
 	private startRecovery(): void {
@@ -1310,7 +1548,8 @@ class AhpTask implements AgentTaskHandle {
 		const previousGeneration = this.generation;
 		previousGeneration.valid = false;
 		previousGeneration.abort.abort();
-		const previousShutdown = previousConnection.shutdown();
+		this.staleConnections.add(previousConnection);
+		const previousShutdown = this.shutdownConnection(previousConnection);
 		void previousShutdown.catch(() => undefined);
 		let candidate: AhpConnection | undefined;
 		let candidateGeneration: ConnectionGeneration | undefined;
@@ -1508,6 +1747,15 @@ class AhpTask implements AgentTaskHandle {
 		}
 	}
 
+	private throwIfTerminalFailure(): void {
+		if (this.terminalError !== undefined) {
+			throw this.terminalError;
+		}
+		if (this.disposed) {
+			throw new AgentRuntimeError('TASK_EXECUTION_FAILED', 'The Agent Host task stopped during startup.');
+		}
+	}
+
 	private fail(error: AgentRuntimeError): void {
 		if (this.terminal || this.disposed) {
 			return;
@@ -1678,6 +1926,14 @@ async function collectCleanupFailures(
 	}
 }
 
+async function runCleanupPhase(operations: readonly CleanupOperation[]): Promise<void> {
+	const failures: string[] = [];
+	await collectCleanupFailures(operations, failures);
+	if (failures.length > 0) {
+		throw cleanupFailure(failures);
+	}
+}
+
 function cleanupFailure(failures: readonly string[]): AgentRuntimeError {
 	const unique = [...new Set(failures)];
 	return new AgentRuntimeError(
@@ -1711,6 +1967,26 @@ function safeCleanupResource(uri: string): string {
 	}
 	const scheme = uri.match(/^ahp-([a-z]+):/u)?.[1];
 	return scheme === undefined ? 'resource' : scheme;
+}
+
+function responsePartIdentity(part: Readonly<Record<string, unknown>>): string | undefined {
+	if (part.kind === 'toolCall' && isRecord(part.toolCall) && typeof part.toolCall.toolCallId === 'string') {
+		return `tool:${part.toolCall.toolCallId}:${String(part.toolCall.status)}`;
+	}
+	if (part.kind === 'inputRequest' && isRecord(part.request) && typeof part.request.id === 'string') {
+		return `input:${part.request.id}`;
+	}
+	return undefined;
+}
+
+function responsePartOrdinalIdentity(part: Readonly<Record<string, unknown>>): string | undefined {
+	if (part.kind === 'systemNotification') {
+		return `system:${JSON.stringify(part.content)}`;
+	}
+	if (part.kind === 'contentRef') {
+		return `content-ref:${JSON.stringify(part)}`;
+	}
+	return undefined;
 }
 
 function normalizeRuntimeError(error: unknown): AgentRuntimeError {

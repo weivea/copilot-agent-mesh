@@ -41,6 +41,7 @@ import {
 	type AuthBroker,
 	type ProtectedResource,
 } from '../agentHost/AuthBroker';
+import { OwnedCommandError } from '../spikes/ownedProcess';
 
 const workspaceUri = 'file:///tmp/copilot-agent-mesh-safe-workspace';
 const protectedResource = {
@@ -78,6 +79,29 @@ test('runtime lifecycle awaits detached asynchronous cleanup and shares the same
 	releaseCleanup?.();
 	await first;
 	assert.equal(cleanupFinished, true);
+});
+
+test('runtime lifecycle restores failed cleanup ownership and retries disposal', async () => {
+	const lifecycle = new AgentRuntimeLifecycle();
+	let attempts = 0;
+	lifecycle.track({
+		probe: async () => ({ available: false, featureEnabled: false }),
+		start: async () => { throw new Error('not used'); },
+		dispose: async () => {
+			attempts += 1;
+			if (attempts === 1) {
+				throw new Error('synthetic cleanup failure');
+			}
+		},
+	});
+
+	const failed = lifecycle.dispose();
+	await assert.rejects(failed, /synthetic cleanup failure/u);
+	const retry = lifecycle.dispose();
+	assert.notEqual(retry, failed);
+	await retry;
+	assert.equal(attempts, 2);
+	assert.equal(lifecycle.dispose(), retry);
 });
 
 test('owned Agent Host retains cleanup ownership after termination failure and retries safely', async () => {
@@ -230,6 +254,30 @@ if (args[0] === '--version') {
 		await launcher.dispose();
 		await rm(root, { recursive: true, force: true });
 	}
+});
+
+test('launcher retains auxiliary command cleanup ownership after discovery cleanup fails', async () => {
+	let terminationAttempts = 0;
+	const launcher = new AgentHostLauncher({
+		storageRoot: '/tmp/not-used',
+		configuredCodeCli: '/fake/code',
+	}, {
+		runCommand: async () => {
+			throw new OwnedCommandError('synthetic command cleanup failure', 424242, true);
+		},
+		terminate: async (processGroupId) => {
+			assert.equal(processGroupId, 424242);
+			terminationAttempts += 1;
+			if (terminationAttempts === 1) {
+				throw new Error('synthetic retained cleanup failure');
+			}
+		},
+	});
+
+	assert.deepEqual(await launcher.probe(), { available: false });
+	await assert.rejects(launcher.dispose(), AgentRuntimeError);
+	await launcher.dispose();
+	assert.equal(terminationAttempts, 2);
 });
 
 test('production runtime initializes, authenticates, resolves config, runs a turn, answers input, and cancels', async () => {
@@ -437,9 +485,10 @@ test('start failure cleans the task, AHP connection, and owned host without losi
 	assert.equal(transport.shutdownCalls, 1);
 	assert.equal(launcher.host.disposed, true);
 
+	transport.shutdownFails = false;
 	await runtime.dispose();
 	assert.equal(transport.disposeSessionCalls, 1);
-	assert.equal(transport.shutdownCalls, 1);
+	assert.equal(transport.shutdownCalls, 2);
 });
 
 test('connection failure cleans the detached owned host before surfacing startup failure', async () => {
@@ -471,6 +520,61 @@ test('root connection loss before Session creation fails startup instead of ente
 	assert.equal(transport.shutdownCalls, 1);
 });
 
+test('startup resumes Session and Chat subscription on the recovered generation', async () => {
+	const first = new FakeAhpTransport();
+	first.blockSessionSubscriptions = true;
+	const recovered = new FakeAhpTransport();
+	recovered.sessionDefaultChat = 'ahp-chat:/recovered';
+	const launcher = new FakeLauncher();
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([first, recovered]));
+	const started = runtime.start(taskRequest());
+	await waitForCondition(() => first.subscribeAttempts.some((uri) => uri.startsWith('ahp-session:')));
+	const sessionUri = first.subscribeAttempts.find((uri) => uri.startsWith('ahp-session:'))!;
+	recovered.created = first.created;
+	recovered.reconnectResult = {
+		type: 'replay',
+		actions: [envelope(sessionUri, {
+			type: 'session/defaultChatChanged',
+			defaultChat: 'ahp-chat:/recovered',
+		}, 5)],
+		missing: [],
+	};
+	first.failRoot();
+
+	const handle = await started;
+	assert.equal(first.dispatched.length, 0);
+	assert.equal(recovered.subscribedUris.includes(sessionUri), true);
+	assert.equal(recovered.subscribedUris.includes('ahp-chat:/recovered'), true);
+	assert.equal(recovered.dispatched[0]?.channel, 'ahp-chat:/recovered');
+	assert.equal(recovered.dispatched[0]?.action.type, 'chat/turnStarted');
+	await handle.dispose();
+});
+
+test('startup follows a changed default Chat when recovery occurs during Chat subscription', async () => {
+	const first = new FakeAhpTransport();
+	first.blockSubscribe('ahp-chat:/default');
+	const recovered = new FakeAhpTransport();
+	const runtime = createRuntime(new FakeLauncher(), new FakeConnectionFactory([first, recovered]));
+	const started = runtime.start(taskRequest());
+	await waitForCondition(() => first.subscribeAttempts.includes('ahp-chat:/default'));
+	recovered.created = first.created;
+	recovered.reconnectResult = {
+		type: 'replay',
+		actions: [envelope(first.created!.sessionUri, {
+			type: 'session/defaultChatChanged',
+			defaultChat: 'ahp-chat:/recovered',
+		}, 5)],
+		missing: [],
+	};
+	first.failRoot();
+
+	const handle = await started;
+	assert.equal(recovered.unsubscribedUris.includes('ahp-chat:/default'), true);
+	assert.equal(recovered.subscribedUris.includes('ahp-chat:/recovered'), true);
+	assert.equal(recovered.dispatched[0]?.channel, 'ahp-chat:/recovered');
+	await handle.dispose();
+});
+
 test('startup never dispatches a turn or returns a handle after the task becomes terminal', async () => {
 	const transport = new FakeAhpTransport();
 	transport.completeAfterChatSubscribe = true;
@@ -491,11 +595,10 @@ test('startup observes terminal actions delivered immediately after turn dispatc
 	const launcher = new FakeLauncher();
 	const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
 
-	await assert.rejects(
-		runtime.start(taskRequest()),
-		(error: unknown) => error instanceof AgentRuntimeError && error.code === 'TASK_EXECUTION_FAILED',
-	);
+	const handle = await runtime.start(taskRequest());
+	assert.deepEqual(await nextEvent(handle.events), { type: 'completed' });
 	assert.equal(transport.dispatched.length, 1);
+	await handle.dispose();
 	assert.equal(launcher.host.disposed, true);
 });
 
@@ -533,12 +636,18 @@ test('runtime reconnects with the recovery descriptor and fails truthfully on ho
 	const handle = await runtime.start(taskRequest());
 	await nextEvent(handle.events);
 	recovered.created = first.created;
+	const recoveryBeforeLoss = handle.recovery;
 
 	first.failChat();
 	assert.deepEqual(await nextEvent(handle.events), { type: 'progress', message: 'Reconnecting to Agent Host.' });
 	assert.deepEqual(await nextEvent(handle.events), { type: 'output', text: 'replayed' });
 	assert.deepEqual(await nextEvent(handle.events), { type: 'progress', message: 'Agent Host connection recovered.' });
 	assert.equal(handle.recovery.lastSeenServerSeq, 9);
+	assert.deepEqual(recovered.reconnectRequests, [{
+		clientId: recoveryBeforeLoss.clientId,
+		lastSeenServerSeq: recoveryBeforeLoss.lastSeenServerSeq,
+		subscriptions: ['ahp-root://', recoveryBeforeLoss.sessionUri, recoveryBeforeLoss.chatUri],
+	}]);
 
 	launcher.host.crash();
 	const failed = await nextEvent(handle.events);
@@ -636,7 +745,7 @@ test('recovery resends unacknowledged turn and input actions with their original
 	first.failChat();
 	assert.equal((await nextEvent(handle.events)).type, 'progress');
 	assert.equal((await nextEvent(handle.events)).type, 'progress');
-	assert.deepEqual(recovered.dispatched.map(({ clientSeq }) => clientSeq), [1, 2]);
+	assert.deepEqual(recovered.dispatched, first.dispatched);
 	recovered.emitChat({
 		type: 'chat/delta',
 		turnId: 'turn-1',
@@ -677,8 +786,7 @@ test('recovery resends unacknowledged cancellation and rejects writes until cand
 	);
 	recovered.releaseReconnect();
 	await waitForCondition(() => recovered.dispatched.length === 1);
-	assert.equal(recovered.dispatched[0]?.action.type, 'chat/turnCancelled');
-	assert.equal(recovered.dispatched[0]?.clientSeq, first.dispatched.at(-1)?.clientSeq);
+	assert.deepEqual(recovered.dispatched[0], first.dispatched.at(-1));
 	await handle.dispose();
 });
 
@@ -899,6 +1007,23 @@ test('dispose cancels and awaits terminal subscription updates and cleans a late
 	assert.equal(launcher.host.disposed, true);
 });
 
+test('runtime disposal can be retried after cleanup failure and retains task ownership', async () => {
+	const transport = new FakeAhpTransport();
+	const launcher = new FakeLauncher();
+	launcher.host.disposeFailuresRemaining = 2;
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+
+	await assert.rejects(runtime.dispose(), AgentRuntimeError);
+	assert.equal(launcher.host.disposed, false);
+	await runtime.dispose();
+	assert.equal(launcher.host.disposed, true);
+	assert.equal(transport.disposeSessionCalls, 1);
+	assert.equal(transport.shutdownCalls, 1);
+	await handle.dispose();
+});
+
 test('authentication deduplication is scoped to each AHP connection', async () => {
 	const first = new FakeAhpTransport();
 	const recovered = new FakeAhpTransport();
@@ -919,6 +1044,8 @@ test('authentication deduplication is scoped to each AHP connection', async () =
 	assert.equal((await nextEvent(handle.events)).type, 'progress');
 	assert.equal((await nextEvent(handle.events)).type, 'progress');
 	assert.equal(broker.requests.length, 3);
+	assert.equal(first.authenticated.length, 1);
+	assert.equal(recovered.authenticated.length, 1);
 	broker.rejectBlocked(new AgentRuntimeError('AGENT_AUTH_REQUIRED', 'The stale connection rejected authentication.'));
 	recovered.emitChat({
 		type: 'chat/delta',
@@ -927,6 +1054,8 @@ test('authentication deduplication is scoped to each AHP connection', async () =
 		content: 'recovered',
 	});
 	assert.equal((await nextEvent(handle.events)).type, 'output');
+	assert.equal(first.authenticated.length, 1);
+	assert.equal(recovered.authenticated.length, 1);
 	await handle.dispose();
 });
 
@@ -954,7 +1083,7 @@ for (const authCode of ['AGENT_AUTH_REQUIRED', 'AGENT_AUTH_FAILED'] as const) {
 	});
 }
 
-test('runtime iterates dependent session config and restores completion from a reconnect snapshot', async () => {
+test('runtime restores undelivered response parts and completion from a reconnect snapshot', async () => {
 	const first = new FakeAhpTransport();
 	first.iterativeConfig = true;
 	const recovered = new FakeAhpTransport();
@@ -981,6 +1110,26 @@ test('runtime iterates dependent session config and restores completion from a r
 
 	const turnId = first.dispatched[0]?.action.turnId;
 	assert.equal(typeof turnId, 'string');
+	first.emitChat({
+		type: 'chat/delta',
+		turnId,
+		partId: 'answer',
+		content: 'Hello ',
+	});
+	assert.deepEqual(await nextEvent(handle.events), { type: 'output', text: 'Hello ' });
+	first.emitChat({
+		type: 'chat/reasoning',
+		turnId,
+		partId: 'reason',
+		content: 'think',
+	});
+	assert.deepEqual(await nextEvent(handle.events), { type: 'progress', message: 'think' });
+	first.emitChat({
+		type: 'chat/responsePart',
+		turnId,
+		part: { kind: 'systemNotification', content: 'already shown' },
+	});
+	assert.deepEqual(await nextEvent(handle.events), { type: 'output', text: 'already shown' });
 	recovered.created = first.created;
 	recovered.reconnectResult = {
 		type: 'snapshot',
@@ -1025,7 +1174,27 @@ test('runtime iterates dependent session config and restores completion from a r
 				turns: [{
 					id: turnId,
 					message: { text: 'safe', origin: { kind: 'user' } },
-					responseParts: [],
+					responseParts: [
+						{ kind: 'markdown', id: 'answer', content: 'Hello world' },
+						{ kind: 'reasoning', id: 'reason', content: 'thinking' },
+						{ kind: 'systemNotification', content: 'already shown' },
+						{ kind: 'systemNotification', content: 'already shown' },
+						{ kind: 'systemNotification', content: 'done notice' },
+						{
+							kind: 'toolCall',
+							toolCall: {
+								toolCallId: 'tool-recovered',
+								toolName: 'safe_tool',
+								displayName: 'Safe tool',
+								status: 'completed',
+								invocationMessage: 'Run safe tool',
+								confirmed: 'not-needed',
+								success: true,
+								pastTenseMessage: 'Ran safe tool',
+								content: [],
+							},
+						},
+					],
 					usage: undefined,
 					state: 'complete',
 				}],
@@ -1035,7 +1204,17 @@ test('runtime iterates dependent session config and restores completion from a r
 	};
 	first.failChat();
 	assert.equal((await nextEvent(handle.events)).type, 'progress');
-	assert.equal((await nextEvent(handle.events)).type, 'completed');
+	assert.deepEqual(await nextEvent(handle.events), { type: 'output', text: 'world' });
+	assert.deepEqual(await nextEvent(handle.events), { type: 'progress', message: 'ing' });
+	assert.deepEqual(await nextEvent(handle.events), { type: 'output', text: 'already shown' });
+	assert.deepEqual(await nextEvent(handle.events), { type: 'output', text: 'done notice' });
+	assert.deepEqual(await nextEvent(handle.events), {
+		type: 'tool',
+		name: 'tool-recovered',
+		status: 'completed',
+		summary: 'Ran safe tool',
+	});
+	assert.deepEqual(await nextEvent(handle.events), { type: 'completed' });
 	await handle.dispose();
 });
 
@@ -1409,6 +1588,11 @@ class BlockingConnectionAuthBroker implements AuthBroker {
 			await new Promise<void>((resolve, reject) => {
 				this.release = resolve;
 				this.reject = reject;
+				request.signal?.addEventListener(
+					'abort',
+					() => reject(new DOMException('Stale authentication aborted.', 'AbortError')),
+					{ once: true },
+				);
 			});
 		}
 
@@ -1498,6 +1682,7 @@ class FakeHost implements LaunchedAgentHost {
 	readonly version = '1.134.0';
 	readonly registryProtocolVersion = '0.1.0';
 	disposed = false;
+	disposeFailuresRemaining = 0;
 	private listeners = new Set<(error: AgentRuntimeError) => void>();
 
 	onExit(listener: (error: AgentRuntimeError) => void): { dispose(): void } {
@@ -1512,6 +1697,10 @@ class FakeHost implements LaunchedAgentHost {
 	}
 
 	async dispose(): Promise<void> {
+		if (this.disposeFailuresRemaining > 0) {
+			this.disposeFailuresRemaining -= 1;
+			throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'Synthetic host cleanup failure.', false, undefined, true);
+		}
 		this.disposed = true;
 	}
 }
@@ -1547,11 +1736,18 @@ class FakeAhpTransport implements AhpConnection {
 		type: 'snapshot',
 		snapshots: [],
 	};
+	readonly reconnectRequests: Array<{
+		readonly clientId: string;
+		readonly lastSeenServerSeq: number;
+		readonly subscriptions: readonly string[];
+	}> = [];
 	iterativeConfig = false;
 	completeAfterChatSubscribe = false;
 	completeAfterTurnDispatch = false;
 	ignoreSubscribeAbort = false;
 	sessionStartsPending = false;
+	sessionDefaultChat = 'ahp-chat:/default';
+	blockSessionSubscriptions = false;
 	notificationDuringInitialize: readonly ProtectedResource[] = [];
 	rootAttachedBeforeInitialize = false;
 	disposeSessionCalls = 0;
@@ -1573,8 +1769,10 @@ class FakeAhpTransport implements AhpConnection {
 		readonly reject: (error: Error) => void;
 	}>();
 	readonly subscribeAttempts: string[] = [];
+	private shutdownComplete = false;
 
 	async initialize(clientId: string): Promise<Awaited<ReturnType<AhpConnection['initialize']>>> {
+		this.assertOpen();
 		this.initialized = true;
 		this.initializedClientId = clientId;
 		this.rootAttachedBeforeInitialize = this.attachedUris.has('ahp-root://');
@@ -1604,8 +1802,14 @@ class FakeAhpTransport implements AhpConnection {
 		};
 	}
 
-	async reconnect(clientId: string): Promise<Awaited<ReturnType<AhpConnection['reconnect']>>> {
+	async reconnect(
+		clientId: string,
+		lastSeenServerSeq: number,
+		subscriptions: readonly string[],
+	): Promise<Awaited<ReturnType<AhpConnection['reconnect']>>> {
+		this.assertOpen();
 		this.initializedClientId = clientId;
+		this.reconnectRequests.push({ clientId, lastSeenServerSeq, subscriptions: [...subscriptions] });
 		await this.reconnectBarrier;
 		return this.reconnectResult;
 	}
@@ -1643,6 +1847,7 @@ class FakeAhpTransport implements AhpConnection {
 	}
 
 	attachSubscription(uri: string): AhpSubscription {
+		this.assertOpen();
 		this.attachedUris.add(uri);
 		return this.queue(uri);
 	}
@@ -1651,7 +1856,11 @@ class FakeAhpTransport implements AhpConnection {
 		readonly snapshot?: Snapshot;
 		readonly subscription: AhpSubscription;
 	}> {
+		this.assertOpen();
 		this.subscribeAttempts.push(uri);
+		if (this.blockSessionSubscriptions && uri.startsWith('ahp-session:') && !this.subscribeBarriers.has(uri)) {
+			this.blockSubscribe(uri);
+		}
 		const barrier = this.subscribeBarriers.get(uri);
 		const handleAbort = () => barrier?.reject(new DOMException('Subscription aborted.', 'AbortError'));
 		if (!this.ignoreSubscribeAbort) {
@@ -1678,7 +1887,7 @@ class FakeAhpTransport implements AhpConnection {
 						lifecycle: this.sessionStartsPending ? 'creating' : 'ready',
 						activeClients: [],
 						chats: [],
-						defaultChat: this.sessionStartsPending ? undefined : 'ahp-chat:/default',
+						defaultChat: this.sessionStartsPending ? undefined : this.sessionDefaultChat,
 					},
 				} as Snapshot,
 				subscription: this.queue(uri),
@@ -1708,6 +1917,7 @@ class FakeAhpTransport implements AhpConnection {
 	}
 
 	async authenticate(resource: string, token: string, scopes: readonly string[]): Promise<void> {
+		this.assertOpen();
 		this.authenticated.push({ resource, token, scopes });
 	}
 
@@ -1716,6 +1926,7 @@ class FakeAhpTransport implements AhpConnection {
 		_workingDirectory: string,
 		config: Readonly<Record<string, unknown>>,
 	): Promise<{ readonly schema: SessionConfigSchema; readonly values: Record<string, unknown> }> {
+		this.assertOpen();
 		this.resolveConfigCalls += 1;
 		if (this.failRootDuringConfig) {
 			this.failRootDuringConfig = false;
@@ -1763,19 +1974,23 @@ class FakeAhpTransport implements AhpConnection {
 		_property: string,
 		query: string,
 	): Promise<readonly { readonly value: string; readonly label: string }[]> {
+		this.assertOpen();
 		this.completionQueries.push(query);
 		return [{ value: 'test-model', label: 'Test Model' }];
 	}
 
 	async createSession(params: NonNullable<FakeAhpTransport['created']>): Promise<void> {
+		this.assertOpen();
 		this.created = params;
 	}
 
 	async listSessions(): Promise<readonly { readonly resource: string }[]> {
+		this.assertOpen();
 		return this.created === undefined ? [] : [{ resource: this.created.sessionUri }];
 	}
 
 	dispatch(channel: string, action: unknown, clientSeq?: number): number {
+		this.assertOpen();
 		assert.equal(typeof action, 'object');
 		assert.ok(action);
 		const record = action as Record<string, unknown>;
@@ -1799,11 +2014,13 @@ class FakeAhpTransport implements AhpConnection {
 	}
 
 	async unsubscribe(uri: string): Promise<void> {
+		this.assertOpen();
 		this.unsubscribedUris.push(uri);
 		this.queue(uri).finish();
 	}
 
 	async disposeSession(): Promise<void> {
+		this.assertOpen();
 		this.disposeSessionCalls += 1;
 	}
 
@@ -1816,6 +2033,11 @@ class FakeAhpTransport implements AhpConnection {
 		if (this.shutdownFails) {
 			throw new Error('synthetic shutdown failure');
 		}
+		this.shutdownComplete = true;
+	}
+
+	private assertOpen(): void {
+		assert.equal(this.shutdownComplete, false, 'AHP request was issued after connection shutdown.');
 	}
 
 	emitChat(action: Record<string, unknown>): void {
@@ -1835,6 +2057,10 @@ class FakeAhpTransport implements AhpConnection {
 
 	failChat(): void {
 		this.queue('ahp-chat:/default').fail(new Error('transport closed'));
+	}
+
+	failRoot(): void {
+		this.queue('ahp-root://').fail(new Error('transport closed'));
 	}
 
 	private emit(

@@ -9,6 +9,7 @@ export class OwnedCommandError extends Error {
 	constructor(
 		message: string,
 		readonly processGroupId?: number,
+		readonly cleanupRequired = false,
 	) {
 		super(message);
 		this.name = 'OwnedCommandError';
@@ -59,6 +60,7 @@ export function runOwnedCommand(
 		let outputBytes = 0;
 		let resolveClose: (() => void) | undefined;
 		let settled = false;
+		let processTerminated = processGroupId === undefined;
 		const closePromise = new Promise<void>((resolveClosePromise) => {
 			resolveClose = resolveClosePromise;
 		});
@@ -120,6 +122,7 @@ export function runOwnedCommand(
 			void (async () => {
 				if (processGroupId !== undefined) {
 					await terminateOwnedProcessGroup(processGroupId, terminationGraceMs);
+					processTerminated = true;
 				}
 				await waitForOutputClose();
 				const output = Buffer.concat(stdoutChunks).toString('utf8');
@@ -136,6 +139,7 @@ export function runOwnedCommand(
 				reject(new OwnedCommandError(
 					`${commandLabel(executable, args)} failed to clean up its owned process group or output pipes.`,
 					processGroupId,
+					!processTerminated,
 				));
 			});
 		};

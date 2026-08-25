@@ -75,6 +75,10 @@ async function main(): Promise<void> {
 			workspaceId: 'temporary-e2e-workspace',
 			allowInteractiveAuthentication: false,
 		});
+		if (authBoundary) {
+			await handle.dispose();
+			throw new Error('The auth-boundary E2E unexpectedly started a real Agent Host turn.');
+		}
 		let completed = false;
 		let output = '';
 		for await (const event of handle.events) {

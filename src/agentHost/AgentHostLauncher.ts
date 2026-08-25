@@ -11,8 +11,10 @@ import {
 } from '../spikes/agentHostEndpoint';
 import {
 	assertOwnedProcessControlSupported,
+	OwnedCommandError,
 	runOwnedCommand,
 	terminateOwnedProcessGroup,
+	type RunOwnedCommandOptions,
 } from '../spikes/ownedProcess';
 import { AgentRuntimeError } from './AgentRuntime';
 
@@ -42,6 +44,16 @@ export interface AgentHostLauncherOptions {
 	readonly startupTimeoutMs?: number;
 }
 
+export interface AgentHostLauncherDependencies {
+	readonly runCommand: (
+		executable: string,
+		args: readonly string[],
+		options: RunOwnedCommandOptions,
+	) => Promise<string>;
+	readonly terminate: (processGroupId: number, graceMs: number) => Promise<void>;
+	readonly remove: (path: string) => Promise<void>;
+}
+
 export interface AgentHostLauncherLike {
 	probe(): Promise<AgentHostProbe>;
 	launch(): Promise<LaunchedAgentHost>;
@@ -59,15 +71,31 @@ interface InFlightLaunch {
 
 export class AgentHostLauncher implements AgentHostLauncherLike {
 	private readonly owned = new Set<OwnedResource>();
+	private readonly auxiliaryProcessGroups = new Map<number, OwnedResource>();
 	private readonly inFlight = new Set<InFlightLaunch>();
 	private disposed = false;
+	private readonly dependencies: AgentHostLauncherDependencies;
 
-	constructor(private readonly options: AgentHostLauncherOptions) {}
+	constructor(
+		private readonly options: AgentHostLauncherOptions,
+		dependencies: Partial<AgentHostLauncherDependencies> = {},
+	) {
+		this.dependencies = {
+			runCommand: runOwnedCommand,
+			terminate: terminateOwnedProcessGroup,
+			remove: (path) => rm(path, { recursive: true, force: true }),
+			...dependencies,
+		};
+	}
 
 	async probe(): Promise<AgentHostProbe> {
 		try {
 			assertOwnedProcessControlSupported();
-			const result = await discoverCodeCli(this.options.configuredCodeCli);
+			const result = await discoverCodeCli(
+				this.options.configuredCodeCli,
+				undefined,
+				(executable, args, options) => this.runCommand(executable, args, options),
+			);
 			return { available: true, ...result };
 		} catch {
 			return { available: false };
@@ -97,7 +125,11 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 			);
 		}
 
-		const code = await discoverCodeCli(this.options.configuredCodeCli, signal).catch(() => {
+		const code = await discoverCodeCli(
+			this.options.configuredCodeCli,
+			signal,
+			(executable, args, options) => this.runCommand(executable, args, options),
+		).catch(() => {
 			throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'A compatible VS Code command-line interface was not found.');
 		});
 		throwIfLaunchAborted(signal);
@@ -119,7 +151,13 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 				writeFile(tokenFile, token, { encoding: 'utf8', mode: 0o600 }),
 			]);
 			throwIfLaunchAborted(signal);
-			const baseline = await discoverEndpoints(code.executable, userDataDir, commandTimeoutMs, signal);
+			const baseline = await discoverEndpoints(
+				code.executable,
+				userDataDir,
+				commandTimeoutMs,
+				signal,
+				(executable, args, options) => this.runCommand(executable, args, options),
+			);
 			const baselineInstanceIds = new Set(baseline.endpoints.map(({ instanceId }) => instanceId));
 
 			host = spawn(code.executable, [
@@ -166,8 +204,18 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 						throw new Error('The Agent Host exited before publishing its endpoint.');
 					}
 					throwIfLaunchAborted(signal);
-					ownedPids = await readOwnedProcessGroup(processGroupId!, signal);
-					return discoverEndpoints(code.executable, userDataDir, remainingMs, signal);
+					ownedPids = await readOwnedProcessGroup(
+						processGroupId!,
+						signal,
+						(executable, args, options) => this.runCommand(executable, args, options),
+					);
+					return discoverEndpoints(
+						code.executable,
+						userDataDir,
+						remainingMs,
+						signal,
+						(executable, args, options) => this.runCommand(executable, args, options),
+					);
 				},
 				ownedPids: () => ownedPids,
 				expectedToken: token,
@@ -185,8 +233,8 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 				endpoint.registryProtocolVersion,
 				token,
 				{
-					terminate: terminateOwnedProcessGroup,
-					remove: (path) => rm(path, { recursive: true, force: true }),
+					terminate: this.dependencies.terminate,
+					remove: this.dependencies.remove,
 				},
 				() => this.owned.delete(launched!),
 			);
@@ -207,8 +255,8 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 					ownedRoot,
 					token,
 					{
-						terminate: terminateOwnedProcessGroup,
-						remove: (path) => rm(path, { recursive: true, force: true }),
+						terminate: this.dependencies.terminate,
+						remove: this.dependencies.remove,
 					},
 					() => this.owned.delete(cleanup),
 				);
@@ -228,6 +276,42 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 			const primary = normalizeLaunchError(error, token);
 			throw cleanupError === undefined ? primary : combineLaunchErrors(primary, cleanupError);
 		}
+	}
+
+	private async runCommand(
+		executable: string,
+		args: readonly string[],
+		options: RunOwnedCommandOptions,
+	): Promise<string> {
+		try {
+			return await this.dependencies.runCommand(executable, args, options);
+		} catch (error) {
+			if (
+				error instanceof OwnedCommandError
+				&& error.cleanupRequired
+				&& error.processGroupId !== undefined
+			) {
+				this.retainAuxiliaryProcessGroup(error.processGroupId);
+			}
+			throw error;
+		}
+	}
+
+	private retainAuxiliaryProcessGroup(processGroupId: number): void {
+		if (this.auxiliaryProcessGroups.has(processGroupId)) {
+			return;
+		}
+		let cleanup: OwnedResource;
+		cleanup = new RetainedProcessGroupCleanup(
+			processGroupId,
+			this.dependencies.terminate,
+			() => {
+				this.auxiliaryProcessGroups.delete(processGroupId);
+				this.owned.delete(cleanup);
+			},
+		);
+		this.auxiliaryProcessGroups.set(processGroupId, cleanup);
+		this.owned.add(cleanup);
 	}
 
 	async dispose(): Promise<void> {
@@ -388,7 +472,41 @@ class RetainedLaunchCleanup implements OwnedResource {
 	}
 }
 
-async function discoverCodeCli(configuredCodeCli?: string, signal?: AbortSignal): Promise<{
+class RetainedProcessGroupCleanup implements OwnedResource {
+	private disposal: Promise<void> | undefined;
+	private disposed = false;
+
+	constructor(
+		private readonly processGroupId: number,
+		private readonly terminate: (processGroupId: number, graceMs: number) => Promise<void>,
+		private readonly didDispose: () => void,
+	) {}
+
+	dispose(): Promise<void> {
+		if (this.disposed) {
+			return Promise.resolve();
+		}
+		this.disposal ??= this.terminate(this.processGroupId, shutdownGraceMs)
+			.then(() => {
+				this.disposed = true;
+				this.didDispose();
+			})
+			.finally(() => {
+				if (!this.disposed) {
+					this.disposal = undefined;
+				}
+			});
+		return this.disposal;
+	}
+}
+
+type OwnedCommandRunner = AgentHostLauncherDependencies['runCommand'];
+
+async function discoverCodeCli(
+	configuredCodeCli?: string,
+	signal?: AbortSignal,
+	runCommand: OwnedCommandRunner = runOwnedCommand,
+): Promise<{
 	readonly executable: string;
 	readonly version: string;
 	readonly commit: string;
@@ -400,7 +518,7 @@ async function discoverCodeCli(configuredCodeCli?: string, signal?: AbortSignal)
 	for (const executable of candidates) {
 		throwIfLaunchAborted(signal);
 		try {
-			const lines = (await runOwnedCommand(executable, ['--version'], {
+			const lines = (await runCommand(executable, ['--version'], {
 				timeoutMs: commandTimeoutMs,
 				maxOutputBytes: 16 * 1024,
 				signal,
@@ -436,8 +554,9 @@ async function discoverEndpoints(
 	userDataDir: string,
 	timeoutMs: number,
 	signal?: AbortSignal,
+	runCommand: OwnedCommandRunner = runOwnedCommand,
 ): Promise<AgentHostEndpointDocument> {
-	const stdout = await runOwnedCommand(
+	const stdout = await runCommand(
 		codeCli,
 		['agent', 'endpoints', '--user-data-dir', userDataDir],
 		{ timeoutMs, maxOutputBytes: 1024 * 1024, signal },
@@ -449,8 +568,12 @@ async function discoverEndpoints(
 	return document;
 }
 
-async function readOwnedProcessGroup(processGroupId: number, signal?: AbortSignal): Promise<Set<number>> {
-	const stdout = await runOwnedCommand('ps', ['-axo', 'pid=,pgid='], {
+async function readOwnedProcessGroup(
+	processGroupId: number,
+	signal?: AbortSignal,
+	runCommand: OwnedCommandRunner = runOwnedCommand,
+): Promise<Set<number>> {
+	const stdout = await runCommand('ps', ['-axo', 'pid=,pgid='], {
 		timeoutMs: commandTimeoutMs,
 		maxOutputBytes: 1024 * 1024,
 		signal,
