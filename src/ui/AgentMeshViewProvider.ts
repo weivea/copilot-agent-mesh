@@ -145,7 +145,15 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 				await this.facade.removePeer(requireTarget(message));
 				return;
 			case 'runTask':
-				await this.facade.runTask(message.peerId, message.workspaceId);
+				await this.facade.runTask(message.deviceId === undefined
+					? undefined
+					: {
+						deviceId: message.deviceId,
+						nodeId: message.nodeId!,
+						nodeInstanceId: message.nodeInstanceId!,
+						workspaceId: message.workspaceId!,
+						...(message.peerId === undefined ? {} : { peerId: message.peerId }),
+					});
 				return;
 			case 'cancelTask':
 				await this.facade.cancelTask(requireTarget(message));
@@ -261,8 +269,8 @@ export function createDashboardHtml(
 	<main>
 		<section aria-labelledby="device-heading"><h2 id="device-heading">This Device</h2><div id="device" class="card loading">Loading...</div></section>
 		<section aria-labelledby="listener-heading"><h2 id="listener-heading">Listener</h2><div id="listener" class="card loading">Loading...</div></section>
-		<section aria-labelledby="workspaces-heading"><h2 id="workspaces-heading">Shared Workspaces</h2><div id="workspaces" class="stack loading">Loading...</div><button data-action="registerWorkspace">Add Current Workspace</button></section>
-		<section aria-labelledby="peers-heading"><h2 id="peers-heading">Remote Devices</h2><div id="peers" class="stack loading">Loading...</div><button data-action="addPeer">Add Connection</button></section>
+		<section aria-labelledby="nodes-heading"><h2 id="nodes-heading">Local Window Nodes</h2><div id="localNodes" class="stack loading">Loading...</div><button data-action="registerWorkspace">Refresh Current Workspaces</button></section>
+		<section aria-labelledby="peers-heading"><h2 id="peers-heading">Remote Devices</h2><div id="remoteDevices" class="stack loading">Loading...</div><button data-action="addPeer">Add Connection</button></section>
 		<section aria-labelledby="tasks-heading"><h2 id="tasks-heading">Tasks</h2><div id="tasks" class="stack loading">Loading...</div><button data-action="runTask">Run Task</button></section>
 		<section aria-labelledby="errors-heading"><h2 id="errors-heading">Errors</h2><div id="errors" class="stack"></div></section>
 	</main>

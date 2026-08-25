@@ -164,7 +164,7 @@ function transition(
 	changes: Partial<TaskRecord> = {},
 	summary?: string,
 ): TaskRecord {
-	return compactTaskEventJournal({
+	const transitioned = {
 		...record,
 		...changes,
 		updatedAt: event.at,
@@ -178,5 +178,6 @@ function transition(
 				...(summary === undefined ? {} : { summary }),
 			},
 		],
-	}, event.at);
+	} as TaskRecord;
+	return compactTaskEventJournal(transitioned, event.at);
 }

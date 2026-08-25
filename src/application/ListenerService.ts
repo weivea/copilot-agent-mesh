@@ -63,8 +63,12 @@ export class ListenerService {
 	private operation: Promise<void> = Promise.resolve();
 	private lastError: ListenerSnapshot['error'];
 	private disposed = false;
+	private disposeRequested = false;
+	private disposal: Promise<void> | undefined;
 	private ownsResources = false;
-	private readonly tunnelSubscription: { dispose(): void } | undefined;
+	private tunnelDisposed = false;
+	private pairingDisposed = false;
+	private tunnelSubscription: { dispose(): void } | undefined;
 
 	public constructor(
 		private readonly deviceId: string,
@@ -154,20 +158,28 @@ export class ListenerService {
 		return { dispose: () => this.listeners.delete(listener) };
 	}
 
-	public async dispose(): Promise<void> {
+	public dispose(): Promise<void> {
 		if (this.disposed) {
-			return;
+			return this.disposal ?? Promise.resolve();
 		}
-		if (!this.ownsResources && this.options.ownership?.isOwner() === false) {
-			this.disposed = true;
-			this.listeners.clear();
-			return;
+		if (this.disposal !== undefined) {
+			return this.disposal;
 		}
-		await this.serialize(() => this.disposeCore());
+		this.disposeRequested = true;
+		const skipOwnedResources = !this.ownsResources
+			&& this.options.ownership?.isOwner() === false;
+		let disposal!: Promise<void>;
+		disposal = this.serialize(() => this.disposeCore(skipOwnedResources)).finally(() => {
+			if (!this.disposed && this.disposal === disposal) {
+				this.disposal = undefined;
+			}
+		});
+		this.disposal = disposal;
+		return disposal;
 	}
 
 	private async startCore(): Promise<void> {
-		if (this.disposed) {
+		if (this.disposeRequested || this.disposed) {
 			throw new Error('Listener service is disposed.');
 		}
 		if (this.state === 'running') {
@@ -269,7 +281,7 @@ export class ListenerService {
 		const gateway = this.gateway;
 		const results = await Promise.allSettled([
 			gateway?.dispose() ?? Promise.resolve(),
-			this.tunnel.stop(),
+			this.tunnelDisposed ? Promise.resolve() : this.tunnel.stop(),
 		]);
 		const failures = results.flatMap((result) =>
 			result.status === 'rejected' ? [result.reason] : [],
@@ -297,7 +309,15 @@ export class ListenerService {
 		this.changed();
 	}
 
-	private async disposeCore(): Promise<void> {
+	private async disposeCore(skipOwnedResources: boolean): Promise<void> {
+		if (skipOwnedResources) {
+			this.tunnelDisposed = true;
+			this.pairingDisposed = true;
+			this.disposeSubscription();
+			this.completeDisposal();
+			return;
+		}
+
 		let stopFailure: unknown;
 		try {
 			await this.stopCore(false);
@@ -305,20 +325,34 @@ export class ListenerService {
 			stopFailure = error;
 		}
 
+		const cleanupFailures: unknown[] = [];
 		const gateway = this.gateway;
-		const cleanup = await Promise.allSettled([
-			gateway?.dispose() ?? Promise.resolve(),
-			this.tunnel.dispose(),
-			this.pairing.dispose(),
-		]);
-		const cleanupFailures = cleanup.flatMap((result) =>
-			result.status === 'rejected' ? [result.reason] : [],
-		);
-		if (cleanup[0]?.status === 'fulfilled' && this.gateway === gateway) {
-			this.gateway = undefined;
+		if (gateway !== undefined) {
+			try {
+				await gateway.dispose();
+				if (this.gateway === gateway) {
+					this.gateway = undefined;
+				}
+			} catch (error: unknown) {
+				cleanupFailures.push(error);
+			}
 		}
-		if (cleanup[1]?.status === 'fulfilled') {
-			this.hosted = undefined;
+		if (!this.tunnelDisposed) {
+			try {
+				await this.tunnel.dispose();
+				this.tunnelDisposed = true;
+				this.hosted = undefined;
+			} catch (error: unknown) {
+				cleanupFailures.push(error);
+			}
+		}
+		if (!this.pairingDisposed) {
+			try {
+				await this.pairing.dispose();
+				this.pairingDisposed = true;
+			} catch (error: unknown) {
+				cleanupFailures.push(error);
+			}
 		}
 		if (cleanupFailures.length > 0) {
 			this.state = 'error';
@@ -337,9 +371,34 @@ export class ListenerService {
 		this.hosted = undefined;
 		this.state = 'stopped';
 		this.lastError = undefined;
+		try {
+			this.disposeSubscription();
+		} catch (error: unknown) {
+			this.state = 'error';
+			this.lastError = {
+				code: 'LISTENER_STOP_FAILED',
+				message: 'The listener subscription could not be disposed; retry disposal.',
+			};
+			this.changed();
+			throw new AggregateError([error], this.lastError.message);
+		}
+		this.completeDisposal();
+	}
+
+	private disposeSubscription(): void {
+		const subscription = this.tunnelSubscription;
+		if (subscription === undefined) {
+			return;
+		}
+		subscription.dispose();
+		if (this.tunnelSubscription === subscription) {
+			this.tunnelSubscription = undefined;
+		}
+	}
+
+	private completeDisposal(): void {
 		this.disposed = true;
 		this.ownsResources = false;
-		this.tunnelSubscription?.dispose();
 		this.listeners.clear();
 	}
 

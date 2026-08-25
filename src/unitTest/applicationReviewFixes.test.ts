@@ -11,8 +11,15 @@ import {
 	type CoordinatorPeerManager,
 } from '../application/TaskCoordinator';
 import { getWorkerPlatformSupport } from '../application/WorkerPlatformSupport';
-import { selectDashboardTaskTarget } from '../composition/ProductionDashboardBindings';
-import { VscodeLocalTaskApproval } from '../composition/VscodeAgentRuntime';
+import {
+	ProductionDashboardBindings,
+	type ProductionDashboardBindingsOptions,
+	selectDashboardTaskTarget,
+} from '../composition/ProductionDashboardBindings';
+import {
+	VscodeLocalTaskApproval,
+	VscodeWindowNodeTaskConfirmation,
+} from '../composition/VscodeAgentRuntime';
 import { canonicalTaskRequestHash } from '../domain/task';
 import { GatewayRouter } from '../gateway/GatewayRouter';
 import { GatewayServer } from '../gateway/GatewayServer';
@@ -69,10 +76,9 @@ test('TaskCoordinator excludes an online connection when the peer is disabled', 
 		new MemoryState(),
 		allowedGuard(),
 	);
-	assert.deepStrictEqual(
-		await coordinator.listWorkers(new AbortController().signal),
-		{ workers: [] },
-	);
+	const directory = await coordinator.listWorkers(new AbortController().signal);
+	assert.deepStrictEqual(directory.devices, []);
+	assert.deepStrictEqual(directory.workers, []);
 	assert.equal(requests, 0);
 });
 
@@ -88,7 +94,7 @@ test('TaskCoordinator preserves capabilities and excludes disabled workspaces', 
 				architecture: 'arm64',
 				vscodeVersion: '1.134.0',
 				extensionVersion: '0.0.1',
-				protocolVersion: 1,
+				protocolVersion: 2,
 			}
 			: {
 				workspaces: [
@@ -178,6 +184,54 @@ test('Dashboard requires explicit picks and skips disabled workers', async () =>
 	);
 });
 
+test('production dashboard persists the separate title without deriving it from instructions', async () => {
+	let persisted: {
+		readonly title: string;
+		readonly prompt: string;
+	} | undefined;
+	const disposable = { dispose: () => undefined };
+	const bindings = new ProductionDashboardBindings({
+		changed: {
+			event: () => disposable,
+			fire: () => undefined,
+		},
+		node: {
+			onDidChange: () => disposable,
+		},
+		localTasks: {
+			persistDelegationIntent: async (intent: {
+				readonly title: string;
+				readonly prompt: string;
+			}) => {
+				persisted = intent;
+				return {
+					delegationRequestId: '00000000-0000-4000-8000-000000000010',
+					taskId: '00000000-0000-4000-8000-000000000011',
+					recovered: false,
+				};
+			},
+		},
+		lifecycle: {
+			onDidChange: () => disposable,
+		},
+	} as unknown as ProductionDashboardBindingsOptions);
+	await bindings.runTask({
+		target: {
+			deviceId,
+			nodeId: '00000000-0000-4000-8000-000000000020',
+			nodeInstanceId: '00000000-0000-4000-8000-000000000021',
+			workspaceId,
+		},
+		title: 'Non-sensitive task title',
+		instruction: 'Sensitive prompt shown only during confirmation.',
+	});
+
+	assert.equal(persisted?.title, 'Non-sensitive task title');
+	assert.equal(persisted?.prompt, 'Sensitive prompt shown only during confirmation.');
+	assert.notEqual(persisted?.title, persisted?.prompt);
+	bindings.dispose();
+});
+
 test('local approval shows the full prompt and preapproval cannot be reused by title', async () => {
 	const calls: unknown[][] = [];
 	const choices: Array<string | undefined> = ['Run Once', undefined];
@@ -247,6 +301,37 @@ test('local approval shows the full prompt and preapproval cannot be reused by t
 		prompt: fullPrompt,
 	}), 'once');
 	assert.equal(calls.length, 2);
+});
+
+test('Window Node confirmation names both windows, workspace, title, and full prompt', async () => {
+	const calls: unknown[][] = [];
+	const vscodeApi = {
+		window: {
+			showWarningMessage: async (...args: unknown[]) => {
+				calls.push(args);
+				return 'Run Once';
+			},
+		},
+	} as unknown as typeof vscode;
+	const confirmation = new VscodeWindowNodeTaskConfirmation(vscodeApi);
+	const result = await confirmation.confirm({
+		sourceWindowLabel: 'Source Window',
+		targetWindowLabel: 'Target Window',
+		workspaceDisplayName: 'Workspace',
+		taskTitle: 'Review changes',
+		prompt: 'Full prompt text.',
+	});
+	assert.equal(result, 'once');
+	const detail = String((calls[0]?.[1] as { detail?: string }).detail);
+	for (const expected of [
+		'Source Window',
+		'Target Window',
+		'Workspace',
+		'Review changes',
+		'Full prompt text.',
+	]) {
+		assert.ok(detail.includes(expected));
+	}
 });
 
 test('real GatewayServer retries HTTP close after a transient stop failure', async () => {
@@ -391,6 +476,34 @@ test('ListenerService aggregates double cleanup failures and retains retryable o
 	assert.equal(listener.snapshot().state, 'stopped');
 });
 
+test('ListenerService retries failed subscription cleanup without re-disposing services', async () => {
+	const tunnel = new RecordingTunnel();
+	tunnel.subscriptionDisposeFailures = 1;
+	const gateway = new RecordingGateway();
+	const pairing = new RecordingPairing();
+	const listener = createListener(tunnel, gateway, pairing);
+	await listener.start();
+
+	await assert.rejects(listener.dispose(), (error: unknown) =>
+		error instanceof AggregateError
+		&& error.errors.length === 1
+		&& error.errors[0] instanceof Error
+		&& error.errors[0].message === 'subscription cleanup failed',
+	);
+	const stopCalls = tunnel.stopCalls;
+	const gatewayDisposeCalls = gateway.disposeCalls;
+	assert.equal(pairing.disposeCalls, 1);
+	assert.equal(tunnel.subscriptionDisposeCalls, 1);
+
+	await listener.dispose();
+	assert.equal(tunnel.stopCalls, stopCalls);
+	assert.equal(gateway.disposeCalls, gatewayDisposeCalls);
+	assert.equal(pairing.disposeCalls, 1);
+	assert.equal(tunnel.subscriptionDisposeCalls, 2);
+	await listener.dispose();
+	assert.equal(tunnel.subscriptionDisposeCalls, 2);
+});
+
 test('ListenerService never replaces retained Gateway ownership after failed startup cleanup', async () => {
 	const tunnel = new RecordingTunnel();
 	tunnel.ensureFailures = 1;
@@ -490,6 +603,8 @@ class RecordingTunnel implements DevTunnelProvider {
 	public stopCalls = 0;
 	public stopFailures = 0;
 	public ensureFailures = 0;
+	public subscriptionDisposeCalls = 0;
+	public subscriptionDisposeFailures = 0;
 	public lastRequest: TunnelRequest | undefined;
 	private readonly listeners = new Set<() => void>();
 	private status: DevTunnelRuntimeStatus = { state: 'stopped' };
@@ -547,7 +662,16 @@ class RecordingTunnel implements DevTunnelProvider {
 
 	public onDidChange(listener: () => void): { dispose(): void } {
 		this.listeners.add(listener);
-		return { dispose: () => this.listeners.delete(listener) };
+		return {
+			dispose: () => {
+				this.subscriptionDisposeCalls += 1;
+				if (this.subscriptionDisposeFailures > 0) {
+					this.subscriptionDisposeFailures -= 1;
+					throw new Error('subscription cleanup failed');
+				}
+				this.listeners.delete(listener);
+			},
+		};
 	}
 
 	public expireAccess(): void {

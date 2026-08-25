@@ -10,6 +10,10 @@ import {
 	uuidSchema,
 	workspaceSummarySchema,
 } from './models';
+import {
+	nodeDirectoryResultSchema,
+	routedTaskStartParamsSchema,
+} from './nodes';
 
 const nonceSchema = z.string().regex(/^[A-Za-z0-9_-]{32,256}$/);
 const proofSchema = z.string().regex(/^[A-Za-z0-9_-]{43,512}$/);
@@ -94,8 +98,9 @@ export const methodParamsSchemas = {
 	[GATEWAY_METHODS.enrollmentCommit]: enrollmentCommitParamsSchema,
 	[GATEWAY_METHODS.ping]: pingParamsSchema,
 	[GATEWAY_METHODS.deviceGetInfo]: z.strictObject({}),
+	[GATEWAY_METHODS.nodeList]: z.strictObject({}),
 	[GATEWAY_METHODS.workspaceList]: z.strictObject({}),
-	[GATEWAY_METHODS.taskStart]: taskStartParamsSchema,
+	[GATEWAY_METHODS.taskStart]: routedTaskStartParamsSchema,
 	[GATEWAY_METHODS.taskGet]: taskGetParamsSchema,
 	[GATEWAY_METHODS.taskCancel]: taskCancelParamsSchema,
 	[GATEWAY_METHODS.taskAnswer]: taskAnswerParamsSchema,
@@ -126,6 +131,7 @@ export const methodResultSchemas = {
 	[GATEWAY_METHODS.enrollmentCommit]: enrollmentCommitResultSchema,
 	[GATEWAY_METHODS.ping]: pingResultSchema,
 	[GATEWAY_METHODS.deviceGetInfo]: deviceInfoSchema,
+	[GATEWAY_METHODS.nodeList]: nodeDirectoryResultSchema,
 	[GATEWAY_METHODS.workspaceList]: workspaceListResultSchema,
 	[GATEWAY_METHODS.taskStart]: taskSnapshotSchema,
 	[GATEWAY_METHODS.taskGet]: z.union([

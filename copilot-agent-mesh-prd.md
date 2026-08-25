@@ -1,28 +1,29 @@
 # Copilot Agent Mesh 产品需求文档
 
-> Preview platform scope: Worker hosting and task execution are currently
-> supported only on macOS arm64. Windows, Linux, macOS x64, and other
-> architectures are Coordinator-only when peer-client networking is available.
-> Cross-platform Worker statements below describe the future product target, not
-> the current Preview support claim.
+> Preview platform scope: every ordinary VS Code window under one User Data is an
+> active Window Node. Worker hosting and real task execution are currently
+> supported only on macOS arm64; other platforms can participate as Broker
+> clients/Window Nodes but cannot host Worker execution.
 
 > 工作名称：Copilot Agent Mesh  
-> 文档版本：v0.3<br>
-> 状态：0.1.0 Preview 已实现；G0 仍为 No-Go<br>
+> 文档版本：v0.4<br>
+> 状态：0.2.0 Preview Multi-window Mesh Nodes 已实现；G0 仍为 No-Go<br>
 > 日期：2026-08-25<br>
 > 产品形态：个人使用的 VS Code Desktop 扩展  
-> Preview 支持平台：Coordinator 可运行于支持 peer client 的桌面平台；Worker 仅 macOS arm64
+> Preview 支持平台：普通桌面 Window Node 跨平台；Worker Host 仅 macOS arm64
 
-> 实施快照：真实双实例 E2E 已覆盖 Dev Tunnel、配对、Workspace 发现、任务委派、
-> 查询和精确资源清理。隔离 Worker Profile 因没有显式 VS Code Authentication
-> Session，在真实 AHP Turn 前返回 `AGENT_AUTH_REQUIRED`；因此本文描述的完整
-> authenticated Agent 闭环仍是 Preview Gate，而不是已完成的 G0 声明。
+> 实施快照：Mesh protocol v2 已实现，v1 Peer 明确不兼容。真实普通窗口 E2E
+> 已覆盖 Broker/Node、IPC、Claim/Conflict/Takeover 和精确清理。第二次 opted-in
+> AHP 运行因 Fresh Shared Profile 没有 Authentication Mapping/Session 正确返回
+> `AGENT_AUTH_REQUIRED`，未证明 authoritative start/get/cancel/output。
 
 ## 1. 产品摘要
 
 Copilot Agent Mesh 是一个安装在多台开发设备上的 VS Code 扩展。它让用户在任意一台主设备的 VS Code Copilot Agent 中描述完整开发需求，并通过扩展提供的 Language Model Tools，把平台相关或仓库相关的子任务委派给其他设备上的 VS Code 内置 Copilot Agent 执行。
 
-设备之间通过 Microsoft Dev Tunnels 建立点对点 WSS 通信。每台从设备可以启动监听服务、配置设备名、注册允许执行任务的本地 Workspace，并显示可分享的连接 URL。主设备通过输入连接 URL 注册从设备，在控制界面查看连接状态、可用 Workspace 和远程任务状态。
+每台设备有一个稳定 Device Broker，所有同 User Data 的普通窗口通过认证本机
+IPC 连接它。设备之间通过一个 Gateway/Dev Tunnel 建立 WSS 通信。用户按明确的
+Device → Node → Workspace Target 派发任务，并在任意本机窗口查看权威状态。
 
 远端任务完成后，结果作为 Tool Result 返回主设备原始 Copilot Agent 会话，主 Agent 可以继续推理、执行本地任务并向用户汇总跨平台、跨仓库的最终结果。
 
@@ -54,7 +55,8 @@ Windows Copilot Agent：
 
 1. 打通不同设备上 VS Code 内置 Copilot Agent 的任务通信。
 2. 用户只操作主设备，不需要远程桌面或直接操作从设备。
-3. 当前 Preview 支持跨平台 Coordinator；Windows、Linux、macOS x64 和其他架构作为 Worker 是未来目标。
+3. 当前 Preview 支持跨平台 Window Node/Broker Client；Windows、Linux、macOS
+   x64 和其他架构作为 Worker Host 是未来目标。
 4. 支持同一仓库和不同仓库的任务委派。
 5. 让主 Copilot Agent 能通过标准 Language Model Tool 自动发现设备、选择 Workspace、派发任务并获得结果。
 6. 提供可视化控制界面，用于启动监听、显示连接 URL、管理设备和查看任务。
@@ -80,6 +82,8 @@ Windows Copilot Agent：
 | 概念 | 定义 |
 | --- | --- |
 | Device | 安装并运行扩展的一台 Windows、macOS 或 Linux 设备。 |
+| Device Broker | 同一 User Data 的稳定设备控制面 Owner，负责 Pairing、Peer Root、Gateway/one Tunnel、Peer Manager、全局任务与路由持久化、Reducer/Event Log 和 Node Registry。 |
+| Window Node | 每个普通 VS Code Window 的活跃节点，具有 process-lifetime 随机 `nodeId`/`nodeInstanceId`、Heartbeat、Workspace Claim 和自己的真实 AHP Runtime/Handle。 |
 | Coordinator | 用户当前操作的主设备，负责向其他设备派发任务。 |
 | Worker | 接收并执行远程任务的从设备。一个设备可同时是 Coordinator 和 Worker。 |
 | Workspace | Worker 明确注册并允许远程 Agent 使用的本地项目目录。 |
@@ -116,13 +120,17 @@ Windows Copilot Agent：
 
 1. 用户在主设备 Copilot Agent 输入跨平台或跨仓库需求。
 2. 主 Agent 调用 `mesh_list_workers` 获取可用设备和 Workspace。
-3. 主 Agent 调用 `mesh_delegate_task`，传入目标设备、Workspace 和任务描述。
-4. Coordinator 扩展通过 Dev Tunnel 将任务发送到 Worker。
-5. Worker 使用本地 AHP 创建 Copilot Agent Session 并开始执行。
+3. 主 Agent 调用 `mesh_delegate_task`，传入明确 Device、Node、Workspace 和任务描述。
+4. 本机任务走 Window A → Local Broker → Window B，不接触 Dev Tunnel；远端
+   任务走一个 Device Gateway/Tunnel → Remote Broker → Target Node。
+5. Target Window Node 使用自己的真实 AHP Runtime 创建 Copilot Agent Session。
 6. 进度实时显示在主设备控制界面。
 7. `mesh_delegate_task` 在 Worker 接受后立即返回 `pending + taskId`，不等待完整编码任务。
 8. 主 Agent 可调用 `mesh_get_task` 查询状态；用户也可在 Dashboard 查看进度。
 9. 远端 Agent 完成后，`mesh_get_task` 返回受限的结构化结果，主 Agent 可在当前会话继续处理。
+
+Broker 在发送前持久化 Route Catalog；AHP 事件先进入 Broker Store，再经 IPC
+multiplex 给所有本机窗口。
 
 ### 6.4 远程问题与审批
 
@@ -144,6 +152,11 @@ Windows Copilot Agent：
 - 设备名可修改，`deviceId` 不随名称变化。
 - 配置和非敏感状态存入 `globalState`。
 - 配对密钥和访问令牌存入 VS Code `SecretStorage`。
+- 同一 User Data 只允许一个 generation-fenced Device Broker Owner；Takeover
+  后旧 Generation 的 Shared Write 必须失败。非 Owner Window 是 Active Client，
+  不是只读窗口。
+- 每个普通窗口生成 process-lifetime 随机 `nodeId`/`nodeInstanceId` 并发送
+  Heartbeat。
 
 ### FR-2：Workspace 注册
 
@@ -157,6 +170,10 @@ Windows Copilot Agent：
 - Coordinator 只能使用 `workspaceId`，不能提交任意绝对路径。
 - 用户可以启用、禁用或删除 Workspace。
 - MVP 每个 Workspace 同时只允许一个远程写任务。
+- Canonical realpath/file identity 在进入 Broker Catalog/IPC 前 Hash；同一物理
+  Workspace 只允许一个 claimed Node，其他窗口显示 conflict/read-only。
+- Node 丢失释放 Claim。Active Task 因当前 AHP Runtime 无 Recovery API 明确失败
+  为 `TASK_RECOVERY_UNAVAILABLE`，不能在其他 Node 重复执行。
 
 ### FR-3：监听服务
 
@@ -167,6 +184,17 @@ Windows Copilot Agent：
 - 可配置随 VS Code 启动自动监听。
 - VS Code 退出或扩展停用时，正确关闭 Gateway 和 Tunnel 子进程。
 - 异常退出后，下次启动能够恢复持久 Tunnel。
+- Gateway、唯一 Dev Tunnel、Peer Manager 和 Node Registry 由 Device Broker
+  Owner 持有，不由任意 Workspace Window 各自创建。
+
+### FR-3.1：认证本机 IPC
+
+- macOS/Linux 使用 Unix socket，Windows 使用 named pipe；Endpoint 使用短 Hash。
+- Unix Directory/Socket 权限分别为 `0700`/`0600`。
+- Window Node 与 Broker 使用 SecretStorage Shared Broker Key、fresh nonce 和
+  mutual HMAC 双向认证。
+- Replay、Handshake Deadline、Rate、Frame、Queue 和 Backpressure 必须有界。
+- IPC 不传原始路径、Secret、完整 Prompt 或原始 Output。
 
 ### FR-4：Microsoft Dev Tunnels 集成
 
@@ -205,7 +233,7 @@ devtunnel show <tunnel-id> --json
 建议格式：
 
 ```text
-https://<tunnel-port-uri>/agent-mesh/connect?v=1&device=<device-id>#secret=<pairing-secret>
+https://<tunnel-port-uri>/agent-mesh/connect?v=2&device=<device-id>#secret=<pairing-secret>
 ```
 
 `secret` 放在 URI fragment 中，避免浏览器或代理在普通 HTTP 请求中发送它。主设备粘贴后由扩展解析，并在 WebSocket 建连后的首个认证消息中使用。
@@ -240,6 +268,7 @@ https://<tunnel-port-uri>/agent-mesh/connect?v=1&device=<device-id>#secret=<pair
 ```ts
 interface DelegateTaskInput {
   deviceId: string;
+  nodeId: string;
   workspaceId: string;
   title: string;
   prompt: string;
@@ -251,6 +280,8 @@ interface DelegateTaskInput {
 要求：
 
 - Tool 的 `modelDescription` 明确告诉模型何时应委派远程任务。
+- 五个 Tool 都使用明确 Device → Node → Workspace Target；不按显示名或当前窗口
+  隐式选路。
 - Tool 只选择目标设备与 Workspace，并传递主 Agent 给出的任务意图；不得添加 Git、分支或 worktree 操作策略。
 - Tool 不检查 Workspace 的 Git 状态，也不因分支、HEAD、未提交修改或 worktree 状态阻止任务。
 - 是否开始开发以及是否执行任何 Git 操作由远端内置 Agent 自主判断；扩展尤其不得提示 Agent 创建 Git worktree。
@@ -263,7 +294,7 @@ interface DelegateTaskInput {
 
 ### FR-8：Worker 任务执行
 
-Worker 接收任务后：
+Target Window Node 接收 Broker 路由的任务后：
 
 1. 校验协议版本、任务 ID 和 Workspace。
 2. 确保没有违反 Workspace 并发限制。
@@ -273,6 +304,9 @@ Worker 接收任务后：
 6. 发送任务 Prompt 并订阅 Chat、Tool、Terminal 和 Changeset 事件。
 7. 持续更新任务状态。
 8. 完成后生成结构化结果并回传 Coordinator。
+
+Local Node 的 AHP Event 先持久化到 Broker Reducer/Event Log，再返回 Source
+Window。Remote Event 由目标 Broker 通过一个 Gateway/Tunnel 发送。
 
 任务开始前，扩展不得检查或修改 Git 状态、分支、HEAD 或 worktree，也不得把相关策略注入 Prompt。远端 Agent 根据任务、本地环境和自身能力自主决定是否开始开发及是否执行 Git 操作；如需用户决策，沿用任务输入与审批转发机制。
 
@@ -289,6 +323,8 @@ running → completed | failed | cancelled | timedOut
 - `taskId` 由 Coordinator 生成并保证幂等。
 - Worker 重复收到相同 `taskId` 时返回已有任务，不重复执行。
 - Worker 将任务最小状态持久化，扩展重启后可恢复展示。
+- Global Task/Delegation State、Route Catalog 和 Reducer/Event Log 由 Broker
+  Owner 持久化并使用 Generation Fence。
 - Tool 确认等待超时或取消不等同于远端任务失败；任务可继续运行并通过 `mesh_get_task` 查询。
 
 ### FR-10：任务结果
@@ -338,17 +374,19 @@ COPILOT AGENT MESH
 This Device
   Name: mac-ios
   Platform: macOS arm64
+  Broker: Owner generation 7
   Listener: Running
   Tunnel: Connected
   [Copy Connection URL] [Stop]
 
-Shared Workspaces
-  ● iOS Client      ios
-  ● Shared Client   cross-platform
+Local Nodes
+  ● node-a  iOS Client      claimed
+  ● node-b  Shared Client   claimed
+  ! node-c  iOS Client      conflict / read-only
   [+ Add Current Workspace]
 
-Remote Devices
-  ● linux-server    Online   42 ms   2 workspaces
+Remote Devices / Nodes
+  ● linux-server / node-x   Online   42 ms   2 workspaces
   ○ win-client      Offline  last seen 15:32
   [+ Add Connection]
 
@@ -361,45 +399,51 @@ Tasks
 控制界面至少支持：
 
 - 配置本设备名称。
+- 展示 Broker Owner、Generation、Takeover。
 - 启停监听和 Tunnel。
 - 复制连接 URL。
 - 添加和管理远程连接。
-- 展示设备状态、延迟、Workspace 和活动任务。
+- 展示本机 Nodes、Heartbeat、Workspace Claim/Conflict、Remote Nodes、延迟和任务。
 - 查看任务详情、进度、输出摘要、审批和错误。
 - 取消任务。
 - 打开对应 Agent Session 或 Agent 返回的文件与链接。
 
 详细日志写入独立 `OutputChannel`，不把调试日志全部塞入 Webview。
+Dashboard ViewModel 不包含 Secret、原始本地路径、完整 Prompt 或原始 Output。
+
+### FR-13：0.1 数据迁移
+
+- 首次打开 0.2 时，把 0.1 稳定 Device ID 和 v1 Workspace/Task Data 迁移到
+  Schema v2。
+- Migration 必须可重复且由 Broker Owner 独占执行。
+- Unknown/Corrupt Version 失败并显示稳定错误，不静默删除或猜测数据。
 
 ## 8. 技术架构
 
 ```text
-┌──────────────── Coordinator VS Code ────────────────┐
-│ User → Built-in Copilot Agent                       │
-│                 │ Language Model Tool               │
-│                 ▼                                   │
-│ ToolProvider → TaskCoordinator → PeerConnection     │
-│                                      │ WSS          │
-└──────────────────────────────────────┼──────────────┘
-                                       │
-                          Microsoft Dev Tunnels
-                                       │
-┌────────────────── Worker VS Code ────┼──────────────┐
-│ GatewayServer ◀──────────────────────┘              │
-│      │                                              │
-│ TaskRunner → AgentHostAdapter → local AHP           │
-│                                  │                  │
-│                         VS Code Agent Host           │
-│                                  │                  │
-│                       Built-in Copilot Agent         │
-│                                  │                  │
-│                          Local Workspace             │
-└─────────────────────────────────────────────────────┘
+Window Node A ─┐                         ┌─ Window Node B
+Tools/UI/AHP   ├─ authenticated IPC ────┤  Tools/UI/real AHP
+               │       Device Broker    │
+               │  owner lock + catalog  │
+               │  task/delegation store │
+               │  reducer/event log     │
+               └──────────┬──────────────┘
+                          │ one Gateway / one Dev Tunnel
+                          ▼
+                  Remote protocol-v2 Broker
+                          │
+                     Target Window Node
+```
+
+Local full route:
+
+```text
+Window A → Local Broker → Window B → real AHP → Broker Store → Window A
 ```
 
 ### 8.1 为什么增加 Gateway，而不是直接暴露 AHP
 
-Worker Gateway 是必要的产品边界：
+Device Broker Gateway 是必要的产品边界：
 
 - 提供设备名称、能力和 Workspace 白名单。
 - 隐藏本地 Agent Host connection token。
@@ -410,7 +454,7 @@ Worker Gateway 是必要的产品边界：
 
 ### 8.2 Gateway 协议
 
-采用 JSON-RPC 2.0 over WSS，协议版本从 `1` 开始。
+采用 JSON-RPC 2.0 over WSS，当前协议版本是 `2`；v1 Peer 明确不兼容。
 
 建议方法：
 
@@ -436,11 +480,12 @@ task.completed
 connection.draining
 ```
 
-所有消息必须包含 `requestId` 或 `taskId`，未知字段向前兼容忽略。
+所有消息必须包含 `requestId` 或 `taskId`；Route 使用显式 Device/Node/Workspace
+Target。只有明确标记为 forward-compatible 的未知字段可以忽略。
 
 ### 8.3 Agent Host/AHP 集成
 
-Worker 使用 `code agent host` 启动专用本地 Agent Host：
+Target Window Node 使用 `code agent host` 启动专用本地 Agent Host：
 
 ```bash
 code agent host \
@@ -486,6 +531,8 @@ ws://127.0.0.1:<port>?tkn=<connection-token>
 | 扩展 | TypeScript + VS Code Extension API |
 | 控制界面 | Webview View；React 可选，MVP 可使用轻量 TypeScript UI |
 | 本地 Gateway | Node `http` + `ws`，仅绑定 `127.0.0.1` |
+| 本机控制面 | generation-fenced Device Broker + ordinary-window Window Nodes |
+| 本机 IPC | Unix socket / Windows named pipe + SecretStorage Key + mutual HMAC |
 | 外部传输 | Microsoft Dev Tunnels，HTTP/WSS 转发 |
 | Peer 协议 | JSON-RPC 2.0 over WSS |
 | Agent 控制 | `@microsoft/agent-host-protocol` |
@@ -500,6 +547,17 @@ ws://127.0.0.1:<port>?tkn=<connection-token>
 ```text
 src/
   extension.ts
+  broker/
+    DeviceBroker.ts
+    BrokerLifecycle.ts
+    BrokerTaskService.ts
+    NodeRegistry.ts
+  node/
+    WindowNodeClient.ts
+    WindowNodeTaskExecutor.ts
+    LocalIpcRemoteTaskAdapter.ts
+  ipc/
+    LocalIpcTransport.ts
   ui/
     AgentMeshViewProvider.ts
   tunnel/
@@ -525,7 +583,8 @@ src/
   workspaces/
     WorkspaceRegistry.ts
   storage/
-    SecretStore.ts
+    BrokerOwnerLock.ts
+    VscodeStorageAdapters.ts
 shared/
   protocol.ts
   schemas.ts
@@ -578,6 +637,10 @@ AHP 的 Root、Session、Chat 和 Terminal channel 在当前规范中标记为 S
 - Dev Tunnel 可匿名访问，但 Gateway 必须要求 256-bit 随机配对密钥。
 - 配对密钥只显示一次，并存入 SecretStorage。
 - Gateway 不接受未注册的 Workspace 路径。
+- Local IPC 使用短 Hash Endpoint、Unix `0700`/`0600`、Shared Broker Key、
+  Fresh Nonce + Mutual HMAC，并限制 Replay/Deadline/Rate/Frame/Backpressure。
+- Canonical Workspace Identity 只以 Hash 进入 Catalog/IPC；Duplicate Window
+  Conflict/read-only。
 - GitHub、Copilot 和 Agent Host token 永不离开 Worker。
 - 控制界面提供“旋转密钥”和“撤销设备”操作。
 - 日志必须脱敏连接 URL fragment、token 和 Authorization 信息。
@@ -591,7 +654,8 @@ AHP 的 Root、Session、Chat 和 Terminal channel 在当前规范中标记为 S
 
 ### 兼容性
 
-- 支持 Windows x64/arm64、macOS x64/arm64、Linux x64；实际打包矩阵由依赖验证决定。
+- Window Node/Broker Client 支持桌面 Windows、macOS、Linux；Worker Host/真实
+  AHP 执行当前仅验证 macOS arm64。
 - 要求桌面版 VS Code。
 - MVP 仅支持本机 `file:` Workspace；不支持 SSH、WSL、Dev Containers、Codespaces 或其他 VS Code Remote Workspace。
 - 每台 Worker 均需要有效 Copilot 权限并完成登录。
@@ -648,7 +712,8 @@ AHP 的 Root、Session、Chat 和 Terminal channel 在当前规范中标记为 S
 5. 显示并复制连接 URL。
 6. 主设备通过 URL 添加、保存和删除连接。
 7. 连接状态、心跳和 Workspace 列表 UI。
-8. `mesh_list_workers`、`mesh_delegate_task`、`mesh_get_task`、`mesh_cancel_task`。
+8. `mesh_list_workers`、`mesh_delegate_task`、`mesh_get_task`、
+   `mesh_cancel_task`、`mesh_answer_task`，均使用 Device → Node → Workspace。
 9. macOS arm64 Worker 通过 AHP 调用内置 Copilot Agent。
 10. 主设备 UI 显示任务状态和输出摘要。
 11. 任务完成结果可通过 `mesh_get_task` 在当前 Copilot 会话中查询。
@@ -697,6 +762,41 @@ AHP 的 Root、Session、Chat 和 Terminal channel 在当前规范中标记为 S
 - 用户取消任务后，远端 AHP Turn 被取消并返回 `cancelled`。
 - 协议版本不匹配时连接状态显示 `incompatible`。
 
+### AC-5：Multi-window Mesh Nodes
+
+- 同一 User Data 的两个普通窗口在 5 秒内发现两个 Window Nodes 和 exactly one
+  Broker。
+- Broker Owner 丢失后 Survivor 以新 Generation Takeover，旧 Owner Shared
+  Write 失效。
+- 同一物理 Workspace 的第二窗口是 conflict/read-only；Node 丢失后原
+  `workspaceId` 可 reclaim。
+- Local Task Route 不启动或接触 Dev Tunnel。
+- 所有 Socket/Process 精确清理；Active Runtime 丢失返回
+  `TASK_RECOVERY_UNAVAILABLE`，不重复执行。
+
+真实证据（VS Code 1.134.0，macOS arm64）：
+
+- `.vscode-test/multi-window-evidence/6c119d7b-8596-4757-a129-7e31b412db5d.json`：
+  2 Nodes in 129 ms、exactly 1 Broker、Listener/Tunnel stopped 且 sentinel
+  untouched、repo-b offline in 268 ms 后 same `workspaceId` reclaim、changed
+  generation takeover、duplicate conflict、完整 socket/process cleanup。
+- `.vscode-test/multi-window-evidence/7886dc25-37ef-4909-ac2b-6af2a506078c.json`：
+  opted-in AHP，2 Nodes in 278 ms、repo-b offline in 214 ms、takeover in
+  1683 ms、same `workspaceId`、zero residue。Fresh Shared Profile 无 Auth
+  Mapping/Session，因此正确停在 `AGENT_AUTH_REQUIRED`；未证明 authoritative
+  AHP start/get/cancel/output，G0 保持 No-Go。
+
+复现命令：
+
+```sh
+npm run test:multi-window-real
+MESH_MULTI_WINDOW_E2E_RUNTIME_DIR=$HOME/.mw \
+MESH_MULTI_WINDOW_E2E_TASKS=1 npm run test:multi-window-real
+```
+
+macOS 使用 `$HOME/.mw` 这类短路径以避开 Unix-domain socket path limit。实施
+期间 Unit/Component/Extension Host/完整 npm Test 已通过；最终验证前不固定数量。
+
 ## 17. 开发阶段
 
 ### Phase 0：技术 Spike
@@ -725,13 +825,14 @@ AHP 的 Root、Session、Chat 和 Terminal channel 在当前规范中标记为 S
 
 ### Phase 3：Copilot Tools
 
-- 注册四个核心 Language Model Tools。
+- 注册五个 Language Model Tools。
 - Tool 输入输出 Schema。
 - 与控制界面任务列表联动。
 
 ### Phase 4：恢复与完善
 
 - 自动重连、持久任务、审批转发。
+- Broker Takeover、Window Node Lifecycle、Workspace Claim 和 Schema-v2 Migration。
 - 三平台 E2E。
 - 文档、诊断和 VSIX 打包。
 
@@ -755,7 +856,8 @@ AHP 的 Root、Session、Chat 和 Terminal channel 在当前规范中标记为 S
 - Desktop extension host，禁止声明为 Web Extension。
 - Core 与 Webview UI 分包但保持单仓库。
 - 协议类型放在 `shared/`，客户端和服务端共同使用。
-- 首先实现 FakeAgentHost 与 InMemory Peer Transport，确保核心状态机可测试。
+- 在测试目录实现 AgentRuntime Double 与 InMemory Peer Transport，确保核心状态机
+  可测试；生产布局和 Bundle 不包含测试 Agent 回退。
 - E2E 测试再接真实 Dev Tunnel 和 Copilot，避免普通单元测试消耗模型额度。
 
 第一批开发 Issue 建议：

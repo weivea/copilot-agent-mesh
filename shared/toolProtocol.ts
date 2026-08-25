@@ -3,6 +3,7 @@ import type { TaskStatus } from './protocol';
 export const TASK_TOOL_LIMITS = {
 	idBytes: 36,
 	deviceNameBytes: 256,
+	nodeLabelBytes: 256,
 	workspaceNameBytes: 256,
 	capabilityBytes: 128,
 	titleBytes: 256,
@@ -12,9 +13,11 @@ export const TASK_TOOL_LIMITS = {
 	answerBytes: 32 * 1024,
 	failureCodeBytes: 128,
 	errorMessageBytes: 2 * 1024,
-	maxWorkers: 128,
-	maxWorkspacesPerWorker: 128,
-	maxCapabilitiesPerWorker: 64,
+	maxDevices: 128,
+	maxNodesPerDevice: 128,
+	maxWorkspacesPerNode: 32,
+	maxCapabilitiesPerNode: 32,
+	maxTagsPerWorkspace: 32,
 	maxEvents: 100,
 	maxArtifacts: 32,
 	minimumOutputBytes: 1_024,
@@ -67,13 +70,49 @@ export interface MeshWorkspaceToolSummary {
 	readonly name: string;
 	readonly tags: readonly string[];
 	readonly busy: boolean;
+	readonly claimStatus: 'claimed' | 'readOnly' | 'conflict';
 }
 
+export interface MeshNodeToolSummary {
+	readonly nodeId: string;
+	readonly nodeInstanceId: string;
+	readonly label: string;
+	readonly status: 'online' | 'busy' | 'offline' | 'conflict' | 'draining';
+	readonly capabilities: readonly string[];
+	readonly workspaces: readonly MeshWorkspaceToolSummary[];
+}
+
+export interface MeshDeviceToolSummary {
+	readonly deviceId: string;
+	readonly deviceName: string;
+	readonly locality: 'local' | 'remote';
+	readonly status: 'online' | 'incompatible';
+	readonly peerId?: string;
+	readonly nodes: readonly MeshNodeToolSummary[];
+	readonly nodesTruncated: boolean;
+	readonly totalNodes: number;
+}
+
+export interface MeshDirectorySnapshot {
+	readonly devices: readonly MeshDeviceToolSummary[];
+	readonly truncated: boolean;
+}
+
+export interface MeshRemoteDirectorySnapshot {
+	readonly devices: readonly MeshDeviceToolSummary[];
+	readonly truncated: boolean;
+	readonly totalDevices: number;
+}
+
+/**
+ * Legacy v1 directory shape retained only for TaskCoordinator/dashboard
+ * compatibility while remote v2 routing is introduced.
+ */
 export interface MeshWorkerToolSummary {
 	readonly peerId: string;
 	readonly deviceName: string;
 	readonly capabilities: readonly string[];
-	readonly workspaces: readonly MeshWorkspaceToolSummary[];
+	readonly workspaces: readonly Omit<MeshWorkspaceToolSummary, 'claimStatus'>[];
 }
 
 export interface MeshWorkerDirectorySnapshot {
@@ -86,8 +125,15 @@ export interface DelegationIntentInput {
 	 * payload; omitting it always creates a fresh delegation.
 	 */
 	readonly delegationRequestId?: string;
-	readonly peerId: string;
+	readonly deviceId: string;
+	readonly nodeId: string;
+	readonly nodeInstanceId: string;
 	readonly workspaceId: string;
+	/**
+	 * Optional internal routing metadata for remote devices. It never replaces
+	 * the explicit Device -> Node -> Workspace target.
+	 */
+	readonly peerId?: string;
 	readonly title: string;
 	readonly prompt: string;
 	readonly acceptanceCriteria: readonly string[];

@@ -236,6 +236,42 @@ describe('foundation storage', () => {
 		assert.deepStrictEqual([...state.values.keys()], ['copilotAgentMesh.deviceProfile']);
 	});
 
+	test('atomically migrates the 0.1 device profile without changing device identity', async () => {
+		const state = new MemoryState();
+		state.values.set('copilotAgentMesh.deviceProfile', {
+			schemaVersion: 1,
+			deviceId: IDS.device,
+			name: 'existing-device',
+			platform: 'darwin',
+			architecture: 'arm64',
+			vscodeVersion: '1.103.0',
+			extensionVersion: '0.1.0',
+			protocolVersion: 1,
+			createdAt: AT,
+			updatedAt: AT,
+		});
+		const store = new DeviceProfileStore(
+			state,
+			new SequenceIds([]),
+			fixedClock,
+		);
+
+		assert.equal(store.get(), undefined);
+		const migrated = await store.getOrCreate({
+			defaultName: 'ignored',
+			platform: 'darwin',
+			architecture: 'arm64',
+			vscodeVersion: '1.103.0',
+			extensionVersion: '0.2.0',
+		});
+
+		assert.equal(migrated.schemaVersion, 2);
+		assert.equal(migrated.protocolVersion, 2);
+		assert.equal(migrated.deviceId, IDS.device);
+		assert.equal(migrated.name, 'existing-device');
+		assert.equal(migrated.createdAt, AT);
+	});
+
 	test('registers file workspaces but exposes only opaque wire data', async () => {
 		const state = new MemoryState();
 		const leases = new WorkspaceLeaseManager();

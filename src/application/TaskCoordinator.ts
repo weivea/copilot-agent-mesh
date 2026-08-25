@@ -13,13 +13,14 @@ import type {
 	TaskToolErrorCode,
 	DelegationAcceptance,
 	DelegationIntentInput,
+	MeshDirectorySnapshot,
 	MeshWorkerDirectorySnapshot,
 	PersistedDelegationIntent,
 	TaskActionReceipt,
 	TaskToolReadResult,
 } from '../../shared/toolProtocol';
 import type { StateStore } from '../domain/ports';
-import type { PeerProfileStore } from '../peer/PeerProfile';
+import { isUsablePeerProfile, type PeerProfileStore } from '../peer/PeerProfile';
 import { PeerRpcError } from '../peer/WebSocketPeerTransport';
 import type { TaskToolFacade } from '../tools/taskToolFacade';
 import { TaskToolFacadeError } from '../tools/taskToolFacade';
@@ -46,6 +47,18 @@ interface DelegationState {
 	readonly intents: readonly StoredDelegationIntent[];
 }
 
+export interface LegacyCoordinatorDelegationInput {
+	readonly delegationRequestId?: string;
+	readonly peerId: string;
+	readonly workspaceId: string;
+	readonly title: string;
+	readonly prompt: string;
+	readonly acceptanceCriteria: readonly string[];
+	readonly timeoutMinutes?: number;
+}
+
+type CoordinatorDelegationInput = DelegationIntentInput | LegacyCoordinatorDelegationInput;
+
 export interface CoordinatorTaskView {
 	readonly intent: StoredDelegationIntent;
 	readonly snapshot?: TaskSnapshot | TaskSnapshotAfterEventSeq;
@@ -66,7 +79,7 @@ export interface CoordinatorPeerManager {
 export class TaskCoordinator implements TaskToolFacade {
 	private mutation = Promise.resolve();
 	private readonly taskCache = new Map<string, TaskSnapshot | TaskSnapshotAfterEventSeq>();
-	private readonly intentPayloads = new Map<string, DelegationIntentInput>();
+	private readonly intentPayloads = new Map<string, CoordinatorDelegationInput>();
 
 	public constructor(
 		private readonly peers: CoordinatorPeerManager,
@@ -78,7 +91,9 @@ export class TaskCoordinator implements TaskToolFacade {
 		private readonly ownership?: WorkerOwnership,
 	) {}
 
-	public async listWorkers(signal: AbortSignal): Promise<MeshWorkerDirectorySnapshot> {
+	public async listWorkers(
+		signal: AbortSignal,
+	): Promise<MeshDirectorySnapshot & MeshWorkerDirectorySnapshot> {
 		this.guard.assertAllowed({ requireWorkspace: false });
 		throwIfAborted(signal);
 		const workers = await Promise.all(this.peers.listConnections().map(async (connection) => {
@@ -121,13 +136,23 @@ export class TaskCoordinator implements TaskToolFacade {
 				return undefined;
 			}
 		}));
-		return { workers: workers.filter((worker) => worker !== undefined) };
+		const directory = { devices: [], truncated: false } as unknown as
+			MeshDirectorySnapshot & MeshWorkerDirectorySnapshot;
+		// The legacy dashboard can still read workers without exposing v1 data to the strict v2 tool parser.
+		Object.defineProperty(directory, 'workers', {
+			value: workers.filter((worker) => worker !== undefined),
+			enumerable: false,
+		});
+		return directory;
 	}
 
 	public persistDelegationIntent(
-		input: DelegationIntentInput,
+		input: CoordinatorDelegationInput,
 	): Promise<PersistedDelegationIntent> {
 		this.guard.assertAllowed({ requireWorkspace: false });
+		if ('deviceId' in input) {
+			return Promise.reject(new TaskToolFacadeError('PROTOCOL_INCOMPATIBLE'));
+		}
 		return this.mutate(async () => {
 			await this.assertOwner();
 			const requestHash = hashIntent(input);
@@ -288,7 +313,10 @@ export class TaskCoordinator implements TaskToolFacade {
 		return { taskId: snapshot.taskId, status: snapshot.state };
 	}
 
-	public async startTask(input: DelegationIntentInput, signal: AbortSignal): Promise<PersistedDelegationIntent> {
+	public async startTask(
+		input: CoordinatorDelegationInput,
+		signal: AbortSignal,
+	): Promise<PersistedDelegationIntent> {
 		await this.assertOwner();
 		const persisted = await this.persistDelegationIntent(input);
 		await this.waitForDelegationAcceptance(persisted, signal);
@@ -315,7 +343,9 @@ export class TaskCoordinator implements TaskToolFacade {
 
 	public async profileNames(): Promise<ReadonlyMap<string, string>> {
 		const profiles = await this.profiles.list();
-		return new Map(profiles.map((profile) => [profile.id, profile.workerDeviceId]));
+		return new Map(profiles
+			.filter(isUsablePeerProfile)
+			.map((profile) => [profile.id, profile.workerDeviceId]));
 	}
 
 	private read(): DelegationState {
@@ -367,9 +397,9 @@ export class TaskCoordinator implements TaskToolFacade {
 	}
 }
 
-function hashIntent(input: DelegationIntentInput): string {
+function hashIntent(input: CoordinatorDelegationInput): string {
 	const fields = [
-		input.peerId,
+		input.peerId ?? '',
 		input.workspaceId,
 		input.title,
 		input.prompt,

@@ -11,7 +11,7 @@ state.
 | Tool | Behavior | Application deadline |
 | --- | --- | ---: |
 | `mesh_list_workers` | Returns bounded peer capability and opaque workspace metadata. | 5 s |
-| `mesh_delegate_task` | Persists an intent, waits for worker acceptance, then returns `pending` with poll/cancel hints. | 15 s |
+| `mesh_delegate_task` | Persists an intent, waits for durable broker acceptance, then returns `pending` before Agent startup completes. | 15 s |
 | `mesh_get_task` | Returns a bounded snapshot, event cursor, event-gap indicator, and truncation indicator. | 10 s |
 | `mesh_cancel_task` | Requests cancellation through the owner-scoped Facade method. | 10 s |
 | `mesh_answer_task` | Sends an idempotent answer through the owner-scoped Facade method. | 10 s |
@@ -57,7 +57,7 @@ wire form before any generic error or empty-text fallback:
 
 | `s` | Meaning | Compact fields |
 | ---: | --- | --- |
-| `0` | Worker accepted; task is pending | `t` task ID, `d` delegation request ID |
+| `0` | Broker accepted; Agent startup is pending | `t` task ID, `d` delegation request ID |
 | `1` | Caller wait ended; durable delegation needs reconciliation | `t`, `d`, `r:1` |
 | `2` | Durable delegation error | `t`, `d`, `e` stable error code, `r` retry flag |
 | `3` | Intent persistence is still pending and IDs are not available | `r:1` |
@@ -83,7 +83,8 @@ in flight, while a fresh invocation creates a new task even when a terminal
 historical intent has identical semantics.
 
 The delegate's 15-second budget covers both durable intent persistence and the
-worker acceptance wait. Persistence itself is deliberately not given an abort
+broker acceptance wait. Agent startup continues asynchronously and is observed
+through `mesh_get_task`. Persistence itself is deliberately not given an abort
 signal: if the caller budget or cancellation wins first, the durable promise
 continues in the background and the Tool returns `pending`,
 `reconciliationPending: true`, and `retrySameIntent: true`. Retrying the exact

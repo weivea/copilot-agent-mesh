@@ -1,11 +1,11 @@
 import * as assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import type { DelegationIntentInput } from '../../shared/toolProtocol';
 import {
 	TaskCoordinator,
 	type CoordinatorPeerConnection,
 	type CoordinatorPeerManager,
+	type LegacyCoordinatorDelegationInput,
 } from '../application/TaskCoordinator';
 import { LocalDesktopWorkspaceGuard } from '../application/LocalDesktopWorkspaceGuard';
 import { InMemoryPeerProfileStore } from '../peer/PeerProfile';
@@ -144,7 +144,7 @@ function createCoordinator(
 	);
 }
 
-function delegationInput(): DelegationIntentInput {
+function delegationInput(): LegacyCoordinatorDelegationInput {
 	return {
 		peerId,
 		workspaceId,

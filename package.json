@@ -2,7 +2,7 @@
   "name": "copilot-agent-mesh",
   "displayName": "Copilot Agent Mesh",
   "description": "Preview mesh coordinator; experimental Worker hosting is limited to macOS arm64.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "preview": true,
   "publisher": "weivea",
   "license": "MIT",
@@ -29,7 +29,9 @@
     "multi-device",
     "remote-development"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./dist/extension.js",
   "files": [
     "dist/**",
@@ -59,8 +61,8 @@
         "displayName": "List Mesh Workers",
         "toolReferenceName": "meshListWorkers",
         "canBeReferencedInPrompt": true,
-        "modelDescription": "Lists currently available Copilot Agent Mesh peers and their opaque workspaces. Call this before delegating when the target peer or workspace is not already known.",
-        "userDescription": "List available remote worker devices and workspaces without exposing filesystem paths.",
+        "modelDescription": "Lists a bounded opaque Device -> Node -> Workspace hierarchy. Call this before delegating to obtain every explicit target ID. Results contain routing/status/capability metadata only, never paths, prompts, secrets, or raw task output.",
+        "userDescription": "List available mesh devices, window nodes, and workspaces without exposing filesystem paths.",
         "tags": [
           "copilot-agent-mesh"
         ],
@@ -75,8 +77,8 @@
         "displayName": "Delegate Mesh Task",
         "toolReferenceName": "meshDelegateTask",
         "canBeReferencedInPrompt": true,
-        "modelDescription": "Delegates a coding task to a selected Copilot Agent Mesh peer and opaque workspace. Omit delegationRequestId for a fresh user invocation; the tool generates and returns one. Reuse that ID only to retry the exact same payload, which recovers the same task; the same ID with a different payload conflicts. A fresh invocation is never deduplicated against completed history. Returns after worker acceptance with a pending task ID; use mesh_get_task to poll. Under a small token budget, compact JSON uses s state (0 accepted pending, 1 reconcile the same intent, 2 error, 3 persistence pending), t taskId, d delegationRequestId, e stable error code, and r retry/reconciliation flag; s=1 or s=3 with r=1 means retry the exact same intent and ID. Do not use this tool for Git, branch, worktree, commit, push, or pull request management.",
-        "userDescription": "Start an asynchronous coding task on a selected trusted worker and workspace.",
+        "modelDescription": "Delegates a coding task to one explicit Device -> Node -> Workspace target from mesh_list_workers. deviceId, nodeId, nodeInstanceId, and workspaceId are always required; optional peerId is internal remote routing metadata and never replaces those IDs. Omit delegationRequestId for a fresh user invocation; the tool generates and returns one. Reuse that ID only to retry the exact same payload, which recovers the same task; the same ID with a different payload conflicts. Returns after durable broker acceptance and before Agent startup completes with a pending task ID; use mesh_get_task to poll startup and terminal outcomes. Under a small token budget, compact JSON uses s state (0 accepted pending, 1 reconcile the same intent, 2 error, 3 persistence pending), t taskId, d delegationRequestId, e stable error code, and r retry/reconciliation flag; s=1 or s=3 with r=1 means retry the exact same intent and ID. Do not use this tool for Git, branch, worktree, commit, push, or pull request management.",
+        "userDescription": "Start an asynchronous coding task on an explicitly selected device, node, and workspace.",
         "tags": [
           "copilot-agent-mesh"
         ],
@@ -90,12 +92,26 @@
               "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
               "description": "Optional invocation identity. Omit for a fresh task; reuse the returned ID only for an exact retry."
             },
-            "peerId": {
+            "deviceId": {
               "type": "string",
               "minLength": 36,
               "maxLength": 36,
               "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-              "description": "Opaque peer ID returned by mesh_list_workers."
+              "description": "Explicit opaque target device ID returned by mesh_list_workers."
+            },
+            "nodeId": {
+              "type": "string",
+              "minLength": 36,
+              "maxLength": 36,
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+              "description": "Explicit opaque target node ID returned by mesh_list_workers."
+            },
+            "nodeInstanceId": {
+              "type": "string",
+              "minLength": 36,
+              "maxLength": 36,
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+              "description": "Explicit target node instance ID returned by mesh_list_workers."
             },
             "workspaceId": {
               "type": "string",
@@ -103,6 +119,13 @@
               "maxLength": 36,
               "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
               "description": "Opaque workspace ID returned by mesh_list_workers."
+            },
+            "peerId": {
+              "type": "string",
+              "minLength": 36,
+              "maxLength": 36,
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+              "description": "Optional internal routing metadata for a remote device; it does not replace explicit target IDs."
             },
             "title": {
               "type": "string",
@@ -133,7 +156,9 @@
             }
           },
           "required": [
-            "peerId",
+            "deviceId",
+            "nodeId",
+            "nodeInstanceId",
             "workspaceId",
             "title",
             "prompt"
@@ -471,10 +496,10 @@
     "watch": "npm-run-all -p watch:*",
     "watch:esbuild": "node esbuild.js --watch",
     "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
-    "package:vsix": "node -e \"require('node:fs').mkdirSync('artifacts',{recursive:true})\" && vsce package --pre-release --no-dependencies --out artifacts/copilot-agent-mesh-0.1.0-preview.vsix && npm run verify:vsix",
+    "package:vsix": "node -e \"require('node:fs').mkdirSync('artifacts',{recursive:true})\" && vsce package --pre-release --no-dependencies --out artifacts/copilot-agent-mesh-0.2.0-preview.vsix && npm run verify:vsix",
     "vsix:list": "vsce ls --no-dependencies",
-    "verify:vsix": "npm run vsix:list && node scripts/verify-vsix.mjs artifacts/copilot-agent-mesh-0.1.0-preview.vsix",
-    "smoke:vsix": "node scripts/smoke-vsix.mjs artifacts/copilot-agent-mesh-0.1.0-preview.vsix",
+    "verify:vsix": "npm run vsix:list && node scripts/verify-vsix.mjs artifacts/copilot-agent-mesh-0.2.0-preview.vsix",
+    "smoke:vsix": "node scripts/smoke-vsix.mjs artifacts/copilot-agent-mesh-0.2.0-preview.vsix",
     "compile-tests": "tsc -p . --outDir out",
     "watch-tests": "tsc -p . -w --outDir out",
     "check-types": "tsc --noEmit",
@@ -482,7 +507,8 @@
     "test:unit": "npm run compile-tests && node --test out/src/unitTest/*.test.js out/src/test/unit/*.test.js",
     "test:component": "npm run compile-tests && node --test out/src/componentTest/*.test.js",
     "test:dev-tunnel-real": "npm run compile-tests && node --test out/src/integrationTest/devTunnel.real.test.js",
-    "test:two-instance-real": "npm run compile-tests && npm run package && node scripts/e2e/two-instance/run.mjs",
+    "test:two-instance-real": "npm run compile-tests && npm run compile && node scripts/e2e/two-instance/run.mjs",
+    "test:multi-window-real": "npm run compile-tests && npm run compile && node scripts/e2e/multi-window/run.mjs",
     "test:extension": "npm run compile-tests && npm run compile && vscode-test",
     "test": "npm run test:unit && npm run test:component && npm run test:extension",
     "verify": "npm run test:unit && npm run test:component && npm run test:extension && npm run package:vsix",

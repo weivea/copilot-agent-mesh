@@ -1,5 +1,14 @@
 import { Buffer } from 'node:buffer';
 
+import {
+	nodeDirectoryResultSchema,
+	routedTaskStartParamsSchema,
+	taskAnswerParamsSchema,
+	taskCancelParamsSchema,
+	taskGetParamsSchema,
+	type RoutedTaskStartParams,
+} from '../../shared/protocol';
+
 export interface DeviceService {
 	getInfo(authenticatedPeerId: string): Promise<unknown>;
 }
@@ -31,6 +40,20 @@ export interface TaskService {
 	): Promise<unknown>;
 }
 
+export interface BrokerRoutingService {
+	listNodes(): unknown;
+	startRemote(authenticatedPeerId: string, params: RoutedTaskStartParams): Promise<unknown>;
+	getRemote(authenticatedPeerId: string, taskId: string, afterEventSeq?: number): Promise<unknown>;
+	cancelRemote(authenticatedPeerId: string, taskId: string): Promise<unknown>;
+	answerRemote(
+		authenticatedPeerId: string,
+		taskId: string,
+		inputId: string,
+		answerId: string,
+		answer: string,
+	): Promise<unknown>;
+}
+
 export class GatewayValidationError extends Error {
 	public constructor(message = 'Invalid method parameters.') {
 		super(message);
@@ -39,48 +62,83 @@ export class GatewayValidationError extends Error {
 }
 
 export class GatewayRouter {
+	private readonly brokerRouting: BrokerRoutingService | undefined;
+	private readonly workspaceService: WorkspaceService | undefined;
+	private readonly taskService: TaskService | undefined;
+
+	public constructor(
+		deviceService: DeviceService,
+		brokerRouting: BrokerRoutingService,
+	);
+	public constructor(
+		deviceService: DeviceService,
+		workspaceService: WorkspaceService,
+		taskService: TaskService,
+	);
 	public constructor(
 		private readonly deviceService: DeviceService,
-		private readonly workspaceService: WorkspaceService,
-		private readonly taskService: TaskService,
-	) {}
+		routingOrWorkspace: BrokerRoutingService | WorkspaceService,
+		taskService?: TaskService,
+	) {
+		if (taskService === undefined) {
+			this.brokerRouting = routingOrWorkspace as BrokerRoutingService;
+			this.workspaceService = undefined;
+			this.taskService = undefined;
+		} else {
+			this.brokerRouting = undefined;
+			this.workspaceService = routingOrWorkspace as WorkspaceService;
+			this.taskService = taskService;
+		}
+	}
 
 	public hasMethod(method: string): boolean {
-		return [
-			'device.getInfo',
-			'workspace.list',
-			'task.start',
-			'task.get',
-			'task.cancel',
-			'task.answer',
-		].includes(method);
+		return this.brokerRouting === undefined
+			? [
+				'device.getInfo',
+				'workspace.list',
+				'task.start',
+				'task.get',
+				'task.cancel',
+				'task.answer',
+			].includes(method)
+			: [
+				'device.getInfo',
+				'node.list',
+				'task.start',
+				'task.get',
+				'task.cancel',
+				'task.answer',
+			].includes(method);
 	}
 
 	public async dispatch(peerId: string, method: string, params: unknown): Promise<unknown> {
+		if (this.brokerRouting !== undefined) {
+			return this.dispatchV2(peerId, method, params);
+		}
 		switch (method) {
 			case 'device.getInfo':
 				assertObject(params, []);
 				return this.deviceService.getInfo(peerId);
 			case 'workspace.list':
 				assertObject(params, []);
-				return this.workspaceService.list(peerId);
+				return this.workspaceService!.list(peerId);
 			case 'task.start':
-				return this.taskService.start(peerId, validateTaskStart(params));
+				return this.taskService!.start(peerId, validateTaskStart(params));
 			case 'task.get': {
 				const value = assertObject(params, ['taskId'], ['afterEventSeq']);
 				const taskId = identifier(value.taskId);
 				const after = value.afterEventSeq === undefined
 					? undefined
 					: nonNegativeInteger(value.afterEventSeq);
-				return this.taskService.get(peerId, taskId, after);
+				return this.taskService!.get(peerId, taskId, after);
 			}
 			case 'task.cancel': {
 				const value = assertObject(params, ['taskId']);
-				return this.taskService.cancel(peerId, identifier(value.taskId));
+				return this.taskService!.cancel(peerId, identifier(value.taskId));
 			}
 			case 'task.answer': {
 				const value = assertObject(params, ['taskId', 'inputId', 'answerId', 'answer']);
-				return this.taskService.answer(
+				return this.taskService!.answer(
 					peerId,
 					identifier(value.taskId),
 					identifier(value.inputId),
@@ -91,6 +149,56 @@ export class GatewayRouter {
 			default:
 				throw new GatewayValidationError('Method is not allowlisted.');
 		}
+	}
+
+	private dispatchV2(peerId: string, method: string, params: unknown): Promise<unknown> {
+		const broker = this.brokerRouting!;
+		switch (method) {
+			case 'device.getInfo':
+				assertObject(params, []);
+				return this.deviceService.getInfo(peerId);
+			case 'node.list':
+				assertObject(params, []);
+				return Promise.resolve(nodeDirectoryResultSchema.parse(broker.listNodes()));
+			case 'task.start': {
+				const input = parseV2(routedTaskStartParamsSchema, params);
+				if (input.sourceNodeId !== undefined) {
+					throw new GatewayValidationError('Remote task routes cannot claim a local source node.');
+				}
+				return broker.startRemote(peerId, input);
+			}
+			case 'task.get': {
+				const input = parseV2(taskGetParamsSchema, params);
+				return broker.getRemote(peerId, input.taskId, input.afterEventSeq);
+			}
+			case 'task.cancel': {
+				const input = parseV2(taskCancelParamsSchema, params);
+				return broker.cancelRemote(peerId, input.taskId);
+			}
+			case 'task.answer': {
+				const input = parseV2(taskAnswerParamsSchema, params);
+				return broker.answerRemote(
+					peerId,
+					input.taskId,
+					input.inputId,
+					input.answerId,
+					input.answer,
+				);
+			}
+			default:
+				throw new GatewayValidationError('Method is not allowlisted.');
+		}
+	}
+}
+
+function parseV2<T>(
+	schema: { parse(value: unknown): T },
+	value: unknown,
+): T {
+	try {
+		return schema.parse(value);
+	} catch {
+		throw new GatewayValidationError();
 	}
 }
 

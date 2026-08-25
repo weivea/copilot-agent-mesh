@@ -1,7 +1,7 @@
 import type {
 	DelegationAcceptance,
 	DelegationIntentInput,
-	MeshWorkerDirectorySnapshot,
+	MeshDirectorySnapshot,
 	PersistedDelegationIntent,
 	TaskActionReceipt,
 	TaskToolErrorCode,
@@ -9,7 +9,9 @@ import type {
 } from '../../shared/toolProtocol';
 
 export interface TaskToolFacade {
-	listWorkers(signal: AbortSignal): Promise<MeshWorkerDirectorySnapshot>;
+	readonly sourceNodeId?: string;
+
+	listWorkers(signal: AbortSignal): Promise<MeshDirectorySnapshot>;
 
 	/**
 	 * Resolves only after the intent and both IDs are durable. An exact retry

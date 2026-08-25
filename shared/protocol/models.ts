@@ -62,8 +62,7 @@ export const recoveryDescriptorSchema = z.strictObject({
 
 export type RecoveryDescriptor = z.infer<typeof recoveryDescriptorSchema>;
 
-const persistedTaskRecordObjectSchema = z.strictObject({
-	schemaVersion: z.literal(1),
+const persistedTaskRecordCommonFields = {
 	taskId: uuidSchema,
 	delegationRequestId: uuidSchema,
 	requestHash: z.string().regex(/^[a-f0-9]{64}$/),
@@ -85,11 +84,53 @@ const persistedTaskRecordObjectSchema = z.strictObject({
 	events: z.array(taskEventRecordSchema),
 	earliestAvailableEventSeq: z.number().int().positive().optional(),
 	eventsTruncated: z.boolean(),
+};
+
+export const persistedTaskRoutingTargetSchema = z.strictObject({
+	deviceId: uuidSchema,
+	workspaceId: uuidSchema,
+	nodeId: uuidSchema.optional(),
+	nodeInstanceId: uuidSchema.optional(),
+}).superRefine((target, context) => {
+	if ((target.nodeId === undefined) !== (target.nodeInstanceId === undefined)) {
+		context.addIssue({
+			code: 'custom',
+			path: ['nodeId'],
+			message: 'Live task routing requires both nodeId and nodeInstanceId',
+		});
+	}
 });
 
-export const persistedTaskRecordSchema = persistedTaskRecordObjectSchema
+export const persistedTaskRecordV1Schema = z.strictObject({
+	schemaVersion: z.literal(1),
+	...persistedTaskRecordCommonFields,
+});
+
+export const persistedTaskRecordV2Schema = z.strictObject({
+	schemaVersion: z.literal(2),
+	...persistedTaskRecordCommonFields,
+	target: persistedTaskRoutingTargetSchema,
+	sourceNodeId: uuidSchema.optional(),
+});
+
+export const persistedTaskRecordSchema = z.discriminatedUnion('schemaVersion', [
+	persistedTaskRecordV1Schema,
+	persistedTaskRecordV2Schema,
+])
 	.superRefine(validateTaskState)
-	.superRefine(validateFullJournal);
+	.superRefine(validateFullJournal)
+	.superRefine((record, context) => {
+		if (
+			record.schemaVersion === 2
+			&& record.workspaceId !== record.target.workspaceId
+		) {
+			context.addIssue({
+				code: 'custom',
+				path: ['target', 'workspaceId'],
+				message: 'The persisted task target must match workspaceId',
+			});
+		}
+	});
 
 function validateTaskState(
 	record: {
@@ -222,16 +263,22 @@ function validateFullJournal(
 }
 
 export type PersistedTaskRecord = z.infer<typeof persistedTaskRecordSchema>;
+export type PersistedTaskRecordV1 = z.infer<typeof persistedTaskRecordV1Schema>;
+export type PersistedTaskRecordV2 = z.infer<typeof persistedTaskRecordV2Schema>;
+export type PersistedTaskRoutingTarget = z.infer<typeof persistedTaskRoutingTargetSchema>;
 
-const taskSnapshotObjectSchema = persistedTaskRecordObjectSchema
-	.omit({
-		recoveryDescriptor: true,
-		answeredInputs: true,
-		workspaceLeaseKey: true,
-	})
-	.extend({
-		deviceId: uuidSchema,
-	});
+const {
+	recoveryDescriptor: _recoveryDescriptorSchema,
+	answeredInputs: _answeredInputsSchema,
+	workspaceLeaseKey: _workspaceLeaseKeySchema,
+	...taskSnapshotCommonFields
+} = persistedTaskRecordCommonFields;
+
+const taskSnapshotObjectSchema = z.strictObject({
+	schemaVersion: z.union([z.literal(1), z.literal(2)]),
+	...taskSnapshotCommonFields,
+	deviceId: uuidSchema,
+});
 
 function validateWireJournalBudget(
 	snapshot: { readonly events: readonly z.infer<typeof taskEventRecordSchema>[] },

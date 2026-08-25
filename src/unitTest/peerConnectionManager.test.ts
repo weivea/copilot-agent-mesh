@@ -22,7 +22,7 @@ import {
 } from '../peer/WebSocketPeerTransport';
 
 const connectionUrl = 'https://worker.example/agent-mesh/connect'
-	+ '?v=1&device=worker&invite=invitation'
+	+ '?v=2&device=worker&invite=invitation'
 	+ `#secret=${encodeBase64Url(Buffer.alloc(32, 1))}`;
 
 test('PeerConnectionManager dispose rolls back an add blocked in secret storage', async () => {
@@ -206,6 +206,56 @@ test('PeerConnectionManager creates one managed connection for concurrent connec
 	assert.equal(closeCalls, 1);
 });
 
+test('PeerConnectionManager retries a retained session after cleanup rejects', async () => {
+	const profile: PeerProfile = {
+		id: 'retry-cleanup-profile',
+		rpcEndpoint: 'wss://worker.example/agent-mesh/rpc',
+		workerDeviceId: 'worker',
+		peerId: 'peer',
+		credentialKeyRef: 'credential',
+	};
+	const profiles = new InMemoryPeerProfileStore();
+	await profiles.store(profile);
+	let closeCalls = 0;
+	let closeFailures = 2;
+	const transport: PeerTransport = {
+		connect: async () => ({
+			profile,
+			request: async () => undefined,
+			onClose: () => () => undefined,
+			close: async () => {
+				closeCalls += 1;
+				if (closeFailures > 0) {
+					closeFailures -= 1;
+					throw new Error('peer cleanup failed');
+				}
+			},
+		}),
+	};
+	const manager = new PeerConnectionManager(
+		'coordinator',
+		profiles,
+		new InMemorySecretStore(),
+		transport,
+	);
+	await manager.connect(profile.id);
+
+	await assert.rejects(manager.dispose(), (error: unknown) =>
+		error instanceof AggregateError
+		&& error.errors.length === 1
+		&& error.errors[0] instanceof Error
+		&& error.errors[0].message === 'peer cleanup failed',
+	);
+	assert.equal(closeCalls, 2);
+	assert.ok(manager.get(profile.id));
+
+	await manager.dispose();
+	assert.equal(closeCalls, 3);
+	assert.equal(manager.get(profile.id), undefined);
+	await manager.dispose();
+	assert.equal(closeCalls, 3);
+});
+
 for (const reason of ['AUTH_FAILED', 'PROTOCOL_INCOMPATIBLE'] as const) {
 	test(`PeerConnectionManager rolls back a new add after terminal ${reason}`, async () => {
 		const secrets = new InMemorySecretStore();
@@ -342,13 +392,18 @@ test('PeerConnectionManager rolls back a provisional peer after a retry becomes 
 	await manager.dispose();
 });
 
-test('PeerConnectionManager does not restore a profile after partial secret rollback', async () => {
+test('PeerConnectionManager retains and restores a cleanup tombstone after partial secret rollback', async () => {
 	const storedSecrets = new InMemorySecretStore();
+	let credentialDeleteFailures = 1;
 	const secrets: SecretStore = {
 		get: (key) => storedSecrets.get(key),
 		store: (key, value) => storedSecrets.store(key, value),
 		delete: async (key) => {
-			if (key === 'mesh.remotePeer.rollback-profile') {
+			if (
+				key === 'mesh.remotePeer.rollback-profile'
+				&& credentialDeleteFailures > 0
+			) {
+				credentialDeleteFailures -= 1;
 				throw new Error('Credential deletion failed.');
 			}
 			await storedSecrets.delete(key);
@@ -388,9 +443,35 @@ test('PeerConnectionManager does not restore a profile after partial secret roll
 
 	await assert.rejects(manager.add(connectionUrl), /roll back/u);
 
-	assert.equal(await profiles.get('rollback-profile'), undefined);
+	assert.deepEqual(await profiles.get('rollback-profile'), {
+		id: 'rollback-profile',
+		generation: 'rollback-profile',
+		rpcEndpoint: 'wss://worker.example/agent-mesh/rpc',
+		workerDeviceId: 'worker',
+		cleanupPending: true,
+		credentialKeyRef: 'mesh.remotePeer.rollback-profile',
+	});
+	assert.equal(await storedSecrets.get('mesh.remoteInvitation.rollback-profile'), undefined);
 	assert.ok(await storedSecrets.get('mesh.remotePeer.rollback-profile'));
+	assert.equal(await storedSecrets.get('mesh.remoteCommit.rollback-profile'), undefined);
 	assert.equal(manager.get('rollback-profile'), undefined);
+	let reconnectAttempts = 0;
+	const restarted = new PeerConnectionManager(
+		'coordinator',
+		profiles,
+		secrets,
+		{
+			connect: async () => {
+				reconnectAttempts += 1;
+				throw new Error('Cleanup tombstones must not connect.');
+			},
+		},
+	);
+	await restarted.restore();
+	assert.equal(reconnectAttempts, 0);
+	assert.equal(await profiles.get('rollback-profile'), undefined);
+	assert.equal(await storedSecrets.get('mesh.remotePeer.rollback-profile'), undefined);
+	await restarted.dispose();
 	await manager.dispose();
 });
 
@@ -450,7 +531,13 @@ test('PeerConnectionManager reports and awaits a background rollback failure on 
 			&& error.message === 'One or more peer reconnect operations failed.'
 		),
 	);
-	assert.equal(await profiles.get('background-profile'), undefined);
+	assert.deepEqual(await profiles.get('background-profile'), {
+		id: 'background-profile',
+		rpcEndpoint: 'wss://worker.example/agent-mesh/rpc',
+		workerDeviceId: 'worker',
+		cleanupPending: true,
+		credentialKeyRef: 'background-credential',
+	});
 	assert.ok(await storedSecrets.get('background-credential'));
 });
 

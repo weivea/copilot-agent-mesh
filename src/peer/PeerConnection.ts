@@ -4,6 +4,7 @@ import type {
 	PeerProfile,
 	PeerProfileStore,
 } from './PeerProfile';
+import { isUsablePeerProfile } from './PeerProfile';
 import {
 	PeerTransportError,
 	type PeerSession,
@@ -90,6 +91,9 @@ export class PeerConnection {
 			if (profile === undefined) {
 				throw new Error('Peer profile does not exist.');
 			}
+			if (!isUsablePeerProfile(profile)) {
+				throw new Error('Peer profile cleanup is pending.');
+			}
 			const session = await this.transport.connect(
 				profile,
 				this.coordinatorDeviceId,
@@ -173,9 +177,11 @@ export class PeerConnection {
 		this.controller = undefined;
 		await this.connecting?.catch(() => undefined);
 		const session = this.session;
-		this.session = undefined;
 		if (session !== undefined) {
 			await session.close();
+			if (this.session === session) {
+				this.session = undefined;
+			}
 		}
 		this.setState('offline');
 	}

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 
 import {
 	DelegationIntentInput,
-	MeshWorkerDirectorySnapshot,
+	MeshDirectorySnapshot,
 	PersistedDelegationIntent,
 	TASK_TOOL_DEADLINES_MS,
 	TASK_TOOL_ERROR_CODES,
@@ -37,8 +37,11 @@ export interface ToolDeadlineTimer {
 
 export interface DelegateTaskInput {
 	readonly delegationRequestId?: string;
-	readonly peerId: string;
+	readonly deviceId: string;
+	readonly nodeId: string;
+	readonly nodeInstanceId: string;
 	readonly workspaceId: string;
+	readonly peerId?: string;
 	readonly title: string;
 	readonly prompt: string;
 	readonly acceptanceCriteria?: readonly string[];
@@ -174,14 +177,18 @@ export class TaskToolsCore {
 
 	prepareDelegateInvocation(rawInput: unknown): DelegateInvocationPreparation {
 		const input = parseDelegateTaskInput(rawInput);
-		const summary = input.title.replace(/\s+/g, ' ').slice(0, 160);
+		const source = this.facade.sourceNodeId === undefined
+			? 'This Window'
+			: `This Window (${this.facade.sourceNodeId})`;
 		return {
-			invocationMessage: `Waiting up to ${TASK_TOOL_DEADLINES_MS.delegateTask / 1_000}s for worker acceptance`,
+			invocationMessage: `Waiting up to ${TASK_TOOL_DEADLINES_MS.delegateTask / 1_000}s for durable broker acceptance`,
 			confirmationTitle: 'Delegate this task to a mesh worker?',
 			confirmationMessage: [
-				`Peer: ${input.peerId}`,
+				`Source: ${source}`,
+				`Target node: ${input.nodeId} (${input.nodeInstanceId})`,
 				`Workspace: ${input.workspaceId}`,
-				`Title: ${summary}`,
+				`Title: ${input.title}`,
+				`Prompt:\n${input.prompt}`,
 			].join('\n'),
 		};
 	}
@@ -559,73 +566,101 @@ export class TaskToolsCore {
 		});
 	}
 
-	private boundWorkerResult(directory: MeshWorkerDirectorySnapshot): ToolJsonResult {
-		const workers: Array<{
-			peerId: string;
+	private boundWorkerResult(directory: MeshDirectorySnapshot): ToolJsonResult {
+		const devices: Array<{
+			deviceId: string;
 			deviceName: string;
-			capabilities: string[];
-			workspaces: Array<{
-				workspaceId: string;
-				name: string;
-				tags: string[];
-				busy: boolean;
-			}>;
-		}> = [];
-		const result: {
-			status: string;
-			workers: typeof workers;
-			truncated: boolean;
-		} = { status: 'ok', workers, truncated: false };
-
-		for (const sourceWorker of directory.workers) {
-			const worker = {
-				peerId: sourceWorker.peerId,
-				deviceName: sourceWorker.deviceName,
-				capabilities: [] as string[],
-				workspaces: [] as Array<{
+			locality: 'local' | 'remote';
+			status: 'online' | 'incompatible';
+			peerId?: string;
+			nodes: Array<{
+				nodeId: string;
+				nodeInstanceId: string;
+				label: string;
+				status: 'online' | 'busy' | 'offline' | 'conflict' | 'draining';
+				capabilities: string[];
+				workspaces: Array<{
 					workspaceId: string;
 					name: string;
 					tags: string[];
 					busy: boolean;
-				}>,
+					claimStatus: 'claimed' | 'readOnly' | 'conflict';
+				}>;
+			}>;
+		}> = [];
+		const result: {
+			status: string;
+			devices: typeof devices;
+			truncated: boolean;
+		} = { status: 'ok', devices, truncated: false };
+		const sourceTruncated = directory.truncated
+			|| directory.devices.some(({ nodesTruncated }) => nodesTruncated);
+
+		for (const sourceDevice of directory.devices) {
+			const device = {
+				deviceId: sourceDevice.deviceId,
+				deviceName: sourceDevice.deviceName,
+				locality: sourceDevice.locality,
+				status: sourceDevice.status,
+				...(sourceDevice.peerId === undefined ? {} : { peerId: sourceDevice.peerId }),
+				nodes: [] as typeof devices[number]['nodes'],
 			};
-			workers.push(worker);
+			devices.push(device);
 			if (utf8JsonBytes(result) > this.outputByteLimit) {
-				workers.pop();
+				devices.pop();
 				result.truncated = true;
 				break;
 			}
 
-			for (const capability of sourceWorker.capabilities) {
-				worker.capabilities.push(capability);
-				if (utf8JsonBytes(result) > this.outputByteLimit) {
-					worker.capabilities.pop();
-					result.truncated = true;
-					break;
-				}
-			}
-			if (result.truncated) {
-				break;
-			}
-
-			for (const sourceWorkspace of sourceWorker.workspaces) {
-				const workspace = {
-					workspaceId: sourceWorkspace.workspaceId,
-					name: sourceWorkspace.name,
-					tags: [] as string[],
-					busy: sourceWorkspace.busy,
+			for (const sourceNode of sourceDevice.nodes) {
+				const node = {
+					nodeId: sourceNode.nodeId,
+					nodeInstanceId: sourceNode.nodeInstanceId,
+					label: sourceNode.label,
+					status: sourceNode.status,
+					capabilities: [] as string[],
+					workspaces: [] as typeof devices[number]['nodes'][number]['workspaces'],
 				};
-				worker.workspaces.push(workspace);
+				device.nodes.push(node);
 				if (utf8JsonBytes(result) > this.outputByteLimit) {
-					worker.workspaces.pop();
+					device.nodes.pop();
 					result.truncated = true;
 					break;
 				}
-				for (const tag of sourceWorkspace.tags) {
-					workspace.tags.push(tag);
+				for (const capability of sourceNode.capabilities) {
+					node.capabilities.push(capability);
 					if (utf8JsonBytes(result) > this.outputByteLimit) {
-						workspace.tags.pop();
+						node.capabilities.pop();
 						result.truncated = true;
+						break;
+					}
+				}
+				if (result.truncated) {
+					break;
+				}
+				for (const sourceWorkspace of sourceNode.workspaces) {
+					const workspace = {
+						workspaceId: sourceWorkspace.workspaceId,
+						name: sourceWorkspace.name,
+						tags: [] as string[],
+						busy: sourceWorkspace.busy,
+						claimStatus: sourceWorkspace.claimStatus,
+					};
+					node.workspaces.push(workspace);
+					if (utf8JsonBytes(result) > this.outputByteLimit) {
+						node.workspaces.pop();
+						result.truncated = true;
+						break;
+					}
+					for (const tag of sourceWorkspace.tags) {
+						workspace.tags.push(tag);
+						if (utf8JsonBytes(result) > this.outputByteLimit) {
+							workspace.tags.pop();
+							result.truncated = true;
+							break;
+						}
+					}
+					if (result.truncated) {
 						break;
 					}
 				}
@@ -637,6 +672,7 @@ export class TaskToolsCore {
 				break;
 			}
 		}
+		result.truncated ||= sourceTruncated;
 		return this.fitResult(result);
 	}
 
@@ -856,6 +892,9 @@ export function parseDelegateTaskInput(value: unknown): DelegationIntentInput {
 	const input = expectRecord(value, 'input');
 	expectExactKeys(input, [
 		'delegationRequestId',
+		'deviceId',
+		'nodeId',
+		'nodeInstanceId',
 		'peerId',
 		'workspaceId',
 		'title',
@@ -866,7 +905,10 @@ export function parseDelegateTaskInput(value: unknown): DelegationIntentInput {
 	const delegationRequestId = input.delegationRequestId === undefined
 		? undefined
 		: expectIdentifier(input.delegationRequestId, 'delegationRequestId');
-	const peerId = expectIdentifier(input.peerId, 'peerId');
+	const deviceId = expectIdentifier(input.deviceId, 'deviceId');
+	const nodeId = expectIdentifier(input.nodeId, 'nodeId');
+	const nodeInstanceId = expectIdentifier(input.nodeInstanceId, 'nodeInstanceId');
+	const peerId = input.peerId === undefined ? undefined : expectIdentifier(input.peerId, 'peerId');
 	const workspaceId = expectIdentifier(input.workspaceId, 'workspaceId');
 	const title = expectString(input.title, 'title', TASK_TOOL_LIMITS.titleBytes);
 	const prompt = expectString(input.prompt, 'prompt', TASK_TOOL_LIMITS.promptBytes);
@@ -883,8 +925,11 @@ export function parseDelegateTaskInput(value: unknown): DelegationIntentInput {
 		: expectInteger(input.timeoutMinutes, 'timeoutMinutes', 1, 1_440);
 	return {
 		...(delegationRequestId === undefined ? {} : { delegationRequestId }),
-		peerId,
+		deviceId,
+		nodeId,
+		nodeInstanceId,
 		workspaceId,
+		...(peerId === undefined ? {} : { peerId }),
 		title,
 		prompt,
 		acceptanceCriteria,
@@ -980,44 +1025,131 @@ export async function serializeToolResultToTokenBudget(
 	return serialized;
 }
 
-function parseWorkerDirectory(value: unknown): MeshWorkerDirectorySnapshot {
+function parseWorkerDirectory(value: unknown): MeshDirectorySnapshot {
 	const directory = expectRecord(value, 'worker directory');
-	expectExactKeys(directory, ['workers']);
-	const workers = expectArray(directory.workers, 'workers', TASK_TOOL_LIMITS.maxWorkers).map((workerValue) => {
-		const worker = expectRecord(workerValue, 'worker');
-		expectExactKeys(worker, ['peerId', 'deviceName', 'capabilities', 'workspaces']);
-		const workspaces = expectArray(
-			worker.workspaces,
-			'workspaces',
-			TASK_TOOL_LIMITS.maxWorkspacesPerWorker,
-		).map((workspaceValue) => {
-			const workspace = expectRecord(workspaceValue, 'workspace');
-			expectExactKeys(workspace, ['workspaceId', 'name', 'tags', 'busy']);
+	expectExactKeys(directory, ['devices', 'truncated']);
+	const devices = expectArray(directory.devices, 'devices', TASK_TOOL_LIMITS.maxDevices)
+		.map((deviceValue) => {
+			const device = expectRecord(deviceValue, 'device');
+			expectExactKeys(device, [
+				'deviceId',
+				'deviceName',
+				'locality',
+				'status',
+				'peerId',
+				'nodes',
+				'nodesTruncated',
+				'totalNodes',
+			]);
+			const locality = expectEnum(device.locality, 'locality', ['local', 'remote'] as const);
+			const peerId = device.peerId === undefined
+				? undefined
+				: expectIdentifier(device.peerId, 'peerId');
+			if (locality === 'local' && peerId !== undefined) {
+				throw new Error('local devices cannot include remote routing metadata.');
+			}
+			const nodes = expectArray(
+				device.nodes,
+				'nodes',
+				TASK_TOOL_LIMITS.maxNodesPerDevice,
+			).map((nodeValue) => {
+				const node = expectRecord(nodeValue, 'node');
+				expectExactKeys(node, [
+					'nodeId',
+					'nodeInstanceId',
+					'label',
+					'status',
+					'capabilities',
+					'workspaces',
+				]);
+				const workspaces = expectArray(
+					node.workspaces,
+					'workspaces',
+					TASK_TOOL_LIMITS.maxWorkspacesPerNode,
+				).map((workspaceValue) => {
+					const workspace = expectRecord(workspaceValue, 'workspace');
+					expectExactKeys(workspace, [
+						'workspaceId',
+						'name',
+						'tags',
+						'busy',
+						'claimStatus',
+					]);
+					return {
+						workspaceId: expectIdentifier(workspace.workspaceId, 'workspaceId'),
+						name: expectString(
+							workspace.name,
+							'workspace name',
+							TASK_TOOL_LIMITS.workspaceNameBytes,
+						),
+						tags: expectStringArray(
+							workspace.tags,
+							'workspace tags',
+							TASK_TOOL_LIMITS.maxTagsPerWorkspace,
+							TASK_TOOL_LIMITS.capabilityBytes,
+						),
+						busy: expectBoolean(workspace.busy, 'busy'),
+						claimStatus: expectEnum(
+							workspace.claimStatus,
+							'claimStatus',
+							['claimed', 'readOnly', 'conflict'] as const,
+						),
+					};
+				});
+				return {
+					nodeId: expectIdentifier(node.nodeId, 'nodeId'),
+					nodeInstanceId: expectIdentifier(node.nodeInstanceId, 'nodeInstanceId'),
+					label: expectString(node.label, 'node label', TASK_TOOL_LIMITS.nodeLabelBytes),
+					status: expectEnum(
+						node.status,
+						'node status',
+						['online', 'busy', 'offline', 'conflict', 'draining'] as const,
+					),
+					capabilities: expectStringArray(
+						node.capabilities,
+						'capabilities',
+						TASK_TOOL_LIMITS.maxCapabilitiesPerNode,
+						TASK_TOOL_LIMITS.capabilityBytes,
+					),
+					workspaces,
+				};
+			});
+			const nodesTruncated = expectBoolean(device.nodesTruncated, 'nodesTruncated');
+			const totalNodes = expectInteger(
+				device.totalNodes,
+				'totalNodes',
+				nodes.length,
+				TASK_TOOL_LIMITS.maxNodesPerDevice,
+			);
+			if (
+				(nodesTruncated && totalNodes === nodes.length)
+				|| (!nodesTruncated && totalNodes !== nodes.length)
+			) {
+				throw new Error('device node truncation metadata is inconsistent.');
+			}
 			return {
-				workspaceId: expectIdentifier(workspace.workspaceId, 'workspaceId'),
-				name: expectString(workspace.name, 'workspace name', TASK_TOOL_LIMITS.workspaceNameBytes),
-				tags: expectStringArray(
-					workspace.tags,
-					'workspace tags',
-					TASK_TOOL_LIMITS.maxCapabilitiesPerWorker,
-					TASK_TOOL_LIMITS.capabilityBytes,
+				deviceId: expectIdentifier(device.deviceId, 'deviceId'),
+				deviceName: expectString(
+					device.deviceName,
+					'deviceName',
+					TASK_TOOL_LIMITS.deviceNameBytes,
 				),
-				busy: expectBoolean(workspace.busy, 'busy'),
+				locality,
+				status: expectEnum(
+					device.status,
+					'device status',
+					['online', 'incompatible'] as const,
+				),
+				...(peerId === undefined ? {} : { peerId }),
+				nodes,
+				nodesTruncated,
+				totalNodes,
 			};
 		});
-		return {
-			peerId: expectIdentifier(worker.peerId, 'peerId'),
-			deviceName: expectString(worker.deviceName, 'deviceName', TASK_TOOL_LIMITS.deviceNameBytes),
-			capabilities: expectStringArray(
-				worker.capabilities,
-				'capabilities',
-				TASK_TOOL_LIMITS.maxCapabilitiesPerWorker,
-				TASK_TOOL_LIMITS.capabilityBytes,
-			),
-			workspaces,
-		};
-	});
-	return { workers };
+	return {
+		devices,
+		truncated: expectBoolean(directory.truncated, 'truncated'),
+	};
 }
 
 function parsePersistedIntent(value: unknown): PersistedDelegationIntent {
@@ -1276,6 +1408,17 @@ function expectBoolean(value: unknown, field: string): boolean {
 	return value;
 }
 
+function expectEnum<const T extends readonly string[]>(
+	value: unknown,
+	field: string,
+	values: T,
+): T[number] {
+	if (typeof value !== 'string' || !(values as readonly string[]).includes(value)) {
+		throw new Error(`${field} is invalid.`);
+	}
+	return value as T[number];
+}
+
 function expectInteger(value: unknown, field: string, minimum: number, maximum: number): number {
 	if (!Number.isSafeInteger(value) || (value as number) < minimum || (value as number) > maximum) {
 		throw new Error(`${field} must be an integer between ${minimum} and ${maximum}.`);
@@ -1336,12 +1479,15 @@ function shrinkToolResult(value: ToolJsonResult): ToolJsonResult | undefined {
 			truncated: true,
 		};
 	}
-	if (Array.isArray(value.workers) && value.workers.length > 0) {
-		return {
-			...value,
-			workers: value.workers.slice(0, -1),
-			truncated: true,
-		};
+	if (Array.isArray(value.devices) && value.devices.length > 0) {
+		const smallerDirectory = shrinkDirectoryDevices(value.devices);
+		if (smallerDirectory !== undefined) {
+			return {
+				...value,
+				devices: smallerDirectory,
+				truncated: true,
+			};
+		}
 	}
 	if (isRecord(value.snapshot)) {
 		const snapshot = value.snapshot;
@@ -1349,6 +1495,7 @@ function shrinkToolResult(value: ToolJsonResult): ToolJsonResult | undefined {
 			const { summary: _summary, ...withoutSummary } = snapshot;
 			return { ...value, snapshot: withoutSummary, truncated: true };
 		}
+
 		if (snapshot.artifacts !== undefined) {
 			const { artifacts: _artifacts, ...withoutArtifacts } = snapshot;
 			return { ...value, snapshot: withoutArtifacts, truncated: true };
@@ -1474,6 +1621,64 @@ function shrinkToolResult(value: ToolJsonResult): ToolJsonResult | undefined {
 		return withoutRecovered;
 	}
 	return undefined;
+}
+
+function shrinkDirectoryDevices(devices: readonly unknown[]): readonly unknown[] | undefined {
+	const lastDevice = devices.at(-1);
+	if (!isRecord(lastDevice)) {
+		return devices.slice(0, -1);
+	}
+	const nodes = Array.isArray(lastDevice.nodes) ? lastDevice.nodes : [];
+	const lastNode = nodes.at(-1);
+	if (isRecord(lastNode)) {
+		const workspaces = Array.isArray(lastNode.workspaces) ? lastNode.workspaces : [];
+		const lastWorkspace = workspaces.at(-1);
+		if (
+			isRecord(lastWorkspace)
+			&& Array.isArray(lastWorkspace.tags)
+			&& lastWorkspace.tags.length > 0
+		) {
+			return replaceLast(devices, {
+				...lastDevice,
+				nodes: replaceLast(nodes, {
+					...lastNode,
+					workspaces: replaceLast(workspaces, {
+						...lastWorkspace,
+						tags: lastWorkspace.tags.slice(0, -1),
+					}),
+				}),
+			});
+		}
+		if (workspaces.length > 0) {
+			return replaceLast(devices, {
+				...lastDevice,
+				nodes: replaceLast(nodes, {
+					...lastNode,
+					workspaces: workspaces.slice(0, -1),
+				}),
+			});
+		}
+		if (Array.isArray(lastNode.capabilities) && lastNode.capabilities.length > 0) {
+			return replaceLast(devices, {
+				...lastDevice,
+				nodes: replaceLast(nodes, {
+					...lastNode,
+					capabilities: lastNode.capabilities.slice(0, -1),
+				}),
+			});
+		}
+		if (nodes.length > 0) {
+			return replaceLast(devices, {
+				...lastDevice,
+				nodes: nodes.slice(0, -1),
+			});
+		}
+	}
+	return devices.slice(0, -1);
+}
+
+function replaceLast(values: readonly unknown[], replacement: unknown): readonly unknown[] {
+	return [...values.slice(0, -1), replacement];
 }
 
 function compactTaskEventWindow(value: ToolJsonResult): ToolJsonResult {

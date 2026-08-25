@@ -7,7 +7,10 @@ import {
 	isE2eCapabilityEnabled,
 } from '../composition/E2eCapability';
 import { createTwoDeviceE2eApi } from '../composition/TwoDeviceE2eApi';
-import { VscodeLocalTaskApproval } from '../composition/VscodeAgentRuntime';
+import {
+	VscodeLocalTaskApproval,
+	VscodeWindowNodeTaskConfirmation,
+} from '../composition/VscodeAgentRuntime';
 
 const nonce = '00000000-0000-4000-8000-000000000001';
 
@@ -26,14 +29,17 @@ test('production mode rejects the E2E capability even with matching environment 
 	assert.throws(() => capability.assertRequest(nonce, 'worker'), /rejected/u);
 	assert.equal(
 		createTwoDeviceE2eApi(
-			undefined as never,
-			undefined as never,
-			undefined as never,
-			undefined as never,
-			undefined as never,
-			undefined as never,
-			undefined as never,
-			capability,
+			{
+				vscodeApi: undefined as never,
+				bindings: undefined as never,
+				node: undefined as never,
+				localTasks: undefined as never,
+				remoteTasks: undefined as never,
+				runtime: undefined as never,
+				lifecycle: undefined as never,
+				ownerRuntime: () => undefined,
+				capability,
+			},
 		),
 		undefined,
 	);
@@ -99,14 +105,17 @@ test('development mode rejects wrong nonce or role and authorizes only the match
 	assert.throws(() => capability.assertRequest(nonce, 'coordinator'), /rejected/u);
 
 	const api = createTwoDeviceE2eApi(
-		undefined as never,
-		undefined as never,
-		undefined as never,
-		undefined as never,
-		undefined as never,
-		undefined as never,
-		undefined as never,
-		capability,
+		{
+			vscodeApi: undefined as never,
+			bindings: undefined as never,
+			node: undefined as never,
+			localTasks: undefined as never,
+			remoteTasks: undefined as never,
+			runtime: undefined as never,
+			lifecycle: undefined as never,
+			ownerRuntime: () => undefined,
+			capability,
+		},
 	);
 	assert.ok(api);
 	api.authorize({ nonce, role: 'worker' });
@@ -121,6 +130,24 @@ test('development mode rejects wrong nonce or role and authorizes only the match
 		),
 		/rejected/u,
 	);
+
+	let prompts = 0;
+	const confirmation = new VscodeWindowNodeTaskConfirmation({
+		window: {
+			showWarningMessage: async () => {
+				prompts += 1;
+				return 'Run Once';
+			},
+		},
+	} as unknown as typeof vscode, capability);
+	assert.equal(await confirmation.confirm({
+		sourceWindowLabel: 'repo-a',
+		targetWindowLabel: 'repo-b',
+		workspaceDisplayName: 'repo-b',
+		taskTitle: 'Gated real task',
+		prompt: 'Use the production runtime.',
+	}), 'once');
+	assert.equal(prompts, 0);
 });
 
 class MemoryState {

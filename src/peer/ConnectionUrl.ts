@@ -1,4 +1,5 @@
 import { decodeFixedBase64Url, SECRET_BYTES } from '../gateway/PairingCrypto';
+import { MESH_PROTOCOL_VERSION } from '../../shared/protocol';
 
 export interface ParsedConnectionUrl {
 	readonly rpcEndpoint: string;
@@ -33,7 +34,7 @@ export function parseConnectionUrl(input: string): ParsedConnectionUrl {
 		|| url.searchParams.getAll('v').length !== 1
 		|| url.searchParams.getAll('device').length !== 1
 		|| url.searchParams.getAll('invite').length !== 1
-		|| url.searchParams.get('v') !== '1') {
+		|| url.searchParams.get('v') !== String(MESH_PROTOCOL_VERSION)) {
 		throw new ConnectionUrlError();
 	}
 	const workerDeviceId = identifier(url.searchParams.get('device'));

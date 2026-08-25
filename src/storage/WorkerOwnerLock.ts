@@ -11,6 +11,7 @@ import {
 import { join } from 'node:path';
 
 import { MeshDomainError } from '../domain/errors';
+import type { StateStore } from '../domain/ports';
 
 const lockFileName = 'worker-owner.lock';
 const takeoverLockFileName = 'worker-owner.takeover';
@@ -38,6 +39,7 @@ interface TakeoverRecord {
 export interface WorkerOwnershipSnapshot {
 	readonly owner: boolean;
 	readonly instanceId: string;
+	readonly generation?: string;
 	readonly holderPid?: number;
 	readonly holderInstanceId?: string;
 	readonly acquiredAt?: string;
@@ -46,9 +48,18 @@ export interface WorkerOwnershipSnapshot {
 
 export interface WorkerOwnership {
 	isOwner(): boolean;
+	currentGeneration(): string | undefined;
 	snapshot(): WorkerOwnershipSnapshot;
 	assertOwner(): Promise<void>;
 }
+
+export interface BrokerOwnership extends WorkerOwnership {
+	contend(): Promise<boolean>;
+	onDidLoseOwnership(listener: () => void): { dispose(): void };
+	dispose(): Promise<void>;
+}
+
+export type BrokerOwnershipSnapshot = WorkerOwnershipSnapshot;
 
 export interface WorkerOwnerLockOptions {
 	readonly pid?: number;
@@ -64,14 +75,18 @@ export interface WorkerOwnerLockOptions {
 	readonly onTakeoverMutexOpened?: () => Promise<void>;
 }
 
-export class WorkerOwnerLock implements WorkerOwnership {
+export class WorkerOwnerLock implements BrokerOwnership {
 	private readonly lossListeners = new Set<() => void>();
 	private handle: FileHandle | undefined;
 	private record: WorkerOwnerRecord | undefined;
 	private holder: WorkerOwnerRecord | undefined;
 	private heartbeatTimer: NodeJS.Timeout | undefined;
 	private heartbeatOperation = Promise.resolve();
+	private contendOperation = Promise.resolve(false);
+	private disposeOperation: Promise<void> | undefined;
 	private disposed = false;
+	private disposeComplete = false;
+	private lockReleased = false;
 
 	private constructor(
 		private readonly path: string,
@@ -79,7 +94,6 @@ export class WorkerOwnerLock implements WorkerOwnership {
 		private readonly pid: number,
 		private readonly instanceId: string,
 		private readonly token: string,
-		private readonly generation: string,
 		private readonly now: () => number,
 		private readonly ttlMs: number,
 		private readonly heartbeatMs: number,
@@ -100,7 +114,6 @@ export class WorkerOwnerLock implements WorkerOwnership {
 			options.pid ?? process.pid,
 			options.instanceId ?? randomUUID(),
 			options.token ?? randomUUID(),
-			randomUUID(),
 			options.now ?? Date.now,
 			options.ttlMs ?? defaultTtlMs,
 			options.heartbeatMs ?? defaultHeartbeatMs,
@@ -119,11 +132,16 @@ export class WorkerOwnerLock implements WorkerOwnership {
 		return this.handle !== undefined && this.record !== undefined && !this.disposed;
 	}
 
+	public currentGeneration(): string | undefined {
+		return this.isOwner() ? this.record?.generation : undefined;
+	}
+
 	public snapshot(): WorkerOwnershipSnapshot {
 		const record = this.record ?? this.holder;
 		return {
 			owner: this.isOwner(),
 			instanceId: this.instanceId,
+			generation: record?.generation,
 			holderPid: record?.pid,
 			holderInstanceId: record?.instanceId,
 			acquiredAt: record?.acquiredAt,
@@ -140,49 +158,102 @@ export class WorkerOwnerLock implements WorkerOwnership {
 		if (!this.isOwner() || !await this.queueRenew()) {
 			throw new MeshDomainError(
 				'WORKER_DRAINING',
-				'Another VS Code window owns Worker and Listener services for this extension storage.',
+				'Another VS Code window owns the Device Broker for this extension storage.',
 				true,
 			);
 		}
 	}
 
-	public async dispose(): Promise<void> {
+	public contend(): Promise<boolean> {
 		if (this.disposed) {
-			return;
+			return Promise.reject(new Error('Broker owner lock is disposed.'));
 		}
+		const operation = this.contendOperation.then(async () => {
+			if (this.disposed) {
+				throw new Error('Broker owner lock is disposed.');
+			}
+			if (!this.isOwner()) {
+				const observed = await readRecordIfPresent(this.path);
+				await this.tryAcquireWithMutex(observed);
+			}
+			return this.isOwner();
+		});
+		this.contendOperation = operation.then(
+			(value) => value,
+			() => false,
+		);
+		return operation;
+	}
+
+	public dispose(): Promise<void> {
+		if (this.disposeOperation !== undefined) {
+			return this.disposeOperation;
+		}
+		if (this.disposeComplete) {
+			return Promise.resolve();
+		}
+		let disposal!: Promise<void>;
+		disposal = this.disposeCore().then(() => {
+			this.disposeComplete = true;
+		}).finally(() => {
+			if (!this.disposeComplete && this.disposeOperation === disposal) {
+				this.disposeOperation = undefined;
+			}
+		});
+		this.disposeOperation = disposal;
+		return disposal;
+	}
+
+	private async disposeCore(): Promise<void> {
 		this.disposed = true;
 		if (this.heartbeatTimer !== undefined) {
 			clearInterval(this.heartbeatTimer);
 			this.heartbeatTimer = undefined;
 		}
-		await this.heartbeatOperation.catch(() => undefined);
-		let disposalError: unknown;
-		try {
-			const current = await readRecord(this.path).catch(() => undefined);
-			if (current?.token === this.token && current.instanceId === this.instanceId) {
-				await unlink(this.path).catch((error: unknown) => {
-					if (!hasCode(error, 'ENOENT')) {
-						throw error;
-					}
-				});
+		await this.contendOperation;
+		if (this.heartbeatTimer !== undefined) {
+			clearInterval(this.heartbeatTimer);
+			this.heartbeatTimer = undefined;
+		}
+		await this.heartbeatOperation;
+		const failures: unknown[] = [];
+		if (!this.lockReleased) {
+			try {
+				const current = await readRecordIfPresent(this.path);
+				if (
+					current?.token === this.token
+					&& current.instanceId === this.instanceId
+					&& current.generation === this.record?.generation
+				) {
+					await unlinkIfPresent(this.path);
+				}
+				this.lockReleased = true;
+			} catch (error) {
+				failures.push(error);
 			}
-		} catch (error) {
-			disposalError = error;
-		} finally {
-			await this.handle?.close().catch((error: unknown) => {
-				disposalError ??= error;
-			});
-			this.handle = undefined;
+		}
+		if (this.lockReleased && this.handle !== undefined) {
+			try {
+				await this.handle.close();
+				this.handle = undefined;
+			} catch (error: unknown) {
+				failures.push(error);
+			}
+		}
+		if (this.lockReleased && this.handle === undefined) {
 			this.record = undefined;
 			this.lossListeners.clear();
 		}
-		if (disposalError !== undefined) {
-			throw disposalError;
+		if (failures.length === 1) {
+			throw failures[0];
+		}
+		if (failures.length > 1) {
+			throw new AggregateError(failures, 'Broker owner lock cleanup failed.');
 		}
 	}
 
 	private async tryAcquire(): Promise<void> {
-		const observed = await readRecord(this.path).catch(() => undefined);
+		const observed = await readRecordIfPresent(this.path);
 		await this.tryAcquireWithMutex(observed);
 	}
 
@@ -211,11 +282,12 @@ export class WorkerOwnerLock implements WorkerOwnership {
 		if (handle === undefined || record === undefined || this.disposed) {
 			return false;
 		}
-		const current = await readRecord(this.path).catch(() => undefined);
+		const current = await readRecordIfPresent(this.path);
 		if (
 			current?.token !== this.token
 			|| current.instanceId !== this.instanceId
 			|| current.pid !== this.pid
+			|| current.generation !== record.generation
 		) {
 			await this.loseOwnership();
 			return false;
@@ -238,15 +310,30 @@ export class WorkerOwnerLock implements WorkerOwnership {
 			clearInterval(this.heartbeatTimer);
 			this.heartbeatTimer = undefined;
 		}
-		await this.handle?.close().catch(() => undefined);
+		try {
+			await this.handle?.close();
+		} catch {
+			process.emitWarning('The previous Device Broker owner file did not close cleanly.', {
+				code: 'BROKER_OWNER_HANDLE_CLOSE_FAILED',
+			});
+		}
 		this.handle = undefined;
 		this.record = undefined;
 		for (const listener of this.lossListeners) {
-			listener();
+			try {
+				listener();
+			} catch {
+				process.emitWarning('A Device Broker ownership loss listener failed.', {
+					code: 'BROKER_OWNER_LOSS_LISTENER_FAILED',
+				});
+			}
 		}
 	}
 
 	private async createOwnerFile(): Promise<boolean> {
+		if (this.disposed) {
+			return false;
+		}
 		const candidatePath = `${this.path}.candidate-${this.token}`;
 		let handle: FileHandle | undefined;
 		let published = false;
@@ -258,12 +345,15 @@ export class WorkerOwnerLock implements WorkerOwnership {
 				pid: this.pid,
 				instanceId: this.instanceId,
 				token: this.token,
-				generation: this.generation,
+				generation: randomUUID(),
 				acquiredAt: at,
 				heartbeatAt: at,
 			};
 			await writeRecord(handle, record);
 			await this.onOwnerCandidateReady?.();
+			if (this.disposed) {
+				return false;
+			}
 			try {
 				await link(candidatePath, this.path);
 			} catch (error) {
@@ -272,21 +362,21 @@ export class WorkerOwnerLock implements WorkerOwnership {
 				}
 				throw error;
 			}
+			if (this.disposed) {
+				await unlinkIfPresent(this.path);
+				return false;
+			}
 			published = true;
 			this.handle = handle;
 			this.record = record;
 			this.holder = record;
 			this.startHeartbeat();
-			await unlink(candidatePath).catch(() => undefined);
+			await unlinkIfPresent(candidatePath);
 			return true;
 		} finally {
 			if (!published) {
-				await handle?.close().catch(() => undefined);
-				await unlink(candidatePath).catch((error: unknown) => {
-					if (!hasCode(error, 'ENOENT')) {
-						throw error;
-					}
-				});
+				await handle?.close();
+				await unlinkIfPresent(candidatePath);
 			}
 		}
 	}
@@ -309,54 +399,126 @@ export class WorkerOwnerLock implements WorkerOwnership {
 			token: this.token,
 			createdAt: new Date(this.now()).toISOString(),
 		};
-		const mutexStats = await mutex.stat();
-		const mutexIdentity = { device: mutexStats.dev, inode: mutexStats.ino };
+		let mutexIdentity: FileIdentity | undefined;
+		const failures: unknown[] = [];
 		try {
-			await this.onTakeoverMutexOpened?.();
-			await writeRecord(mutex, takeover);
-			if (observed !== undefined && !this.isLive(observed)) {
-				await this.onTakeoverMutexAcquired?.();
+			const mutexStats = await mutex.stat();
+			mutexIdentity = { device: mutexStats.dev, inode: mutexStats.ino };
+			await this.contendWithMutex(mutex, takeover, observed);
+		} catch (error) {
+			failures.push(error);
+		}
+		try {
+			await mutex.close();
+		} catch (error) {
+			failures.push(error);
+		}
+		try {
+			if (mutexIdentity === undefined) {
+				await unlinkIfPresent(this.takeoverPath);
+			} else {
+				await releaseTakeoverMutex(
+					this.takeoverPath,
+					takeover,
+					mutexIdentity,
+					this.onTakeoverMutexReleaseClaimed,
+				);
 			}
-			const current = await readRecord(this.path).catch(() => undefined);
-			if (observed === undefined && current === undefined) {
-				await this.createOwnerFile();
-				return;
-			}
-			if (
-				current === undefined
-				|| observed === undefined
-				|| current.token !== observed.token
-				|| current.generation !== observed.generation
-				|| this.isLive(current)
-			) {
-				this.holder = current;
-				return;
-			}
-			const stalePath = `${this.path}.stale-${this.token}`;
-			await rename(this.path, stalePath);
-			if (!await this.createOwnerFile()) {
-				this.holder = await readRecord(this.path).catch(() => undefined);
-				return;
-			}
-			await unlink(stalePath).catch((error: unknown) => {
-				if (!hasCode(error, 'ENOENT')) {
-					throw error;
-				}
-			});
-		} finally {
-			await mutex.close().catch(() => undefined);
-			await releaseTakeoverMutex(
-				this.takeoverPath,
-				takeover,
-				mutexIdentity,
-				this.onTakeoverMutexReleaseClaimed,
-			);
+		} catch (error) {
+			failures.push(error);
+		}
+		if (failures.length === 1) {
+			throw failures[0];
+		}
+		if (failures.length > 1) {
+			throw new AggregateError(failures, 'Broker takeover operation failed.');
+		}
+	}
+
+	private async contendWithMutex(
+		mutex: FileHandle,
+		takeover: TakeoverRecord,
+		observed: WorkerOwnerRecord | undefined,
+	): Promise<void> {
+		await this.onTakeoverMutexOpened?.();
+		await writeRecord(mutex, takeover);
+		if (this.disposed) {
+			return;
+		}
+		if (observed !== undefined && !this.isLive(observed)) {
+			await this.onTakeoverMutexAcquired?.();
+		}
+		if (this.disposed) {
+			return;
+		}
+		const current = await readRecordIfPresent(this.path);
+		if (observed === undefined && current === undefined) {
+			await this.createOwnerFile();
+			return;
+		}
+		if (
+			current === undefined
+			|| observed === undefined
+			|| current.token !== observed.token
+			|| current.generation !== observed.generation
+			|| this.isLive(current)
+		) {
+			this.holder = current;
+			return;
+		}
+		const stalePath = `${this.path}.stale-${this.token}`;
+		await rename(this.path, stalePath);
+		if (!await this.createOwnerFile()) {
+			this.holder = await readRecordIfPresent(this.path);
+			await unlinkIfPresent(stalePath);
+			return;
+		}
+		await unlinkIfPresent(stalePath);
+	}
+}
+
+export class FencedStateStore implements StateStore {
+	private readonly generation: string | undefined;
+
+	public constructor(
+		private readonly state: StateStore,
+		private readonly ownership: WorkerOwnership,
+		generation = ownership.currentGeneration(),
+	) {
+		this.generation = generation;
+	}
+
+	public get<T>(key: string): T | undefined {
+		return this.state.get<T>(key);
+	}
+
+	public async update(key: string, value: unknown): Promise<void> {
+		const generation = this.generation;
+		if (generation === undefined || this.ownership.currentGeneration() !== generation) {
+			throw generationChangedError('before');
+		}
+		await this.ownership.assertOwner();
+		if (this.ownership.currentGeneration() !== generation) {
+			throw generationChangedError('before');
+		}
+		await this.state.update(key, value);
+		await this.ownership.assertOwner();
+		if (this.ownership.currentGeneration() !== generation) {
+			throw generationChangedError('during');
 		}
 	}
 }
 
 async function readRecord(path: string): Promise<WorkerOwnerRecord | undefined> {
-	const value = JSON.parse(await readFile(path, 'utf8')) as unknown;
+	let value: unknown;
+	try {
+		value = JSON.parse(await readFile(path, 'utf8')) as unknown;
+	} catch (error) {
+		if (error instanceof SyntaxError) {
+			return undefined;
+		}
+		throw error;
+	}
 	if (
 		typeof value !== 'object'
 		|| value === null
@@ -383,6 +545,35 @@ async function readRecord(path: string): Promise<WorkerOwnerRecord | undefined> 
 		...(value as Omit<WorkerOwnerRecord, 'generation'>),
 		generation: 'generation' in value ? value.generation as string : value.token,
 	};
+}
+
+async function readRecordIfPresent(path: string): Promise<WorkerOwnerRecord | undefined> {
+	try {
+		return await readRecord(path);
+	} catch (error) {
+		if (hasCode(error, 'ENOENT')) {
+			return undefined;
+		}
+		throw error;
+	}
+}
+
+async function unlinkIfPresent(path: string): Promise<void> {
+	try {
+		await unlink(path);
+	} catch (error) {
+		if (!hasCode(error, 'ENOENT')) {
+			throw error;
+		}
+	}
+}
+
+function generationChangedError(when: 'before' | 'during'): MeshDomainError {
+	return new MeshDomainError(
+		'WORKER_DRAINING',
+		`Device Broker generation changed ${when} the shared-state write.`,
+		true,
+	);
 }
 
 async function writeRecord(handle: FileHandle, record: WorkerOwnerRecord | TakeoverRecord): Promise<void> {
@@ -421,17 +612,13 @@ async function releaseTakeoverMutex(
 	}
 	await onClaimed?.();
 	const claimedStats = await statFile(claimedPath);
-	const claimed = await readTakeoverRecord(claimedPath).catch(() => undefined);
+	const claimed = await readTakeoverRecord(claimedPath);
 	const sameInode = claimedStats.device === expectedIdentity.device
 		&& claimedStats.inode === expectedIdentity.inode;
 	const matchingToken = claimed?.token === expected.token
 		&& claimed.instanceId === expected.instanceId;
 	if (sameInode && (claimed === undefined || matchingToken)) {
-		await unlink(claimedPath).catch((error: unknown) => {
-			if (!hasCode(error, 'ENOENT')) {
-				throw error;
-			}
-		});
+		await unlinkIfPresent(claimedPath);
 		return;
 	}
 	try {
@@ -460,7 +647,15 @@ async function statFile(path: string): Promise<FileIdentity> {
 }
 
 async function readTakeoverRecord(path: string): Promise<TakeoverRecord | undefined> {
-	const value = JSON.parse(await readFile(path, 'utf8')) as unknown;
+	let value: unknown;
+	try {
+		value = JSON.parse(await readFile(path, 'utf8')) as unknown;
+	} catch (error) {
+		if (error instanceof SyntaxError) {
+			return undefined;
+		}
+		throw error;
+	}
 	if (
 		typeof value !== 'object'
 		|| value === null
@@ -495,3 +690,9 @@ function hasCode(error: unknown, code: string): boolean {
 		&& 'code' in error
 		&& error.code === code;
 }
+
+export {
+	FencedStateStore as BrokerFencedStateStore,
+	WorkerOwnerLock as BrokerOwnerLock,
+};
+export type BrokerOwnerLockOptions = WorkerOwnerLockOptions;

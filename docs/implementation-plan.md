@@ -1,10 +1,10 @@
 # Copilot Agent Mesh 实施计划
 
-> 当前 Preview 范围：仅 macOS arm64 支持 Worker。Windows、Linux、macOS
-> x64 和其他架构在 peer client 可用时仅支持 Coordinator。本文其余跨平台
-> Worker 条目是未来目标，不是当前 Marketplace Preview 声明。
+> 当前 Preview 范围：每个同 User Data 的普通 VS Code Window 都是活跃 Window
+> Node；仅 macOS arm64 支持 Worker Host/真实任务执行。Windows、Linux、macOS
+> x64 和其他架构可以作为 Broker Client/Window Node，但不能 Host Worker。
 
-> 状态：0.1.0 Preview MVP 已实现；Gate G0 No-Go<br>
+> 状态：0.2.0 Preview Multi-window Mesh Nodes 已实现；Gate G0 No-Go<br>
 > 日期：2026-08-25<br>
 > 依据：[PRD v0.3](../copilot-agent-mesh-prd.md) 与 [技术实施方案](./technical-implementation.md)<br>
 > 兼容性 Gate：[Compatibility Matrix](./compatibility-matrix.md)<br>
@@ -16,7 +16,9 @@
 
 首版交付结果：
 
-- 一个可安装在桌面版 VS Code 的 VSIX；非 macOS arm64 平台当前仅启用 Coordinator 能力。
+- 一个 `0.2.0` Preview VSIX；Protocol v2，v1 Peer 明确不兼容。
+- 一个稳定 Device Broker 和每普通窗口一个活跃 Window Node；非 Owner Window
+  不是只读。
 - macOS arm64 Worker 可注册本机 Workspace、启动本地 Gateway 和 Dev Tunnel。
 - Coordinator 可配对 Worker、查看 Workspace、创建/查询/取消任务。
 - macOS arm64 Worker 通过 Agent Host/AHP 启动独立内置 Copilot Agent Session。
@@ -29,13 +31,22 @@
 已完成：
 
 - Runtime Schema、Task Reducer、Workspace Lease、原子文件和恢复存储。
-- Device/Workspace 持久化、本机 Guard 和跨窗口 Application Owner fencing。
+- Device/Workspace 持久化、本机 Guard 和 generation-fenced
+  `BrokerOwnerLock`。
+- Device Broker 拥有 Pairing/Peer Root、Gateway/one Tunnel、Peer Manager、
+  全局 Task/Delegation Store、Reducer/Event Log、Remote Routing 与 Node Registry。
+- 每窗口 process-lifetime 随机 `nodeId`/`nodeInstanceId`、Heartbeat、
+  Workspace Claim 和独立真实 AHP Runtime/Handle。
+- Unix Socket / Windows Named Pipe 本机 IPC，短 Hash Endpoint、Unix
+  `0700`/`0600`、SecretStorage Broker Key、nonce + mutual HMAC 和有界流控。
 - Loopback Gateway、Pairing、Peer、Heartbeat、重连和任务 RPC。
 - 精确版本 Dev Tunnel Provider、HTTPS/WSS Readiness、续期和精确清理。
 - Production Agent Host/AHP Runtime、认证边界、Session/Chat/Terminal/Input 映射。
 - 五个 Production Language Model Tools 和安全交互 Dashboard。
 - TaskCoordinator、WorkerTaskService、Composition Root 和启动/关闭恢复。
 - 双实例真实 E2E、三平台离线 CI、Preview VSIX 和隔离安装 activation smoke。
+- 普通窗口同 User Data E2E：一个 Broker、多 Node、Claim/Reclaim/Conflict、
+  Takeover Generation 和零残留清理。
 
 Preview 后续 Gate：
 
@@ -43,6 +54,22 @@ Preview 后续 Gate：
 - 在真实 Copilot 会话中验证五个 Tool 的自动选择与完成结果消费。
 - Windows/Linux Worker 的进程树所有权、Dev Tunnel 版本和完整 E2E。
 - 多 Workspace 真实并发、重启恢复和人工 UI 验收扩展矩阵。
+
+### 2.1 0.2 Multi-window 实施不变量
+
+1. Canonical realpath/file identity 在进入 Broker Catalog/IPC 前 Hash；同一物理
+   Workspace 只有一个 `claimed` Node，其他 Node 为 `conflict`/read-only。
+2. Node 丢失立即释放 Claim。当前 AHP Runtime 没有 Recovery API，Active Task
+   必须失败为 `TASK_RECOVERY_UNAVAILABLE`，不能重复执行。
+3. 本地完整 Route 为 Window A → Local Broker → Window B → real AHP → Broker
+   Store → Window A，绝不接触 Dev Tunnel。
+4. Remote v2 Route 为一个 Device Gateway/Tunnel → Broker → Target Node；Route
+   Catalog 在 Send 前持久化，结果通过 IPC multiplex 到全部本机窗口。
+5. 五个 Tool 和 Dashboard 使用显式 Device → Node → Workspace Target。
+   Dashboard 显示 Broker Owner/Takeover、本机 Nodes/Conflicts 和 Remote Nodes，
+   ViewModel 不含 Secret、Path、Raw Prompt/Output。
+6. 0.1 Migration 保留 Device ID 与 v1 Workspace/Task Data 进入 Schema v2；
+   Unknown/Corrupt Version Fail Closed。
 
 ## 3. 决策 Gate
 
@@ -60,7 +87,7 @@ flowchart LR
 | --- | --- |
 | G0 | 当前 VS Code/AHP/Dev Tunnel/Tool API 组合可行，并锁定兼容版本 |
 | G1 | Task、RPC、存储、认证核心可在无 VS Code/网络/模型环境下完整测试 |
-| G2 | Worker 本地 Gateway + Fake Agent 可安全、持久地执行任务 |
+| G2 | Worker 本地 Gateway + 测试专用 Runtime Double 可安全验证持久任务协议 |
 | G3 | 两个 Extension Instance 可经 Dev Tunnel 配对、重连和恢复任务 |
 | G4 | Worker 可通过 AHP 创建真实 Copilot Session、取消并处理输入 |
 | G5 | 内置 Copilot Agent 可调用 Mesh Tools 完成异步委派闭环 |
@@ -179,7 +206,8 @@ Known unsupported:
 **Gate G0**
 
 - P0.1、P0.2、P0.3 均通过。
-- 若 AHP Auth 或真实 Copilot Session 不可用，停止构建完整 MVP；只保留 Fake Agent Demo，不把它声明为可交付产品。
+- 若 AHP Auth 或真实 Copilot Session 不可用，保持 No-Go；测试专用 Runtime
+  Double 不得成为生产回退或产品能力声明。
 - 更新 `engines.vscode`，将 `@types/vscode` 精确锁定到同一最低 API 版本，锁定 AHP/CLI 兼容版本。
 - 把 Manifest `extensionKind` 改为 `ui`，记录本机桌面 Workspace Feature Guard 和 Feature Flag 默认值。
 
@@ -187,6 +215,11 @@ Known unsupported:
 仍缺少 Auth、Session、Turn 和恢复验证；P0.3 的已安装旧 CLI 无法满足机器可读创建与 hosted
 readiness 契约。详见 [Compatibility Matrix](./compatibility-matrix.md) 和 `docs/spikes/`。
 在这些 Gate 关闭前，不进入 P1 正式功能开发，也不宣称端到端 MVP 可交付。
+
+2026-08-25 0.2 更新：Multi-window Infrastructure/Lifecycle 已通过；P0.2 的第二次
+opted-in Real AHP Run 因 Fresh Shared Profile 没有 Authentication Mapping/Session
+正确停在 `AGENT_AUTH_REQUIRED`。Authoritative start/get/cancel/output 仍未证明，
+因此 G0 继续 No-Go。
 
 ## 6. Phase 1：工程与领域基础
 
@@ -343,12 +376,12 @@ readiness 契约。详见 [Compatibility Matrix](./compatibility-matrix.md) 和 
 - 不读取 `.git`。
 - 任意外部 Path 输入不能绕过 Registry。
 
-### P2.3 InMemory/Fake Agent Runtime — M
+### P2.3 Test-only AgentRuntime Double — M
 
 **实现**
 
 - 可脚本化事件：Progress、Output、InputRequired、Complete、Fail、Delay、Ignore Cancel、Unrecoverable。
-- Fake Runtime 不读取 Workspace、不运行进程。
+- Double 只位于 Test Source，不读取 Workspace、不运行进程，也不进入生产 Bundle。
 - 可注入 Task Runner。
 
 ### P2.4 RemoteTaskRunner — L
@@ -389,11 +422,11 @@ readiness 契约。详见 [Compatibility Matrix](./compatibility-matrix.md) 和 
 
 **Gate G2**
 
-- 真实 Loopback WebSocket + Fake Agent 完成 Start/Get/Cancel/Answer。
+- 真实 Loopback WebSocket + Test Double 完成 Start/Get/Cancel/Answer。
 - 未认证连接无法读取任何 Inventory。
 - 任意 Enrollment Crash/Ack 丢失不会产生无法恢复的单边 Credential。
 - Worker 撤销 Peer 会关闭 Active Socket，旧 Secret 离线后也不能重连。
-- Duplicate Start 只调用一次 Fake Agent。
+- Duplicate Start 只调用一次 Test Double。
 - 同 Workspace 并发只有一个成功。
 - Worker 重启后可查询 Snapshot。
 
@@ -455,8 +488,18 @@ readiness 契约。详见 [Compatibility Matrix](./compatibility-matrix.md) 和 
 **实现**
 
 - 同一机器启动 Worker/Coordinator 两个 Extension Instance。
-- 可选真实 Dev Tunnel，Fake Agent。
+- 可选真实 Dev Tunnel，测试专用 Runtime Double。
 - 自动验证 URL 配对、重连、任务恢复。
+
+### P3.6 Multi-window Broker/Node — XL（0.2 已完成）
+
+- Stable Device Broker Ownership 与 generation-fenced Takeover。
+- Ordinary-window Node Registration、Heartbeat 和 Process-lifetime Identity。
+- Unix Socket / Windows Named Pipe Mutual-HMAC IPC 与所有 Bound。
+- Canonical Workspace Identity Hash、Claim/Reclaim/Conflict。
+- Broker-owned Route Catalog、Reducer/Event Log 与 Shared Write Fence。
+- Local Direct Route 不经过 Tunnel；Remote v2 Route 通过一个
+  Gateway/Tunnel multiplex。
 
 **Gate G3**
 
@@ -465,7 +508,7 @@ readiness 契约。详见 [Compatibility Matrix](./compatibility-matrix.md) 和 
 - Pairing Secret/Peer Secret 不出现在日志和 State。
 - URL 轮换使旧 Credential 失效。
 - ACE 续期失败、Tunnel 被删除、Login 过期和 Port 冲突不会进入无限重试。
-- Fake Agent Task 可跨 Tunnel 完成并查询。
+- Test-double Task 可跨 Tunnel 完成并查询；不作为真实 AHP 证据。
 
 ## 9. Phase 4：真实 Agent Host/AHP
 
@@ -546,6 +589,7 @@ readiness 契约。详见 [Compatibility Matrix](./compatibility-matrix.md) 和 
 - `mesh_delegate_task`
 - `mesh_get_task`
 - `mesh_cancel_task`
+- `mesh_answer_task`
 
 输入 Schema 设置 `additionalProperties: false`。每个 Tool 提供明确的 `modelDescription`、`userDescription`、`toolReferenceName`。
 
@@ -555,17 +599,17 @@ Contract Test 断言 Manifest 与 Runtime Registration Name 完全一致，并�
 
 返回：
 
-- 在线 Peer。
-- Device Capability。
-- Workspace opaque ID/name/tags/busy。
+- 在线 Device 与 Remote/Local Node。
+- Device/Node Capability。
+- 显式 Device → Node → Workspace Target、opaque ID/name/tags/busy。
 - 不返回路径或 Secret。
 
 ### P5.3 DelegateTaskTool — M
 
 **实现**
 
-- `prepareInvocation` 显示目标和摘要。
-- 校验 Peer/Workspace/Trust/Input Size。
+- `prepareInvocation` 显示 Device/Node/Workspace 目标和摘要。
+- 校验 Peer/Node/Workspace/Trust/Input Size。
 - 在网络发送前持久化 Delegation Intent。
 - 使用 `delegationRequestId + taskId` 创建 Task。
 - 在 Ack Deadline 内返回 `pending + taskId`。
@@ -591,7 +635,7 @@ Contract Test 断言 Manifest 与 Runtime Registration Name 完全一致，并�
 
 ### P5.6 AnswerTaskTool — M
 
-输入/审批通道稳定后增加：
+已实现的输入/审批通道：
 
 - 指定 `taskId`、`inputId`、`answerId`。
 - Confirmation。
@@ -626,27 +670,31 @@ Contract Test 断言 Manifest 与 Runtime Registration Name 完全一致，并�
 - Presenter + ViewModel。
 - Repeated Resolve/Dispose Lifecycle。
 - Outbound ViewModel/`postMessage` Secret 与 Path Guard。
+- Raw Prompt/Output Guard。
 
-### P6.2 This Device / Listener — M
+### P6.2 Device Broker / Listener — M
 
 - Device Name/Platform。
+- Broker Owner/Generation/Takeover。
 - Gateway/Tunnel/AHP 分层状态。
 - Start/Stop/Restart。
 - Copy Pairing URL。
 - Install/Login/Version Guidance。
 
-### P6.3 Workspace Management — M
+### P6.3 Local Nodes / Workspace Management — M
 
 - Add Current Workspace。
 - Name/Tags/Enabled。
 - Remove/Disable。
 - Busy/Active Task。
+- Node Heartbeat、Claim/Reclaim 与 Conflict/read-only。
 
 ### P6.4 Remote Devices — M
 
 - Add URL。
 - Connecting/Online/Busy/Offline/AuthFailed/Incompatible。
 - Latency/Last Seen。
+- Remote Node 与 Workspace Target。
 - Disconnect/Reconnect/Revoke。
 
 ### P6.5 Task Dashboard — L
@@ -673,7 +721,8 @@ Contract Test 断言 Manifest 与 Runtime Registration Name 完全一致，并�
 - 恢复 Tunnel Host。
 - 重连 Peer。
 - 查询 Active Task。
-- 尝试 AHP Session Recovery。
+- 当前 AHP Runtime 无 Recovery API；Node 丢失释放 Claim，并把 Active Task
+  持久化为 `TASK_RECOVERY_UNAVAILABLE`，禁止重复执行。
 
 ### P7.2 Shutdown/Drain — M
 
@@ -691,6 +740,8 @@ Contract Test 断言 Manifest 与 Runtime Registration Name 完全一致，并�
 - Flood、Oversize、Slow Consumer。
 - Malicious JSON/Webview Message。
 - Local Path/Secret Exfiltration。
+- IPC Mutual HMAC、Nonce Replay/Deadline、Rate/Frame/Backpressure、Unix Permission。
+- Stale Broker Generation Write 与 Duplicate Physical Workspace Claim。
 - Revoked Peer。
 - Untrusted/Virtual/Remote Workspace。
 
@@ -723,12 +774,34 @@ Contract Test 断言 Manifest 与 Runtime Registration Name 完全一致，并�
 
 ### P8.3 真实平台验证 — XL
 
-- macOS arm64。
+- macOS arm64 VS Code 1.134.0 普通窗口同 User Data。
 - Windows x64。
 - Linux x64。
 - 两设备真实 Tunnel。
-- 真实 Copilot Task。
+- 真实 Copilot Task；没有 authoritative AHP start/get/cancel/output 前保持 No-Go。
 - Suspend/Resume、Network Loss、VS Code Reload。
+
+已记录：
+
+- `.vscode-test/multi-window-evidence/6c119d7b-8596-4757-a129-7e31b412db5d.json`：
+  2 Nodes / 129 ms，exactly 1 Broker，Listener/Tunnel stopped + sentinel
+  untouched，repo-b 268 ms 内 offline 后相同 `workspaceId` reclaim，generation
+  takeover，duplicate conflict，完整 cleanup。
+- `.vscode-test/multi-window-evidence/7886dc25-37ef-4909-ac2b-6af2a506078c.json`：
+  opted-in AHP，2 Nodes / 278 ms，offline 214 ms，takeover 1683 ms，相同
+  `workspaceId`，零 residue；因 Fresh Shared Profile 无 Auth Mapping/Session 在
+  `AGENT_AUTH_REQUIRED` 正确阻塞，未证明 authoritative start/get/cancel/output。
+
+复现：
+
+```sh
+npm run test:multi-window-real
+MESH_MULTI_WINDOW_E2E_RUNTIME_DIR=$HOME/.mw \
+MESH_MULTI_WINDOW_E2E_TASKS=1 npm run test:multi-window-real
+```
+
+实施期间 Unit/Component/Extension Host/完整 npm Test 已通过；最终验证前不写死
+最终数量。
 
 ### P8.4 Preview Release Checklist — M
 
@@ -762,7 +835,7 @@ Contract Test 断言 Manifest 与 Runtime Registration Name 完全一致，并�
 11. `guard: enforce Git non-interference invariant`（6, 10）
 12. `identity: persist device identity and local-desktop guards`（9）
 13. `workspaces: implement opaque workspace registry`（9, 12）
-14. `testing: implement FakeAgentRuntime`（8）
+14. `testing: implement test-only AgentRuntime double`（8）
 15. `tasks: implement RemoteTaskRunner using AgentRuntime`（9, 13, 14）
 16. `gateway: implement loopback HTTP and WebSocket transport`（7, 10）
 17. `security: implement two-phase pairing and peer credentials`（9, 16）
@@ -821,7 +894,8 @@ Contract Test 断言 Manifest 与 Runtime Registration Name 完全一致，并�
 | Relay 不稳定 | Host/Service 中断 | Task 持久化、Reconnect、Get Snapshot |
 | Secret 泄漏 | URL/日志/状态出现 Secret | One-time Secret、Redactor、Snapshot Test |
 | Pairing Commit 中断 | 单边保存 Credential | Pending Enrollment、两阶段 Commit、可恢复 Ack |
-| Extension Host 重载 | Active Task 内存丢失 | 持久 Snapshot、AHP Best-effort Recovery |
+| Window Node/Extension Host 丢失 | Active Runtime Handle 丢失 | Broker 释放 Claim，持久失败为 `TASK_RECOVERY_UNAVAILABLE`；当前 AHP 无 Recovery API，不重复执行 |
+| Broker Owner 丢失或旧 Owner 写入 | Split brain / Shared State 损坏 | Generation-fenced Takeover；拒绝旧 Generation Shared Write |
 | 跨平台 Process 差异 | CLI Path/Signal 不同 | Process Adapter、三平台测试 |
 | 输出过大 | Agent/Terminal 高频输出 | Bounded Journal/Outbox、摘要、Truncation |
 | 误碰 Git 边界 | 新功能读取仓库状态 | Static Guard、Spawn Allowlist、Fake `.git` Test |
@@ -843,9 +917,9 @@ Contract Test 断言 Manifest 与 Runtime Registration Name 完全一致，并�
 - 文档和 Compatibility Matrix 同步更新。
 - 最小目标测试、Type Check 和 Lint 通过。
 
-## 18. 推荐的首个开发批次
+## 18. 原始开发批次记录
 
-在正式功能开发前，先完成以下顺序：
+0.1/0.2 实施使用了以下原始顺序；本节保留为追踪记录，不代表未开始：
 
 1. P0.1 Language Model Tool Spike。
 2. P0.2 Agent Host/AHP Spike。

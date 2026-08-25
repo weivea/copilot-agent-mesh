@@ -12,6 +12,7 @@ export interface PeerProfile {
 	readonly generation?: string;
 	readonly rpcEndpoint: string;
 	readonly workerDeviceId: string;
+	readonly cleanupPending?: true;
 	readonly invitationId?: string;
 	readonly pairingSecretKeyRef?: string;
 	readonly peerId?: string;
@@ -24,6 +25,7 @@ export interface PeerProfile {
 
 export interface PeerProfileDeleteCondition {
 	readonly generation?: string;
+	readonly cleanupPending?: true;
 	readonly pairingSecretKeyRef?: string;
 	readonly credentialKeyRef?: string;
 	readonly pendingCommitProofKeyRef?: string;
@@ -34,6 +36,7 @@ export interface PeerProfileStore {
 	list(): Promise<readonly PeerProfile[]>;
 	store(profile: PeerProfile): Promise<void>;
 	storeIfAbsent?(profile: PeerProfile): Promise<boolean>;
+	replace?(profile: PeerProfile, expected: PeerProfileDeleteCondition): Promise<boolean>;
 	delete(id: string, expected?: PeerProfileDeleteCondition): Promise<boolean | void>;
 }
 
@@ -56,6 +59,17 @@ export class InMemoryPeerProfileStore implements PeerProfileStore {
 		this.profiles.set(profile.id, structuredClone(profile));
 		return true;
 	}
+	public async replace(
+		profile: PeerProfile,
+		expected: PeerProfileDeleteCondition,
+	): Promise<boolean> {
+		const current = this.profiles.get(profile.id);
+		if (current === undefined || !matchesDeleteCondition(current, expected)) {
+			return false;
+		}
+		this.profiles.set(profile.id, structuredClone(profile));
+		return true;
+	}
 	public async delete(id: string, expected?: PeerProfileDeleteCondition): Promise<boolean> {
 		const current = this.profiles.get(id);
 		if (current === undefined || !matchesDeleteCondition(current, expected)) {
@@ -71,8 +85,54 @@ export function matchesDeleteCondition(
 ): boolean {
 	return expected === undefined || (
 		profile.generation === expected.generation
+		&& profile.cleanupPending === expected.cleanupPending
 		&& profile.pairingSecretKeyRef === expected.pairingSecretKeyRef
 		&& profile.credentialKeyRef === expected.credentialKeyRef
 		&& profile.pendingCommitProofKeyRef === expected.pendingCommitProofKeyRef
 	);
+}
+
+export function isPeerCleanupPending(profile: PeerProfile): boolean {
+	const marker = (profile as { readonly cleanupPending?: unknown }).cleanupPending;
+	if (marker === undefined) {
+		return false;
+	}
+	if (marker !== true) {
+		throw new TypeError('Invalid persisted peer cleanup metadata.');
+	}
+	const allowed = new Set([
+		'id',
+		'generation',
+		'rpcEndpoint',
+		'workerDeviceId',
+		'cleanupPending',
+		'pairingSecretKeyRef',
+		'credentialKeyRef',
+		'pendingCommitProofKeyRef',
+	]);
+	if (
+		Object.keys(profile).some((key) => !allowed.has(key))
+		|| !nonEmptyString(profile.id)
+		|| !nonEmptyString(profile.rpcEndpoint)
+		|| !nonEmptyString(profile.workerDeviceId)
+		|| !optionalString(profile.generation)
+		|| !optionalString(profile.pairingSecretKeyRef)
+		|| !optionalString(profile.credentialKeyRef)
+		|| !optionalString(profile.pendingCommitProofKeyRef)
+	) {
+		throw new TypeError('Invalid persisted peer cleanup metadata.');
+	}
+	return true;
+}
+
+export function isUsablePeerProfile(profile: PeerProfile): boolean {
+	return !isPeerCleanupPending(profile);
+}
+
+function nonEmptyString(value: unknown): value is string {
+	return typeof value === 'string' && value.length > 0;
+}
+
+function optionalString(value: unknown): boolean {
+	return value === undefined || nonEmptyString(value);
 }

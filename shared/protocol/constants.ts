@@ -1,4 +1,4 @@
-export const MESH_PROTOCOL_VERSION = 1 as const;
+export const MESH_PROTOCOL_VERSION = 2 as const;
 
 export const GATEWAY_METHODS = {
 	hello: 'mesh.hello',
@@ -6,6 +6,7 @@ export const GATEWAY_METHODS = {
 	enrollmentCommit: 'mesh.enrollmentCommit',
 	ping: 'mesh.ping',
 	deviceGetInfo: 'device.getInfo',
+	nodeList: 'node.list',
 	workspaceList: 'workspace.list',
 	taskStart: 'task.start',
 	taskGet: 'task.get',

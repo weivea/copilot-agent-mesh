@@ -19,6 +19,7 @@ import {
 	MESH_RUNTIME_TOOL_NAMES,
 	MESH_TOOL_NAMES,
 } from '../tools/toolManifest';
+import type { AgentMeshExtensionApi } from '../composition/createApplication';
 
 suite('Copilot Agent Mesh', () => {
 	test('cold host has an implicit activation path for the contributed tool', async () => {
@@ -26,7 +27,10 @@ suite('Copilot Agent Mesh', () => {
 		const manifestTools = extension.packageJSON.contributes.languageModelTools as Array<{ name: string }>;
 
 		assert.strictEqual(extension.isActive, false);
-		assert.strictEqual(extension.packageJSON.activationEvents.length, 0);
+		assert.deepStrictEqual(
+			extension.packageJSON.activationEvents,
+			['onStartupFinished'],
+		);
 		assert.deepStrictEqual(manifestTools.map(({ name }) => name), MESH_RUNTIME_TOOL_NAMES);
 
 		const cancellation = new vscode.CancellationTokenSource();
@@ -79,8 +83,24 @@ suite('Copilot Agent Mesh', () => {
 		assert.strictEqual(extension.isActive, true);
 	});
 
+	test('exposes the production Window Node and Broker lifecycle state', async () => {
+		const extension = getExtension();
+		const api = await extension.activate() as AgentMeshExtensionApi;
+		assert.match(api.nodeId, /^[0-9a-f-]{36}$/u);
+		assert.match(api.nodeInstanceId, /^[0-9a-f-]{36}$/u);
+		assert.strictEqual(api.nodeState().state, 'online');
+		assert.strictEqual(api.nodeState().registered, true);
+		assert.strictEqual(api.brokerState().state, 'running');
+		assert.strictEqual(api.brokerState().owner, true);
+		const directory = await api.node.listNodes();
+		assert.ok(directory.nodes.some((node) =>
+			node.nodeId === api.nodeId
+			&& node.nodeInstanceId === api.nodeInstanceId,
+		));
+	});
+
 	test('defines the initial gateway protocol surface', () => {
-		assert.strictEqual(MESH_PROTOCOL_VERSION, 1);
+		assert.strictEqual(MESH_PROTOCOL_VERSION, 2);
 		assert.strictEqual(GATEWAY_METHODS.taskStart, 'task.start');
 		assert.ok(TASK_STATUSES.includes('needsInput'));
 	});
@@ -114,7 +134,9 @@ suite('Copilot Agent Mesh', () => {
 				new MeshDelegateTaskTool(facade).invoke({
 					...invocationBase,
 					input: {
-						peerId: '00000000-0000-4000-8000-000000000001',
+						deviceId: '00000000-0000-4000-8000-000000000001',
+						nodeId: '00000000-0000-4000-8000-000000000007',
+						nodeInstanceId: '00000000-0000-4000-8000-000000000008',
 						workspaceId: '00000000-0000-4000-8000-000000000002',
 						title: 'Tokenizer containment',
 						prompt: 'Verify the invocation catch boundary.',
@@ -169,7 +191,7 @@ function createTaskToolFacade(): TaskToolFacade {
 	const delegationRequestId = '00000000-0000-4000-8000-000000000004';
 	const taskId = '00000000-0000-4000-8000-000000000003';
 	return {
-		listWorkers: async () => ({ workers: [] }),
+		listWorkers: async () => ({ devices: [], truncated: false }),
 		persistDelegationIntent: async () => ({
 			delegationRequestId,
 			taskId,

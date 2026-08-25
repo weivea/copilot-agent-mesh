@@ -1,6 +1,10 @@
 import * as vscode from 'vscode';
 
-import type { TaskStatus } from '../../shared/protocol';
+import {
+	PROTOCOL_LIMITS,
+	utf8ByteLength,
+	type TaskStatus,
+} from '../../shared/protocol';
 
 export type ListenerState = 'stopped' | 'starting' | 'running' | 'stopping' | 'error' | 'unavailable';
 export type PeerState = 'connecting' | 'online' | 'busy' | 'offline' | 'authFailed' | 'incompatible';
@@ -15,6 +19,7 @@ export interface ComponentSnapshot {
 
 export interface DashboardSnapshot {
 	readonly device: {
+		readonly deviceId?: string;
 		readonly name: string;
 		readonly platform: string;
 		readonly architecture: string;
@@ -30,6 +35,26 @@ export interface DashboardSnapshot {
 		readonly canStop: boolean;
 		readonly canCopyConnectionUrl: boolean;
 	};
+	readonly broker?: {
+		readonly state: 'starting' | 'running' | 'contending' | 'takingOver'
+			| 'stopping' | 'error' | 'disposed';
+		readonly role: 'owner' | 'contender';
+		readonly takeover: 'stable' | 'waiting' | 'takingOver' | 'stopping' | 'error';
+		readonly holder: 'thisWindow' | 'anotherWindow' | 'none';
+		readonly error?: {
+			readonly code: string;
+			readonly message: string;
+			readonly action?: string;
+		};
+	};
+	readonly localNodes?: readonly DashboardNodeSnapshot[];
+	readonly remoteDevices?: readonly {
+		readonly deviceId: string;
+		readonly peerId: string;
+		readonly name: string;
+		readonly state: PeerState;
+		readonly nodes: readonly DashboardNodeSnapshot[];
+	}[];
 	readonly workspaces: readonly {
 		readonly workspaceId: string;
 		readonly name: string;
@@ -70,6 +95,31 @@ export interface DashboardSnapshot {
 	}[];
 }
 
+export interface DashboardNodeSnapshot {
+	readonly nodeId: string;
+	readonly nodeInstanceId: string;
+	readonly label: string;
+	readonly status: 'online' | 'busy' | 'offline' | 'conflict' | 'draining';
+	readonly thisWindow: boolean;
+	readonly workspaces: readonly {
+		readonly workspaceId: string;
+		readonly name: string;
+		readonly capabilityTags: readonly string[];
+		readonly enabled: boolean;
+		readonly busy: boolean;
+		readonly claimStatus: 'claimed' | 'readOnly' | 'conflict';
+		readonly activeTaskId?: string;
+	}[];
+}
+
+export interface DashboardTaskTarget {
+	readonly deviceId: string;
+	readonly nodeId: string;
+	readonly nodeInstanceId: string;
+	readonly workspaceId: string;
+	readonly peerId?: string;
+}
+
 /**
  * Application-service boundary for the dashboard.
  *
@@ -88,7 +138,7 @@ export interface DashboardFacade {
 	copyConnectionUrl(): Promise<void>;
 	addPeer(): Promise<void>;
 	removePeer(peerId: string): Promise<void>;
-	runTask(peerId?: string, workspaceId?: string): Promise<void>;
+	runTask(target?: DashboardTaskTarget): Promise<void>;
 	cancelTask(taskId: string): Promise<void>;
 	answerTaskInput(taskId: string): Promise<void>;
 }
@@ -105,8 +155,8 @@ export interface DashboardServiceBindings {
 	addPeer(connectionUrl: string): Promise<void>;
 	removePeer(peerId: string): Promise<void>;
 	runTask(request: {
-		readonly peerId?: string;
-		readonly workspaceId?: string;
+		readonly target?: DashboardTaskTarget;
+		readonly title: string;
 		readonly instruction: string;
 	}): Promise<void>;
 	cancelTask(taskId: string): Promise<void>;
@@ -115,6 +165,10 @@ export interface DashboardServiceBindings {
 
 export interface DashboardConfirmationHost {
 	confirm(message: string, action: string): Promise<boolean>;
+}
+
+export interface DashboardInputHost {
+	showInputBox(options: vscode.InputBoxOptions): Thenable<string | undefined>;
 }
 
 /**
@@ -129,6 +183,7 @@ export class ServiceDashboardFacade implements DashboardFacade {
 	public constructor(
 		private readonly services: DashboardServiceBindings,
 		private readonly confirmations: DashboardConfirmationHost = new VscodeDashboardConfirmationHost(),
+		private readonly inputs: DashboardInputHost = vscode.window,
 	) {
 		this.onDidChange = services.onDidChange.bind(services);
 	}
@@ -139,7 +194,7 @@ export class ServiceDashboardFacade implements DashboardFacade {
 
 	public async configureDeviceName(): Promise<void> {
 		const snapshot = await this.services.getSnapshot();
-		const name = await vscode.window.showInputBox({
+		const name = await this.inputs.showInputBox({
 			title: 'Configure Copilot Agent Mesh Device',
 			prompt: 'Choose a recognizable name for this device.',
 			value: snapshot.device.name === 'Not configured' ? '' : snapshot.device.name,
@@ -178,7 +233,7 @@ export class ServiceDashboardFacade implements DashboardFacade {
 	}
 
 	public async addPeer(): Promise<void> {
-		const connectionUrl = await vscode.window.showInputBox({
+		const connectionUrl = await this.inputs.showInputBox({
 			title: 'Add Copilot Agent Mesh Connection',
 			prompt: 'Paste the connection URL from the remote device.',
 			password: true,
@@ -196,15 +251,28 @@ export class ServiceDashboardFacade implements DashboardFacade {
 		}
 	}
 
-	public async runTask(peerId?: string, workspaceId?: string): Promise<void> {
-		const instruction = await vscode.window.showInputBox({
+	public async runTask(target?: DashboardTaskTarget): Promise<void> {
+		const title = await this.inputs.showInputBox({
+			title: 'Name Remote Task',
+			prompt: 'Enter a non-sensitive title for task lists and persisted history.',
+			ignoreFocusOut: true,
+			validateInput: validateTaskTitle,
+		});
+		if (title === undefined) {
+			return;
+		}
+		const instruction = await this.inputs.showInputBox({
 			title: 'Run Remote Task',
 			prompt: 'Describe the coding task. The instruction stays in the Extension Host.',
 			ignoreFocusOut: true,
-			validateInput: (candidate) => candidate.trim().length > 0 ? undefined : 'A task instruction is required.',
+			validateInput: validateTaskInstruction,
 		});
 		if (instruction !== undefined) {
-			await this.services.runTask({ peerId, workspaceId, instruction: instruction.trim() });
+			await this.services.runTask({
+				target,
+				title: title.trim(),
+				instruction: instruction.trim(),
+			});
 		}
 	}
 
@@ -215,7 +283,7 @@ export class ServiceDashboardFacade implements DashboardFacade {
 	}
 
 	public async answerTaskInput(taskId: string): Promise<void> {
-		const answer = await vscode.window.showInputBox({
+		const answer = await this.inputs.showInputBox({
 			title: 'Answer Remote Task',
 			prompt: 'The answer stays in the Extension Host.',
 			ignoreFocusOut: true,
@@ -256,6 +324,18 @@ export class UnavailableDashboardFacade implements DashboardFacade {
 				canStop: false,
 				canCopyConnectionUrl: false,
 			},
+			broker: {
+				state: 'error',
+				role: 'contender',
+				takeover: 'error',
+				holder: 'none',
+				error: {
+					code: 'BROKER_UNAVAILABLE',
+					message: 'The local Device Broker lifecycle is unavailable.',
+				},
+			},
+			localNodes: [],
+			remoteDevices: [],
 			workspaces: [],
 			peers: [],
 			tasks: [],
@@ -311,7 +391,7 @@ export class UnavailableDashboardFacade implements DashboardFacade {
 		return this.unavailable('Peer service');
 	}
 
-	public runTask(_peerId?: string, _workspaceId?: string): Promise<void> {
+	public runTask(_target?: DashboardTaskTarget): Promise<void> {
 		return this.unavailable('Task service');
 	}
 
@@ -353,10 +433,31 @@ function validateConnectionUrl(candidate: string): string | undefined {
 	if (value.length === 0) {
 		return 'A connection URL is required.';
 	}
+
 	try {
 		const parsed = new URL(value);
 		return parsed.protocol === 'https:' ? undefined : 'Connection URLs must use HTTPS.';
 	} catch {
 		return 'Enter a valid connection URL.';
 	}
+}
+
+function validateTaskTitle(candidate: string): string | undefined {
+	const value = candidate.trim();
+	if (value.length === 0) {
+		return 'A non-sensitive task title is required.';
+	}
+	return utf8ByteLength(value) <= PROTOCOL_LIMITS.taskTitleBytes
+		? undefined
+		: `The task title must be at most ${PROTOCOL_LIMITS.taskTitleBytes} UTF-8 bytes.`;
+}
+
+function validateTaskInstruction(candidate: string): string | undefined {
+	const value = candidate.trim();
+	if (value.length === 0) {
+		return 'A task instruction is required.';
+	}
+	return utf8ByteLength(value) <= PROTOCOL_LIMITS.taskPromptBytes
+		? undefined
+		: `The task instruction must be at most ${PROTOCOL_LIMITS.taskPromptBytes} UTF-8 bytes.`;
 }

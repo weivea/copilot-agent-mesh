@@ -4,6 +4,7 @@ export * from './errors';
 export * from './limits';
 export * from './methods';
 export * from './models';
+export * from './nodes';
 export * from './notifications';
 export * from './schemas';
 export * from './webview';

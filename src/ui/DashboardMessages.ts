@@ -2,7 +2,7 @@ import { DashboardViewModel } from './DashboardPresenter';
 import { containsUnsafeDashboardText } from './DashboardRedaction';
 import { TASK_STATUSES, utf8ByteLength } from '../../shared/protocol';
 
-export const DASHBOARD_MESSAGE_VERSION = 1 as const;
+export const DASHBOARD_MESSAGE_VERSION = 2 as const;
 
 export const DASHBOARD_ACTIONS = [
 	'configureDevice',
@@ -33,6 +33,9 @@ export type DashboardInboundMessage =
 		readonly type: 'action';
 		readonly action: DashboardAction;
 		readonly targetId?: string;
+		readonly deviceId?: string;
+		readonly nodeId?: string;
+		readonly nodeInstanceId?: string;
 		readonly peerId?: string;
 		readonly workspaceId?: string;
 	};
@@ -72,14 +75,51 @@ export function parseDashboardInboundMessage(value: unknown): DashboardInboundMe
 		|| typeof value.action !== 'string'
 		|| !actions.has(value.action)
 		|| !optionalIdentifier(value.targetId)
+		|| !optionalIdentifier(value.deviceId)
+		|| !optionalIdentifier(value.nodeId)
+		|| !optionalIdentifier(value.nodeInstanceId)
 		|| !optionalIdentifier(value.peerId)
 		|| !optionalIdentifier(value.workspaceId)
-		|| !hasOnlyKeys(value, ['version', 'uiInstanceId', 'type', 'action', 'targetId', 'peerId', 'workspaceId'])
+		|| !hasOnlyKeys(value, [
+			'version',
+			'uiInstanceId',
+			'type',
+			'action',
+			'targetId',
+			'deviceId',
+			'nodeId',
+			'nodeInstanceId',
+			'peerId',
+			'workspaceId',
+		])
 	) {
 		return undefined;
 	}
 	const action = value.action as DashboardAction;
 	if (targetActions.has(action) && !isIdentifier(value.targetId)) {
+		return undefined;
+	}
+	const routingKeys = [
+		value.deviceId,
+		value.nodeId,
+		value.nodeInstanceId,
+		value.workspaceId,
+	];
+	const hasRouting = routingKeys.some((entry) => entry !== undefined);
+	if (
+		action === 'runTask'
+			? (hasRouting && !routingKeys.every(isIdentifier))
+				|| (!hasRouting && value.peerId !== undefined)
+			: hasRouting || value.peerId !== undefined
+	) {
+		return undefined;
+	}
+	const allowedActionKeys = action === 'runTask'
+		? ['version', 'uiInstanceId', 'type', 'action', 'deviceId', 'nodeId', 'nodeInstanceId', 'peerId', 'workspaceId']
+		: targetActions.has(action)
+			? ['version', 'uiInstanceId', 'type', 'action', 'targetId']
+			: ['version', 'uiInstanceId', 'type', 'action'];
+	if (!hasOnlyKeys(value, allowedActionKeys)) {
 		return undefined;
 	}
 	return value as DashboardInboundMessage;
@@ -106,9 +146,18 @@ export function assertSafeDashboardOutboundMessage(value: DashboardOutboundMessa
 }
 
 function assertDashboardViewModel(model: unknown): asserts model is DashboardViewModel {
-	assertExactRecord(model, ['device', 'listener', 'workspaces', 'peers', 'tasks', 'errors'], []);
-	assertExactRecord(model.device, ['name', 'platform', 'architecture', 'vscodeVersion', 'extensionVersion'], []);
+	assertExactRecord(
+		model,
+		['device', 'listener', 'broker', 'localNodes', 'remoteDevices', 'workspaces', 'peers', 'tasks', 'errors'],
+		[],
+	);
+	assertExactRecord(
+		model.device,
+		['name', 'platform', 'architecture', 'vscodeVersion', 'extensionVersion'],
+		['deviceId'],
+	);
 	assertStrings(model.device, ['name', 'platform', 'architecture', 'vscodeVersion', 'extensionVersion']);
+	assertOptionalIdentifier(model.device.deviceId);
 
 	assertExactRecord(
 		model.listener,
@@ -122,6 +171,41 @@ function assertDashboardViewModel(model: unknown): asserts model is DashboardVie
 	assertComponent(model.listener.gateway);
 	assertComponent(model.listener.tunnel);
 	assertComponent(model.listener.agentHost);
+
+	assertExactRecord(
+		model.broker,
+		['state', 'role', 'takeover', 'holder'],
+		['error'],
+	);
+	assertEnum(model.broker.state, [
+		'starting',
+		'running',
+		'contending',
+		'takingOver',
+		'stopping',
+		'error',
+		'disposed',
+	]);
+	assertEnum(model.broker.role, ['owner', 'contender']);
+	assertEnum(model.broker.takeover, ['stable', 'waiting', 'takingOver', 'stopping', 'error']);
+	assertEnum(model.broker.holder, ['thisWindow', 'anotherWindow', 'none']);
+	if (model.broker.error !== undefined) {
+		assertDashboardError(model.broker.error);
+	}
+
+	assertArray(model.localNodes, 128);
+	model.localNodes.forEach(assertNode);
+
+	assertArray(model.remoteDevices, 128);
+	for (const device of model.remoteDevices) {
+		assertExactRecord(device, ['deviceId', 'peerId', 'name', 'state', 'nodes'], []);
+		assertIdentifier(device.deviceId);
+		assertIdentifier(device.peerId);
+		assertString(device.name);
+		assertEnum(device.state, ['connecting', 'online', 'busy', 'offline', 'authFailed', 'incompatible']);
+		assertArray(device.nodes, 128);
+		device.nodes.forEach(assertNode);
+	}
 
 	assertArray(model.workspaces, 200);
 	for (const workspace of model.workspaces) {
@@ -137,6 +221,35 @@ function assertDashboardViewModel(model: unknown): asserts model is DashboardVie
 		assertOptionalIdentifier(workspace.activeTaskId);
 		assertArray(workspace.capabilityTags, 50);
 		workspace.capabilityTags.forEach(assertString);
+	}
+
+	function assertNode(value: unknown): void {
+		assertExactRecord(
+			value,
+			['nodeId', 'nodeInstanceId', 'label', 'status', 'thisWindow', 'workspaces'],
+			[],
+		);
+		assertIdentifier(value.nodeId);
+		assertIdentifier(value.nodeInstanceId);
+		assertString(value.label);
+		assertEnum(value.status, ['online', 'busy', 'offline', 'conflict', 'draining']);
+		assertBoolean(value.thisWindow);
+		assertArray(value.workspaces, 32);
+		for (const workspace of value.workspaces) {
+			assertExactRecord(
+				workspace,
+				['workspaceId', 'name', 'capabilityTags', 'enabled', 'busy', 'claimStatus'],
+				['activeTaskId'],
+			);
+			assertIdentifier(workspace.workspaceId);
+			assertString(workspace.name);
+			assertArray(workspace.capabilityTags, 32);
+			workspace.capabilityTags.forEach(assertString);
+			assertBoolean(workspace.enabled);
+			assertBoolean(workspace.busy);
+			assertEnum(workspace.claimStatus, ['claimed', 'readOnly', 'conflict']);
+			assertOptionalIdentifier(workspace.activeTaskId);
+		}
 	}
 
 	assertArray(model.peers, 200);
