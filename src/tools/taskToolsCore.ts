@@ -1014,6 +1014,12 @@ function parseTaskSnapshot(value: unknown): TaskToolSnapshot {
 	const pendingInput = snapshot.pendingInput === undefined
 		? undefined
 		: parsePendingInput(snapshot.pendingInput);
+	if (status === 'needsInput' && pendingInput === undefined) {
+		throw new Error('needsInput task snapshot must include pendingInput.');
+	}
+	if (status !== 'needsInput' && pendingInput !== undefined) {
+		throw new Error('pendingInput is only valid for a needsInput task snapshot.');
+	}
 	return {
 		taskId: expectIdentifier(snapshot.taskId, 'taskId'),
 		status,
@@ -1192,6 +1198,10 @@ function halveUtf8(value: string, minimumBytes: number): string {
 }
 
 function shrinkToolResult(value: ToolJsonResult): ToolJsonResult | undefined {
+	const compactDelegation = compactDelegationResult(value);
+	if (compactDelegation !== undefined) {
+		return compactDelegation;
+	}
 	if (Array.isArray(value.events) && value.events.length > 0) {
 		return {
 			...value,
@@ -1298,17 +1308,6 @@ function shrinkToolResult(value: ToolJsonResult): ToolJsonResult | undefined {
 		const { recovered: _recovered, ...withoutRecovered } = value;
 		return withoutRecovered;
 	}
-	if (
-		typeof value.taskId === 'string'
-		&& typeof value.delegationRequestId === 'string'
-	) {
-		return {
-			s: 0,
-			t: value.taskId,
-			d: value.delegationRequestId,
-			r: 1,
-		};
-	}
 	return undefined;
 }
 
@@ -1317,8 +1316,52 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function isCompactDelegationResult(value: ToolJsonResult): boolean {
-	return value.s === 0
-		&& typeof value.t === 'string'
-		&& typeof value.d === 'string'
-		&& value.r === 1;
+	return typeof value.s === 'number'
+		&& value.s >= 0
+		&& value.s <= 3;
+}
+
+function compactDelegationResult(value: ToolJsonResult): ToolJsonResult | undefined {
+	if (isCompactDelegationResult(value)) {
+		return undefined;
+	}
+	if (
+		value.status === 'pending'
+		&& value.phase === 'persisting'
+		&& value.reconciliationPending === true
+		&& value.retrySameIntent === true
+	) {
+		return { s: 3, r: 1 };
+	}
+	if (
+		typeof value.taskId !== 'string'
+		|| typeof value.delegationRequestId !== 'string'
+	) {
+		return undefined;
+	}
+	if (value.status === 'pending') {
+		return {
+			s: 0,
+			t: value.taskId,
+			d: value.delegationRequestId,
+		};
+	}
+	if (value.status === 'cancelled' || value.status === 'timeout') {
+		return {
+			s: 1,
+			t: value.taskId,
+			d: value.delegationRequestId,
+			r: 1,
+		};
+	}
+	if (value.status === 'error' && isRecord(value.error) && typeof value.error.code === 'string') {
+		return {
+			s: 2,
+			t: value.taskId,
+			d: value.delegationRequestId,
+			e: value.error.code,
+			r: value.error.retryable === true ? 1 : 0,
+		};
+	}
+	return undefined;
 }

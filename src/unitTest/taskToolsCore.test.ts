@@ -406,6 +406,55 @@ suite('TaskToolsCore', () => {
 		assert.equal(cancel.taskStatus, 'cancelling');
 	});
 
+	test('rejects snapshots whose pending input contradicts task status', async () => {
+		const facade = new RecordingFacade();
+		const core = new TaskToolsCore(facade);
+		facade.taskRead = {
+			...facade.taskRead,
+			snapshot: {
+				...facade.taskRead.snapshot,
+				status: 'needsInput',
+			},
+		};
+		const missing = await core.getTask({ taskId: TASK_ID });
+
+		assert.equal(missing.status, 'error');
+		assert.equal((missing.error as Record<string, unknown>).code, 'OUTPUT_INVALID');
+
+		for (const status of [
+			'created',
+			'accepted',
+			'startingAgent',
+			'running',
+			'recovering',
+			'cancelling',
+			'completed',
+			'failed',
+			'cancelled',
+			'timedOut',
+		] as const) {
+			facade.taskRead = {
+				...facade.taskRead,
+				snapshot: {
+					...facade.taskRead.snapshot,
+					status,
+					pendingInput: {
+						inputId: INPUT_ID,
+						prompt: 'Contradictory input.',
+					},
+				},
+			};
+			const contradictory = await core.getTask({ taskId: TASK_ID });
+			assert.equal(contradictory.status, 'error', status);
+			assert.equal(
+				(contradictory.error as Record<string, unknown>).code,
+				'OUTPUT_INVALID',
+				status,
+			);
+			assert.equal(contradictory.answerTool, undefined, status);
+		}
+	});
+
 	test('keeps durable IDs when acceptance fails after persistence', async () => {
 		const facade = new RecordingFacade();
 		facade.acceptance = Promise.reject(new TaskToolFacadeError('TUNNEL_UNAVAILABLE', true));
@@ -555,9 +604,71 @@ suite('TaskToolsCore', () => {
 			s: 0,
 			t: TASK_ID,
 			d: DELEGATION_ID,
-			r: 1,
 		});
 		assert.equal(tooSmall, '');
+	});
+
+	test('preserves conflict error semantics in a 200-character compact result', async () => {
+		const facade = new RecordingFacade();
+		facade.acceptance = Promise.reject(new TaskToolFacadeError('TASK_ID_CONFLICT'));
+		const result = await new TaskToolsCore(facade).delegateTask(delegationInput());
+		const countCharacters = async (text: string): Promise<number> => text.length;
+
+		const serialized = await serializeToolResultToTokenBudget(result, 200, countCharacters);
+		const compact = JSON.parse(serialized) as Record<string, unknown>;
+
+		assert.ok(serialized.length <= 200);
+		assert.deepStrictEqual(compact, {
+			s: 2,
+			t: TASK_ID,
+			d: DELEGATION_ID,
+			e: 'TASK_ID_CONFLICT',
+			r: 0,
+		});
+	});
+
+	test('distinguishes reconciliation waits from accepted pending at 100 characters', async () => {
+		const result = {
+			status: 'timeout',
+			delegationRequestId: DELEGATION_ID,
+			taskId: TASK_ID,
+			recovered: false,
+			pollTool: MESH_TOOL_NAMES.getTask,
+			cancelTool: MESH_TOOL_NAMES.cancelTask,
+			error: {
+				code: 'TIMEOUT',
+				message: 'The caller wait ended.',
+				retryable: true,
+			},
+		};
+		const countCharacters = async (text: string): Promise<number> => text.length;
+
+		const serialized = await serializeToolResultToTokenBudget(result, 100, countCharacters);
+
+		assert.deepStrictEqual(JSON.parse(serialized), {
+			s: 1,
+			t: TASK_ID,
+			d: DELEGATION_ID,
+			r: 1,
+		});
+		assert.ok(serialized.length <= 100);
+	});
+
+	test('preserves pre-ID persistence reconciliation at a 100-character budget', async () => {
+		const facade = new RecordingFacade();
+		facade.persistence = new Promise(() => undefined);
+		const clock = new ManualClock();
+		const invocation = new TaskToolsCore(facade, { clock }).delegateTask(delegationInput());
+		await Promise.resolve();
+		await Promise.resolve();
+		clock.advanceBy(15_000);
+		const result = await invocation;
+		const countCharacters = async (text: string): Promise<number> => text.length;
+
+		const serialized = await serializeToolResultToTokenBudget(result, 100, countCharacters);
+
+		assert.deepStrictEqual(JSON.parse(serialized), { s: 3, r: 1 });
+		assert.ok(serialized.length <= 100);
 	});
 
 	test('preserves the minimal needsInput contract at a 300-character token budget', async () => {

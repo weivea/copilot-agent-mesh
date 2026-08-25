@@ -38,11 +38,22 @@ strings, so identifier JSON size is fixed and matches the domain foundation.
 Facade task responses are also bound to the requested task ID; a mismatched
 snapshot or action receipt becomes `OUTPUT_INVALID`.
 
-Under severe token pressure, an already-persisted delegation is compacted to
-`{"s":0,"t":"<taskId>","d":"<delegationRequestId>","r":1}` before any generic
-error or empty-text fallback. Here `s:0` means pending, `t` and `d` preserve the
-two durable IDs, and `r:1` means reconciliation/retry of the same intent is
-required. This form fits a 100-character budget with canonical UUIDs.
+Under severe token pressure, delegation results use a state-preserving compact
+wire form before any generic error or empty-text fallback:
+
+| `s` | Meaning | Compact fields |
+| ---: | --- | --- |
+| `0` | Worker accepted; task is pending | `t` task ID, `d` delegation request ID |
+| `1` | Caller wait ended; durable delegation needs reconciliation | `t`, `d`, `r:1` |
+| `2` | Durable delegation error | `t`, `d`, `e` stable error code, `r` retry flag |
+| `3` | Intent persistence is still pending and IDs are not available | `r:1` |
+
+The keys are `s` state, `t` task ID, `d` delegation request ID, `e` error code,
+and `r` retry/reconciliation flag. State is derived from the full result, never
+inferred merely from the presence of both IDs. The pending and reconciliation
+forms fit a 100-character budget with canonical UUIDs; a conflict error with
+`r:0` fits 200 characters. If the matching compact form does not fit, the
+result is empty text rather than a semantically different generic error.
 
 Cancelling a `CancellationToken` aborts only the current Tool wait. In
 particular, delegate cancellation or acknowledgement timeout does not call the
