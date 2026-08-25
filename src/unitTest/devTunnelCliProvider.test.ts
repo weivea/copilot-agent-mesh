@@ -322,6 +322,41 @@ suite('DevTunnelCliProvider', () => {
 		await provider.stop();
 	});
 
+	test('blocks renewal delete when the executable hash changes', async () => {
+		const runner = new FakeRunner();
+		let verifications = 0;
+		const provider = createProvider(runner, new MemoryStore(), {
+			binaryVerifier: async () => {
+				verifications += 1;
+				return verifications < 3;
+			},
+		});
+		await provider.ensureHosted(request);
+
+		await assert.rejects(
+			provider.renewAccess(),
+			(error: unknown) => hasProviderCode(error, 'CLI_UNSUPPORTED'),
+		);
+
+		assert.equal(runner.commands.some((args) => args.slice(0, 2).join(' ') === 'access delete'), false);
+		assert.equal(provider.getStatus().state, 'circuit-open');
+	});
+
+	test('blocks renewal delete when the exact executable version changes', async () => {
+		const runner = new FakeRunner();
+		const provider = createProvider(runner, new MemoryStore());
+		await provider.ensureHosted(request);
+		runner.versionBuild = '1.0.2006+dd9fe5139f';
+
+		await assert.rejects(
+			provider.renewAccess(),
+			(error: unknown) => hasProviderCode(error, 'CLI_UNSUPPORTED'),
+		);
+
+		assert.equal(runner.commands.some((args) => args.slice(0, 2).join(' ') === 'access delete'), false);
+		assert.equal(provider.getStatus().state, 'circuit-open');
+	});
+
 	test('serializes concurrent access renewals', async () => {
 		const runner = new FakeRunner();
 		const provider = createProvider(runner, new MemoryStore());
@@ -493,6 +528,95 @@ suite('DevTunnelCliProvider', () => {
 		await provider.stop();
 	});
 
+	test('adopts the unique owned ACE when an interrupted tunnel already has its port', async () => {
+		const runner = new FakeRunner();
+		const store = new MemoryStore(createMetadata({
+			accessExpiresAt: now.toISOString(),
+			provisioned: false,
+		}));
+		const provider = createProvider(runner, store);
+
+		const hosted = await provider.ensureHosted(request);
+
+		assert.equal(hosted.accessExpiresAt, runner.listedAccessExpiration);
+		assert.equal(
+			runner.commands.some((args) => args.slice(0, 2).join(' ') === 'access create'),
+			false,
+		);
+		await provider.stop();
+	});
+
+	test('creates access only when an interrupted existing port has an empty ACE list', async () => {
+		const runner = new FakeRunner();
+		runner.emptyAccessList = true;
+		const store = new MemoryStore(createMetadata({
+			accessExpiresAt: now.toISOString(),
+			provisioned: false,
+		}));
+		const provider = createProvider(runner, store);
+
+		await provider.ensureHosted(request);
+
+		assert.equal(
+			runner.commands.some((args) => args.slice(0, 2).join(' ') === 'access create'),
+			true,
+		);
+		await provider.stop();
+	});
+
+	test('rejects ambiguous ACEs on an interrupted existing port without creating access', async () => {
+		const runner = new FakeRunner();
+		runner.extraAccessEntry = true;
+		const store = new MemoryStore(createMetadata({
+			accessExpiresAt: now.toISOString(),
+			provisioned: false,
+		}));
+		const provider = createProvider(runner, store);
+
+		await assert.rejects(
+			provider.ensureHosted(request),
+			(error: unknown) => hasProviderCode(error, 'CLI_UNSUPPORTED'),
+		);
+
+		assert.equal(
+			runner.commands.some((args) => args.slice(0, 2).join(' ') === 'access create'),
+			false,
+		);
+	});
+
+	test('retains the host handle and exposes cleanup failure until stop succeeds', async () => {
+		const runner = new FakeRunner();
+		const provider = createProvider(runner, new MemoryStore());
+		await provider.ensureHosted(request);
+		runner.hosts[0].failStop = true;
+
+		await assert.rejects(provider.stop());
+		assert.equal(provider.getStatus().state, 'cleanup-failed');
+
+		runner.hosts[0].failStop = false;
+		await provider.stop();
+		assert.equal(provider.getStatus().state, 'stopped');
+		assert.equal(runner.hosts[0].stopCount, 2);
+	});
+
+	test('retains a host whose pending start races with a failed stop', async () => {
+		const runner = new FakeRunner();
+		runner.pauseHostStart = true;
+		const provider = createProvider(runner, new MemoryStore());
+		const starting = provider.ensureHosted(request);
+		await runner.waitForHostStart();
+		const stopping = provider.stop();
+		runner.continueHostStart(true);
+
+		await assert.rejects(stopping);
+		await assert.rejects(starting);
+		assert.equal(provider.getStatus().state, 'cleanup-failed');
+
+		runner.hosts[0].failStop = false;
+		await provider.stop();
+		assert.equal(provider.getStatus().state, 'stopped');
+	});
+
 	test('stops the host and suppresses restart after ACE renewal fails', async () => {
 		const runner = new FakeRunner();
 		const provider = createProvider(runner, new MemoryStore());
@@ -548,6 +672,53 @@ suite('DevTunnelCliProvider', () => {
 		if (status.state === 'circuit-open') {
 			assert.equal(status.code, 'CLI_UNSUPPORTED');
 		}
+	});
+
+	test('blocks restart after the owned ACE expires', async () => {
+		const runner = new FakeRunner();
+		const store = new MemoryStore();
+		const provider = createProvider(runner, store, {
+			random: () => 0,
+			restartBaseDelayMs: 1,
+		});
+		await provider.ensureHosted(request);
+		assert.ok(store.value);
+		store.value = { ...store.value, accessExpiresAt: now.toISOString() };
+
+		runner.hosts[0].finish({ exitCode: 1, signal: null });
+		await waitFor(() => provider.getStatus().state === 'circuit-open');
+
+		assert.equal(runner.hosts.length, 1);
+		const status = provider.getStatus();
+		assert.equal(status.state, 'circuit-open');
+		if (status.state === 'circuit-open') {
+			assert.equal(status.code, 'TUNNEL_ACCESS_EXPIRED');
+		}
+	});
+
+	test('renews access inside the renewal window before restarting', async () => {
+		const runner = new FakeRunner();
+		const store = new MemoryStore();
+		const provider = createProvider(runner, store, {
+			random: () => 0,
+			restartBaseDelayMs: 1,
+		});
+		await provider.ensureHosted(request);
+		const expiringSoon = '2026-08-25T02:00:00.000Z';
+		assert.ok(store.value);
+		store.value = { ...store.value, accessExpiresAt: expiringSoon };
+		runner.listedAccessExpiration = expiringSoon;
+		runner.accessExpiration = '2026-09-01T02:00:00.000Z';
+
+		runner.hosts[0].finish({ exitCode: 1, signal: null });
+		await waitFor(() => runner.hosts.length === 2 && provider.getStatus().state === 'ready');
+
+		assert.equal(store.value?.accessExpiresAt, runner.accessExpiration);
+		assert.equal(
+			runner.commands.some((args) => args.slice(0, 2).join(' ') === 'access delete'),
+			true,
+		);
+		await provider.stop();
 	});
 
 	test('cancels readiness when the owned host exits before WSS succeeds', async () => {
@@ -616,16 +787,19 @@ class FakeRunner {
 	accessExpiration = '2026-09-01T01:00:00.000Z';
 	listedAccessExpiration = '2026-09-01T01:00:00.000Z';
 	accessListTimeout = false;
+	emptyAccessList = false;
 	failAccessCreate = false;
 	extraAccessEntry = false;
 	extraPort = false;
 	hasPort = true;
 	invalidShow = false;
 	pauseCreate = false;
+	pauseHostStart = false;
 	pausePortCreate = false;
 	showNotFound = false;
 	showTimeout = false;
 	tunnelAccessEntry = false;
+	versionBuild: string;
 	private createContinuation: (() => void) | undefined;
 	private createReached: (() => void) | undefined;
 	private readonly createReachedPromise = new Promise<void>((resolve) => {
@@ -635,8 +809,15 @@ class FakeRunner {
 	private readonly portCreateReachedPromise = new Promise<void>((resolve) => {
 		this.portCreateReached = resolve;
 	});
+	private hostStartContinuation: ((failStop: boolean) => void) | undefined;
+	private hostStartReached: (() => void) | undefined;
+	private readonly hostStartReachedPromise = new Promise<void>((resolve) => {
+		this.hostStartReached = resolve;
+	});
 
-	constructor(private readonly build = SUPPORTED_DEVTUNNEL_BUILD) {}
+	constructor(private readonly build = SUPPORTED_DEVTUNNEL_BUILD) {
+		this.versionBuild = build;
+	}
 
 	async run(
 		_executable: string,
@@ -646,7 +827,7 @@ class FakeRunner {
 		this.commands.push([...args]);
 		const command = args.slice(0, 2).join(' ');
 		if (args[0] === '--version') {
-			return result(`Tunnel CLI version: ${this.build}\n`);
+			return result(`Tunnel CLI version: ${this.versionBuild}\n`);
 		}
 		if (command === 'user show') {
 			return result('');
@@ -690,7 +871,7 @@ class FakeRunner {
 			if (this.accessListTimeout) {
 				throw new ChildProcessExecutionError('PROCESS_TIMEOUT', 'Injected access-list timeout.');
 			}
-			const entries = [{
+			const entries = this.emptyAccessList ? [] : [{
 				type: 'Anonymous',
 				subjects: [],
 				scopes: ['connect'],
@@ -710,6 +891,7 @@ class FakeRunner {
 			if (this.failAccessCreate) {
 				throw new Error('Injected access create failure.');
 			}
+			this.emptyAccessList = false;
 			this.listedAccessExpiration = this.accessExpiration;
 			return result(JSON.stringify({
 				accessControlEntries: [{
@@ -761,6 +943,14 @@ class FakeRunner {
 		this.createContinuation?.();
 	}
 
+	waitForHostStart(): Promise<void> {
+		return this.hostStartReachedPromise;
+	}
+
+	continueHostStart(failStop = false): void {
+		this.hostStartContinuation?.(failStop);
+	}
+
 	private waitForCreateContinuation(signal?: AbortSignal): Promise<void> {
 		return new Promise((resolve, reject) => {
 			const abort = (): void => {
@@ -788,12 +978,22 @@ class FakeRunner {
 		]);
 		const host = new FakeOwnedHost(this.hosts.length + 100);
 		this.hosts.push(host);
+		this.hostStartReached?.();
+		if (this.pauseHostStart) {
+			await new Promise<void>((resolve) => {
+				this.hostStartContinuation = (failStop) => {
+					host.failStop = failStop;
+					resolve();
+				};
+			});
+		}
 		return host;
 	}
 }
 
 class FakeOwnedHost implements OwnedChildProcess {
 	readonly exit: Promise<OwnedChildProcessExit>;
+	failStop = false;
 	stopCount = 0;
 	private resolveExit: ((result: OwnedChildProcessExit) => void) | undefined;
 
@@ -809,6 +1009,9 @@ class FakeOwnedHost implements OwnedChildProcess {
 
 	async stop(): Promise<void> {
 		this.stopCount += 1;
+		if (this.failStop) {
+			throw new Error('Injected host stop failure.');
+		}
 		this.finish({ exitCode: null, signal: 'SIGTERM' });
 	}
 }

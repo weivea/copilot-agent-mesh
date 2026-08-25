@@ -411,11 +411,19 @@ export class ChildProcessRunner {
 				resolveExit = resolveExitPromise;
 			});
 			const stop = (): Promise<void> => {
-				stopping ??= this.stopOwnedProcess(
-					child.pid,
-					terminateProcessTree,
-					isProcessTreeAlive,
-				);
+				if (stopping === undefined) {
+					const attempt = this.stopOwnedProcess(
+						child.pid,
+						terminateProcessTree,
+						isProcessTreeAlive,
+					);
+					stopping = attempt;
+					void attempt.catch(() => {
+						if (stopping === attempt) {
+							stopping = undefined;
+						}
+					});
+				}
 				return stopping;
 			};
 

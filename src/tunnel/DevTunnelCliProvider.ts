@@ -10,6 +10,7 @@ import {
 	DEVTUNNEL_EXECUTABLE_SHA256,
 	decodeDevTunnelAccessCreateJson,
 	decodeDevTunnelAccessDeleteJson,
+	decodeDevTunnelAccessListForAdoptionJson,
 	decodeDevTunnelAccessListJson,
 	decodeDevTunnelCreateJson,
 	decodeDevTunnelPortCreateJson,
@@ -102,6 +103,7 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 	private ensurePromise: Promise<HostedTunnel> | undefined;
 	private inFlightRequest: TunnelRequest | undefined;
 	private host: OwnedChildProcess | undefined;
+	private hostStartPromise: Promise<OwnedChildProcess> | undefined;
 	private lifecycleGeneration = 0;
 	private lifecycleAbortController: AbortController | undefined;
 	private lifecycleMutationTail: Promise<void> = Promise.resolve();
@@ -308,6 +310,8 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 				expectedIndex: metadata.accessIndex,
 			});
 			this.assertLifecycleActive(generation);
+			await this.assertExactExecutable(generation, signal);
+			this.assertLifecycleActive(generation);
 			destructiveRenewalStarted = true;
 			const deleted = await this.run([
 				'access',
@@ -336,6 +340,14 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 				throw toProviderError(error);
 			}
 			const providerError = toProviderError(error);
+			if (
+				!destructiveRenewalStarted
+				&& error instanceof DevTunnelProviderError
+				&& providerError.code === 'CLI_UNSUPPORTED'
+			) {
+				await this.openCircuitAndStop(providerError.code, providerError.message);
+				throw providerError;
+			}
 			if (!destructiveRenewalStarted && providerError.retryable) {
 				throw providerError;
 			}
@@ -356,11 +368,31 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 		this.lifecycleAbortController = undefined;
 		this.lifecycleGeneration += 1;
 		this.clearRestartTimer();
+		const pendingHost = this.hostStartPromise;
+		if (pendingHost !== undefined) {
+			try {
+				await pendingHost;
+			} catch {
+				// A failed spawn has no owned process handle to clean up.
+			}
+		}
 		const host = this.host;
-		this.host = undefined;
-		this.status = { state: 'stopped' };
-		if (host !== undefined) {
+		if (host === undefined) {
+			this.status = { state: 'stopped' };
+			return;
+		}
+		try {
 			await host.stop();
+			if (this.host === host) {
+				this.host = undefined;
+			}
+			this.status = { state: 'stopped' };
+		} catch (error: unknown) {
+			this.status = {
+				state: 'cleanup-failed',
+				message: 'The owned Dev Tunnel host could not be stopped; retry stop().',
+			};
+			throw error;
 		}
 	}
 
@@ -428,10 +460,16 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 		} catch (error: unknown) {
 			const providerError = toProviderError(error);
 			const lifecycleActive = this.lifecycleIsActive(generation);
-			if (lifecycleActive && !providerError.retryable) {
+			const cleanupFailed = this.getStatus().state === 'cleanup-failed';
+			if (
+				lifecycleActive
+				&& !cleanupFailed
+				&& !providerError.retryable
+			) {
 				this.openCircuit(providerError.code, providerError.message);
 			} else if (
 				lifecycleActive
+				&& !cleanupFailed
 				&& hostStartAttempted
 				&& this.metadata !== undefined
 				&& this.request !== undefined
@@ -489,6 +527,7 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 		generation: number,
 		signal: AbortSignal,
 	): Promise<TunnelMetadata> {
+		let access: { readonly expiresAt: string; readonly index: number } | undefined;
 		if (!portExists) {
 			this.assertLifecycleActive(generation);
 			const port = await this.run([
@@ -510,8 +549,24 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 			this.assertLifecycleActive(generation);
 			await this.stateStore.save(metadata);
 			this.assertLifecycleActive(generation);
+		} else {
+			this.assertLifecycleActive(generation);
+			const listed = await this.run([
+				'access',
+				'list',
+				metadata.tunnelId,
+				'--port-number',
+				String(metadata.localPort),
+				'--json',
+			], commandTimeoutMs, commandMaxOutputBytes, signal);
+			this.assertLifecycleActive(generation);
+			access = decodeDevTunnelAccessListForAdoptionJson(
+				metadata.build,
+				listed.stdout,
+				this.now(),
+			);
 		}
-		const access = await this.createAccess(metadata, generation, signal);
+		access ??= await this.createAccess(metadata, generation, signal);
 		const provisioned: TunnelMetadata = {
 			...metadata,
 			accessExpiresAt: access.expiresAt,
@@ -571,13 +626,20 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 	): Promise<HostedTunnel> {
 		return this.withLifecycleMutation(async () => {
 			this.assertLifecycleActive(generation);
-			const metadata = await this.stateStore.load();
+			let metadata = await this.stateStore.load();
 			this.assertLifecycleActive(generation);
 			if (metadata === undefined) {
 				throw permanent('TUNNEL_METADATA_INVALID', 'No owned Dev Tunnel metadata exists.');
 			}
 			validateMetadata(metadata, request);
 			this.metadata = metadata;
+			const accessExpiresAt = new Date(metadata.accessExpiresAt);
+			if (!Number.isFinite(accessExpiresAt.valueOf()) || accessExpiresAt.valueOf() <= this.now().valueOf()) {
+				throw permanent('TUNNEL_ACCESS_EXPIRED', 'The owned anonymous access entry has expired.');
+			}
+			if (accessExpiresAt.valueOf() - this.now().valueOf() <= renewalWindowMs) {
+				metadata = await this.renewAccessOnce(generation, signal);
+			}
 			const hosted = await this.startAndProbeLocked(metadata, request, generation, signal);
 			this.metadata = hosted;
 			return hosted;
@@ -603,15 +665,24 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 			);
 		}
 		this.assertLifecycleActive(generation);
-		const host = await this.requireCommandRunner().startOwned(
+		const hostStart = this.requireCommandRunner().startOwned(
 			this.requireTrustedExecutable(),
 			['host', metadata.tunnelId],
 		);
-		if (!this.lifecycleIsActive(generation)) {
-			await host.stop();
-			this.assertLifecycleActive(generation);
+		this.hostStartPromise = hostStart;
+		let host: OwnedChildProcess;
+		try {
+			host = await hostStart;
+		} finally {
+			if (this.hostStartPromise === hostStart) {
+				this.hostStartPromise = undefined;
+			}
 		}
 		this.host = host;
+		if (!this.lifecycleIsActive(generation)) {
+			await this.stopHostOrMarkCleanupFailed(host);
+			this.assertLifecycleActive(generation);
+		}
 		let readyPublished = false;
 		let hostExited = false;
 		const hostExit = host.exit.then(() => {
@@ -653,8 +724,7 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 			abortReadiness();
 			await readiness.catch(() => undefined);
 			if (this.host === host) {
-				this.host = undefined;
-				await host.stop();
+				await this.stopHostOrMarkCleanupFailed(host);
 			}
 			throw error;
 		} finally {
@@ -682,8 +752,7 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 			return hosted;
 		} catch (error: unknown) {
 			if (this.host === host) {
-				this.host = undefined;
-				await host.stop();
+				await this.stopHostOrMarkCleanupFailed(host);
 			}
 			throw error;
 		}
@@ -720,6 +789,28 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 			expectedExpiration: metadata.accessExpiresAt,
 			expectedIndex: metadata.accessIndex,
 		});
+	}
+
+	private async assertExactExecutable(
+		generation: number,
+		signal: AbortSignal,
+	): Promise<void> {
+		this.assertLifecycleActive(generation);
+		if (!await this.binaryVerifier(this.requireTrustedExecutable())) {
+			throw permanent(
+				'CLI_UNSUPPORTED',
+				'The Dev Tunnel executable hash changed before a protected lifecycle mutation.',
+			);
+		}
+		this.assertLifecycleActive(generation);
+		const version = await this.run(['--version'], 15_000, 32 * 1024, signal);
+		this.assertLifecycleActive(generation);
+		if (decodeVersion(version.stdout) !== SUPPORTED_DEVTUNNEL_BUILD) {
+			throw permanent(
+				'CLI_UNSUPPORTED',
+				'The Dev Tunnel executable build changed before a protected lifecycle mutation.',
+			);
+		}
 	}
 
 	private async discoverAndProbe(
@@ -822,6 +913,9 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 			if (!lifecycleActive) {
 				return;
 			}
+			if (this.status.state === 'cleanup-failed') {
+				return;
+			}
 			if (!providerError.retryable) {
 				this.openCircuit(providerError.code, providerError.message);
 				return;
@@ -844,9 +938,35 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 		this.lifecycleAbortController?.abort();
 		this.openCircuit(code, message);
 		const host = this.host;
-		this.host = undefined;
 		if (host !== undefined) {
+			try {
+				await host.stop();
+				if (this.host === host) {
+					this.host = undefined;
+				}
+
+			} catch (error: unknown) {
+				this.status = {
+					state: 'cleanup-failed',
+					message: 'The owned Dev Tunnel host could not be stopped; retry stop().',
+				};
+				throw error;
+			}
+		}
+	}
+
+	private async stopHostOrMarkCleanupFailed(host: OwnedChildProcess): Promise<void> {
+		try {
 			await host.stop();
+			if (this.host === host) {
+				this.host = undefined;
+			}
+		} catch (error: unknown) {
+			this.status = {
+				state: 'cleanup-failed',
+				message: 'The owned Dev Tunnel host could not be stopped; retry stop().',
+			};
+			throw error;
 		}
 	}
 

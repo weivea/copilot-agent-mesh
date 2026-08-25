@@ -67,6 +67,7 @@ export type DevTunnelRuntimeStatus =
 	| { readonly state: 'starting' }
 	| { readonly state: 'ready'; readonly tunnel: HostedTunnel }
 	| { readonly state: 'backoff'; readonly attempt: number; readonly retryAt: string }
+	| { readonly state: 'cleanup-failed'; readonly message: string }
 	| { readonly state: 'circuit-open'; readonly code: DevTunnelErrorCode; readonly message?: string };
 
 export interface DevTunnelStateStore {

@@ -6,6 +6,7 @@ import { suite, test } from 'node:test';
 import {
 	computeSanitizedFixtureHash,
 	DEVTUNNEL_HOSTED_FIXTURE_SHA256,
+	decodeDevTunnelAccessListForAdoptionJson,
 	decodeDevTunnelAccessListJson,
 	decodeDevTunnelShowJson as decodeDevTunnelShowForBuild,
 	DevTunnelDecodeError,
@@ -276,6 +277,40 @@ suite('DevTunnelJsonDecoder', () => {
 				SUPPORTED_DEVTUNNEL_BUILD,
 				JSON.stringify({ accessControlEntries: [entry] }),
 				{ expectedExpiration: '2026-08-27T02:45:25.005839Z', expectedIndex: 0 },
+			),
+			(error: unknown) => hasCode(error, 'ACCESS_INVALID'),
+		);
+	});
+
+	test('adopts only an empty list or one future owned access entry', () => {
+		const now = new Date('2026-08-25T01:00:00.000Z');
+		const entry = {
+			type: 'Anonymous',
+			subjects: [],
+			scopes: ['connect'],
+			expiration: '2026-08-27T01:00:00.000Z',
+		};
+		assert.equal(
+			decodeDevTunnelAccessListForAdoptionJson(
+				SUPPORTED_DEVTUNNEL_BUILD,
+				JSON.stringify({ accessControlEntries: [] }),
+				now,
+			),
+			undefined,
+		);
+		assert.deepStrictEqual(
+			decodeDevTunnelAccessListForAdoptionJson(
+				SUPPORTED_DEVTUNNEL_BUILD,
+				JSON.stringify({ accessControlEntries: [entry] }),
+				now,
+			),
+			{ expiresAt: entry.expiration, index: 0 },
+		);
+		assert.throws(
+			() => decodeDevTunnelAccessListForAdoptionJson(
+				SUPPORTED_DEVTUNNEL_BUILD,
+				JSON.stringify({ accessControlEntries: [entry, entry] }),
+				now,
 			),
 			(error: unknown) => hasCode(error, 'ACCESS_INVALID'),
 		);

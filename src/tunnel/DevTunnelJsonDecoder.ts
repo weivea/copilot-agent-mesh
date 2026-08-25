@@ -208,6 +208,35 @@ export function decodeDevTunnelAccessListJson(
 	}
 }
 
+export function decodeDevTunnelAccessListForAdoptionJson(
+	build: string,
+	raw: string,
+	now: Date,
+): DecodedAccess | undefined {
+	assertSupportedBuild(build);
+	const root = parseRoot(raw, new Set(['accessControlEntries']));
+	if (!Array.isArray(root.accessControlEntries)) {
+		throw new DevTunnelDecodeError('ACCESS_INVALID', 'Dev Tunnel access list must be an array.');
+	}
+	if (root.accessControlEntries.length === 0) {
+		return undefined;
+	}
+	if (root.accessControlEntries.length !== 1) {
+		throw new DevTunnelDecodeError(
+			'ACCESS_INVALID',
+			'The existing port has ambiguous access entries and cannot be adopted.',
+		);
+	}
+	const expiration = decodeOwnedAnonymousAccessEntry(root.accessControlEntries[0]);
+	if (expiration.valueOf() <= now.valueOf()) {
+		throw new DevTunnelDecodeError('ACCESS_INVALID', 'The existing owned access entry is expired.');
+	}
+	return {
+		expiresAt: expiration.toISOString(),
+		index: 0,
+	};
+}
+
 export function decodeDevTunnelAccessDeleteJson(build: string, raw: string): void {
 	assertSupportedBuild(build);
 	const root = parseRoot(raw, new Set(['accessControlEntries']));

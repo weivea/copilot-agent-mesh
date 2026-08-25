@@ -293,6 +293,32 @@ suite('ChildProcessRunner', () => {
 		assertProcessGroupGone(owned.pid);
 	});
 
+	test('retries owned process termination after a failed stop attempt', {
+		skip: process.platform === 'win32',
+	}, async () => {
+		let attempts = 0;
+		const runner = createNodeRunner((pid, signal) => {
+			attempts += 1;
+			if (attempts === 1) {
+				throw new Error('Injected termination failure.');
+			}
+			process.kill(-pid, signal);
+		});
+		const owned = await runner.startOwned(
+			process.execPath,
+			['-e', 'setInterval(() => undefined, 1000);'],
+		);
+
+		await assert.rejects(
+			owned.stop(),
+			(error: unknown) => hasCode(error, 'PROCESS_TREE_TERMINATION_FAILED'),
+		);
+		await owned.stop();
+
+		assert.equal(attempts, 2);
+		assertProcessGroupGone(owned.pid);
+	});
+
 	test('redacts URL fragments, tokens, authorization, and JSON secrets', () => {
 		const redacted = redactProcessText(
 			'https://example.test/connect#secret=value?x=1 '

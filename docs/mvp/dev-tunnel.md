@@ -39,6 +39,12 @@ Any extra port, protocol, ownership, ACE, index, scope, expiration, or executabl
 fails closed and opens the circuit before another host starts. Renewal and host transitions
 are serialized against freshly loaded ownership metadata. No global CLI upgrade is attempted.
 
+Renewal repeats both the executable SHA-256 gate and exact `--version` gate inside the
+serialized mutation immediately before ACE deletion; failure cannot revoke access. If
+provisioning resumes with an existing fixed port, it first lists that port's ACEs: an empty
+list creates a new ACE, one strict future index-zero anonymous/connect ACE is adopted, and
+every other nonempty set fails closed without creating another ACE.
+
 ## Lifecycle
 
 `DevTunnelCliProvider` performs:
@@ -65,11 +71,16 @@ failure while inspecting the ACE remains transient and performs no deletion.
 
 Before the exact-2030 host fallback starts, `show --json` must contain no additional ports
 and the ACE list must match persisted ownership metadata. An unexpected host exit starts
-full-jitter bounded backoff and repeats invariant validation, JSON discovery, HTTPS health,
-and WSS probes. Permanent build, schema, login, missing-resource, and expired-access failures
-open the circuit breaker. `stop()` cancels pending restart timers plus in-flight CLI, JSON
+full-jitter bounded backoff. Every restart reloads metadata, refuses an expired ACE with
+`TUNNEL_ACCESS_EXPIRED`, safely renews an ACE inside the renewal window, then repeats
+invariant validation, JSON discovery, HTTPS health, and WSS probes. Permanent build, schema,
+login, missing-resource, and expired-access failures open the circuit breaker. `stop()`
+cancels pending restart timers plus in-flight CLI, JSON
 discovery, HTTPS, WSS, and backoff work, and terminates only the owned process group. A
 stopped generation cannot publish later state. It does not delete the persistent tunnel.
+`stop()` clears the owned host reference and publishes `stopped` only after process-tree
+termination succeeds. A termination failure preserves the handle, reports `cleanup-failed`,
+and allows a later `stop()` retry.
 
 If the persisted port differs from the requested port, or no longer serves the expected
 loopback health endpoint, startup fails with `PORT_MIGRATION_REQUIRED` or `PORT_CONFLICT`.
