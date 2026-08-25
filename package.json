@@ -166,8 +166,9 @@
     "check-types": "tsc --noEmit",
     "lint": "eslint src shared",
     "test:unit": "npm run compile-tests && node --test out/src/unitTest/*.test.js out/src/test/unit/*.test.js",
+    "test:component": "npm run compile-tests && node --test out/src/componentTest/*.test.js",
     "test:extension": "npm run compile-tests && npm run compile && vscode-test",
-    "test": "npm run test:unit && npm run test:extension",
+    "test": "npm run test:unit && npm run test:component && npm run test:extension",
     "spike:dev-tunnel": "npm run compile-tests && node out/src/spikes/devTunnelSpike.js",
     "spike:agent-host": "npm run compile-tests && node out/src/spikes/agentHostSpike.js"
   },
@@ -175,6 +176,7 @@
     "@types/mocha": "^10.0.10",
     "@types/node": "22.x",
     "@types/vscode": "^1.103.0",
+    "@types/ws": "8.18.1",
     "@vscode/test-cli": "^0.0.15",
     "@vscode/test-electron": "^3.0.0",
     "esbuild": "^0.28.1",
@@ -189,6 +191,7 @@
   },
   "dependencies": {
     "@microsoft/agent-host-protocol": "file:vendor/microsoft-agent-host-protocol-0.8.0.tgz",
-    "zod": "4.1.11"
+    "zod": "4.1.11",
+    "ws": "8.21.3"
   }
 }
