@@ -386,6 +386,7 @@ function hostPaths(role) {
 		extensions: join(root, 'extensions'),
 		control: join(root, 'control'),
 		log: join(root, `${role}.log`),
+		nonce: randomUUID(),
 	};
 }
 
@@ -416,6 +417,8 @@ async function writeSettings(host, name, workerEnabled) {
 		'copilotAgentMesh.codePath': codeCli,
 		'copilotAgentMesh.experimental.agentHost': workerEnabled,
 		'copilotAgentMesh.experimental.authenticationProviders': mappings,
+		'copilotAgentMesh.e2e.nonce': host.nonce,
+		'copilotAgentMesh.e2e.role': host.role,
 		'security.workspace.trust.enabled': false,
 	})}\n`, { mode: 0o600 });
 }
@@ -440,6 +443,7 @@ function launchHost(host, role) {
 		extensionTestsEnv: {
 			MESH_TWO_DEVICE_E2E: '1',
 			MESH_TWO_DEVICE_E2E_CONTROL_DIR: host.control,
+			MESH_TWO_DEVICE_E2E_NONCE: host.nonce,
 			MESH_TWO_DEVICE_E2E_ROLE: role,
 		},
 		stdout: output,
@@ -455,7 +459,13 @@ async function request(host, action, params = {}, timeoutMs = 30_000) {
 	const id = randomUUID();
 	const requestPath = join(host.control, 'requests', `${id}.json`);
 	const temporary = `${requestPath}.tmp`;
-	await writeFile(temporary, `${JSON.stringify({ id, action, params })}\n`, { mode: 0o600 });
+	await writeFile(temporary, `${JSON.stringify({
+		id,
+		action,
+		nonce: host.nonce,
+		role: host.role,
+		params,
+	})}\n`, { mode: 0o600 });
 	await rename(temporary, requestPath);
 	const responsePath = join(host.control, 'responses', `${id}.json`);
 	await waitForFile(responsePath, timeoutMs);

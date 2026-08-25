@@ -38,7 +38,11 @@ import {
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { realpath } from 'node:fs/promises';
-import { basename, isAbsolute } from 'node:path';
+import { basename, delimiter, isAbsolute, join } from 'node:path';
+import {
+	isE2eCapabilityEnabled,
+	type E2eCapability,
+} from '../composition/E2eCapability';
 
 interface DevTunnelCommandRunner {
 	run(
@@ -410,8 +414,8 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 		return this.stop();
 	}
 
-	async deleteOwnedForE2e(): Promise<'deleted' | 'already-absent'> {
-		if (process.env.MESH_TWO_DEVICE_E2E !== '1') {
+	async deleteOwnedForE2e(capability: E2eCapability): Promise<'deleted' | 'already-absent'> {
+		if (!isE2eCapabilityEnabled(capability)) {
 			throw new Error('Owned Tunnel deletion is available only to the opted-in two-device E2E.');
 		}
 
@@ -432,8 +436,8 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 			);
 		}
 
-		const capability = await this.probe();
-		if (!capability.supported || capability.build !== metadata.build) {
+		const tunnelCapability = await this.probe();
+		if (!tunnelCapability.supported || tunnelCapability.build !== metadata.build) {
 			throw permanent('CLI_UNSUPPORTED', 'The exact trusted Dev Tunnel CLI is unavailable for cleanup.');
 		}
 		const shown = await this.run(
@@ -476,7 +480,7 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 		);
 	}
 
-	async ownedMetadataForE2e(): Promise<{
+	async ownedMetadataForE2e(capability: E2eCapability): Promise<{
 		readonly build: string;
 		readonly decoderRevision: string;
 		readonly executablePath: string;
@@ -484,7 +488,7 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 		readonly ownershipLabel: string;
 		readonly tunnelId: string;
 	}> {
-		if (process.env.MESH_TWO_DEVICE_E2E !== '1') {
+		if (!isE2eCapabilityEnabled(capability)) {
 			throw new Error('Owned Tunnel metadata is available only to the opted-in two-device E2E.');
 		}
 		const metadata = await this.stateStore.load();

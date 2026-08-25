@@ -55,6 +55,10 @@ import {
 	createTwoDeviceE2eApi,
 	type TwoDeviceE2eApi,
 } from './TwoDeviceE2eApi';
+import {
+	E2eCapability,
+	type ExtensionRuntimeMode,
+} from './E2eCapability';
 
 export const APPLICATION_COMMANDS = {
 	registerWorkspace: 'copilotAgentMesh.registerWorkspace',
@@ -102,6 +106,14 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		const ids = { next: randomUUID };
 		const workerPlatform = getWorkerPlatformSupport();
 		const configuration = vscode.workspace.getConfiguration('copilotAgentMesh');
+		const e2eCapability = E2eCapability.create({
+			mode: extensionRuntimeMode(context.extensionMode),
+			environmentEnabled: process.env.MESH_TWO_DEVICE_E2E === '1',
+			environmentNonce: process.env.MESH_TWO_DEVICE_E2E_NONCE,
+			environmentRole: process.env.MESH_TWO_DEVICE_E2E_ROLE,
+			profileNonce: configuration.get<string>('e2e.nonce'),
+			profileRole: configuration.get<string>('e2e.role'),
+		});
 		const storageRoot = vscode.Uri.joinPath(context.globalStorageUri, 'mesh-state');
 		await vscode.workspace.fs.createDirectory(storageRoot);
 		const ownership = await WorkerOwnerLock.acquire(context.globalStorageUri.fsPath, {
@@ -184,7 +196,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 
 		const changeEvents = new vscode.EventEmitter<void>();
 		cleanup.push(() => changeEvents.dispose());
-		const approvals = new VscodeLocalTaskApproval(vscode, state);
+		const approvals = new VscodeLocalTaskApproval(vscode, state, e2eCapability);
 		const runtime = createVscodeAgentRuntime(
 			vscode,
 			context,
@@ -219,6 +231,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 						},
 					),
 				},
+				e2eCapability,
 			},
 		);
 		cleanup.push(() => workerTasks.dispose());
@@ -307,6 +320,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			runtime,
 			tunnel,
 			workerTasks,
+			e2eCapability,
 		);
 		if (ownership.isOwner()) {
 			await peerManager.restore();
@@ -518,5 +532,17 @@ function supportedPlatform(platform: NodeJS.Platform): 'win32' | 'darwin' | 'lin
 	if (platform === 'win32' || platform === 'darwin' || platform === 'linux') {
 		return platform;
 	}
+
 	throw new Error(`Copilot Agent Mesh does not support platform ${platform}.`);
+}
+
+function extensionRuntimeMode(mode: vscode.ExtensionMode): ExtensionRuntimeMode {
+	switch (mode) {
+		case vscode.ExtensionMode.Development:
+			return 'development';
+		case vscode.ExtensionMode.Test:
+			return 'test';
+		default:
+			return 'production';
+	}
 }

@@ -32,6 +32,11 @@ import type { TaskStartParams } from '../gateway/GatewayRouter';
 import type { LocalWorkspace, WorkspaceRegistry } from '../workspaces/WorkspaceRegistry';
 import { canonicalTaskRequestHash } from '../domain/task';
 import type { WorkerOwnership } from '../storage/WorkerOwnerLock';
+import {
+	disabledE2eCapability,
+	isE2eCapabilityEnabled,
+	type E2eCapability,
+} from './E2eCapability';
 
 const configurationSection = 'copilotAgentMesh';
 const taskApprovalStateKey = 'copilotAgentMesh.taskApprovals';
@@ -47,12 +52,13 @@ export class VscodeLocalTaskApproval implements LocalTaskConfirmation, FirstTask
 	public constructor(
 		private readonly vscodeApi: typeof vscode,
 		private readonly state: StateStore,
+		private readonly e2eCapability: E2eCapability = disabledE2eCapability,
 	) {}
 
 	public async confirmRuntime(
 		request: ResolvedAgentTaskRequest,
 	): Promise<'once' | 'deny'> {
-		if (process.env.MESH_TWO_DEVICE_E2E === '1') {
+		if (isE2eCapabilityEnabled(this.e2eCapability)) {
 			return 'once';
 		}
 		const runtimeHash = runtimeApprovalHash(request);
@@ -117,7 +123,7 @@ export class VscodeLocalTaskApproval implements LocalTaskConfirmation, FirstTask
 		request: TaskStartParams,
 		workspace: LocalWorkspace,
 	): Promise<boolean> {
-		if (process.env.MESH_TWO_DEVICE_E2E === '1') {
+		if (isE2eCapabilityEnabled(this.e2eCapability)) {
 			const requestHash = canonicalTaskRequestHash({
 				...request,
 				acceptanceCriteria: [...request.acceptanceCriteria],

@@ -22,9 +22,19 @@ import {
 	TunnelMetadata,
 	TunnelRequest,
 } from '../tunnel/DevTunnelProvider';
+import { E2eCapability } from '../composition/E2eCapability';
 
 const now = new Date('2026-08-25T01:00:00.000Z');
 const tunnelId = 'came2etest.jpe1';
+const e2eNonce = '00000000-0000-4000-8000-000000000004';
+const e2eCapability = E2eCapability.create({
+	mode: 'test',
+	environmentEnabled: true,
+	environmentNonce: e2eNonce,
+	environmentRole: 'worker',
+	profileNonce: e2eNonce,
+	profileRole: 'worker',
+});
 const request: TunnelRequest = {
 	accessDuration: '7d',
 	healthPath: '/healthz',
@@ -117,32 +127,22 @@ suite('DevTunnelCliProvider', () => {
 	});
 
 	test('deletes only an exact owned E2E tunnel and confirms exact not-found', async () => {
-		const previous = process.env.MESH_TWO_DEVICE_E2E;
-		process.env.MESH_TWO_DEVICE_E2E = '1';
-		try {
-			const runner = new FakeRunner();
-			const provider = createProvider(runner, new MemoryStore());
-			await provider.ensureHosted(request);
-			assert.deepStrictEqual(await provider.ownedMetadataForE2e(), {
-				build: SUPPORTED_DEVTUNNEL_BUILD,
-				decoderRevision: DEVTUNNEL_DECODER_REVISION,
-				executablePath: '/verified/devtunnel',
-				localPort: request.localPort,
-				ownershipLabel: request.ownershipLabel,
-				tunnelId,
-			});
-			assert.equal(await provider.deleteOwnedForE2e(), 'deleted');
-			assert.deepStrictEqual(
-				runner.commands.filter((args) => args[0] === 'delete'),
-				[['delete', tunnelId]],
-			);
-		} finally {
-			if (previous === undefined) {
-				delete process.env.MESH_TWO_DEVICE_E2E;
-			} else {
-				process.env.MESH_TWO_DEVICE_E2E = previous;
-			}
-		}
+		const runner = new FakeRunner();
+		const provider = createProvider(runner, new MemoryStore());
+		await provider.ensureHosted(request);
+		assert.deepStrictEqual(await provider.ownedMetadataForE2e(e2eCapability), {
+			build: SUPPORTED_DEVTUNNEL_BUILD,
+			decoderRevision: DEVTUNNEL_DECODER_REVISION,
+			executablePath: '/verified/devtunnel',
+			localPort: request.localPort,
+			ownershipLabel: request.ownershipLabel,
+			tunnelId,
+		});
+		assert.equal(await provider.deleteOwnedForE2e(e2eCapability), 'deleted');
+		assert.deepStrictEqual(
+			runner.commands.filter((args) => args[0] === 'delete'),
+			[['delete', tunnelId]],
+		);
 	});
 
 	test('fails closed when the exact build executable hash is not allowlisted', async () => {

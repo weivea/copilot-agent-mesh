@@ -4,10 +4,15 @@ import { isAbsolute, join } from 'node:path';
 import * as vscode from 'vscode';
 
 import type { AgentMeshExtensionApi } from '../composition/createApplication';
+import type { E2eRole } from '../composition/E2eCapability';
+
+const requestIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 interface RequestEnvelope {
 	readonly id: string;
 	readonly action: string;
+	readonly nonce: string;
+	readonly role: E2eRole;
 	readonly params?: Record<string, unknown>;
 }
 
@@ -18,6 +23,14 @@ export async function run(): Promise<void> {
 	const controlRoot = process.env.MESH_TWO_DEVICE_E2E_CONTROL_DIR;
 	if (controlRoot === undefined || !isAbsolute(controlRoot)) {
 		throw new Error('MESH_TWO_DEVICE_E2E_CONTROL_DIR must be an absolute path.');
+	}
+	const nonce = process.env.MESH_TWO_DEVICE_E2E_NONCE;
+	const role = process.env.MESH_TWO_DEVICE_E2E_ROLE;
+	if (
+		nonce === undefined
+		|| (role !== 'worker' && role !== 'coordinator')
+	) {
+		throw new Error('The two-device E2E nonce and role are required.');
 	}
 	const requests = join(controlRoot, 'requests');
 	const responses = join(controlRoot, 'responses');
@@ -33,7 +46,7 @@ export async function run(): Promise<void> {
 	}
 	await atomicJson(join(controlRoot, 'ready.json'), {
 		ready: true,
-		role: process.env.MESH_TWO_DEVICE_E2E_ROLE ?? 'unknown',
+		role,
 	});
 
 	let stopping = false;
@@ -44,6 +57,7 @@ export async function run(): Promise<void> {
 			try {
 				request = parseRequest(JSON.parse(await readFile(path, 'utf8')));
 				if (request.action === 'host.shutdown') {
+					api.twoDeviceE2e.authorize(request);
 					stopping = true;
 					await atomicJson(join(responses, `${request.id}.json`), {
 						id: request.id,
@@ -51,7 +65,11 @@ export async function run(): Promise<void> {
 						result: { stopping: true },
 					});
 				} else {
-					const result = await api.twoDeviceE2e.execute(request.action, request.params);
+					const result = await api.twoDeviceE2e.execute(
+						request,
+						request.action,
+						request.params,
+					);
 					await atomicJson(join(responses, `${request.id}.json`), {
 						id: request.id,
 						ok: true,
@@ -84,8 +102,13 @@ function parseRequest(value: unknown): RequestEnvelope {
 		|| value === null
 		|| !('id' in value)
 		|| typeof value.id !== 'string'
+		|| !requestIdPattern.test(value.id)
 		|| !('action' in value)
 		|| typeof value.action !== 'string'
+		|| !('nonce' in value)
+		|| typeof value.nonce !== 'string'
+		|| !('role' in value)
+		|| (value.role !== 'worker' && value.role !== 'coordinator')
 	) {
 		throw new TypeError('Invalid two-device E2E request envelope.');
 	}
@@ -96,6 +119,8 @@ function parseRequest(value: unknown): RequestEnvelope {
 	return {
 		id: value.id,
 		action: value.action,
+		nonce: value.nonce,
+		role: value.role,
 		params: params as Record<string, unknown> | undefined,
 	};
 }

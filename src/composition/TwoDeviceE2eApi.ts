@@ -6,9 +6,19 @@ import type { TaskCoordinator } from '../application/TaskCoordinator';
 import type { AgentRuntime } from '../agentHost/AgentRuntime';
 import type { DevTunnelCliProvider } from '../tunnel/DevTunnelCliProvider';
 import type { ProductionDashboardBindings } from './ProductionDashboardBindings';
+import {
+	isE2eCapabilityEnabled,
+	type E2eCapability,
+	type E2eRole,
+} from './E2eCapability';
 
 export interface TwoDeviceE2eApi {
-	execute(action: string, params?: Record<string, unknown>): Promise<unknown>;
+	authorize(request: { readonly nonce: string; readonly role: E2eRole }): void;
+	execute(
+		request: { readonly nonce: string; readonly role: E2eRole },
+		action: string,
+		params?: Record<string, unknown>,
+	): Promise<unknown>;
 }
 
 export function createTwoDeviceE2eApi(
@@ -19,12 +29,18 @@ export function createTwoDeviceE2eApi(
 	runtime: AgentRuntime,
 	tunnel: DevTunnelCliProvider,
 	workerTasks: WorkerTaskService,
+	capability: E2eCapability,
 ): TwoDeviceE2eApi | undefined {
-	if (process.env.MESH_TWO_DEVICE_E2E !== '1') {
+	if (!isE2eCapabilityEnabled(capability)) {
 		return undefined;
 	}
+	const authorize = (request: { readonly nonce: string; readonly role: E2eRole }): void => {
+		capability.assertRequest(request.nonce, request.role);
+	};
 	return {
-		execute: async (action, params = {}) => {
+		authorize,
+		execute: async (request, action, params = {}) => {
+			authorize(request);
 			switch (action) {
 				case 'snapshot':
 					return bindings.getSnapshot();
@@ -104,9 +120,9 @@ export function createTwoDeviceE2eApi(
 					await bindings.stopListener();
 					return listener.snapshot();
 				case 'tunnel.cleanup':
-					return { cleanup: await tunnel.deleteOwnedForE2e() };
+					return { cleanup: await tunnel.deleteOwnedForE2e(capability) };
 				case 'tunnel.metadata':
-					return tunnel.ownedMetadataForE2e();
+					return tunnel.ownedMetadataForE2e(capability);
 				default:
 					throw new Error(`Unsupported two-device E2E action: ${action}`);
 			}

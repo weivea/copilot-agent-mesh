@@ -29,9 +29,11 @@ harness neither installs nor changes a global CLI.
 
 The Worker and Coordinator use different temporary `user-data`, `extensions`, control,
 and therefore `globalStorage` directories. Both load the current `dist/extension.js`.
-The file IPC and automatic local task approval exist only when
-`MESH_TWO_DEVICE_E2E=1`; they invoke production services and never replace
-`AgentRuntime`.
+The file IPC and automatic local task approval require a Development/Test
+Extension Host, `MESH_TWO_DEVICE_E2E=1`, and matching per-profile random nonce
+and role values. Production extension mode disables the capability regardless
+of environment values. Every IPC request revalidates its nonce and role; the
+capability invokes production services and never replaces `AgentRuntime`.
 
 ## Automated flow
 
@@ -116,7 +118,7 @@ only `MESH_TWO_INSTANCE_E2E_OK` and forbids file changes and commands.
 | 7 | Connection state, heartbeat, and workspace list UI | Pass | Production dashboard/directory observed the peer online and its workspace over the real Tunnel. |
 | 8 | Four mesh language-model tools | Partial | Offline extension/tool suites cover all four tools; real delegation/cancel used the same `TaskCoordinator`, but an authenticated Copilot did not invoke the LM tools. |
 | 9 | macOS arm64 Worker invokes built-in Copilot over AHP | Blocked | Real production AHP launched and probed, but the isolated profile had no explicit VS Code authentication mapping/session; task failed correctly with `AGENT_AUTH_REQUIRED` before `agentStarted`, runtime-handle cancellation, Session completion, or `turnComplete`. |
-| 10 | Coordinator UI shows task state/output summary | Partial | Real `cancelled` and auth failure states were observable through production snapshots; no authenticated text output or visual UI assertion was available. |
+| 10 | Coordinator UI shows task state/output summary | Partial | The real auth failure was observable through production snapshots; cancellation was blocked before `agentStarted`, and no authenticated text output or visual UI assertion was available. |
 | 11 | `mesh_get_task` returns completion result to Copilot | Partial | Real result polling traversed Coordinator/Gateway/Worker; authenticated Copilot tool invocation and a completed AHP result remain blocked by item 9. |
 | 12 | Multiple workspaces, one writer per workspace | Partial | Lease/concurrency behavior passes offline; this real run registered one temporary workspace. |
 | 13 | No Git/worktree management or injected Git prompt | Pass | Production request forwards the supplied prompt/criteria only; the real prompts contained no Git operation and the harness performed no repository mutation in the Worker workspace. |

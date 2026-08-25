@@ -28,6 +28,11 @@ import type { WorkspaceLeaseManager } from '../tasks/WorkspaceLeaseManager';
 import type { WorkspaceRegistry, LocalWorkspace } from '../workspaces/WorkspaceRegistry';
 import type { LocalDesktopWorkspaceGuard } from './LocalDesktopWorkspaceGuard';
 import type { WorkerOwnership } from '../storage/WorkerOwnerLock';
+import {
+	disabledE2eCapability,
+	isE2eCapabilityEnabled,
+	type E2eCapability,
+} from '../composition/E2eCapability';
 
 const activeStates = new Set<string>(ACTIVE_TASK_STATUSES);
 const defaultCancellationDeadlineMs = 15_000;
@@ -51,6 +56,7 @@ export interface RemoteTaskRunnerOptions {
 	readonly notificationSink?: TaskNotificationSink;
 	readonly onDidChange?: () => void;
 	readonly ownership?: WorkerOwnership;
+	readonly e2eCapability?: E2eCapability;
 }
 
 interface RunningTask {
@@ -251,7 +257,7 @@ export class RemoteTaskRunner implements TaskService {
 		} else {
 			this.scheduleCancellationDeadline(running);
 			try {
-				if (process.env.MESH_TWO_DEVICE_E2E === '1') {
+				if (isE2eCapabilityEnabled(this.options.e2eCapability ?? disabledE2eCapability)) {
 					this.runtimeHandleCancellationRequests.add(taskId);
 				}
 				await running.handle.cancel();
@@ -263,7 +269,7 @@ export class RemoteTaskRunner implements TaskService {
 	}
 
 	public runtimeHandleCancellationObservedForE2e(taskId: string): boolean {
-		if (process.env.MESH_TWO_DEVICE_E2E !== '1') {
+		if (!isE2eCapabilityEnabled(this.options.e2eCapability ?? disabledE2eCapability)) {
 			throw new Error('Runtime cancellation evidence is available only to the opted-in two-device E2E.');
 		}
 		const observed = this.runtimeHandleCancellationRequests.has(taskId);
