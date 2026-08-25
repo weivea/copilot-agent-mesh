@@ -1,7 +1,7 @@
 {
   "name": "copilot-agent-mesh",
   "displayName": "Copilot Agent Mesh",
-  "description": "Delegate GitHub Copilot coding tasks across trusted VS Code workspaces and devices.",
+  "description": "Preview mesh coordinator with an experimental macOS arm64 Worker candidate.",
   "version": "0.0.1",
   "publisher": "weivea",
   "repository": {
@@ -32,7 +32,7 @@
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": false,
-      "description": "Copilot Agent Mesh can delegate coding tasks that modify files and run commands."
+      "description": "Copilot Agent Mesh can delegate coding tasks. Worker Preview execution is supported only on macOS arm64."
     },
     "virtualWorkspaces": {
       "supported": false,
@@ -377,13 +377,13 @@
           "type": "string",
           "default": "",
           "scope": "machine",
-          "markdownDescription": "Optional VS Code CLI path used by the experimental Agent Host runtime."
+          "markdownDescription": "Optional VS Code CLI path used by the macOS arm64 Worker Preview Agent Host runtime. Other platforms are Coordinator-only."
         },
         "copilotAgentMesh.experimental.agentHost": {
           "type": "boolean",
           "default": false,
           "scope": "machine",
-          "markdownDescription": "Enable the real Agent Host/AHP runtime. This may consume Copilot quota."
+          "markdownDescription": "Enable the real macOS arm64 Worker Preview Agent Host/AHP runtime. This may consume Copilot quota. Windows, Linux, macOS x64, and other architectures remain Coordinator-only."
         },
         "copilotAgentMesh.experimental.authenticationProviders": {
           "type": "object",
@@ -414,7 +414,7 @@
           "type": "string",
           "default": "",
           "scope": "machine",
-          "markdownDescription": "Optional path to the exact supported Dev Tunnel CLI executable. The extension never installs or upgrades the CLI."
+          "markdownDescription": "Optional path to the exact supported macOS arm64 Dev Tunnel CLI executable for Worker Preview. Other platforms are Coordinator-only. The extension never installs or upgrades the CLI."
         },
         "copilotAgentMesh.listener.port": {
           "type": "integer",
@@ -428,7 +428,7 @@
           "type": "boolean",
           "default": false,
           "scope": "machine",
-          "markdownDescription": "Start the persisted listener during local Extension Host activation."
+          "markdownDescription": "Start the persisted Worker Preview listener during local Extension Host activation. Listener hosting is supported only on macOS arm64."
         },
         "copilotAgentMesh.workspace.capabilityTags": {
           "type": "array",

@@ -27,18 +27,18 @@ must not claim an end-to-end Copilot Agent Mesh MVP.
 | Dev Tunnel service | `1.0.1995.17384` (`43e8069d44`) | Version output only | Informational |
 | Dev Tunnel decoder | Supported revision `show-json-1.0.2030-r1`; sanitized real hosted fixture SHA-256 `d561eed56125ea53d2e97f1dcc5107575f7fb1df2eb2032a955338c9fb7a5ace` | Exact 2030 `portUri` contract and cross-version `portForwardingUris` rejection are tested | Pass for exact macOS arm64 build |
 
-## Platform support
+## Preview platform support
 
-No OS/architecture combination is declared supported before Gate G0 passes.
+The Marketplace Preview scope does not claim cross-platform Worker support.
+Coordinator support still depends on the peer client being available in that
+environment.
 
-The initial desktop target matrix is:
-
-| OS | Architecture | Phase 0 evidence | Support |
+| OS | Architecture | Phase 0 evidence | Preview support |
 | --- | --- | --- | --- |
-| macOS | arm64 | Bootstrap, P0.1 Tool API, P0.2 real AHP initialize, and P0.3 real Dev Tunnel lifecycle | Not declared while Gate G0 remains No-Go |
-| macOS | x64 | None | Not declared |
-| Windows | x64 | None | Not declared |
-| Linux | x64 | None | Not declared |
+| macOS | arm64 | Bootstrap, Tool API, real AHP initialize, and real exact-build Dev Tunnel lifecycle; authenticated AHP Session/Turn E2E remains pending | Only Worker Preview candidate plus Coordinator; end-to-end Gate G0 remains No-Go |
+| macOS | x64 | No owned Worker lifecycle evidence | Coordinator only; Worker returns `CLI_UNSUPPORTED` / `AGENT_UNAVAILABLE` |
+| Windows | x64 | No Job Object-based Agent Host ownership and no validated tunnel build | Coordinator only; Worker returns `CLI_UNSUPPORTED` / `AGENT_UNAVAILABLE` |
+| Linux | x64 | Agent process groups exist, but no validated tunnel build or complete Worker gate | Coordinator only; Worker returns `CLI_UNSUPPORTED` / `AGENT_UNAVAILABLE` |
 
 ## Known unsupported environments
 

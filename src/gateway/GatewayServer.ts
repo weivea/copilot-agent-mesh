@@ -10,6 +10,7 @@ import { RpcPeer, type RpcPeerOptions } from './RpcPeer';
 export interface GatewayServerOptions extends RpcPeerOptions {
 	readonly unauthenticatedGlobalLimit?: number;
 	readonly unauthenticatedPerSourceLimit?: number;
+	readonly closeHttpServer?: (server: Server) => Promise<void>;
 }
 
 export interface GatewayAddress {
@@ -143,8 +144,15 @@ export class GatewayServer {
 		}
 
 		this.disposed = true;
-		this.stopping = this.stop();
-		return this.stopping;
+		let stopping!: Promise<void>;
+		stopping = this.stop().catch((error: unknown) => {
+			if (this.stopping === stopping) {
+				this.stopping = undefined;
+			}
+			throw error;
+		});
+		this.stopping = stopping;
+		return stopping;
 	}
 
 	public async notifyPeer(
@@ -169,15 +177,7 @@ export class GatewayServer {
 			await new Promise<void>((resolve) => {
 				this.webSocketServer.close(() => resolve());
 			});
-			await new Promise<void>((resolve, reject) => {
-				this.httpServer.close((error) => {
-					if (error === undefined) {
-						resolve();
-					} else {
-						reject(error);
-					}
-				});
-			});
+			await (this.options.closeHttpServer ?? closeHttpServer)(this.httpServer);
 		}
 		this.started = false;
 	}
@@ -200,6 +200,18 @@ export class GatewayServer {
 			this.sourceCounts.set(source, count - 1);
 		}
 	}
+}
+
+function closeHttpServer(server: Server): Promise<void> {
+	return new Promise<void>((resolve, reject) => {
+		server.close((error) => {
+			if (error === undefined) {
+				resolve();
+			} else {
+				reject(error);
+			}
+		});
+	});
 }
 
 function rejectUpgrade(socket: Duplex): void {

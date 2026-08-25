@@ -538,6 +538,18 @@ export class PairingService {
 		this.cleanupConnectionState(connectionId);
 	}
 
+	public async dispose(): Promise<void> {
+		await this.recordMutation;
+		for (const sessionId of [...this.sessions.keys()]) {
+			this.deleteSession(sessionId);
+		}
+		this.usedNonces.clear();
+		this.activeConnections.clear();
+		this.closedConnections.clear();
+		this.connectionGenerations.clear();
+		this.inFlightHellos.clear();
+	}
+
 	private assertHello(params: HelloParams): void {
 		const keys = Object.keys(params);
 		if (keys.some((key) => ![

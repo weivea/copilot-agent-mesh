@@ -199,10 +199,11 @@ async function makeDirectory(): Promise<string> {
 describe('foundation storage', () => {
 	test('keeps device identity stable while allowing name changes', async () => {
 		const state = new MemoryState();
+		const clock = new MutableClock(new Date(AT));
 		const store = new DeviceProfileStore(
 			state,
 			new SequenceIds([IDS.device]),
-			fixedClock,
+			clock,
 		);
 		const environment = {
 			defaultName: 'worker',
@@ -212,9 +213,24 @@ describe('foundation storage', () => {
 			extensionVersion: '0.0.1',
 		};
 		const first = await store.getOrCreate(environment);
-		const reloaded = await store.getOrCreate({ ...environment, defaultName: 'ignored' });
+		clock.set(new Date(LATER));
+		const reloaded = await store.getOrCreate({
+			...environment,
+			defaultName: 'ignored',
+			platform: 'linux',
+			architecture: 'x64',
+			vscodeVersion: '1.134.0',
+			extensionVersion: '0.0.2',
+		});
 		const renamed = await store.rename('renamed');
 		assert.strictEqual(reloaded.deviceId, first.deviceId);
+		assert.strictEqual(reloaded.name, first.name);
+		assert.strictEqual(reloaded.createdAt, first.createdAt);
+		assert.strictEqual(reloaded.platform, 'linux');
+		assert.strictEqual(reloaded.architecture, 'x64');
+		assert.strictEqual(reloaded.vscodeVersion, '1.134.0');
+		assert.strictEqual(reloaded.extensionVersion, '0.0.2');
+		assert.strictEqual(reloaded.updatedAt, LATER);
 		assert.strictEqual(renamed.deviceId, first.deviceId);
 		assert.strictEqual(renamed.name, 'renamed');
 		assert.deepStrictEqual([...state.values.keys()], ['copilotAgentMesh.deviceProfile']);

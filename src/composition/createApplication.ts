@@ -10,6 +10,7 @@ import { LocalDesktopWorkspaceGuard } from '../application/LocalDesktopWorkspace
 import { WorkerTaskService } from '../application/RemoteTaskRunner';
 import { TaskCoordinator } from '../application/TaskCoordinator';
 import { WorkspaceService } from '../application/WorkspaceService';
+import { getWorkerPlatformSupport } from '../application/WorkerPlatformSupport';
 import type { AgentRuntime } from '../agentHost/AgentRuntime';
 import { systemClock } from '../domain/ports';
 import { GatewayRouter } from '../gateway/GatewayRouter';
@@ -93,6 +94,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			})),
 		}));
 		const ids = { next: randomUUID };
+		const workerPlatform = getWorkerPlatformSupport();
 		const configuration = vscode.workspace.getConfiguration('copilotAgentMesh');
 		const extensionVersion = String(context.extension?.packageJSON.version ?? '0.0.0');
 		const deviceStore = new DeviceProfileStore(state, ids, systemClock);
@@ -173,6 +175,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			workspaceRegistry,
 			guard,
 			approvals,
+			workerPlatform,
 		);
 		cleanup.push(() => runtime.dispose());
 		let listenerService: ListenerService | undefined;
@@ -222,7 +225,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			() => new GatewayServer(pairing, router),
 			state,
 			guard,
-			{ configuredPort },
+			{ configuredPort, workerPlatform },
 		);
 		listenerService = listener;
 		cleanup.push(() => listener.dispose());
@@ -247,6 +250,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			leases,
 			runtime,
 			guard,
+			workerPlatform,
 		);
 		cleanup.push(() => bindings.dispose());
 		const dashboardFacade = new ServiceDashboardFacade(bindings);

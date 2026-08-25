@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import type * as vscode from 'vscode';
 
 import {
@@ -25,8 +27,10 @@ import { VscodeAuthBroker, type AuthenticationMapping } from '../agentHost/AuthB
 import type { StateStore } from '../domain/ports';
 import type { LocalDesktopWorkspaceGuard } from '../application/LocalDesktopWorkspaceGuard';
 import type { LocalTaskConfirmation } from '../application/RemoteTaskRunner';
+import type { WorkerPlatformSupport } from '../application/WorkerPlatformSupport';
 import type { TaskStartParams } from '../gateway/GatewayRouter';
 import type { LocalWorkspace, WorkspaceRegistry } from '../workspaces/WorkspaceRegistry';
+import { canonicalTaskRequestHash } from '../domain/task';
 
 const configurationSection = 'copilotAgentMesh';
 const taskApprovalStateKey = 'copilotAgentMesh.taskApprovals';
@@ -37,7 +41,7 @@ interface TaskApprovalState {
 }
 
 export class VscodeLocalTaskApproval implements LocalTaskConfirmation, FirstTaskConfirmation {
-	private readonly preapprovedTasks = new Set<string>();
+	private readonly preapprovedTasks = new Map<string, Map<string, PreapprovedTask>>();
 
 	public constructor(
 		private readonly vscodeApi: typeof vscode,
@@ -47,12 +51,33 @@ export class VscodeLocalTaskApproval implements LocalTaskConfirmation, FirstTask
 	public async confirmRuntime(
 		request: ResolvedAgentTaskRequest,
 	): Promise<'once' | 'deny'> {
-		if (this.preapprovedTasks.delete(request.taskId)) {
-			return 'once';
+		const runtimeHash = runtimeApprovalHash(request);
+		const approvals = this.preapprovedTasks.get(request.taskId);
+		const context = request.approvalContext;
+		const cacheKey = context === undefined
+			? undefined
+			: `${context.peerId}:${context.workspaceId}:${context.requestHash}`;
+		const matching = cacheKey === undefined ? undefined : approvals?.get(cacheKey);
+		if (matching !== undefined) {
+			if (
+				matching.peerId === context?.peerId
+				&& matching.workspaceId === request.workspaceId
+				&& matching.requestHash === context.requestHash
+				&& matching.runtimeHash === runtimeHash
+			) {
+				approvals?.delete(matching.cacheKey);
+				if (approvals?.size === 0) {
+					this.preapprovedTasks.delete(request.taskId);
+				}
+				return 'once';
+			}
 		}
 		const choice = await this.vscodeApi.window.showWarningMessage(
 			`Allow Copilot Agent Mesh to run "${request.title}" in ${request.workspace.displayName}?`,
-			{ modal: true, detail: 'The agent may modify files and run commands in this workspace.' },
+			{
+				modal: true,
+				detail: runtimeApprovalDetail(request),
+			},
 			'Run Once',
 		);
 		return choice === 'Run Once' ? 'once' : 'deny';
@@ -89,16 +114,29 @@ export class VscodeLocalTaskApproval implements LocalTaskConfirmation, FirstTask
 		workspace: LocalWorkspace,
 	): Promise<boolean> {
 		const approvalKey = `${peerId}:${workspace.workspaceId}`;
+		const requestHash = canonicalTaskRequestHash({
+			...request,
+			acceptanceCriteria: [...request.acceptanceCriteria],
+			peerId,
+			workspaceLeaseKey: workspace.fileIdentity,
+		});
+		const cacheKey = `${peerId}:${workspace.workspaceId}:${requestHash}`;
 		const persisted = this.read();
 		if (persisted.always.includes(approvalKey)) {
-			this.preapprovedTasks.add(request.taskId);
+			this.cachePreapproval(request.taskId, {
+				cacheKey,
+				peerId,
+				workspaceId: workspace.workspaceId,
+				requestHash,
+				runtimeHash: remoteRuntimeApprovalHash(request),
+			});
 			return true;
 		}
 		const choice = await this.vscodeApi.window.showWarningMessage(
-			`Allow Copilot Agent Mesh to run "${request.title}" in ${workspace.name}?`,
+			'Allow this remote Copilot Agent Mesh task?',
 			{
 				modal: true,
-				detail: 'The remote agent may modify files and run commands in this registered workspace.',
+				detail: remoteApprovalDetail(peerId, request, workspace),
 			},
 			'Run Once',
 			'Always Allow for This Device and Workspace',
@@ -112,8 +150,20 @@ export class VscodeLocalTaskApproval implements LocalTaskConfirmation, FirstTask
 				always: [...new Set([...persisted.always, approvalKey])],
 			});
 		}
-		this.preapprovedTasks.add(request.taskId);
+		this.cachePreapproval(request.taskId, {
+			cacheKey,
+			peerId,
+			workspaceId: workspace.workspaceId,
+			requestHash,
+			runtimeHash: remoteRuntimeApprovalHash(request),
+		});
 		return true;
+	}
+
+	private cachePreapproval(taskId: string, approval: PreapprovedTask): void {
+		const approvals = this.preapprovedTasks.get(taskId) ?? new Map<string, PreapprovedTask>();
+		approvals.set(approval.cacheKey, approval);
+		this.preapprovedTasks.set(taskId, approvals);
 	}
 
 	private read(): TaskApprovalState {
@@ -130,6 +180,7 @@ export function createVscodeAgentRuntime(
 	workspaces: WorkspaceRegistry,
 	guard: LocalDesktopWorkspaceGuard,
 	approval: FirstTaskConfirmation,
+	workerPlatform: WorkerPlatformSupport,
 ): AgentRuntime {
 	const configuration = vscodeApi.workspace.getConfiguration(configurationSection);
 	const launcher = new AgentHostLauncher({
@@ -148,7 +199,7 @@ export function createVscodeAgentRuntime(
 		workspaceResolver: new RegistryWorkspaceResolver(workspaces),
 		configResolver: new VscodeSessionConfigurationResolver(vscodeApi),
 	});
-	return new GuardedAgentRuntime(runtime, guard);
+	return new GuardedAgentRuntime(runtime, guard, workerPlatform);
 }
 
 class RegistryWorkspaceResolver implements WorkspaceResolver {
@@ -172,14 +223,29 @@ class GuardedAgentRuntime implements AgentRuntime {
 	public constructor(
 		private readonly delegate: AgentRuntime,
 		private readonly guard: LocalDesktopWorkspaceGuard,
+		private readonly workerPlatform: WorkerPlatformSupport,
 	) {}
 
 	public probe(): Promise<AgentRuntimeProbe> {
 		this.guard.assertAllowed({ requireWorkspace: false });
+		if (!this.workerPlatform.supported) {
+			return Promise.resolve({
+				available: false,
+				featureEnabled: false,
+				reason: this.workerPlatform.agentCode,
+			});
+		}
 		return this.delegate.probe();
 	}
 
 	public start(request: AgentTaskRequest): Promise<AgentTaskHandle> {
+		this.guard.assertAllowed({ requireWorkspace: false });
+		if (!this.workerPlatform.supported) {
+			return Promise.reject(new AgentRuntimeError(
+				this.workerPlatform.agentCode,
+				this.workerPlatform.agentMessage,
+			));
+		}
 		this.guard.assertAllowed();
 		return this.delegate.start(request);
 	}
@@ -290,4 +356,89 @@ async function resolveAuthenticationProvider(
 
 function configRequired(message: string): AgentRuntimeError {
 	return new AgentRuntimeError('AGENT_CONFIG_REQUIRED', message);
+}
+
+interface PreapprovedTask {
+	readonly cacheKey: string;
+	readonly peerId: string;
+	readonly workspaceId: string;
+	readonly requestHash: string;
+	readonly runtimeHash: string;
+}
+
+function remoteApprovalDetail(
+	peerId: string,
+	request: TaskStartParams,
+	workspace: LocalWorkspace,
+): string {
+	assertPromptDisplayable(request.prompt);
+	return [
+		`Peer: ${peerId}`,
+		`Workspace: ${workspace.name} (${workspace.workspaceId})`,
+		`Title: ${request.title}`,
+		'',
+		'Full prompt:',
+		request.prompt,
+		'',
+		'The remote agent may modify files and run commands in this registered workspace.',
+	].join('\n');
+}
+
+function runtimeApprovalDetail(request: ResolvedAgentTaskRequest): string {
+	assertPromptDisplayable(request.prompt);
+	return [
+		`Workspace: ${request.workspace.displayName} (${request.workspaceId})`,
+		`Title: ${request.title}`,
+		'',
+		'Full prompt:',
+		request.prompt,
+		'',
+		'The agent may modify files and run commands in this workspace.',
+	].join('\n');
+}
+
+function assertPromptDisplayable(prompt: string): void {
+	if (Buffer.byteLength(prompt, 'utf8') > 128 * 1_024) {
+		throw new AgentRuntimeError(
+			'TASK_EXECUTION_FAILED',
+			'The task prompt exceeds the safe local approval display limit.',
+		);
+	}
+}
+
+function remoteRuntimeApprovalHash(request: TaskStartParams): string {
+	return approvalHash({
+		taskId: request.taskId,
+		workspaceId: request.workspaceId,
+		title: request.title,
+		prompt: request.prompt,
+		acceptanceCriteria: request.acceptanceCriteria,
+	});
+}
+
+function runtimeApprovalHash(request: ResolvedAgentTaskRequest): string {
+	return approvalHash({
+		taskId: request.taskId,
+		workspaceId: request.workspaceId,
+		title: request.title,
+		prompt: request.prompt,
+		acceptanceCriteria: request.acceptanceCriteria ?? [],
+	});
+}
+
+function approvalHash(request: {
+	readonly taskId: string;
+	readonly workspaceId: string;
+	readonly title: string;
+	readonly prompt: string;
+	readonly acceptanceCriteria: readonly string[];
+}): string {
+	return createHash('sha256').update([
+		request.taskId,
+		request.workspaceId,
+		request.title,
+		request.prompt,
+		String(request.acceptanceCriteria.length),
+		...request.acceptanceCriteria,
+	].map((value) => `${Buffer.byteLength(value, 'utf8')}:${value}`).join(''), 'utf8').digest('hex');
 }

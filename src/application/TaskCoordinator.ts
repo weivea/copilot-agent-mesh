@@ -19,7 +19,6 @@ import type {
 	TaskToolReadResult,
 } from '../../shared/toolProtocol';
 import type { StateStore } from '../domain/ports';
-import type { PeerConnectionManager } from '../peer/PeerConnectionManager';
 import type { PeerProfileStore } from '../peer/PeerProfile';
 import { PeerRpcError } from '../peer/WebSocketPeerTransport';
 import type { TaskToolFacade } from '../tools/taskToolFacade';
@@ -50,13 +49,25 @@ export interface CoordinatorTaskView {
 	readonly snapshot?: TaskSnapshot | TaskSnapshotAfterEventSeq;
 }
 
+export interface CoordinatorPeerConnection {
+	readonly profileId: string;
+	snapshot(): { readonly state: string };
+	request(method: string, params: Record<string, unknown>): Promise<unknown>;
+}
+
+export interface CoordinatorPeerManager {
+	listConnections(): readonly CoordinatorPeerConnection[];
+	isEnabled(profileId: string): boolean;
+	get(profileId: string): CoordinatorPeerConnection | undefined;
+}
+
 export class TaskCoordinator implements TaskToolFacade {
 	private mutation = Promise.resolve();
 	private readonly taskCache = new Map<string, TaskSnapshot | TaskSnapshotAfterEventSeq>();
 	private readonly intentPayloads = new Map<string, DelegationIntentInput>();
 
 	public constructor(
-		private readonly peers: PeerConnectionManager,
+		private readonly peers: CoordinatorPeerManager,
 		private readonly profiles: PeerProfileStore,
 		private readonly state: StateStore,
 		private readonly guard: LocalDesktopWorkspaceGuard,
@@ -68,7 +79,10 @@ export class TaskCoordinator implements TaskToolFacade {
 		this.guard.assertAllowed({ requireWorkspace: false });
 		throwIfAborted(signal);
 		const workers = await Promise.all(this.peers.listConnections().map(async (connection) => {
-			if (connection.snapshot().state !== 'online') {
+			if (
+				!this.peers.isEnabled(connection.profileId)
+				|| connection.snapshot().state !== 'online'
+			) {
 				return undefined;
 			}
 			try {
@@ -79,13 +93,18 @@ export class TaskCoordinator implements TaskToolFacade {
 				const device = deviceInfoSchema.parse(deviceValue);
 				const workspaceResult = workspaceListResultSchema.parse(workspaceValue);
 				const capabilities = [...new Set(
-					workspaceResult.workspaces.flatMap(({ capabilityTags }) => capabilityTags),
+					workspaceResult.workspaces
+						.filter(({ enabled }) => enabled === true)
+						.flatMap(({ capabilityTags }) => capabilityTags),
 				)];
+				const enabledWorkspaces = workspaceResult.workspaces.filter(
+					({ enabled }) => enabled === true,
+				);
 				return {
 					peerId: connection.profileId,
 					deviceName: device.name,
 					capabilities,
-					workspaces: workspaceResult.workspaces.map((workspace) => ({
+					workspaces: enabledWorkspaces.map((workspace) => ({
 						workspaceId: workspace.workspaceId,
 						name: workspace.name,
 						tags: workspace.capabilityTags,
@@ -306,7 +325,11 @@ export class TaskCoordinator implements TaskToolFacade {
 
 	private requireConnection(profileId: string) {
 		const connection = this.peers.get(profileId);
-		if (connection === undefined || connection.snapshot().state !== 'online') {
+		if (
+			!this.peers.isEnabled(profileId)
+			|| connection === undefined
+			|| connection.snapshot().state !== 'online'
+		) {
 			throw new TaskToolFacadeError('TUNNEL_UNAVAILABLE', true);
 		}
 		return connection;

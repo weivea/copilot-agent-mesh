@@ -21,6 +21,20 @@ The application creates:
 - `ProductionDashboardBindings`, `ServiceDashboardFacade`, the Dashboard view, and the
   five production Language Model Tools.
 
+## Preview platform scope
+
+Worker Preview platform eligibility is deliberately limited to **macOS arm64**. That is the
+only platform with both the exact-gated Dev Tunnel build and reliable owned Agent
+Host process control validated together. Authenticated end-to-end AHP execution
+remains behind compatibility Gate G0 and is not claimed complete. Windows, Linux, macOS x64, and other
+architectures are Coordinator-only when peer-client networking is available.
+
+On a Coordinator-only platform, Listener start fails before spawning with stable
+`CLI_UNSUPPORTED`, and Agent Host probe/start returns stable
+`AGENT_UNAVAILABLE`. Dashboard details explain that macOS arm64 is required and
+that Coordinator features remain available. The application never substitutes a
+different CLI, an unowned process, or a fake Worker runtime.
+
 Every command and public service crosses `LocalDesktopWorkspaceGuard`. Listener, peer,
 coordinator, and metadata-only operations do not require an open folder, but still reject a
 remote Extension Host or untrusted workspace. Workspace registration and worker execution

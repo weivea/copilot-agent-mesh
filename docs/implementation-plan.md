@@ -1,5 +1,9 @@
 # Copilot Agent Mesh 实施计划
 
+> 当前 Preview 范围：仅 macOS arm64 支持 Worker。Windows、Linux、macOS
+> x64 和其他架构在 peer client 可用时仅支持 Coordinator。本文其余跨平台
+> Worker 条目是未来目标，不是当前 Marketplace Preview 声明。
+
 > 状态：Phase 0 evaluated; Gate G0 No-Go<br>
 > 日期：2026-08-24<br>
 > 依据：[PRD v0.3](../copilot-agent-mesh-prd.md) 与 [技术实施方案](./technical-implementation.md)<br>
@@ -12,10 +16,10 @@
 
 首版交付结果：
 
-- 一个可安装在 Windows、macOS、Linux 桌面版 VS Code 的 VSIX。
-- Worker 可注册本机 Workspace、启动本地 Gateway 和 Dev Tunnel。
+- 一个可安装在桌面版 VS Code 的 VSIX；非 macOS arm64 平台当前仅启用 Coordinator 能力。
+- macOS arm64 Worker 可注册本机 Workspace、启动本地 Gateway 和 Dev Tunnel。
 - Coordinator 可配对 Worker、查看 Workspace、创建/查询/取消任务。
-- Worker 通过 Agent Host/AHP 启动独立内置 Copilot Agent Session。
+- macOS arm64 Worker 通过 Agent Host/AHP 启动独立内置 Copilot Agent Session。
 - Dashboard 可查看连接、任务、输入请求和错误。
 - 所有远程执行均受 Workspace 白名单、Peer 认证和本机首次授权保护。
 - 插件不检查、管理或提示任何 Git/分支/worktree 行为。

@@ -1,11 +1,17 @@
 # Copilot Agent Mesh 产品需求文档
 
+> Preview platform scope: Worker hosting and task execution are currently
+> supported only on macOS arm64. Windows, Linux, macOS x64, and other
+> architectures are Coordinator-only when peer-client networking is available.
+> Cross-platform Worker statements below describe the future product target, not
+> the current Preview support claim.
+
 > 工作名称：Copilot Agent Mesh  
 > 文档版本：v0.3<br>
 > 状态：Draft / 可用于创建项目  
 > 日期：2026-08-24  
 > 产品形态：个人使用的 VS Code Desktop 扩展  
-> 支持平台：Windows、macOS、Linux
+> Preview 支持平台：Coordinator 可运行于支持 peer client 的桌面平台；Worker 仅 macOS arm64
 
 ## 1. 产品摘要
 
@@ -43,7 +49,7 @@ Windows Copilot Agent：
 
 1. 打通不同设备上 VS Code 内置 Copilot Agent 的任务通信。
 2. 用户只操作主设备，不需要远程桌面或直接操作从设备。
-3. 支持 Windows、macOS、Linux 任意组合；任意设备都可作为主设备或从设备。
+3. 当前 Preview 支持跨平台 Coordinator；Windows、Linux、macOS x64 和其他架构作为 Worker 是未来目标。
 4. 支持同一仓库和不同仓库的任务委派。
 5. 让主 Copilot Agent 能通过标准 Language Model Tool 自动发现设备、选择 Workspace、派发任务并获得结果。
 6. 提供可视化控制界面，用于启动监听、显示连接 URL、管理设备和查看任务。
@@ -633,12 +639,12 @@ AHP 的 Root、Session、Chat 和 Terminal channel 在当前规范中标记为 S
 1. 单一 VSIX 可安装在 Windows、macOS、Linux。
 2. 配置设备名。
 3. 注册当前 Workspace。
-4. 启停本地 Gateway 和持久 Dev Tunnel。
+4. macOS arm64 Worker 启停本地 Gateway 和持久 Dev Tunnel；其他平台稳定显示不支持。
 5. 显示并复制连接 URL。
 6. 主设备通过 URL 添加、保存和删除连接。
 7. 连接状态、心跳和 Workspace 列表 UI。
 8. `mesh_list_workers`、`mesh_delegate_task`、`mesh_get_task`、`mesh_cancel_task`。
-9. Worker 通过 AHP 调用内置 Copilot Agent。
+9. macOS arm64 Worker 通过 AHP 调用内置 Copilot Agent。
 10. 主设备 UI 显示任务状态和输出摘要。
 11. 任务完成结果可通过 `mesh_get_task` 在当前 Copilot 会话中查询。
 12. 一台设备可注册多个 Workspace，但每个 Workspace 同时只执行一个任务。
@@ -657,7 +663,8 @@ AHP 的 Root、Session、Chat 和 Terminal channel 在当前规范中标记为 S
 
 ### AC-1：监听与连接
 
-- 在 Mac 或 Linux 点击启动监听后，UI 显示有效连接 URL。
+- 在 macOS arm64 点击启动监听后，UI 显示有效连接 URL。
+- Windows、Linux、macOS x64 和其他架构显示 `CLI_UNSUPPORTED`，且 Coordinator 功能仍可用。
 - Windows 粘贴 URL 后，15 秒内看到设备 Online。
 - 停止 Worker Tunnel 后，Coordinator 在 30 秒内显示 Offline。
 - 重启 Worker 后，持久 Tunnel URL 不变且自动恢复连接。
@@ -671,11 +678,12 @@ AHP 的 Root、Session、Chat 和 Terminal channel 在当前规范中标记为 S
 - Mac 的文本输出和状态可在 Windows 控制界面查看。
 - `mesh_delegate_task` 先返回 `pending + taskId`；完成后 Windows Copilot Agent 可通过 `mesh_get_task` 取得结果并继续回复。
 
-### AC-3：多平台与多仓库
+### AC-3：Preview 多平台 Coordinator 与多仓库
 
-- Coordinator 同时连接一个 macOS Worker 和一个 Linux Worker。
-- macOS 和 Linux 分别暴露不同仓库 Workspace。
-- 主 Agent 能向两个 Workspace 分别派发任务并正确关联结果。
+- Windows 或 Linux Coordinator 连接一个 macOS arm64 Worker。
+- macOS arm64 Worker 暴露多个不同仓库 Workspace。
+- 主 Agent 能向多个 Workspace 分别派发任务并正确关联结果。
+- Linux Worker 是 Preview 后续兼容性目标。
 
 ### AC-4：失败与取消
 

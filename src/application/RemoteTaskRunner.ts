@@ -15,7 +15,12 @@ import type {
 } from '../agentHost/AgentRuntime';
 import { AgentRuntimeError } from '../agentHost/AgentRuntime';
 import { MeshDomainError } from '../domain/errors';
-import { createAcceptedTask, type OwnedTaskStart, type TaskRecord } from '../domain/task';
+import {
+	canonicalTaskRequestHash,
+	createAcceptedTask,
+	type OwnedTaskStart,
+	type TaskRecord,
+} from '../domain/task';
 import type { TaskDomainEvent } from '../domain/taskReducer';
 import { GatewayValidationError, type TaskService, type TaskStartParams } from '../gateway/GatewayRouter';
 import type { FileTaskStore } from '../tasks/FileTaskStore';
@@ -341,6 +346,16 @@ export class RemoteTaskRunner implements TaskService {
 				acceptanceCriteria: params.acceptanceCriteria,
 				workspaceId: params.workspaceId,
 				allowInteractiveAuthentication: true,
+				approvalContext: {
+					peerId: running.peerId,
+					workspaceId: params.workspaceId,
+					requestHash: canonicalTaskRequestHash({
+						...params,
+						acceptanceCriteria: [...params.acceptanceCriteria],
+						peerId: running.peerId,
+						workspaceLeaseKey: workspace.fileIdentity,
+					}),
+				},
 			});
 			const current = await this.store.getOwned(running.peerId, running.taskId);
 			if (running.stopBeforeStart || current?.state !== 'startingAgent') {

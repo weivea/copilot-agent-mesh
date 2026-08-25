@@ -1,12 +1,11 @@
 import type { StateStore } from '../domain/ports';
-import type { GatewayServer } from '../gateway/GatewayServer';
-import type { PairingService } from '../gateway/PairingService';
 import type {
 	DevTunnelProvider,
 	DevTunnelRuntimeStatus,
 	HostedTunnel,
 } from '../tunnel/DevTunnelProvider';
 import type { LocalDesktopWorkspaceGuard } from './LocalDesktopWorkspaceGuard';
+import type { WorkerPlatformSupport } from './WorkerPlatformSupport';
 
 const listenerStateKey = 'copilotAgentMesh.listener';
 const probeRequest = 'mesh-readiness-probe';
@@ -36,11 +35,27 @@ export interface ListenerServiceOptions {
 	readonly accessDuration?: `${number}h` | `${number}d`;
 	readonly tunnelExpiration?: `${number}h` | `${number}d`;
 	readonly configuredPort?: () => number | undefined;
+	readonly workerPlatform?: WorkerPlatformSupport;
+}
+
+export interface ListenerGateway {
+	start(preferredPort?: number): Promise<{ readonly port: number }>;
+	dispose(): Promise<void>;
+	notifyPeer(
+		peerId: string,
+		method: string,
+		params: Record<string, unknown>,
+	): Promise<void>;
+}
+
+export interface ListenerPairing {
+	createInvitation(origin: string): Promise<{ readonly url: string }>;
+	dispose(): Promise<void>;
 }
 
 export class ListenerService {
 	private readonly listeners = new Set<() => void>();
-	private gateway: GatewayServer | undefined;
+	private gateway: ListenerGateway | undefined;
 	private hosted: HostedTunnel | undefined;
 	private state: ListenerLifecycleState = 'stopped';
 	private operation: Promise<void> = Promise.resolve();
@@ -49,9 +64,9 @@ export class ListenerService {
 
 	public constructor(
 		private readonly deviceId: string,
-		private readonly pairing: PairingService,
+		private readonly pairing: ListenerPairing,
 		private readonly tunnel: DevTunnelProvider,
-		private readonly createGateway: () => GatewayServer,
+		private readonly createGateway: () => ListenerGateway,
 		private readonly metadata: StateStore,
 		private readonly guard: LocalDesktopWorkspaceGuard,
 		private readonly options: ListenerServiceOptions = {},
@@ -118,10 +133,7 @@ export class ListenerService {
 		if (this.disposed) {
 			return;
 		}
-		await this.serialize(() => this.stopCore(false));
-		this.disposed = true;
-		await this.tunnel.dispose();
-		this.listeners.clear();
+		await this.serialize(() => this.disposeCore());
 	}
 
 	private async startCore(): Promise<void> {
@@ -131,9 +143,21 @@ export class ListenerService {
 		if (this.state === 'running') {
 			return;
 		}
+		if (this.gateway !== undefined || this.hosted !== undefined) {
+			await this.stopCore(false);
+		}
 		this.state = 'starting';
 		this.lastError = undefined;
 		this.changed();
+		if (this.options.workerPlatform?.supported === false) {
+			this.state = 'error';
+			this.lastError = {
+				code: this.options.workerPlatform.listenerCode,
+				message: this.options.workerPlatform.listenerMessage,
+			};
+			this.changed();
+			throw new Error(this.lastError.message);
+		}
 		const capability = await this.tunnel.probe();
 		if (!capability.supported) {
 			this.state = 'error';
@@ -171,17 +195,28 @@ export class ListenerService {
 			this.state = 'running';
 			this.changed();
 		} catch (error) {
-			await Promise.allSettled([gateway.dispose(), this.tunnel.stop()]);
-			if (this.gateway === gateway) {
+			const cleanup = await Promise.allSettled([gateway.dispose(), this.tunnel.stop()]);
+			if (cleanup[0]?.status === 'fulfilled' && this.gateway === gateway) {
 				this.gateway = undefined;
 			}
-			this.hosted = undefined;
+			if (cleanup[1]?.status === 'fulfilled') {
+				this.hosted = undefined;
+			}
 			this.state = 'error';
 			this.lastError = {
 				code: 'LISTENER_START_FAILED',
 				message: error instanceof Error ? error.message : 'Listener startup failed.',
 			};
 			this.changed();
+			const cleanupFailures = cleanup.flatMap((result) =>
+				result.status === 'rejected' ? [result.reason] : [],
+			);
+			if (cleanupFailures.length > 0) {
+				throw new AggregateError(
+					[error, ...cleanupFailures],
+					'Listener startup failed and one or more owned resources require cleanup retry.',
+				);
+			}
 			throw error;
 		}
 	}
@@ -228,6 +263,50 @@ export class ListenerService {
 			});
 		}
 		this.changed();
+	}
+
+	private async disposeCore(): Promise<void> {
+		let stopFailure: unknown;
+		try {
+			await this.stopCore(false);
+		} catch (error) {
+			stopFailure = error;
+		}
+
+		const gateway = this.gateway;
+		const cleanup = await Promise.allSettled([
+			gateway?.dispose() ?? Promise.resolve(),
+			this.tunnel.dispose(),
+			this.pairing.dispose(),
+		]);
+		const cleanupFailures = cleanup.flatMap((result) =>
+			result.status === 'rejected' ? [result.reason] : [],
+		);
+		if (cleanup[0]?.status === 'fulfilled' && this.gateway === gateway) {
+			this.gateway = undefined;
+		}
+		if (cleanup[1]?.status === 'fulfilled') {
+			this.hosted = undefined;
+		}
+		if (cleanupFailures.length > 0) {
+			this.state = 'error';
+			this.lastError = {
+				code: 'LISTENER_STOP_FAILED',
+				message: 'One or more owned listener resources could not be disposed; retry disposal.',
+			};
+			this.changed();
+			throw new AggregateError(
+				stopFailure === undefined ? cleanupFailures : [stopFailure, ...cleanupFailures],
+				this.lastError.message,
+			);
+		}
+
+		this.gateway = undefined;
+		this.hosted = undefined;
+		this.state = 'stopped';
+		this.lastError = undefined;
+		this.disposed = true;
+		this.listeners.clear();
 	}
 
 	private read(): PersistedListenerState {

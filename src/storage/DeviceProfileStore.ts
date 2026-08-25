@@ -42,7 +42,16 @@ export class DeviceProfileStore {
 			if (!parsed.success) {
 				throw new TypeError(`Invalid persisted device profile: ${parsed.error.message}`);
 			}
-			return parsed.data;
+			const refreshed = deviceProfileSchema.parse({
+				...parsed.data,
+				platform: environment.platform,
+				architecture: environment.architecture,
+				vscodeVersion: environment.vscodeVersion,
+				extensionVersion: environment.extensionVersion,
+				updatedAt: this.clock.now().toISOString(),
+			});
+			await this.state.update(DEVICE_PROFILE_KEY, refreshed);
+			return refreshed;
 		}
 
 		const at = this.clock.now().toISOString();

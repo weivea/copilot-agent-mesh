@@ -37,6 +37,11 @@ export interface AgentTaskRequest {
 	readonly workspaceId: string;
 	readonly providerId?: string;
 	readonly allowInteractiveAuthentication?: boolean;
+	readonly approvalContext?: {
+		readonly peerId: string;
+		readonly workspaceId: string;
+		readonly requestHash: string;
+	};
 }
 
 export interface ResolvedAgentTaskRequest extends AgentTaskRequest {

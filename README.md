@@ -1,8 +1,14 @@
 # Copilot Agent Mesh
 
-Copilot Agent Mesh is a desktop VS Code extension for delegating GitHub Copilot coding tasks across trusted devices and local workspaces.
+Copilot Agent Mesh is a Preview desktop VS Code extension for delegating GitHub Copilot coding tasks across trusted devices and local workspaces.
 
-The project is currently in its bootstrap phase. The extension contributes an Activity Bar dashboard, device-name configuration, and the initial shared protocol types described in the [product requirements](./copilot-agent-mesh-prd.md).
+The only Worker Preview candidate platform is **macOS arm64**; full authenticated
+end-to-end support remains gated by the opt-in compatibility evidence. Windows, Linux,
+macOS x64, and other architectures may use Coordinator features when the peer
+client is otherwise available, but they cannot host a listener or execute Worker
+tasks. Unsupported Worker surfaces return `CLI_UNSUPPORTED` and
+`AGENT_UNAVAILABLE` with an actionable macOS arm64 requirement; they never fall
+back to an unowned process or unvalidated tunnel build.
 
 Project documents:
 
@@ -45,14 +51,18 @@ npm test
 ## Project layout
 
 ```text
-shared/              Gateway protocol types shared by coordinator and worker code
-src/extension.ts     Extension activation and command registration
+shared/              Gateway protocol types shared by coordinator and Worker code
+src/extension.ts     Minimal extension lifecycle entry point
+src/composition/     Production application composition
 src/ui/              Activity Bar and Webview UI
 src/test/            VS Code extension integration tests
 ```
 
-The architecture will expand into the `gateway`, `peer`, `agentHost`, `tasks`, `tools`, `tunnel`, and `workspaces` modules defined by the PRD as each capability is implemented.
+Production modules live under `gateway`, `peer`, `agentHost`, `tasks`, `tools`,
+`tunnel`, and `workspaces`.
 
 ## Security model
 
-This extension is intentionally disabled in untrusted and virtual workspaces. Future remote execution will require an explicitly registered workspace and paired peer connection.
+This extension is intentionally disabled in untrusted and virtual workspaces.
+Remote execution requires an explicitly registered workspace and paired peer
+connection.

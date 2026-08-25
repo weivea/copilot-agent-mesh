@@ -13,6 +13,8 @@ import type { PeerConnectionManager } from '../peer/PeerConnectionManager';
 import type { PeerProfileStore } from '../peer/PeerProfile';
 import type { FileTaskStore } from '../tasks/FileTaskStore';
 import type { WorkspaceLeaseManager } from '../tasks/WorkspaceLeaseManager';
+import type { MeshWorkerDirectorySnapshot } from '../../shared/toolProtocol';
+import type { WorkerPlatformSupport } from '../application/WorkerPlatformSupport';
 import type {
 	DashboardServiceBindings,
 	DashboardSnapshot,
@@ -38,6 +40,7 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 		private readonly leases: WorkspaceLeaseManager,
 		private readonly runtime: AgentRuntime,
 		private readonly guard: LocalDesktopWorkspaceGuard,
+		private readonly workerPlatform: WorkerPlatformSupport,
 	) {
 		this.subscriptions.push(
 			listener.onDidChange(() => changed.fire()),
@@ -118,11 +121,25 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 					error: record.failure,
 				})),
 		];
-		const listenerError = listener.error === undefined ? [] : [{
-			code: listener.error.code,
-			message: listener.error.message,
-			action: 'Check the Dev Tunnel build, login, and listener settings.',
+		const workerPlatformSupported = this.workerPlatform.supported;
+		const listenerError = !workerPlatformSupported
+			? [{
+				code: this.workerPlatform.listenerCode,
+				message: this.workerPlatform.listenerMessage,
+				action: 'Use a macOS arm64 device to host a Worker listener.',
+			}]
+			: listener.error === undefined ? [] : [{
+				code: listener.error.code,
+				message: listener.error.message,
+				action: 'Check the Dev Tunnel build, login, and listener settings.',
+			}];
+		const agentPlatformError = workerPlatformSupported ? [] : [{
+			code: 'AGENT_UNAVAILABLE',
+			message: 'Worker Preview task execution requires macOS arm64. Coordinator features remain available.',
+			action: 'Use a macOS arm64 device to host Worker tasks.',
 		}];
+		const listenerUnsupported = !workerPlatformSupported
+			|| listener.error?.code === 'CLI_UNSUPPORTED';
 		const tunnelReady = listener.tunnel.state === 'ready';
 		return {
 			device: {
@@ -133,26 +150,55 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 				extensionVersion: profile.extensionVersion,
 			},
 			listener: {
-				state: listener.state,
-				gateway: listener.state === 'running'
-					? { state: 'ready', label: 'Ready', detail: 'Loopback gateway is accepting authenticated peers.' }
-					: listener.state === 'error'
-						? { state: 'error', label: 'Error', detail: 'Gateway startup did not complete.' }
-						: { state: 'stopped', label: 'Stopped' },
-				tunnel: tunnelReady
-					? { state: 'ready', label: 'Ready', detail: 'Exact-build Dev Tunnel is hosted.' }
-					: listener.state === 'error'
-						? { state: 'error', label: 'Error', detail: 'Dev Tunnel is unavailable.' }
+				state: listenerUnsupported ? 'unavailable' : listener.state,
+				gateway: listenerUnsupported
+					? {
+						state: 'unavailable',
+						label: 'Unsupported',
+						detail: listener.error?.message ?? this.workerPlatform.listenerMessage,
+						action: 'Use macOS arm64 to host a Worker; Coordinator features remain available.',
+					}
+					: listener.state === 'running'
+						? { state: 'ready', label: 'Ready', detail: 'Loopback gateway is accepting authenticated peers.' }
+						: listener.state === 'error'
+							? { state: 'error', label: 'Error', detail: 'Gateway startup did not complete.' }
+							: { state: 'stopped', label: 'Stopped' },
+				tunnel: listenerUnsupported
+					? {
+						state: 'unavailable',
+						label: 'Unsupported',
+						detail: listener.error?.message ?? this.workerPlatform.listenerMessage,
+						action: 'Use macOS arm64 for Worker Preview listener hosting.',
+					}
+					: tunnelReady
+						? { state: 'ready', label: 'Ready', detail: 'Exact-build Dev Tunnel is hosted.' }
+						: listener.state === 'error'
+						? {
+							state: listener.error?.code === 'CLI_UNSUPPORTED' ? 'unavailable' : 'error',
+							label: listener.error?.code === 'CLI_UNSUPPORTED' ? 'Unsupported' : 'Error',
+							detail: listener.error?.message
+								?? (listenerUnsupported
+									? this.workerPlatform.listenerMessage
+									: 'Dev Tunnel is unavailable.'),
+							action: listener.error?.code === 'CLI_UNSUPPORTED'
+								? 'Use macOS arm64 for Worker Preview listener hosting; Coordinator features remain available.'
+								: undefined,
+						}
 						: { state: 'stopped', label: 'Stopped' },
 				agentHost: runtimeProbe.available
 					? { state: 'ready', label: 'Available', detail: 'Agent Host runtime is enabled.' }
 					: {
 						state: 'unavailable',
 						label: runtimeProbe.featureEnabled ? 'Unavailable' : 'Disabled',
-						detail: 'Enable the Agent Host feature after satisfying the AHP compatibility gate.',
-						action: 'Configure copilotAgentMesh.experimental.agentHost.',
+						detail: !workerPlatformSupported
+							? 'Worker Preview execution is unavailable. macOS arm64 is required; Coordinator features remain available.'
+							: 'Enable the Agent Host feature after satisfying the AHP compatibility gate.',
+						action: !workerPlatformSupported
+							? 'Use macOS arm64 for Worker Preview execution.'
+							: 'Configure copilotAgentMesh.experimental.agentHost.',
 					},
-				canStart: listener.state === 'stopped' || listener.state === 'error',
+				canStart: !listenerUnsupported
+					&& (listener.state === 'stopped' || listener.state === 'error'),
 				canStop: listener.state === 'running' || listener.state === 'starting',
 				canCopyConnectionUrl: listener.state === 'running',
 			},
@@ -179,7 +225,7 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 				};
 			}),
 			tasks,
-			errors: listenerError,
+			errors: [...listenerError, ...agentPlatformError],
 		};
 	}
 
@@ -236,32 +282,58 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 		readonly instruction: string;
 	}): Promise<void> {
 		this.guard.assertAllowed({ requireWorkspace: false });
-		const controller = new AbortController();
-		const timer = setTimeout(() => controller.abort(), 15_000);
+		const directoryController = deadlineSignal(5_000);
+		let directory: MeshWorkerDirectorySnapshot;
 		try {
-			const directory = await this.coordinator.listWorkers(controller.signal);
-			const selectedPeer = request.peerId === undefined
-				? directory.workers[0]
-				: directory.workers.find(({ peerId }) => peerId === request.peerId);
-			if (selectedPeer === undefined) {
-				throw new Error('No online peer is available.');
-			}
-			const selectedWorkspace = request.workspaceId === undefined
-				? selectedPeer.workspaces.find(({ busy }) => !busy)
-				: selectedPeer.workspaces.find(({ workspaceId }) => workspaceId === request.workspaceId);
-			if (selectedWorkspace === undefined) {
-				throw new Error('No available remote workspace is available.');
-			}
+			directory = await this.coordinator.listWorkers(directoryController.signal);
+		} finally {
+			directoryController.abort();
+		}
+		const selected = await selectDashboardTaskTarget(
+			directory,
+			request.peerId,
+			request.workspaceId,
+			(peerId) => this.peers.isEnabled(peerId),
+			async (workers) => (await this.vscodeApi.window.showQuickPick(
+				workers.map((worker) => ({
+					label: worker.deviceName,
+					description: worker.capabilities.join(', '),
+					worker,
+				})),
+				{
+					title: 'Select an online Worker',
+					placeHolder: 'Choose the enabled Worker for this task',
+					ignoreFocusOut: true,
+				},
+			))?.worker,
+			async (workspaces) => (await this.vscodeApi.window.showQuickPick(
+				workspaces.map((workspace) => ({
+					label: workspace.name,
+					description: workspace.tags.join(', '),
+					workspace,
+				})),
+				{
+					title: 'Select an enabled Worker workspace',
+					placeHolder: 'Choose a non-busy workspace',
+					ignoreFocusOut: true,
+				},
+			))?.workspace,
+		);
+		if (selected === undefined) {
+			return;
+		}
+		const startController = deadlineSignal(15_000);
+		try {
 			await this.coordinator.startTask({
-				peerId: selectedPeer.peerId,
-				workspaceId: selectedWorkspace.workspaceId,
+				peerId: selected.worker.peerId,
+				workspaceId: selected.workspace.workspaceId,
 				title: boundUtf8(request.instruction, 256),
 				prompt: request.instruction,
 				acceptanceCriteria: [],
-			}, controller.signal);
+			}, startController.signal);
 			this.changed.fire();
 		} finally {
-			clearTimeout(timer);
+			startController.abort();
 		}
 	}
 
@@ -314,6 +386,35 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 			void this.coordinator.refreshKnownTasks().finally(() => this.changed.fire());
 		}, 100);
 	}
+}
+
+export async function selectDashboardTaskTarget(
+	directory: MeshWorkerDirectorySnapshot,
+	requestedPeerId: string | undefined,
+	requestedWorkspaceId: string | undefined,
+	isEnabled: (peerId: string) => boolean,
+	pickWorker: (
+		workers: MeshWorkerDirectorySnapshot['workers'],
+	) => Promise<MeshWorkerDirectorySnapshot['workers'][number] | undefined>,
+	pickWorkspace: (
+		workspaces: MeshWorkerDirectorySnapshot['workers'][number]['workspaces'],
+	) => Promise<MeshWorkerDirectorySnapshot['workers'][number]['workspaces'][number] | undefined>,
+): Promise<{
+	readonly worker: MeshWorkerDirectorySnapshot['workers'][number];
+	readonly workspace: MeshWorkerDirectorySnapshot['workers'][number]['workspaces'][number];
+} | undefined> {
+	const enabledWorkers = directory.workers.filter(({ peerId }) => isEnabled(peerId));
+	const worker = requestedPeerId === undefined
+		? await pickWorker(enabledWorkers)
+		: enabledWorkers.find(({ peerId }) => peerId === requestedPeerId);
+	if (worker === undefined) {
+		return undefined;
+	}
+	const availableWorkspaces = worker.workspaces.filter(({ busy }) => !busy);
+	const workspace = requestedWorkspaceId === undefined
+		? await pickWorkspace(availableWorkspaces)
+		: availableWorkspaces.find(({ workspaceId }) => workspaceId === requestedWorkspaceId);
+	return workspace === undefined ? undefined : { worker, workspace };
 }
 
 function deadlineSignal(delayMs: number): AbortController {

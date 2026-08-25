@@ -128,6 +128,10 @@ export class PeerConnectionManager {
 		return [...this.peers.values()].map(({ connection }) => connection);
 	}
 
+	public isEnabled(profileId: string): boolean {
+		return this.peers.get(profileId)?.enabled === true;
+	}
+
 	public onDidChange(listener: () => void): () => void {
 		this.listeners.add(listener);
 		return () => this.listeners.delete(listener);
