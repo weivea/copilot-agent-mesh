@@ -114,6 +114,8 @@ const neverCancelled: ToolCancellation = {
 	onCancellationRequested: () => ({ dispose: () => undefined }),
 };
 
+const canonicalIdentifierPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
 const safeErrorMessages: Readonly<Record<TaskToolErrorCode, string>> = {
 	INVALID_INPUT: 'The tool input does not match the required schema or byte limits.',
 	OUTPUT_INVALID: 'The mesh coordinator returned an invalid response.',
@@ -316,7 +318,11 @@ export class TaskToolsCore {
 		}
 
 		try {
-			return this.boundTaskResult(parseTaskReadResult(outcome.value, input.maxEvents));
+			const read = parseTaskReadResult(outcome.value, input.maxEvents);
+			if (read.snapshot.taskId !== input.taskId) {
+				return this.errorResult('OUTPUT_INVALID');
+			}
+			return this.boundTaskResult(read);
 		} catch {
 			return this.errorResult('OUTPUT_INVALID');
 		}
@@ -338,7 +344,7 @@ export class TaskToolsCore {
 			TASK_TOOL_DEADLINES_MS.cancelTask,
 			cancellation,
 		);
-		return this.actionOutcomeResult(outcome);
+		return this.actionOutcomeResult(outcome, input.taskId);
 	}
 
 	async answerTask(
@@ -357,7 +363,7 @@ export class TaskToolsCore {
 			TASK_TOOL_DEADLINES_MS.answerTask,
 			cancellation,
 		);
-		return this.actionOutcomeResult(outcome);
+		return this.actionOutcomeResult(outcome, input.taskId);
 	}
 
 	private async runBounded<T>(
@@ -400,12 +406,18 @@ export class TaskToolsCore {
 		}
 	}
 
-	private actionOutcomeResult(outcome: OperationOutcome<TaskActionReceipt>): ToolJsonResult {
+	private actionOutcomeResult(
+		outcome: OperationOutcome<TaskActionReceipt>,
+		expectedTaskId: string,
+	): ToolJsonResult {
 		if (outcome.kind !== 'success') {
 			return this.outcomeResult(outcome);
 		}
 		try {
 			const receipt = parseTaskActionReceipt(outcome.value);
+			if (receipt.taskId !== expectedTaskId) {
+				return this.errorResult('OUTPUT_INVALID');
+			}
 			return this.fitResult({
 				status: 'ok',
 				taskId: receipt.taskId,
@@ -794,8 +806,8 @@ export function parseListWorkersInput(value: unknown): Record<string, never> {
 export function parseDelegateTaskInput(value: unknown): DelegationIntentInput {
 	const input = expectRecord(value, 'input');
 	expectExactKeys(input, ['peerId', 'workspaceId', 'title', 'prompt', 'acceptanceCriteria', 'timeoutMinutes']);
-	const peerId = expectString(input.peerId, 'peerId', TASK_TOOL_LIMITS.idBytes);
-	const workspaceId = expectString(input.workspaceId, 'workspaceId', TASK_TOOL_LIMITS.idBytes);
+	const peerId = expectIdentifier(input.peerId, 'peerId');
+	const workspaceId = expectIdentifier(input.workspaceId, 'workspaceId');
 	const title = expectString(input.title, 'title', TASK_TOOL_LIMITS.titleBytes);
 	const prompt = expectString(input.prompt, 'prompt', TASK_TOOL_LIMITS.promptBytes);
 	const acceptanceCriteria = input.acceptanceCriteria === undefined
@@ -824,7 +836,7 @@ export function parseGetTaskInput(
 ): Required<Pick<GetTaskInput, 'taskId' | 'maxEvents'>> & Pick<GetTaskInput, 'afterEventSequence'> {
 	const input = expectRecord(value, 'input');
 	expectExactKeys(input, ['taskId', 'afterEventSequence', 'maxEvents']);
-	const taskId = expectString(input.taskId, 'taskId', TASK_TOOL_LIMITS.idBytes);
+	const taskId = expectIdentifier(input.taskId, 'taskId');
 	const afterEventSequence = input.afterEventSequence === undefined
 		? undefined
 		: expectInteger(input.afterEventSequence, 'afterEventSequence', 0, Number.MAX_SAFE_INTEGER);
@@ -841,16 +853,16 @@ export function parseGetTaskInput(
 export function parseCancelTaskInput(value: unknown): CancelTaskInput {
 	const input = expectRecord(value, 'input');
 	expectExactKeys(input, ['taskId']);
-	return { taskId: expectString(input.taskId, 'taskId', TASK_TOOL_LIMITS.idBytes) };
+	return { taskId: expectIdentifier(input.taskId, 'taskId') };
 }
 
 export function parseAnswerTaskInput(value: unknown): AnswerTaskInput {
 	const input = expectRecord(value, 'input');
 	expectExactKeys(input, ['taskId', 'inputId', 'answerId', 'answer']);
 	return {
-		taskId: expectString(input.taskId, 'taskId', TASK_TOOL_LIMITS.idBytes),
-		inputId: expectString(input.inputId, 'inputId', TASK_TOOL_LIMITS.idBytes),
-		answerId: expectString(input.answerId, 'answerId', TASK_TOOL_LIMITS.idBytes),
+		taskId: expectIdentifier(input.taskId, 'taskId'),
+		inputId: expectIdentifier(input.inputId, 'inputId'),
+		answerId: expectIdentifier(input.answerId, 'answerId'),
 		answer: expectString(input.answer, 'answer', TASK_TOOL_LIMITS.answerBytes),
 	};
 }
@@ -866,6 +878,9 @@ export async function serializeToolResultToTokenBudget(
 	while (await countTokens(serialized) > normalizedBudget) {
 		const smaller = shrinkToolResult(candidate);
 		if (smaller === undefined) {
+			if (isCompactDelegationResult(candidate)) {
+				return '';
+			}
 			for (const fallback of [
 				'{"status":"error","error":{"code":"OUTPUT_TOO_LARGE"}}',
 				'{"status":"error"}',
@@ -881,6 +896,9 @@ export async function serializeToolResultToTokenBudget(
 		}
 		const smallerSerialized = JSON.stringify(smaller);
 		if (smallerSerialized === serialized) {
+			if (isCompactDelegationResult(candidate)) {
+				return '';
+			}
 			for (const fallback of [
 				'{"status":"error","error":{"code":"OUTPUT_TOO_LARGE"}}',
 				'{"status":"error"}',
@@ -915,7 +933,7 @@ function parseWorkerDirectory(value: unknown): MeshWorkerDirectorySnapshot {
 			const workspace = expectRecord(workspaceValue, 'workspace');
 			expectExactKeys(workspace, ['workspaceId', 'name', 'tags', 'busy']);
 			return {
-				workspaceId: expectString(workspace.workspaceId, 'workspaceId', TASK_TOOL_LIMITS.idBytes),
+				workspaceId: expectIdentifier(workspace.workspaceId, 'workspaceId'),
 				name: expectString(workspace.name, 'workspace name', TASK_TOOL_LIMITS.workspaceNameBytes),
 				tags: expectStringArray(
 					workspace.tags,
@@ -927,7 +945,7 @@ function parseWorkerDirectory(value: unknown): MeshWorkerDirectorySnapshot {
 			};
 		});
 		return {
-			peerId: expectString(worker.peerId, 'peerId', TASK_TOOL_LIMITS.idBytes),
+			peerId: expectIdentifier(worker.peerId, 'peerId'),
 			deviceName: expectString(worker.deviceName, 'deviceName', TASK_TOOL_LIMITS.deviceNameBytes),
 			capabilities: expectStringArray(
 				worker.capabilities,
@@ -945,12 +963,8 @@ function parsePersistedIntent(value: unknown): PersistedDelegationIntent {
 	const persisted = expectRecord(value, 'persisted delegation intent');
 	expectExactKeys(persisted, ['delegationRequestId', 'taskId', 'recovered']);
 	return {
-		delegationRequestId: expectString(
-			persisted.delegationRequestId,
-			'delegationRequestId',
-			TASK_TOOL_LIMITS.idBytes,
-		),
-		taskId: expectString(persisted.taskId, 'taskId', TASK_TOOL_LIMITS.idBytes),
+		delegationRequestId: expectIdentifier(persisted.delegationRequestId, 'delegationRequestId'),
+		taskId: expectIdentifier(persisted.taskId, 'taskId'),
 		recovered: expectBoolean(persisted.recovered, 'recovered'),
 	};
 }
@@ -1001,7 +1015,7 @@ function parseTaskSnapshot(value: unknown): TaskToolSnapshot {
 		? undefined
 		: parsePendingInput(snapshot.pendingInput);
 	return {
-		taskId: expectString(snapshot.taskId, 'taskId', TASK_TOOL_LIMITS.idBytes),
+		taskId: expectIdentifier(snapshot.taskId, 'taskId'),
 		status,
 		title: expectString(snapshot.title, 'title', TASK_TOOL_LIMITS.titleBytes),
 		updatedAt: expectTimestamp(snapshot.updatedAt, 'updatedAt'),
@@ -1051,7 +1065,7 @@ function parseArtifact(value: unknown): TaskArtifactReference {
 	expectExactKeys(artifact, ['artifactId', 'label', 'mediaType']);
 	const mediaType = optionalString(artifact.mediaType, 'mediaType', 256);
 	return {
-		artifactId: expectString(artifact.artifactId, 'artifactId', TASK_TOOL_LIMITS.idBytes),
+		artifactId: expectIdentifier(artifact.artifactId, 'artifactId'),
 		label: expectString(artifact.label, 'artifact label', 512),
 		...(mediaType === undefined ? {} : { mediaType }),
 	};
@@ -1064,7 +1078,7 @@ function parsePendingInput(value: unknown): TaskPendingInputSummary {
 		? undefined
 		: expectStringArray(pendingInput.choices, 'choices', 32, 4 * 1024);
 	return {
-		inputId: expectString(pendingInput.inputId, 'inputId', TASK_TOOL_LIMITS.idBytes),
+		inputId: expectIdentifier(pendingInput.inputId, 'inputId'),
 		prompt: expectString(pendingInput.prompt, 'input prompt', 16 * 1024),
 		...(choices === undefined ? {} : { choices }),
 	};
@@ -1074,7 +1088,7 @@ function parseTaskActionReceipt(value: unknown): TaskActionReceipt {
 	const receipt = expectRecord(value, 'task action receipt');
 	expectExactKeys(receipt, ['taskId', 'status']);
 	return {
-		taskId: expectString(receipt.taskId, 'taskId', TASK_TOOL_LIMITS.idBytes),
+		taskId: expectIdentifier(receipt.taskId, 'taskId'),
 		status: expectTaskStatus(receipt.status),
 	};
 }
@@ -1104,6 +1118,13 @@ function expectExactKeys(value: Record<string, unknown>, allowedKeys: readonly s
 function expectString(value: unknown, field: string, maxBytes: number): string {
 	if (typeof value !== 'string' || value.trim().length === 0 || Buffer.byteLength(value, 'utf8') > maxBytes) {
 		throw new Error(`${field} is invalid.`);
+	}
+	return value;
+}
+
+function expectIdentifier(value: unknown, field: string): string {
+	if (typeof value !== 'string' || !canonicalIdentifierPattern.test(value)) {
+		throw new Error(`${field} must be a canonical lowercase UUID.`);
 	}
 	return value;
 }
@@ -1277,9 +1298,27 @@ function shrinkToolResult(value: ToolJsonResult): ToolJsonResult | undefined {
 		const { recovered: _recovered, ...withoutRecovered } = value;
 		return withoutRecovered;
 	}
+	if (
+		typeof value.taskId === 'string'
+		&& typeof value.delegationRequestId === 'string'
+	) {
+		return {
+			s: 0,
+			t: value.taskId,
+			d: value.delegationRequestId,
+			r: 1,
+		};
+	}
 	return undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isCompactDelegationResult(value: ToolJsonResult): boolean {
+	return value.s === 0
+		&& typeof value.t === 'string'
+		&& typeof value.d === 'string'
+		&& value.r === 1;
 }

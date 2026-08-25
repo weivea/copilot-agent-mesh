@@ -31,6 +31,19 @@ function and shrinks events, worker lists, and optional snapshot fields to the
 actual token budget. If even the smallest JSON result does not fit, the adapter
 returns an empty `LanguageModelTextPart` rather than exceeding the budget.
 
+Every peer, workspace, delegation, task, input, answer, and artifact identifier
+is a canonical lowercase UUID (`8-4-4-4-12` hexadecimal form). Runtime parsing
+rejects uppercase, escaped control characters, suffixes, and arbitrary opaque
+strings, so identifier JSON size is fixed and matches the domain foundation.
+Facade task responses are also bound to the requested task ID; a mismatched
+snapshot or action receipt becomes `OUTPUT_INVALID`.
+
+Under severe token pressure, an already-persisted delegation is compacted to
+`{"s":0,"t":"<taskId>","d":"<delegationRequestId>","r":1}` before any generic
+error or empty-text fallback. Here `s:0` means pending, `t` and `d` preserve the
+two durable IDs, and `r:1` means reconciliation/retry of the same intent is
+required. This form fits a 100-character budget with canonical UUIDs.
+
 Cancelling a `CancellationToken` aborts only the current Tool wait. In
 particular, delegate cancellation or acknowledgement timeout does not call the
 remote cancellation method. Once `persistDelegationIntent` resolves, the result

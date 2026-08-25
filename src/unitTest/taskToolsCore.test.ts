@@ -24,6 +24,14 @@ import {
 	MESH_TOOL_NAMES,
 } from '../tools/toolManifest';
 
+const PEER_ID = '00000000-0000-4000-8000-000000000001';
+const WORKSPACE_ID = '00000000-0000-4000-8000-000000000002';
+const TASK_ID = '00000000-0000-4000-8000-000000000003';
+const DELEGATION_ID = '00000000-0000-4000-8000-000000000004';
+const INPUT_ID = '00000000-0000-4000-8000-000000000005';
+const ANSWER_ID = '00000000-0000-4000-8000-000000000006';
+const OTHER_TASK_ID = '00000000-0000-4000-8000-000000000007';
+
 suite('TaskToolsCore', () => {
 	test('lists only bounded opaque worker metadata', async () => {
 		const facade = new RecordingFacade();
@@ -34,11 +42,11 @@ suite('TaskToolsCore', () => {
 		assert.deepStrictEqual(result, {
 			status: 'ok',
 			workers: [{
-				peerId: 'peer-1',
+				peerId: PEER_ID,
 				deviceName: 'worker-one',
 				capabilities: ['coding'],
 				workspaces: [{
-					workspaceId: 'workspace-1',
+					workspaceId: WORKSPACE_ID,
 					name: 'app',
 					tags: ['typescript'],
 					busy: false,
@@ -58,8 +66,8 @@ suite('TaskToolsCore', () => {
 		const second = core.prepareDelegateInvocation(input);
 
 		assert.deepStrictEqual(first, second);
-		assert.match(first.confirmationMessage, /Peer: peer-1/);
-		assert.match(first.confirmationMessage, /Workspace: workspace-1/);
+		assert.match(first.confirmationMessage, new RegExp(`Peer: ${PEER_ID}`));
+		assert.match(first.confirmationMessage, new RegExp(`Workspace: ${WORKSPACE_ID}`));
 		assert.match(first.confirmationMessage, /Title: Fix scheduler/);
 		assert.equal(facade.persistCalls, 0);
 		assert.equal(facade.acceptanceWaits, 0);
@@ -74,8 +82,8 @@ suite('TaskToolsCore', () => {
 		assert.deepStrictEqual(facade.callOrder, ['persist', 'wait']);
 		assert.deepStrictEqual(result, {
 			status: 'pending',
-			delegationRequestId: 'request-1',
-			taskId: 'task-1',
+			delegationRequestId: DELEGATION_ID,
+			taskId: TASK_ID,
 			recovered: false,
 			pollTool: MESH_TOOL_NAMES.getTask,
 			cancelTool: MESH_TOOL_NAMES.cancelTask,
@@ -96,7 +104,7 @@ suite('TaskToolsCore', () => {
 		const result = await invocation;
 
 		assert.equal(result.status, 'cancelled');
-		assert.equal(result.taskId, 'task-1');
+		assert.equal(result.taskId, TASK_ID);
 		assert.equal(result.pollTool, MESH_TOOL_NAMES.getTask);
 		assert.equal(facade.persistCalls, 1);
 		assert.equal(facade.cancelCalls, 0);
@@ -116,8 +124,8 @@ suite('TaskToolsCore', () => {
 		const result = await invocation;
 
 		assert.equal(result.status, 'timeout');
-		assert.equal(result.delegationRequestId, 'request-1');
-		assert.equal(result.taskId, 'task-1');
+		assert.equal(result.delegationRequestId, DELEGATION_ID);
+		assert.equal(result.taskId, TASK_ID);
 		assert.equal(result.pollTool, MESH_TOOL_NAMES.getTask);
 		assert.equal(result.cancelTool, MESH_TOOL_NAMES.cancelTask);
 		assert.equal(facade.cancelCalls, 0);
@@ -181,8 +189,8 @@ suite('TaskToolsCore', () => {
 		const first = await firstInvocation;
 
 		persistence.resolve({
-			delegationRequestId: 'request-durable',
-			taskId: 'task-durable',
+			delegationRequestId: DELEGATION_ID,
+			taskId: TASK_ID,
 			recovered: true,
 		});
 		await Promise.resolve();
@@ -191,8 +199,8 @@ suite('TaskToolsCore', () => {
 
 		assert.equal(first.status, 'pending');
 		assert.equal(retry.status, 'pending');
-		assert.equal(retry.delegationRequestId, 'request-durable');
-		assert.equal(retry.taskId, 'task-durable');
+		assert.equal(retry.delegationRequestId, DELEGATION_ID);
+		assert.equal(retry.taskId, TASK_ID);
 		assert.equal(retry.recovered, true);
 		assert.equal(facade.persistCalls, 2);
 		assert.equal(facade.acceptanceWaits, 1);
@@ -201,8 +209,8 @@ suite('TaskToolsCore', () => {
 	test('a duplicate retry relies on durable Facade recovery and keeps the same IDs', async () => {
 		const facade = new RecordingFacade();
 		facade.persisted = {
-			delegationRequestId: 'request-stable',
-			taskId: 'task-stable',
+			delegationRequestId: DELEGATION_ID,
+			taskId: TASK_ID,
 			recovered: true,
 		};
 		const core = new TaskToolsCore(facade);
@@ -211,8 +219,8 @@ suite('TaskToolsCore', () => {
 		const retry = await core.delegateTask(delegationInput());
 
 		assert.equal(facade.persistCalls, 2);
-		assert.equal(first.taskId, 'task-stable');
-		assert.equal(retry.taskId, 'task-stable');
+		assert.equal(first.taskId, TASK_ID);
+		assert.equal(retry.taskId, TASK_ID);
 		assert.equal(retry.recovered, true);
 	});
 
@@ -234,7 +242,7 @@ suite('TaskToolsCore', () => {
 		};
 		const core = new TaskToolsCore(facade, { outputByteLimit: 1_200 });
 
-		const result = await core.getTask({ taskId: 'task-1', maxEvents: 10 });
+		const result = await core.getTask({ taskId: TASK_ID, maxEvents: 10 });
 		const bytes = Buffer.byteLength(JSON.stringify(result), 'utf8');
 
 		assert.equal(result.status, 'ok');
@@ -248,7 +256,7 @@ suite('TaskToolsCore', () => {
 		const facade = new RecordingFacade();
 		facade.taskRead = {
 			snapshot: {
-				taskId: 'task-1',
+				taskId: TASK_ID,
 				status: 'needsInput',
 				title: 'Fix scheduler',
 				updatedAt: '2026-08-25T00:00:00.000Z',
@@ -257,7 +265,7 @@ suite('TaskToolsCore', () => {
 					summary: 'v'.repeat(16 * 1024),
 				},
 				pendingInput: {
-					inputId: 'input-1',
+					inputId: INPUT_ID,
 					prompt: 'p'.repeat(16 * 1024),
 					choices: Array.from({ length: 32 }, (_, index) => `${index}-${'c'.repeat(4_090)}`),
 				},
@@ -268,15 +276,15 @@ suite('TaskToolsCore', () => {
 		};
 		const core = new TaskToolsCore(facade, { outputByteLimit: 1_024 });
 
-		const result = await core.getTask({ taskId: 'task-1' });
+		const result = await core.getTask({ taskId: TASK_ID });
 		const snapshot = result.snapshot as Record<string, unknown>;
 		const pendingInput = snapshot.pendingInput as Record<string, unknown>;
 		const validation = snapshot.validation as Record<string, unknown>;
 
 		assert.equal(result.status, 'ok');
 		assert.equal(result.truncated, true);
-		assert.equal(snapshot.taskId, 'task-1');
-		assert.equal(pendingInput.inputId, 'input-1');
+		assert.equal(snapshot.taskId, TASK_ID);
+		assert.equal(pendingInput.inputId, INPUT_ID);
 		assert.equal(result.answerTool, MESH_TOOL_NAMES.answerTask);
 		assert.equal(validation.status, 'failed');
 		assert.ok(typeof pendingInput.prompt === 'string' && pendingInput.prompt.length > 0);
@@ -289,8 +297,8 @@ suite('TaskToolsCore', () => {
 
 	test('preserves maximum-length task and input IDs at the minimum output budget', async () => {
 		const facade = new RecordingFacade();
-		const taskId = 't'.repeat(128);
-		const inputId = 'i'.repeat(128);
+		const taskId = TASK_ID;
+		const inputId = INPUT_ID;
 		facade.taskRead = {
 			snapshot: {
 				taskId,
@@ -304,7 +312,7 @@ suite('TaskToolsCore', () => {
 					summary: 'v'.repeat(16 * 1024),
 				},
 				artifacts: Array.from({ length: 32 }, (_, index) => ({
-					artifactId: `artifact-${index}`,
+					artifactId: uuidFromIndex(index + 100),
 					label: 'a'.repeat(512),
 				})),
 				pendingInput: {
@@ -336,26 +344,50 @@ suite('TaskToolsCore', () => {
 		const facade = new RecordingFacade();
 		const core = new TaskToolsCore(facade);
 
-		const cancelled = await core.cancelTask({ taskId: 'task-1' });
+		const cancelled = await core.cancelTask({ taskId: TASK_ID });
 		const answered = await core.answerTask({
-			taskId: 'task-1',
-			inputId: 'input-1',
-			answerId: 'answer-1',
+			taskId: TASK_ID,
+			inputId: INPUT_ID,
+			answerId: ANSWER_ID,
 			answer: 'Proceed',
 		});
 
 		assert.deepStrictEqual(cancelled, {
 			status: 'ok',
-			taskId: 'task-1',
+			taskId: TASK_ID,
 			taskStatus: 'cancelled',
 		});
 		assert.deepStrictEqual(answered, {
 			status: 'ok',
-			taskId: 'task-1',
+			taskId: TASK_ID,
 			taskStatus: 'running',
 		});
 		assert.equal(facade.cancelCalls, 1);
 		assert.equal(facade.answerCalls, 1);
+	});
+
+	test('rejects get, cancel, and answer responses for a different task', async () => {
+		const facade = new RecordingFacade();
+		const core = new TaskToolsCore(facade);
+		facade.taskRead = {
+			...facade.taskRead,
+			snapshot: { ...facade.taskRead.snapshot, taskId: OTHER_TASK_ID },
+		};
+		facade.responseTaskId = OTHER_TASK_ID;
+
+		const read = await core.getTask({ taskId: TASK_ID });
+		const cancel = await core.cancelTask({ taskId: TASK_ID });
+		const answer = await core.answerTask({
+			taskId: TASK_ID,
+			inputId: INPUT_ID,
+			answerId: ANSWER_ID,
+			answer: 'Proceed',
+		});
+
+		for (const result of [read, cancel, answer]) {
+			assert.equal(result.status, 'error');
+			assert.equal((result.error as Record<string, unknown>).code, 'OUTPUT_INVALID');
+		}
 	});
 
 	test('accepts recovering and cancelling production task states', async () => {
@@ -367,8 +399,8 @@ suite('TaskToolsCore', () => {
 		facade.cancelStatus = 'cancelling';
 		const core = new TaskToolsCore(facade);
 
-		const read = await core.getTask({ taskId: 'task-1' });
-		const cancel = await core.cancelTask({ taskId: 'task-1' });
+		const read = await core.getTask({ taskId: TASK_ID });
+		const cancel = await core.cancelTask({ taskId: TASK_ID });
 
 		assert.equal((read.snapshot as Record<string, unknown>).status, 'recovering');
 		assert.equal(cancel.taskStatus, 'cancelling');
@@ -382,8 +414,8 @@ suite('TaskToolsCore', () => {
 		const result = await core.delegateTask(delegationInput());
 
 		assert.equal(result.status, 'error');
-		assert.equal(result.delegationRequestId, 'request-1');
-		assert.equal(result.taskId, 'task-1');
+		assert.equal(result.delegationRequestId, DELEGATION_ID);
+		assert.equal(result.taskId, TASK_ID);
 		assert.equal(result.pollTool, MESH_TOOL_NAMES.getTask);
 		assert.equal(result.cancelTool, MESH_TOOL_NAMES.cancelTask);
 		assert.equal((result.error as Record<string, unknown>).code, 'TUNNEL_UNAVAILABLE');
@@ -399,9 +431,9 @@ suite('TaskToolsCore', () => {
 			title: 'é'.repeat(129),
 		});
 		const oversizedAnswer = await core.answerTask({
-			taskId: 'task-1',
-			inputId: 'input-1',
-			answerId: 'answer-1',
+			taskId: TASK_ID,
+			inputId: INPUT_ID,
+			answerId: ANSWER_ID,
 			answer: '界'.repeat(11_000),
 		});
 
@@ -410,6 +442,22 @@ suite('TaskToolsCore', () => {
 		assert.equal(oversizedAnswer.status, 'error');
 		assert.equal(facade.persistCalls, 0);
 		assert.equal(facade.answerCalls, 0);
+	});
+
+	test('rejects non-canonical and control-character identifiers', async () => {
+		const facade = new RecordingFacade();
+		const core = new TaskToolsCore(facade);
+		const uppercase = await core.getTask({
+			taskId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'.toUpperCase(),
+		});
+		const controlled = await core.delegateTask({
+			...delegationInput(),
+			peerId: `${PEER_ID}\n`,
+		});
+
+		assert.equal(uppercase.status, 'error');
+		assert.equal(controlled.status, 'error');
+		assert.equal(facade.persistCalls, 0);
 	});
 
 	test('maps stable and unknown failures to safe text without leaking details', async () => {
@@ -431,7 +479,7 @@ suite('TaskToolsCore', () => {
 	test('rejects malformed Facade output instead of forwarding it', async () => {
 		const facade = new RecordingFacade();
 		const workerWithPath = {
-			peerId: 'peer-1',
+			peerId: PEER_ID,
 			deviceName: 'worker',
 			capabilities: [],
 			workspaces: [],
@@ -467,7 +515,7 @@ suite('TaskToolsCore', () => {
 	});
 
 	test('returns no over-budget fallback for zero, one, and exact-boundary budgets', async () => {
-		const result = { status: 'ok', taskId: 'task-1' };
+		const result = { status: 'ok', taskId: TASK_ID };
 		const expected = JSON.stringify(result);
 		const countTokens = async (text: string): Promise<number> => text.length;
 
@@ -483,10 +531,39 @@ suite('TaskToolsCore', () => {
 		assert.equal(await countTokens(boundary), expected.length);
 	});
 
+	test('preserves delegation IDs and retry semantics at a 100-character budget', async () => {
+		const result = {
+			status: 'pending',
+			delegationRequestId: DELEGATION_ID,
+			taskId: TASK_ID,
+			recovered: true,
+			pollTool: MESH_TOOL_NAMES.getTask,
+			cancelTool: MESH_TOOL_NAMES.cancelTask,
+		};
+		const countCharacters = async (text: string): Promise<number> => text.length;
+
+		const serialized = await serializeToolResultToTokenBudget(result, 100, countCharacters);
+		const compact = JSON.parse(serialized) as Record<string, unknown>;
+		const tooSmall = await serializeToolResultToTokenBudget(
+			result,
+			serialized.length - 1,
+			countCharacters,
+		);
+
+		assert.ok(serialized.length <= 100);
+		assert.deepStrictEqual(compact, {
+			s: 0,
+			t: TASK_ID,
+			d: DELEGATION_ID,
+			r: 1,
+		});
+		assert.equal(tooSmall, '');
+	});
+
 	test('preserves the minimal needsInput contract at a 300-character token budget', async () => {
 		const facade = new RecordingFacade();
-		const taskId = 't'.repeat(64);
-		const inputId = 'i'.repeat(64);
+		const taskId = TASK_ID;
+		const inputId = INPUT_ID;
 		facade.taskRead = {
 			snapshot: {
 				taskId,
@@ -584,8 +661,8 @@ suite('Mesh tool manifest contract', () => {
 
 function delegationInput(): DelegationIntentInput {
 	return {
-		peerId: 'peer-1',
-		workspaceId: 'workspace-1',
+		peerId: PEER_ID,
+		workspaceId: WORKSPACE_ID,
 		title: 'Fix scheduler',
 		prompt: 'Implement the scheduler fix exactly as requested.',
 		acceptanceCriteria: ['The focused tests pass.'],
@@ -593,14 +670,18 @@ function delegationInput(): DelegationIntentInput {
 	};
 }
 
+function uuidFromIndex(index: number): string {
+	return `00000000-0000-4000-8000-${index.toString().padStart(12, '0')}`;
+}
+
 class RecordingFacade implements TaskToolFacade {
 	workers: MeshWorkerDirectorySnapshot = {
 		workers: [{
-			peerId: 'peer-1',
+			peerId: PEER_ID,
 			deviceName: 'worker-one',
 			capabilities: ['coding'],
 			workspaces: [{
-				workspaceId: 'workspace-1',
+				workspaceId: WORKSPACE_ID,
 				name: 'app',
 				tags: ['typescript'],
 				busy: false,
@@ -608,15 +689,15 @@ class RecordingFacade implements TaskToolFacade {
 		}],
 	};
 	persisted: PersistedDelegationIntent = {
-		delegationRequestId: 'request-1',
-		taskId: 'task-1',
+		delegationRequestId: DELEGATION_ID,
+		taskId: TASK_ID,
 		recovered: false,
 	};
 	persistence?: Promise<PersistedDelegationIntent>;
 	acceptance: Promise<DelegationAcceptance> = Promise.resolve({ status: 'accepted' });
 	taskRead: TaskToolReadResult = {
 		snapshot: {
-			taskId: 'task-1',
+			taskId: TASK_ID,
 			status: 'running',
 			title: 'Fix scheduler',
 			updatedAt: '2026-08-25T00:00:00.000Z',
@@ -637,6 +718,7 @@ class RecordingFacade implements TaskToolFacade {
 	cancelCalls = 0;
 	answerCalls = 0;
 	cancelStatus: TaskActionReceipt['status'] = 'cancelled';
+	responseTaskId?: string;
 	callOrder: string[] = [];
 	lastAcceptanceSignal?: AbortSignal;
 
@@ -675,7 +757,7 @@ class RecordingFacade implements TaskToolFacade {
 		_signal: AbortSignal,
 	): Promise<TaskActionReceipt> {
 		this.cancelCalls += 1;
-		return { taskId: request.taskId, status: this.cancelStatus };
+		return { taskId: this.responseTaskId ?? request.taskId, status: this.cancelStatus };
 	}
 
 	async answerOwnedTask(
@@ -688,7 +770,7 @@ class RecordingFacade implements TaskToolFacade {
 		_signal: AbortSignal,
 	): Promise<TaskActionReceipt> {
 		this.answerCalls += 1;
-		return { taskId: request.taskId, status: 'running' };
+		return { taskId: this.responseTaskId ?? request.taskId, status: 'running' };
 	}
 }
 

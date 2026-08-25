@@ -1,7 +1,7 @@
 import type { TaskStatus } from './protocol';
 
 export const TASK_TOOL_LIMITS = {
-	idBytes: 128,
+	idBytes: 36,
 	deviceNameBytes: 256,
 	workspaceNameBytes: 256,
 	capabilityBytes: 128,

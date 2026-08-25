@@ -21,8 +21,9 @@ export interface ToolManifestDescriptor {
 
 const idSchema = {
 	type: 'string',
-	minLength: 1,
-	maxLength: 128,
+	minLength: 36,
+	maxLength: 36,
+	pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
 } as const;
 
 export const MESH_TOOL_MANIFEST_DESCRIPTORS: readonly ToolManifestDescriptor[] = [
