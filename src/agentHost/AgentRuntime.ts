@@ -104,6 +104,7 @@ export interface AgentTaskAnswer {
 export type AgentRuntimeEvent =
 	| { readonly type: 'progress'; readonly message: string }
 	| { readonly type: 'output'; readonly text: string }
+	| { readonly type: 'outputTruncated'; readonly message: string }
 	| { readonly type: 'tool'; readonly name: string; readonly status: string; readonly summary?: string }
 	| { readonly type: 'terminal'; readonly summary: string }
 	| { readonly type: 'inputRequired'; readonly request: AgentInputRequest }
@@ -175,39 +176,209 @@ export interface AgentRuntimeProbe {
 	readonly reason?: AgentRuntimeErrorCode;
 }
 
+export type AsyncEventQueuePriority = 'coalescible' | 'droppable' | 'nondroppable';
+
+export interface AsyncEventQueueOptions<T> {
+	readonly maxItems?: number;
+	readonly maxBytes?: number;
+	readonly sizeOf?: (value: T) => number;
+	readonly priority?: (value: T) => AsyncEventQueuePriority;
+	readonly coalesce?: (queued: T, incoming: T) => T | undefined;
+	readonly truncate?: (value: T, maxBytes: number) => T | undefined;
+	readonly pressureEvent?: () => T;
+}
+
+interface QueuedEvent<T> {
+	readonly value: T;
+	readonly bytes: number;
+}
+
+export class AsyncEventQueueCapacityError extends Error {
+	constructor(readonly maxBytes: number) {
+		super(`AsyncEventQueue event exceeds the ${maxBytes}-byte limit.`);
+		this.name = 'AsyncEventQueueCapacityError';
+	}
+}
+
 export class AsyncEventQueue<T> implements AsyncIterable<T> {
-	private readonly values: T[] = [];
+	private readonly values: Array<QueuedEvent<T>> = [];
 	private readonly waiting: Array<(result: IteratorResult<T>) => void> = [];
+	private readonly capacityWaiters: Array<() => void> = [];
+	private readonly maxItems: number;
+	private readonly maxBytes: number;
+	private readonly sizeOf: (value: T) => number;
+	private readonly priority: (value: T) => AsyncEventQueuePriority;
+	private bufferedByteCount = 0;
+	private pendingByteCount = 0;
+	private pendingItemCount = 0;
+	private pressureReported = false;
+	private sealed = false;
 	private closed = false;
 
-	push(value: T): void {
-		if (this.closed) {
-			return;
+	constructor(private readonly options: AsyncEventQueueOptions<T> = {}) {
+		this.maxItems = positiveInteger(options.maxItems ?? 256, 'maxItems');
+		this.maxBytes = positiveInteger(options.maxBytes ?? 1024 * 1024, 'maxBytes');
+		this.sizeOf = options.sizeOf ?? defaultEventSize;
+		this.priority = options.priority ?? (() => 'nondroppable');
+	}
+
+	get bufferedItems(): number {
+		return this.values.length;
+	}
+
+	get bufferedBytes(): number {
+		return this.bufferedByteCount;
+	}
+
+	push(value: T): Promise<boolean> {
+		return this.pushInternal(value, false);
+	}
+
+	async pushAndClose(value: T): Promise<boolean> {
+		if (this.closed || this.sealed) {
+			return false;
 		}
-		const waiter = this.waiting.shift();
-		if (waiter !== undefined) {
-			waiter({ done: false, value });
-		} else {
-			this.values.push(value);
+		this.sealed = true;
+		this.notifyCapacity();
+		await Promise.resolve();
+		try {
+			const accepted = await this.pushInternal(value, true);
+			this.close();
+			return accepted;
+		} catch (error: unknown) {
+			this.close();
+			throw error;
 		}
+	}
+
+	private async pushInternal(value: T, allowSealed: boolean): Promise<boolean> {
+		if (this.ingressClosed(allowSealed)) {
+			return false;
+		}
+		const priority = this.priority(value);
+		const coalesced = priority === 'coalescible' ? this.tryCoalesce(value) : undefined;
+		if (coalesced !== undefined) {
+			return coalesced;
+		}
+
+		let bytes = this.measure(value);
+		let outputTruncated = false;
+		if (bytes > this.maxBytes && this.options.truncate !== undefined) {
+			const truncated = this.options.truncate(value, this.maxBytes);
+			if (truncated !== undefined) {
+				value = truncated;
+				bytes = this.measure(value);
+				outputTruncated = priority === 'droppable';
+			}
+		}
+		if (bytes > this.maxBytes) {
+			if (priority === 'droppable' || priority === 'coalescible') {
+				if (priority === 'droppable') {
+					await this.reportPressure(allowSealed);
+				}
+				return false;
+			}
+			throw new AsyncEventQueueCapacityError(this.maxBytes);
+		}
+
+		if (priority === 'droppable') {
+			if (outputTruncated) {
+				await this.reportPressure(allowSealed);
+			}
+			if (!this.hasCapacity(bytes)) {
+				while (!this.hasCapacity(bytes) && this.removeOldestDiscardable(false) !== undefined) {
+					// Progress is replaceable and can be discarded without losing output.
+				}
+			}
+			if (!this.hasCapacity(bytes)) {
+				await this.reportPressure(allowSealed);
+				if (this.ingressClosed(allowSealed)) {
+					return false;
+				}
+				const availableBytes = this.maxBytes - this.bufferedByteCount;
+				const truncated = this.values.length < this.maxItems && this.options.truncate !== undefined
+					? this.options.truncate(value, availableBytes)
+					: undefined;
+				if (truncated === undefined) {
+					return false;
+				}
+				value = truncated;
+				bytes = this.measure(value);
+				if (!this.hasCapacity(bytes)) {
+					return false;
+				}
+			}
+			this.enqueue(value, bytes);
+			return true;
+		}
+
+		if (priority === 'coalescible') {
+			if (!this.hasCapacity(bytes)) {
+				this.removeOldestDiscardable(false);
+			}
+			if (!this.hasCapacity(bytes)) {
+				return false;
+			}
+			this.enqueue(value, bytes);
+			return true;
+		}
+
+		let discardedOutput = false;
+		while (!this.hasCapacity(bytes)) {
+			const removed = this.removeOldestDiscardable(true);
+			if (removed === undefined) {
+				break;
+			}
+			discardedOutput ||= removed === 'droppable';
+		}
+		if (discardedOutput) {
+			await this.reportPressure(allowSealed);
+		}
+		if (!this.hasCapacity(bytes)) {
+			this.reservePending(bytes);
+			try {
+				while (!this.ingressClosed(allowSealed) && !this.hasCapacity(bytes)) {
+					await this.waitForCapacity();
+				}
+			} finally {
+				this.releasePending(bytes);
+			}
+		}
+		if (this.ingressClosed(allowSealed)) {
+			return false;
+		}
+		this.enqueue(value, bytes);
+		return true;
 	}
 
 	close(): void {
 		if (this.closed) {
 			return;
 		}
+		this.sealed = true;
 		this.closed = true;
 		for (const waiter of this.waiting.splice(0)) {
 			waiter({ done: true, value: undefined });
+		}
+		for (const waiter of this.capacityWaiters.splice(0)) {
+			waiter();
 		}
 	}
 
 	[Symbol.asyncIterator](): AsyncIterator<T> {
 		return {
 			next: async () => {
-				const value = this.values.shift();
-				if (value !== undefined) {
-					return { done: false, value };
+				const queued = this.values.shift();
+				if (queued !== undefined) {
+					this.bufferedByteCount -= queued.bytes;
+					this.notifyCapacity();
+					if (
+						this.values.length <= Math.floor(this.maxItems / 2)
+						&& this.bufferedByteCount <= Math.floor(this.maxBytes / 2)
+					) {
+						this.pressureReported = false;
+					}
+					return { done: false, value: queued.value };
 				}
 				if (this.closed) {
 					return { done: true, value: undefined };
@@ -220,4 +391,215 @@ export class AsyncEventQueue<T> implements AsyncIterable<T> {
 			},
 		};
 	}
+
+	private tryCoalesce(value: T): boolean | undefined {
+		const queued = this.values.at(-1);
+		if (queued === undefined || this.options.coalesce === undefined) {
+			return undefined;
+		}
+		const replacement = this.options.coalesce(queued.value, value);
+		if (replacement === undefined) {
+			return undefined;
+		}
+		const bytes = this.measure(replacement);
+		if (bytes > this.maxBytes || this.bufferedByteCount - queued.bytes + bytes > this.maxBytes) {
+			return undefined;
+		}
+		this.values[this.values.length - 1] = { value: replacement, bytes };
+		this.bufferedByteCount += bytes - queued.bytes;
+		return true;
+	}
+
+	private enqueue(value: T, bytes: number): void {
+		const waiter = this.waiting.shift();
+		if (waiter !== undefined) {
+			waiter({ done: false, value });
+			return;
+		}
+		this.values.push({ value, bytes });
+		this.bufferedByteCount += bytes;
+	}
+
+	private hasCapacity(bytes: number): boolean {
+		return this.values.length < this.maxItems
+			&& this.bufferedByteCount + bytes <= this.maxBytes;
+	}
+
+	private removeOldestDiscardable(includeOutput: boolean): AsyncEventQueuePriority | undefined {
+		const index = this.values.findIndex(({ value }) => {
+			const priority = this.priority(value);
+			return priority === 'coalescible' || (includeOutput && priority === 'droppable');
+		});
+		if (index < 0) {
+			return undefined;
+		}
+		const [removed] = this.values.splice(index, 1);
+		if (removed === undefined) {
+			return undefined;
+		}
+		this.bufferedByteCount -= removed.bytes;
+		this.notifyCapacity();
+		return this.priority(removed.value);
+	}
+
+	private async reportPressure(allowSealed: boolean): Promise<void> {
+		if (
+			this.pressureReported
+			|| this.options.pressureEvent === undefined
+			|| this.ingressClosed(allowSealed)
+		) {
+			return;
+		}
+		this.pressureReported = true;
+		const event = this.options.pressureEvent();
+		const bytes = this.measure(event);
+		if (bytes > this.maxBytes) {
+			throw new AsyncEventQueueCapacityError(this.maxBytes);
+		}
+		while (!this.hasCapacity(bytes)) {
+			if (this.removeOldestDiscardable(true) !== undefined) {
+				continue;
+			}
+			await this.waitForCapacity();
+			if (this.ingressClosed(allowSealed)) {
+				return;
+			}
+		}
+		this.enqueue(event, bytes);
+	}
+
+	private waitForCapacity(): Promise<void> {
+		return new Promise((resolve) => this.capacityWaiters.push(resolve));
+	}
+
+	private notifyCapacity(): void {
+		for (const waiter of this.capacityWaiters.splice(0)) {
+			waiter();
+		}
+	}
+
+	private ingressClosed(allowSealed: boolean): boolean {
+		return this.closed || (this.sealed && !allowSealed);
+	}
+
+	private reservePending(bytes: number): void {
+		if (
+			this.pendingItemCount + 1 > this.maxItems
+			|| this.pendingByteCount + bytes > this.maxBytes
+		) {
+			throw new AsyncEventQueueCapacityError(this.maxBytes);
+		}
+		this.pendingItemCount += 1;
+		this.pendingByteCount += bytes;
+	}
+
+	private releasePending(bytes: number): void {
+		this.pendingItemCount -= 1;
+		this.pendingByteCount -= bytes;
+	}
+
+	private measure(value: T): number {
+		const bytes = this.sizeOf(value);
+		if (!Number.isSafeInteger(bytes) || bytes < 0) {
+			throw new TypeError('AsyncEventQueue sizeOf must return a non-negative safe integer.');
+		}
+		return bytes;
+	}
+}
+
+export function createAgentRuntimeEventQueue(
+	limits: { readonly maxItems?: number; readonly maxBytes?: number } = {},
+): AsyncEventQueue<AgentRuntimeEvent> {
+	return new AsyncEventQueue<AgentRuntimeEvent>({
+		maxItems: limits.maxItems ?? 256,
+		maxBytes: limits.maxBytes ?? 512 * 1024,
+		sizeOf: agentRuntimeEventSize,
+		priority: (event) => event.type === 'progress'
+			? 'coalescible'
+			: event.type === 'output'
+				? 'droppable'
+				: 'nondroppable',
+		coalesce: (queued, incoming) =>
+			queued.type === 'progress' && incoming.type === 'progress' ? incoming : undefined,
+		truncate: truncateRuntimeEvent,
+		pressureEvent: () => ({
+			type: 'outputTruncated',
+			message: 'Agent output was truncated while the consumer was catching up.',
+		}),
+	});
+}
+
+function truncateRuntimeEvent(event: AgentRuntimeEvent, maxBytes: number): AgentRuntimeEvent | undefined {
+	switch (event.type) {
+		case 'output':
+			return fitRuntimeText(event.text, maxBytes, (text) => ({ type: 'output', text }));
+		case 'progress':
+			return fitRuntimeText(event.message, maxBytes, (message) => ({ type: 'progress', message }));
+		case 'outputTruncated':
+			return fitRuntimeText(event.message, maxBytes, (message) => ({ type: 'outputTruncated', message }));
+		case 'terminal':
+			return fitRuntimeText(event.summary, maxBytes, (summary) => ({ type: 'terminal', summary }));
+		case 'failed':
+			return fitRuntimeText(event.error.message, maxBytes, (message) => ({
+				type: 'failed',
+				error: new AgentRuntimeError(
+					event.error.code,
+					message,
+					event.error.retryable,
+					undefined,
+					event.error.cleanupFailed,
+				),
+			}));
+		default:
+			return undefined;
+	}
+}
+
+function fitRuntimeText(
+	text: string,
+	maxBytes: number,
+	create: (text: string) => AgentRuntimeEvent,
+): AgentRuntimeEvent | undefined {
+	let low = 0;
+	let high = text.length;
+	let best: AgentRuntimeEvent | undefined;
+	while (low <= high) {
+		const middle = Math.floor((low + high) / 2);
+		const candidate = create(text.slice(0, middle));
+		if (agentRuntimeEventSize(candidate) <= maxBytes) {
+			best = candidate;
+			low = middle + 1;
+		} else {
+			high = middle - 1;
+		}
+	}
+	return best;
+}
+
+function agentRuntimeEventSize(event: AgentRuntimeEvent): number {
+	if (event.type === 'failed') {
+		return defaultEventSize({
+			type: event.type,
+			error: {
+				name: event.error.name,
+				code: event.error.code,
+				message: event.error.message,
+				retryable: event.error.retryable,
+				cleanupFailed: event.error.cleanupFailed,
+			},
+		});
+	}
+	return defaultEventSize(event);
+}
+
+function defaultEventSize(value: unknown): number {
+	const serialized = JSON.stringify(value);
+	return Buffer.byteLength(serialized === undefined ? String(value) : serialized, 'utf8');
+}
+
+function positiveInteger(value: number, name: string): number {
+	if (!Number.isSafeInteger(value) || value <= 0) {
+		throw new TypeError(`AsyncEventQueue ${name} must be a positive safe integer.`);
+	}
+	return value;
 }

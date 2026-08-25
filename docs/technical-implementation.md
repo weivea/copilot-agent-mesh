@@ -389,13 +389,14 @@ connection.draining
 | 单条 output event | 16 KiB |
 | Terminal summary | 16 KiB |
 | Error message | 2 KiB |
-| 每 Peer 待发送队列 | 256 KiB 或 128 events |
+| 每 Peer 普通待发送队列 | 256 KiB 或 128 events |
+| 每 Peer 总待发送量 | 1 MiB Critical Frame + 256 KiB 普通流量，最多 144 events |
 
 认证前使用更严格限制：单 Frame 64 KiB、全局最多 16 个未认证 Socket、每个来源提示最多 4 个 Socket、30 秒 Handshake Deadline、每 Socket 10 秒最多 8 条消息。来源 IP 只用于 Best-effort 限流，不能作为身份。
 
 认证后每 Peer 最多 2 个连接，RPC Token Bucket 默认每分钟 60 次、Burst 20。`task.start` 另受 Workspace Lease 和 Peer 并发限制。
 
-每任务最多发送 10 个非终态 Output Event/秒。Outbox 按**序列化后的 UTF-8 Byte**计数，分 Terminal/Control/Progress/Output 优先级，并同时检查 `ws.bufferedAmount`；Socket + Queue 总待发送量达到 256 KiB 时停止普通 Output。队列压力下合并 Progress、丢弃非终态 Output，并发出一次 `truncated: true`；永不丢弃 Terminal Snapshot。若终态消息 5 秒仍无法发送，以 `1013` 关闭，等待重连后 `task.get` 恢复。
+每任务最多发送 10 个非终态 Output Event/秒。Outbox 按**序列化后的 UTF-8 Byte**计数，分 Terminal/Control/Progress/Output 优先级，并同时检查 `ws.bufferedAmount`。普通 Progress/Output 使用 256 KiB / 128 events 水位；压力下按 Task 合并 Progress，将非终态 Output 替换为每次压力周期一次的 `truncated: true` 通知，后续 Output 明确 Backpressure。Critical/Response 保留容量，允许一个不超过 1 MiB 的合法 Snapshot Frame；Socket + Queue 总量始终限制在 1 MiB + 256 KiB 和 144 events，超过 1 MiB 的单 Frame 以 `1009` 拒绝。Terminal Snapshot 永不因普通流量被丢弃；Critical 容量仍不可用时以 `1013` 关闭，等待重连后 `task.get` 恢复。
 
 ### 7.7 Heartbeat 和重连
 

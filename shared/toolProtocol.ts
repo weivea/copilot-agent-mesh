@@ -81,6 +81,11 @@ export interface MeshWorkerDirectorySnapshot {
 }
 
 export interface DelegationIntentInput {
+	/**
+	 * Optional invocation identity. Reuse it only when retrying the exact same
+	 * payload; omitting it always creates a fresh delegation.
+	 */
+	readonly delegationRequestId?: string;
 	readonly peerId: string;
 	readonly workspaceId: string;
 	readonly title: string;

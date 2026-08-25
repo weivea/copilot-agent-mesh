@@ -384,6 +384,153 @@ suite('DevTunnelCliProvider', () => {
 		await provider.stop();
 	});
 
+	test('schedules ready-state renewal with a safe lead without looping a 24-hour lease', async () => {
+		const clock = new FakeClock(now);
+		const runner = new FakeRunner();
+		runner.accessExpiration = '2026-08-26T01:00:00.000Z';
+		const provider = createProvider(runner, new MemoryStore(), { clock });
+
+		await provider.ensureHosted({ ...request, accessDuration: '1d' });
+
+		assert.equal(runner.commands.filter(
+			(args) => args.slice(0, 2).join(' ') === 'access create',
+		).length, 1);
+		assert.equal(clock.pendingCount, 1);
+		assert.equal(
+			clock.nextDelayMs,
+			21.6 * 60 * 60 * 1_000,
+		);
+		await provider.stop();
+	});
+
+	test('publishes scheduled renewal metadata and reschedules from the new expiration', async () => {
+		const clock = new FakeClock(now);
+		const runner = new FakeRunner();
+		const store = new MemoryStore();
+		const provider = createProvider(runner, store, { clock });
+		await provider.ensureHosted(request);
+		runner.accessExpiration = '2026-09-08T01:00:00.000Z';
+		let changes = 0;
+		const subscription = provider.onDidChange(() => {
+			changes += 1;
+		});
+
+		await clock.advance(6 * 24 * 60 * 60 * 1_000);
+
+		const status = provider.getStatus();
+		assert.equal(status.state, 'ready');
+		if (status.state === 'ready') {
+			assert.equal(status.tunnel.accessExpiresAt, runner.accessExpiration);
+		}
+		assert.equal(store.value?.accessExpiresAt, runner.accessExpiration);
+		assert.ok(changes >= 1);
+		assert.equal(clock.nextDelayMs, 7 * 24 * 60 * 60 * 1_000);
+		subscription.dispose();
+		await provider.stop();
+	});
+
+	test('isolates status listener failures from tunnel lifecycle mutations', async () => {
+		const reported: unknown[] = [];
+		const runner = new FakeRunner();
+		const provider = createProvider(runner, new MemoryStore(), {
+			reportStatusListenerError: (error) => reported.push(error),
+		});
+		provider.onDidChange(() => {
+			throw new Error('listener failed');
+		});
+
+		await provider.ensureHosted(request);
+		assert.equal(provider.getStatus().state, 'ready');
+		await provider.stop();
+		assert.equal(provider.getStatus().state, 'stopped');
+		assert.ok(reported.length >= 2);
+	});
+
+	test('cancels ready-state renewal when the lifecycle stops', async () => {
+		const clock = new FakeClock(now);
+		const runner = new FakeRunner();
+		const provider = createProvider(runner, new MemoryStore(), { clock });
+		await provider.ensureHosted(request);
+
+		await provider.stop();
+		await clock.advance(7 * 24 * 60 * 60 * 1_000);
+
+		assert.equal(clock.pendingCount, 0);
+		assert.equal(runner.commands.some(
+			(args) => args.slice(0, 2).join(' ') === 'access delete',
+		), false);
+		assert.equal(provider.getStatus().state, 'stopped');
+	});
+
+	test('stop waits for destructive renewal to restore access before shutdown', async () => {
+		const runner = new FakeRunner();
+		const store = new MemoryStore();
+		const provider = createProvider(runner, store);
+		await provider.ensureHosted(request);
+		runner.pauseAccessCreate = true;
+		runner.accessExpiration = '2026-09-08T01:00:00.000Z';
+
+		const renewal = provider.renewAccess();
+		await runner.waitForAccessCreate();
+		let stopped = false;
+		const stopping = provider.stop().then(() => {
+			stopped = true;
+		});
+		await settleMicrotasks();
+		assert.equal(stopped, false);
+
+		runner.continueAccessCreate();
+		await Promise.all([renewal, stopping]);
+
+		assert.equal((await store.load())?.accessExpiresAt, runner.accessExpiration);
+		assert.equal(provider.getStatus().state, 'stopped');
+		assert.equal(runner.hosts[0].stopCount, 1);
+	});
+
+	test('serializes a scheduled renewal with a manual renewal', async () => {
+		const clock = new FakeClock(now);
+		const runner = new FakeRunner();
+		const provider = createProvider(runner, new MemoryStore(), { clock });
+		await provider.ensureHosted(request);
+		runner.accessExpiration = '2026-09-08T01:00:00.000Z';
+		const accessListsBeforeRenewal = runner.commands.filter(
+			(args) => args.slice(0, 2).join(' ') === 'access list',
+		).length;
+
+		clock.fireNext();
+		await provider.renewAccess();
+		await settleMicrotasks();
+
+		assert.equal(
+			runner.commands.filter((args) => args.slice(0, 2).join(' ') === 'access list').length
+				- accessListsBeforeRenewal,
+			1,
+		);
+		assert.equal(
+			runner.commands.filter((args) => args.slice(0, 2).join(' ') === 'access delete').length,
+			1,
+		);
+		await provider.stop();
+	});
+
+	test('retries transient scheduled renewal failures only until ACE expiry', async () => {
+		const clock = new FakeClock(now);
+		const runner = new FakeRunner();
+		const provider = createProvider(runner, new MemoryStore(), { clock });
+		await provider.ensureHosted(request);
+		runner.accessListTimeout = true;
+
+		await clock.advance(7 * 24 * 60 * 60 * 1_000);
+
+		const status = provider.getStatus();
+		assert.equal(status.state, 'circuit-open');
+		if (status.state === 'circuit-open') {
+			assert.equal(status.code, 'TUNNEL_ACCESS_EXPIRED');
+		}
+		assert.equal(runner.hosts[0].stopCount, 1);
+		assert.equal(clock.pendingCount, 0);
+	});
+
 	test('blocks renewal delete when the executable hash changes', async () => {
 		const runner = new FakeRunner();
 		let verifications = 0;
@@ -401,7 +548,11 @@ suite('DevTunnelCliProvider', () => {
 		);
 
 		assert.equal(runner.commands.some((args) => args.slice(0, 2).join(' ') === 'access delete'), false);
-		assert.equal(provider.getStatus().state, 'circuit-open');
+		const status = provider.getStatus();
+		assert.equal(status.state, 'circuit-open');
+		if (status.state === 'circuit-open') {
+			assert.equal(status.code, 'TUNNEL_ACCESS_EXPIRED');
+		}
 	});
 
 	test('blocks renewal delete when the exact executable version changes', async () => {
@@ -416,7 +567,11 @@ suite('DevTunnelCliProvider', () => {
 		);
 
 		assert.equal(runner.commands.some((args) => args.slice(0, 2).join(' ') === 'access delete'), false);
-		assert.equal(provider.getStatus().state, 'circuit-open');
+		const status = provider.getStatus();
+		assert.equal(status.state, 'circuit-open');
+		if (status.state === 'circuit-open') {
+			assert.equal(status.code, 'TUNNEL_ACCESS_EXPIRED');
+		}
 	});
 
 	test('serializes concurrent access renewals', async () => {
@@ -783,6 +938,37 @@ suite('DevTunnelCliProvider', () => {
 		await provider.stop();
 	});
 
+	test('stop waits for restart-path destructive renewal to restore access', async () => {
+		const runner = new FakeRunner();
+		const store = new MemoryStore();
+		const provider = createProvider(runner, store, {
+			random: () => 0,
+			restartBaseDelayMs: 1,
+		});
+		await provider.ensureHosted(request);
+		const expiringSoon = '2026-08-25T02:00:00.000Z';
+		assert.ok(store.value);
+		store.value = { ...store.value, accessExpiresAt: expiringSoon };
+		runner.listedAccessExpiration = expiringSoon;
+		runner.accessExpiration = '2026-09-01T02:00:00.000Z';
+		runner.pauseAccessCreate = true;
+
+		runner.hosts[0].finish({ exitCode: 1, signal: null });
+		await runner.waitForAccessCreate();
+		let stopped = false;
+		const stopping = provider.stop().then(() => {
+			stopped = true;
+		});
+		await settleMicrotasks();
+		assert.equal(stopped, false);
+
+		runner.continueAccessCreate();
+		await stopping;
+
+		assert.equal(store.value?.accessExpiresAt, runner.accessExpiration);
+		assert.equal(provider.getStatus().state, 'stopped');
+	});
+
 	test('cancels readiness when the owned host exits before WSS succeeds', async () => {
 		let reachProbe: (() => void) | undefined;
 		const probeReached = new Promise<void>((resolve) => {
@@ -855,6 +1041,7 @@ class FakeRunner {
 	extraPort = false;
 	hasPort = true;
 	invalidShow = false;
+	pauseAccessCreate = false;
 	pauseCreate = false;
 	pauseHostStart = false;
 	pausePortCreate = false;
@@ -870,6 +1057,11 @@ class FakeRunner {
 	private portCreateReached: (() => void) | undefined;
 	private readonly portCreateReachedPromise = new Promise<void>((resolve) => {
 		this.portCreateReached = resolve;
+	});
+	private accessCreateContinuation: (() => void) | undefined;
+	private accessCreateReached: (() => void) | undefined;
+	private readonly accessCreateReachedPromise = new Promise<void>((resolve) => {
+		this.accessCreateReached = resolve;
 	});
 	private hostStartContinuation: ((failStop: boolean) => void) | undefined;
 	private hostStartReached: (() => void) | undefined;
@@ -950,6 +1142,10 @@ class FakeRunner {
 			return result(JSON.stringify({ accessControlEntries: entries }));
 		}
 		if (command === 'access create') {
+			if (this.pauseAccessCreate) {
+				this.accessCreateReached?.();
+				await this.waitForAccessCreateContinuation(options?.signal);
+			}
 			if (this.failAccessCreate) {
 				throw new Error('Injected access create failure.');
 			}
@@ -1009,6 +1205,14 @@ class FakeRunner {
 		this.createContinuation?.();
 	}
 
+	waitForAccessCreate(): Promise<void> {
+		return this.accessCreateReachedPromise;
+	}
+
+	continueAccessCreate(): void {
+		this.accessCreateContinuation?.();
+	}
+
 	waitForHostStart(): Promise<void> {
 		return this.hostStartReachedPromise;
 	}
@@ -1027,6 +1231,26 @@ class FakeRunner {
 				));
 			};
 			this.createContinuation = () => {
+				signal?.removeEventListener('abort', abort);
+				resolve();
+			};
+			signal?.addEventListener('abort', abort, { once: true });
+			if (signal?.aborted === true) {
+				abort();
+			}
+		});
+	}
+
+	private waitForAccessCreateContinuation(signal?: AbortSignal): Promise<void> {
+		return new Promise((resolve, reject) => {
+			const abort = (): void => {
+				signal?.removeEventListener('abort', abort);
+				reject(new ChildProcessExecutionError(
+					'PROCESS_ABORTED',
+					'Injected access create abort.',
+				));
+			};
+			this.accessCreateContinuation = () => {
 				signal?.removeEventListener('abort', abort);
 				resolve();
 			};
@@ -1102,7 +1326,9 @@ function createProvider(
 	store: MemoryStore,
 	overrides: {
 		readonly binaryVerifier?: () => Promise<boolean>;
+		readonly clock?: FakeClock;
 		readonly random?: () => number;
+		readonly reportStatusListenerError?: (error: unknown) => void;
 		readonly restartBaseDelayMs?: number;
 		readonly wssProbe?: DevTunnelCliProviderOptions['wssProbe'];
 	} = {},
@@ -1114,17 +1340,91 @@ function createProvider(
 		executable: 'devtunnel',
 		healthProbe: async () => undefined,
 		localHealthProbe: async () => undefined,
-		now: () => now,
+		now: overrides.clock?.now ?? (() => now),
 		platform: 'darwin',
 		random: overrides.random,
+		reportStatusListenerError: overrides.reportStatusListenerError,
 		resolveExecutable: async () => '/verified/devtunnel',
 		restartBaseDelayMs: overrides.restartBaseDelayMs,
 		restartMaxDelayMs: 100,
+		clearTimer: overrides.clock?.clearTimer,
+		setTimer: overrides.clock?.setTimer,
 		showPollIntervalMs: 1,
 		showTimeoutMs: 100,
 		stateStore: store,
 		wssProbe: overrides.wssProbe ?? (async () => undefined),
 	});
+}
+
+class FakeClock {
+	private currentMs: number;
+	private nextId = 1;
+	private readonly timers = new Map<number, {
+		readonly callback: () => void;
+		readonly dueAt: number;
+	}>();
+
+	constructor(start: Date) {
+		this.currentMs = start.valueOf();
+	}
+
+	readonly now = (): Date => new Date(this.currentMs);
+
+	readonly setTimer = (
+		callback: () => void,
+		delayMs: number,
+	): ReturnType<typeof setTimeout> => {
+		const id = this.nextId++;
+		this.timers.set(id, { callback, dueAt: this.currentMs + delayMs });
+		return id as unknown as ReturnType<typeof setTimeout>;
+	};
+
+	readonly clearTimer = (timer: ReturnType<typeof setTimeout>): void => {
+		this.timers.delete(timer as unknown as number);
+	};
+
+	get pendingCount(): number {
+		return this.timers.size;
+	}
+
+	get nextDelayMs(): number | undefined {
+		const timer = this.nextTimer();
+		return timer === undefined ? undefined : timer.dueAt - this.currentMs;
+	}
+
+	fireNext(): void {
+		const timer = this.nextTimer();
+		assert.ok(timer);
+		this.currentMs = timer.dueAt;
+		this.timers.delete(timer.id);
+		timer.callback();
+	}
+
+	async advance(milliseconds: number): Promise<void> {
+		const target = this.currentMs + milliseconds;
+		for (;;) {
+			const timer = this.nextTimer();
+			if (timer === undefined || timer.dueAt > target) {
+				break;
+			}
+			this.currentMs = timer.dueAt;
+			this.timers.delete(timer.id);
+			timer.callback();
+			await settleMicrotasks();
+		}
+		this.currentMs = target;
+		await settleMicrotasks();
+	}
+
+	private nextTimer(): {
+		readonly callback: () => void;
+		readonly dueAt: number;
+		readonly id: number;
+	} | undefined {
+		return [...this.timers.entries()]
+			.map(([id, timer]) => ({ id, ...timer }))
+			.sort((left, right) => left.dueAt - right.dueAt || left.id - right.id)[0];
+	}
 }
 
 function createMetadata(overrides: Partial<TunnelMetadata> = {}): TunnelMetadata {
@@ -1204,4 +1504,10 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 
 function delay(milliseconds: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function settleMicrotasks(): Promise<void> {
+	for (let index = 0; index < 20; index += 1) {
+		await Promise.resolve();
+	}
 }

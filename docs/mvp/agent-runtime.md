@@ -26,6 +26,15 @@ The first-task safety decision is an injected `FirstTaskConfirmation`. The VS Co
 6. Wait for `session/ready` and `defaultChat`, subscribe to the Chat, then dispatch only the supplied prompt plus acceptance criteria.
 7. Map bounded Chat output/reasoning, tool lifecycle and confirmation, elicited input, MCP authentication, Terminal summaries, and authoritative completion/cancellation/error actions to Mesh-neutral events.
 
+Mapped events enter a queue bounded by both serialized UTF-8 bytes and event
+count. Progress coalesces to its latest queued value. Nonterminal output is
+truncated or dropped under pressure and produces at most one
+`outputTruncated` event until the queue falls below its low-water mark. Tool,
+input, terminal, completed, failed, and cancelled events are nondroppable and
+backpressure their producer. Subscription pumps await admission, while the
+consumer remains serial so each retained event finishes task-store persistence
+and fsync before the next event is consumed.
+
 Connection recovery retains only `clientId`, Session/Chat URIs, subscriptions, and `lastSeenServerSeq`. It attempts AHP replay/snapshot recovery, re-lists Sessions, and rechecks authentication. Outbound Turn, input, and cancellation actions use persistent `clientSeq` values; actions without an accepted matching `origin` acknowledgement are resent with the same sequence after candidate takeover. Snapshot recovery reconciles accumulated response parts by stable IDs and stream ordinals, emits only undelivered content before authoritative completion, and preserves repeated id-less parts. Writes remain blocked during takeover, and Terminal subscriptions and authentication work are isolated by explicit connection generations. Recovery invalidates and aborts the old generation before shutdown; task disposal aborts and awaits recovery plus Terminal subscription work, then records successful subscription, Session, connection, and Host cleanup phases so a retry repeats only failed work. Missing Hosts or Sessions map to `TASK_RECOVERY_UNAVAILABLE`; authentication failures retain `AGENT_AUTH_REQUIRED` or `AGENT_AUTH_FAILED`. Endpoint tokens are never included in recovery descriptors, events, errors, or logs.
 
 Required Session configuration is rendered from the provider schema. Boolean values use explicit choices, strings remain strings, and numbers, arrays, and objects are parsed and recursively validated as JSON. Invalid, read-only, or unsupported properties fail with `AGENT_CONFIG_REQUIRED` instead of sending a coerced value to the provider.

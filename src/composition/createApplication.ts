@@ -243,6 +243,8 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		const tunnelPath = configuration.get<string>('devTunnelPath', '').trim();
 		const tunnel = new DevTunnelCliProvider({
 			executable: tunnelPath || undefined,
+			reportStatusListenerError: (error) =>
+				logger.error('listener', 'A Dev Tunnel status listener failed.', error),
 			stateStore: new VscodeDevTunnelStateStore(state),
 		});
 		const configuredPort = (): number | undefined => {

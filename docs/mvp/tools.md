@@ -75,13 +75,20 @@ remote cancellation method. Once `persistDelegationIntent` resolves, the result
 retains `delegationRequestId` and `taskId` so the durable task can be polled or
 explicitly cancelled.
 
+`mesh_delegate_task` accepts an optional `delegationRequestId`. Omit it for a
+new user invocation; the Tool generates and returns a fresh ID. Reuse that ID
+only for an automatic retry of the exact same payload. An explicit exact retry
+recovers the same task whether acknowledgement was lost or the task is still
+in flight, while a fresh invocation creates a new task even when a terminal
+historical intent has identical semantics.
+
 The delegate's 15-second budget covers both durable intent persistence and the
 worker acceptance wait. Persistence itself is deliberately not given an abort
 signal: if the caller budget or cancellation wins first, the durable promise
 continues in the background and the Tool returns `pending`,
 `reconciliationPending: true`, and `retrySameIntent: true`. Retrying the exact
-intent lets the Facade recover the IDs after persistence completes instead of
-creating another task.
+intent with the returned `delegationRequestId` lets the Facade recover the IDs
+after persistence completes instead of creating another task.
 
 ## Facade integration
 
@@ -112,7 +119,9 @@ interface TaskToolFacade {
 ```
 
 The persistence method must durably allocate both IDs before resolving and must
-recover the same IDs for an exact retry. Aborting the acceptance signal stops
+recover the same IDs for an exact retry carrying the same `delegationRequestId`.
+Historical semantic hashes are retained for audit and conflict detection, not
+used as a global deduplication key. Aborting the acceptance signal stops
 only that acknowledgement wait. Ownership is taken from the Facade's
 authenticated coordinator context, never from tool input.
 

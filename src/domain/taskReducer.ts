@@ -13,6 +13,7 @@ export type TaskDomainEvent =
 	| { readonly type: 'agentStarted'; readonly at: string; readonly recoveryDescriptor?: RecoveryDescriptor }
 	| { readonly type: 'progress'; readonly at: string; readonly summary: string }
 	| { readonly type: 'output'; readonly at: string; readonly summary: string }
+	| { readonly type: 'outputTruncated'; readonly at: string; readonly summary: string }
 	| { readonly type: 'tool'; readonly at: string; readonly summary: string }
 	| { readonly type: 'terminal'; readonly at: string; readonly summary: string }
 	| { readonly type: 'inputRequired'; readonly at: string; readonly inputId: string; readonly prompt: string }
@@ -52,6 +53,7 @@ export function taskReducer(record: TaskRecord, event: TaskDomainEvent): TaskRec
 			);
 		case 'progress':
 		case 'output':
+		case 'outputTruncated':
 		case 'tool':
 		case 'terminal':
 			return transition(

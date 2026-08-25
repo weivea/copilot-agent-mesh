@@ -8,9 +8,20 @@ import { PairingProtocolError } from './PairingCrypto';
 import { PairingService } from './PairingService';
 import { MeshDomainError } from '../domain/errors';
 import { AgentRuntimeError } from '../agentHost/AgentRuntime';
-import { MESH_ERROR_CODES, type MeshErrorReason } from '../../shared/protocol';
+import {
+	GATEWAY_NOTIFICATIONS,
+	MESH_ERROR_CODES,
+	PROTOCOL_LIMITS,
+	type MeshErrorReason,
+} from '../../shared/protocol';
 
 const textDecoder = new TextDecoder('utf-8', { fatal: true });
+const ORDINARY_OUTBOX_MAX_BYTES = 256 * 1024;
+const ORDINARY_OUTBOX_MAX_EVENTS = 128;
+const PRESSURE_MARKER_MAX_EVENTS = 16;
+const TOTAL_OUTBOX_MAX_BYTES = PROTOCOL_LIMITS.frameBytes + ORDINARY_OUTBOX_MAX_BYTES;
+const TOTAL_OUTBOX_MAX_EVENTS = ORDINARY_OUTBOX_MAX_EVENTS + PRESSURE_MARKER_MAX_EVENTS;
+const OUTPUT_PRESSURE_MARKER = 'Output truncated due to outbound backpressure.';
 
 export interface RpcPeerOptions {
 	readonly preAuthMaxBytes?: number;
@@ -32,9 +43,20 @@ interface RpcRequest {
 }
 
 interface QueuedMessage {
-	readonly data: Buffer;
+	data: Buffer;
+	readonly kind: 'critical' | 'progress' | 'output' | 'output-marker';
+	readonly taskId?: string;
+	readonly waiters: SendWaiter[];
+}
+
+interface SendWaiter {
 	resolve(): void;
 	reject(error: Error): void;
+}
+
+interface OrdinaryNotification {
+	readonly kind: 'progress' | 'output';
+	readonly taskId: string;
 }
 
 export class RpcPeer {
@@ -48,13 +70,17 @@ export class RpcPeer {
 	private readonly outboxMaxEvents: number;
 	private readonly now: () => number;
 	private readonly queue: QueuedMessage[] = [];
+	private readonly outputPressureMarkers = new Map<string, QueuedMessage>();
+	private readonly outputPressureEpisodes = new Set<string>();
 	private readonly messageTimes: number[] = [];
 	private handshakeTimer: NodeJS.Timeout | undefined;
 	private heartbeatTimer: NodeJS.Timeout | undefined;
 	private authenticatedPeerId: string | undefined;
 	private lastPongAt: number;
-	private outboxBytes = 0;
+	private queueBytes = 0;
 	private outboxEvents = 0;
+	private ordinaryQueueBytes = 0;
+	private ordinaryOutboxEvents = 0;
 	private authenticationFailures = 0;
 	private sending = false;
 	private disposed = false;
@@ -72,8 +98,14 @@ export class RpcPeer {
 		this.preAuthRateWindowMs = options.preAuthRateWindowMs ?? 10_000;
 		this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 10_000;
 		this.heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? 30_000;
-		this.outboxMaxBytes = options.outboxMaxBytes ?? 256 * 1024;
-		this.outboxMaxEvents = options.outboxMaxEvents ?? 128;
+		this.outboxMaxBytes = Math.min(
+			options.outboxMaxBytes ?? ORDINARY_OUTBOX_MAX_BYTES,
+			ORDINARY_OUTBOX_MAX_BYTES,
+		);
+		this.outboxMaxEvents = Math.min(
+			options.outboxMaxEvents ?? ORDINARY_OUTBOX_MAX_EVENTS,
+			ORDINARY_OUTBOX_MAX_EVENTS,
+		);
 		this.now = options.now ?? Date.now;
 		this.lastPongAt = this.now();
 		this.pairing.registerConnection(this.connectionId);
@@ -127,7 +159,7 @@ export class RpcPeer {
 		}
 		this.pairing.disposeConnection(this.connectionId);
 		for (const message of this.queue.splice(0)) {
-			message.reject(new Error('Connection is closed.'));
+			rejectWaiters(message, new Error('Connection is closed.'));
 		}
 		this.onDisposed();
 	}
@@ -341,17 +373,129 @@ export class RpcPeer {
 			return Promise.reject(new Error('Connection is closed.'));
 		}
 		const data = Buffer.from(JSON.stringify(value), 'utf8');
-		if (this.outboxEvents + 1 > this.outboxMaxEvents
-			|| this.outboxBytes + this.socket.bufferedAmount + data.byteLength > this.outboxMaxBytes) {
-			this.close(1013, 'Outbound queue capacity exceeded.');
-			return Promise.reject(new Error('Outbound queue capacity exceeded.'));
+		if (data.byteLength > PROTOCOL_LIMITS.frameBytes) {
+			this.close(1009, 'Outbound frame exceeds protocol limit.');
+			return Promise.reject(new Error('Outbound frame exceeds protocol limit.'));
 		}
-		this.outboxBytes += data.byteLength;
-		this.outboxEvents += 1;
+
 		return new Promise<void>((resolve, reject) => {
-			this.queue.push({ data, resolve, reject });
-			this.flush();
+			const waiter = { resolve, reject };
+			this.maybeResetOutputPressureEpisodes();
+			const ordinary = ordinaryNotification(value);
+			if (ordinary?.kind === 'progress') {
+				const queued = this.queue.find((message) => (
+					message.kind === 'progress' && message.taskId === ordinary.taskId
+				));
+				if (queued !== undefined) {
+					if (this.canReplaceOrdinary(queued, data)) {
+						this.queueBytes += data.byteLength - queued.data.byteLength;
+						this.ordinaryQueueBytes += data.byteLength - queued.data.byteLength;
+						queued.data = data;
+						queued.waiters.push(waiter);
+					} else {
+						reject(new Error('Outbound progress backpressure exceeded.'));
+					}
+					return;
+				}
+			}
+			if (ordinary !== undefined && !this.canAdmitOrdinary(data.byteLength)) {
+				if (ordinary.kind === 'output') {
+					this.enqueueOutputPressureMarker(value, ordinary.taskId, waiter);
+				} else {
+					reject(new Error('Outbound progress backpressure exceeded.'));
+				}
+				return;
+			}
+			if (ordinary === undefined && !this.canAdmitTotal(data.byteLength)) {
+				this.close(1013, 'Outbound queue capacity exceeded.');
+				reject(new Error('Outbound queue capacity exceeded.'));
+				return;
+			}
+			this.enqueue({
+				data,
+				kind: ordinary?.kind ?? 'critical',
+				taskId: ordinary?.taskId,
+				waiters: [waiter],
+			});
 		});
+	}
+
+	private canReplaceOrdinary(message: QueuedMessage, data: Buffer): boolean {
+		const byteDelta = data.byteLength - message.data.byteLength;
+		return this.queueBytes + this.socket.bufferedAmount + byteDelta <= TOTAL_OUTBOX_MAX_BYTES
+			&& this.ordinaryQueueBytes + this.socket.bufferedAmount + byteDelta
+				<= this.outboxMaxBytes;
+	}
+
+	private canAdmitOrdinary(bytes: number): boolean {
+		return this.ordinaryOutboxEvents + 1 <= this.outboxMaxEvents
+			&& this.canAdmitTotal(bytes)
+			&& this.ordinaryQueueBytes + this.socket.bufferedAmount + bytes
+				<= this.outboxMaxBytes;
+	}
+
+	private canAdmitTotal(bytes: number): boolean {
+		return this.outboxEvents + 1 <= TOTAL_OUTBOX_MAX_EVENTS
+			&& this.queueBytes + this.socket.bufferedAmount + bytes <= TOTAL_OUTBOX_MAX_BYTES;
+	}
+
+	private maybeResetOutputPressureEpisodes(): void {
+		if (
+			this.queueBytes + this.socket.bufferedAmount <= Math.floor(TOTAL_OUTBOX_MAX_BYTES / 2)
+			&& this.ordinaryQueueBytes + this.socket.bufferedAmount
+				<= Math.floor(this.outboxMaxBytes / 2)
+			&& this.outboxEvents <= Math.floor(TOTAL_OUTBOX_MAX_EVENTS / 2)
+		) {
+			this.outputPressureEpisodes.clear();
+		}
+	}
+
+	private enqueueOutputPressureMarker(
+		value: unknown,
+		taskId: string,
+		waiter: SendWaiter,
+	): void {
+		const existing = this.outputPressureMarkers.get(taskId);
+		if (existing !== undefined) {
+			existing.waiters.push(waiter);
+			return;
+		}
+		if (this.outputPressureEpisodes.has(taskId)) {
+			waiter.reject(new Error('Outbound output backpressure exceeded.'));
+			return;
+		}
+		if (
+			this.outputPressureMarkers.size >= PRESSURE_MARKER_MAX_EVENTS
+			|| this.outputPressureEpisodes.size >= PRESSURE_MARKER_MAX_EVENTS
+		) {
+			waiter.reject(new Error('Outbound output backpressure exceeded.'));
+			return;
+		}
+		const data = Buffer.from(JSON.stringify(outputPressureMarker(value)), 'utf8');
+		if (!this.canAdmitTotal(data.byteLength)) {
+			waiter.reject(new Error('Outbound output backpressure exceeded.'));
+			return;
+		}
+		const message: QueuedMessage = {
+			data,
+			kind: 'output-marker',
+			taskId,
+			waiters: [waiter],
+		};
+		this.outputPressureEpisodes.add(taskId);
+		this.outputPressureMarkers.set(taskId, message);
+		this.enqueue(message);
+	}
+
+	private enqueue(message: QueuedMessage): void {
+		this.queueBytes += message.data.byteLength;
+		this.outboxEvents += 1;
+		if (message.kind === 'progress' || message.kind === 'output') {
+			this.ordinaryQueueBytes += message.data.byteLength;
+			this.ordinaryOutboxEvents += 1;
+		}
+		this.queue.push(message);
+		this.flush();
 	}
 
 	private flush(): void {
@@ -362,18 +506,80 @@ export class RpcPeer {
 		if (message === undefined) {
 			return;
 		}
+		this.queueBytes -= message.data.byteLength;
+		if (message.kind === 'progress' || message.kind === 'output') {
+			this.ordinaryQueueBytes -= message.data.byteLength;
+		}
 		this.sending = true;
 		this.socket.send(message.data, { binary: false, compress: false }, (error) => {
 			this.sending = false;
-			this.outboxBytes -= message.data.byteLength;
 			this.outboxEvents -= 1;
-			if (error === undefined || error === null) {
-				message.resolve();
-			} else {
-				message.reject(new Error('WebSocket send failed.'));
+			if (message.kind === 'progress' || message.kind === 'output') {
+				this.ordinaryOutboxEvents -= 1;
 			}
+			if (
+				message.kind === 'output-marker'
+				&& message.taskId !== undefined
+				&& this.outputPressureMarkers.get(message.taskId) === message
+			) {
+				this.outputPressureMarkers.delete(message.taskId);
+			}
+			if (error === undefined || error === null) {
+				resolveWaiters(message);
+			} else {
+				rejectWaiters(message, new Error('WebSocket send failed.'));
+			}
+			this.maybeResetOutputPressureEpisodes();
 			this.flush();
 		});
+	}
+}
+
+function ordinaryNotification(value: unknown): OrdinaryNotification | undefined {
+	if (typeof value !== 'object' || value === null) {
+		return undefined;
+	}
+	const envelope = value as {
+		readonly method?: unknown;
+		readonly params?: { readonly taskId?: unknown };
+	};
+	if (typeof envelope.params?.taskId !== 'string') {
+		return undefined;
+	}
+	if (envelope.method === GATEWAY_NOTIFICATIONS.taskProgress) {
+		return { kind: 'progress', taskId: envelope.params.taskId };
+	}
+	if (envelope.method === GATEWAY_NOTIFICATIONS.taskOutput) {
+		return { kind: 'output', taskId: envelope.params.taskId };
+	}
+	return undefined;
+}
+
+function outputPressureMarker(value: unknown): unknown {
+	const envelope = value as {
+		readonly jsonrpc: '2.0';
+		readonly method: string;
+		readonly params: Record<string, unknown>;
+	};
+	return {
+		...envelope,
+		params: {
+			...envelope.params,
+			output: OUTPUT_PRESSURE_MARKER,
+			truncated: true,
+		},
+	};
+}
+
+function resolveWaiters(message: QueuedMessage): void {
+	for (const waiter of message.waiters) {
+		waiter.resolve();
+	}
+}
+
+function rejectWaiters(message: QueuedMessage, error: Error): void {
+	for (const waiter of message.waiters) {
+		waiter.reject(error);
 	}
 }
 

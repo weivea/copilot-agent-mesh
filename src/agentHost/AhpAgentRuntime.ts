@@ -15,7 +15,8 @@ import type {
 import { AhpEventMapper } from './AhpEventMapper';
 import {
 	AgentRuntimeError,
-	AsyncEventQueue,
+	AsyncEventQueueCapacityError,
+	createAgentRuntimeEventQueue,
 	type AgentRecoveryDescriptor,
 	type AgentRuntime,
 	type AgentRuntimeEvent,
@@ -436,7 +437,7 @@ class DefaultSessionConfigurationResolver implements SessionConfigurationResolve
 }
 
 class AhpTask implements AgentTaskHandle {
-	readonly events = new AsyncEventQueue<AgentRuntimeEvent>();
+	readonly events = createAgentRuntimeEventQueue();
 	readonly taskId: string;
 	private readonly mapper = new AhpEventMapper();
 	private readonly clientId = `copilot-agent-mesh-${randomUUID()}`;
@@ -604,7 +605,7 @@ class AhpTask implements AgentTaskHandle {
 		this.throwIfTerminalFailure();
 		await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
 		this.throwIfTerminalFailure();
-		this.events.push({ type: 'progress', message: 'Agent turn started.' });
+		await this.events.push({ type: 'progress', message: 'Agent turn started.' });
 		this.throwIfTerminalFailure();
 	}
 
@@ -613,7 +614,7 @@ class AhpTask implements AgentTaskHandle {
 			return;
 		}
 		this.assertWritable();
-		this.events.push({ type: 'progress', message: 'Cancellation requested.' });
+		await this.events.push({ type: 'progress', message: 'Cancellation requested.' });
 		this.dispatchTracked(this.chatUri, {
 			type: 'chat/turnCancelled',
 			turnId: this.currentTurnId(),
@@ -954,7 +955,7 @@ class AhpTask implements AgentTaskHandle {
 				continue;
 			}
 			if (result.snapshot !== undefined) {
-				this.applySnapshot(result.snapshot);
+				await this.applySnapshot(result.snapshot);
 			}
 			this.throwIfTerminalError();
 			if (!this.isCurrentGeneration(generation)) {
@@ -1033,7 +1034,7 @@ class AhpTask implements AgentTaskHandle {
 					return;
 				}
 				if (event.type === 'action') {
-					this.handleEnvelope(event.params as ActionEnvelope);
+					await this.handleEnvelope(event.params as ActionEnvelope);
 				} else {
 					this.trackAuthNotification(event.params, generation);
 				}
@@ -1046,13 +1047,20 @@ class AhpTask implements AgentTaskHandle {
 			) {
 				this.handleSubscriptionLoss();
 			}
-		} catch {
+		} catch (error) {
 			if (
 				!this.disposed
 				&& !this.terminal
 				&& this.isCurrentGeneration(generation)
 			) {
-				this.handleSubscriptionLoss();
+				if (error instanceof AsyncEventQueueCapacityError) {
+					this.fail(new AgentRuntimeError(
+						'TASK_EXECUTION_FAILED',
+						'The Agent Host emitted a control event larger than the runtime safety limit.',
+					));
+				} else {
+					this.handleSubscriptionLoss();
+				}
 			}
 		}
 	}
@@ -1072,7 +1080,7 @@ class AhpTask implements AgentTaskHandle {
 		));
 	}
 
-	private handleEnvelope(envelope: ActionEnvelope, subscribeRootTerminals = true): void {
+	private async handleEnvelope(envelope: ActionEnvelope, subscribeRootTerminals = true): Promise<void> {
 		this.lastSeenServerSeq = Math.max(this.lastSeenServerSeq, envelope.serverSeq);
 		this.acknowledgeDispatch(envelope);
 		const action = envelope.action;
@@ -1105,7 +1113,7 @@ class AhpTask implements AgentTaskHandle {
 			}
 		}
 		this.trackDeliveredResponseAction(action);
-		this.emitMappedEvents(this.mapper.map(envelope));
+		await this.emitMappedEvents(this.mapper.map(envelope));
 	}
 
 	private trackDeliveredResponseAction(action: ActionEnvelope['action']): void {
@@ -1166,16 +1174,23 @@ class AhpTask implements AgentTaskHandle {
 		}
 	}
 
-	private emitMappedEvents(events: readonly AgentRuntimeEvent[]): void {
+	private async emitMappedEvents(events: readonly AgentRuntimeEvent[]): Promise<void> {
 		for (const event of events) {
-			this.events.push(event);
-			if (event.type === 'completed' || event.type === 'cancelled' || event.type === 'failed') {
-				this.finishTerminal();
+			const terminal = event.type === 'completed' || event.type === 'cancelled' || event.type === 'failed';
+			if (this.terminal) {
+				return;
 			}
+			if (terminal) {
+				this.terminal = true;
+				await this.events.pushAndClose(event);
+				this.finishTerminal();
+				return;
+			}
+			await this.events.push(event);
 		}
 	}
 
-	private applySnapshot(snapshot: Snapshot, subscribeRootTerminals = true): void {
+	private async applySnapshot(snapshot: Snapshot, subscribeRootTerminals = true): Promise<void> {
 		this.lastSeenServerSeq = Math.max(this.lastSeenServerSeq, snapshot.fromSeq);
 		if (snapshot.resource === this.sessionUri) {
 			const state = snapshot.state as SessionState;
@@ -1210,17 +1225,17 @@ class AhpTask implements AgentTaskHandle {
 			return;
 		}
 		if (snapshot.resource === this.chatUri) {
-			this.applyChatSnapshot(snapshot.state, snapshot.resource);
+			await this.applyChatSnapshot(snapshot.state, snapshot.resource);
 		}
 	}
 
-	private applyChatSnapshot(value: unknown, chatUri: string): void {
+	private async applyChatSnapshot(value: unknown, chatUri: string): Promise<void> {
 		if (!isRecord(value)) {
 			throw new AgentRuntimeError('TASK_RECOVERY_UNAVAILABLE', 'The recovered Chat snapshot was invalid.');
 		}
 		const activeTurn = isRecord(value.activeTurn) ? value.activeTurn : undefined;
 		if (activeTurn !== undefined && activeTurn.id === this.turnId && Array.isArray(activeTurn.responseParts)) {
-			this.restoreResponseParts(chatUri, activeTurn.responseParts);
+			await this.restoreResponseParts(chatUri, activeTurn.responseParts);
 			return;
 		}
 		if (!Array.isArray(value.turns)) {
@@ -1233,24 +1248,24 @@ class AhpTask implements AgentTaskHandle {
 			return;
 		}
 		if (Array.isArray(turn.responseParts)) {
-			this.restoreResponseParts(chatUri, turn.responseParts);
+			await this.restoreResponseParts(chatUri, turn.responseParts);
 		}
 		if (turn.state === 'complete') {
-			this.emitMappedEvents([{ type: 'completed' }]);
+			await this.emitMappedEvents([{ type: 'completed' }]);
 		} else if (turn.state === 'cancelled') {
-			this.emitMappedEvents([{ type: 'cancelled' }]);
+			await this.emitMappedEvents([{ type: 'cancelled' }]);
 		} else if (turn.state === 'error') {
 			const message = isRecord(turn.error) && typeof turn.error.message === 'string'
 				? turn.error.message
 				: 'The recovered Agent Host turn failed.';
-			this.emitMappedEvents([{
+			await this.emitMappedEvents([{
 				type: 'failed',
 				error: new AgentRuntimeError('TASK_EXECUTION_FAILED', safeMessage(message)),
 			}]);
 		}
 	}
 
-	private restoreResponseParts(chatUri: string, parts: readonly unknown[]): void {
+	private async restoreResponseParts(chatUri: string, parts: readonly unknown[]): Promise<void> {
 		const snapshotOrdinals = new Map<string, number>();
 		for (let index = 0; index < parts.length; index += 1) {
 			const part = parts[index];
@@ -1261,17 +1276,17 @@ class AhpTask implements AgentTaskHandle {
 			if (ordinalIdentity !== undefined && ordinal !== undefined) {
 				snapshotOrdinals.set(ordinalIdentity, ordinal);
 			}
-			this.restoreResponsePart(chatUri, part, index, ordinalIdentity, ordinal);
+			await this.restoreResponsePart(chatUri, part, index, ordinalIdentity, ordinal);
 		}
 	}
 
-	private restoreResponsePart(
+	private async restoreResponsePart(
 		chatUri: string,
 		value: unknown,
 		index: number,
 		ordinalIdentity?: string,
 		ordinal?: number,
-	): void {
+	): Promise<void> {
 		if (!isRecord(value)) {
 			return;
 		}
@@ -1286,7 +1301,7 @@ class AhpTask implements AgentTaskHandle {
 				: value.content;
 			this.deliveredResponsePartLengths.set(value.id, value.content.length);
 			if (content.length > 0) {
-				this.emitMappedEvents([value.kind === 'markdown'
+				await this.emitMappedEvents([value.kind === 'markdown'
 					? { type: 'output', text: content }
 					: { type: 'progress', message: content }]);
 			}
@@ -1301,7 +1316,7 @@ class AhpTask implements AgentTaskHandle {
 		const identity = responsePartIdentity(value)
 			?? (ordinalIdentity === undefined ? `snapshot:${this.turnId ?? 'unknown'}:${index}` : undefined);
 		if (identity === undefined) {
-			this.emitMappedEvents(this.mapper.map(envelopeFromSnapshot(chatUri, {
+			await this.emitMappedEvents(this.mapper.map(envelopeFromSnapshot(chatUri, {
 				type: 'chat/responsePart',
 				turnId: this.turnId,
 				part: value,
@@ -1313,14 +1328,14 @@ class AhpTask implements AgentTaskHandle {
 		}
 		this.deliveredResponsePartStates.add(identity);
 		if (value.kind === 'inputRequest' && isRecord(value.request) && value.response === undefined) {
-			this.handleEnvelope(envelopeFromSnapshot(chatUri, {
+			await this.handleEnvelope(envelopeFromSnapshot(chatUri, {
 				type: 'chat/inputRequested',
 				request: value.request,
 			}, this.lastSeenServerSeq));
 			return;
 		}
 		if (value.kind !== 'toolCall' || !isRecord(value.toolCall)) {
-			this.emitMappedEvents(this.mapper.map(envelopeFromSnapshot(chatUri, {
+			await this.emitMappedEvents(this.mapper.map(envelopeFromSnapshot(chatUri, {
 				type: 'chat/responsePart',
 				turnId: this.turnId,
 				part: value,
@@ -1333,7 +1348,7 @@ class AhpTask implements AgentTaskHandle {
 			toolCallId: tool.toolCallId,
 		};
 		if (tool.status === 'pending-confirmation') {
-			this.handleEnvelope(envelopeFromSnapshot(chatUri, {
+			await this.handleEnvelope(envelopeFromSnapshot(chatUri, {
 				type: 'chat/toolCallReady',
 				...common,
 				invocationMessage: tool.invocationMessage,
@@ -1341,7 +1356,7 @@ class AhpTask implements AgentTaskHandle {
 				options: tool.options,
 			}, this.lastSeenServerSeq));
 		} else if (tool.status === 'pending-result-confirmation') {
-			this.handleEnvelope(envelopeFromSnapshot(chatUri, {
+			await this.handleEnvelope(envelopeFromSnapshot(chatUri, {
 				type: 'chat/toolCallComplete',
 				...common,
 				result: {
@@ -1352,13 +1367,13 @@ class AhpTask implements AgentTaskHandle {
 				requiresResultConfirmation: true,
 			}, this.lastSeenServerSeq));
 		} else if (tool.status === 'auth-required') {
-			this.handleEnvelope(envelopeFromSnapshot(chatUri, {
+			await this.handleEnvelope(envelopeFromSnapshot(chatUri, {
 				type: 'chat/toolCallAuthRequired',
 				...common,
 				auth: tool.auth,
 			}, this.lastSeenServerSeq));
 		} else if (tool.status === 'completed') {
-			this.handleEnvelope(envelopeFromSnapshot(chatUri, {
+			await this.handleEnvelope(envelopeFromSnapshot(chatUri, {
 				type: 'chat/toolCallComplete',
 				...common,
 				result: {
@@ -1371,7 +1386,7 @@ class AhpTask implements AgentTaskHandle {
 				requiresResultConfirmation: false,
 			}, this.lastSeenServerSeq));
 		} else if (tool.status === 'streaming' || tool.status === 'running') {
-			this.handleEnvelope(envelopeFromSnapshot(chatUri, {
+			await this.handleEnvelope(envelopeFromSnapshot(chatUri, {
 				type: 'chat/toolCallStart',
 				...common,
 				toolName: tool.toolName,
@@ -1459,7 +1474,7 @@ class AhpTask implements AgentTaskHandle {
 				continue;
 			}
 			if (result.snapshot !== undefined) {
-				this.applySnapshot(result.snapshot, false);
+				await this.applySnapshot(result.snapshot, false);
 			}
 			subscriptions.set(terminal.resource, result.subscription);
 			if (startPumps) {
@@ -1589,7 +1604,7 @@ class AhpTask implements AgentTaskHandle {
 
 	private async recover(signal: AbortSignal): Promise<void> {
 		this.recovering = true;
-		this.events.push({ type: 'progress', message: 'Reconnecting to Agent Host.' });
+		await this.events.push({ type: 'progress', message: 'Reconnecting to Agent Host.' });
 		const previousConnection = this.connection;
 		const previousGeneration = this.generation;
 		previousGeneration.valid = false;
@@ -1640,7 +1655,7 @@ class AhpTask implements AgentTaskHandle {
 					if (action.channel === rootUri && action.action.type === 'root/terminalsChanged') {
 						recoveredTerminals = action.action.terminals;
 					}
-					this.handleEnvelope(action, false);
+					await this.handleEnvelope(action, false);
 				}
 				const missing = result.missing ?? [];
 				if (
@@ -1675,7 +1690,7 @@ class AhpTask implements AgentTaskHandle {
 					if (snapshot.resource === rootUri) {
 						recoveredTerminals = parseRootState(snapshot).terminals ?? [];
 					}
-					this.applySnapshot(snapshot, false);
+					await this.applySnapshot(snapshot, false);
 				}
 			}
 			const sessions = await this.awaitRecoveryStep(candidate.listSessions(), signal);
@@ -1726,7 +1741,7 @@ class AhpTask implements AgentTaskHandle {
 			for (const [uri, subscription] of recoveredSubscriptions) {
 				this.startSubscription(uri, subscription, candidateGeneration);
 			}
-			this.events.push({ type: 'progress', message: 'Agent Host connection recovered.' });
+			await this.events.push({ type: 'progress', message: 'Agent Host connection recovered.' });
 		} catch (error) {
 			const stopped = error instanceof RecoveryStoppedCause || signal.aborted || this.disposed || this.terminal;
 			let failure = error instanceof RecoveryUnavailableCause
@@ -1814,8 +1829,8 @@ class AhpTask implements AgentTaskHandle {
 		this.terminalError = error;
 		this.readyReject?.(error);
 		this.defaultChatReject?.(error);
-		this.events.push({ type: 'failed', error });
-		this.finishTerminal();
+		this.terminal = true;
+		void this.events.pushAndClose({ type: 'failed', error }).then(() => this.finishTerminal());
 	}
 
 	private finishTerminal(): void {

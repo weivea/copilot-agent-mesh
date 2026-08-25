@@ -82,4 +82,5 @@ export interface DevTunnelProvider {
 	stop(): Promise<void>;
 	dispose(): Promise<void>;
 	getStatus(): DevTunnelRuntimeStatus;
+	onDidChange?(listener: () => void): { dispose(): void };
 }

@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 import {
 	DelegationIntentInput,
 	MeshWorkerDirectorySnapshot,
@@ -34,6 +36,7 @@ export interface ToolDeadlineTimer {
 }
 
 export interface DelegateTaskInput {
+	readonly delegationRequestId?: string;
 	readonly peerId: string;
 	readonly workspaceId: string;
 	readonly title: string;
@@ -70,6 +73,7 @@ export type ToolJsonResult = Readonly<Record<string, unknown>>;
 export interface TaskToolsCoreOptions {
 	readonly clock?: ToolClock;
 	readonly outputByteLimit?: number;
+	readonly id?: () => string;
 }
 
 interface OperationSuccess<T> {
@@ -151,6 +155,7 @@ const safeErrorMessages: Readonly<Record<TaskToolErrorCode, string>> = {
 export class TaskToolsCore {
 	private readonly clock: ToolClock;
 	private readonly outputByteLimit: number;
+	private readonly id: () => string;
 
 	constructor(
 		private readonly facade: TaskToolFacade,
@@ -158,6 +163,7 @@ export class TaskToolsCore {
 	) {
 		this.clock = options.clock ?? systemClock;
 		this.outputByteLimit = options.outputByteLimit ?? TASK_TOOL_LIMITS.defaultOutputBytes;
+		this.id = options.id ?? randomUUID;
 		if (
 			!Number.isSafeInteger(this.outputByteLimit)
 			|| this.outputByteLimit < TASK_TOOL_LIMITS.minimumOutputBytes
@@ -232,9 +238,13 @@ export class TaskToolsCore {
 		rawInput: unknown,
 		cancellation: ToolCancellation = neverCancelled,
 	): Promise<ToolJsonResult> {
-		let input: DelegationIntentInput;
+		let input: DelegationIntentInput & { readonly delegationRequestId: string };
 		try {
-			input = parseDelegateTaskInput(rawInput);
+			const parsed = parseDelegateTaskInput(rawInput);
+			input = {
+				...parsed,
+				delegationRequestId: parsed.delegationRequestId ?? this.id(),
+			};
 		} catch {
 			return this.errorResult('INVALID_INPUT');
 		}
@@ -288,7 +298,10 @@ export class TaskToolsCore {
 		}
 		if (outcome.kind === 'cancelled' || outcome.kind === 'timeout') {
 			if (persisted === undefined) {
-				return this.delegatePersistencePendingResult(outcome.kind);
+				return this.delegatePersistencePendingResult(
+					outcome.kind,
+					input.delegationRequestId,
+				);
 			}
 			return this.delegateWaitResult(outcome.kind, persisted);
 		}
@@ -483,10 +496,14 @@ export class TaskToolsCore {
 		});
 	}
 
-	private delegatePersistencePendingResult(waitStatus: 'cancelled' | 'timeout'): ToolJsonResult {
+	private delegatePersistencePendingResult(
+		waitStatus: 'cancelled' | 'timeout',
+		delegationRequestId: string,
+	): ToolJsonResult {
 		return this.fitResult({
 			status: 'pending',
 			phase: 'persisting',
+			delegationRequestId,
 			waitStatus,
 			reconciliationPending: true,
 			retrySameIntent: true,
@@ -837,7 +854,18 @@ export function parseListWorkersInput(value: unknown): Record<string, never> {
 
 export function parseDelegateTaskInput(value: unknown): DelegationIntentInput {
 	const input = expectRecord(value, 'input');
-	expectExactKeys(input, ['peerId', 'workspaceId', 'title', 'prompt', 'acceptanceCriteria', 'timeoutMinutes']);
+	expectExactKeys(input, [
+		'delegationRequestId',
+		'peerId',
+		'workspaceId',
+		'title',
+		'prompt',
+		'acceptanceCriteria',
+		'timeoutMinutes',
+	]);
+	const delegationRequestId = input.delegationRequestId === undefined
+		? undefined
+		: expectIdentifier(input.delegationRequestId, 'delegationRequestId');
 	const peerId = expectIdentifier(input.peerId, 'peerId');
 	const workspaceId = expectIdentifier(input.workspaceId, 'workspaceId');
 	const title = expectString(input.title, 'title', TASK_TOOL_LIMITS.titleBytes);
@@ -854,6 +882,7 @@ export function parseDelegateTaskInput(value: unknown): DelegationIntentInput {
 		? undefined
 		: expectInteger(input.timeoutMinutes, 'timeoutMinutes', 1, 1_440);
 	return {
+		...(delegationRequestId === undefined ? {} : { delegationRequestId }),
 		peerId,
 		workspaceId,
 		title,
@@ -1490,7 +1519,13 @@ function compactDelegationResult(value: ToolJsonResult): ToolJsonResult | undefi
 		&& value.reconciliationPending === true
 		&& value.retrySameIntent === true
 	) {
-		return { s: 3, r: 1 };
+		return {
+			s: 3,
+			...(typeof value.delegationRequestId === 'string'
+				? { d: value.delegationRequestId }
+				: {}),
+			r: 1,
+		};
 	}
 	if (
 		typeof value.taskId !== 'string'

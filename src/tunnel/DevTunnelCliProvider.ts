@@ -75,9 +75,15 @@ export interface DevTunnelCliProviderOptions {
 	readonly now?: () => Date;
 	readonly platform?: NodeJS.Platform;
 	readonly random?: () => number;
+	readonly reportStatusListenerError?: (error: unknown) => void;
 	readonly resolveExecutable?: (executable: string) => Promise<string>;
 	readonly restartBaseDelayMs?: number;
 	readonly restartMaxDelayMs?: number;
+	readonly clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
+	readonly setTimer?: (
+		callback: () => void,
+		delayMs: number,
+	) => ReturnType<typeof setTimeout>;
 	readonly showPollIntervalMs?: number;
 	readonly showTimeoutMs?: number;
 	readonly stateStore: DevTunnelStateStore;
@@ -86,7 +92,11 @@ export interface DevTunnelCliProviderOptions {
 
 const commandTimeoutMs = 30_000;
 const commandMaxOutputBytes = 256 * 1024;
-const renewalWindowMs = 24 * 60 * 60 * 1_000;
+const hourMs = 60 * 60 * 1_000;
+const dayMs = 24 * hourMs;
+const maxTimerDelayMs = 2_147_483_647;
+const maxRenewalRetryAttempts = 3;
+const renewalRetryBaseDelayMs = 60_000;
 const knownVersionLines = new Map([
 	[`Tunnel CLI version: ${SUPPORTED_DEVTUNNEL_BUILD}`, SUPPORTED_DEVTUNNEL_BUILD],
 	[`Tunnel CLI version: ${LEGACY_UNSUPPORTED_DEVTUNNEL_BUILD}`, LEGACY_UNSUPPORTED_DEVTUNNEL_BUILD],
@@ -95,6 +105,7 @@ const knownVersionLines = new Map([
 export class DevTunnelCliProvider implements DevTunnelProvider {
 	private readonly architecture: string;
 	private readonly binaryVerifier: (executable: string) => Promise<boolean>;
+	private readonly clearTimer: (timer: ReturnType<typeof setTimeout>) => void;
 	private commandRunner: DevTunnelCommandRunner | undefined;
 	private readonly commandRunnerFactory: (
 		allowedExecutableBasename: string,
@@ -106,9 +117,14 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 	private readonly now: () => Date;
 	private readonly platform: NodeJS.Platform;
 	private readonly random: () => number;
+	private readonly reportStatusListenerError: (error: unknown) => void;
 	private readonly resolveExecutable: (executable: string) => Promise<string>;
 	private readonly restartBaseDelayMs: number;
 	private readonly restartMaxDelayMs: number;
+	private readonly setTimer: (
+		callback: () => void,
+		delayMs: number,
+	) => ReturnType<typeof setTimeout>;
 	private readonly showPollIntervalMs: number;
 	private readonly showTimeoutMs: number;
 	private readonly stateStore: DevTunnelStateStore;
@@ -122,18 +138,24 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 	private lifecycleAbortController: AbortController | undefined;
 	private lifecycleMutationTail: Promise<void> = Promise.resolve();
 	private metadata: TunnelMetadata | undefined;
+	private destructiveRenewalCompletion: Promise<void> | undefined;
+	private destructiveRenewalGeneration: number | undefined;
 	private renewalGeneration: number | undefined;
 	private renewalPromise: Promise<TunnelMetadata> | undefined;
+	private renewalRetryAttempt = 0;
+	private renewalTimer: ReturnType<typeof setTimeout> | undefined;
 	private request: TunnelRequest | undefined;
 	private restartAttempt = 0;
 	private restartTimer: NodeJS.Timeout | undefined;
 	private status: DevTunnelRuntimeStatus = { state: 'idle' };
+	private readonly statusListeners = new Set<() => void>();
 	private stopRequested = false;
 	private trustedExecutable: string | undefined;
 
 	constructor(options: DevTunnelCliProviderOptions) {
 		this.architecture = options.architecture ?? process.arch;
 		this.binaryVerifier = options.binaryVerifier ?? verifyOfficialExecutable;
+		this.clearTimer = options.clearTimer ?? clearTimeout;
 		this.commandRunner = options.commandRunner;
 		this.commandRunnerFactory = options.commandRunnerFactory ?? (
 			(allowedExecutableBasename) => new ChildProcessRunner({
@@ -147,9 +169,15 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 		this.now = options.now ?? (() => new Date());
 		this.platform = options.platform ?? process.platform;
 		this.random = options.random ?? Math.random;
+		this.reportStatusListenerError = options.reportStatusListenerError ?? (() => {
+			process.emitWarning('A Dev Tunnel status listener failed.', {
+				code: 'DEVTUNNEL_STATUS_LISTENER_FAILED',
+			});
+		});
 		this.resolveExecutable = options.resolveExecutable ?? resolveExecutablePath;
 		this.restartBaseDelayMs = options.restartBaseDelayMs ?? 500;
 		this.restartMaxDelayMs = options.restartMaxDelayMs ?? 30_000;
+		this.setTimer = options.setTimer ?? setTimeout;
 		this.showPollIntervalMs = options.showPollIntervalMs ?? 250;
 		this.showTimeoutMs = options.showTimeoutMs ?? 20_000;
 		this.stateStore = options.stateStore;
@@ -169,6 +197,11 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 
 	getStatus(): DevTunnelRuntimeStatus {
 		return this.status;
+	}
+
+	onDidChange(listener: () => void): { dispose(): void } {
+		this.statusListeners.add(listener);
+		return { dispose: () => this.statusListeners.delete(listener) };
 	}
 
 	async probe(signal?: AbortSignal): Promise<TunnelCapability> {
@@ -271,9 +304,11 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 		) {
 			return this.renewalPromise;
 		}
-		const renewal = this.withLifecycleMutation(
-			() => this.renewAccessOnce(generation, signal),
-		);
+		const renewal = this.withLifecycleMutation(async () => {
+			const renewed = await this.renewAccessOnce(generation, signal);
+			this.publishRenewal(renewed, generation);
+			return renewed;
+		});
 		const tracked = renewal.finally(() => {
 			if (this.renewalPromise === tracked) {
 				this.renewalGeneration = undefined;
@@ -309,6 +344,8 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 			throw permanent('TUNNEL_ACCESS_EXPIRED', 'The owned anonymous access entry has expired.');
 		}
 		let destructiveRenewalStarted = false;
+		let completeDestructiveRenewal: (() => void) | undefined;
+		let destructiveRenewalCompletion: Promise<void> | undefined;
 		try {
 			this.assertLifecycleActive(generation);
 			const listed = await this.run([
@@ -327,6 +364,11 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 			await this.assertExactExecutable(generation, signal);
 			this.assertLifecycleActive(generation);
 			destructiveRenewalStarted = true;
+			destructiveRenewalCompletion = new Promise<void>((resolve) => {
+				completeDestructiveRenewal = resolve;
+			});
+			this.destructiveRenewalCompletion = destructiveRenewalCompletion;
+			this.destructiveRenewalGeneration = generation;
 			const deleted = await this.run([
 				'access',
 				'delete',
@@ -359,7 +401,10 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 				&& error instanceof DevTunnelProviderError
 				&& providerError.code === 'CLI_UNSUPPORTED'
 			) {
-				await this.openCircuitAndStop(providerError.code, providerError.message);
+				await this.openCircuitAndStop(
+					'TUNNEL_ACCESS_EXPIRED',
+					'The owned anonymous access entry cannot be safely renewed with the current CLI.',
+				);
 				throw providerError;
 			}
 			if (!destructiveRenewalStarted && providerError.retryable) {
@@ -373,15 +418,29 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 				failureMessage,
 			);
 			throw permanent('TUNNEL_ACCESS_EXPIRED', failureMessage);
+		} finally {
+			completeDestructiveRenewal?.();
+			if (this.destructiveRenewalCompletion === destructiveRenewalCompletion) {
+				this.destructiveRenewalCompletion = undefined;
+			}
+			if (this.destructiveRenewalGeneration === generation) {
+				this.destructiveRenewalGeneration = undefined;
+			}
 		}
 	}
 
 	async stop(): Promise<void> {
+		const generation = this.lifecycleGeneration;
+		this.clearRestartTimer();
+		this.clearRenewalTimer();
+		if (this.destructiveRenewalGeneration === generation) {
+			await this.destructiveRenewalCompletion;
+		}
 		this.stopRequested = true;
 		this.lifecycleAbortController?.abort();
 		this.lifecycleAbortController = undefined;
 		this.lifecycleGeneration += 1;
-		this.clearRestartTimer();
+		this.clearRenewalTimer();
 		const pendingHost = this.hostStartPromise;
 		if (pendingHost !== undefined) {
 			try {
@@ -392,7 +451,7 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 		}
 		const host = this.host;
 		if (host === undefined) {
-			this.status = { state: 'stopped' };
+			this.setStatus({ state: 'stopped' });
 			return;
 		}
 		try {
@@ -400,12 +459,12 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 			if (this.host === host) {
 				this.host = undefined;
 			}
-			this.status = { state: 'stopped' };
+			this.setStatus({ state: 'stopped' });
 		} catch (error: unknown) {
-			this.status = {
+			this.setStatus({
 				state: 'cleanup-failed',
 				message: 'The owned Dev Tunnel host could not be stopped; retry stop().',
-			};
+			});
 			throw error;
 		}
 	}
@@ -522,7 +581,7 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 		const abortController = new AbortController();
 		this.lifecycleAbortController = abortController;
 		const signal = abortController.signal;
-		this.status = { state: 'starting' };
+		this.setStatus({ state: 'starting' });
 		let hostStartAttempted = false;
 		try {
 			const capability = await this.probe(signal);
@@ -561,7 +620,10 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 			if (!Number.isFinite(accessExpiresAt.valueOf()) || accessExpiresAt.valueOf() <= this.now().valueOf()) {
 				throw permanent('TUNNEL_ACCESS_EXPIRED', 'The owned anonymous access entry has expired.');
 			}
-			if (accessExpiresAt.valueOf() - this.now().valueOf() <= renewalWindowMs) {
+			if (
+				accessExpiresAt.valueOf() - this.now().valueOf()
+				<= renewalLeadMs(parseDuration(metadata.accessDuration))
+			) {
 				this.metadata = metadata;
 				metadata = await this.renewAccess();
 			}
@@ -571,7 +633,8 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 			this.assertLifecycleActive(generation);
 			this.metadata = hosted;
 			this.restartAttempt = 0;
-			this.status = { state: 'ready', tunnel: hosted };
+			this.setStatus({ state: 'ready', tunnel: hosted });
+			this.scheduleAccessRenewal(hosted, generation);
 			return hosted;
 		} catch (error: unknown) {
 			const providerError = toProviderError(error);
@@ -753,7 +816,10 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 			if (!Number.isFinite(accessExpiresAt.valueOf()) || accessExpiresAt.valueOf() <= this.now().valueOf()) {
 				throw permanent('TUNNEL_ACCESS_EXPIRED', 'The owned anonymous access entry has expired.');
 			}
-			if (accessExpiresAt.valueOf() - this.now().valueOf() <= renewalWindowMs) {
+			if (
+				accessExpiresAt.valueOf() - this.now().valueOf()
+				<= renewalLeadMs(parseDuration(metadata.accessDuration))
+			) {
 				metadata = await this.renewAccessOnce(generation, signal);
 			}
 			const hosted = await this.startAndProbeLocked(metadata, request, generation, signal);
@@ -998,8 +1064,8 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 		const delayMs = Math.floor(this.random() * ceiling);
 		const retryAt = new Date(this.now().valueOf() + delayMs).toISOString();
 		this.assertLifecycleActive(generation);
-		this.status = { state: 'backoff', attempt: this.restartAttempt, retryAt };
-		this.restartTimer = setTimeout(() => {
+		this.setStatus({ state: 'backoff', attempt: this.restartAttempt, retryAt });
+		this.restartTimer = this.setTimer(() => {
 			this.restartTimer = undefined;
 			void this.restart(generation);
 		}, delayMs);
@@ -1022,7 +1088,8 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 			this.assertLifecycleActive(generation);
 			this.metadata = hosted;
 			this.restartAttempt = 0;
-			this.status = { state: 'ready', tunnel: hosted };
+			this.setStatus({ state: 'ready', tunnel: hosted });
+			this.scheduleAccessRenewal(hosted, generation);
 		} catch (error: unknown) {
 			const providerError = toProviderError(error);
 			const lifecycleActive = this.lifecycleIsActive(generation);
@@ -1042,8 +1109,9 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 
 	private openCircuit(code: DevTunnelProviderError['code'], message?: string): void {
 		this.clearRestartTimer();
+		this.clearRenewalTimer();
 		this.lifecycleAbortController?.abort();
-		this.status = { state: 'circuit-open', code, message };
+		this.setStatus({ state: 'circuit-open', code, message });
 	}
 
 	private async openCircuitAndStop(
@@ -1062,10 +1130,10 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 				}
 
 			} catch (error: unknown) {
-				this.status = {
+				this.setStatus({
 					state: 'cleanup-failed',
 					message: 'The owned Dev Tunnel host could not be stopped; retry stop().',
-				};
+				});
 				throw error;
 			}
 		}
@@ -1078,18 +1146,146 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 				this.host = undefined;
 			}
 		} catch (error: unknown) {
-			this.status = {
+			this.setStatus({
 				state: 'cleanup-failed',
 				message: 'The owned Dev Tunnel host could not be stopped; retry stop().',
-			};
+			});
 			throw error;
 		}
 	}
 
 	private clearRestartTimer(): void {
 		if (this.restartTimer !== undefined) {
-			clearTimeout(this.restartTimer);
+			this.clearTimer(this.restartTimer);
 			this.restartTimer = undefined;
+		}
+	}
+
+	private publishRenewal(renewed: TunnelMetadata, generation: number): void {
+		if (!this.lifecycleIsActive(generation)) {
+			return;
+		}
+		if (this.status.state === 'ready') {
+			const hosted: HostedTunnel = {
+				...this.status.tunnel,
+				...renewed,
+				forwardingOrigin: this.status.tunnel.forwardingOrigin,
+				status: 'ready',
+			};
+			this.metadata = hosted;
+			this.renewalRetryAttempt = 0;
+			this.setStatus({ state: 'ready', tunnel: hosted });
+			this.scheduleAccessRenewal(hosted, generation);
+		}
+	}
+
+	private scheduleAccessRenewal(metadata: TunnelMetadata, generation: number): void {
+		this.clearRenewalTimer();
+		if (!this.lifecycleIsActive(generation) || this.status.state !== 'ready') {
+			return;
+		}
+		const expiresAt = new Date(metadata.accessExpiresAt).valueOf();
+		const renewAt = expiresAt - renewalLeadMs(parseDuration(metadata.accessDuration));
+		const delayMs = Math.max(0, Math.min(maxTimerDelayMs, renewAt - this.now().valueOf()));
+		this.renewalTimer = this.setTimer(() => {
+			this.renewalTimer = undefined;
+			void this.runScheduledRenewal(generation, expiresAt).catch(() => undefined);
+		}, delayMs);
+		this.renewalTimer.unref?.();
+	}
+
+	private async runScheduledRenewal(generation: number, expiresAt: number): Promise<void> {
+		if (!this.lifecycleIsActive(generation) || this.status.state !== 'ready') {
+			return;
+		}
+		if (this.now().valueOf() < expiresAt - renewalLeadMs(
+			parseDuration(this.status.tunnel.accessDuration),
+		)) {
+			this.scheduleAccessRenewal(this.status.tunnel, generation);
+			return;
+		}
+		try {
+			await this.renewAccess();
+		} catch (error: unknown) {
+			if (!this.lifecycleIsActive(generation) || this.status.state !== 'ready') {
+				return;
+			}
+			const providerError = toProviderError(error);
+			if (!providerError.retryable) {
+				await this.openCircuitAndStop(
+					'TUNNEL_ACCESS_EXPIRED',
+					'The owned anonymous access entry could not be safely renewed.',
+				);
+				return;
+			}
+			this.renewalRetryAttempt += 1;
+			const remainingMs = expiresAt - this.now().valueOf();
+			if (remainingMs <= 0) {
+				await this.openCircuitAndStop(
+					'TUNNEL_ACCESS_EXPIRED',
+					'The owned anonymous access entry expired before it could be renewed.',
+				);
+				return;
+			}
+			const retryDelayMs = this.renewalRetryAttempt <= maxRenewalRetryAttempts
+				? Math.min(
+					renewalRetryBaseDelayMs * (2 ** (this.renewalRetryAttempt - 1)),
+					Math.max(1, Math.floor(remainingMs / 2)),
+				)
+				: undefined;
+			if (retryDelayMs === undefined) {
+				this.scheduleAccessExpiration(generation, expiresAt);
+				return;
+			}
+			this.renewalTimer = this.setTimer(() => {
+				this.renewalTimer = undefined;
+				void this.runScheduledRenewal(generation, expiresAt).catch(() => undefined);
+			}, Math.min(maxTimerDelayMs, retryDelayMs));
+			this.renewalTimer.unref?.();
+		}
+	}
+
+	private scheduleAccessExpiration(generation: number, expiresAt: number): void {
+		const delayMs = Math.min(maxTimerDelayMs, Math.max(0, expiresAt - this.now().valueOf()));
+		this.renewalTimer = this.setTimer(() => {
+			this.renewalTimer = undefined;
+			if (!this.lifecycleIsActive(generation) || this.status.state !== 'ready') {
+				return;
+			}
+			if (this.now().valueOf() < expiresAt) {
+				this.scheduleAccessExpiration(generation, expiresAt);
+				return;
+			}
+			void this.openCircuitAndStop(
+				'TUNNEL_ACCESS_EXPIRED',
+				'The owned anonymous access entry expired before it could be renewed.',
+			).catch(() => undefined);
+		}, delayMs);
+		this.renewalTimer.unref?.();
+	}
+
+	private clearRenewalTimer(): void {
+		if (this.renewalTimer !== undefined) {
+			this.clearTimer(this.renewalTimer);
+			this.renewalTimer = undefined;
+		}
+		this.renewalRetryAttempt = 0;
+	}
+
+	private setStatus(status: DevTunnelRuntimeStatus): void {
+		this.status = status;
+		for (const listener of this.statusListeners) {
+			try {
+				listener();
+			} catch (error: unknown) {
+				try {
+					this.reportStatusListenerError(error);
+				} catch {
+					process.emitWarning('A Dev Tunnel status listener and its error reporter failed.', {
+						code: 'DEVTUNNEL_STATUS_LISTENER_FAILED',
+					});
+				}
+			}
 		}
 	}
 
@@ -1282,6 +1478,13 @@ function validateEquivalentRequest(
 
 function addDuration(date: Date, duration: `${number}h` | `${number}d`): Date {
 	return new Date(date.valueOf() + parseDuration(duration));
+}
+
+function renewalLeadMs(durationMs: number): number {
+	const proportionalLead = Math.max(60_000, Math.floor(durationMs / 10));
+	return durationMs >= 2 * dayMs
+		? Math.max(dayMs, proportionalLead)
+		: Math.min(Math.floor(durationMs / 2), proportionalLead);
 }
 
 function parseDuration(duration: `${number}h` | `${number}d`): number {

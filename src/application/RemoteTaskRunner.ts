@@ -445,6 +445,13 @@ export class RemoteTaskRunner implements TaskService {
 					summary: boundUtf8(event.text, 16_384),
 				});
 				return;
+			case 'outputTruncated':
+				await this.transition(running.peerId, running.taskId, {
+					type: 'outputTruncated',
+					at: this.now().toISOString(),
+					summary: boundUtf8(event.message, 16_384),
+				});
+				return;
 			case 'tool':
 				await this.transition(running.peerId, running.taskId, {
 					type: 'tool',

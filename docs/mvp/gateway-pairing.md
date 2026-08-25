@@ -117,7 +117,11 @@ Unknown or conflicting readback preserves keys and fails closed.
 - Pre-authentication: 64 KiB frames, 8 messages per 10 seconds, 30-second deadline.
 - Listener: 16 global unauthenticated sockets and best-effort 4 per source.
 - WebSocket payload: 1 MiB; text JSON only.
-- Outbox: serialized UTF-8 accounting, 256 KiB or 128 events, including `bufferedAmount`.
+- Outbox: serialized UTF-8 accounting with `bufferedAmount`; ordinary progress/output uses
+  256 KiB or 128 events, while one schema-valid critical/snapshot frame up to 1 MiB has
+  reserved capacity. Total pending transport data is bounded at 1 MiB + 256 KiB and 144
+  events. Progress coalesces by task and output pressure emits one truncated marker per
+  episode; a single frame over 1 MiB closes with `1009`.
 - Post-authentication: WS ping every 10 seconds; terminate after 30 seconds without pong.
 - Reconnect: full jitter, exponential ceiling from 1 to 30 seconds; reset only after 30 stable seconds.
 - Handshake lifecycle: every async hello boundary checks its connection generation; socket disposal

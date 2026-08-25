@@ -60,16 +60,23 @@ revision even when an older request has not resolved.
 
 ## Task lifecycle
 
-The coordinator persists a semantic-hash `DelegationIntent`, UUID task ID, UUID delegation
-ID, and deadline before sending `task.start`. Lost acknowledgements retry the same IDs.
+The coordinator persists a semantic-hash `DelegationIntent`, UUID task ID, explicit invocation
+ID, and deadline before sending `task.start`. The Tool generates a fresh invocation ID when the
+caller omits one. Lost acknowledgements and in-flight retries reuse the returned invocation ID
+with the exact payload to recover the same task; reusing an ID with different semantics fails
+with `TASK_ID_CONFLICT`. Terminal intents remain append-only audit history, but never globally
+deduplicate a later fresh invocation with the same semantics.
 Worker start verifies ownership, resolves only an opaque registered workspace ID, checks the
 Agent Host feature/probe, acquires the workspace lease, and atomically persists `accepted`
 before launching `AgentRuntime.start`.
 
 The first task for a peer/workspace pair requires local confirmation. “Always allow” stores
 only the non-sensitive pair grant; each accepted task is still explicitly pre-authorized for
-the runtime confirmation boundary. Runtime progress, bounded output, input, cancellation,
-and terminal reducer events are persisted before change notifications. `task.get` reports
+the runtime confirmation boundary. Runtime events use a byte-and-count-bounded queue:
+progress coalesces, nonterminal output truncates or drops with one explicit truncation event
+per pressure episode, and tool/control/terminal events apply backpressure instead of being
+discarded. The serial consumer persists every retained input, cancellation, and terminal
+reducer event before change notifications. `task.get` reports
 retained event gaps, and cancel has a worker deadline that fails with
 `TASK_CANCELLATION_UNCONFIRMED` if no terminal confirmation arrives.
 

@@ -69,6 +69,17 @@ index-zero anonymous/connect ACE with the persisted expiration. Renewal then use
 or a failure after deletion starts opens `TUNNEL_ACCESS_EXPIRED`; a timeout or network
 failure while inspecting the ACE remains transient and performs no deletion.
 
+After the provider reaches `ready`, a lifecycle-owned timer renews the ACE before
+expiration. Long leases renew at least 24 hours early and short leases use a
+proportional lead that cannot loop immediately. Scheduled and manual renewal
+share one serialized operation; success persists and publishes the new
+expiration before scheduling the next renewal. Transient pre-delete failures
+retry only a bounded number of times before the current ACE expires. Expiration
+or any destructive renewal failure opens `TUNNEL_ACCESS_EXPIRED`, stops the
+owned host, and propagates an error state so the Listener and dashboard no
+longer report a running/copy-ready endpoint. `stop()` and `dispose()` cancel the
+timer and abort stale lifecycle work.
+
 Before the exact-2030 host fallback starts, `show --json` must contain no additional ports
 and the ACE list must match persisted ownership metadata. An unexpected host exit starts
 full-jitter bounded backoff. Every restart reloads metadata, refuses an expired ACE with

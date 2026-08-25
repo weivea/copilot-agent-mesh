@@ -91,6 +91,27 @@ suite('TaskToolsCore', () => {
 		});
 	});
 
+	test('generates a fresh delegation identity when the caller omits one', async () => {
+		const facade = new RecordingFacade();
+		const generatedIds = [
+			'00000000-0000-4000-8000-000000000008',
+			'00000000-0000-4000-8000-000000000009',
+		];
+		const core = new TaskToolsCore(facade, { id: () => generatedIds.shift()! });
+		const { delegationRequestId: _delegationRequestId, ...freshInput } = delegationInput();
+
+		await core.delegateTask(freshInput);
+		await core.delegateTask(freshInput);
+
+		assert.deepStrictEqual(
+			facade.persistedIntents.map(({ delegationRequestId }) => delegationRequestId),
+			[
+				'00000000-0000-4000-8000-000000000008',
+				'00000000-0000-4000-8000-000000000009',
+			],
+		);
+	});
+
 	test('a cancelled acknowledgement wait retains intent and never requests remote cancellation', async () => {
 		const facade = new RecordingFacade();
 		facade.acceptance = new Promise(() => undefined);
@@ -136,8 +157,9 @@ suite('TaskToolsCore', () => {
 		const facade = new RecordingFacade();
 		facade.persistence = new Promise(() => undefined);
 		const clock = new ManualClock();
-		const core = new TaskToolsCore(facade, { clock });
-		const invocation = core.delegateTask(delegationInput());
+		const core = new TaskToolsCore(facade, { clock, id: () => DELEGATION_ID });
+		const { delegationRequestId: _delegationRequestId, ...freshInput } = delegationInput();
+		const invocation = core.delegateTask(freshInput);
 		await Promise.resolve();
 		await Promise.resolve();
 
@@ -147,12 +169,14 @@ suite('TaskToolsCore', () => {
 		assert.deepStrictEqual(result, {
 			status: 'pending',
 			phase: 'persisting',
+			delegationRequestId: DELEGATION_ID,
 			waitStatus: 'timeout',
 			reconciliationPending: true,
 			retrySameIntent: true,
 			retryTool: MESH_TOOL_NAMES.delegateTask,
 		});
 		assert.equal(facade.acceptanceWaits, 0);
+		assert.equal(facade.persistedIntents[0]?.delegationRequestId, DELEGATION_ID);
 		assert.equal(clock.activeTimers, 0);
 	});
 
@@ -207,7 +231,7 @@ suite('TaskToolsCore', () => {
 		assert.equal(facade.acceptanceWaits, 1);
 	});
 
-	test('a duplicate retry relies on durable Facade recovery and keeps the same IDs', async () => {
+	test('an explicit ACK retry relies on durable Facade recovery and keeps the same IDs', async () => {
 		const facade = new RecordingFacade();
 		facade.persisted = {
 			delegationRequestId: DELEGATION_ID,
@@ -898,7 +922,7 @@ suite('TaskToolsCore', () => {
 
 		const serialized = await serializeToolResultToTokenBudget(result, 100, countCharacters);
 
-		assert.deepStrictEqual(JSON.parse(serialized), { s: 3, r: 1 });
+		assert.deepStrictEqual(JSON.parse(serialized), { s: 3, d: DELEGATION_ID, r: 1 });
 		assert.ok(serialized.length <= 100);
 	});
 
@@ -997,6 +1021,11 @@ suite('Mesh tool manifest contract', () => {
 		assert.ok(delegateDescriptor);
 		assert.match(delegateDescriptor.modelDescription, /s state/);
 		assert.match(delegateDescriptor.modelDescription, /retry the exact same intent/);
+		const delegateProperties = delegateDescriptor.inputSchema.properties as Record<string, unknown>;
+		assert.ok(delegateProperties.delegationRequestId);
+		const delegateRequired = delegateDescriptor.inputSchema.required;
+		assert.ok(!Array.isArray(delegateRequired)
+			|| !delegateRequired.includes('delegationRequestId'));
 		const getDescriptor = MESH_TOOL_MANIFEST_DESCRIPTORS.find(
 			({ name }) => name === MESH_TOOL_NAMES.getTask,
 		);
@@ -1018,6 +1047,7 @@ suite('Mesh tool manifest contract', () => {
 
 function delegationInput(): DelegationIntentInput {
 	return {
+		delegationRequestId: DELEGATION_ID,
 		peerId: PEER_ID,
 		workspaceId: WORKSPACE_ID,
 		title: 'Fix scheduler',
@@ -1078,6 +1108,7 @@ class RecordingFacade implements TaskToolFacade {
 	responseTaskId?: string;
 	callOrder: string[] = [];
 	lastAcceptanceSignal?: AbortSignal;
+	persistedIntents: DelegationIntentInput[] = [];
 
 	async listWorkers(_signal: AbortSignal): Promise<MeshWorkerDirectorySnapshot> {
 		if (this.listError !== undefined) {
@@ -1086,10 +1117,14 @@ class RecordingFacade implements TaskToolFacade {
 		return this.workers;
 	}
 
-	async persistDelegationIntent(_intent: DelegationIntentInput): Promise<PersistedDelegationIntent> {
+	async persistDelegationIntent(intent: DelegationIntentInput): Promise<PersistedDelegationIntent> {
 		this.persistCalls += 1;
 		this.callOrder.push('persist');
-		return this.persistence ?? this.persisted;
+		this.persistedIntents.push(intent);
+		return this.persistence ?? {
+			...this.persisted,
+			delegationRequestId: intent.delegationRequestId ?? this.persisted.delegationRequestId,
+		};
 	}
 
 	async waitForDelegationAcceptance(

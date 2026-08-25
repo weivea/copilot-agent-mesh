@@ -220,8 +220,10 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 					},
 				canStart: workerOwnedHere && !listenerUnsupported
 					&& (listener.state === 'stopped' || listener.state === 'error'),
-				canStop: listener.state === 'running' || listener.state === 'starting',
-				canCopyConnectionUrl: listener.state === 'running',
+				canStop: listener.state === 'running'
+					|| listener.state === 'starting'
+					|| (listener.state === 'error' && listener.error?.code === 'LISTENER_STOP_FAILED'),
+				canCopyConnectionUrl: listener.state === 'running' && tunnelReady,
 			},
 			workspaces: localWorkspaces.map((workspace) => ({
 				workspaceId: workspace.workspaceId,

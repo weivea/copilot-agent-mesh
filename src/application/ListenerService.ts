@@ -64,6 +64,7 @@ export class ListenerService {
 	private lastError: ListenerSnapshot['error'];
 	private disposed = false;
 	private ownsResources = false;
+	private readonly tunnelSubscription: { dispose(): void } | undefined;
 
 	public constructor(
 		private readonly deviceId: string,
@@ -73,7 +74,9 @@ export class ListenerService {
 		private readonly metadata: StateStore,
 		private readonly guard: LocalDesktopWorkspaceGuard,
 		private readonly options: ListenerServiceOptions = {},
-	) {}
+	) {
+		this.tunnelSubscription = tunnel.onDidChange?.(() => this.tunnelChanged());
+	}
 
 	public async restore(): Promise<void> {
 		await this.options.ownership?.assertOwner();
@@ -114,10 +117,15 @@ export class ListenerService {
 	public async createConnectionUrl(): Promise<string> {
 		await this.options.ownership?.assertOwner();
 		this.guard.assertAllowed({ requireWorkspace: false });
-		if (this.state !== 'running' || this.hosted === undefined) {
+		const tunnelStatus = this.tunnel.getStatus();
+		if (
+			this.state !== 'running'
+			|| this.hosted === undefined
+			|| tunnelStatus.state !== 'ready'
+		) {
 			throw new Error('Start the listener before creating a connection URL.');
 		}
-		return (await this.pairing.createInvitation(this.hosted.forwardingOrigin)).url;
+		return (await this.pairing.createInvitation(tunnelStatus.tunnel.forwardingOrigin)).url;
 	}
 
 	public snapshot(): ListenerSnapshot {
@@ -165,7 +173,7 @@ export class ListenerService {
 		if (this.state === 'running') {
 			return;
 		}
-		if (this.gateway !== undefined || this.hosted !== undefined) {
+		if (this.state === 'error' || this.gateway !== undefined || this.hosted !== undefined) {
 			await this.stopCore(false);
 		}
 		this.ownsResources = true;
@@ -331,6 +339,7 @@ export class ListenerService {
 		this.lastError = undefined;
 		this.disposed = true;
 		this.ownsResources = false;
+		this.tunnelSubscription?.dispose();
 		this.listeners.clear();
 	}
 
@@ -361,6 +370,63 @@ export class ListenerService {
 	private changed(): void {
 		for (const listener of this.listeners) {
 			listener();
+		}
+	}
+
+	private tunnelChanged(): void {
+		if (this.disposed) {
+			return;
+		}
+		const status = this.tunnel.getStatus();
+		if (status.state === 'ready' && this.state === 'running') {
+			this.hosted = status.tunnel;
+			this.changed();
+			return;
+		}
+		if (status.state === 'backoff') {
+			this.changed();
+			return;
+		}
+		if (status.state === 'cleanup-failed') {
+			if (this.state === 'running' || this.state === 'starting') {
+				this.hosted = undefined;
+				this.state = 'error';
+				this.lastError = {
+					code: 'LISTENER_STOP_FAILED',
+					message: status.message,
+				};
+			}
+			this.changed();
+			return;
+		}
+		if (status.state === 'circuit-open' && (this.state === 'running' || this.state === 'starting')) {
+			const gateway = this.gateway;
+			this.hosted = undefined;
+			this.state = 'error';
+			this.lastError = {
+				code: status.code,
+				message: status.message ?? 'The Dev Tunnel circuit breaker is open.',
+			};
+			this.changed();
+			if (gateway !== undefined) {
+				void this.serialize(async () => {
+					if (this.gateway !== gateway) {
+						return;
+					}
+					try {
+						await gateway.dispose();
+						if (this.gateway === gateway) {
+							this.gateway = undefined;
+						}
+					} catch {
+						this.lastError = {
+							code: 'LISTENER_STOP_FAILED',
+							message: 'The loopback Gateway could not be stopped after the Dev Tunnel failed.',
+						};
+					}
+					this.changed();
+				});
+			}
 		}
 	}
 }

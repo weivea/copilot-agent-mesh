@@ -12,8 +12,9 @@ export interface TaskToolFacade {
 	listWorkers(signal: AbortSignal): Promise<MeshWorkerDirectorySnapshot>;
 
 	/**
-	 * Resolves only after the intent and both IDs are durable. Repeated exact
-	 * intents must recover the same IDs rather than create another remote task.
+	 * Resolves only after the intent and both IDs are durable. An exact retry
+	 * with the same delegationRequestId recovers the same task, while reusing
+	 * that ID for another payload conflicts. Inputs without an ID are fresh.
 	 */
 	persistDelegationIntent(intent: DelegationIntentInput): Promise<PersistedDelegationIntent>;
 

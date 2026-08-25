@@ -38,6 +38,12 @@ import {
 	type PeerProfileStore,
 } from '../peer/PeerProfile';
 import { WebSocketPeerTransport } from '../peer/WebSocketPeerTransport';
+import {
+	GATEWAY_METHODS,
+	PROTOCOL_LIMITS,
+	methodResultSchemas,
+	utf8ByteLength,
+} from '../../shared/protocol';
 
 suite('Gateway pairing component', { concurrency: 1 }, () => {
 	test('serves an exact private health check and rejects other HTTP routes', async () => {
@@ -116,6 +122,56 @@ suite('Gateway pairing component', { concurrency: 1 }, () => {
 			assert.doesNotMatch(JSON.stringify(profile), /secret=/u);
 		} finally {
 			await manager.dispose();
+			await fixture.dispose();
+		}
+	});
+
+	test('sends a schema-valid 640 KiB task snapshot and keeps the connection usable', async () => {
+		const snapshot = largeTaskSnapshot();
+		assert.equal(
+			methodResultSchemas[GATEWAY_METHODS.taskGet].safeParse(snapshot).success,
+			true,
+		);
+		const responseBytes = utf8ByteLength(JSON.stringify({
+			jsonrpc: '2.0',
+			id: '1',
+			result: snapshot,
+		}));
+		assert.ok(responseBytes > 630 * 1024);
+		assert.ok(responseBytes < PROTOCOL_LIMITS.frameBytes);
+
+		const fixture = await createFixture({ taskGetResult: snapshot });
+		const client = await RawClient.open(fixture.endpoint);
+		try {
+			await pairAndCommit(client, await fixture.invitation(), 'large-snapshot-coordinator');
+			const received = await client.request('task.get', {
+				taskId: snapshot.taskId,
+			}) as typeof snapshot;
+			assert.equal(received.events.length, snapshot.events.length);
+			assert.equal(received.events.at(-1)?.summary, snapshot.events.at(-1)?.summary);
+			assert.deepStrictEqual(
+				await client.request('device.getInfo', {}),
+				{ deviceId: 'worker-device' },
+			);
+			assert.equal(client.readyState, WebSocket.OPEN);
+		} finally {
+			await client.close();
+			await fixture.dispose();
+		}
+	});
+
+	test('closes deterministically when an outbound frame exceeds the protocol limit', async () => {
+		const fixture = await createFixture({
+			taskGetResult: { payload: 'x'.repeat(PROTOCOL_LIMITS.frameBytes) },
+		});
+		const client = await RawClient.open(fixture.endpoint);
+		try {
+			await pairAndCommit(client, await fixture.invitation(), 'oversized-frame-coordinator');
+			const closed = client.closed();
+			client.sendWithoutWaiting('task.get', { taskId: 'oversized-task' });
+			assert.equal(await closed, 1009);
+		} finally {
+			await client.close();
 			await fixture.dispose();
 		}
 	});
@@ -827,6 +883,7 @@ interface FixtureOptions {
 	readonly records?: PairingRecordStore;
 	readonly secrets?: SecretStore;
 	readonly now?: () => number;
+	readonly taskGetResult?: unknown;
 }
 
 async function createFixture(options: FixtureOptions = {}) {
@@ -918,7 +975,7 @@ function createGatewayDependencies(options: FixtureOptions = {}) {
 				taskPeers.push(peerId);
 				return params;
 			},
-			get: async (peerId, taskId) => ({ peerId, taskId }),
+			get: async (peerId, taskId) => options.taskGetResult ?? { peerId, taskId },
 			cancel: async (peerId, taskId) => ({ peerId, taskId }),
 			answer: async (peerId, taskId) => ({ peerId, taskId }),
 		},
@@ -930,6 +987,34 @@ function createGatewayDependencies(options: FixtureOptions = {}) {
 		router,
 		devicePeers,
 		taskPeers,
+	};
+}
+
+function largeTaskSnapshot() {
+	const at = '2026-08-25T09:00:00.000Z';
+	const events = Array.from({ length: 40 }, (_, index) => ({
+		eventSeq: index + 1,
+		at,
+		type: 'output',
+		summary: 'x'.repeat(index === 39 ? 12_000 : PROTOCOL_LIMITS.outputEventBytes),
+	}));
+	return {
+		schemaVersion: 1 as const,
+		taskId: '11111111-1111-4111-8111-111111111111',
+		delegationRequestId: '22222222-2222-4222-8222-222222222222',
+		requestHash: 'a'.repeat(64),
+		peerId: '33333333-3333-4333-8333-333333333333',
+		workspaceId: '44444444-4444-4444-8444-444444444444',
+		title: 'Large journal task',
+		state: 'completed' as const,
+		createdAt: at,
+		updatedAt: at,
+		eventSeq: events.length,
+		workerDeadline: '2026-08-25T10:00:00.000Z',
+		summary: 'Completed',
+		events,
+		eventsTruncated: false,
+		deviceId: '55555555-5555-4555-8555-555555555555',
 	};
 }
 

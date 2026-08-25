@@ -30,6 +30,8 @@ import {
 	AgentRuntimeError,
 	AgentRuntimeLifecycle,
 	AsyncEventQueue,
+	AsyncEventQueueCapacityError,
+	createAgentRuntimeEventQueue,
 	type AgentRuntimeEvent,
 	type AgentRuntimeErrorCode,
 	type AgentTaskRequest,
@@ -55,6 +57,120 @@ const initializationOnlyResource = {
 	resource_name: 'Initialization Agent',
 	scopes_supported: ['agent:initialize'],
 };
+
+test('agent event queue stays within count and byte bounds and preserves terminal events under output pressure', async () => {
+	const queue = createAgentRuntimeEventQueue({ maxItems: 8, maxBytes: 512 });
+	for (let index = 0; index < 20_000; index += 1) {
+		await queue.push({ type: 'output', text: `${index}:${'界'.repeat(80)}` });
+		assert.ok(queue.bufferedItems <= 8);
+		assert.ok(queue.bufferedBytes <= 512);
+	}
+
+	const terminalEvents: readonly AgentRuntimeEvent[] = [
+		{ type: 'terminal', summary: 'command finished' },
+		{ type: 'completed' },
+		{ type: 'cancelled' },
+		{ type: 'failed', error: new AgentRuntimeError('TASK_EXECUTION_FAILED', 'failed safely') },
+	];
+	for (const event of terminalEvents) {
+		await queue.push(event);
+		assert.ok(queue.bufferedItems <= 8);
+		assert.ok(queue.bufferedBytes <= 512);
+	}
+	queue.close();
+
+	const retained: AgentRuntimeEvent[] = [];
+	for await (const event of queue) {
+		retained.push(event);
+	}
+	assert.equal(retained.filter(({ type }) => type === 'outputTruncated').length, 1);
+	for (const event of terminalEvents) {
+		assert.ok(retained.some(({ type }) => type === event.type), `${event.type} must be retained`);
+	}
+
+	const oversizedFailure = createAgentRuntimeEventQueue({ maxItems: 1, maxBytes: 256 });
+	await oversizedFailure.push({
+		type: 'failed',
+		error: new AgentRuntimeError('TASK_EXECUTION_FAILED', 'bounded failure '.repeat(2_000)),
+	});
+	assert.equal(oversizedFailure.bufferedItems, 1);
+	assert.ok(oversizedFailure.bufferedBytes <= 256);
+	oversizedFailure.close();
+	assert.equal((await oversizedFailure[Symbol.asyncIterator]().next()).value?.type, 'failed');
+});
+
+test('agent event queue coalesces progress and backpressures nondroppable producers in FIFO order', async () => {
+	const progress = createAgentRuntimeEventQueue({ maxItems: 4, maxBytes: 256 });
+	for (let index = 0; index < 1_000; index += 1) {
+		await progress.push({ type: 'progress', message: `step ${index}` });
+	}
+	assert.equal(progress.bufferedItems, 1);
+	assert.deepEqual(await progress[Symbol.asyncIterator]().next(), {
+		done: false,
+		value: { type: 'progress', message: 'step 999' },
+	});
+	progress.close();
+
+	const queue = new AsyncEventQueue<string>({
+		maxItems: 2,
+		maxBytes: 16,
+		sizeOf: (value) => Buffer.byteLength(value),
+	});
+	await queue.push('first');
+	await queue.push('second');
+	let thirdSettled = false;
+	const third = queue.push('third').then((result) => {
+		thirdSettled = true;
+		return result;
+	});
+	await Promise.resolve();
+	assert.equal(thirdSettled, false);
+
+	const iterator = queue[Symbol.asyncIterator]();
+	assert.deepEqual(await iterator.next(), { done: false, value: 'first' });
+	assert.equal(await third, true);
+	assert.ok(queue.bufferedItems <= 2);
+	assert.ok(queue.bufferedBytes <= 16);
+	queue.close();
+	assert.deepEqual(await iterator.next(), { done: false, value: 'second' });
+	assert.deepEqual(await iterator.next(), { done: false, value: 'third' });
+	assert.deepEqual(await iterator.next(), { done: true, value: undefined });
+});
+
+test('agent event queue enforces byte limits with a waiting consumer', async () => {
+	const queue = new AsyncEventQueue<string>({
+		maxItems: 2,
+		maxBytes: 4,
+		sizeOf: (value) => Buffer.byteLength(value, 'utf8'),
+	});
+	const next = queue[Symbol.asyncIterator]().next();
+
+	await assert.rejects(queue.push('oversized'), AsyncEventQueueCapacityError);
+	assert.equal(queue.bufferedItems, 0);
+	queue.close();
+	assert.equal((await next).done, true);
+});
+
+test('agent event queue bounds pending producers and seals atomically on terminal admission', async () => {
+	const queue = new AsyncEventQueue<string>({
+		maxItems: 1,
+		maxBytes: 16,
+		sizeOf: (value) => Buffer.byteLength(value, 'utf8'),
+	});
+	await queue.push('first');
+	const blocked = queue.push('second');
+
+	await assert.rejects(queue.push('third'), AsyncEventQueueCapacityError);
+	const terminal = queue.pushAndClose('terminal');
+	assert.equal(await queue.push('late'), false);
+	assert.equal(await blocked, false);
+
+	const iterator = queue[Symbol.asyncIterator]();
+	assert.deepEqual(await iterator.next(), { done: false, value: 'first' });
+	assert.equal(await terminal, true);
+	assert.deepEqual(await iterator.next(), { done: false, value: 'terminal' });
+	assert.deepEqual(await iterator.next(), { done: true, value: undefined });
+});
 
 test('runtime lifecycle awaits detached asynchronous cleanup and shares the same disposal', async () => {
 	const lifecycle = new AgentRuntimeLifecycle();
@@ -373,6 +489,36 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 	assert.equal((await nextEvent(handle.events)).type, 'cancelled');
 	await handle.dispose();
 	assert.equal(launcher.host.disposed, true);
+});
+
+test('AHP subscription pump applies bounded output pressure before accepting terminal completion', async () => {
+	const transport = new FakeAhpTransport();
+	const launcher = new FakeLauncher();
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+
+	for (let index = 0; index < 10_000; index += 1) {
+		await transport.emitChat({
+			type: 'chat/delta',
+			turnId: 'turn-1',
+			partId: `part-${index}`,
+			content: `${index}:${'x'.repeat(1_000)}`,
+		});
+	}
+	await transport.emitChat({
+		type: 'chat/turnComplete',
+		turnId: 'turn-1',
+		duration: 1,
+	});
+
+	const events: AgentRuntimeEvent[] = [];
+	for await (const event of handle.events) {
+		events.push(event);
+	}
+	assert.ok(events.some(({ type }) => type === 'outputTruncated'));
+	assert.equal(events.at(-1)?.type, 'completed');
+	await handle.dispose();
 });
 
 test('runtime resolves workspace IDs through the trusted registry and ignores forged caller metadata', async () => {
@@ -2040,19 +2186,19 @@ class FakeAhpTransport implements AhpConnection {
 		assert.equal(this.shutdownComplete, false, 'AHP request was issued after connection shutdown.');
 	}
 
-	emitChat(action: Record<string, unknown>): void {
-		this.emit('ahp-chat:/default', action);
+	emitChat(action: Record<string, unknown>): Promise<boolean> {
+		return this.emit('ahp-chat:/default', action);
 	}
 
-	emitRootAuth(resources: readonly ProtectedResource[]): void {
-		this.queue('ahp-root://').push({
+	emitRootAuth(resources: readonly ProtectedResource[]): Promise<boolean> {
+		return this.queue('ahp-root://').push({
 			type: 'authRequired',
 			params: { resources },
 		});
 	}
 
-	emitRootAction(action: Record<string, unknown>): void {
-		this.emit('ahp-root://', action);
+	emitRootAction(action: Record<string, unknown>): Promise<boolean> {
+		return this.emit('ahp-root://', action);
 	}
 
 	failChat(): void {
@@ -2067,8 +2213,8 @@ class FakeAhpTransport implements AhpConnection {
 		channel: string,
 		action: Record<string, unknown>,
 		origin?: { readonly clientId: string; readonly clientSeq: number },
-	): void {
-		this.queue(channel).push({
+	): Promise<boolean> {
+		return this.queue(channel).push({
 			type: 'action',
 			params: envelope(channel, action, 4, origin),
 		});
@@ -2088,8 +2234,8 @@ class FakeSubscription implements AhpSubscription {
 	private readonly queue = new AsyncEventQueue<AhpSubscriptionEvent>();
 	private failure: Error | undefined;
 
-	push(event: AhpSubscriptionEvent): void {
-		this.queue.push(event);
+	push(event: AhpSubscriptionEvent): Promise<boolean> {
+		return this.queue.push(event);
 	}
 
 	fail(error: Error): void {

@@ -310,6 +310,52 @@ test('ListenerService creates an exact service-compatible ownership label', asyn
 	await listener.dispose();
 });
 
+test('ListenerService stops reporting running and copy-ready after tunnel access expires', async () => {
+	const tunnel = new RecordingTunnel();
+	const gateway = new RecordingGateway();
+	const listener = createListener(tunnel, gateway, new RecordingPairing());
+	let changes = 0;
+	const subscription = listener.onDidChange(() => {
+		changes += 1;
+	});
+	await listener.start();
+
+	tunnel.expireAccess();
+
+	const snapshot = listener.snapshot();
+	assert.equal(snapshot.state, 'error');
+	assert.equal(snapshot.error?.code, 'TUNNEL_ACCESS_EXPIRED');
+	assert.equal(snapshot.forwardingOrigin, undefined);
+	await assert.rejects(listener.createConnectionUrl(), /Start the listener/u);
+	assert.ok(changes >= 3);
+	await settleMicrotasks();
+	assert.equal(gateway.disposeCalls, 1);
+
+	await listener.start();
+	assert.equal(listener.snapshot().state, 'running');
+	assert.equal(tunnel.stopCalls, 1);
+	subscription.dispose();
+	await listener.dispose();
+});
+
+test('ListenerService publishes transient tunnel backoff without reporting a copy-ready endpoint', async () => {
+	const tunnel = new RecordingTunnel();
+	const listener = createListener(tunnel, new RecordingGateway(), new RecordingPairing());
+	let changes = 0;
+	listener.onDidChange(() => {
+		changes += 1;
+	});
+	await listener.start();
+	const beforeBackoff = changes;
+
+	tunnel.enterBackoff();
+
+	assert.equal(listener.snapshot().tunnel.state, 'backoff');
+	assert.equal(changes, beforeBackoff + 1);
+	await assert.rejects(listener.createConnectionUrl(), /Start the listener/u);
+	await listener.dispose();
+});
+
 test('ListenerService dispose succeeds after a prior stop failure and releases all ownership', async () => {
 	const tunnel = new RecordingTunnel();
 	tunnel.stopFailures = 1;
@@ -445,6 +491,7 @@ class RecordingTunnel implements DevTunnelProvider {
 	public stopFailures = 0;
 	public ensureFailures = 0;
 	public lastRequest: TunnelRequest | undefined;
+	private readonly listeners = new Set<() => void>();
 	private status: DevTunnelRuntimeStatus = { state: 'stopped' };
 
 	public async probe(): Promise<TunnelCapability> {
@@ -497,6 +544,39 @@ class RecordingTunnel implements DevTunnelProvider {
 	public getStatus(): DevTunnelRuntimeStatus {
 		return this.status;
 	}
+
+	public onDidChange(listener: () => void): { dispose(): void } {
+		this.listeners.add(listener);
+		return { dispose: () => this.listeners.delete(listener) };
+	}
+
+	public expireAccess(): void {
+		this.status = {
+			state: 'circuit-open',
+			code: 'TUNNEL_ACCESS_EXPIRED',
+			message: 'The owned anonymous access entry has expired.',
+		};
+		for (const listener of this.listeners) {
+			listener();
+		}
+	}
+
+	public enterBackoff(): void {
+		this.status = {
+			state: 'backoff',
+			attempt: 1,
+			retryAt: '2026-08-25T10:00:00.000Z',
+		};
+		for (const listener of this.listeners) {
+			listener();
+		}
+	}
+}
+
+async function settleMicrotasks(): Promise<void> {
+	await Promise.resolve();
+	await Promise.resolve();
+	await Promise.resolve();
 }
 
 function closeServer(server: Server): Promise<void> {

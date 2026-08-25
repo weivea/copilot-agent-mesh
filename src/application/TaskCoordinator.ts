@@ -132,8 +132,14 @@ export class TaskCoordinator implements TaskToolFacade {
 			await this.assertOwner();
 			const requestHash = hashIntent(input);
 			const state = this.read();
-			const existing = state.intents.find((intent) => intent.requestHash === requestHash);
+			const delegationRequestId = input.delegationRequestId ?? this.id();
+			const existing = state.intents.find(
+				(intent) => intent.delegationRequestId === delegationRequestId,
+			);
 			if (existing !== undefined) {
+				if (existing.requestHash !== requestHash) {
+					throw new TaskToolFacadeError('TASK_ID_CONFLICT');
+				}
 				this.intentPayloads.set(existing.taskId, {
 					...input,
 					acceptanceCriteria: [...input.acceptanceCriteria],
@@ -148,7 +154,7 @@ export class TaskCoordinator implements TaskToolFacade {
 			const timeoutMinutes = input.timeoutMinutes ?? 60;
 			const intent: StoredDelegationIntent = {
 				schemaVersion: 1,
-				delegationRequestId: this.id(),
+				delegationRequestId,
 				taskId: this.id(),
 				requestHash,
 				peerId: input.peerId,
