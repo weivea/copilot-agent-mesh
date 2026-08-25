@@ -407,6 +407,62 @@ suite('TaskToolsCore', () => {
 		assert.equal(await countTokens(boundary), expected.length);
 	});
 
+	test('preserves the minimal needsInput contract at a 300-character token budget', async () => {
+		const facade = new RecordingFacade();
+		const taskId = 't'.repeat(64);
+		const inputId = 'i'.repeat(64);
+		facade.taskRead = {
+			snapshot: {
+				taskId,
+				status: 'needsInput',
+				title: 'n'.repeat(256),
+				updatedAt: '2026-08-25T00:00:00.000Z',
+				phase: 'p'.repeat(256),
+				validation: { status: 'failed', summary: 'v'.repeat(16 * 1024) },
+				pendingInput: {
+					inputId,
+					prompt: 'q'.repeat(16 * 1024),
+					choices: Array.from({ length: 32 }, () => 'c'.repeat(4 * 1024)),
+				},
+			},
+			eventCursor: 0,
+			events: [],
+			truncated: false,
+		};
+		const coreResult = await new TaskToolsCore(facade).getTask({ taskId });
+		const countCharacters = async (text: string): Promise<number> => text.length;
+
+		const atThreeHundred = await serializeToolResultToTokenBudget(
+			coreResult,
+			300,
+			countCharacters,
+		);
+		const parsed = JSON.parse(atThreeHundred) as Record<string, unknown>;
+		const task = parsed.task as Record<string, unknown>;
+		const pendingInput = task.pendingInput as Record<string, unknown>;
+		const exactBoundary = await serializeToolResultToTokenBudget(
+			coreResult,
+			atThreeHundred.length,
+			countCharacters,
+		);
+		const belowBoundary = await serializeToolResultToTokenBudget(
+			coreResult,
+			atThreeHundred.length - 1,
+			countCharacters,
+		);
+
+		assert.ok(atThreeHundred.length <= 300);
+		assert.equal(parsed.status, 'ok');
+		assert.equal(task.taskId, taskId);
+		assert.equal(task.status, 'needsInput');
+		assert.equal(task.truncated, true);
+		assert.equal(pendingInput.inputId, inputId);
+		assert.equal(pendingInput.prompt, 'q');
+		assert.equal(pendingInput.answerTool, MESH_TOOL_NAMES.answerTask);
+		assert.equal(exactBoundary, atThreeHundred);
+		assert.ok(belowBoundary.length <= atThreeHundred.length - 1);
+	});
+
 	test('disposes deadline timers after success, failure, cancellation, and concurrent calls', async () => {
 		const clock = new ManualClock();
 		const facade = new RecordingFacade();

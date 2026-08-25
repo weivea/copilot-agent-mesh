@@ -1155,6 +1155,10 @@ function shrinkToolResult(value: ToolJsonResult): ToolJsonResult | undefined {
 			const { artifacts: _artifacts, ...withoutArtifacts } = snapshot;
 			return { ...value, snapshot: withoutArtifacts, truncated: true };
 		}
+		if (snapshot.phase !== undefined) {
+			const { phase: _phase, ...withoutPhase } = snapshot;
+			return { ...value, snapshot: withoutPhase, truncated: true };
+		}
 		if (isRecord(snapshot.validation) && snapshot.validation.summary !== undefined) {
 			const { summary: _summary, ...compactValidation } = snapshot.validation;
 			return {
@@ -1162,6 +1166,10 @@ function shrinkToolResult(value: ToolJsonResult): ToolJsonResult | undefined {
 				snapshot: { ...snapshot, validation: compactValidation },
 				truncated: true,
 			};
+		}
+		if (snapshot.validation !== undefined) {
+			const { validation: _validation, ...withoutValidation } = snapshot;
+			return { ...value, snapshot: withoutValidation, truncated: true };
 		}
 		if (isRecord(snapshot.pendingInput)) {
 			const pendingInput = snapshot.pendingInput;
@@ -1171,6 +1179,17 @@ function shrinkToolResult(value: ToolJsonResult): ToolJsonResult | undefined {
 					snapshot: {
 						...snapshot,
 						pendingInput: { ...pendingInput, choices: pendingInput.choices.slice(0, -1) },
+					},
+					truncated: true,
+				};
+			}
+			if (Array.isArray(pendingInput.choices)) {
+				const { choices: _choices, ...withoutChoices } = pendingInput;
+				return {
+					...value,
+					snapshot: {
+						...snapshot,
+						pendingInput: withoutChoices,
 					},
 					truncated: true,
 				};
@@ -1186,6 +1205,26 @@ function shrinkToolResult(value: ToolJsonResult): ToolJsonResult | undefined {
 						},
 					},
 					truncated: true,
+				};
+			}
+			if (
+				snapshot.status === 'needsInput'
+				&& typeof snapshot.taskId === 'string'
+				&& typeof pendingInput.inputId === 'string'
+				&& typeof pendingInput.prompt === 'string'
+			) {
+				return {
+					status: typeof value.status === 'string' ? value.status : 'ok',
+					task: {
+						taskId: snapshot.taskId,
+						status: 'needsInput',
+						pendingInput: {
+							inputId: pendingInput.inputId,
+							prompt: pendingInput.prompt,
+							answerTool: MESH_TOOL_NAMES.answerTask,
+						},
+						truncated: true,
+					},
 				};
 			}
 		}
