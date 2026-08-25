@@ -6,8 +6,13 @@ import { PROTOCOL_LIMITS, utf8ByteLength, utf8String } from './limits';
 import { methodParamsSchemas } from './methods';
 
 const rpcIdSchema = utf8String(PROTOCOL_LIMITS.identifierBytes, 'JSON-RPC id', 1);
+export const SAFE_JSON_LIMITS = {
+	maxDepth: 128,
+	maxNodes: 65_536,
+} as const;
+
 export const safeJsonValueSchema: z.ZodType<unknown> = z.unknown().refine(
-	(value) => isSafeJsonValue(value, new WeakSet()),
+	(value) => isSafeJsonValue(value),
 	'Value must be JSON-compatible and contain no dangerous object keys',
 );
 
@@ -73,37 +78,85 @@ export function safeParseJsonText(
 		return { success: false, reason: 'INVALID_JSON' };
 	}
 
-	const parsed = schema.safeParse(decoded);
+	let parsed: z.ZodSafeParseResult<unknown>;
+	try {
+		parsed = schema.safeParse(decoded);
+	} catch {
+		return { success: false, reason: 'INVALID_MESSAGE' };
+	}
 	return parsed.success
 		? { success: true, data: parsed.data }
 		: { success: false, reason: 'INVALID_MESSAGE', error: parsed.error };
 }
 
-function isSafeJsonValue(value: unknown, visited: WeakSet<object>): boolean {
-	if (
-		value === null
-		|| typeof value === 'string'
-		|| typeof value === 'boolean'
-	) {
+function isSafeJsonValue(root: unknown): boolean {
+	const pending: Array<{ readonly value: unknown; readonly depth: number }> = [
+		{ value: root, depth: 0 },
+	];
+	const visited = new WeakSet<object>();
+	let nodeCount = 0;
+
+	try {
+		while (pending.length > 0) {
+			const current = pending.pop();
+			if (current === undefined) {
+				return false;
+			}
+			nodeCount += 1;
+			if (
+				current.depth > SAFE_JSON_LIMITS.maxDepth
+				|| nodeCount > SAFE_JSON_LIMITS.maxNodes
+			) {
+				return false;
+			}
+
+			const value = current.value;
+			if (
+				value === null
+				|| typeof value === 'string'
+				|| typeof value === 'boolean'
+			) {
+				continue;
+			}
+			if (typeof value === 'number') {
+				if (!Number.isFinite(value)) {
+					return false;
+				}
+				continue;
+			}
+			if (typeof value !== 'object' || visited.has(value)) {
+				return false;
+			}
+
+			visited.add(value);
+			const entries: readonly unknown[] = Array.isArray(value)
+				? value
+				: objectValues(value);
+			if (nodeCount + pending.length + entries.length > SAFE_JSON_LIMITS.maxNodes) {
+				return false;
+			}
+			for (let index = entries.length - 1; index >= 0; index -= 1) {
+				pending.push({
+					value: entries[index],
+					depth: current.depth + 1,
+				});
+			}
+		}
 		return true;
-	}
-	if (typeof value === 'number') {
-		return Number.isFinite(value);
-	}
-	if (typeof value !== 'object' || visited.has(value)) {
+	} catch {
 		return false;
 	}
+}
 
-	visited.add(value);
-	if (Array.isArray(value)) {
-		return value.every((entry) => isSafeJsonValue(entry, visited));
-	}
+function objectValues(value: object): readonly unknown[] {
 	const prototype = Object.getPrototypeOf(value);
 	if (prototype !== Object.prototype && prototype !== null) {
-		return false;
+		throw new TypeError('JSON object must have a plain prototype.');
 	}
-	return Object.keys(value).every((key) =>
-		!['__proto__', 'prototype', 'constructor'].includes(key)
-		&& isSafeJsonValue((value as Record<string, unknown>)[key], visited),
-	);
+	const record = value as Record<string, unknown>;
+	const keys = Object.keys(record);
+	if (keys.some((key) => ['__proto__', 'prototype', 'constructor'].includes(key))) {
+		throw new TypeError('JSON object contains a dangerous key.');
+	}
+	return keys.map((key) => record[key]);
 }

@@ -6,6 +6,7 @@ import {
 } from '../../shared/protocol';
 import { InvalidTaskTransitionError, MeshDomainError } from './errors';
 import type { TaskRecord } from './task';
+import { compactTaskEventJournal } from './taskEvents';
 
 export type TaskDomainEvent =
 	| { readonly type: 'agentStartRequested'; readonly at: string }
@@ -38,7 +39,10 @@ export function taskReducer(record: TaskRecord, event: TaskDomainEvent): TaskRec
 			return transition(
 				requireState(record, event, ['startingAgent', 'recovering']),
 				event,
-				{ state: 'running', recoveryDescriptor: event.recoveryDescriptor },
+				{
+					state: 'running',
+					recoveryDescriptor: event.recoveryDescriptor ?? record.recoveryDescriptor,
+				},
 			);
 		case 'inputRequired':
 			return transition(
@@ -134,7 +138,7 @@ function transition(
 	event: TaskDomainEvent,
 	changes: Partial<TaskRecord> = {},
 ): TaskRecord {
-	return {
+	return compactTaskEventJournal({
 		...record,
 		...changes,
 		updatedAt: event.at,
@@ -147,5 +151,5 @@ function transition(
 				type: event.type,
 			},
 		],
-	};
+	}, event.at);
 }

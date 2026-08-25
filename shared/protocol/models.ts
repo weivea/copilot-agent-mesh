@@ -6,7 +6,7 @@ import {
 	TASK_STATUSES,
 	TERMINAL_TASK_STATUSES,
 } from './constants';
-import { PROTOCOL_LIMITS, utf8String } from './limits';
+import { PROTOCOL_LIMITS, utf8ByteLength, utf8String } from './limits';
 
 export const uuidSchema = z.string().uuid();
 export const timestampSchema = z.string().datetime({ offset: true });
@@ -84,6 +84,52 @@ export const persistedTaskRecordSchema = z.strictObject({
 	events: z.array(taskEventRecordSchema),
 	earliestAvailableEventSeq: z.number().int().positive().optional(),
 	eventsTruncated: z.boolean(),
+}).superRefine((record, context) => {
+	const expectedFirstSequence = record.eventsTruncated
+		? record.earliestAvailableEventSeq
+		: 1;
+	const actualFirstSequence = record.events[0]?.eventSeq ?? record.eventSeq + 1;
+	if (expectedFirstSequence !== actualFirstSequence) {
+		context.addIssue({
+			code: 'custom',
+			path: ['earliestAvailableEventSeq'],
+			message: 'Event gap metadata does not match the retained journal',
+		});
+	}
+	if (!record.eventsTruncated && record.earliestAvailableEventSeq !== undefined) {
+		context.addIssue({
+			code: 'custom',
+			path: ['earliestAvailableEventSeq'],
+			message: 'Untruncated event journals cannot declare a gap',
+		});
+	}
+	for (let index = 0; index < record.events.length; index += 1) {
+		const expectedSequence = actualFirstSequence + index;
+		if (record.events[index].eventSeq !== expectedSequence) {
+			context.addIssue({
+				code: 'custom',
+				path: ['events', index, 'eventSeq'],
+				message: 'Retained event sequences must form a contiguous suffix',
+			});
+		}
+	}
+	if (
+		record.events.length > 0
+		&& record.events[record.events.length - 1].eventSeq !== record.eventSeq
+	) {
+		context.addIssue({
+			code: 'custom',
+			path: ['eventSeq'],
+			message: 'Event sequence must match the newest retained event',
+		});
+	}
+	if (utf8ByteLength(JSON.stringify(record.events)) > PROTOCOL_LIMITS.frameBytes) {
+		context.addIssue({
+			code: 'custom',
+			path: ['events'],
+			message: 'Serialized event journal exceeds 1 MiB',
+		});
+	}
 });
 
 export type PersistedTaskRecord = z.infer<typeof persistedTaskRecordSchema>;

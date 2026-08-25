@@ -9,16 +9,23 @@ import {
 	type OwnedTaskStart,
 	type TaskRecord,
 } from '../domain/task';
+import { systemClock, type Clock } from '../domain/ports';
 import { taskReducer, type TaskDomainEvent } from '../domain/taskReducer';
+import { compactTaskEventJournal } from '../domain/taskEvents';
 import { AtomicFileStore, StorageCorruptionError } from '../storage/AtomicFileStore';
 
 export class FileTaskStore {
 	private mutationQueue: Promise<void> = Promise.resolve();
 
-	public constructor(private readonly files: AtomicFileStore) {}
+	public constructor(
+		private readonly files: AtomicFileStore,
+		private readonly clock: Clock = systemClock,
+	) {}
 
 	public create(record: TaskRecord): Promise<void> {
-		return this.runExclusive(() => this.createUnlocked(record));
+		return this.runExclusive(async () => {
+			await this.createUnlocked(record);
+		});
 	}
 
 	public createIdempotent(
@@ -30,13 +37,14 @@ export class FileTaskStore {
 			if (existing !== undefined) {
 				return { record: existing, created: false };
 			}
-			await this.createUnlocked(record);
-			return { record, created: true };
+			const created = await this.createUnlocked(record);
+			return { record: created, created: true };
 		});
 	}
 
-	private async createUnlocked(record: TaskRecord): Promise<void> {
-		const validated = persistedTaskRecordSchema.safeParse(record);
+	private async createUnlocked(record: TaskRecord): Promise<TaskRecord> {
+		const compacted = compactTaskEventJournal(record, this.clock.now().toISOString());
+		const validated = persistedTaskRecordSchema.safeParse(compacted);
 		if (!validated.success) {
 			throw new TypeError(`Invalid task record: ${validated.error.message}`);
 		}
@@ -45,18 +53,21 @@ export class FileTaskStore {
 			throw new MeshDomainError('TASK_ID_CONFLICT', 'Task already exists.');
 		}
 		await this.files.writeJson(taskPath(record.peerId, record.taskId), validated.data);
+		return validated.data;
 	}
 
 	public async findIdempotentStart(request: OwnedTaskStart): Promise<TaskRecord | undefined> {
 		return matchIdempotentStart(await this.list(), request);
 	}
 
-	private async saveUnlocked(record: TaskRecord): Promise<void> {
-		const validated = persistedTaskRecordSchema.safeParse(record);
+	private async saveUnlocked(record: TaskRecord): Promise<TaskRecord> {
+		const compacted = compactTaskEventJournal(record, this.clock.now().toISOString());
+		const validated = persistedTaskRecordSchema.safeParse(compacted);
 		if (!validated.success) {
 			throw new TypeError(`Invalid task record: ${validated.error.message}`);
 		}
 		await this.files.writeJson(taskPath(record.peerId, record.taskId), validated.data);
+		return validated.data;
 	}
 
 	public transitionOwned(
@@ -116,7 +127,7 @@ export class FileTaskStore {
 	): Promise<TaskRecord> {
 		const updated = taskReducer(current, event);
 		if (updated !== current) {
-			await this.saveUnlocked(updated);
+			return this.saveUnlocked(updated);
 		}
 		return updated;
 	}

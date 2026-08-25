@@ -1,5 +1,6 @@
 import * as assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
+import { z } from 'zod';
 
 import {
 	GATEWAY_METHODS,
@@ -9,6 +10,7 @@ import {
 	rpcErrorResponseSchema,
 	rpcNotificationSchema,
 	rpcRequestSchema,
+	safeParseJsonText,
 	safeParseRpcMessageText,
 	taskStartParamsSchema,
 	utf8ByteLength,
@@ -68,6 +70,25 @@ describe('protocol schemas', () => {
 			'{"jsonrpc":"2.0","id":"request-1","result":{"nested":{"__proto__":{"polluted":true}}}}',
 		);
 		assert.strictEqual(response.success, false);
+	});
+
+	test('rejects deeply nested JSON without recursion or thrown validation errors', () => {
+		const depth = 12_000;
+		const text = `{"jsonrpc":"2.0","id":"request-1","result":${'['.repeat(depth)}null${']'.repeat(depth)}}`;
+		assert.ok(utf8ByteLength(text) < PROTOCOL_LIMITS.unauthenticatedFrameBytes);
+		let result: ReturnType<typeof safeParseRpcMessageText> | undefined;
+		assert.doesNotThrow(() => {
+			result = safeParseRpcMessageText(text, PROTOCOL_LIMITS.unauthenticatedFrameBytes);
+		});
+		assert.strictEqual(result?.success, false);
+
+		const throwingSchema = z.unknown().refine(() => {
+			throw new Error('validator failed');
+		});
+		assert.deepStrictEqual(
+			safeParseJsonText('null', throwingSchema),
+			{ success: false, reason: 'INVALID_MESSAGE' },
+		);
 	});
 
 	test('enforces serialized frame bytes before parsing', () => {

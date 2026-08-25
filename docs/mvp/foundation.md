@@ -14,7 +14,8 @@ runtime and does not inspect or control Git.
 - Network, persistence, and Webview inputs use strict Zod 4 schemas and
   `safeParse`. JSON-RPC batches, unknown methods, unknown authorization fields,
   prototype-pollution shapes, and values over their UTF-8 byte limits are
-  rejected.
+  rejected. Generic JSON values use an iterative validator capped at 128 levels
+  and 65,536 nodes, so adversarial nesting cannot overflow the call stack.
 - `shared/protocol.ts` remains a compatibility export while runtime schemas live
   under `shared/protocol/`.
 - Local workspace URIs exist only in `WorkspaceRegistry` persisted state.
@@ -34,6 +35,9 @@ Terminal states are `completed`, `failed`, `cancelled`, and `timedOut`.
   cancellation begins cannot overwrite `cancelling`.
 - Task access is scoped to the authenticated owner. A different peer receives
   the same `TASK_NOT_FOUND` result as a missing task.
+- Workspace leases are owned by the compound `(peerId, taskId)` identity, so
+  equal task IDs from different peers cannot acquire or release each other's
+  lease.
 - Start idempotency is scoped by peer and checks both `delegationRequestId` and
   `taskId`. Reuse with a different canonical hash returns `TASK_ID_CONFLICT`.
 - The canonical hash uses UTF-8 byte-length-prefixed semantic fields. Prompt,
@@ -54,6 +58,11 @@ transitions, and stores one peer-namespaced task file per task. These task files
 are the recovery authority; in-memory workspace leases are rebuilt from active
 records. A corrupt record fails recovery explicitly rather than producing an
 empty or successful-looking result.
+
+Task event journals retain a contiguous suffix for at most 24 hours and 1 MiB
+of serialized UTF-8 JSON. Truncation updates `earliestAvailableEventSeq` and
+`eventsTruncated`; an individually oversized event is dropped together with all
+older events so gap reporting remains unambiguous.
 
 Persisted task records contain identifiers, owner, workspace, canonical request
 hash, state, bounded summaries/events, and recovery metadata. They do not

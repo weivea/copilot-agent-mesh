@@ -1,15 +1,20 @@
 import * as assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 
-import { ACTIVE_TASK_STATUSES } from '../../../shared/protocol';
+import { ACTIVE_TASK_STATUSES, PROTOCOL_LIMITS } from '../../../shared/protocol';
 import { InvalidTaskTransitionError, MeshDomainError } from '../../domain/errors';
 import {
 	canonicalTaskRequestHash,
 	createAcceptedTask,
 	getOwnedTask,
 	matchIdempotentStart,
+	type TaskRecord,
 } from '../../domain/task';
 import { taskReducer } from '../../domain/taskReducer';
+import {
+	compactTaskEventJournal,
+	taskEventJournalBytes,
+} from '../../domain/taskEvents';
 import { WorkspaceLeaseManager } from '../../tasks/WorkspaceLeaseManager';
 import { AT, DEADLINE, IDS, LATER, taskRequest } from './fixtures';
 
@@ -26,6 +31,7 @@ describe('task domain', () => {
 			inputId: IDS.input,
 			prompt: 'Proceed?',
 		});
+
 		assert.strictEqual(record.state, 'needsInput');
 		record = taskReducer(record, {
 			type: 'inputAnswered',
@@ -40,6 +46,84 @@ describe('task domain', () => {
 		record = taskReducer(record, { type: 'completed', at: LATER, summary: 'Done' });
 		assert.strictEqual(record.state, 'completed');
 		assert.strictEqual(record.eventSeq, 7);
+	});
+
+	test('preserves the recovery descriptor across a second crash', () => {
+		const descriptor = {
+			adapter: 'ahp',
+			sessionId: 'session-1',
+			conversationId: 'conversation-1',
+		};
+		let record: TaskRecord = {
+			...createAcceptedTask(taskRequest(), AT),
+			state: 'startingAgent' as const,
+		};
+		record = taskReducer(record, {
+			type: 'agentStarted',
+			at: LATER,
+			recoveryDescriptor: descriptor,
+		});
+		record = taskReducer(record, { type: 'recoveryStarted', at: LATER });
+		record = taskReducer(record, { type: 'agentStarted', at: LATER });
+		assert.deepStrictEqual(record.recoveryDescriptor, descriptor);
+		record = taskReducer(record, { type: 'recoveryStarted', at: LATER });
+		assert.strictEqual(record.state, 'recovering');
+		assert.deepStrictEqual(record.recoveryDescriptor, descriptor);
+	});
+
+	test('trims event journals by bytes, age, and oversized-event gaps', () => {
+		const largeSummary = 'x'.repeat(PROTOCOL_LIMITS.outputEventBytes);
+		const events = Array.from({ length: 80 }, (_, index) => ({
+			eventSeq: index + 1,
+			at: AT,
+			type: 'task.output',
+			summary: largeSummary,
+		}));
+		const compacted = compactTaskEventJournal({
+			...createAcceptedTask(taskRequest(), AT),
+			eventSeq: events.length,
+			events,
+		}, LATER);
+		assert.ok(taskEventJournalBytes(compacted) <= PROTOCOL_LIMITS.frameBytes);
+		assert.strictEqual(compacted.eventsTruncated, true);
+		assert.strictEqual(
+			compacted.earliestAvailableEventSeq,
+			compacted.events[0].eventSeq,
+		);
+		assert.strictEqual(compacted.events.at(-1)?.eventSeq, events.length);
+
+		const aged = compactTaskEventJournal({
+			...createAcceptedTask(taskRequest(), AT),
+			eventSeq: 2,
+			events: [
+				{
+					eventSeq: 1,
+					at: '2026-08-24T00:59:59.000Z',
+					type: 'old',
+				},
+				{
+					eventSeq: 2,
+					at: LATER,
+					type: 'new',
+				},
+			],
+		}, LATER);
+		assert.deepStrictEqual(aged.events.map((event) => event.eventSeq), [2]);
+		assert.strictEqual(aged.earliestAvailableEventSeq, 2);
+
+		const oversized = compactTaskEventJournal({
+			...createAcceptedTask(taskRequest(), AT),
+			eventSeq: 1,
+			events: [{
+				eventSeq: 1,
+				at: LATER,
+				type: 'oversized',
+				summary: 'x'.repeat(PROTOCOL_LIMITS.frameBytes),
+			}],
+		}, LATER);
+		assert.deepStrictEqual(oversized.events, []);
+		assert.strictEqual(oversized.eventsTruncated, true);
+		assert.strictEqual(oversized.earliestAvailableEventSeq, 2);
 	});
 
 	test('allows every active state to fail or time out', () => {
@@ -192,14 +276,27 @@ describe('task domain', () => {
 
 	test('enforces and restores one lease per workspace', () => {
 		const leases = new WorkspaceLeaseManager();
-		leases.acquire(IDS.workspace, IDS.task);
-		leases.acquire(IDS.workspace, IDS.task);
 		assert.throws(
-			() => leases.acquire(IDS.workspace, IDS.otherTask),
+			() => leases.acquire('invalid', IDS.peer, IDS.task),
+			TypeError,
+		);
+		leases.acquire(IDS.workspace, IDS.peer, IDS.task);
+		leases.acquire(IDS.workspace, IDS.peer, IDS.task);
+		assert.throws(
+			() => leases.acquire(IDS.workspace, IDS.peer, IDS.otherTask),
 			(error) => error instanceof MeshDomainError && error.reason === 'WORKSPACE_BUSY',
 		);
-		leases.release(IDS.workspace, IDS.otherTask);
-		assert.strictEqual(leases.owner(IDS.workspace), IDS.task);
+		leases.release(IDS.workspace, IDS.peer, IDS.otherTask);
+		assert.deepStrictEqual(leases.owner(IDS.workspace), {
+			peerId: IDS.peer,
+			taskId: IDS.task,
+		});
+		leases.release(IDS.workspace, IDS.otherPeer, IDS.task);
+		assert.strictEqual(leases.isLeased(IDS.workspace), true);
+		assert.throws(
+			() => leases.acquire(IDS.workspace, IDS.otherPeer, IDS.task),
+			(error) => error instanceof MeshDomainError && error.reason === 'WORKSPACE_BUSY',
+		);
 		leases.restoreFromTaskRecords([
 			{ ...createAcceptedTask(taskRequest(), AT), state: 'running' },
 			{
@@ -211,13 +308,16 @@ describe('task domain', () => {
 				state: 'completed',
 			},
 		]);
-		assert.strictEqual(leases.owner(IDS.workspace), IDS.task);
+		assert.deepStrictEqual(leases.owner(IDS.workspace), {
+			peerId: IDS.peer,
+			taskId: IDS.task,
+		});
 		assert.strictEqual(leases.owner(IDS.otherWorkspace), undefined);
 		assert.throws(() => leases.restoreFromTaskRecords([
 			{ ...createAcceptedTask(taskRequest(), AT), state: 'running' },
 			{
 				...createAcceptedTask(taskRequest({
-					taskId: IDS.otherTask,
+					peerId: IDS.otherPeer,
 					delegationRequestId: IDS.otherTask,
 				}), AT),
 				state: 'recovering',
@@ -227,7 +327,7 @@ describe('task domain', () => {
 			...createAcceptedTask(taskRequest(), AT),
 			state: 'failed' as const,
 		};
-		leases.acquire(IDS.workspace, IDS.task);
+		leases.acquire(IDS.workspace, IDS.peer, IDS.task);
 		leases.releaseForPersistedTerminal(terminal);
 		assert.strictEqual(leases.isLeased(IDS.workspace), false);
 	});

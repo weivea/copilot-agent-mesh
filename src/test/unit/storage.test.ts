@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterEach, describe, test } from 'node:test';
 
 import { createAcceptedTask } from '../../domain/task';
+import { taskEventJournalBytes } from '../../domain/taskEvents';
 import type { Clock, IdGenerator, StateStore } from '../../domain/ports';
 import {
 	AtomicFileStore,
@@ -122,7 +123,7 @@ describe('foundation storage', () => {
 			}),
 			TypeError,
 		);
-		leases.acquire(IDS.workspace, IDS.task);
+		leases.acquire(IDS.workspace, IDS.peer, IDS.task);
 		assert.strictEqual(registry.listForWire()[0].busy, true);
 		await assert.rejects(
 			registry.setEnabled(IDS.workspace, false),
@@ -166,7 +167,7 @@ describe('foundation storage', () => {
 			new NodeAtomicFileSystem(),
 			new SequenceIds(['temp-1', 'temp-2', 'temp-3']),
 		);
-		const tasks = new FileTaskStore(files);
+		const tasks = new FileTaskStore(files, fixedClock);
 		const active = createAcceptedTask(taskRequest(), AT);
 		await tasks.create(active);
 		await tasks.transitionOwned(IDS.peer, IDS.task, {
@@ -177,7 +178,10 @@ describe('foundation storage', () => {
 		const leases = new WorkspaceLeaseManager();
 		leases.restoreFromTaskRecords(recovered);
 		assert.strictEqual(recovered[0].state, 'startingAgent');
-		assert.strictEqual(leases.owner(IDS.workspace), IDS.task);
+		assert.deepStrictEqual(leases.owner(IDS.workspace), {
+			peerId: IDS.peer,
+			taskId: IDS.task,
+		});
 
 		const raw = await readFile(
 			join(root, 'tasks', `${IDS.peer}--${IDS.task}.json`),
@@ -204,7 +208,10 @@ describe('foundation storage', () => {
 			message: 'Session cannot be recovered.',
 			retryable: true,
 		});
-		assert.strictEqual(leases.owner(IDS.workspace), IDS.task);
+		assert.deepStrictEqual(leases.owner(IDS.workspace), {
+			peerId: IDS.peer,
+			taskId: IDS.task,
+		});
 		const restartedLeases = new WorkspaceLeaseManager();
 		restartedLeases.restoreFromTaskRecords(await tasks.listForRecovery());
 		assert.strictEqual(restartedLeases.isLeased(IDS.workspace), false);
@@ -216,7 +223,7 @@ describe('foundation storage', () => {
 			root,
 			new NodeAtomicFileSystem(),
 			new SequenceIds(['temp-1', 'temp-2']),
-		));
+		), fixedClock);
 		const first = createAcceptedTask(taskRequest(), AT);
 		const second = createAcceptedTask(taskRequest({
 			peerId: IDS.otherPeer,
@@ -229,6 +236,35 @@ describe('foundation storage', () => {
 		assert.strictEqual(
 			(await tasks.getOwned(IDS.otherPeer, IDS.task))?.peerId,
 			IDS.otherPeer,
+		);
+	});
+
+	test('compacts event journals before writing task files', async () => {
+		const root = await makeDirectory();
+		const tasks = new FileTaskStore(new AtomicFileStore(
+			root,
+			new NodeAtomicFileSystem(),
+			new SequenceIds(['temp-1']),
+		), fixedClock);
+		const summary = 'x'.repeat(16 * 1_024);
+		const events = Array.from({ length: 80 }, (_, index) => ({
+			eventSeq: index + 1,
+			at: AT,
+			type: 'task.output',
+			summary,
+		}));
+		await tasks.create({
+			...createAcceptedTask(taskRequest(), AT),
+			eventSeq: events.length,
+			events,
+		});
+		const stored = await tasks.getOwned(IDS.peer, IDS.task);
+		assert.ok(stored);
+		assert.ok(taskEventJournalBytes(stored) <= 1_048_576);
+		assert.strictEqual(stored.eventsTruncated, true);
+		assert.strictEqual(
+			stored.earliestAvailableEventSeq,
+			stored.events[0].eventSeq,
 		);
 	});
 
@@ -246,7 +282,7 @@ describe('foundation storage', () => {
 			'utf8',
 		);
 		await assert.rejects(
-			new FileTaskStore(files).listForRecovery(),
+			new FileTaskStore(files, fixedClock).listForRecovery(),
 			StorageCorruptionError,
 		);
 	});
