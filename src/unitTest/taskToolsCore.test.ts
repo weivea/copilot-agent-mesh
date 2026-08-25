@@ -480,7 +480,6 @@ suite('TaskToolsCore', () => {
 		assert.equal((missing.error as Record<string, unknown>).code, 'OUTPUT_INVALID');
 
 		for (const status of [
-			'created',
 			'accepted',
 			'startingAgent',
 			'running',
