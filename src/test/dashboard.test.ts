@@ -85,17 +85,30 @@ suite('Dashboard', () => {
 			'#secret%25253Dhidden',
 			'{"password":"hunter2"}',
 			'{ "PaSsWoRd" : "hunter2" }',
+			'{"access_token":"private-value"}',
+			'client_secret = private-value',
+			'apiKey: private-value',
+			'api_key = private-value',
+			'private-key: private-value',
+			'refresh_token%253Dprivate-value',
 			'credential = private-value',
 			'Authorization : private-value',
 			'tkn\t=\tprivate-value',
 			'token: ghp_example',
 			'malformed=%E0%A4%A',
+			'https://x/#/Users/person/private-project',
+			'https://x/?location=C%3A%5CUsers%5Cperson%5Cprivate',
+			'https://x/?location=file%253A%252F%252F%252Ftmp%252Fprivate',
 		]) {
 			assert.throws(() => assertSafeDashboardOutboundMessage({
 				...base,
 				model: withTaskSummary(snapshot(), unsafeText),
 			}));
 		}
+		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({
+			...base,
+			model: withTaskSummary(snapshot(), 'https://example.test'),
+		}));
 	});
 
 	test('redacts path-bearing remote summaries, details, and errors before validation', () => {

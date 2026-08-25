@@ -1,19 +1,29 @@
 const maximumCanonicalLength = 4096;
 const maximumDecodeRounds = 4;
-const credentialKeys = [
+const maximumUrlInspectionDepth = 4;
+const normalizedCredentialKeys = new Set([
+	'accesstoken',
+	'apikey',
 	'authorization',
+	'clientsecret',
 	'credential',
 	'password',
+	'privatekey',
+	'refreshtoken',
 	'secret',
 	'tkn',
 	'token',
-] as const;
+]);
 
 export function redactRemoteText(value: string): string {
 	return containsUnsafeDashboardText(value) ? '[redacted sensitive details]' : value;
 }
 
 export function containsUnsafeDashboardText(value: string): boolean {
+	return containsUnsafeDashboardTextAtDepth(value, 0);
+}
+
+function containsUnsafeDashboardTextAtDepth(value: string, depth: number): boolean {
 	const canonical = canonicalizePercentEncoding(value);
 	if (canonical === undefined) {
 		return true;
@@ -29,6 +39,17 @@ export function containsUnsafeDashboardText(value: string): boolean {
 		|| containsCredentialAssignment(lower)
 	) {
 		return true;
+	}
+	const urls = extractUrlCandidates(canonical);
+	if (urls.length > 0) {
+		if (depth >= maximumUrlInspectionDepth) {
+			return true;
+		}
+		for (const candidate of urls) {
+			if (containsUnsafeUrl(candidate, depth + 1)) {
+				return true;
+			}
+		}
 	}
 	return lexicalTokens(lower).some(isPathToken);
 }
@@ -139,26 +160,24 @@ function canonicalizePercentEncoding(value: string): string | undefined {
 }
 
 function containsCredentialAssignment(value: string): boolean {
-	for (const key of credentialKeys) {
-		let searchFrom = 0;
-		while (searchFrom < value.length) {
-			const index = value.indexOf(key, searchFrom);
-			if (index < 0) {
-				break;
-			}
-			searchFrom = index + key.length;
-			const before = index === 0 ? undefined : value[index - 1];
-			const after = value[searchFrom];
-			if ((before !== undefined && isIdentifierCharacter(before)) || isIdentifierCharacter(after)) {
-				continue;
-			}
-			let cursor = searchFrom;
-			while (cursor < value.length && isCredentialPadding(value[cursor])) {
-				cursor += 1;
-			}
-			if (value[cursor] === '=' || value[cursor] === ':') {
-				return true;
-			}
+	for (let separator = 0; separator < value.length; separator += 1) {
+		if (value[separator] !== '=' && value[separator] !== ':') {
+			continue;
+		}
+		let cursor = separator - 1;
+		while (cursor >= 0 && isCredentialPadding(value[cursor])) {
+			cursor -= 1;
+		}
+		const keyEnd = cursor + 1;
+		while (cursor >= 0 && isIdentifierCharacter(value[cursor])) {
+			cursor -= 1;
+		}
+		if (keyEnd === cursor + 1) {
+			continue;
+		}
+		const normalized = normalizeCredentialKey(value.slice(cursor + 1, keyEnd));
+		if (normalizedCredentialKeys.has(normalized)) {
+			return true;
 		}
 	}
 	return false;
@@ -177,4 +196,80 @@ function isIdentifierCharacter(character: string | undefined): boolean {
 		|| (code >= 48 && code <= 57)
 		|| character === '_'
 		|| character === '-';
+}
+
+function normalizeCredentialKey(value: string): string {
+	let normalized = '';
+	for (const character of value) {
+		if (character !== '_' && character !== '-') {
+			normalized += character.toLowerCase();
+		}
+	}
+	return normalized;
+}
+
+function extractUrlCandidates(value: string): string[] {
+	const lower = value.toLowerCase();
+	const candidates: string[] = [];
+	let searchFrom = 0;
+	while (searchFrom < value.length) {
+		const httpsIndex = lower.indexOf('https://', searchFrom);
+		const httpIndex = lower.indexOf('http://', searchFrom);
+		const start = firstAvailableIndex(httpsIndex, httpIndex);
+		if (start < 0) {
+			break;
+		}
+		let end = start;
+		while (end < value.length && !isUrlTerminator(value[end])) {
+			end += 1;
+		}
+		let candidate = value.slice(start, end);
+		while (candidate.length > 0 && '.,;!?'.includes(candidate[candidate.length - 1])) {
+			candidate = candidate.slice(0, -1);
+		}
+		if (candidate.length > 0) {
+			candidates.push(candidate);
+		}
+		searchFrom = Math.max(end, start + 1);
+	}
+	return candidates;
+}
+
+function containsUnsafeUrl(candidate: string, depth: number): boolean {
+	let parsed: URL;
+	try {
+		parsed = new URL(candidate);
+	} catch {
+		return true;
+	}
+	if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+		return true;
+	}
+	if (parsed.pathname !== '/' && containsUnsafeDashboardTextAtDepth(parsed.pathname, depth)) {
+		return true;
+	}
+	for (const [key, value] of parsed.searchParams) {
+		if (
+			containsUnsafeDashboardTextAtDepth(key, depth)
+			|| containsUnsafeDashboardTextAtDepth(value, depth)
+		) {
+			return true;
+		}
+	}
+	const fragment = parsed.hash.startsWith('#') ? parsed.hash.slice(1) : parsed.hash;
+	return fragment.length > 0 && containsUnsafeDashboardTextAtDepth(fragment, depth);
+}
+
+function firstAvailableIndex(first: number, second: number): number {
+	if (first < 0) {
+		return second;
+	}
+	if (second < 0) {
+		return first;
+	}
+	return Math.min(first, second);
+}
+
+function isUrlTerminator(character: string): boolean {
+	return character.trim().length === 0 || '"\'`()[]{}<>'.includes(character);
 }
