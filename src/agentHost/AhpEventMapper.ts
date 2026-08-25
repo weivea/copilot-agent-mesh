@@ -212,7 +212,9 @@ export class AhpEventMapper {
 			};
 		}
 
-		const answers = validateAnswers(pending.questions, answer.values ?? {});
+		const answers = answer.outcome === 'accept'
+			? validateAnswers(pending.questions, answer.values ?? {})
+			: undefined;
 		this.pending.delete(answer.requestId);
 		return {
 			channel: pending.chatUri,
@@ -220,7 +222,7 @@ export class AhpEventMapper {
 				type: 'chat/inputCompleted',
 				requestId: pending.requestId,
 				response: answer.outcome,
-				answers: answer.outcome === 'accept' ? answers : undefined,
+				answers,
 			},
 		};
 	}

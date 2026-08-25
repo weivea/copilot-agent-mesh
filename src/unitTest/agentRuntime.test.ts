@@ -22,8 +22,10 @@ import type {
 } from '../agentHost/AgentHostLauncher';
 import {
 	AgentRuntimeError,
+	AgentRuntimeLifecycle,
 	AsyncEventQueue,
 	type AgentRuntimeEvent,
+	type AgentRuntimeErrorCode,
 	type AgentTaskRequest,
 } from '../agentHost/AgentRuntime';
 import {
@@ -31,6 +33,7 @@ import {
 	type AuthenticationApi,
 	type AuthenticationRequest,
 	type AuthBroker,
+	type ProtectedResource,
 } from '../agentHost/AuthBroker';
 
 const workspaceUri = 'file:///tmp/copilot-agent-mesh-safe-workspace';
@@ -40,6 +43,36 @@ const protectedResource = {
 	authorization_servers: ['https://login.example.test'],
 	scopes_supported: ['agent:run'],
 };
+const initializationOnlyResource = {
+	resource: 'https://initialization.example.test',
+	resource_name: 'Initialization Agent',
+	scopes_supported: ['agent:initialize'],
+};
+
+test('runtime lifecycle awaits detached asynchronous cleanup and shares the same disposal', async () => {
+	const lifecycle = new AgentRuntimeLifecycle();
+	let releaseCleanup: (() => void) | undefined;
+	let cleanupFinished = false;
+	const cleanupGate = new Promise<void>((resolve) => {
+		releaseCleanup = resolve;
+	});
+	lifecycle.track({
+		probe: async () => ({ available: false, featureEnabled: false }),
+		start: async () => { throw new Error('not used'); },
+		dispose: async () => {
+			await cleanupGate;
+			cleanupFinished = true;
+		},
+	});
+
+	const first = lifecycle.dispose();
+	const second = lifecycle.dispose();
+	assert.equal(first, second);
+	assert.equal(cleanupFinished, false);
+	releaseCleanup?.();
+	await first;
+	assert.equal(cleanupFinished, true);
+});
 
 test('production runtime initializes, authenticates, resolves config, runs a turn, answers input, and cancels', async () => {
 	const transport = new FakeAhpTransport();
@@ -58,6 +91,7 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 				return 'once';
 			},
 		},
+		workspaceResolver: trustedWorkspaceResolver(),
 		configResolver: {
 			resolve: async ({ completions }) => {
 				const options = await completions('model', { target: 'workspace' });
@@ -134,6 +168,132 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 	assert.equal(launcher.host.disposed, true);
 });
 
+test('runtime resolves workspace IDs through the trusted registry and ignores forged caller metadata', async () => {
+	const transport = new FakeAhpTransport();
+	const launcher = new FakeLauncher();
+	let confirmedWorkspace = '';
+	const runtime = new AhpAgentRuntime({
+		enabled: () => true,
+		launcher,
+		connections: new FakeConnectionFactory([transport]),
+		authBroker: new RecordingAuthBroker(),
+		confirmation: {
+			confirm: async (request) => {
+				confirmedWorkspace = request.workspace.uri;
+				return 'once';
+			},
+		},
+		workspaceResolver: trustedWorkspaceResolver(),
+		configResolver: { resolve: async () => ({ model: 'test-model' }) },
+	});
+	const forged = {
+		...taskRequest(),
+		workspace: {
+			workspaceId: 'workspace-1',
+			displayName: 'Forged Workspace',
+			uri: 'file:///tmp/forged-workspace',
+			registered: true,
+		},
+	} as AgentTaskRequest;
+
+	const handle = await runtime.start(forged);
+	assert.equal(confirmedWorkspace, workspaceUri);
+	assert.deepEqual(transport.created?.workingDirectories, [workspaceUri]);
+	await handle.dispose();
+
+	await assert.rejects(
+		runtime.start({ ...taskRequest(), workspaceId: 'unregistered-workspace' }),
+		(error: unknown) => error instanceof AgentRuntimeError && error.code === 'AGENT_UNAVAILABLE',
+	);
+	assert.equal(launcher.launchCalls, 1);
+	await runtime.dispose();
+});
+
+test('runtime attaches the root subscription before initialize and preserves notifications from that window', async () => {
+	const transport = new FakeAhpTransport();
+	transport.notificationDuringInitialize = [protectedResource, initializationOnlyResource];
+	const auth = new RecordingAuthBroker();
+	const runtime = new AhpAgentRuntime({
+		enabled: () => true,
+		launcher: new FakeLauncher(),
+		connections: new FakeConnectionFactory([transport]),
+		authBroker: auth,
+		confirmation: { confirm: async () => 'once' },
+		workspaceResolver: trustedWorkspaceResolver(),
+		configResolver: { resolve: async () => ({ model: 'test-model' }) },
+	});
+
+	const handle = await runtime.start(taskRequest());
+	await waitForCondition(() => auth.requests.some(({ reason }) => reason === 'tokenInvalid'));
+	assert.equal(transport.rootAttachedBeforeInitialize, true);
+	assert.equal(auth.requests.filter(({ resources }) =>
+		resources.some(({ resource }) => resource === protectedResource.resource),
+	).length, 1);
+	assert.deepEqual(
+		auth.requests.find(({ reason }) => reason === 'tokenInvalid')?.resources,
+		[initializationOnlyResource],
+	);
+	await handle.dispose();
+});
+
+test('start failure cleans the task, AHP connection, and owned host without losing the auth error', async () => {
+	const transport = new FakeAhpTransport();
+	transport.shutdownFails = true;
+	const launcher = new FakeLauncher();
+	const runtime = new AhpAgentRuntime({
+		enabled: () => true,
+		launcher,
+		connections: new FakeConnectionFactory([transport]),
+		authBroker: new FailingAuthBroker('AGENT_AUTH_REQUIRED'),
+		confirmation: { confirm: async () => 'once' },
+		workspaceResolver: trustedWorkspaceResolver(),
+	});
+
+	await assert.rejects(
+		runtime.start(taskRequest()),
+		(error: unknown) => error instanceof AgentRuntimeError
+			&& error.code === 'AGENT_AUTH_REQUIRED'
+			&& error.cause instanceof AggregateError
+			&& !error.message.includes('not-a-real-token'),
+	);
+	assert.equal(transport.disposeSessionCalls, 1);
+	assert.equal(transport.shutdownCalls, 1);
+	assert.equal(launcher.host.disposed, true);
+
+	await runtime.dispose();
+	assert.equal(transport.disposeSessionCalls, 1);
+	assert.equal(transport.shutdownCalls, 1);
+});
+
+test('connection failure cleans the detached owned host before surfacing startup failure', async () => {
+	const launcher = new FakeLauncher();
+	const runtime = new AhpAgentRuntime({
+		enabled: () => true,
+		launcher,
+		connections: { connect: async () => { throw new Error('connection failed'); } },
+		authBroker: new RecordingAuthBroker(),
+		confirmation: { confirm: async () => 'once' },
+		workspaceResolver: trustedWorkspaceResolver(),
+	});
+
+	await assert.rejects(runtime.start(taskRequest()), AgentRuntimeError);
+	assert.equal(launcher.host.disposed, true);
+});
+
+test('root connection loss before Session creation fails startup instead of entering Session recovery', async () => {
+	const transport = new FakeAhpTransport();
+	transport.failRootDuringConfig = true;
+	const launcher = new FakeLauncher();
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+
+	await assert.rejects(
+		runtime.start(taskRequest()),
+		(error: unknown) => error instanceof AgentRuntimeError && error.code === 'AGENT_UNAVAILABLE',
+	);
+	assert.equal(launcher.host.disposed, true);
+	assert.equal(transport.shutdownCalls, 1);
+});
+
 test('runtime reconnects with the recovery descriptor and fails truthfully on host crash', async () => {
 	const first = new FakeAhpTransport();
 	const recovered = new FakeAhpTransport();
@@ -168,6 +328,55 @@ test('runtime reconnects with the recovery descriptor and fails truthfully on ho
 	await handle.dispose();
 });
 
+test('runtime preserves non-missing recovery connection failures', async () => {
+	const first = new FakeAhpTransport();
+	let connects = 0;
+	const runtime = createRuntime(new FakeLauncher(), {
+		connect: async () => {
+			connects += 1;
+			if (connects === 1) {
+				return first;
+			}
+			throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'Transient recovery connection failure.');
+		},
+	});
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+
+	first.failChat();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	const failed = await nextEvent(handle.events);
+	assert.equal(failed.type, 'failed');
+	if (failed.type === 'failed') {
+		assert.equal(failed.error.code, 'AGENT_UNAVAILABLE');
+	}
+	await handle.dispose();
+});
+
+for (const authCode of ['AGENT_AUTH_REQUIRED', 'AGENT_AUTH_FAILED'] as const) {
+	test(`runtime preserves ${authCode} when recovery authentication fails`, async () => {
+		const first = new FakeAhpTransport();
+		const recovered = new FakeAhpTransport();
+		recovered.reconnectResult = { type: 'replay', actions: [], missing: [] };
+		const launcher = new FakeLauncher();
+		const broker = new FailingRecoveryAuthBroker(authCode);
+		const runtime = createRuntime(launcher, new FakeConnectionFactory([first, recovered]), broker);
+		const handle = await runtime.start(taskRequest());
+		await nextEvent(handle.events);
+		recovered.created = first.created;
+
+		first.failChat();
+		assert.equal((await nextEvent(handle.events)).type, 'progress');
+		const failed = await nextEvent(handle.events);
+		assert.equal(failed.type, 'failed');
+		if (failed.type === 'failed') {
+			assert.equal(failed.error.code, authCode);
+		}
+		assert.equal(recovered.shutdownCalls, 1);
+		await handle.dispose();
+	});
+}
+
 test('runtime iterates dependent session config and restores completion from a reconnect snapshot', async () => {
 	const first = new FakeAhpTransport();
 	first.iterativeConfig = true;
@@ -179,6 +388,7 @@ test('runtime iterates dependent session config and restores completion from a r
 		connections: new FakeConnectionFactory([first, recovered]),
 		authBroker: new RecordingAuthBroker(),
 		confirmation: { confirm: async () => 'once' },
+		workspaceResolver: trustedWorkspaceResolver(),
 		configResolver: {
 			resolve: async ({ schema, values }) => ({
 				...values,
@@ -197,7 +407,36 @@ test('runtime iterates dependent session config and restores completion from a r
 	recovered.created = first.created;
 	recovered.reconnectResult = {
 		type: 'snapshot',
-		snapshots: [{
+		snapshots: [
+			{
+				resource: 'ahp-root://',
+				fromSeq: 20,
+				state: {
+					agents: [{
+						provider: 'dynamic-provider',
+						displayName: 'Dynamic Provider',
+						description: 'Test provider',
+						models: [],
+						protectedResources: [protectedResource],
+					}],
+					terminals: [],
+				},
+			} as Snapshot,
+			{
+				resource: first.created!.sessionUri,
+				fromSeq: 20,
+				state: {
+					resource: first.created!.sessionUri,
+					provider: 'dynamic-provider',
+					title: 'Task',
+					status: 1,
+					lifecycle: 'ready',
+					activeClients: [],
+					chats: [],
+					defaultChat: 'ahp-chat:/default',
+				},
+			} as Snapshot,
+			{
 			resource: 'ahp-chat:/default',
 			fromSeq: 20,
 			state: {
@@ -214,11 +453,37 @@ test('runtime iterates dependent session config and restores completion from a r
 					state: 'complete',
 				}],
 			},
-		} as Snapshot],
+			} as Snapshot,
+		],
 	};
 	first.failChat();
 	assert.equal((await nextEvent(handle.events)).type, 'progress');
 	assert.equal((await nextEvent(handle.events)).type, 'completed');
+	await handle.dispose();
+});
+
+test('snapshot recovery fails when the active chat snapshot is missing', async () => {
+	const first = new FakeAhpTransport();
+	const recovered = new FakeAhpTransport();
+	const runtime = createRuntime(new FakeLauncher(), new FakeConnectionFactory([first, recovered]));
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+	recovered.created = first.created;
+	recovered.reconnectResult = {
+		type: 'snapshot',
+		snapshots: [
+			{ resource: 'ahp-root://', fromSeq: 10, state: {} } as Snapshot,
+			{ resource: first.created!.sessionUri, fromSeq: 10, state: {} } as Snapshot,
+		],
+	};
+
+	first.failChat();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	const failed = await nextEvent(handle.events);
+	assert.equal(failed.type, 'failed');
+	if (failed.type === 'failed') {
+		assert.equal(failed.error.code, 'TASK_RECOVERY_UNAVAILABLE');
+	}
 	await handle.dispose();
 });
 
@@ -389,13 +654,48 @@ test('event mapper enforces integer and freeform select input constraints', () =
 		}
 });
 
-function createRuntime(launcher: FakeLauncher, connections: AhpConnectionFactory): AhpAgentRuntime {
-	return new AhpAgentRuntime({
-		enabled: () => true,
-		launcher,
-		connections,
-		authBroker: new RecordingAuthBroker(),
+for (const outcome of ['decline', 'cancel'] as const) {
+		test(`event mapper allows ${outcome} without required structured answers`, () => {
+			const mapper = new AhpEventMapper();
+			const [event] = mapper.map(envelope('ahp-chat:/default', {
+				type: 'chat/inputRequested',
+				request: {
+					id: `structured-${outcome}`,
+					message: 'Required question',
+					questions: [{ id: 'required', message: 'Required', kind: 'text', required: true }],
+				},
+			}, 15));
+			assert.equal(event?.type, 'inputRequired');
+			if (event?.type !== 'inputRequired') {
+				return;
+			}
+			assert.deepEqual(mapper.createAnswer({
+				requestId: event.request.requestId,
+				outcome,
+			}), {
+				channel: 'ahp-chat:/default',
+				action: {
+					type: 'chat/inputCompleted',
+					requestId: `structured-${outcome}`,
+					response: outcome,
+					answers: undefined,
+				},
+			});
+		});
+}
+
+function createRuntime(
+		launcher: FakeLauncher,
+		connections: AhpConnectionFactory,
+		authBroker: AuthBroker = new RecordingAuthBroker(),
+): AhpAgentRuntime {
+		return new AhpAgentRuntime({
+			enabled: () => true,
+			launcher,
+			connections,
+			authBroker,
 		confirmation: { confirm: async () => 'once' },
+		workspaceResolver: trustedWorkspaceResolver(),
 		configResolver: { resolve: async () => ({ model: 'test-model' }) },
 		cancellationTimeoutMs: 100,
 	});
@@ -407,12 +707,15 @@ function taskRequest(): AgentTaskRequest {
 		title: 'Harmless task',
 		prompt: 'Make a harmless change.',
 		acceptanceCriteria: ['Finish successfully'],
-		workspace: {
-			workspaceId: 'workspace-1',
-			displayName: 'Safe Workspace',
-			uri: workspaceUri,
-			registered: true,
-		},
+		workspaceId: 'workspace-1',
+	};
+}
+
+function trustedWorkspaceResolver() {
+	return {
+		resolve: async (workspaceId: string) => workspaceId === 'workspace-1'
+			? { workspaceId, displayName: 'Safe Workspace', uri: workspaceUri }
+			: undefined,
 	};
 }
 
@@ -430,14 +733,43 @@ class RecordingAuthBroker implements AuthBroker {
 	}
 }
 
+class FailingAuthBroker implements AuthBroker {
+	constructor(private readonly code: Extract<AgentRuntimeErrorCode, 'AGENT_AUTH_REQUIRED' | 'AGENT_AUTH_FAILED'>) {}
+
+	async authenticate(): Promise<void> {
+		throw new AgentRuntimeError(this.code, 'Authentication could not be completed.');
+	}
+}
+
+class FailingRecoveryAuthBroker implements AuthBroker {
+	private initial = true;
+
+	constructor(private readonly code: Extract<AgentRuntimeErrorCode, 'AGENT_AUTH_REQUIRED' | 'AGENT_AUTH_FAILED'>) {}
+
+	async authenticate(
+		request: AuthenticationRequest,
+		pushToken: (resource: string, token: string, scopes: readonly string[]) => Promise<void>,
+	): Promise<void> {
+		if (!this.initial && request.reason === 'tokenInvalid') {
+			throw new AgentRuntimeError(this.code, 'Recovery authentication could not be completed.');
+		}
+		this.initial = false;
+		for (const resource of request.resources.filter(({ required }) => required !== false)) {
+			await pushToken(resource.resource, 'test-token', resource.scopes_supported ?? []);
+		}
+	}
+}
+
 class FakeLauncher implements AgentHostLauncherLike {
 	readonly host = new FakeHost();
+	launchCalls = 0;
 
 	async probe(): Promise<AgentHostProbe> {
 		return { available: true, executable: '/safe/code', version: '1.134.0' };
 	}
 
 	async launch(): Promise<LaunchedAgentHost> {
+		this.launchCalls += 1;
 		return this.host;
 	}
 
@@ -495,11 +827,25 @@ class FakeAhpTransport implements AhpConnection {
 		snapshots: [],
 	};
 	iterativeConfig = false;
+	notificationDuringInitialize: readonly ProtectedResource[] = [];
+	rootAttachedBeforeInitialize = false;
+	disposeSessionCalls = 0;
+	shutdownCalls = 0;
+	shutdownFails = false;
+	failRootDuringConfig = false;
 	resolveConfigCalls = 0;
+	private readonly attachedUris = new Set<string>();
 	private readonly queues = new Map<string, FakeSubscription>();
 
 	async initialize(): Promise<Awaited<ReturnType<AhpConnection['initialize']>>> {
 		this.initialized = true;
+		this.rootAttachedBeforeInitialize = this.attachedUris.has('ahp-root://');
+		if (this.notificationDuringInitialize.length > 0 && this.rootAttachedBeforeInitialize) {
+			this.queue('ahp-root://').push({
+				type: 'authRequired',
+				params: { resources: this.notificationDuringInitialize },
+			});
+		}
 		return {
 			protocolVersion: '0.8.0',
 			serverSeq: 1,
@@ -525,6 +871,7 @@ class FakeAhpTransport implements AhpConnection {
 	}
 
 	attachSubscription(uri: string): AhpSubscription {
+		this.attachedUris.add(uri);
 		return this.queue(uri);
 	}
 
@@ -574,6 +921,11 @@ class FakeAhpTransport implements AhpConnection {
 		config: Readonly<Record<string, unknown>>,
 	): Promise<{ readonly schema: SessionConfigSchema; readonly values: Record<string, unknown> }> {
 		this.resolveConfigCalls += 1;
+		if (this.failRootDuringConfig) {
+			this.failRootDuringConfig = false;
+			this.queue('ahp-root://').fail(new Error('startup transport closed'));
+			await new Promise((resolve) => setTimeout(resolve, 0));
+		}
 		if (this.iterativeConfig) {
 			const required = config.target === undefined
 				? ['target']
@@ -634,11 +986,17 @@ class FakeAhpTransport implements AhpConnection {
 		this.queue(uri).finish();
 	}
 
-	async disposeSession(): Promise<void> {}
+	async disposeSession(): Promise<void> {
+		this.disposeSessionCalls += 1;
+	}
 
 	async shutdown(): Promise<void> {
+		this.shutdownCalls += 1;
 		for (const queue of this.queues.values()) {
 			queue.finish();
+		}
+		if (this.shutdownFails) {
+			throw new Error('synthetic shutdown failure');
 		}
 	}
 
@@ -715,4 +1073,14 @@ async function nextEvent(events: AsyncIterable<AgentRuntimeEvent>): Promise<Agen
 	]);
 	assert.equal(result.done, false);
 	return result.value;
+}
+
+async function waitForCondition(condition: () => boolean): Promise<void> {
+	const deadline = Date.now() + 1_000;
+	while (!condition()) {
+		if (Date.now() >= deadline) {
+			throw new Error('Timed out waiting for condition.');
+		}
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
 }

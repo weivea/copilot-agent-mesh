@@ -24,6 +24,8 @@ import {
 	type AgentTaskHandle,
 	type AgentTaskRequest,
 	type FirstTaskConfirmation,
+	type ResolvedAgentTaskRequest,
+	type WorkspaceResolver,
 } from './AgentRuntime';
 import type { AgentHostLauncherLike, LaunchedAgentHost } from './AgentHostLauncher';
 import type { AuthBroker, ProtectedResource } from './AuthBroker';
@@ -106,6 +108,7 @@ export interface AhpAgentRuntimeOptions {
 	readonly connections: AhpConnectionFactory;
 	readonly authBroker: AuthBroker;
 	readonly confirmation: FirstTaskConfirmation;
+	readonly workspaceResolver: WorkspaceResolver;
 	readonly configResolver?: SessionConfigurationResolver;
 	readonly cancellationTimeoutMs?: number;
 }
@@ -113,6 +116,7 @@ export interface AhpAgentRuntimeOptions {
 export class AhpAgentRuntime implements AgentRuntime {
 	private readonly tasks = new Set<AhpTask>();
 	private disposed = false;
+	private disposePromise: Promise<void> | undefined;
 
 	constructor(private readonly options: AhpAgentRuntimeOptions) {}
 
@@ -134,40 +138,72 @@ export class AhpAgentRuntime implements AgentRuntime {
 			throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'The production Agent Host runtime is disabled.');
 		}
 		validateRequest(request);
-		if (await this.options.confirmation.confirm(request) === 'deny') {
+		const workspace = await this.options.workspaceResolver.resolve(request.workspaceId);
+		if (workspace === undefined) {
+			throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'The requested workspace is not registered on this device.');
+		}
+		validateWorkspace(request.workspaceId, workspace);
+		const resolvedRequest: ResolvedAgentTaskRequest = { ...request, workspace };
+		if (await this.options.confirmation.confirm(resolvedRequest) === 'deny') {
 			throw new AgentRuntimeError('TASK_EXECUTION_FAILED', 'The local user denied this task.');
 		}
 
 		const host = await this.options.launcher.launch();
+		let connection: AhpConnection | undefined;
+		let task: AhpTask | undefined;
 		try {
-			const connection = await this.options.connections.connect(host.endpoint);
-			let task: AhpTask;
-			task = new AhpTask(
-				request,
+			connection = await this.options.connections.connect(host.endpoint);
+			const createdTask = new AhpTask(
+				resolvedRequest,
 				host,
 				connection,
 				this.options.connections,
 				this.options.authBroker,
 				this.options.configResolver ?? new DefaultSessionConfigurationResolver(),
 				this.options.cancellationTimeoutMs ?? cancellationTimeoutMs,
-				() => this.tasks.delete(task),
+				() => this.tasks.delete(createdTask),
 			);
-			this.tasks.add(task);
-			await task.start();
-			return task;
+			task = createdTask;
+			this.tasks.add(createdTask);
+			await createdTask.start();
+			return createdTask;
 		} catch (error) {
-			await host.dispose().catch(() => undefined);
-			throw normalizeRuntimeError(error);
+			const primary = normalizeRuntimeError(error);
+			let cleanupError: AgentRuntimeError | undefined;
+			try {
+				if (task !== undefined) {
+					await task.dispose();
+				} else {
+					cleanupError = await cleanupDetachedResources(host, connection);
+				}
+			} catch (cleanup) {
+				cleanupError = normalizeRuntimeError(cleanup);
+			}
+			throw cleanupError === undefined ? primary : combineRuntimeErrors(primary, cleanupError);
 		}
 	}
 
-	async dispose(): Promise<void> {
-		if (this.disposed) {
-			return;
-		}
+	dispose(): Promise<void> {
+		this.disposePromise ??= this.disposeResources();
+		return this.disposePromise;
+	}
+
+	private async disposeResources(): Promise<void> {
 		this.disposed = true;
-		await Promise.all([...this.tasks].map((task) => task.dispose()));
-		await this.options.launcher.dispose();
+		const failures: string[] = [];
+		await collectCleanupFailures(
+			[...this.tasks].map((task) => ({
+				label: 'dispose active Agent Host task',
+				run: () => task.dispose(),
+			})),
+			failures,
+		);
+		await collectCleanupFailures([
+			{ label: 'dispose Agent Host launcher', run: () => this.options.launcher.dispose() },
+		], failures);
+		if (failures.length > 0) {
+			throw cleanupFailure(failures);
+		}
 	}
 }
 
@@ -351,6 +387,7 @@ class AhpTask implements AgentTaskHandle {
 	private provider: AgentInfo | undefined;
 	private sessionReady = false;
 	private sessionDefaultChat: string | undefined;
+	private sessionCreated = false;
 	private lastSeenServerSeq = 0;
 	private terminal = false;
 	private disposed = false;
@@ -361,9 +398,13 @@ class AhpTask implements AgentTaskHandle {
 	private defaultChatReject: ((error: Error) => void) | undefined;
 	private cancellationTimer: NodeJS.Timeout | undefined;
 	private exitSubscription: { dispose(): void } | undefined;
+	private disposePromise: Promise<void> | undefined;
+	private readonly authenticationInFlight = new Map<string, Promise<void>>();
+	private readonly pendingAuthNotifications = new Set<Promise<void>>();
+	private terminalError: AgentRuntimeError | undefined;
 
 	constructor(
-		private readonly request: AgentTaskRequest,
+		private readonly request: ResolvedAgentTaskRequest,
 		private readonly host: LaunchedAgentHost,
 		connection: AhpConnection,
 		private readonly connectionFactory: AhpConnectionFactory,
@@ -387,6 +428,8 @@ class AhpTask implements AgentTaskHandle {
 
 	async start(): Promise<void> {
 		this.exitSubscription = this.host.onExit((error) => this.fail(error));
+		const rootSubscription = this.connection.attachSubscription(rootUri);
+		this.subscriptions.set(rootUri, rootSubscription);
 		const initialized = await this.connection.initialize(this.clientId);
 		this.lastSeenServerSeq = initialized.serverSeq;
 		const rootSnapshot = initialized.snapshots.find(({ resource }) => resource === rootUri);
@@ -395,10 +438,16 @@ class AhpTask implements AgentTaskHandle {
 		}
 		const root = parseRootState(rootSnapshot);
 		this.provider = selectProvider(root.agents, this.request.providerId);
+		this.startSubscription(rootUri, rootSubscription);
 		await this.authenticate(this.provider.protectedResources ?? [], 'initial', this.request.allowInteractiveAuthentication === true);
-		this.addSubscription(rootUri, this.connection.attachSubscription(rootUri));
+		await Promise.resolve();
+		await this.drainAuthNotifications();
+		if (this.terminalError !== undefined) {
+			throw this.terminalError;
+		}
 
 		const config = await this.resolveConfig();
+		this.throwIfTerminalError();
 		await this.withAuthenticationRetry(
 			() => this.connection.createSession({
 				sessionUri: this.sessionUri,
@@ -409,6 +458,8 @@ class AhpTask implements AgentTaskHandle {
 			}),
 			'challenge',
 		);
+		this.sessionCreated = true;
+		this.throwIfTerminalError();
 
 		const sessionSubscription = await this.connection.subscribe(this.sessionUri);
 		if (sessionSubscription.snapshot !== undefined) {
@@ -472,23 +523,50 @@ class AhpTask implements AgentTaskHandle {
 		this.connection.dispatch(dispatch.channel, dispatch.action);
 	}
 
-	async dispose(): Promise<void> {
-		if (this.disposed) {
-			return;
-		}
+	dispose(): Promise<void> {
+		this.disposePromise ??= this.disposeResources();
+		return this.disposePromise;
+	}
+
+	private async disposeResources(): Promise<void> {
 		this.disposed = true;
 		if (this.cancellationTimer !== undefined) {
 			clearTimeout(this.cancellationTimer);
 		}
 		this.exitSubscription?.dispose();
-		await Promise.all([...this.subscriptions.keys()].map((uri) =>
-			this.connection.unsubscribe(uri).catch(() => undefined),
-		));
-		await this.connection.disposeSession(this.sessionUri).catch(() => undefined);
-		await this.connection.shutdown().catch(() => undefined);
-		await this.host.dispose();
-		this.events.close();
-		this.didDispose();
+		const failures: string[] = [];
+		try {
+			await collectCleanupFailures(
+				[...this.subscriptions].map(([uri, subscription]) => ({
+					label: `close subscription ${safeCleanupResource(uri)}`,
+					run: () => subscription.close(),
+				})),
+				failures,
+			);
+			await collectCleanupFailures(
+				[...this.subscriptions.keys()].map((uri) => ({
+					label: `unsubscribe ${safeCleanupResource(uri)}`,
+					run: () => this.connection.unsubscribe(uri),
+				})),
+				failures,
+			);
+			this.subscriptions.clear();
+			await collectCleanupFailures([
+				{ label: 'dispose AHP session', run: () => this.connection.disposeSession(this.sessionUri) },
+			], failures);
+			await collectCleanupFailures([
+				{ label: 'shutdown AHP connection', run: () => this.connection.shutdown() },
+			], failures);
+			await collectCleanupFailures([
+				{ label: 'dispose owned Agent Host', run: () => this.host.dispose() },
+			], failures);
+		} finally {
+			this.events.close();
+			this.didDispose();
+		}
+		if (failures.length > 0) {
+			throw cleanupFailure(failures);
+		}
 	}
 
 	private async resolveConfig(): Promise<Readonly<Record<string, unknown>>> {
@@ -544,15 +622,48 @@ class AhpTask implements AgentTaskHandle {
 		resources: readonly ProtectedResourceMetadata[] | readonly ProtectedResource[],
 		reason: 'initial' | 'challenge' | 'tokenInvalid',
 		interactive: boolean,
+		connection = this.connection,
 	): Promise<void> {
-		await this.authBroker.authenticate(
-			{ resources, interactive, reason },
-			(resource, token, scopes) => this.connection.authenticate(resource, token, scopes),
-		);
+		const pending = new Set<Promise<void>>();
+		const fresh = new Map<string, ProtectedResource>();
+		for (const resource of resources.filter(({ required }) => required !== false)) {
+			const existing = this.authenticationInFlight.get(resource.resource);
+			if (existing === undefined) {
+				fresh.set(resource.resource, resource);
+			} else {
+				pending.add(existing);
+			}
+		}
+		let operation: Promise<void> | undefined;
+		if (fresh.size > 0) {
+			operation = this.authBroker.authenticate(
+				{ resources: [...fresh.values()], interactive, reason },
+				(resource, token, scopes) => connection.authenticate(resource, token, scopes),
+			);
+			for (const resource of fresh.keys()) {
+				this.authenticationInFlight.set(resource, operation);
+			}
+			pending.add(operation);
+		}
+		try {
+			await Promise.all(pending);
+		} finally {
+			if (operation !== undefined) {
+				for (const resource of fresh.keys()) {
+					if (this.authenticationInFlight.get(resource) === operation) {
+						this.authenticationInFlight.delete(resource);
+					}
+				}
+			}
+		}
 	}
 
 	private addSubscription(uri: string, subscription: AhpSubscription): void {
 		this.subscriptions.set(uri, subscription);
+		this.startSubscription(uri, subscription);
+	}
+
+	private startSubscription(uri: string, subscription: AhpSubscription): void {
 		void this.pumpSubscription(uri, subscription);
 	}
 
@@ -565,17 +676,28 @@ class AhpTask implements AgentTaskHandle {
 				if (event.type === 'action') {
 					this.handleEnvelope(event.params as ActionEnvelope);
 				} else {
-					void this.handleAuthNotification(event.params);
+					this.trackAuthNotification(event.params);
 				}
 			}
 			if (!this.disposed && !this.terminal && this.subscriptions.get(uri) === subscription) {
-				void this.recover();
+				this.handleSubscriptionLoss();
 			}
 		} catch {
 			if (!this.disposed && !this.terminal) {
-				void this.recover();
+				this.handleSubscriptionLoss();
 			}
 		}
+	}
+
+	private handleSubscriptionLoss(): void {
+		if (this.sessionCreated) {
+			void this.recover();
+			return;
+		}
+		this.fail(new AgentRuntimeError(
+			'AGENT_UNAVAILABLE',
+			'The Agent Host connection closed while the task was starting.',
+		));
 	}
 
 	private handleEnvelope(envelope: ActionEnvelope): void {
@@ -788,19 +910,32 @@ class AhpTask implements AgentTaskHandle {
 		}
 	}
 
+	private trackAuthNotification(params: unknown): void {
+		const operation = this.handleAuthNotification(params);
+		this.pendingAuthNotifications.add(operation);
+		void operation.finally(() => this.pendingAuthNotifications.delete(operation));
+	}
+
+	private async drainAuthNotifications(): Promise<void> {
+		while (this.pendingAuthNotifications.size > 0) {
+			await Promise.all([...this.pendingAuthNotifications]);
+		}
+	}
+
 	private async recover(): Promise<void> {
 		if (this.recovering || this.disposed || this.terminal) {
 			return;
 		}
 		this.recovering = true;
 		this.events.push({ type: 'progress', message: 'Reconnecting to Agent Host.' });
+		let candidate: AhpConnection | undefined;
+		const recoveredSubscriptions = new Map<string, AhpSubscription>();
 		try {
-			const connection = await this.connectionFactory.connect(this.host.endpoint);
-			const recoveredSubscriptions = new Map<string, AhpSubscription>();
+			candidate = await this.connectionFactory.connect(this.host.endpoint);
 			for (const uri of this.subscriptions.keys()) {
-				recoveredSubscriptions.set(uri, connection.attachSubscription(uri));
+				recoveredSubscriptions.set(uri, candidate.attachSubscription(uri));
 			}
-			const result = await connection.reconnect(
+			const result = await candidate.reconnect(
 				this.clientId,
 				this.lastSeenServerSeq,
 				[...this.subscriptions.keys()],
@@ -810,36 +945,58 @@ class AhpTask implements AgentTaskHandle {
 					this.handleEnvelope(action);
 				}
 				if ((result.missing ?? []).includes(this.sessionUri) || (result.missing ?? []).includes(this.chatUri ?? '')) {
-					throw new Error('The Agent Host no longer has the task session.');
+					throw new RecoveryUnavailableCause('The Agent Host no longer has the task session.');
 				}
 			} else {
-				for (const snapshot of result.snapshots ?? []) {
+				const snapshots = result.snapshots ?? [];
+				const snapshotResources = new Set(snapshots.map(({ resource }) => resource));
+				const required = [rootUri, this.sessionUri, this.chatUri].filter((uri): uri is string => uri !== undefined);
+				if (required.some((uri) => !snapshotResources.has(uri))) {
+					throw new RecoveryUnavailableCause('The Agent Host no longer has the task session or active chat.');
+				}
+				for (const [uri, subscription] of recoveredSubscriptions) {
+					if (!snapshotResources.has(uri)) {
+						await subscription.close();
+						recoveredSubscriptions.delete(uri);
+					}
+				}
+				for (const snapshot of snapshots) {
 					this.applySnapshot(snapshot);
 				}
 			}
-			const sessions = await connection.listSessions();
+			const sessions = await candidate.listSessions();
 			if (!sessions.some(({ resource }) => resource === this.sessionUri)) {
-				throw new Error('The Agent Host session is missing after reconnect.');
-			}
-			await this.connection.shutdown().catch(() => undefined);
-			this.connection = connection;
-			this.subscriptions.clear();
-			for (const [uri, subscription] of recoveredSubscriptions) {
-				this.addSubscription(uri, subscription);
+				throw new RecoveryUnavailableCause('The Agent Host session is missing after reconnect.');
 			}
 			if (this.provider !== undefined) {
 				await this.authenticate(
 					this.provider.protectedResources ?? [],
 					'tokenInvalid',
 					this.request.allowInteractiveAuthentication === true,
+					candidate,
 				);
 			}
+			await this.connection.shutdown().catch(() => undefined);
+			this.connection = candidate;
+			this.subscriptions.clear();
+			for (const [uri, subscription] of recoveredSubscriptions) {
+				this.addSubscription(uri, subscription);
+			}
 			this.events.push({ type: 'progress', message: 'Agent Host connection recovered.' });
-		} catch {
-			this.fail(new AgentRuntimeError(
-				'TASK_RECOVERY_UNAVAILABLE',
-				'The Agent Host task could not be recovered after the connection closed.',
-			));
+		} catch (error) {
+			let failure = error instanceof RecoveryUnavailableCause
+				? new AgentRuntimeError(
+					'TASK_RECOVERY_UNAVAILABLE',
+					'The Agent Host task could not be recovered because its Host or Session is unavailable.',
+				)
+				: normalizeRuntimeError(error);
+			if (candidate !== undefined && candidate !== this.connection) {
+				const cleanup = await cleanupRecoveryCandidate(candidate, recoveredSubscriptions);
+				if (cleanup !== undefined) {
+					failure = combineRuntimeErrors(failure, cleanup);
+				}
+			}
+			this.fail(failure);
 		} finally {
 			this.recovering = false;
 		}
@@ -852,10 +1009,17 @@ class AhpTask implements AgentTaskHandle {
 		return this.turnId;
 	}
 
+	private throwIfTerminalError(): void {
+		if (this.terminalError !== undefined) {
+			throw this.terminalError;
+		}
+	}
+
 	private fail(error: AgentRuntimeError): void {
 		if (this.terminal || this.disposed) {
 			return;
 		}
+		this.terminalError = error;
 		this.readyReject?.(error);
 		this.defaultChatReject?.(error);
 		this.events.push({ type: 'failed', error });
@@ -884,14 +1048,26 @@ function adaptSubscription(
 }
 
 function validateRequest(request: AgentTaskRequest): void {
-	if (!request.workspace.registered || !request.workspace.uri.startsWith('file:')) {
+	if (request.prompt.trim().length === 0) {
+		throw new AgentRuntimeError('TASK_EXECUTION_FAILED', 'An Agent Host task prompt is required.');
+	}
+	if (request.workspaceId.trim().length === 0) {
+		throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'A registered workspace ID is required.');
+	}
+}
+
+function validateWorkspace(workspaceId: string, workspace: ResolvedAgentTaskRequest['workspace']): void {
+	let uri: URL;
+	try {
+		uri = new URL(workspace.uri);
+	} catch {
+		throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'The registered workspace URI is invalid.');
+	}
+	if (workspace.workspaceId !== workspaceId || uri.protocol !== 'file:') {
 		throw new AgentRuntimeError(
 			'AGENT_UNAVAILABLE',
 			'Agent Host tasks require a registered local file workspace.',
 		);
-	}
-	if (request.prompt.trim().length === 0) {
-		throw new AgentRuntimeError('TASK_EXECUTION_FAILED', 'An Agent Host task prompt is required.');
 	}
 }
 
@@ -912,7 +1088,7 @@ function selectProvider(agents: readonly AgentInfo[], requested?: string): Agent
 	return selected;
 }
 
-function buildPrompt(request: AgentTaskRequest): string {
+function buildPrompt(request: ResolvedAgentTaskRequest): string {
 	if (request.acceptanceCriteria === undefined || request.acceptanceCriteria.length === 0) {
 		return request.prompt;
 	}
@@ -942,6 +1118,92 @@ function isProtectedResource(value: unknown): value is ProtectedResource {
 	return isRecord(value)
 		&& typeof value.resource === 'string'
 		&& value.resource.startsWith('https://');
+}
+
+class RecoveryUnavailableCause extends Error {}
+
+interface CleanupOperation {
+	readonly label: string;
+	readonly run: () => Promise<void>;
+}
+
+async function cleanupDetachedResources(
+	host: LaunchedAgentHost,
+	connection: AhpConnection | undefined,
+): Promise<AgentRuntimeError | undefined> {
+	const failures: string[] = [];
+	if (connection !== undefined) {
+		await collectCleanupFailures([
+			{ label: 'shutdown detached AHP connection', run: () => connection.shutdown() },
+		], failures);
+	}
+	await collectCleanupFailures([
+		{ label: 'dispose detached owned Agent Host', run: () => host.dispose() },
+	], failures);
+	return failures.length === 0 ? undefined : cleanupFailure(failures);
+}
+
+async function cleanupRecoveryCandidate(
+	connection: AhpConnection,
+	subscriptions: ReadonlyMap<string, AhpSubscription>,
+): Promise<AgentRuntimeError | undefined> {
+	const failures: string[] = [];
+	await collectCleanupFailures(
+		[...subscriptions].map(([uri, subscription]) => ({
+			label: `close recovery subscription ${safeCleanupResource(uri)}`,
+			run: () => subscription.close(),
+		})),
+		failures,
+	);
+	await collectCleanupFailures([
+		{ label: 'shutdown recovery AHP connection', run: () => connection.shutdown() },
+	], failures);
+	return failures.length === 0 ? undefined : cleanupFailure(failures);
+}
+
+async function collectCleanupFailures(
+	operations: readonly CleanupOperation[],
+	failures: string[],
+): Promise<void> {
+	const results = await Promise.allSettled(operations.map(({ run }) => run()));
+	for (let index = 0; index < results.length; index += 1) {
+		if (results[index]?.status === 'rejected') {
+			failures.push(operations[index]!.label);
+		}
+	}
+}
+
+function cleanupFailure(failures: readonly string[]): AgentRuntimeError {
+	const unique = [...new Set(failures)];
+	return new AgentRuntimeError(
+		'TASK_EXECUTION_FAILED',
+		`Agent Host resource cleanup failed: ${unique.join(', ')}.`,
+		false,
+		new AggregateError(
+			unique.map((label) => new Error(`Cleanup failed: ${label}.`)),
+			'One or more Agent Host resources could not be released.',
+		),
+	);
+}
+
+function combineRuntimeErrors(primary: AgentRuntimeError, cleanup: AgentRuntimeError): AgentRuntimeError {
+	return new AgentRuntimeError(
+		primary.code,
+		`${primary.message} Resource cleanup also failed.`,
+		primary.retryable,
+		new AggregateError([
+			new AgentRuntimeError(primary.code, primary.message, primary.retryable),
+			new AgentRuntimeError(cleanup.code, cleanup.message, cleanup.retryable, cleanup.cause),
+		], 'The Agent Host operation and its resource cleanup both failed.'),
+	);
+}
+
+function safeCleanupResource(uri: string): string {
+	if (uri === rootUri) {
+		return 'root';
+	}
+	const scheme = uri.match(/^ahp-([a-z]+):/u)?.[1];
+	return scheme === undefined ? 'resource' : scheme;
 }
 
 function normalizeRuntimeError(error: unknown): AgentRuntimeError {

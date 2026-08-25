@@ -12,7 +12,7 @@ The runtime is disabled by default:
 }
 ```
 
-Run **Copilot Agent Mesh: Run Agent Host Task** for an explicit local invocation. Extension consumers can also use the `agentRuntime` returned by `activate()`. Every request must carry a registry-issued local `file:` workspace descriptor. The adapter passes exactly that URI as the Session `workingDirectories` entry.
+Run **Copilot Agent Mesh: Run Agent Host Task** for an explicit local invocation. Extension consumers can also use the `agentRuntime` returned by `activate()`. Requests carry only a workspace ID. The injected `WorkspaceResolver` must resolve that ID from the trusted local registry; the adapter rejects unknown or non-`file:` results and passes only the resolved URI as the Session `workingDirectories` entry.
 
 The first-task safety decision is an injected `FirstTaskConfirmation`. The VS Code command supplies a modal implementation; the AHP adapter never assumes approval and cannot bypass the injected decision.
 
@@ -26,7 +26,7 @@ The first-task safety decision is an injected `FirstTaskConfirmation`. The VS Co
 6. Wait for `session/ready` and `defaultChat`, subscribe to the Chat, then dispatch only the supplied prompt plus acceptance criteria.
 7. Map bounded Chat output/reasoning, tool lifecycle and confirmation, elicited input, MCP authentication, Terminal summaries, and authoritative completion/cancellation/error actions to Mesh-neutral events.
 
-Connection recovery retains only `clientId`, Session/Chat URIs, subscriptions, and `lastSeenServerSeq`. It attempts AHP replay/snapshot recovery, re-lists Sessions, rechecks authentication, and fails with `TASK_RECOVERY_UNAVAILABLE` when the Host or Session is gone. Endpoint tokens are never included in recovery descriptors, events, errors, or logs.
+Connection recovery retains only `clientId`, Session/Chat URIs, subscriptions, and `lastSeenServerSeq`. It attempts AHP replay/snapshot recovery, re-lists Sessions, and rechecks authentication. Missing Hosts or Sessions map to `TASK_RECOVERY_UNAVAILABLE`; authentication failures retain `AGENT_AUTH_REQUIRED` or `AGENT_AUTH_FAILED`. Endpoint tokens are never included in recovery descriptors, events, errors, or logs.
 
 ## Authentication
 

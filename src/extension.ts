@@ -11,12 +11,14 @@ import {
 import { AgentHostLauncher } from './agentHost/AgentHostLauncher';
 import {
 	AgentRuntimeError,
+	AgentRuntimeLifecycle,
 	type AgentInputValue,
 	type AgentInputRequest,
 	type AgentRuntime,
 	type AgentTaskAnswer,
-	type AgentTaskRequest,
 	type FirstTaskConfirmation,
+	type ResolvedAgentTaskRequest,
+	type WorkspaceResolver,
 } from './agentHost/AgentRuntime';
 import { VscodeAuthBroker, type AuthenticationMapping } from './agentHost/AuthBroker';
 import { registerMeshSpikeEchoTool } from './tools/spikeEchoTool';
@@ -24,6 +26,7 @@ import { AgentMeshViewProvider } from './ui/AgentMeshViewProvider';
 
 const configurationSection = 'copilotAgentMesh';
 const runAgentHostTaskCommand = 'copilotAgentMesh.runAgentHostTask';
+const agentRuntimeLifecycle = new AgentRuntimeLifecycle();
 
 export interface AgentMeshExtensionApi {
 	readonly agentRuntime: AgentRuntime;
@@ -33,6 +36,7 @@ export function activate(context: vscode.ExtensionContext): AgentMeshExtensionAp
 	const output = vscode.window.createOutputChannel('Copilot Agent Mesh');
 	const dashboard = new AgentMeshViewProvider();
 	const agentRuntime = createAgentRuntime(context);
+	agentRuntimeLifecycle.track(agentRuntime);
 
 	const configureDevice = vscode.commands.registerCommand('copilotAgentMesh.configureDevice', async () => {
 		const configuration = vscode.workspace.getConfiguration(configurationSection);
@@ -77,12 +81,7 @@ export function activate(context: vscode.ExtensionContext): AgentMeshExtensionAp
 				taskId: randomUUID(),
 				title: prompt.trim().slice(0, 80),
 				prompt: prompt.trim(),
-				workspace: {
-					workspaceId: workspace.uri.toString(),
-					displayName: workspace.name,
-					uri: workspace.uri.toString(),
-					registered: true,
-				},
+				workspaceId: workspace.uri.toString(),
 				allowInteractiveAuthentication: true,
 			});
 			void consumeTask(handle, output).catch((error: unknown) => {
@@ -115,14 +114,23 @@ export function activate(context: vscode.ExtensionContext): AgentMeshExtensionAp
 		runAgentHostTask,
 		configurationListener,
 		vscode.workspace.onDidChangeWorkspaceFolders(() => dashboard.refresh()),
-		{ dispose: () => void agentRuntime.dispose() },
+		{
+			dispose: () => void agentRuntimeLifecycle.dispose().catch((error: unknown) => {
+				const message = error instanceof AgentRuntimeError
+					? `${error.code}: ${error.message}`
+					: 'Agent Host runtime cleanup failed.';
+				output.appendLine(message);
+			}),
+		},
 	);
 
 	output.appendLine(`Copilot Agent Mesh activated with protocol v${MESH_PROTOCOL_VERSION}.`);
 	return { agentRuntime };
 }
 
-export function deactivate(): void {}
+export async function deactivate(): Promise<void> {
+	await agentRuntimeLifecycle.dispose();
+}
 
 function createAgentRuntime(context: vscode.ExtensionContext): AgentRuntime {
 	const configuration = vscode.workspace.getConfiguration(configurationSection);
@@ -138,18 +146,34 @@ function createAgentRuntime(context: vscode.ExtensionContext): AgentRuntime {
 		connections: new SdkAhpConnectionFactory(),
 		authBroker: new VscodeAuthBroker(vscode.authentication, resolveAuthenticationProvider),
 		confirmation: new VscodeFirstTaskConfirmation(),
+		workspaceResolver: new VscodeWorkspaceResolver(),
 		configResolver: new VscodeSessionConfigurationResolver(),
 	});
 }
 
 class VscodeFirstTaskConfirmation implements FirstTaskConfirmation {
-	async confirm(request: AgentTaskRequest): Promise<'once' | 'deny'> {
+	async confirm(request: ResolvedAgentTaskRequest): Promise<'once' | 'deny'> {
 		const choice = await vscode.window.showWarningMessage(
 			`Allow Copilot Agent Mesh to run "${request.title}" in ${request.workspace.displayName}?`,
 			{ modal: true, detail: 'The agent may modify files and run commands in this workspace.' },
 			'Run Once',
 		);
 		return choice === 'Run Once' ? 'once' : 'deny';
+	}
+}
+
+class VscodeWorkspaceResolver implements WorkspaceResolver {
+	async resolve(workspaceId: string) {
+		const workspace = vscode.workspace.workspaceFolders?.find(({ uri }) =>
+			uri.scheme === 'file' && uri.toString() === workspaceId,
+		);
+		return workspace === undefined
+			? undefined
+			: {
+				workspaceId,
+				displayName: workspace.name,
+				uri: workspace.uri.toString(),
+			};
 	}
 }
 

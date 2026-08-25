@@ -32,6 +32,15 @@ async function main(): Promise<void> {
 		connections: new SdkAhpConnectionFactory(),
 		authBroker: new UnavailableAuthBroker(),
 		confirmation: { confirm: async () => 'once' },
+		workspaceResolver: {
+			resolve: async (workspaceId) => workspaceId === 'temporary-e2e-workspace'
+				? {
+					workspaceId,
+					displayName: 'Temporary E2E Workspace',
+					uri: new URL(`file://${workspace}`).toString(),
+				}
+				: undefined,
+		},
 		configResolver: new E2eConfigurationResolver(),
 	});
 
@@ -41,12 +50,7 @@ async function main(): Promise<void> {
 			taskId: 'agent-host-e2e',
 			title: 'Non-destructive Agent Host probe',
 			prompt: 'Reply with exactly MESH_AGENT_HOST_E2E_OK. Do not modify files or run commands.',
-			workspace: {
-				workspaceId: 'temporary-e2e-workspace',
-				displayName: 'Temporary E2E Workspace',
-				uri: new URL(`file://${workspace}`).toString(),
-				registered: true,
-			},
+			workspaceId: 'temporary-e2e-workspace',
 			allowInteractiveAuthentication: false,
 		});
 		let completed = false;

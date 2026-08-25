@@ -15,8 +15,9 @@ export class AgentRuntimeError extends Error {
 		readonly code: AgentRuntimeErrorCode,
 		message: string,
 		readonly retryable = false,
+		cause?: unknown,
 	) {
-		super(message);
+		super(message, { cause });
 		this.name = 'AgentRuntimeError';
 	}
 }
@@ -25,7 +26,6 @@ export interface RegisteredLocalWorkspace {
 	readonly workspaceId: string;
 	readonly displayName: string;
 	readonly uri: string;
-	readonly registered: true;
 }
 
 export interface AgentTaskRequest {
@@ -33,13 +33,21 @@ export interface AgentTaskRequest {
 	readonly title: string;
 	readonly prompt: string;
 	readonly acceptanceCriteria?: readonly string[];
-	readonly workspace: RegisteredLocalWorkspace;
+	readonly workspaceId: string;
 	readonly providerId?: string;
 	readonly allowInteractiveAuthentication?: boolean;
 }
 
+export interface ResolvedAgentTaskRequest extends AgentTaskRequest {
+	readonly workspace: RegisteredLocalWorkspace;
+}
+
+export interface WorkspaceResolver {
+	resolve(workspaceId: string): Promise<RegisteredLocalWorkspace | undefined>;
+}
+
 export interface FirstTaskConfirmation {
-	confirm(request: AgentTaskRequest): Promise<'once' | 'always' | 'deny'>;
+	confirm(request: ResolvedAgentTaskRequest): Promise<'once' | 'always' | 'deny'>;
 }
 
 export type AgentInputKind = 'chatInput' | 'toolConfirmation' | 'toolAuthentication';
@@ -116,6 +124,28 @@ export interface AgentRuntime {
 	probe(): Promise<AgentRuntimeProbe>;
 	start(request: AgentTaskRequest): Promise<AgentTaskHandle>;
 	dispose(): Promise<void>;
+}
+
+export class AgentRuntimeLifecycle {
+	private runtime: AgentRuntime | undefined;
+	private disposal: Promise<void> | undefined;
+
+	track(runtime: AgentRuntime): void {
+		if (this.runtime !== undefined || this.disposal !== undefined) {
+			throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'An Agent runtime lifecycle is already active.');
+		}
+		this.runtime = runtime;
+	}
+
+	dispose(): Promise<void> {
+		if (this.disposal !== undefined) {
+			return this.disposal;
+		}
+		const runtime = this.runtime;
+		this.runtime = undefined;
+		this.disposal = runtime?.dispose() ?? Promise.resolve();
+		return this.disposal;
+	}
 }
 
 export interface AgentRuntimeProbe {
