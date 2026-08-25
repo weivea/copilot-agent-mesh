@@ -119,6 +119,10 @@ export interface DashboardServiceBindings {
 	answerTaskInput(taskId: string, answer: string): Promise<void>;
 }
 
+export interface DashboardConfirmationHost {
+	confirm(message: string, action: string): Promise<boolean>;
+}
+
 /**
  * Secure Extension Host adapter for real application services.
  *
@@ -128,7 +132,10 @@ export interface DashboardServiceBindings {
 export class ServiceDashboardFacade implements DashboardFacade {
 	public readonly onDidChange: (listener: () => void) => vscode.Disposable;
 
-	public constructor(private readonly services: DashboardServiceBindings) {
+	public constructor(
+		private readonly services: DashboardServiceBindings,
+		private readonly confirmations: DashboardConfirmationHost = new VscodeDashboardConfirmationHost(),
+	) {
 		this.onDidChange = services.onDidChange.bind(services);
 	}
 
@@ -155,7 +162,7 @@ export class ServiceDashboardFacade implements DashboardFacade {
 	}
 
 	public async removeWorkspace(workspaceId: string): Promise<void> {
-		if (await confirm('Remove this shared workspace?', 'Remove Workspace')) {
+		if (await this.confirmations.confirm('Remove this shared workspace?', 'Remove Workspace')) {
 			await this.services.removeWorkspace(workspaceId);
 		}
 	}
@@ -164,8 +171,10 @@ export class ServiceDashboardFacade implements DashboardFacade {
 		return this.services.startListener();
 	}
 
-	public stopListener(): Promise<void> {
-		return this.services.stopListener();
+	public async stopListener(): Promise<void> {
+		if (await this.confirmations.confirm('Stop the listener and disconnect remote devices?', 'Stop Listener')) {
+			await this.services.stopListener();
+		}
 	}
 
 	public async copyConnectionUrl(): Promise<void> {
@@ -188,7 +197,7 @@ export class ServiceDashboardFacade implements DashboardFacade {
 	}
 
 	public async removePeer(peerId: string): Promise<void> {
-		if (await confirm('Remove and revoke this remote device?', 'Remove Device')) {
+		if (await this.confirmations.confirm('Remove and revoke this remote device?', 'Remove Device')) {
 			await this.services.removePeer(peerId);
 		}
 	}
@@ -206,7 +215,7 @@ export class ServiceDashboardFacade implements DashboardFacade {
 	}
 
 	public async cancelTask(taskId: string): Promise<void> {
-		if (await confirm('Cancel this running task?', 'Cancel Task')) {
+		if (await this.confirmations.confirm('Cancel this running task?', 'Cancel Task')) {
 			await this.services.cancelTask(taskId);
 		}
 	}
@@ -338,9 +347,11 @@ function platformLabel(platform: NodeJS.Platform): string {
 	return names[platform] ?? platform;
 }
 
-async function confirm(message: string, action: string): Promise<boolean> {
-	const selected = await vscode.window.showWarningMessage(message, { modal: true }, action);
-	return selected === action;
+class VscodeDashboardConfirmationHost implements DashboardConfirmationHost {
+	public async confirm(message: string, action: string): Promise<boolean> {
+		const selected = await vscode.window.showWarningMessage(message, { modal: true }, action);
+		return selected === action;
+	}
 }
 
 function validateConnectionUrl(candidate: string): string | undefined {

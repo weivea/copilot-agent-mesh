@@ -1,4 +1,5 @@
 import { DashboardViewModel } from './DashboardPresenter';
+import { containsUnsafeDashboardText } from './DashboardRedaction';
 
 export const DASHBOARD_MESSAGE_VERSION = 1 as const;
 
@@ -192,14 +193,7 @@ function assertSafeValue(value: unknown, location: string): void {
 		if (value.length > 2048) {
 			throw new Error(`Dashboard value exceeds the safe bound at ${location}.`);
 		}
-		if (
-			value.startsWith('/')
-			|| /(^|[\s("'=])[A-Za-z]:[\\/]/.test(value)
-			|| /(^|[\s("'=])\\\\[^\\\s]+\\/.test(value)
-			|| /(^|[\s("'=])\/(?:[^/\s]+\/)+[^/\s]+/.test(value)
-			|| /file:\/\//i.test(value)
-			|| /[#&?]secret=/i.test(value)
-		) {
+		if (containsUnsafeDashboardText(value)) {
 			throw new Error(`Dashboard value contains a local path or secret at ${location}.`);
 		}
 		return;

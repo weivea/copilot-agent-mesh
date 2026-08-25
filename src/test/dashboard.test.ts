@@ -4,12 +4,18 @@ import { readFile } from 'fs/promises';
 import * as vscode from 'vscode';
 
 import { AgentMeshViewProvider } from '../ui/AgentMeshViewProvider';
-import { DashboardFacade, DashboardSnapshot } from '../ui/DashboardFacade';
+import {
+	DashboardFacade,
+	DashboardServiceBindings,
+	DashboardSnapshot,
+	ServiceDashboardFacade,
+} from '../ui/DashboardFacade';
 import {
 	assertSafeDashboardOutboundMessage,
 	DASHBOARD_MESSAGE_VERSION,
 	parseDashboardInboundMessage,
 } from '../ui/DashboardMessages';
+import { DashboardPresenter } from '../ui/DashboardPresenter';
 
 suite('Dashboard', () => {
 	test('configures a script-enabled webview with media-only resources and a strict CSP', () => {
@@ -56,23 +62,56 @@ suite('Dashboard', () => {
 		assert.strictEqual(parseDashboardInboundMessage({ ...valid, action: 'unknown' }), undefined);
 	});
 
-	test('rejects secrets, local paths, full prompts, and complete output outbound', () => {
+	test('rejects secrets and path forms in otherwise valid outbound models', () => {
 		const base = {
 			version: DASHBOARD_MESSAGE_VERSION,
 			uiInstanceId: 'instance-1',
 			type: 'dashboard.snapshot' as const,
 		};
-		for (const model of [
-			{ secret: 'hidden' },
-			{ localPath: 'workspace' },
-			{ prompt: 'do work' },
-			{ fullOutput: 'all output' },
-			{ summary: '/Users/person/private-project' },
-			{ summary: 'Failed to open /Users/person/private-project/file.ts' },
-			{ summary: 'https://example.test/connect#secret=hidden' },
+		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({ ...base, model: snapshot() }));
+		for (const unsafeText of [
+			'/tmp',
+			'Failed at /tmp',
+			'path=/Users/person/private-project',
+			'C:\\Users\\person\\private-project\\file.ts',
+			'path=C:\\Users\\person\\private-project',
+			'path=\\\\server\\share\\private',
+			'file:///Users/person/private-project/file.ts',
+			'src/auth.ts',
+			'media/dashboard.css',
+			'https://example.test/connect#secret=hidden',
+			'#secret%3Dhidden',
+			'token: ghp_example',
 		]) {
-			assert.throws(() => assertSafeDashboardOutboundMessage({ ...base, model } as never));
+			assert.throws(() => assertSafeDashboardOutboundMessage({
+				...base,
+				model: withTaskSummary(snapshot(), unsafeText),
+			}));
 		}
+	});
+
+	test('redacts path-bearing remote summaries, details, and errors before validation', () => {
+		const source = snapshot();
+		const presenter = new DashboardPresenter();
+		const model = presenter.present({
+			...source,
+			listener: {
+				...source.listener,
+				gateway: { ...source.listener.gateway, detail: 'Gateway failed at C:\\mesh\\gateway.json' },
+			},
+			tasks: source.tasks.map((task) => ({ ...task, summary: 'Changed src/auth.ts' })),
+			errors: [{ code: 'TASK_FAILED', message: 'Could not read file:///tmp/private.txt' }],
+		});
+
+		assert.strictEqual(model.listener.gateway.detail, '[redacted sensitive details]');
+		assert.strictEqual(model.tasks[0].summary, '[redacted sensitive details]');
+		assert.strictEqual(model.errors[0].message, '[redacted sensitive details]');
+		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({
+			version: 1,
+			uiInstanceId: 'instance-1',
+			type: 'dashboard.snapshot',
+			model,
+		}));
 	});
 
 	test('strictly validates outbound model types and enums', () => {
@@ -145,6 +184,43 @@ suite('Dashboard', () => {
 		assert.deepStrictEqual(facade.calls, []);
 		assert.strictEqual(view.webview.sent[0]?.type, 'dashboard.error');
 		provider.dispose();
+	});
+
+	test('coalesces async publications so an old snapshot cannot overwrite a new one', async () => {
+		const extension = getExtension();
+		const facade = new DeferredDashboardFacade();
+		const provider = new AgentMeshViewProvider(facade, extension.extensionUri);
+		const view = new TestWebviewView();
+		provider.resolveWebviewView(view);
+		const uiInstanceId = getUiInstanceId(view.webview.html);
+
+		await view.webview.receive({ version: 1, uiInstanceId, type: 'ready' });
+		await waitFor(() => facade.pendingCount === 1);
+		facade.fireChanged();
+		facade.resolveNext(withDeviceName(snapshot(), 'old-device'));
+		await waitFor(() => facade.pendingCount === 1);
+		facade.resolveNext(withDeviceName(snapshot(), 'new-device'));
+		await waitFor(() => view.webview.sent.length === 1);
+
+		const message = view.webview.sent[0];
+		assert.strictEqual(message.type, 'dashboard.snapshot');
+		assert.strictEqual(getSnapshotDeviceName(message), 'new-device');
+		provider.dispose();
+	});
+
+	test('requires local confirmation before stopping the listener', async () => {
+		const services = new RecordingServiceBindings();
+		const denied = new ServiceDashboardFacade(services, {
+			confirm: async () => false,
+		});
+		await denied.stopListener();
+		assert.strictEqual(services.stopCalls, 0);
+
+		const approved = new ServiceDashboardFacade(services, {
+			confirm: async () => true,
+		});
+		await approved.stopListener();
+		assert.strictEqual(services.stopCalls, 1);
 	});
 
 	test('dispatches all dashboard actions without sensitive values in messages', async () => {
@@ -254,6 +330,59 @@ class RecordingDashboardFacade implements DashboardFacade {
 	}
 }
 
+class DeferredDashboardFacade extends RecordingDashboardFacade {
+	private readonly pending: Array<(value: DashboardSnapshot) => void> = [];
+
+	public override getSnapshot(): Promise<DashboardSnapshot> {
+		return new Promise((resolve) => this.pending.push(resolve));
+	}
+
+	public get pendingCount(): number {
+		return this.pending.length;
+	}
+
+	public resolveNext(value: DashboardSnapshot): void {
+		const resolve = this.pending.shift();
+		assert.ok(resolve);
+		resolve(value);
+	}
+}
+
+class RecordingServiceBindings implements DashboardServiceBindings {
+	private readonly changed = new vscode.EventEmitter<void>();
+	public readonly onDidChange = this.changed.event;
+	public stopCalls = 0;
+
+	public getSnapshot(): Promise<DashboardSnapshot> {
+		return Promise.resolve(snapshot());
+	}
+
+	public async configureDeviceName(_name: string): Promise<void> {}
+	public async registerCurrentWorkspace(): Promise<void> {}
+	public async removeWorkspace(_workspaceId: string): Promise<void> {}
+	public async startListener(): Promise<void> {}
+
+	public async stopListener(): Promise<void> {
+		this.stopCalls += 1;
+	}
+
+	public createConnectionUrl(): Promise<string> {
+		return Promise.resolve('https://example.test/connect#secret=secret');
+	}
+
+	public async addPeer(_connectionUrl: string): Promise<void> {}
+	public async removePeer(_peerId: string): Promise<void> {}
+
+	public async runTask(_request: {
+		readonly peerId?: string;
+		readonly workspaceId?: string;
+		readonly instruction: string;
+	}): Promise<void> {}
+
+	public async cancelTask(_taskId: string): Promise<void> {}
+	public async answerTaskInput(_taskId: string, _answer: string): Promise<void> {}
+}
+
 class TestWebview implements vscode.Webview {
 	public options: vscode.WebviewOptions = {};
 	public html = '';
@@ -318,9 +447,45 @@ function snapshot(): DashboardSnapshot {
 		},
 		workspaces: [],
 		peers: [],
-		tasks: [],
+		tasks: [{
+			taskId: 'task-1',
+			title: 'Implement authentication',
+			peerName: 'remote-device',
+			workspaceName: 'service-workspace',
+			state: 'running',
+			phase: 'Editing',
+			summary: 'Task is running.',
+			canCancel: true,
+			needsInput: false,
+		}],
 		errors: [],
 	};
+}
+
+function withTaskSummary(value: DashboardSnapshot, summary: string): DashboardSnapshot {
+	return {
+		...value,
+		tasks: value.tasks.map((task) => ({ ...task, summary })),
+	};
+}
+
+function withDeviceName(value: DashboardSnapshot, name: string): DashboardSnapshot {
+	return {
+		...value,
+		device: { ...value.device, name },
+	};
+}
+
+function getSnapshotDeviceName(message: Record<string, unknown>): unknown {
+	const model = message.model;
+	if (typeof model !== 'object' || model === null || Array.isArray(model)) {
+		return undefined;
+	}
+	const device = (model as Record<string, unknown>).device;
+	if (typeof device !== 'object' || device === null || Array.isArray(device)) {
+		return undefined;
+	}
+	return (device as Record<string, unknown>).name;
 }
 
 function getExtension(): vscode.Extension<unknown> {
@@ -337,4 +502,14 @@ function getUiInstanceId(html: string): string {
 
 function settle(): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+	for (let attempt = 0; attempt < 50; attempt += 1) {
+		if (predicate()) {
+			return;
+		}
+		await settle();
+	}
+	assert.fail('Timed out waiting for dashboard test condition.');
 }

@@ -17,6 +17,9 @@ interface ViewInstance {
 	readonly view: vscode.WebviewView;
 	readonly subscriptions: vscode.Disposable[];
 	disposed: boolean;
+	requestedRevision: number;
+	publishedRevision: number;
+	publication: Promise<void> | undefined;
 }
 
 export const DASHBOARD_COMMANDS = {
@@ -49,6 +52,9 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 			view: webviewView,
 			subscriptions: [],
 			disposed: false,
+			requestedRevision: 0,
+			publishedRevision: 0,
+			publication: undefined,
 		};
 		this.instances.set(instance.id, instance);
 
@@ -156,21 +162,46 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 		if (instance.disposed) {
 			return;
 		}
-		try {
-			const model = this.presenter.present(await this.facade.getSnapshot());
-			const message: DashboardOutboundMessage = {
-				version: DASHBOARD_MESSAGE_VERSION,
-				uiInstanceId: instance.id,
-				type: 'dashboard.snapshot',
-				model,
-			};
-			await this.safePost(instance, message);
-		} catch {
-			await this.postError(
-				instance,
-				'UNSAFE_VIEW_MODEL',
-				'The dashboard rejected an invalid service snapshot.',
-			);
+		const targetRevision = ++instance.requestedRevision;
+		while (!instance.disposed && instance.publishedRevision < targetRevision) {
+			if (instance.publication === undefined) {
+				instance.publication = this.drainPublications(instance);
+			}
+			const publication = instance.publication;
+			await publication;
+			if (instance.publication === publication) {
+				instance.publication = undefined;
+			}
+		}
+	}
+
+	private async drainPublications(instance: ViewInstance): Promise<void> {
+		while (!instance.disposed && instance.publishedRevision < instance.requestedRevision) {
+			const revision = instance.requestedRevision;
+			try {
+				const model = this.presenter.present(await this.facade.getSnapshot());
+				if (instance.disposed) {
+					return;
+				}
+				if (revision === instance.requestedRevision) {
+					const message: DashboardOutboundMessage = {
+						version: DASHBOARD_MESSAGE_VERSION,
+						uiInstanceId: instance.id,
+						type: 'dashboard.snapshot',
+						model,
+					};
+					await this.safePost(instance, message);
+				}
+			} catch {
+				if (revision === instance.requestedRevision) {
+					await this.postError(
+						instance,
+						'UNSAFE_VIEW_MODEL',
+						'The dashboard rejected an invalid service snapshot.',
+					);
+				}
+			}
+			instance.publishedRevision = revision;
 		}
 	}
 

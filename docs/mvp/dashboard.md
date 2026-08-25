@@ -23,7 +23,8 @@ composition root should adapt the real stores and application services to
 | `answerTaskInput` | Collect the answer in Extension Host UI and submit it by `taskId` |
 
 Destructive confirmations are a Facade responsibility and therefore remain an
-Extension Host security boundary. The production fallback is
+Extension Host security boundary. This includes listener stop, workspace/peer
+removal, and task cancellation. The production fallback is
 `UnavailableDashboardFacade`; it reads only the configured device metadata and
 reports services as unavailable. It never creates fake online state or fake tasks.
 
@@ -36,7 +37,14 @@ outbound messages are rejected when they contain forbidden fields, local path
 shapes, secret URL fragments, or oversized strings.
 
 Each resolved view receives a new `uiInstanceId`. Messages from stale instances
-are rejected, and resolve/dispose cleanup is idempotent.
+are rejected, resolve/dispose cleanup is idempotent, and snapshot reads are
+serialized and coalesced per instance so an older async read cannot overwrite a
+newer state.
+
+The presenter redacts path-bearing remote summaries, component details, and
+errors. The outbound guard independently rejects POSIX, Windows, UNC, file URI,
+and relative source-path forms in any string. This defense is applied after
+strict ViewModel shape validation and before every `postMessage`.
 
 The webview loads `media/dashboard.js` and `media/dashboard.css` through
 `asWebviewUri`. Its resource roots contain only `media/`, scripts are enabled, and
