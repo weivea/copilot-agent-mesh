@@ -121,6 +121,37 @@ test('owned Agent Host retains cleanup ownership after termination failure and r
 	assert.equal(released, 1);
 });
 
+test('owned Agent Host never signals a reused process group after termination already succeeded', async () => {
+	let terminateCalls = 0;
+	let removeCalls = 0;
+	const host = new OwnedAgentHost(
+		new ChildProcess(),
+		12346,
+		'/tmp/owned-agent-host-remove-test',
+		new URL('ws://127.0.0.1:1234/?tkn=secret'),
+		'1.134.0',
+		'0.1.0',
+		'secret',
+		{
+			terminate: async () => {
+				terminateCalls += 1;
+			},
+			remove: async () => {
+				removeCalls += 1;
+				if (removeCalls === 1) {
+					throw new Error('remove failed');
+				}
+			},
+		},
+		() => undefined,
+	);
+
+	await assert.rejects(host.dispose(), AgentRuntimeError);
+	await host.dispose();
+	assert.equal(terminateCalls, 1);
+	assert.equal(removeCalls, 2);
+});
+
 test('launcher aborts and awaits an in-flight host launch during disposal', {
 	skip: process.platform !== 'darwin' && process.platform !== 'linux',
 }, async () => {
@@ -163,6 +194,38 @@ if (args[0] === '--version') {
 		await assert.rejects(launch, AgentRuntimeError);
 		const pid = Number(await readFile(marker, 'utf8'));
 		assert.equal(processExists(pid), false);
+	} finally {
+		await launcher.dispose();
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test('launcher handles a host executable disappearing before spawn without an uncaught child error', {
+	skip: process.platform !== 'darwin' && process.platform !== 'linux',
+}, async () => {
+	const root = await mkdtemp(join(tmpdir(), 'agent-host-spawn-error-test-'));
+	const executable = join(root, 'fake-code');
+	await writeFile(executable, `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+if (args[0] === '--version') {
+  process.stdout.write('1.134.0\\ncommit\\narch\\n');
+} else if (args[0] === 'agent' && args[1] === 'endpoints') {
+  const userData = args[args.indexOf('--user-data-dir') + 1];
+  fs.unlinkSync(process.argv[1]);
+  process.stdout.write(JSON.stringify({ userDataPath: userData, endpoints: [] }));
+}
+`);
+	await chmod(executable, 0o700);
+	const launcher = new AgentHostLauncher({
+		storageRoot: join(root, 'storage'),
+		configuredCodeCli: executable,
+	});
+	try {
+		await assert.rejects(
+			launcher.launch(),
+			(error: unknown) => error instanceof AgentRuntimeError && error.code === 'AGENT_UNAVAILABLE',
+		);
 	} finally {
 		await launcher.dispose();
 		await rm(root, { recursive: true, force: true });
@@ -319,15 +382,15 @@ test('runtime attaches the root subscription before initialize and preserves not
 	});
 
 	const handle = await runtime.start(taskRequest());
-	await waitForCondition(() => auth.requests.some(({ reason }) => reason === 'tokenInvalid'));
+	await waitForCondition(() => auth.requests.filter(({ reason }) => reason === 'tokenInvalid').length === 2);
 	assert.equal(transport.rootAttachedBeforeInitialize, true);
 	assert.equal(auth.requests.filter(({ resources }) =>
 		resources.some(({ resource }) => resource === protectedResource.resource),
-	).length, 1);
-	assert.deepEqual(
-		auth.requests.find(({ reason }) => reason === 'tokenInvalid')?.resources,
-		[initializationOnlyResource],
-	);
+	).length, 2);
+	assert.ok(auth.requests.some(({ reason, resources }) =>
+		reason === 'tokenInvalid'
+		&& resources.some(({ resource }) => resource === initializationOnlyResource.resource),
+	));
 	await handle.dispose();
 });
 
@@ -421,6 +484,85 @@ test('runtime reconnects with the recovery descriptor and fails truthfully on ho
 	if (failed.type === 'failed') {
 		assert.equal(failed.error.code, 'TASK_RECOVERY_UNAVAILABLE');
 	}
+	await handle.dispose();
+});
+
+test('recovery resends unacknowledged turn and input actions with their original client sequences', async () => {
+	const first = new FakeAhpTransport();
+	first.ackDispatches = false;
+	const recovered = new FakeAhpTransport();
+	recovered.reconnectResult = { type: 'replay', actions: [], missing: [] };
+	const runtime = createRuntime(new FakeLauncher(), new FakeConnectionFactory([first, recovered]));
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+	recovered.created = first.created;
+
+	first.emitChat({
+		type: 'chat/inputRequested',
+		request: {
+			id: 'resend-input',
+			message: 'Name',
+			questions: [{ id: 'name', message: 'Name', kind: 'text', required: true }],
+		},
+	});
+	const input = await nextEvent(handle.events);
+	assert.equal(input.type, 'inputRequired');
+	if (input.type !== 'inputRequired') {
+		return;
+	}
+	await handle.answer({
+		requestId: input.request.requestId,
+		outcome: 'accept',
+		values: { name: 'mesh' },
+	});
+	assert.deepEqual(first.dispatched.map(({ clientSeq }) => clientSeq), [1, 2]);
+
+	first.failChat();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	assert.deepEqual(recovered.dispatched.map(({ clientSeq }) => clientSeq), [1, 2]);
+	recovered.emitChat({
+		type: 'chat/delta',
+		turnId: 'turn-1',
+		partId: 'post-ack',
+		content: 'acknowledged',
+	});
+	assert.equal((await nextEvent(handle.events)).type, 'output');
+	await assert.rejects(
+		handle.answer({
+			requestId: input.request.requestId,
+			outcome: 'accept',
+			values: { name: 'mesh' },
+		}),
+		(error: unknown) => error instanceof AgentRuntimeError
+			&& error.message.includes('no longer pending'),
+	);
+	await handle.dispose();
+});
+
+test('recovery resends unacknowledged cancellation and rejects writes until candidate takeover', async () => {
+	const first = new FakeAhpTransport();
+	const recovered = new FakeAhpTransport();
+	recovered.reconnectResult = { type: 'replay', actions: [], missing: [] };
+	recovered.blockReconnect();
+	const runtime = createRuntime(new FakeLauncher(), new FakeConnectionFactory([first, recovered]));
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+	recovered.created = first.created;
+	first.ackDispatches = false;
+	await handle.cancel();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+
+	first.failChat();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	await assert.rejects(
+		handle.cancel(),
+		(error: unknown) => error instanceof AgentRuntimeError && error.retryable,
+	);
+	recovered.releaseReconnect();
+	await waitForCondition(() => recovered.dispatched.length === 1);
+	assert.equal(recovered.dispatched[0]?.action.type, 'chat/turnCancelled');
+	assert.equal(recovered.dispatched[0]?.clientSeq, first.dispatched.at(-1)?.clientSeq);
 	await handle.dispose();
 });
 
@@ -518,6 +660,45 @@ test('intentional terminal removal does not trigger connection recovery', async 
 	await handle.dispose();
 });
 
+test('terminal subscription updates are serialized independently per connection generation', async () => {
+	const first = new FakeAhpTransport();
+	const recovered = new FakeAhpTransport();
+	first.blockSubscribe('ahp-terminal:/old');
+	const runtime = createRuntime(new FakeLauncher(), new FakeConnectionFactory([first, recovered]));
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+	first.emitRootAction({
+		type: 'root/terminalsChanged',
+		terminals: [{
+			resource: 'ahp-terminal:/old',
+			label: 'Old terminal',
+			claim: { kind: 'session', session: handle.recovery.sessionUri },
+		}],
+	});
+	await waitForCondition(() => first.subscribeAttempts.includes('ahp-terminal:/old'));
+	recovered.reconnectResult = {
+		type: 'replay',
+		actions: [envelope('ahp-root://', {
+			type: 'root/terminalsChanged',
+			terminals: [{
+				resource: 'ahp-terminal:/candidate',
+				label: 'Candidate terminal',
+				claim: { kind: 'session', session: handle.recovery.sessionUri },
+			}],
+		}, 9)],
+		missing: [],
+	};
+	recovered.created = first.created;
+
+	first.failChat();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	await waitForCondition(() => recovered.subscribedUris.includes('ahp-terminal:/candidate'));
+	first.releaseSubscribe('ahp-terminal:/old');
+	await waitForCondition(() => first.subscribedUris.includes('ahp-terminal:/old'));
+	assert.equal(recovered.subscribedUris.includes('ahp-terminal:/old'), false);
+	await handle.dispose();
+});
+
 test('authentication deduplication is scoped to each AHP connection', async () => {
 	const first = new FakeAhpTransport();
 	const recovered = new FakeAhpTransport();
@@ -538,7 +719,14 @@ test('authentication deduplication is scoped to each AHP connection', async () =
 	assert.equal((await nextEvent(handle.events)).type, 'progress');
 	assert.equal((await nextEvent(handle.events)).type, 'progress');
 	assert.equal(broker.requests.length, 3);
-	broker.releaseBlocked();
+	broker.rejectBlocked(new AgentRuntimeError('AGENT_AUTH_REQUIRED', 'The stale connection rejected authentication.'));
+	recovered.emitChat({
+		type: 'chat/delta',
+		turnId: 'turn-1',
+		partId: 'after-stale-auth',
+		content: 'recovered',
+	});
+	assert.equal((await nextEvent(handle.events)).type, 'output');
 	await handle.dispose();
 });
 
@@ -843,6 +1031,38 @@ test('event mapper enforces integer and freeform select input constraints', () =
 		}
 });
 
+test('event mapper enforces text input minimum and maximum lengths', () => {
+		for (const value of ['a', 'toolong']) {
+			const mapper = new AhpEventMapper();
+			const [event] = mapper.map(envelope('ahp-chat:/default', {
+				type: 'chat/inputRequested',
+				request: {
+					id: `text-${value}`,
+					message: 'Text',
+					questions: [{
+						id: 'text',
+						message: 'Text',
+						kind: 'text',
+						required: true,
+						min: 2,
+						max: 4,
+					}],
+				},
+			}, 15));
+			assert.equal(event?.type, 'inputRequired');
+			if (event?.type === 'inputRequired') {
+				assert.throws(
+					() => mapper.createAnswer({
+						requestId: event.request.requestId,
+						outcome: 'accept',
+						values: { text: value },
+					}),
+					(error: unknown) => error instanceof AgentRuntimeError,
+				);
+			}
+		}
+});
+
 for (const outcome of ['decline', 'cancel'] as const) {
 		test(`event mapper allows ${outcome} without required structured answers`, () => {
 			const mapper = new AhpEventMapper();
@@ -863,6 +1083,7 @@ for (const outcome of ['decline', 'cancel'] as const) {
 				outcome,
 			}), {
 				channel: 'ahp-chat:/default',
+				requestId: `structured-${outcome}`,
 				action: {
 					type: 'chat/inputCompleted',
 					requestId: `structured-${outcome}`,
@@ -952,6 +1173,7 @@ class FailingRecoveryAuthBroker implements AuthBroker {
 class BlockingConnectionAuthBroker implements AuthBroker {
 	readonly requests: AuthenticationRequest[] = [];
 	private release: (() => void) | undefined;
+	private reject: ((error: Error) => void) | undefined;
 
 	async authenticate(
 		request: AuthenticationRequest,
@@ -959,8 +1181,9 @@ class BlockingConnectionAuthBroker implements AuthBroker {
 	): Promise<void> {
 		this.requests.push(request);
 		if (this.requests.length === 2) {
-			await new Promise<void>((resolve) => {
+			await new Promise<void>((resolve, reject) => {
 				this.release = resolve;
+				this.reject = reject;
 			});
 		}
 		for (const resource of request.resources.filter(({ required }) => required !== false)) {
@@ -970,6 +1193,10 @@ class BlockingConnectionAuthBroker implements AuthBroker {
 
 	releaseBlocked(): void {
 		this.release?.();
+	}
+
+	rejectBlocked(error: Error): void {
+		this.reject?.(error);
 	}
 }
 
@@ -1029,6 +1256,9 @@ class FakeConnectionFactory implements AhpConnectionFactory {
 
 class FakeAhpTransport implements AhpConnection {
 	initialized = false;
+	initializedClientId = '';
+	ackDispatches = true;
+	nextClientSeq = 1;
 	authenticated: Array<{ resource: string; token: string; scopes: readonly string[] }> = [];
 	created: {
 		sessionUri: string;
@@ -1037,7 +1267,7 @@ class FakeAhpTransport implements AhpConnection {
 		config: Readonly<Record<string, unknown>>;
 		clientId: string;
 	} | undefined;
-	dispatched: Array<{ channel: string; action: Record<string, unknown> }> = [];
+	dispatched: Array<{ channel: string; action: Record<string, unknown>; clientSeq: number }> = [];
 	reconnectResult: Awaited<ReturnType<AhpConnection['reconnect']>> = {
 		type: 'snapshot',
 		snapshots: [],
@@ -1054,9 +1284,17 @@ class FakeAhpTransport implements AhpConnection {
 	readonly unsubscribedUris: string[] = [];
 	private readonly attachedUris = new Set<string>();
 	private readonly queues = new Map<string, FakeSubscription>();
+	private reconnectRelease: (() => void) | undefined;
+	private reconnectBarrier: Promise<void> | undefined;
+	private readonly subscribeBarriers = new Map<string, {
+		readonly promise: Promise<void>;
+		readonly release: () => void;
+	}>();
+	readonly subscribeAttempts: string[] = [];
 
-	async initialize(): Promise<Awaited<ReturnType<AhpConnection['initialize']>>> {
+	async initialize(clientId: string): Promise<Awaited<ReturnType<AhpConnection['initialize']>>> {
 		this.initialized = true;
+		this.initializedClientId = clientId;
 		this.rootAttachedBeforeInitialize = this.attachedUris.has('ahp-root://');
 		if (this.notificationDuringInitialize.length > 0 && this.rootAttachedBeforeInitialize) {
 			this.queue('ahp-root://').push({
@@ -1084,8 +1322,34 @@ class FakeAhpTransport implements AhpConnection {
 		};
 	}
 
-	async reconnect(): Promise<Awaited<ReturnType<AhpConnection['reconnect']>>> {
+	async reconnect(clientId: string): Promise<Awaited<ReturnType<AhpConnection['reconnect']>>> {
+		this.initializedClientId = clientId;
+		await this.reconnectBarrier;
 		return this.reconnectResult;
+	}
+
+	blockReconnect(): void {
+		this.reconnectBarrier = new Promise<void>((resolve) => {
+			this.reconnectRelease = resolve;
+		});
+	}
+
+	releaseReconnect(): void {
+		this.reconnectRelease?.();
+		this.reconnectBarrier = undefined;
+	}
+
+	blockSubscribe(uri: string): void {
+		let release: () => void = () => undefined;
+		const promise = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		this.subscribeBarriers.set(uri, { promise, release });
+	}
+
+	releaseSubscribe(uri: string): void {
+		this.subscribeBarriers.get(uri)?.release();
+		this.subscribeBarriers.delete(uri);
 	}
 
 	attachSubscription(uri: string): AhpSubscription {
@@ -1094,6 +1358,8 @@ class FakeAhpTransport implements AhpConnection {
 	}
 
 	async subscribe(uri: string): Promise<{ readonly snapshot?: Snapshot; readonly subscription: AhpSubscription }> {
+		this.subscribeAttempts.push(uri);
+		await this.subscribeBarriers.get(uri)?.promise;
 		this.subscribedUris.push(uri);
 		if (uri.startsWith('ahp-session:')) {
 			return {
@@ -1191,14 +1457,20 @@ class FakeAhpTransport implements AhpConnection {
 		return this.created === undefined ? [] : [{ resource: this.created.sessionUri }];
 	}
 
-	dispatch(channel: string, action: unknown): void {
+	dispatch(channel: string, action: unknown, clientSeq?: number): number {
 		assert.equal(typeof action, 'object');
 		assert.ok(action);
 		const record = action as Record<string, unknown>;
-		this.dispatched.push({ channel, action: record });
-		if (record.type === 'chat/turnCancelled') {
-			this.emit(channel, record);
+		const sequence = clientSeq ?? this.nextClientSeq++;
+		this.nextClientSeq = Math.max(this.nextClientSeq, sequence + 1);
+		this.dispatched.push({ channel, action: record, clientSeq: sequence });
+		if (this.ackDispatches) {
+			this.emit(channel, record, {
+				clientId: this.initializedClientId,
+				clientSeq: sequence,
+			});
 		}
+		return sequence;
 	}
 
 	async unsubscribe(uri: string): Promise<void> {
@@ -1239,10 +1511,14 @@ class FakeAhpTransport implements AhpConnection {
 		this.queue('ahp-chat:/default').fail(new Error('transport closed'));
 	}
 
-	private emit(channel: string, action: Record<string, unknown>): void {
+	private emit(
+		channel: string,
+		action: Record<string, unknown>,
+		origin?: { readonly clientId: string; readonly clientSeq: number },
+	): void {
 		this.queue(channel).push({
 			type: 'action',
-			params: envelope(channel, action, 4),
+			params: envelope(channel, action, 4, origin),
 		});
 	}
 
@@ -1287,12 +1563,17 @@ class FakeSubscription implements AhpSubscription {
 	}
 }
 
-function envelope(channel: string, action: Record<string, unknown>, serverSeq: number): ActionEnvelope {
+function envelope(
+	channel: string,
+	action: Record<string, unknown>,
+	serverSeq: number,
+	origin?: { readonly clientId: string; readonly clientSeq: number },
+): ActionEnvelope {
 	return {
 		channel,
 		action,
 		serverSeq,
-		origin: undefined,
+		origin,
 	} as unknown as ActionEnvelope;
 }
 

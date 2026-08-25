@@ -110,6 +110,7 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 		let processGroupId: number | undefined;
 		let host: ChildProcess | undefined;
 		let launched: OwnedAgentHost | undefined;
+		let spawnError: Error | undefined;
 
 		try {
 			await Promise.all([
@@ -144,6 +145,9 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 				windowsHide: true,
 				stdio: ['ignore', 'pipe', 'pipe'],
 			});
+			host.once('error', (error) => {
+				spawnError = error;
+			});
 			host.stdout?.resume();
 			host.stderr?.resume();
 			processGroupId = host.pid;
@@ -151,10 +155,6 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 				throw new Error('The Agent Host did not expose an owned process identifier.');
 			}
 
-			let spawnError: Error | undefined;
-			host.once('error', (error) => {
-				spawnError = error;
-			});
 			let ownedPids = new Set([processGroupId]);
 			const endpoint = await waitForOwnedStandaloneEndpoint({
 				baselineInstanceIds,
@@ -256,6 +256,8 @@ export class OwnedAgentHost implements LaunchedAgentHost {
 	private disposing = false;
 	private disposed = false;
 	private disposal: Promise<void> | undefined;
+	private processTerminated = false;
+	private tempDirRemoved = false;
 
 	constructor(
 		private readonly child: ChildProcess,
@@ -302,29 +304,35 @@ export class OwnedAgentHost implements LaunchedAgentHost {
 
 	private async disposeOwned(): Promise<void> {
 		this.disposing = true;
-		try {
-			await this.cleanup.terminate(this.processGroupId, shutdownGraceMs);
-		} catch (error) {
-			this.disposing = false;
-			throw new AgentRuntimeError(
-				'AGENT_UNAVAILABLE',
-				'The owned Agent Host process group could not be terminated and remains tracked for retry.',
-				false,
-				sanitizeError(error, [this.token]),
-				true,
-			);
+		if (!this.processTerminated) {
+			try {
+				await this.cleanup.terminate(this.processGroupId, shutdownGraceMs);
+				this.processTerminated = true;
+			} catch (error) {
+				this.disposing = false;
+				throw new AgentRuntimeError(
+					'AGENT_UNAVAILABLE',
+					'The owned Agent Host process group could not be terminated and remains tracked for retry.',
+					false,
+					sanitizeError(error, [this.token]),
+					true,
+				);
+			}
 		}
-		try {
-			await this.cleanup.remove(this.ownedRoot);
-		} catch (error) {
-			this.disposing = false;
-			throw new AgentRuntimeError(
-				'AGENT_UNAVAILABLE',
-				'The owned Agent Host data could not be removed and remains tracked for retry.',
-				false,
-				sanitizeError(error, [this.token]),
-				true,
-			);
+		if (!this.tempDirRemoved) {
+			try {
+				await this.cleanup.remove(this.ownedRoot);
+				this.tempDirRemoved = true;
+			} catch (error) {
+				this.disposing = false;
+				throw new AgentRuntimeError(
+					'AGENT_UNAVAILABLE',
+					'The owned Agent Host data could not be removed and remains tracked for retry.',
+					false,
+					sanitizeError(error, [this.token]),
+					true,
+				);
+			}
 		}
 		this.disposed = true;
 		this.exitListeners.clear();
@@ -335,6 +343,8 @@ export class OwnedAgentHost implements LaunchedAgentHost {
 class RetainedLaunchCleanup implements OwnedResource {
 	private disposed = false;
 	private disposal: Promise<void> | undefined;
+	private processTerminated = false;
+	private tempDirRemoved = false;
 
 	constructor(
 		private readonly processGroupId: number,
@@ -357,15 +367,21 @@ class RetainedLaunchCleanup implements OwnedResource {
 	}
 
 	private async disposeOwned(): Promise<void> {
-		try {
-			await this.cleanup.terminate(this.processGroupId, shutdownGraceMs);
-		} catch (error) {
-			throw normalizeLaunchError(error, this.token);
+		if (!this.processTerminated) {
+			try {
+				await this.cleanup.terminate(this.processGroupId, shutdownGraceMs);
+				this.processTerminated = true;
+			} catch (error) {
+				throw normalizeLaunchError(error, this.token);
+			}
 		}
-		try {
-			await this.cleanup.remove(this.ownedRoot);
-		} catch (error) {
-			throw normalizeLaunchError(error, this.token);
+		if (!this.tempDirRemoved) {
+			try {
+				await this.cleanup.remove(this.ownedRoot);
+				this.tempDirRemoved = true;
+			} catch (error) {
+				throw normalizeLaunchError(error, this.token);
+			}
 		}
 		this.disposed = true;
 		this.didDispose();

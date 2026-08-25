@@ -47,7 +47,7 @@ interface Question {
 }
 
 export type AnswerDispatch =
-	| { readonly channel: string; readonly action: unknown }
+	| { readonly channel: string; readonly action: unknown; readonly requestId: string }
 	| { readonly authentication: ProtectedResource; readonly requestId: string };
 
 export class AhpEventMapper {
@@ -162,9 +162,9 @@ export class AhpEventMapper {
 
 		if (pending.kind === 'toolAuthentication') {
 			if (answer.outcome !== 'accept') {
-				this.pending.delete(answer.requestId);
 				return {
 					channel: pending.chatUri,
+					requestId: answer.requestId,
 					action: {
 						type: 'chat/toolCallComplete',
 						turnId: pending.turnId,
@@ -177,10 +177,10 @@ export class AhpEventMapper {
 		}
 
 		if (pending.kind === 'toolConfirmation') {
-			this.pending.delete(answer.requestId);
 			if (pending.resultConfirmation) {
 				return {
 					channel: pending.chatUri,
+					requestId: answer.requestId,
 					action: {
 						type: 'chat/toolCallResultConfirmed',
 						turnId: pending.turnId,
@@ -191,6 +191,7 @@ export class AhpEventMapper {
 			}
 			return {
 				channel: pending.chatUri,
+				requestId: answer.requestId,
 				action: answer.outcome === 'accept'
 					? {
 						type: 'chat/toolCallConfirmed',
@@ -215,9 +216,9 @@ export class AhpEventMapper {
 		const answers = answer.outcome === 'accept'
 			? validateAnswers(pending.questions, answer.values ?? {})
 			: undefined;
-		this.pending.delete(answer.requestId);
 		return {
 			channel: pending.chatUri,
+			requestId: answer.requestId,
 			action: {
 				type: 'chat/inputCompleted',
 				requestId: pending.requestId,
@@ -232,6 +233,10 @@ export class AhpEventMapper {
 		if (pending?.kind === 'toolAuthentication') {
 			this.pending.delete(requestId);
 		}
+	}
+
+	completeAnswer(requestId: string): void {
+		this.pending.delete(requestId);
 	}
 
 	private mapToolReady(
@@ -458,6 +463,12 @@ function answerMatches(question: Question, kind: string, value: AgentInputValue)
 	if (typeof normalized.value === 'number'
 		&& ((question.min !== undefined && normalized.value < question.min)
 			|| (question.max !== undefined && normalized.value > question.max))) {
+		return false;
+	}
+	if (kind === 'text'
+		&& typeof normalized.value === 'string'
+		&& ((question.min !== undefined && normalized.value.length < question.min)
+			|| (question.max !== undefined && normalized.value.length > question.max))) {
 		return false;
 	}
 	if (Array.isArray(normalized.value)

@@ -34,6 +34,12 @@ const rootUri = 'ahp-root://';
 const sessionReadyTimeoutMs = 60_000;
 const cancellationTimeoutMs = 15_000;
 
+interface AuthenticationInFlight {
+	readonly reason: 'initial' | 'challenge' | 'tokenInvalid';
+	readonly interactive: boolean;
+	readonly promise: Promise<void>;
+}
+
 export interface AhpSubscriptionEvent {
 	readonly type: 'action' | 'authRequired';
 	readonly params: unknown;
@@ -78,7 +84,7 @@ export interface AhpConnection {
 		readonly clientId: string;
 	}): Promise<void>;
 	listSessions(): Promise<readonly { readonly resource: string }[]>;
-	dispatch(channel: string, action: unknown): void;
+	dispatch(channel: string, action: unknown, clientSeq?: number): number;
 	unsubscribe(uri: string): Promise<void>;
 	disposeSession(uri: string): Promise<void>;
 	shutdown(): Promise<void>;
@@ -326,8 +332,8 @@ class SdkAhpConnection implements AhpConnection {
 		return result.items.map(({ resource }) => ({ resource }));
 	}
 
-	dispatch(channel: string, action: unknown): void {
-		this.client.dispatch(channel, action as StateAction);
+	dispatch(channel: string, action: unknown, clientSeq?: number): number {
+		return this.client.dispatch(channel, action as StateAction, clientSeq).clientSeq;
 	}
 
 	async unsubscribe(uri: string): Promise<void> {
@@ -380,7 +386,7 @@ class AhpTask implements AgentTaskHandle {
 	private readonly mapper = new AhpEventMapper();
 	private readonly clientId = `copilot-agent-mesh-${randomUUID()}`;
 	private readonly sessionUri = `ahp-session:/${randomUUID()}`;
-	private readonly subscriptions = new Map<string, AhpSubscription>();
+	private subscriptions = new Map<string, AhpSubscription>();
 	private readonly staleConnections = new Set<AhpConnection>();
 	private connection: AhpConnection;
 	private chatUri: string | undefined;
@@ -400,11 +406,17 @@ class AhpTask implements AgentTaskHandle {
 	private cancellationTimer: NodeJS.Timeout | undefined;
 	private exitSubscription: { dispose(): void } | undefined;
 	private disposePromise: Promise<void> | undefined;
-	private readonly authenticationInFlight = new WeakMap<AhpConnection, Map<string, Promise<void>>>();
+	private readonly authenticationInFlight = new WeakMap<AhpConnection, Map<string, AuthenticationInFlight>>();
 	private readonly pendingAuthNotifications = new Set<Promise<void>>();
 	private terminalError: AgentRuntimeError | undefined;
 	private rootTerminals: readonly TerminalInfo[] = [];
-	private terminalSubscriptionUpdate = Promise.resolve();
+	private readonly terminalSubscriptionUpdates = new WeakMap<AhpConnection, Promise<void>>();
+	private readonly unacknowledgedDispatches = new Map<number, {
+		readonly channel: string;
+		readonly action: unknown;
+		readonly requestId?: string;
+	}>();
+	private nextClientSeq = 1;
 
 	constructor(
 		private readonly request: ResolvedAgentTaskRequest,
@@ -442,7 +454,7 @@ class AhpTask implements AgentTaskHandle {
 		const root = parseRootState(rootSnapshot);
 		this.provider = selectProvider(root.agents, this.request.providerId);
 		this.rootTerminals = root.terminals ?? [];
-		this.startSubscription(rootUri, rootSubscription);
+		this.startSubscription(rootUri, rootSubscription, this.connection, this.subscriptions);
 		await this.authenticate(this.provider.protectedResources ?? [], 'initial', this.request.allowInteractiveAuthentication === true);
 		await Promise.resolve();
 		await this.drainAuthNotifications();
@@ -484,7 +496,7 @@ class AhpTask implements AgentTaskHandle {
 		await this.scheduleOwnedTerminals(this.rootTerminals, this.connection, this.subscriptions, true);
 
 		this.turnId = randomUUID();
-		this.connection.dispatch(defaultChat, {
+		this.dispatchTracked(defaultChat, {
 			type: 'chat/turnStarted',
 			turnId: this.turnId,
 			startedAt: new Date().toISOString(),
@@ -500,8 +512,9 @@ class AhpTask implements AgentTaskHandle {
 		if (this.terminal || this.disposed || this.chatUri === undefined) {
 			return;
 		}
+		this.assertWritable();
 		this.events.push({ type: 'progress', message: 'Cancellation requested.' });
-		this.connection.dispatch(this.chatUri, {
+		this.dispatchTracked(this.chatUri, {
 			type: 'chat/turnCancelled',
 			turnId: this.currentTurnId(),
 			duration: 0,
@@ -518,13 +531,14 @@ class AhpTask implements AgentTaskHandle {
 		if (this.terminal || this.disposed) {
 			throw new AgentRuntimeError('TASK_EXECUTION_FAILED', 'The Agent Host task is no longer active.');
 		}
+		this.assertWritable();
 		const dispatch = this.mapper.createAnswer(answer);
 		if ('authentication' in dispatch) {
 			await this.authenticate([dispatch.authentication], 'challenge', true);
 			this.mapper.completeAuthentication(dispatch.requestId);
 			return;
 		}
-		this.connection.dispatch(dispatch.channel, dispatch.action);
+		this.dispatchTracked(dispatch.channel, dispatch.action, dispatch.requestId);
 	}
 
 	dispose(): Promise<void> {
@@ -640,69 +654,145 @@ class AhpTask implements AgentTaskHandle {
 	): Promise<void> {
 		let connectionAuthentication = this.authenticationInFlight.get(connection);
 		if (connectionAuthentication === undefined) {
-			connectionAuthentication = new Map<string, Promise<void>>();
+			connectionAuthentication = new Map<string, AuthenticationInFlight>();
 			this.authenticationInFlight.set(connection, connectionAuthentication);
 		}
-		const pending = new Set<Promise<void>>();
-		const fresh = new Map<string, ProtectedResource>();
-		for (const resource of resources.filter(({ required }) => required !== false)) {
-			const existing = connectionAuthentication.get(resource.resource);
-			if (existing === undefined) {
-				fresh.set(resource.resource, resource);
-			} else {
-				pending.add(existing);
-			}
+		await Promise.all(resources
+			.filter(({ required }) => required !== false)
+			.map((resource) => this.authenticateResource(
+				resource,
+				reason,
+				interactive,
+				connection,
+				connectionAuthentication!,
+			)));
+	}
+
+	private authenticateResource(
+		resource: ProtectedResource,
+		reason: 'initial' | 'challenge' | 'tokenInvalid',
+		interactive: boolean,
+		connection: AhpConnection,
+		connectionAuthentication: Map<string, AuthenticationInFlight>,
+	): Promise<void> {
+		const existing = connectionAuthentication.get(resource.resource);
+		if (existing !== undefined && authenticationCovers(existing, reason, interactive)) {
+			return existing.promise;
 		}
-		let operation: Promise<void> | undefined;
-		if (fresh.size > 0) {
-			operation = this.authBroker.authenticate(
-				{ resources: [...fresh.values()], interactive, reason },
-				(resource, token, scopes) => connection.authenticate(resource, token, scopes),
+		const operation = (async () => {
+			if (existing !== undefined) {
+				await existing.promise.catch(() => undefined);
+			}
+			await this.authBroker.authenticate(
+				{ resources: [resource], interactive, reason },
+				(resourceUrl, token, scopes) => connection.authenticate(resourceUrl, token, scopes),
 			);
-			for (const resource of fresh.keys()) {
-				connectionAuthentication.set(resource, operation);
+		})();
+		const current = { reason, interactive, promise: operation };
+		connectionAuthentication.set(resource.resource, current);
+		const clear = () => {
+			if (connectionAuthentication.get(resource.resource) === current) {
+				connectionAuthentication.delete(resource.resource);
 			}
-			pending.add(operation);
-		}
+		};
+		void operation.then(clear, clear);
+		return operation;
+	}
+
+	private dispatchTracked(channel: string, action: unknown, requestId?: string): void {
+		const clientSeq = this.nextClientSeq;
+		this.nextClientSeq += 1;
+		this.unacknowledgedDispatches.set(clientSeq, { channel, action, requestId });
 		try {
-			await Promise.all(pending);
-		} finally {
-			if (operation !== undefined) {
-				for (const resource of fresh.keys()) {
-					if (connectionAuthentication.get(resource) === operation) {
-						connectionAuthentication.delete(resource);
-					}
-				}
-			}
+			this.connection.dispatch(channel, action, clientSeq);
+		} catch (error) {
+			this.handleSubscriptionLoss();
+			throw normalizeRuntimeError(error);
+		}
+	}
+
+	private acknowledgeDispatch(envelope: ActionEnvelope): void {
+		if (envelope.origin?.clientId !== this.clientId) {
+			return;
+		}
+		const pending = this.unacknowledgedDispatches.get(envelope.origin.clientSeq);
+		if (pending === undefined) {
+			return;
+		}
+		this.unacknowledgedDispatches.delete(envelope.origin.clientSeq);
+		if (envelope.rejectionReason === undefined && pending.requestId !== undefined) {
+			this.mapper.completeAnswer(pending.requestId);
+		}
+	}
+
+	private resendUnacknowledged(connection: AhpConnection): void {
+		for (const [clientSeq, pending] of this.unacknowledgedDispatches) {
+			connection.dispatch(pending.channel, pending.action, clientSeq);
+		}
+	}
+
+	private assertWritable(): void {
+		if (this.recovering) {
+			throw new AgentRuntimeError(
+				'TASK_EXECUTION_FAILED',
+				'The Agent Host task is reconnecting; retry the action after recovery completes.',
+				true,
+			);
 		}
 	}
 
 	private addSubscription(uri: string, subscription: AhpSubscription): void {
 		this.subscriptions.set(uri, subscription);
-		this.startSubscription(uri, subscription);
+		this.startSubscription(uri, subscription, this.connection, this.subscriptions);
 	}
 
-	private startSubscription(uri: string, subscription: AhpSubscription): void {
-		void this.pumpSubscription(uri, subscription);
+	private startSubscription(
+		uri: string,
+		subscription: AhpSubscription,
+		connection: AhpConnection,
+		subscriptions: Map<string, AhpSubscription>,
+	): void {
+		void this.pumpSubscription(uri, subscription, connection, subscriptions);
 	}
 
-	private async pumpSubscription(uri: string, subscription: AhpSubscription): Promise<void> {
+	private async pumpSubscription(
+		uri: string,
+		subscription: AhpSubscription,
+		connection: AhpConnection,
+		subscriptions: Map<string, AhpSubscription>,
+	): Promise<void> {
 		try {
 			for await (const event of subscription) {
-				if (this.disposed || this.subscriptions.get(uri) !== subscription) {
+				if (
+					this.disposed
+					|| connection !== this.connection
+					|| subscriptions !== this.subscriptions
+					|| subscriptions.get(uri) !== subscription
+				) {
 					return;
 				}
 				if (event.type === 'action') {
 					this.handleEnvelope(event.params as ActionEnvelope);
 				} else {
-					this.trackAuthNotification(event.params);
+					this.trackAuthNotification(event.params, connection);
 				}
 			}
-			if (!this.disposed && !this.terminal && this.subscriptions.get(uri) === subscription) {
+			if (
+				!this.disposed
+				&& !this.terminal
+				&& connection === this.connection
+				&& subscriptions === this.subscriptions
+				&& subscriptions.get(uri) === subscription
+			) {
 				this.handleSubscriptionLoss();
 			}
 		} catch {
-			if (!this.disposed && !this.terminal) {
+			if (
+				!this.disposed
+				&& !this.terminal
+				&& connection === this.connection
+				&& subscriptions === this.subscriptions
+			) {
 				this.handleSubscriptionLoss();
 			}
 		}
@@ -721,6 +811,7 @@ class AhpTask implements AgentTaskHandle {
 
 	private handleEnvelope(envelope: ActionEnvelope, subscribeRootTerminals = true): void {
 		this.lastSeenServerSeq = Math.max(this.lastSeenServerSeq, envelope.serverSeq);
+		this.acknowledgeDispatch(envelope);
 		const action = envelope.action;
 		if (envelope.channel === rootUri) {
 			if (action.type === 'root/agentsChanged') {
@@ -935,12 +1026,17 @@ class AhpTask implements AgentTaskHandle {
 				continue;
 			}
 			const result = await connection.subscribe(terminal.resource);
+			if (startPumps && connection !== this.connection) {
+				await result.subscription.close().catch(() => undefined);
+				await connection.unsubscribe(terminal.resource).catch(() => undefined);
+				continue;
+			}
 			if (result.snapshot !== undefined) {
 				this.applySnapshot(result.snapshot, false);
 			}
 			subscriptions.set(terminal.resource, result.subscription);
 			if (startPumps) {
-				this.startSubscription(terminal.resource, result.subscription);
+				this.startSubscription(terminal.resource, result.subscription, connection, subscriptions);
 			}
 		}
 	}
@@ -951,14 +1047,15 @@ class AhpTask implements AgentTaskHandle {
 		subscriptions: Map<string, AhpSubscription>,
 		startPumps: boolean,
 	): Promise<void> {
-		const update = this.terminalSubscriptionUpdate.then(() =>
+		const previous = this.terminalSubscriptionUpdates.get(connection) ?? Promise.resolve();
+		const update = previous.then(() =>
 			this.subscribeOwnedTerminals(terminals, connection, subscriptions, startPumps),
 		);
-		this.terminalSubscriptionUpdate = update.catch(() => undefined);
+		this.terminalSubscriptionUpdates.set(connection, update.catch(() => undefined));
 		return update;
 	}
 
-	private async handleAuthNotification(params: unknown): Promise<void> {
+	private async handleAuthNotification(params: unknown, connection: AhpConnection): Promise<void> {
 		const resources = readResourcesFromNotification(params);
 		if (resources.length === 0) {
 			return;
@@ -968,16 +1065,20 @@ class AhpTask implements AgentTaskHandle {
 				resources,
 				'tokenInvalid',
 				this.request.allowInteractiveAuthentication === true,
+				connection,
 			);
 		} catch (error) {
-			this.fail(normalizeRuntimeError(error));
+			if (connection === this.connection && !this.recovering) {
+				this.fail(normalizeRuntimeError(error));
+			}
 		}
 	}
 
-	private trackAuthNotification(params: unknown): void {
-		const operation = this.handleAuthNotification(params);
+	private trackAuthNotification(params: unknown, connection: AhpConnection): void {
+		const operation = this.handleAuthNotification(params, connection);
 		this.pendingAuthNotifications.add(operation);
-		void operation.finally(() => this.pendingAuthNotifications.delete(operation));
+		const clear = () => this.pendingAuthNotifications.delete(operation);
+		void operation.then(clear, clear);
 	}
 
 	private async drainAuthNotifications(): Promise<void> {
@@ -1060,16 +1161,18 @@ class AhpTask implements AgentTaskHandle {
 					false,
 				);
 			}
+			this.resendUnacknowledged(candidate);
 			const previousConnection = this.connection;
 			this.connection = candidate;
-			this.subscriptions.clear();
-			for (const [uri, subscription] of recoveredSubscriptions) {
-				this.addSubscription(uri, subscription);
-			}
+			this.subscriptions = recoveredSubscriptions;
 			try {
 				await previousConnection.shutdown();
 			} catch {
 				this.staleConnections.add(previousConnection);
+			}
+			this.recovering = false;
+			for (const [uri, subscription] of recoveredSubscriptions) {
+				this.startSubscription(uri, subscription, candidate, recoveredSubscriptions);
 			}
 			this.events.push({ type: 'progress', message: 'Agent Host connection recovered.' });
 		} catch (error) {
@@ -1207,6 +1310,16 @@ function isProtectedResource(value: unknown): value is ProtectedResource {
 	return isRecord(value)
 		&& typeof value.resource === 'string'
 		&& value.resource.startsWith('https://');
+}
+
+function authenticationCovers(
+	existing: AuthenticationInFlight,
+	reason: AuthenticationInFlight['reason'],
+	interactive: boolean,
+): boolean {
+	const rank = { initial: 0, challenge: 1, tokenInvalid: 2 } as const;
+	return rank[existing.reason] >= rank[reason]
+		&& (existing.interactive || !interactive);
 }
 
 class RecoveryUnavailableCause extends Error {}
