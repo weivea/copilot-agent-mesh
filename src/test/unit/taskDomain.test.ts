@@ -323,6 +323,10 @@ describe('task domain', () => {
 				state: 'recovering',
 			},
 		]));
+		assert.deepStrictEqual(leases.owner(IDS.workspace), {
+			peerId: IDS.peer,
+			taskId: IDS.task,
+		});
 		const terminal = {
 			...createAcceptedTask(taskRequest(), AT),
 			state: 'failed' as const,

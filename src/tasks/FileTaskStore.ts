@@ -107,9 +107,20 @@ export class FileTaskStore {
 				continue;
 			}
 			const path = `tasks/${name}`;
+			const identity = parseTaskFileName(path, name);
 			const value = await this.files.readJson(path);
 			if (value !== undefined) {
-				records.push(parseRecord(path, value));
+				const record = parseRecord(path, value);
+				if (
+					record.peerId !== identity.peerId
+					|| record.taskId !== identity.taskId
+				) {
+					throw new StorageCorruptionError(
+						path,
+						'record identity does not match its file name',
+					);
+				}
+				records.push(record);
 			}
 		}
 		return records;
@@ -144,6 +155,31 @@ export class FileTaskStore {
 
 function taskPath(peerId: string, taskId: string): string {
 	return `tasks/${peerId}--${taskId}.json`;
+}
+
+function parseTaskFileName(
+	path: string,
+	name: string,
+): { readonly peerId: string; readonly taskId: string } {
+	const stem = name.slice(0, -'.json'.length);
+	const separator = stem.indexOf('--');
+	if (separator <= 0 || separator !== stem.lastIndexOf('--')) {
+		throw new StorageCorruptionError(path, 'task file name is not canonical');
+	}
+	const peerId = stem.slice(0, separator);
+	const taskId = stem.slice(separator + 2);
+	const parsedPeerId = uuidSchema.safeParse(peerId);
+	const parsedTaskId = uuidSchema.safeParse(taskId);
+	if (!parsedPeerId.success || !parsedTaskId.success) {
+		throw new StorageCorruptionError(path, 'task file name contains an invalid identity');
+	}
+	if (name !== `${parsedPeerId.data}--${parsedTaskId.data}.json`) {
+		throw new StorageCorruptionError(path, 'task file name is not canonical');
+	}
+	return {
+		peerId: parsedPeerId.data,
+		taskId: parsedTaskId.data,
+	};
 }
 
 function parseRecord(path: string, value: unknown): TaskRecord {

@@ -286,4 +286,32 @@ describe('foundation storage', () => {
 			StorageCorruptionError,
 		);
 	});
+
+	test('rejects task files whose names do not match their complete identity', async () => {
+		const cases = [
+			`${IDS.otherPeer}--${IDS.task}.json`,
+			`${IDS.peer}--${IDS.otherTask}.json`,
+			`${encodeURIComponent(IDS.peer)}%2Fescape--${IDS.task}.json`,
+			'extra.json',
+		];
+		for (const [index, name] of cases.entries()) {
+			const root = await makeDirectory();
+			const files = new AtomicFileStore(
+				root,
+				new NodeAtomicFileSystem(),
+				new SequenceIds([`temp-${index}`]),
+			);
+			await new NodeAtomicFileSystem().mkdir(join(root, 'tasks'));
+			await writeFile(
+				join(root, 'tasks', name),
+				JSON.stringify(createAcceptedTask(taskRequest(), AT)),
+				'utf8',
+			);
+			const tasks = new FileTaskStore(files, fixedClock);
+			await assert.rejects(
+				index === 0 ? tasks.list() : tasks.listForRecovery(),
+				StorageCorruptionError,
+			);
+		}
+	});
 });
