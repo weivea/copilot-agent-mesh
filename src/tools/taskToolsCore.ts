@@ -674,6 +674,9 @@ export class TaskToolsCore {
 			};
 			result.truncated = true;
 		}
+		if (result.events.length === 0 && result.eventGap !== undefined) {
+			result.eventCursor = afterEventSequence;
+		}
 		while (
 			utf8JsonBytes(result) > this.outputByteLimit
 			&& result.snapshot.artifacts !== undefined
@@ -1028,14 +1031,8 @@ function parseTaskReadResult(
 		}
 	}
 	const lastSequence = events.at(-1)?.sequence;
-	if (eventCursor < requestedCursor) {
-		throw new Error('eventCursor cannot precede afterEventSequence.');
-	}
-	if (lastSequence !== undefined && eventCursor < lastSequence) {
-		throw new Error('eventCursor cannot precede the last returned event.');
-	}
-	if (!truncated && eventCursor !== (lastSequence ?? requestedCursor)) {
-		throw new Error('an untruncated eventCursor must equal the returned cursor.');
+	if (eventCursor !== (lastSequence ?? requestedCursor)) {
+		throw new Error('eventCursor must equal the last returned event or afterEventSequence.');
 	}
 	if (eventGap !== undefined) {
 		if (!truncated) {
@@ -1299,9 +1296,13 @@ function shrinkToolResult(value: ToolJsonResult): ToolJsonResult | undefined {
 	if (Array.isArray(value.events) && value.events.length > 0) {
 		const [removed, ...events] = value.events;
 		const eventGap = leadingEventGap(value.eventGap, removed);
+		const eventCursor = events.length === 0 && eventGap !== undefined
+			? eventGap.expectedFrom - 1
+			: value.eventCursor;
 		return {
 			...value,
 			events,
+			...(typeof eventCursor === 'number' ? { eventCursor } : {}),
 			...(eventGap === undefined ? {} : { eventGap }),
 			truncated: true,
 		};
@@ -1397,6 +1398,7 @@ function shrinkToolResult(value: ToolJsonResult): ToolJsonResult | undefined {
 			) {
 				return {
 					status: typeof value.status === 'string' ? value.status : 'ok',
+					...compactTaskEventWindow(value),
 					snapshot: {
 						taskId: snapshot.taskId,
 						status: 'needsInput',
@@ -1420,6 +1422,7 @@ function shrinkToolResult(value: ToolJsonResult): ToolJsonResult | undefined {
 		) {
 			return {
 				status: typeof value.status === 'string' ? value.status : 'ok',
+				...compactTaskEventWindow(value),
 				snapshot: {
 					taskId: snapshot.taskId,
 					status: snapshot.status,
@@ -1442,6 +1445,14 @@ function shrinkToolResult(value: ToolJsonResult): ToolJsonResult | undefined {
 		return withoutRecovered;
 	}
 	return undefined;
+}
+
+function compactTaskEventWindow(value: ToolJsonResult): ToolJsonResult {
+	return {
+		...(Array.isArray(value.events) ? { events: value.events } : {}),
+		...(typeof value.eventCursor === 'number' ? { eventCursor: value.eventCursor } : {}),
+		...(isRecord(value.eventGap) ? { eventGap: value.eventGap } : {}),
+	};
 }
 
 function leadingEventGap(value: unknown, removed: unknown): Record<string, number> | undefined {

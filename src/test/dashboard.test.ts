@@ -108,6 +108,10 @@ suite('Dashboard', () => {
 			'{"client-secret":"private-value"}',
 			'https://example.test/?credentials[password]=private-value',
 			'https://example.test/?credentials%5Bpassword%5D=private-value',
+			'https://example.test/?user[api_key][value]=private-value',
+			'https://example.test/?x[password][y]=private-value',
+			'https://example.test/?user%5Bapi%2Bkey%5D%5Bvalue%5D=private-value',
+			'https://example.test/?x%5Bpassword%5D%5By%5D=private-value',
 			'https://example.test/?api+key=private-value',
 			'https://example.test/?nested=api%2Bkey%3Dprivate-value',
 			'malformed=%E0%A4%A',
@@ -225,7 +229,7 @@ suite('Dashboard', () => {
 	});
 
 	test('strictly validates outbound model types and enums', () => {
-		const model = snapshot();
+		const model = new DashboardPresenter().present(snapshot());
 		assert.throws(() => assertSafeDashboardOutboundMessage({
 			version: 1,
 			uiInstanceId: 'instance-1',

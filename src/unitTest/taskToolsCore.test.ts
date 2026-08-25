@@ -298,6 +298,18 @@ suite('TaskToolsCore', () => {
 			},
 			{
 				...facade.taskRead,
+				eventCursor: 7,
+				events: [{ ...baseEvent, sequence: 6 }],
+				truncated: true,
+			},
+			{
+				...facade.taskRead,
+				eventCursor: 6,
+				events: [],
+				truncated: true,
+			},
+			{
+				...facade.taskRead,
 				eventCursor: 5,
 				events: [{ ...baseEvent, sequence: 6 }],
 			},
@@ -337,6 +349,25 @@ suite('TaskToolsCore', () => {
 			assert.equal(result.status, 'error');
 			assert.equal((result.error as Record<string, unknown>).code, 'OUTPUT_INVALID');
 		}
+	});
+
+	test('keeps an empty truncated event window at the requested cursor with an explicit gap', async () => {
+		const facade = new RecordingFacade();
+		facade.taskRead = {
+			...facade.taskRead,
+			eventCursor: 5,
+			events: [],
+			eventGap: { expectedFrom: 6, availableFrom: 9 },
+			truncated: true,
+		};
+		const result = await new TaskToolsCore(facade).getTask({
+			taskId: TASK_ID,
+			afterEventSequence: 5,
+		});
+
+		assert.equal(result.status, 'ok');
+		assert.equal(result.eventCursor, 5);
+		assert.deepStrictEqual(result.eventGap, { expectedFrom: 6, availableFrom: 9 });
 	});
 
 	test('progressively bounds maximum pending input while preserving the answer contract', async () => {
@@ -693,6 +724,13 @@ suite('TaskToolsCore', () => {
 		assert.equal(byteFailure.retryable, true);
 		assert.equal(tokenFailure.code, failure.code);
 		assert.equal(tokenFailure.retryable, true);
+		assert.deepStrictEqual(result.events, []);
+		assert.equal(result.eventCursor, 0);
+		assert.deepStrictEqual(result.eventGap, { expectedFrom: 1, availableFrom: 2 });
+		const tokenResult = JSON.parse(serialized) as Record<string, unknown>;
+		assert.deepStrictEqual(tokenResult.events, []);
+		assert.equal(tokenResult.eventCursor, 0);
+		assert.deepStrictEqual(tokenResult.eventGap, { expectedFrom: 1, availableFrom: 2 });
 		assert.equal(
 			Buffer.from(String(byteFailure.message), 'utf8').toString('utf8'),
 			byteFailure.message,
@@ -731,6 +769,7 @@ suite('TaskToolsCore', () => {
 				sequence: index + 1,
 				summary: `event-${index}-${'x'.repeat(80)}`,
 			})),
+			eventCursor: 8,
 			truncated: false,
 		};
 		const countTokens = async (text: string): Promise<number> => text.length;
@@ -743,6 +782,11 @@ suite('TaskToolsCore', () => {
 		assert.ok((fitted.events as readonly unknown[]).length < result.events.length);
 		assert.equal((fitted.eventGap as Record<string, unknown>).expectedFrom, 1);
 		const fittedEvents = fitted.events as Array<Record<string, unknown>>;
+		assert.equal(
+			fitted.eventCursor,
+			fittedEvents.at(-1)?.sequence
+				?? ((fitted.eventGap as Record<string, number>).expectedFrom - 1),
+		);
 		assert.equal(
 			(fitted.eventGap as Record<string, unknown>).availableFrom,
 			fittedEvents[0]?.sequence ?? result.events.length + 1,
@@ -910,6 +954,8 @@ suite('TaskToolsCore', () => {
 		assert.equal(pendingInput.prompt, 'q');
 		assert.equal(parsed.answerTool, MESH_TOOL_NAMES.answerTask);
 		assert.equal(parsed.truncated, true);
+		assert.deepStrictEqual(parsed.events, []);
+		assert.equal(parsed.eventCursor, 0);
 		assert.equal(exactBoundary, atThreeHundred);
 		assert.ok(belowBoundary.length <= atThreeHundred.length - 1);
 	});
@@ -957,6 +1003,7 @@ suite('Mesh tool manifest contract', () => {
 		assert.ok(getDescriptor);
 		assert.match(getDescriptor.modelDescription, /only needsInput snapshots expose mesh_answer_task/);
 		assert.match(getDescriptor.modelDescription, /Failed and timedOut snapshots include safe failure/);
+		assert.match(getDescriptor.modelDescription, /eventGap identifies every omitted leading event/);
 	});
 
 	test('exports the cold implicit activation contract for every tool', () => {

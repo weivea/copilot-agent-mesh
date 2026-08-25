@@ -31,12 +31,12 @@ function and shrinks events, worker lists, and optional snapshot fields to the
 actual token budget. If even the smallest JSON result does not fit, the adapter
 returns an empty `LanguageModelTextPart` rather than exceeding the budget.
 
-Task event sequences are positive and strictly contiguous. Without truncation,
-the cursor equals the last returned event sequence, or the requested `after`
-cursor when no events are returned. Dropping leading events for byte or token
-budgets creates or advances `eventGap.expectedFrom` and
+Task event sequences are positive and strictly contiguous. The cursor always
+equals the last returned event sequence, or the requested `after` cursor when no
+events are returned, including truncated windows. Dropping leading events for
+byte or token budgets creates or advances `eventGap.expectedFrom` and
 `eventGap.availableFrom`; only this explicit gap/truncation contract explains a
-cursor jump.
+missing prefix. A bare `truncated` flag never substitutes for gap metadata.
 
 Snapshots accept Foundation's recoverable pending-input state, but
 `mesh_answer_task` remains exposed only while the task is `needsInput`.

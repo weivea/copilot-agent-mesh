@@ -175,6 +175,20 @@ export class WorkspaceRegistry {
 				(workspace) => workspace.fileIdentity === candidate.fileIdentity,
 			);
 			if (existing !== undefined) {
+				if (existing.stale) {
+					const refreshed = localWorkspaceSchema.parse({
+						...existing,
+						...candidate,
+						enabled: false,
+						stale: false,
+						updatedAt: this.clock.now().toISOString(),
+					});
+					const workspaces = registry.workspaces.map((workspace) =>
+						workspace.workspaceId === existing.workspaceId ? refreshed : workspace,
+					);
+					await this.write(workspaces);
+					return refreshed;
+				}
 				return existing;
 			}
 			if (registry.workspaces.length >= PROTOCOL_LIMITS.workspaceListCount) {

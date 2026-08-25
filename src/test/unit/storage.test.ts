@@ -459,6 +459,43 @@ describe('foundation storage', () => {
 		assert.deepStrictEqual(await registry.listLocal(), []);
 	});
 
+	test('refreshes a stale registration through a reachable URI without enabling it', async () => {
+		let deadLink = false;
+		const registry = new WorkspaceRegistry(
+			new MemoryState(),
+			new SequenceIds([IDS.workspace]),
+			fixedClock,
+			new FakeFileIdentityResolver((localUri) => {
+				if (localUri === 'file:///dead-link' && deadLink) {
+					throw Object.assign(new Error('link target missing'), { code: 'ENOENT' });
+				}
+				return {
+					canonicalUri: 'file:///real-workspace',
+					identity: 'identity:real-workspace',
+				};
+			}),
+			new WorkspaceLeaseManager(),
+		);
+		const original = await registry.register({ localUri: 'file:///dead-link', name: 'Linked' });
+		deadLink = true;
+		await registry.listForWire();
+		assert.strictEqual((await registry.listLocal())[0].stale, true);
+
+		const refreshed = await registry.register({ localUri: 'file:///real-workspace', name: 'Real' });
+		assert.strictEqual(refreshed.workspaceId, original.workspaceId);
+		assert.strictEqual(refreshed.registeredUri, 'file:///real-workspace');
+		assert.strictEqual(refreshed.localUri, 'file:///real-workspace');
+		assert.strictEqual(refreshed.fileIdentity, original.fileIdentity);
+		assert.strictEqual(refreshed.stale, false);
+		assert.strictEqual(refreshed.enabled, false);
+		await assert.rejects(
+			registry.acquireLease(refreshed.workspaceId, IDS.peer, IDS.task),
+			(error) => error instanceof Error && error.message === 'Workspace is disabled.',
+		);
+		const enabled = await registry.setEnabled(refreshed.workspaceId, true);
+		assert.strictEqual(enabled.enabled, true);
+	});
+
 	test('serializes concurrent registry mutations without losing updates', async () => {
 		const state = new BlockingState();
 		const resolver = new FakeFileIdentityResolver((localUri) => ({

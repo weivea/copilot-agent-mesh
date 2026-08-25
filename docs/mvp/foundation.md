@@ -72,6 +72,9 @@ accessible again does not silently reactivate it: `revalidate` or `register`
 must explicitly clear stale state before it can be enabled. Revalidation and
 lease acquisition are atomic under the same mutation queue, so an old and new
 identity cannot both be leased through the registry.
+Registering a different reachable URI that resolves to the same stale identity
+refreshes the existing record's registered and canonical URIs and clears its
+stale marker, while preserving disabled state until an explicit enable.
 
 `AtomicFileStore` uses a temporary file, file sync, atomic rename, and directory
 sync where the platform supports it. New directories are created one level at a

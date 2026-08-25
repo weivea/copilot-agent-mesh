@@ -190,8 +190,7 @@ function containsCredentialAssignment(value: string): boolean {
 		if (keyEnd === cursor + 1) {
 			continue;
 		}
-		const normalized = normalizeCredentialKey(value.slice(cursor + 1, keyEnd));
-		if (isSensitiveCredentialKey(normalized)) {
+		if (containsSensitiveCredentialKeySegment(value.slice(cursor + 1, keyEnd))) {
 			return true;
 		}
 	}
@@ -234,7 +233,7 @@ function normalizeCredentialKey(value: string): string {
 
 function containsUnsafeFormKey(value: string, depth: number): boolean {
 	const normalized = normalizeFormComponent(value);
-	return isSensitiveCredentialKey(normalizeCredentialKey(normalized))
+	return containsSensitiveCredentialKeySegment(normalized)
 		|| containsUnsafeDashboardTextAtDepth(normalized, depth);
 }
 
@@ -244,6 +243,31 @@ function normalizeFormComponent(value: string): string {
 
 function isSensitiveCredentialKey(value: string): boolean {
 	return sensitiveCredentialKeySuffixes.some((suffix) => value.endsWith(suffix));
+}
+
+function containsSensitiveCredentialKeySegment(value: string): boolean {
+	return splitCredentialKeySegments(value).some(
+		(segment) => isSensitiveCredentialKey(normalizeCredentialKey(segment)),
+	);
+}
+
+function splitCredentialKeySegments(value: string): string[] {
+	const segments: string[] = [];
+	let segment = '';
+	for (const character of value) {
+		if (character === '[' || character === ']') {
+			if (segment.length > 0) {
+				segments.push(segment);
+				segment = '';
+			}
+		} else {
+			segment += character;
+		}
+	}
+	if (segment.length > 0) {
+		segments.push(segment);
+	}
+	return segments;
 }
 
 function extractUriCandidates(value: string): string[] {

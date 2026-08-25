@@ -21,8 +21,8 @@ Dashboard modules. Gateway and Dev Tunnel lifecycle behavior is unchanged.
 ## Tool event windows
 
 - Event sequences are positive integers and strictly contiguous.
-- For an untruncated response, `eventCursor` is the last returned sequence, or
-  the requested `afterEventSequence` when no events are returned.
+- `eventCursor` is always the last returned sequence, or the requested
+  `afterEventSequence` when no events are returned, including truncated windows.
 - A source journal gap or output byte/token truncation that removes leading
   events is represented by `eventGap.expectedFrom` and
   `eventGap.availableFrom`. The response also sets `truncated`; a bare
@@ -31,8 +31,9 @@ Dashboard modules. Gateway and Dev Tunnel lifecycle behavior is unchanged.
 ## Dashboard safety
 
 - Query keys and values are inspected with form-urlencoded `+` normalization
-  before recursive decoding. Bracketed and compound credential keys, including
-  `credentials[password]` and `api+key`, are rejected.
+  before recursive decoding. Every bracket-key segment is normalized and
+  checked independently, so forms such as `credentials[password]`,
+  `user[api_key][value]`, and `api+key` are rejected.
 - The ViewModel is shape-checked against every Foundation task state and every
   displayed string is independently bounded by UTF-8 bytes.
 
@@ -45,3 +46,6 @@ Dashboard modules. Gateway and Dev Tunnel lifecycle behavior is unchanged.
   removed.
 - Availability does not automatically clear stale state. The user must
   explicitly revalidate or register the workspace, then enable it.
+- Registering a different reachable URI for the same stale filesystem identity
+  refreshes its registered and canonical URIs and clears stale state, but keeps
+  the existing record disabled until an explicit enable.
