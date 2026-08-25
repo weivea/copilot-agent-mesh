@@ -245,6 +245,9 @@ function containsUnsafeUrl(candidate: string, depth: number): boolean {
 	if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
 		return true;
 	}
+	if (parsed.username.length > 0 || parsed.password.length > 0) {
+		return true;
+	}
 	if (parsed.pathname !== '/' && containsUnsafeDashboardTextAtDepth(parsed.pathname, depth)) {
 		return true;
 	}

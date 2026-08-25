@@ -99,6 +99,9 @@ suite('Dashboard', () => {
 			'https://x/#/Users/person/private-project',
 			'https://x/?location=C%3A%5CUsers%5Cperson%5Cprivate',
 			'https://x/?location=file%253A%252F%252F%252Ftmp%252Fprivate',
+			'https://user:pass@example.test',
+			'https://user%3Apass@example.test',
+			'https://user%253Apass@example.test',
 		]) {
 			assert.throws(() => assertSafeDashboardOutboundMessage({
 				...base,
