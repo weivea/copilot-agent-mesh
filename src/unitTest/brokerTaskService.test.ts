@@ -431,10 +431,32 @@ test('exact concurrent retries share one pending node start dispatch', async (t)
 		fixture.session.requests.filter(({ method }) => method === 'node.task.start').length,
 		1,
 	);
+	assert.equal((await fixture.store.list()).length, 1);
 
 	startResult.resolve(nodeStartedResult());
 	await waitFor(async () =>
 		(await fixture.store.getOwned(OWNER_ID, TASK_ID))?.state === 'running',
+	);
+});
+
+test('concurrent conflicting starts persist and dispatch only one request', async (t) => {
+	const fixture = await createFixture();
+	t.after(() => fixture.dispose());
+
+	const results = await Promise.allSettled([
+		fixture.service.startRemote(OWNER_ID, startParams()),
+		fixture.service.startRemote(OWNER_ID, startParams({ prompt: 'Conflicting prompt.' })),
+	]);
+
+	assert.equal(results[0].status, 'fulfilled');
+	assert.equal(results[1].status, 'rejected');
+	if (results[1].status === 'rejected') {
+		assert.equal(isReason(results[1].reason, 'TASK_ID_CONFLICT'), true);
+	}
+	assert.equal((await fixture.store.list()).length, 1);
+	assert.equal(
+		fixture.session.requests.filter(({ method }) => method === 'node.task.start').length,
+		1,
 	);
 });
 

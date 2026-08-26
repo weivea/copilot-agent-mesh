@@ -6,7 +6,9 @@ import { MeshDomainError } from '../domain/errors';
 import {
 	getOwnedTask,
 	matchIdempotentStart,
+	matchIdempotentRoutedStart,
 	migrateTaskRecordV1,
+	type OwnedRoutedTaskStart,
 	type OwnedTaskStart,
 	type TaskRecord,
 } from '../domain/task';
@@ -70,6 +72,20 @@ export class FileTaskStore {
 	): Promise<{ readonly record: TaskRecord; readonly created: boolean }> {
 		return this.runExclusive(async () => {
 			const existing = matchIdempotentStart(await this.listUnlocked(), request);
+			if (existing !== undefined) {
+				return { record: existing, created: false };
+			}
+			const created = await this.createUnlocked(record);
+			return { record: created, created: true };
+		});
+	}
+
+	public createRoutedIdempotent(
+		request: OwnedRoutedTaskStart,
+		record: TaskRecord,
+	): Promise<{ readonly record: TaskRecord; readonly created: boolean }> {
+		return this.runExclusive(async () => {
+			const existing = matchIdempotentRoutedStart(await this.listUnlocked(), request);
 			if (existing !== undefined) {
 				return { record: existing, created: false };
 			}

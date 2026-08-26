@@ -365,7 +365,7 @@ test('non-owner Window Node multiplexes remote v2 tasks over authenticated local
 			() => new Date(CREATED_AT),
 		);
 		broker = await createBroker(identity, key, restoredRemoteTasks, state);
-		await waitFor(() => node.snapshot().state === 'online');
+		await waitFor(() => node.snapshot().state === 'online' && node.snapshot().registered);
 
 		const restored = await facade.getTask({
 			taskId: persisted.taskId,

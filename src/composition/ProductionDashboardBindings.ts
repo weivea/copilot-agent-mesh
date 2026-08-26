@@ -628,7 +628,6 @@ function uniqueWorkspaces(
 function deadlineSignal(delayMs: number): AbortController {
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), delayMs);
-	timer.unref();
 	controller.signal.addEventListener('abort', () => clearTimeout(timer), { once: true });
 	return controller;
 }

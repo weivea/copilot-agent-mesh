@@ -903,14 +903,21 @@ async function waitForTask(
 	taskId: string,
 	predicate: (snapshot: TaskSnapshot) => boolean,
 ): Promise<TaskSnapshot> {
-	let snapshot = await client.getTask(taskId);
 	const deadline = Date.now() + 3_000;
+	let lastError: unknown;
 	while (Date.now() < deadline) {
-		if (predicate(snapshot)) {
-			return snapshot;
+		try {
+			const snapshot = await client.getTask(taskId);
+			if (predicate(snapshot)) {
+				return snapshot;
+			}
+		} catch (error: unknown) {
+			lastError = error;
 		}
 		await new Promise((resolve) => setTimeout(resolve, 10));
-		snapshot = await client.getTask(taskId);
+	}
+	if (lastError !== undefined) {
+		throw lastError;
 	}
 	assert.fail('Task did not reach the expected state before the deadline.');
 }

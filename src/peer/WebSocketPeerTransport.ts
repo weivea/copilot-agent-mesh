@@ -629,7 +629,6 @@ class RpcWebSocketClient {
 			});
 			this.socket.close(1000, 'Peer disconnected.');
 			timer = setTimeout(() => this.socket.terminate(), 1_000);
-			timer.unref();
 		});
 	}
 

@@ -688,7 +688,6 @@ class IpcPeer {
 				MAX_CONFIGURED_TIMEOUT_MS,
 			),
 		);
-		this.handshakeTimer.unref();
 		this.socket.on('data', (chunk) => this.receive(chunk));
 		this.socket.on('drain', () => this.clearBackpressureTimer());
 		this.socket.once('end', () => this.ended());
@@ -763,7 +762,6 @@ class IpcPeer {
 					this.fail(new Error('Local IPC request timed out.'));
 				}
 			}, this.requestTimeoutMs);
-			timer.unref();
 			this.pendingRequests.set(id, { resolve, reject, timer });
 			void this.send({
 				kind: 'request',
@@ -1096,7 +1094,6 @@ class IpcPeer {
 					() => this.fail(new Error('Local IPC backpressure deadline exceeded.')),
 					this.backpressureTimeoutMs,
 				);
-				this.backpressureTimer.unref();
 			}
 		});
 	}
@@ -1375,7 +1372,6 @@ function socketIsActive(socketPath: string): Promise<boolean> {
 			socket.destroy();
 			reject(new Error('Unable to verify stale local IPC endpoint.'));
 		}, 250);
-		timer.unref();
 		const finish = (): boolean => {
 			if (settled) {
 				return false;

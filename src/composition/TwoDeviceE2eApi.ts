@@ -295,7 +295,6 @@ function optionalStrings(
 function deadline(timeoutMs: number): AbortController {
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), timeoutMs);
-	timer.unref();
 	controller.signal.addEventListener('abort', () => clearTimeout(timer), { once: true });
 	return controller;
 }

@@ -418,7 +418,10 @@ export class BrokerTaskService {
 				createAcceptedRoutedTask(request, at),
 				startRequested,
 			);
-			await this.store.create(record);
+			const result = await this.store.createRoutedIdempotent(request, record);
+			if (!result.created) {
+				return this.snapshot(result.record);
+			}
 			persisted = true;
 			this.scheduleWorkerDeadline(ownerId, params.taskId, params.workerDeadline);
 			await this.publishAcceptedStart(record, startRequested);

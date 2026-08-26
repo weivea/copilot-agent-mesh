@@ -336,7 +336,7 @@ export function decodeDevTunnelShowJson(
 }
 
 export function computeSanitizedFixtureHash(raw: string): string {
-	return createHash('sha256').update(raw, 'utf8').digest('hex');
+	return createHash('sha256').update(raw.replace(/\r\n/gu, '\n'), 'utf8').digest('hex');
 }
 
 export function isExactDevTunnelNotFound(

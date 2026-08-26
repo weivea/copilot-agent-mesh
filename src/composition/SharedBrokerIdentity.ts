@@ -163,7 +163,6 @@ function delay(delayMs: number, signal: AbortSignal | undefined): Promise<void> 
 			signal?.removeEventListener('abort', abort);
 			resolve();
 		}, delayMs);
-		timer.unref();
 		const abort = (): void => {
 			clearTimeout(timer);
 			reject(new DOMException('Shared Broker identity wait was cancelled.', 'AbortError'));
