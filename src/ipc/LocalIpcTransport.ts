@@ -25,6 +25,7 @@ const PROOF_BYTES = 32;
 const HEADER_BYTES = 4;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 5_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const GRACEFUL_CLOSE_POLL_MS = 5;
 const DEFAULT_MAX_PENDING_REQUESTS = 128;
 const DEFAULT_MAX_OUTBOUND_BYTES = 2 * LOCAL_IPC_MAX_FRAME_BYTES;
 const DEFAULT_BACKPRESSURE_TIMEOUT_MS = 10_000;
@@ -634,6 +635,7 @@ class IpcPeer {
 	private readonly decoder = new LengthPrefixedJsonDecoder();
 	private readonly pendingRequests = new Map<string, PendingRequest>();
 	private readonly incomingRequestIds = new Set<string>();
+	private gracefulCloseTimer: ReturnType<typeof setTimeout> | undefined;
 	private readonly pendingWrites = new Set<PendingWrite>();
 	private readonly closeListeners = new Set<(error?: Error) => void>();
 	private readonly handshakeTimer: NodeJS.Timeout;
@@ -815,6 +817,41 @@ class IpcPeer {
 			return;
 		}
 		this.fail(error);
+	}
+
+	/**
+	 * Closes the connection only after in-flight work owned by this peer settles, so a
+	 * failure raised while serving one direction cannot abort a request the same
+	 * connection is still awaiting in the other direction. The drain is bounded by the
+	 * configured request timeout and always terminates in a real close.
+	 */
+	public closeAfterDrain(): void {
+		if (this.state === 'closed' || this.gracefulCloseTimer !== undefined) {
+			return;
+		}
+		const deadline = setTimeout(() => {
+			this.gracefulCloseTimer = undefined;
+			clearInterval(poll);
+			this.close();
+		}, this.requestTimeoutMs);
+		const poll = setInterval(() => {
+			if (this.state === 'closed') {
+				clearInterval(poll);
+				clearTimeout(deadline);
+				this.gracefulCloseTimer = undefined;
+				return;
+			}
+			if (this.pendingRequests.size > 0
+				|| this.pendingWrites.size > 0
+				|| this.incomingRequestIds.size > 0) {
+				return;
+			}
+			clearInterval(poll);
+			clearTimeout(deadline);
+			this.gracefulCloseTimer = undefined;
+			this.close();
+		}, GRACEFUL_CLOSE_POLL_MS);
+		this.gracefulCloseTimer = deadline;
 	}
 
 	private receive(chunk: Buffer): void {
@@ -1014,7 +1051,7 @@ class IpcPeer {
 					},
 				});
 				if (rpcError.closeAfterResponse) {
-					this.close();
+					this.closeAfterDrain();
 				}
 			} catch (sendError: unknown) {
 				this.fail(safeError(sendError, SAFE_CLOSE_MESSAGE));
@@ -1125,6 +1162,10 @@ class IpcPeer {
 		const wasConnecting = this.state !== 'authenticated';
 		this.state = 'closed';
 		clearTimeout(this.handshakeTimer);
+		if (this.gracefulCloseTimer !== undefined) {
+			clearTimeout(this.gracefulCloseTimer);
+			this.gracefulCloseTimer = undefined;
+		}
 		this.clearBackpressureTimer();
 		if (wasConnecting) {
 			this.authenticationReject?.(error ?? new Error(SAFE_CLOSE_MESSAGE));
