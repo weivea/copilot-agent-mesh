@@ -1,6 +1,7 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import {
 	AhpAgentRuntime,
@@ -58,7 +59,7 @@ async function main(): Promise<void> {
 				? {
 					workspaceId,
 					displayName: 'Temporary E2E Workspace',
-					uri: new URL(`file://${workspace}`).toString(),
+					uri: pathToFileURL(workspace).href,
 				}
 				: undefined,
 		},

@@ -1,57 +1,71 @@
 # Compatibility Matrix
 
-> Status: 0.1.0 Preview implemented; Gate G0 No-Go<br>
-> Evidence date: 2026-08-25
-> Implementation evidence through: `26431763836ce0016285c4e873bebef7ec9f4a40`
+> Status: 0.2.0 Preview implemented; Gate G0 No-Go<br>
+> Evidence date: 2026-08-25<br>
+> Mesh protocol: v2; v1 peers incompatible
 
-This document is the release gate for external platform compatibility. A version is
-supported only after the corresponding opt-in spike has produced reproducible evidence.
-Installed or declared versions are not treated as validated support.
+This document is the release gate for external platform compatibility. Installed
+or declared versions are not treated as validated support.
 
 ## Gate G0
 
 **Current decision: No-Go**
 
-P0.1 Language Model Tool behavior, P0.2 Agent Host/AHP authentication and session
-execution, and P0.3 Dev Tunnel hosting have not all passed. Until they do, the project
-must not claim an end-to-end Copilot Agent Mesh MVP.
+The multi-window transport and lifecycle gate passed, but an authenticated
+authoritative AHP Session/Turn has not. The opted-in run correctly reached
+`AGENT_AUTH_REQUIRED` because its fresh shared profile had no explicit
+authentication mapping/session. It did not prove AHP start/get/cancel/output.
 
 | Capability | Declared or detected | Validated | Status |
 | --- | --- | --- | --- |
-| VS Code minimum | `1.103.0` in `package.json` | Offline API/build coverage; real E2E uses `1.134.0` | Preview range; real minimum not yet proven |
-| VS Code tested | `1.134.0`, commit `110a328ea54b42367b803ec53ee0bf52ef26b419`, macOS arm64 | 337 unit, 31 component, 19 Extension Host tests; installed VSIX activation smoke | Pass for tested Preview build |
-| Language Model Tools | Five production tools on stable `vscode.lm` API | Manifest/runtime parity, cold activation, strict schemas, bounded results, durable retry semantics; real TaskCoordinator path exercised | Partial: authenticated Copilot invocation remains pending |
-| AHP package | `@microsoft/agent-host-protocol@0.8.0`, official tag `typescript/v0.8.0` / commit `7153143f1c6993fa886d7d59870811cdad479d83`, vendored tarball SHA-256 `faec121a9a3f1d455015a8bd9d7c529290b2b24d5c3f097245f43ac6c084096c` | Package `0.7.0` was rejected by Host requirement `^0.8.0`; audited `0.8.0` completed real initialize | Partial / No-Go |
-| AHP negotiated protocols | SDK offered `0.8.0`, `0.7.0`, `0.6.0`, `0.5.2`, `0.5.1`; Host selected `0.8.0` | Production lifecycle, Session/Chat/Terminal/Input/cancel/recovery adapters pass component tests; real isolated profile reaches the explicit auth boundary | Partial / No-Go until authenticated `turnComplete` |
-| Dev Tunnel CLI | Installed `1.0.2006+dd9fe5139f`; validated downloaded `1.0.2030+fc9273aa0f`, macOS arm64, executable SHA-256 `004f3cc8ebcce61223bacac80d31937eb2e92eaee9a05600a1cb62fb5f775afe` | Exact-build login, strict create/port/access/show JSON, persistent port, port-scoped expiring anonymous ACE, owned host, HTTPS 204, real WSS, ACE renewal, stable-URI restart, and exact-ID cleanup passed. No global CLI upgrade occurred. | Pass on macOS arm64 / other platforms No-Go |
-| Dev Tunnel service | `1.0.1995.17384` (`43e8069d44`) | Version output only | Informational |
-| Dev Tunnel decoder | Supported revision `show-json-1.0.2030-r1`; sanitized real hosted fixture SHA-256 `d561eed56125ea53d2e97f1dcc5107575f7fb1df2eb2032a955338c9fb7a5ace` | Exact 2030 `portUri` contract and cross-version `portForwardingUris` rejection are tested | Pass for exact macOS arm64 build |
+| Package | `0.2.0` Preview VSIX | Package/version documentation and implementation-time package checks | Preview; not published |
+| Mesh protocol | v2 | Local Broker/Node and remote routing schemas | v2 only; v1 peers incompatible |
+| VS Code minimum | `1.103.0` in `package.json` | Offline API/build coverage | Preview range; real minimum not yet proven |
+| VS Code tested | `1.134.0`, macOS arm64 | Real ordinary same-user-data windows plus implementation-time unit/component/Extension Host/full npm tests | Pass for tested infrastructure; final counts intentionally not recorded here |
+| Window Nodes | Ordinary VS Code windows with random process-lifetime `nodeId`/`nodeInstanceId` | Two nodes observed in 129 ms and 278 ms in separate final real runs | Pass on tested build |
+| Device Broker | One owner, generation-fenced takeover, authenticated local IPC | Exactly one Broker; takeover changed generation. Final AHP-boundary run takeover completed in 1683 ms. | Pass on tested build |
+| Workspace claims | Canonical identity hash, one claim per physical workspace | Duplicate repo conflict; node loss and same-`workspaceId` reclaim | Pass on tested build |
+| Local routing | Window A → Broker → Window B → real AHP → Broker store → Window A; no Tunnel | Transport/lifecycle route infrastructure passed | Partial: authoritative AHP task path remains blocked |
+| AHP package | `@microsoft/agent-host-protocol@0.8.0` | Production lifecycle reaches explicit authentication boundary | Partial / No-Go |
+| AHP authentication | Explicit resource/provider/scope mapping plus available VS Code session | Fresh shared profile had neither mapping nor session | Blocked with expected `AGENT_AUTH_REQUIRED` |
+| Dev Tunnel CLI | Exact macOS arm64 build `1.0.2030+fc9273aa0f` | Existing exact-build lifecycle evidence; multi-window local route kept Listener/Tunnel stopped | Pass on macOS arm64 only |
+| Remote v2 route | One device Gateway/Tunnel → Broker → explicit Window Node | Real two-device pairing/discovery and durable acceptance passed; Fresh Profile then emitted `agentStartRequested` and `failed(AGENT_AUTH_REQUIRED)`; Tunnel/profile/process cleanup passed | Transport/routing pass; authenticated execution No-Go |
+
+## Real multi-window evidence
+
+| Evidence | Assertions |
+| --- | --- |
+| `.vscode-test/multi-window-evidence/6c119d7b-8596-4757-a129-7e31b412db5d.json` | Two nodes in 129 ms; exactly one Broker; Listener/Tunnel stopped and sentinel untouched; repo-b offline in 268 ms, then same `workspaceId` reclaimed; takeover changed generation; duplicate repo conflict; complete socket/process cleanup. |
+| `.vscode-test/multi-window-evidence/7886dc25-37ef-4909-ac2b-6af2a506078c.json` | Opted-in real AHP run: two nodes in 278 ms; repo-b offline in 214 ms; takeover in 1683 ms; same `workspaceId`; zero tunnel/socket/process residue. Infrastructure/lifecycle passed, but AHP stopped at `AGENT_AUTH_REQUIRED`; no authoritative start/get/cancel/output evidence. |
 
 ## Preview platform support
 
-The Preview package scope does not claim cross-platform Worker support or
-Marketplace publication.
-Coordinator support still depends on the peer client being available in that
-environment.
+The 0.2.0 package does not claim Marketplace publication or cross-platform Worker
+hosting. All ordinary windows are active Window Nodes, but the ability to host
+the listener and execute real AHP tasks remains platform-gated.
 
-| OS | Architecture | Phase 0 evidence | Preview support |
+| OS | Architecture | 0.2 evidence | Preview support |
 | --- | --- | --- | --- |
-| macOS | arm64 | Real exact-build Tunnel, public pairing, Workspace discovery, TaskCoordinator delegation/polling and cleanup; authenticated AHP Session/Turn remains pending | Worker Preview candidate plus Coordinator; end-to-end Gate G0 remains No-Go |
-| macOS | x64 | No owned Worker lifecycle evidence | Coordinator only; Worker returns `CLI_UNSUPPORTED` / `AGENT_UNAVAILABLE` |
-| Windows | x64 | No Job Object-based Agent Host ownership and no validated tunnel build | Coordinator only; Worker returns `CLI_UNSUPPORTED` / `AGENT_UNAVAILABLE` |
-| Linux | x64 | Agent process groups exist, but no validated tunnel build or complete Worker gate | Coordinator only; Worker returns `CLI_UNSUPPORTED` / `AGENT_UNAVAILABLE` |
+| macOS | arm64 | Real same-user-data Broker/Node transport and lifecycle on VS Code 1.134.0; existing exact-build Tunnel evidence | Worker candidate and active Window Node; G0 No-Go until authenticated AHP turn |
+| macOS | x64 | No owned Worker lifecycle evidence | Active client Window Node; Worker host unsupported |
+| Windows | x64 | Named-pipe and offline coverage; no Job Object-based real Agent Host/Tunnel gate | Active client Window Node; Worker host unsupported |
+| Linux | x64 | Unix IPC and offline coverage; no validated real Tunnel/Worker gate | Active client Window Node; Worker host unsupported |
 
-## Known unsupported environments
+## Migration and unsupported environments
 
-Version 1 does not support SSH, WSL, Dev Containers, Codespaces, `vscode.dev`, virtual
-workspaces, untrusted workspaces, or mixed local/remote workspace folders.
+- Migration from 0.1 preserves the stable device ID and v1 workspace/task data
+  into schema v2. Unknown or corrupt persisted versions fail closed.
+- Protocol-v1 network peers do not interoperate with protocol v2.
+- SSH, WSL, Dev Containers, Codespaces, `vscode.dev`, virtual workspaces,
+  untrusted workspaces, and mixed local/remote workspace folders remain
+  unsupported.
 
 ## Evidence requirements
 
 Promoting any row to supported requires:
 
 1. The exact executable/package version and OS/architecture.
-2. A reproducible command or automated opt-in test.
-3. A sanitized fixture or protocol negotiation record where applicable.
-4. Explicit cleanup and ownership evidence for child processes and tunnel resources.
-5. A linked spike report describing failures and unsupported behavior.
+2. A reproducible command or automated explicit opt-in test.
+3. Sanitized protocol evidence without secrets, paths, or raw prompt/output.
+4. Explicit cleanup and ownership evidence for processes, IPC, and Tunnel resources.
+5. An authenticated authoritative AHP task result where the row claims execution.

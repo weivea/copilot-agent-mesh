@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, test } from 'node:test';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { createAcceptedTask } from '../../domain/task';
 import { taskEventJournalBytes } from '../../domain/taskEvents';
@@ -23,6 +24,11 @@ import type {
 import { AT, IDS, LATER, taskRequest } from './fixtures';
 
 const temporaryDirectories: string[] = [];
+const fixtureRoot = join(tmpdir(), 'copilot-agent-mesh-fixtures');
+
+function fileUri(relativePath: string): string {
+	return pathToFileURL(join(fixtureRoot, relativePath)).href;
+}
 
 afterEach(async () => {
 	await Promise.all(temporaryDirectories.splice(0).map((path) =>
@@ -197,6 +203,10 @@ async function makeDirectory(): Promise<string> {
 }
 
 describe('foundation storage', () => {
+	test('builds fixture file URIs with native platform paths', () => {
+		assert.equal(fileURLToPath(fileUri('nested/workspace')), join(fixtureRoot, 'nested/workspace'));
+	});
+
 	test('keeps device identity stable while allowing name changes', async () => {
 		const state = new MemoryState();
 		const clock = new MutableClock(new Date(AT));
@@ -236,6 +246,42 @@ describe('foundation storage', () => {
 		assert.deepStrictEqual([...state.values.keys()], ['copilotAgentMesh.deviceProfile']);
 	});
 
+	test('atomically migrates the 0.1 device profile without changing device identity', async () => {
+		const state = new MemoryState();
+		state.values.set('copilotAgentMesh.deviceProfile', {
+			schemaVersion: 1,
+			deviceId: IDS.device,
+			name: 'existing-device',
+			platform: 'darwin',
+			architecture: 'arm64',
+			vscodeVersion: '1.103.0',
+			extensionVersion: '0.1.0',
+			protocolVersion: 1,
+			createdAt: AT,
+			updatedAt: AT,
+		});
+		const store = new DeviceProfileStore(
+			state,
+			new SequenceIds([]),
+			fixedClock,
+		);
+
+		assert.equal(store.get(), undefined);
+		const migrated = await store.getOrCreate({
+			defaultName: 'ignored',
+			platform: 'darwin',
+			architecture: 'arm64',
+			vscodeVersion: '1.103.0',
+			extensionVersion: '0.2.0',
+		});
+
+		assert.equal(migrated.schemaVersion, 2);
+		assert.equal(migrated.protocolVersion, 2);
+		assert.equal(migrated.deviceId, IDS.device);
+		assert.equal(migrated.name, 'existing-device');
+		assert.equal(migrated.createdAt, AT);
+	});
+
 	test('registers file workspaces but exposes only opaque wire data', async () => {
 		const state = new MemoryState();
 		const leases = new WorkspaceLeaseManager();
@@ -251,13 +297,13 @@ describe('foundation storage', () => {
 			leases,
 		);
 		const workspace = await registry.register({
-			localUri: 'file:///Users/example/secret-project',
+			localUri: fileUri('Users/example/secret-project'),
 			name: 'Project',
 			capabilityTags: ['backend'],
 		});
 		const wire = await registry.listForWire();
 		assert.strictEqual(workspace.workspaceId, IDS.workspace);
-		assert.strictEqual(JSON.stringify(wire).includes('/Users/example'), false);
+		assert.strictEqual(JSON.stringify(wire).includes('secret-project'), false);
 		assert.strictEqual('localUri' in wire[0], false);
 		await assert.rejects(
 			registry.register({
@@ -280,7 +326,7 @@ describe('foundation storage', () => {
 	test('normalizes file URIs and deduplicates resolved symbolic-link identities', async () => {
 		const state = new MemoryState();
 		const resolver = new FakeFileIdentityResolver(() => ({
-			canonicalUri: 'file:///canonical/project',
+			canonicalUri: fileUri('canonical/project'),
 			identity: 'device:10:inode:20',
 		}));
 		const registry = new WorkspaceRegistry(
@@ -291,26 +337,26 @@ describe('foundation storage', () => {
 			new WorkspaceLeaseManager(),
 		);
 		const first = await registry.register({
-			localUri: 'file:///workspace/../alias',
+			localUri: fileUri('workspace/../alias'),
 			name: 'Alias',
 		});
 		const second = await registry.register({
-			localUri: 'file:///other/symlink',
+			localUri: fileUri('other/symlink'),
 			name: 'Symlink',
 		});
 		assert.strictEqual(first.workspaceId, second.workspaceId);
-		assert.strictEqual(first.localUri, 'file:///canonical/project');
+		assert.strictEqual(first.localUri, fileUri('canonical/project'));
 		assert.strictEqual(first.fileIdentity, 'device:10:inode:20');
-		assert.strictEqual(resolver.inputs[0], 'file:///alias');
-		assert.strictEqual(resolver.inputs.includes('file:///other/symlink'), true);
+		assert.strictEqual(resolver.inputs[0], fileUri('alias'));
+		assert.strictEqual(resolver.inputs.includes(fileUri('other/symlink')), true);
 		assert.strictEqual(JSON.stringify(await registry.listForWire()).includes('inode'), false);
 	});
 
 	test('persists the latest authoritative identity when registration revalidation changes twice', async () => {
 		const resolutions = [
-			{ canonicalUri: 'file:///canonical/one', identity: 'identity:one' },
-			{ canonicalUri: 'file:///canonical/two', identity: 'identity:two' },
-			{ canonicalUri: 'file:///canonical/three', identity: 'identity:three' },
+			{ canonicalUri: fileUri('canonical/one'), identity: 'identity:one' },
+			{ canonicalUri: fileUri('canonical/two'), identity: 'identity:two' },
+			{ canonicalUri: fileUri('canonical/three'), identity: 'identity:three' },
 		];
 		let resolutionIndex = 0;
 		const registry = new WorkspaceRegistry(
@@ -322,11 +368,11 @@ describe('foundation storage', () => {
 			),
 			new WorkspaceLeaseManager(),
 		);
-		const input = { localUri: 'file:///registered/link', name: 'Moving target' };
+		const input = { localUri: fileUri('registered/link'), name: 'Moving target' };
 		await registry.register(input);
 		const updated = await registry.register(input);
 		assert.strictEqual(updated.fileIdentity, 'identity:three');
-		assert.strictEqual(updated.localUri, 'file:///canonical/three');
+		assert.strictEqual(updated.localUri, fileUri('canonical/three'));
 		assert.strictEqual((await registry.listLocal())[0].fileIdentity, 'identity:three');
 	});
 
@@ -334,7 +380,7 @@ describe('foundation storage', () => {
 		const state = new MemoryState();
 		const leases = new WorkspaceLeaseManager();
 		let resolved = {
-			canonicalUri: 'file:///canonical/original',
+			canonicalUri: fileUri('canonical/original'),
 			identity: 'device:1:inode:old',
 		};
 		const registry = new WorkspaceRegistry(
@@ -344,11 +390,11 @@ describe('foundation storage', () => {
 			new FakeFileIdentityResolver(() => resolved),
 			leases,
 		);
-		const input = { localUri: 'file:///registered/link', name: 'Retargetable' };
+		const input = { localUri: fileUri('registered/link'), name: 'Retargetable' };
 		const original = await registry.register(input);
 		await registry.acquireLease(original.workspaceId, IDS.peer, IDS.task);
 		resolved = {
-			canonicalUri: 'file:///canonical/replacement',
+			canonicalUri: fileUri('canonical/replacement'),
 			identity: 'device:1:inode:new',
 		};
 		await assert.rejects(
@@ -377,7 +423,7 @@ describe('foundation storage', () => {
 
 	test('rejects invalid canonical resolver output on every workspace use', async () => {
 		let resolved = {
-			canonicalUri: 'file:///canonical/project',
+			canonicalUri: fileUri('canonical/project'),
 			identity: 'device:1:inode:2',
 		};
 		const registry = new WorkspaceRegistry(
@@ -388,7 +434,7 @@ describe('foundation storage', () => {
 			new WorkspaceLeaseManager(),
 		);
 		const workspace = await registry.register({
-			localUri: 'file:///registered/project',
+			localUri: fileUri('registered/project'),
 			name: 'Project',
 		});
 		resolved = { canonicalUri: 'https://example.com/not-local', identity: '' };
@@ -416,8 +462,8 @@ describe('foundation storage', () => {
 			resolver,
 			leases,
 		);
-		const missing = await registry.register({ localUri: 'file:///missing', name: 'Missing' });
-		const available = await registry.register({ localUri: 'file:///available', name: 'Available' });
+		const missing = await registry.register({ localUri: fileUri('missing'), name: 'Missing' });
+		const available = await registry.register({ localUri: fileUri('available'), name: 'Available' });
 		unavailable.add(missing.registeredUri);
 
 		const wire = await registry.listForWire();
@@ -468,7 +514,7 @@ describe('foundation storage', () => {
 			}),
 			new WorkspaceLeaseManager(),
 		);
-		const workspace = await registry.register({ localUri: 'file:///restricted', name: 'Restricted' });
+		const workspace = await registry.register({ localUri: fileUri('restricted'), name: 'Restricted' });
 		unavailable = true;
 		await registry.listForWire();
 		await registry.remove(workspace.workspaceId);
@@ -482,25 +528,25 @@ describe('foundation storage', () => {
 			new SequenceIds([IDS.workspace]),
 			fixedClock,
 			new FakeFileIdentityResolver((localUri) => {
-				if (localUri === 'file:///dead-link' && deadLink) {
+				if (localUri === fileUri('dead-link') && deadLink) {
 					throw Object.assign(new Error('link target missing'), { code: 'ENOENT' });
 				}
 				return {
-					canonicalUri: 'file:///real-workspace',
+					canonicalUri: fileUri('real-workspace'),
 					identity: 'identity:real-workspace',
 				};
 			}),
 			new WorkspaceLeaseManager(),
 		);
-		const original = await registry.register({ localUri: 'file:///dead-link', name: 'Linked' });
+		const original = await registry.register({ localUri: fileUri('dead-link'), name: 'Linked' });
 		deadLink = true;
 		await registry.listForWire();
 		assert.strictEqual((await registry.listLocal())[0].stale, true);
 
-		const refreshed = await registry.register({ localUri: 'file:///real-workspace', name: 'Real' });
+		const refreshed = await registry.register({ localUri: fileUri('real-workspace'), name: 'Real' });
 		assert.strictEqual(refreshed.workspaceId, original.workspaceId);
-		assert.strictEqual(refreshed.registeredUri, 'file:///real-workspace');
-		assert.strictEqual(refreshed.localUri, 'file:///real-workspace');
+		assert.strictEqual(refreshed.registeredUri, fileUri('real-workspace'));
+		assert.strictEqual(refreshed.localUri, fileUri('real-workspace'));
 		assert.strictEqual(refreshed.fileIdentity, original.fileIdentity);
 		assert.strictEqual(refreshed.stale, false);
 		assert.strictEqual(refreshed.enabled, false);
@@ -526,8 +572,8 @@ describe('foundation storage', () => {
 			new WorkspaceLeaseManager(),
 		);
 		const [first, second] = await Promise.all([
-			registry.register({ localUri: 'file:///one', name: 'One' }),
-			registry.register({ localUri: 'file:///two', name: 'Two' }),
+			registry.register({ localUri: fileUri('one'), name: 'One' }),
+			registry.register({ localUri: fileUri('two'), name: 'Two' }),
 		]);
 		assert.strictEqual((await registry.listLocal()).length, 2);
 		const blockedUpdate = state.blockNextUpdate();

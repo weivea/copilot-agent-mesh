@@ -123,8 +123,8 @@ suite('Gateway hardening', () => {
 		const invitation = await pairing.createInvitation('https://worker.example');
 		pairing.registerConnection('closing-connection');
 		const hello = pairing.hello('closing-connection', {
-			protocolMin: 1,
-			protocolMax: 1,
+			protocolMin: 2,
+			protocolMax: 2,
 			coordinatorDeviceId: 'coordinator',
 			clientNonce: randomBase64Url(NONCE_BYTES),
 			invitationId: invitation.invitationId,
@@ -155,14 +155,14 @@ suite('Gateway hardening', () => {
 		const secret = new URL(invitation.url).hash.slice('#secret='.length);
 		const clientNonce = randomBase64Url(NONCE_BYTES);
 		const hello = await pairing.hello('ttl-connection', {
-			protocolMin: 1,
-			protocolMax: 1,
+			protocolMin: 2,
+			protocolMax: 2,
 			coordinatorDeviceId: 'coordinator',
 			clientNonce,
 			invitationId: invitation.invitationId,
 		});
 		const transcript: EnrollmentTranscript = {
-			version: 1,
+			version: 2,
 			invitationId: invitation.invitationId,
 			workerDeviceId: 'worker',
 			coordinatorDeviceId: 'coordinator',

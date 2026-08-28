@@ -375,9 +375,10 @@ if (args[0] === '--version') {
 test('launcher retains auxiliary command cleanup ownership after discovery cleanup fails', async () => {
 	let terminationAttempts = 0;
 	const launcher = new AgentHostLauncher({
-		storageRoot: '/tmp/not-used',
-		configuredCodeCli: '/fake/code',
+		storageRoot: join('not-used', 'storage'),
+		configuredCodeCli: join('fake', 'code'),
 	}, {
+		assertProcessControlSupported: () => undefined,
 		runCommand: async () => {
 			throw new OwnedCommandError('synthetic command cleanup failure', 424242, true);
 		},

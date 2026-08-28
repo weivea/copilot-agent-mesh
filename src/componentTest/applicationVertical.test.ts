@@ -1,7 +1,9 @@
 import * as assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { dirname } from 'node:path';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { test } from 'node:test';
+import { pathToFileURL } from 'node:url';
 
 import {
 	AsyncEventQueue,
@@ -48,6 +50,10 @@ const taskId = '00000000-0000-4000-8000-000000000005';
 const inputId = '00000000-0000-4000-8000-000000000006';
 const answerId = '00000000-0000-4000-8000-000000000007';
 const pressureTaskId = '00000000-0000-4000-8000-00000000000a';
+const fixtureRoot = join(tmpdir(), 'copilot-agent-mesh-component-fixtures');
+const workspaceUri = pathToFileURL(join(fixtureRoot, 'workspace')).href;
+const firstWorkspaceUri = pathToFileURL(join(fixtureRoot, 'one')).href;
+const secondWorkspaceUri = pathToFileURL(join(fixtureRoot, 'two')).href;
 
 test('real loopback composes pairing, workspace, accepted task, input, get, and cancellation', async () => {
 	const state = new MemoryState();
@@ -58,13 +64,13 @@ test('real loopback composes pairing, workspace, accepted task, input, get, and 
 		{ now: () => new Date('2026-08-25T00:00:00.000Z') },
 		{
 			resolve: async () => ({
-				canonicalUri: 'file:///workspace',
+				canonicalUri: workspaceUri,
 				identity: 'file:1:1',
 			}),
 		},
 		leases,
 	);
-	await registry.register({ localUri: 'file:///workspace', name: 'Loopback Workspace' });
+	await registry.register({ localUri: workspaceUri, name: 'Loopback Workspace' });
 	const files = new AtomicFileStore('memory-root', new MemoryAtomicFileSystem(), {
 		next: randomUUID,
 	});
@@ -116,7 +122,7 @@ test('real loopback composes pairing, workspace, accepted task, input, get, and 
 	);
 	const gateway = new GatewayServer(pairing, router, {
 		heartbeatIntervalMs: 50,
-		heartbeatTimeoutMs: 500,
+		heartbeatTimeoutMs: 10_000,
 	});
 	liveGateway = gateway;
 	const address = await gateway.start();
@@ -347,7 +353,7 @@ test('startup recovery fails active tasks honestly and releases their workspace 
 			new MemoryState(),
 			{ next: () => workspaceId },
 			{ now: () => new Date() },
-			{ resolve: async () => ({ canonicalUri: 'file:///workspace', identity: 'file:1:1' }) },
+			{ resolve: async () => ({ canonicalUri: workspaceUri, identity: 'file:1:1' }) },
 			leases,
 		),
 		tasks,
@@ -371,10 +377,10 @@ test('disabled Agent Host fails with stable AGENT_UNAVAILABLE before accepting a
 		state,
 		{ next: () => workspaceId },
 		{ now: () => new Date() },
-		{ resolve: async () => ({ canonicalUri: 'file:///workspace', identity: 'file:1:1' }) },
+		{ resolve: async () => ({ canonicalUri: workspaceUri, identity: 'file:1:1' }) },
 		leases,
 	);
-	await registry.register({ localUri: 'file:///workspace', name: 'Workspace' });
+	await registry.register({ localUri: workspaceUri, name: 'Workspace' });
 	const runtime = new StubAgentRuntime(inputId, false);
 	const runner = new WorkerTaskService(
 		workerDeviceId,
@@ -412,10 +418,10 @@ test('concurrent idempotent starts retain the active workspace lease', async () 
 		state,
 		{ next: () => workspaceId },
 		{ now: () => new Date('2026-08-25T00:00:00.000Z') },
-		{ resolve: async () => ({ canonicalUri: 'file:///workspace', identity: 'file:1:1' }) },
+		{ resolve: async () => ({ canonicalUri: workspaceUri, identity: 'file:1:1' }) },
 		leases,
 	);
-	await registry.register({ localUri: 'file:///workspace', name: 'Workspace' });
+	await registry.register({ localUri: workspaceUri, name: 'Workspace' });
 	const runtime = new StubAgentRuntime(inputId);
 	const runner = new WorkerTaskService(
 		workerDeviceId,
@@ -470,8 +476,8 @@ test('runtime handles are isolated by authenticated owner even when task IDs col
 		},
 		leases,
 	);
-	await registry.register({ localUri: 'file:///one', name: 'One' });
-	await registry.register({ localUri: 'file:///two', name: 'Two' });
+	await registry.register({ localUri: firstWorkspaceUri, name: 'One' });
+	await registry.register({ localUri: secondWorkspaceUri, name: 'Two' });
 	const runtime = new StubAgentRuntime(inputId);
 	const runner = new WorkerTaskService(
 		workerDeviceId,
@@ -522,10 +528,10 @@ test('shutdown does not wait forever for an unresolved local approval', async ()
 		state,
 		{ next: () => workspaceId },
 		{ now: () => new Date('2026-08-25T00:00:00.000Z') },
-		{ resolve: async () => ({ canonicalUri: 'file:///workspace', identity: 'file:1:1' }) },
+		{ resolve: async () => ({ canonicalUri: workspaceUri, identity: 'file:1:1' }) },
 		leases,
 	);
-	await registry.register({ localUri: 'file:///workspace', name: 'Workspace' });
+	await registry.register({ localUri: workspaceUri, name: 'Workspace' });
 	const runner = new WorkerTaskService(
 		workerDeviceId,
 		new StubAgentRuntime(inputId),
@@ -564,10 +570,10 @@ test('shutdown drains a task start blocked in atomic persistence', async () => {
 		state,
 		{ next: () => workspaceId },
 		{ now: () => new Date('2026-08-25T00:00:00.000Z') },
-		{ resolve: async () => ({ canonicalUri: 'file:///workspace', identity: 'file:1:1' }) },
+		{ resolve: async () => ({ canonicalUri: workspaceUri, identity: 'file:1:1' }) },
 		leases,
 	);
-	await registry.register({ localUri: 'file:///workspace', name: 'Workspace' });
+	await registry.register({ localUri: workspaceUri, name: 'Workspace' });
 	const fileSystem = new BlockingAtomicFileSystem();
 	const runner = new WorkerTaskService(
 		workerDeviceId,

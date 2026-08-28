@@ -3,39 +3,34 @@ import { hostname } from 'node:os';
 
 import * as vscode from 'vscode';
 
-import { DeviceService } from '../application/DeviceService';
-import { ListenerService } from '../application/ListenerService';
-import { LocalDesktopWorkspaceGuard } from '../application/LocalDesktopWorkspaceGuard';
-import { WorkerTaskService } from '../application/RemoteTaskRunner';
-import { TaskCoordinator } from '../application/TaskCoordinator';
-import { WorkspaceService } from '../application/WorkspaceService';
-import { getWorkerPlatformSupport } from '../application/WorkerPlatformSupport';
 import type { AgentRuntime } from '../agentHost/AgentRuntime';
-import { systemClock } from '../domain/ports';
-import { GatewayRouter } from '../gateway/GatewayRouter';
-import { GatewayServer } from '../gateway/GatewayServer';
-import { PairingService } from '../gateway/PairingService';
+import { LocalDesktopWorkspaceGuard } from '../application/LocalDesktopWorkspaceGuard';
+import { getWorkerPlatformSupport } from '../application/WorkerPlatformSupport';
+import {
+	BrokerLifecycle,
+	type BrokerLifecycleStatus,
+	type BrokerTaskService,
+} from '../broker';
 import { StructuredLogger } from '../logging/StructuredLogger';
-import { createTaskNotificationSink } from './TaskNotificationPublisher';
-import { PeerConnectionManager } from '../peer/PeerConnectionManager';
-import { WebSocketPeerTransport } from '../peer/WebSocketPeerTransport';
 import {
-	AtomicFileStore,
-	NodeAtomicFileSystem,
-} from '../storage/AtomicFileStore';
-import { DeviceProfileStore } from '../storage/DeviceProfileStore';
+	LocalIpcRemoteTaskAdapter,
+	WindowNodeClient,
+	WindowNodeTaskExecutor,
+	type WindowNodeClientSnapshot,
+} from '../node';
+import { deriveLocalIpcEndpoint } from '../ipc';
+import { BrokerOwnerLock } from '../storage/BrokerOwnerLock';
 import {
-	VscodeDevTunnelStateStore,
+	DeviceProfileStore,
+	type DeviceEnvironment,
+	type DeviceProfile,
+} from '../storage/DeviceProfileStore';
+import {
 	VscodeGlobalStateStore,
-	VscodePairingRecordStore,
-	VscodePeerProfileStore,
 	VscodeSecretStore,
 } from '../storage/VscodeStorageAdapters';
-import { WorkerOwnerLock } from '../storage/WorkerOwnerLock';
-import { FileTaskStore } from '../tasks/FileTaskStore';
-import { WorkspaceLeaseManager } from '../tasks/WorkspaceLeaseManager';
+import { LocalBrokerTaskFacade } from '../tools/LocalBrokerTaskFacade';
 import { registerMeshTaskTools } from '../tools/taskTools';
-import { DevTunnelCliProvider } from '../tunnel/DevTunnelCliProvider';
 import {
 	AgentMeshViewProvider,
 	DASHBOARD_COMMANDS,
@@ -43,13 +38,19 @@ import {
 import {
 	ServiceDashboardFacade,
 	type DashboardFacade,
+	type DashboardTaskTarget,
 } from '../ui/DashboardFacade';
-import { NodeFileIdentityResolver } from '../workspaces/NodeFileIdentityResolver';
-import { WorkspaceRegistry } from '../workspaces/WorkspaceRegistry';
+import { ProductionBrokerRuntime } from './ProductionBrokerRuntime';
 import { ProductionDashboardBindings } from './ProductionDashboardBindings';
+import {
+	createLocalBrokerIdentity,
+	waitForBrokerKey,
+	waitForDeviceProfile,
+} from './SharedBrokerIdentity';
 import {
 	createVscodeAgentRuntime,
 	VscodeLocalTaskApproval,
+	VscodeWindowNodeTaskConfirmation,
 } from './VscodeAgentRuntime';
 import {
 	createTwoDeviceE2eApi,
@@ -59,6 +60,13 @@ import {
 	E2eCapability,
 	type ExtensionRuntimeMode,
 } from './E2eCapability';
+import {
+	activationRollbackFailure,
+	addApplicationCleanup,
+	createApplicationCleanupState,
+	disposeApplicationResources,
+	type ApplicationCleanupStep,
+} from './ApplicationCleanup';
 
 export const APPLICATION_COMMANDS = {
 	registerWorkspace: 'copilotAgentMesh.registerWorkspace',
@@ -77,10 +85,17 @@ export const APPLICATION_COMMANDS = {
 
 export interface AgentMeshExtensionApi {
 	readonly agentRuntime: AgentRuntime;
-	readonly coordinator: TaskCoordinator;
-	readonly workerTasks: WorkerTaskService;
-	readonly listener: ListenerService;
+	readonly node: WindowNodeClient;
+	readonly nodeId: string;
+	readonly nodeInstanceId: string;
+	readonly brokerLifecycle: BrokerLifecycle<ProductionBrokerRuntime>;
+	readonly nodeState: () => WindowNodeClientSnapshot;
+	readonly brokerState: () => BrokerLifecycleStatus;
+	readonly coordinator?: ProductionBrokerRuntime['coordinator'];
+	readonly workerTasks?: BrokerTaskService;
+	readonly listener?: ProductionBrokerRuntime['listener'];
 	readonly twoDeviceE2e?: TwoDeviceE2eApi;
+	readonly multiWindowE2e?: TwoDeviceE2eApi;
 }
 
 export interface Application {
@@ -92,9 +107,10 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 	const output = vscode.window.createOutputChannel('Copilot Agent Mesh', { log: true });
 	const logger = new StructuredLogger(output);
 	const contributions: vscode.Disposable[] = [];
-	const cleanup: Array<() => Promise<void> | void> = [];
+	const cleanup: ApplicationCleanupStep[] = [];
+	const cleanupState = createApplicationCleanupState<vscode.Disposable>();
 	try {
-		const state = new VscodeGlobalStateStore(context.globalState);
+		const rawState = new VscodeGlobalStateStore(context.globalState);
 		const secrets = new VscodeSecretStore(context.secrets);
 		const guard = new LocalDesktopWorkspaceGuard(() => ({
 			remoteName: vscode.env.remoteName,
@@ -103,308 +119,306 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 				uriScheme: folder.uri.scheme,
 			})),
 		}));
-		const ids = { next: randomUUID };
+		guard.assertAllowed({ requireWorkspace: false });
 		const workerPlatform = getWorkerPlatformSupport();
 		const configuration = vscode.workspace.getConfiguration('copilotAgentMesh');
+		const twoDeviceE2eRequested = process.env.MESH_TWO_DEVICE_E2E === '1';
+		const multiWindowE2eRequested = process.env.MESH_MULTI_WINDOW_E2E === '1';
+		const oneE2eScenarioRequested = twoDeviceE2eRequested !== multiWindowE2eRequested;
 		const e2eCapability = E2eCapability.create({
 			mode: extensionRuntimeMode(context.extensionMode),
-			environmentEnabled: process.env.MESH_TWO_DEVICE_E2E === '1',
-			environmentNonce: process.env.MESH_TWO_DEVICE_E2E_NONCE,
-			environmentRole: process.env.MESH_TWO_DEVICE_E2E_ROLE,
+			environmentEnabled: oneE2eScenarioRequested,
+			environmentNonce: multiWindowE2eRequested
+				? process.env.MESH_MULTI_WINDOW_E2E_NONCE
+				: process.env.MESH_TWO_DEVICE_E2E_NONCE,
+			environmentRole: multiWindowE2eRequested
+				? 'coordinator'
+				: process.env.MESH_TWO_DEVICE_E2E_ROLE,
 			profileNonce: configuration.get<string>('e2e.nonce'),
 			profileRole: configuration.get<string>('e2e.role'),
 		});
-		const storageRoot = vscode.Uri.joinPath(context.globalStorageUri, 'mesh-state');
-		await vscode.workspace.fs.createDirectory(storageRoot);
-		const ownership = await WorkerOwnerLock.acquire(context.globalStorageUri.fsPath, {
-			instanceId: randomUUID(),
-		});
-		cleanup.push(() => ownership.dispose());
-		const extensionVersion = String(context.extension?.packageJSON.version ?? '0.0.0');
-		const deviceStore = new DeviceProfileStore(state, ids, systemClock);
-		const device = new DeviceService(deviceStore, {
+		const environment: DeviceEnvironment = {
 			defaultName: configuration.get<string>('deviceName', '').trim() || hostname(),
 			platform: supportedPlatform(process.platform),
 			architecture: process.arch,
 			vscodeVersion: vscode.version,
-			extensionVersion,
-		}, guard, ownership);
-		let deviceProfile = ownership.isOwner()
-			? await device.initialize()
-			: device.initializeReadOnly();
-		const configuredDeviceName = configuration.get<string>('deviceName', '').trim();
-		if (
-			configuredDeviceName.length > 0
-			&& configuredDeviceName !== deviceProfile.name
-		) {
-			if (ownership.isOwner()) {
-				deviceProfile = await device.rename(configuredDeviceName);
-			}
-		}
-
-		const leases = new WorkspaceLeaseManager();
-		const workspaceRegistry = new WorkspaceRegistry(
-			state,
-			ids,
-			systemClock,
-			new NodeFileIdentityResolver(),
-			leases,
-		);
-		const workspaceService = new WorkspaceService(
-			workspaceRegistry,
-			guard,
-			() => vscode.workspace.workspaceFolders ?? [],
-			() => {
-				const activeUri = vscode.window.activeTextEditor?.document.uri;
-				return activeUri === undefined ? undefined : vscode.workspace.getWorkspaceFolder(activeUri);
-			},
-			async (folders) => (await vscode.window.showQuickPick(
-				folders.map((folder) => ({
-					label: folder.name,
-					description: folder.uri.fsPath,
-					folder,
-				})),
-				{
-					title: 'Register Copilot Agent Mesh Workspace',
-					placeHolder: 'Choose a local workspace to share',
-					ignoreFocusOut: true,
-				},
-			))?.folder,
-			() => vscode.workspace
-				.getConfiguration('copilotAgentMesh')
-				.get<readonly string[]>('workspace.capabilityTags', []),
-			ownership,
-		);
-		const files = new AtomicFileStore(storageRoot.fsPath, new NodeAtomicFileSystem(), ids);
-		const taskStore = new FileTaskStore(files, systemClock);
-
-		const pairingRecords = new VscodePairingRecordStore(state);
-		const peerProfiles = new VscodePeerProfileStore(state);
-		const pairing = new PairingService(
-			deviceProfile.deviceId,
-			secrets,
-			pairingRecords,
-		);
-		const peerManager = new PeerConnectionManager(
-			deviceProfile.deviceId,
-			peerProfiles,
-			secrets,
-			new WebSocketPeerTransport(),
-			{ ownership },
-		);
-		cleanup.push(() => peerManager.dispose());
-
-		const changeEvents = new vscode.EventEmitter<void>();
-		cleanup.push(() => changeEvents.dispose());
-		const approvals = new VscodeLocalTaskApproval(vscode, state, e2eCapability);
-		const runtime = createVscodeAgentRuntime(
-			vscode,
-			context,
-			workspaceRegistry,
-			guard,
-			approvals,
-			workerPlatform,
-			ownership,
-		);
-		cleanup.push(() => runtime.dispose());
-		let listenerService: ListenerService | undefined;
-		const workerTasks = new WorkerTaskService(
-			deviceProfile.deviceId,
-			runtime,
-			workspaceRegistry,
-			taskStore,
-			leases,
-			guard,
-			approvals,
-			{
-				onDidChange: () => changeEvents.fire(),
-				ownership,
-				notificationSink: createTaskNotificationSink(
-					(peerId, method, params) => listenerService?.publish(peerId, method, params),
-				),
-				e2eCapability,
-			},
-		);
-		cleanup.push(() => workerTasks.dispose());
-		if (ownership.isOwner()) {
-			await workerTasks.initialize();
-		}
-
-		const router = new GatewayRouter(device, workspaceService, workerTasks);
-		const tunnelPath = configuration.get<string>('devTunnelPath', '').trim();
-		const tunnel = new DevTunnelCliProvider({
-			executable: tunnelPath || undefined,
-			reportStatusListenerError: (error) =>
-				logger.error('listener', 'A Dev Tunnel status listener failed.', error),
-			stateStore: new VscodeDevTunnelStateStore(state),
-		});
-		const configuredPort = (): number | undefined => {
-			const value = vscode.workspace
-				.getConfiguration('copilotAgentMesh')
-				.get<number>('listener.port', 0);
-			return value === 0 ? undefined : value;
+			extensionVersion: String(context.extension?.packageJSON.version ?? '0.0.0'),
 		};
-		const listener = new ListenerService(
-			deviceProfile.deviceId,
-			pairing,
-			tunnel,
-			() => new GatewayServer(pairing, router),
-			state,
-			guard,
-			{ configuredPort, workerPlatform, ownership },
-		);
-		listenerService = listener;
-		cleanup.push(() => listener.dispose());
-		const ownershipLoss = ownership.onDidLoseOwnership(() => {
-			void Promise.allSettled([
-				workerTasks.dispose(),
-				listener.dispose(),
-				peerManager.dispose(),
-			]).then((results) => {
-				for (const result of results) {
-					if (result.status === 'rejected') {
-						logger.error(
-							'ownership',
-							'Worker ownership-loss cleanup did not complete.',
-							result.reason,
-						);
-					}
-				}
-				changeEvents.fire();
-			});
+		const windowInstanceId = randomUUID();
+		const ownership = await BrokerOwnerLock.acquire(context.globalStorageUri.fsPath, {
+			instanceId: windowInstanceId,
 		});
-		cleanup.push(() => ownershipLoss.dispose());
-
-		const coordinator = new TaskCoordinator(
-			peerManager,
-			peerProfiles,
-			state,
-			guard,
-			randomUUID,
-			() => new Date(),
+		const ownershipCleanup = addApplicationCleanup(cleanup, () => ownership.dispose(), true);
+		const changeEvents = new vscode.EventEmitter<void>();
+		let profile: DeviceProfile | undefined;
+		let currentOwnerRuntime: ProductionBrokerRuntime | undefined;
+		let lifecycle!: BrokerLifecycle<ProductionBrokerRuntime>;
+		lifecycle = new BrokerLifecycle(
 			ownership,
+			async (generation) => {
+				const ownerRuntime = await ProductionBrokerRuntime.create({
+					vscodeApi: vscode,
+					context,
+					rawState,
+					secrets,
+					ownership,
+					generation,
+					identityFor: (deviceId) =>
+						createLocalBrokerIdentity(context.globalStorageUri, deviceId),
+					guard,
+					workerPlatform,
+					logger,
+					onDidChange: () => changeEvents.fire(),
+					onDisposed: (disposed) => {
+						if (currentOwnerRuntime === disposed) {
+							currentOwnerRuntime = undefined;
+						}
+					},
+				});
+				currentOwnerRuntime = ownerRuntime;
+				profile = ownerRuntime.profile;
+				changeEvents.fire();
+				return ownerRuntime;
+			},
 		);
+		ownershipCleanup.dispose = () => lifecycle.dispose();
+		await lifecycle.start().catch((error: unknown) => {
+			logger.error(
+				'broker',
+				'Initial Broker ownership startup failed; bounded lifecycle retry remains active.',
+				error,
+			);
+		});
 
-		const bindings = new ProductionDashboardBindings(
-			vscode,
-			changeEvents,
-			device,
-			workspaceService,
-			listener,
-			peerManager,
-			peerProfiles,
-			coordinator,
-			taskStore,
-			leases,
+		const [sharedProfile, brokerKey] = await Promise.all([
+			waitForDeviceProfile(rawState, environment),
+			waitForBrokerKey(secrets),
+		]);
+		profile = sharedProfile;
+		const nodeId = randomUUID();
+		const nodeInstanceId = randomUUID();
+		const nodeLabel = windowNodeLabel(nodeId);
+		const runtimeApproval = new VscodeLocalTaskApproval(vscode, rawState, e2eCapability);
+		const nodeConfirmation = new VscodeWindowNodeTaskConfirmation(vscode, e2eCapability);
+		let runtime!: AgentRuntime;
+		const nodeIdentity = createLocalBrokerIdentity(
+			context.globalStorageUri,
+			sharedProfile.deviceId,
+		);
+		const node = new WindowNodeClient({
+			nodeId,
+			nodeInstanceId,
+			label: nodeLabel,
+			capabilities: ['agentRuntime', 'tasks'],
+			identity: nodeIdentity,
+			brokerKey,
+			executor: ({ workspaceResolver, eventSink }) => {
+				runtime = createVscodeAgentRuntime(
+					vscode,
+					context,
+					workspaceResolver,
+					guard,
+					runtimeApproval,
+					workerPlatform,
+				);
+				return new WindowNodeTaskExecutor({
+					nodeId,
+					nodeInstanceId,
+					nodeLabel,
+					runtime,
+					workspaceResolver,
+					confirmationHost: nodeConfirmation,
+					eventSink,
+					ids: { next: randomUUID },
+					clock: { now: () => new Date() },
+				});
+			},
+			workspaceSource: () => {
+				guard.assertAllowed({ requireWorkspace: false });
+				const capabilityTags = vscode.workspace
+					.getConfiguration('copilotAgentMesh')
+					.get<readonly string[]>('workspace.capabilityTags', []);
+				return (vscode.workspace.workspaceFolders ?? [])
+					.filter((folder) => folder.uri.scheme === 'file')
+					.map((folder) => ({
+						localUri: folder.uri.toString(),
+						name: boundUtf8(folder.name, 256),
+						capabilityTags: capabilityTags
+							.map((tag) => boundUtf8(tag.trim(), 64))
+							.filter((tag) => tag.length > 0),
+					}));
+			},
+			onError: (error) => logger.error(
+				'window-node',
+				'The Window Node is reconnecting to the local Device Broker.',
+				error,
+			),
+		});
+		addApplicationCleanup(cleanup, () => node.dispose(), true);
+		addApplicationCleanup(cleanup, () => changeEvents.dispose());
+		await node.start();
+		const remoteTasks = new LocalIpcRemoteTaskAdapter(node);
+		const localTasks = new LocalBrokerTaskFacade(node, {
+			deviceName: () =>
+				currentOwnerRuntime?.device.current().name
+				?? profile?.name
+				?? sharedProfile.name,
+			remoteAdapter: remoteTasks,
+		});
+		const bindings = new ProductionDashboardBindings({
+			vscodeApi: vscode,
+			changed: changeEvents,
+			profile: () => {
+				const ownerProfile = currentOwnerRuntime?.device.current();
+				if (ownerProfile !== undefined) {
+					profile = ownerProfile;
+				} else {
+					const persisted = new DeviceProfileStore(
+						rawState,
+						{ next: randomUUID },
+						{ now: () => new Date() },
+					).get();
+					profile = persisted ?? profile;
+				}
+				if (profile === undefined) {
+					throw new Error('The shared Device profile is unavailable.');
+				}
+				return profile;
+			},
+			node,
+			localTasks,
+			remoteTasks,
 			runtime,
 			guard,
 			workerPlatform,
-			ownership,
-		);
-		cleanup.push(() => bindings.dispose());
+			lifecycle,
+			ownerRuntime: () => currentOwnerRuntime,
+		});
+		addApplicationCleanup(cleanup, () => bindings.dispose());
 		const dashboardFacade = new ServiceDashboardFacade(bindings);
 		const dashboard = new AgentMeshViewProvider(dashboardFacade, context.extensionUri);
-		cleanup.push(() => dashboard.dispose());
-		const twoDeviceE2e = createTwoDeviceE2eApi(
-			vscode,
+		addApplicationCleanup(cleanup, () => dashboard.dispose());
+		const gatedE2e = createTwoDeviceE2eApi({
+			vscodeApi: vscode,
 			bindings,
-			coordinator,
-			listener,
+			node,
+			localTasks,
+			remoteTasks,
 			runtime,
-			tunnel,
-			workerTasks,
-			e2eCapability,
-		);
-		if (ownership.isOwner()) {
-			await peerManager.restore();
-			await restoreListener(listener, configuration, logger);
-			await coordinator.refreshKnownTasks().catch((error: unknown) => {
-				logger.error('coordinator', 'Task status recovery did not complete.', error);
-			});
-		}
+			lifecycle,
+			ownerRuntime: () => currentOwnerRuntime,
+			capability: e2eCapability,
+			localIpcEndpoint: deriveLocalIpcEndpoint(nodeIdentity),
+		});
+		const twoDeviceE2e = twoDeviceE2eRequested && !multiWindowE2eRequested
+			? gatedE2e
+			: undefined;
+		const multiWindowE2e = multiWindowE2eRequested && !twoDeviceE2eRequested
+			? gatedE2e
+			: undefined;
 
 		contributions.push(
-			registerMeshTaskTools(coordinator),
+			registerMeshTaskTools(localTasks),
 			vscode.window.registerWebviewViewProvider(AgentMeshViewProvider.viewType, dashboard),
 			...registerCommands(
-				context,
 				dashboardFacade,
 				dashboard,
-				workspaceService,
+				bindings,
 				guard,
 				logger,
 			),
-			vscode.workspace.onDidChangeWorkspaceFolders(() => changeEvents.fire()),
+			vscode.workspace.onDidChangeWorkspaceFolders(() => {
+				void node.refreshWorkspaces().then(
+					() => changeEvents.fire(),
+					(error: unknown) => logger.error(
+						'window-node',
+						'Window workspace claims will refresh after Broker reconnection.',
+						error,
+					),
+				);
+			}),
 			vscode.workspace.onDidChangeConfiguration((event) => {
-				if (event.affectsConfiguration('copilotAgentMesh.deviceName')) {
-					if (!ownership.isOwner()) {
-						return;
-					}
-					const name = vscode.workspace
-						.getConfiguration('copilotAgentMesh')
-						.get<string>('deviceName', '')
-						.trim();
-					if (name.length > 0) {
-						void device.rename(name).then(
-							() => changeEvents.fire(),
-							(error: unknown) => logger.error('device', 'Device name update failed.', error),
+				if (
+					event.affectsConfiguration('copilotAgentMesh.workspace.capabilityTags')
+				) {
+					void node.refreshWorkspaces().catch((error: unknown) => {
+						logger.error(
+							'window-node',
+							'Window workspace capabilities could not be refreshed.',
+							error,
 						);
-					}
+					});
 				}
 			}),
 		);
 		context.subscriptions.push(...contributions);
-		logger.log('info', 'application', 'Copilot Agent Mesh application started.', {
-			protocolVersion: deviceProfile.protocolVersion,
-			workerOwner: ownership.isOwner(),
+		logger.log('info', 'application', 'Copilot Agent Mesh multi-window application started.', {
+			protocolVersion: sharedProfile.protocolVersion,
+			brokerRole: lifecycle.snapshot().owner ? 'owner' : 'contender',
+			nodeId,
+			nodeInstanceId,
 		});
 
 		let disposal: Promise<void> | undefined;
-		const application: Application = {
-			api: {
-				agentRuntime: runtime,
-				coordinator,
-				workerTasks,
-				listener,
-				...(twoDeviceE2e === undefined ? {} : { twoDeviceE2e }),
+		const api: AgentMeshExtensionApi = {
+			get agentRuntime() {
+				return runtime;
 			},
+			node,
+			nodeId,
+			nodeInstanceId,
+			brokerLifecycle: lifecycle,
+			nodeState: () => node.snapshot(),
+			brokerState: () => lifecycle.snapshot(),
+			get coordinator() {
+				return currentOwnerRuntime?.coordinator;
+			},
+			get workerTasks() {
+				return currentOwnerRuntime?.brokerTasks;
+			},
+			get listener() {
+				return currentOwnerRuntime?.listener;
+			},
+			...(twoDeviceE2e === undefined ? {} : { twoDeviceE2e }),
+			...(multiWindowE2e === undefined ? {} : { multiWindowE2e }),
+		};
+		return {
+			api,
 			dispose: () => {
+				if (cleanupState.complete) {
+					return Promise.resolve();
+				}
 				if (disposal === undefined) {
-					disposal = disposeApplication(contributions, cleanup, logger);
+					let attempt!: Promise<void>;
+					attempt = disposeApplicationResources(
+						contributions,
+						cleanup,
+						logger,
+						cleanupState,
+					).finally(() => {
+						if (!cleanupState.complete && disposal === attempt) {
+							disposal = undefined;
+						}
+					});
+					disposal = attempt;
 				}
 				return disposal;
 			},
 		};
-		return application;
-	} catch (error) {
-		await disposeApplication(contributions, cleanup, logger).catch(() => undefined);
+	} catch (error: unknown) {
+		try {
+			await disposeApplicationResources(contributions, cleanup, logger, cleanupState);
+		} catch (cleanupError: unknown) {
+			throw activationRollbackFailure(error, cleanupError);
+		}
 		throw error;
 	}
 }
 
-async function restoreListener(
-	listener: ListenerService,
-	configuration: vscode.WorkspaceConfiguration,
-	logger: StructuredLogger,
-): Promise<void> {
-	try {
-		await listener.restore();
-		if (
-			listener.snapshot().state === 'stopped'
-			&& configuration.get<boolean>('listener.autoStart', false)
-		) {
-			await listener.start();
-		}
-	} catch (error) {
-		logger.error('listener', 'Listener restoration failed safely.', error);
-	}
-}
-
 function registerCommands(
-	_context: vscode.ExtensionContext,
 	facade: DashboardFacade,
 	dashboard: AgentMeshViewProvider,
-	workspaces: WorkspaceService,
+	bindings: ProductionDashboardBindings,
 	guard: LocalDesktopWorkspaceGuard,
 	logger: StructuredLogger,
 ): vscode.Disposable[] {
@@ -416,10 +430,11 @@ function registerCommands(
 		try {
 			guard.assertAllowed({ requireWorkspace });
 			await handler(...args);
-		} catch (error) {
+		} catch (error: unknown) {
 			logger.error('command', `Command ${id} failed.`, error);
-			const message = error instanceof Error ? error.message : 'The command failed.';
-			await vscode.window.showErrorMessage(message);
+			await vscode.window.showErrorMessage(
+				error instanceof Error ? error.message : 'The command failed.',
+			);
 		}
 	});
 	const selectTarget = async (
@@ -449,14 +464,14 @@ function registerCommands(
 		register(APPLICATION_COMMANDS.enableWorkspace, true, async (value) => {
 			const id = opaqueId(value) ?? await selectTarget('workspace');
 			if (id !== undefined) {
-				await workspaces.setEnabled(id, true);
+				await bindings.setWorkspaceEnabled(id, true);
 				dashboard.refresh();
 			}
 		}),
 		register(APPLICATION_COMMANDS.disableWorkspace, true, async (value) => {
 			const id = opaqueId(value) ?? await selectTarget('workspace');
 			if (id !== undefined) {
-				await workspaces.setEnabled(id, false);
+				await bindings.setWorkspaceEnabled(id, false);
 				dashboard.refresh();
 			}
 		}),
@@ -470,8 +485,8 @@ function registerCommands(
 				await facade.removePeer(id);
 			}
 		}),
-		register(APPLICATION_COMMANDS.runTask, false, (peerId, workspaceId) =>
-			facade.runTask(opaqueId(peerId), opaqueId(workspaceId))),
+		register(APPLICATION_COMMANDS.runTask, false, (value) =>
+			facade.runTask(dashboardTarget(value))),
 		register(APPLICATION_COMMANDS.cancelTask, false, async (value) => {
 			const id = opaqueId(value) ?? await selectTarget('task');
 			if (id !== undefined) {
@@ -487,45 +502,73 @@ function registerCommands(
 	];
 }
 
-async function disposeApplication(
-	contributions: readonly vscode.Disposable[],
-	cleanup: readonly (() => Promise<void> | void)[],
-	logger: StructuredLogger,
-): Promise<void> {
-	for (const contribution of [...contributions].reverse()) {
-		contribution.dispose();
-	}
-	const failures: unknown[] = [];
-	for (const dispose of [...cleanup].reverse()) {
-		try {
-			await dispose();
-		} catch (error) {
-			failures.push(error);
-			logger.error('shutdown', 'Application resource cleanup failed.', error);
-		}
-	}
-	logger.log('info', 'application', 'Copilot Agent Mesh application stopped.');
-	logger.dispose();
-	if (failures.length > 0) {
-		throw new AggregateError(failures, 'Copilot Agent Mesh did not cleanly release every resource.');
-	}
-}
-
 function opaqueId(value: unknown): string | undefined {
 	if (typeof value === 'string') {
 		return value;
 	}
-	if (typeof value === 'object' && value !== null && 'id' in value && typeof value.id === 'string') {
+	if (
+		typeof value === 'object'
+		&& value !== null
+		&& 'id' in value
+		&& typeof value.id === 'string'
+	) {
 		return value.id;
 	}
 	return undefined;
+}
+
+function dashboardTarget(value: unknown): DashboardTaskTarget | undefined {
+	if (typeof value !== 'object' || value === null) {
+		return undefined;
+	}
+	const record = value as Record<string, unknown>;
+	if (
+		typeof record.deviceId !== 'string'
+		|| typeof record.nodeId !== 'string'
+		|| typeof record.nodeInstanceId !== 'string'
+		|| typeof record.workspaceId !== 'string'
+		|| (record.peerId !== undefined && typeof record.peerId !== 'string')
+	) {
+		return undefined;
+	}
+	return {
+		deviceId: record.deviceId,
+		nodeId: record.nodeId,
+		nodeInstanceId: record.nodeInstanceId,
+		workspaceId: record.workspaceId,
+		...(record.peerId === undefined ? {} : { peerId: record.peerId }),
+	};
+}
+
+function windowNodeLabel(nodeId: string): string {
+	const workspaceName = vscode.workspace.name?.trim();
+	const base = workspaceName === undefined || workspaceName.length === 0
+		? 'VS Code'
+		: workspaceName;
+	return boundUtf8(`${base} Window ${nodeId.slice(0, 8)}`, 256);
+}
+
+function boundUtf8(value: string, maximumBytes: number): string {
+	if (Buffer.byteLength(value, 'utf8') <= maximumBytes) {
+		return value;
+	}
+	let result = '';
+	let bytes = 0;
+	for (const character of value) {
+		const size = Buffer.byteLength(character, 'utf8');
+		if (bytes + size > maximumBytes) {
+			break;
+		}
+		result += character;
+		bytes += size;
+	}
+	return result;
 }
 
 function supportedPlatform(platform: NodeJS.Platform): 'win32' | 'darwin' | 'linux' {
 	if (platform === 'win32' || platform === 'darwin' || platform === 'linux') {
 		return platform;
 	}
-
 	throw new Error(`Copilot Agent Mesh does not support platform ${platform}.`);
 }
 

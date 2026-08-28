@@ -1,6 +1,6 @@
 import * as assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { resolve } from 'node:path';
 import { suite, test } from 'node:test';
 
 import {
@@ -17,15 +17,16 @@ import {
 
 const expectedTunnelId = 'fixture-tunnel';
 const expectedPort = 43123;
-const fixturePath = join(
-	process.cwd(),
+const repositoryRoot = resolve(__dirname, '..', '..', '..');
+const fixturePath = resolve(
+	repositoryRoot,
 	'docs',
 	'spikes',
 	'fixtures',
 	'devtunnel-show-1.0.2006-no-host.sanitized.json',
 );
-const hostedFixturePath = join(
-	process.cwd(),
+const hostedFixturePath = resolve(
+	repositoryRoot,
 	'docs',
 	'mvp',
 	'fixtures',
@@ -52,6 +53,12 @@ suite('DevTunnelJsonDecoder', () => {
 		const fixture = readFileSync(hostedFixturePath, 'utf8');
 
 		assert.equal(computeSanitizedFixtureHash(fixture), DEVTUNNEL_HOSTED_FIXTURE_SHA256);
+		assert.equal(
+			computeSanitizedFixtureHash(
+				fixture.replace(/\r\n/gu, '\n').replace(/\n/gu, '\r\n'),
+			),
+			DEVTUNNEL_HOSTED_FIXTURE_SHA256,
+		);
 		assert.deepStrictEqual(
 			decodeDevTunnelShowForBuild(SUPPORTED_DEVTUNNEL_BUILD, fixture, {
 				expectedTunnelId: 'came2efixt.jpe1',

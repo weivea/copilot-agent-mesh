@@ -26,7 +26,10 @@ import {
 	NodeAtomicFileSystem,
 } from '../storage/AtomicFileStore';
 import { DeviceProfileStore } from '../storage/DeviceProfileStore';
-import { WorkerOwnerLock } from '../storage/WorkerOwnerLock';
+import {
+	FencedStateStore,
+	WorkerOwnerLock,
+} from '../storage/WorkerOwnerLock';
 import { FileTaskStore } from '../tasks/FileTaskStore';
 import { WorkspaceLeaseManager } from '../tasks/WorkspaceLeaseManager';
 import type {
@@ -279,6 +282,86 @@ test('two concurrent stale-lock contenders elect exactly one owner', async () =>
 	await second.dispose();
 });
 
+test('overlapping contention is serialized and creates one new generation', async () => {
+	const root = await makeDirectory();
+	const owner = await WorkerOwnerLock.acquire(root, {
+		pid: 101,
+		instanceId: 'owner',
+		token: 'owner-token',
+		pidAlive: (pid) => pid === 101,
+		heartbeatMs: 60_000,
+	});
+	let blockMutex = false;
+	let mutexEntries = 0;
+	const mutexEntered = deferred<void>();
+	const releaseMutex = deferred<void>();
+	const contender = await WorkerOwnerLock.acquire(root, {
+		pid: 202,
+		instanceId: 'contender',
+		token: 'contender-token',
+		pidAlive: () => false,
+		heartbeatMs: 60_000,
+		onTakeoverMutexOpened: async () => {
+			if (blockMutex) {
+				mutexEntries += 1;
+				mutexEntered.resolve(undefined);
+				await releaseMutex.promise;
+			}
+		},
+	});
+	await owner.dispose();
+	blockMutex = true;
+
+	const first = contender.contend();
+	await mutexEntered.promise;
+	const second = contender.contend();
+	assert.equal(mutexEntries, 1);
+	releaseMutex.resolve(undefined);
+
+	assert.deepStrictEqual(await Promise.all([first, second]), [true, true]);
+	assert.equal(mutexEntries, 1);
+	assert.ok(contender.currentGeneration());
+	await contender.dispose();
+});
+
+test('reacquisition uses a new generation and permanently fences the old state wrapper', async () => {
+	const root = await makeDirectory();
+	let now = Date.parse('2026-08-25T00:00:00.000Z');
+	const first = await WorkerOwnerLock.acquire(root, {
+		pid: 101,
+		instanceId: 'first',
+		token: 'first-token',
+		now: () => now,
+		ttlMs: 100,
+		heartbeatMs: 60_000,
+		pidAlive: () => false,
+	});
+	const oldGeneration = first.currentGeneration();
+	const state = new MemoryState();
+	const oldState = new FencedStateStore(state, first);
+	now += 101;
+	const second = await WorkerOwnerLock.acquire(root, {
+		pid: 202,
+		instanceId: 'second',
+		token: 'second-token',
+		now: () => now,
+		ttlMs: 100,
+		heartbeatMs: 60_000,
+		pidAlive: () => false,
+	});
+	await assert.rejects(first.assertOwner(), /Another VS Code window/u);
+	await second.dispose();
+	assert.equal(await first.contend(), true);
+
+	assert.notEqual(first.currentGeneration(), oldGeneration);
+	await assert.rejects(
+		oldState.update('shared', 'stale'),
+		/generation changed before/u,
+	);
+	assert.equal(state.updateCalls, 0);
+	await first.dispose();
+});
+
 test('takeover winner revalidates generation and cannot replace a newer lock', async () => {
 	const root = await makeDirectory();
 	const now = Date.parse('2026-08-25T00:00:01.000Z');
@@ -322,6 +405,32 @@ test('takeover winner revalidates generation and cannot replace a newer lock', a
 		'new-token',
 	);
 	await contender.dispose();
+});
+
+test('heartbeat rejects a replacement generation even when owner identity matches', async () => {
+	const root = await makeDirectory();
+	const now = Date.parse('2026-08-25T00:00:01.000Z');
+	const owner = await WorkerOwnerLock.acquire(root, {
+		pid: 101,
+		instanceId: 'owner-window',
+		token: 'owner-token',
+		now: () => now,
+		heartbeatMs: 60_000,
+		pidAlive: () => true,
+	});
+	const replacement = join(root, 'replacement.lock');
+	await writeFile(replacement, JSON.stringify(ownerRecord({
+		pid: 101,
+		instanceId: 'owner-window',
+		token: 'owner-token',
+		generation: 'replacement-generation',
+		at: new Date(now).toISOString(),
+	})));
+	await rename(replacement, join(root, 'worker-owner.lock'));
+
+	await assert.rejects(owner.assertOwner(), /Another VS Code window/u);
+	assert.equal(owner.isOwner(), false);
+	await owner.dispose();
 });
 
 test('orphaned takeover mutex fails closed instead of being stolen', async () => {
@@ -630,21 +739,20 @@ test('non-owner workspace snapshot does not revalidate or write shared state', a
 	await owner.dispose();
 });
 
-test('read-only device initialization creates no shared profile state', () => {
+test('read-only device initialization waits for owner state instead of inventing an identity', () => {
 	const state = new MemoryState();
 	const profiles = new DeviceProfileStore(
 		state,
 		{ next: () => deviceId },
 		{ now: () => new Date('2026-08-25T00:00:00.000Z') },
 	);
-	const profile = profiles.getReadOnly({
+	assert.throws(() => profiles.getReadOnly({
 		defaultName: 'Transient window',
 		platform: 'darwin',
 		architecture: 'arm64',
 		vscodeVersion: '1.103.0',
 		extensionVersion: '0.0.1',
-	});
-	assert.equal(profile.deviceId, deviceId);
+	}), /Broker owner/u);
 	assert.equal(state.get('copilotAgentMesh.deviceProfile'), undefined);
 	assert.equal(state.updateCalls, 0);
 });

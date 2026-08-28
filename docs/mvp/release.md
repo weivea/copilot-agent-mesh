@@ -1,7 +1,6 @@
 # Preview release engineering
 
-> Version: `0.1.0` pre-release
-> Implementation evidence through: `26431763836ce0016285c4e873bebef7ec9f4a40`
+> Version: `0.2.0` Preview
 > Gate status: G0 **No-Go**
 
 This document describes a reproducible evaluation package. It does not authorize
@@ -10,15 +9,20 @@ availability.
 
 ## Supported Preview surface
 
-| Platform | Coordinator | Worker host |
+| Platform | Window Node / Broker client | Worker host |
 | --- | --- | --- |
 | macOS arm64 | Preview | Experimental candidate; disabled by default |
 | macOS x64 and other macOS architectures | Preview | Unsupported |
 | Windows | Preview | Unsupported |
 | Linux | Preview | Unsupported |
 
-Coordinator support assumes a separately configured, reachable trusted peer.
-Unsupported platforms fail closed instead of launching Worker processes.
+Every ordinary window under the same User Data is an active Window Node and may
+use the Device Broker; non-owner windows are not read-only. Unsupported platforms
+fail closed instead of launching Worker processes.
+
+The package speaks Mesh protocol v2. Protocol-v1 peers are incompatible. Upgrade
+migration preserves the 0.1 device ID and v1 workspace/task data in schema v2;
+unknown or corrupt persisted versions fail.
 
 The real Agent Host/AHP runtime requires:
 
@@ -50,7 +54,7 @@ npm run verify
 The package command creates:
 
 ```text
-artifacts/copilot-agent-mesh-0.1.0-preview.vsix
+artifacts/copilot-agent-mesh-0.2.0-preview.vsix
 ```
 
 The production bundle is separate from VSIX creation:
@@ -72,9 +76,40 @@ Inspect and hash the result independently:
 
 ```sh
 npx vsce ls --no-dependencies
-unzip -Z1 artifacts/copilot-agent-mesh-0.1.0-preview.vsix
-shasum -a 256 artifacts/copilot-agent-mesh-0.1.0-preview.vsix
+unzip -Z1 artifacts/copilot-agent-mesh-0.2.0-preview.vsix
+shasum -a 256 artifacts/copilot-agent-mesh-0.2.0-preview.vsix
 ```
+
+## Real multi-window verification
+
+Run the ordinary-window transport/lifecycle test explicitly:
+
+```sh
+npm run test:multi-window-real
+```
+
+On macOS, keep the runtime path short enough for Unix-domain sockets:
+
+```sh
+MESH_MULTI_WINDOW_E2E_RUNTIME_DIR=$HOME/.mw npm run test:multi-window-real
+```
+
+The test launches ordinary VS Code windows sharing one User Data directory. It
+must observe multiple Window Nodes, exactly one generation-fenced Broker,
+workspace claim/reclaim and conflicts, takeover, and complete process/socket
+cleanup while the local task route leaves Dev Tunnel untouched.
+
+The real AHP task path is a separate opt-in and may consume quota:
+
+```sh
+MESH_MULTI_WINDOW_E2E_RUNTIME_DIR=$HOME/.mw \
+MESH_MULTI_WINDOW_E2E_TASKS=1 npm run test:multi-window-real
+```
+
+The recorded opted-in run passed infrastructure/lifecycle assertions but stopped
+correctly at `AGENT_AUTH_REQUIRED` because the fresh shared profile had no
+authentication mapping/session. It did not prove authoritative AHP
+start/get/cancel/output, so G0 remains No-Go.
 
 ## Isolated activation smoke
 
@@ -104,11 +139,18 @@ Ordinary CI must not run `test:dev-tunnel-real`,
 explicit local opt-in, platform credentials, exact external executables, and
 cleanup review; the success path may consume Copilot quota.
 
+`test:multi-window-real` is also an explicit real-window release check rather than
+an ordinary unit/component gate. Its AHP branch must never run unless
+`MESH_MULTI_WINDOW_E2E_TASKS=1` is set.
+
 ## Manual release checklist
 
 1. Confirm the worktree is clean and record the current commit SHA.
 2. Run `npm ci`, `npm audit --audit-level=high`, and `npm run verify`.
 3. Run `npm run smoke:vsix` without enabling Worker settings.
-4. Record the commit SHA, VSIX SHA-256, and verified archive listing.
-5. Transfer the VSIX only as an explicitly labeled Preview evaluation artifact.
-6. Do not publish, push, create a release, or claim G0 completion from this procedure.
+4. Run `npm run test:multi-window-real`; on macOS use
+   `MESH_MULTI_WINDOW_E2E_RUNTIME_DIR=$HOME/.mw` if needed.
+5. Record the commit SHA, VSIX SHA-256, verified archive listing, and sanitized
+   multi-window evidence.
+6. Transfer the VSIX only as an explicitly labeled Preview evaluation artifact.
+7. Do not publish, push, create a release, or claim G0 completion from this procedure.

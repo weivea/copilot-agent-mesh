@@ -8,6 +8,7 @@ import {
 	DashboardFacade,
 	DashboardServiceBindings,
 	DashboardSnapshot,
+	DashboardTaskTarget,
 	ServiceDashboardFacade,
 } from '../ui/DashboardFacade';
 import {
@@ -60,6 +61,24 @@ suite('Dashboard', () => {
 		assert.strictEqual(parseDashboardInboundMessage({ ...valid, secret: 'leak' }), undefined);
 		assert.strictEqual(parseDashboardInboundMessage({ ...valid, targetId: undefined }), undefined);
 		assert.strictEqual(parseDashboardInboundMessage({ ...valid, action: 'unknown' }), undefined);
+		assert.strictEqual(parseDashboardInboundMessage({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: 'instance-1',
+			type: 'action',
+			action: 'runTask',
+			peerId: 'peer-1',
+			workspaceId: 'workspace-1',
+		}), undefined);
+		assert.ok(parseDashboardInboundMessage({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: 'instance-1',
+			type: 'action',
+			action: 'runTask',
+			deviceId: 'device-1',
+			nodeId: 'node-1',
+			nodeInstanceId: 'instance-1',
+			workspaceId: 'workspace-1',
+		}));
 	});
 
 	test('rejects secrets and path forms in otherwise valid outbound models', () => {
@@ -181,7 +200,7 @@ suite('Dashboard', () => {
 		assert.strictEqual(model.tasks[0].summary, '[redacted sensitive details]');
 		assert.strictEqual(model.errors[0].message, '[redacted sensitive details]');
 		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({
-			version: 1,
+			version: DASHBOARD_MESSAGE_VERSION,
 			uiInstanceId: 'instance-1',
 			type: 'dashboard.snapshot',
 			model,
@@ -231,7 +250,7 @@ suite('Dashboard', () => {
 	test('strictly validates outbound model types and enums', () => {
 		const model = new DashboardPresenter().present(snapshot());
 		assert.throws(() => assertSafeDashboardOutboundMessage({
-			version: 1,
+			version: DASHBOARD_MESSAGE_VERSION,
 			uiInstanceId: 'instance-1',
 			type: 'dashboard.snapshot',
 			model: {
@@ -240,7 +259,7 @@ suite('Dashboard', () => {
 			},
 		} as never));
 		assert.throws(() => assertSafeDashboardOutboundMessage({
-			version: 1,
+			version: DASHBOARD_MESSAGE_VERSION,
 			uiInstanceId: 'instance-1',
 			type: 'dashboard.snapshot',
 			model: { ...model, device: null },
@@ -263,9 +282,9 @@ suite('Dashboard', () => {
 		assert.notStrictEqual(replacedId, firstId);
 		assert.notStrictEqual(firstId, secondId);
 
-		await first.webview.receive({ version: 1, uiInstanceId: replacedId, type: 'ready' });
-		await first.webview.receive({ version: 1, uiInstanceId: firstId, type: 'ready' });
-		await second.webview.receive({ version: 1, uiInstanceId: secondId, type: 'ready' });
+		await first.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: replacedId, type: 'ready' });
+		await first.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: firstId, type: 'ready' });
+		await second.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: secondId, type: 'ready' });
 		assert.strictEqual(first.webview.sent.length, 2);
 		assert.strictEqual(first.webview.sent[0]?.type, 'dashboard.error');
 		assert.strictEqual(second.webview.sent.length, 1);
@@ -289,7 +308,7 @@ suite('Dashboard', () => {
 		provider.resolveWebviewView(view);
 
 		await view.webview.receive({
-			version: 1,
+			version: DASHBOARD_MESSAGE_VERSION,
 			uiInstanceId: 'stale-instance',
 			type: 'action',
 			action: 'startListener',
@@ -308,7 +327,7 @@ suite('Dashboard', () => {
 		provider.resolveWebviewView(view);
 		const uiInstanceId = getUiInstanceId(view.webview.html);
 
-		await view.webview.receive({ version: 1, uiInstanceId, type: 'ready' });
+		await view.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'ready' });
 		await waitFor(() => facade.pendingCount === 1);
 		facade.fireChanged();
 		facade.resolveNext(withDeviceName(snapshot(), 'old-device'));
@@ -337,6 +356,41 @@ suite('Dashboard', () => {
 		assert.strictEqual(services.stopCalls, 1);
 	});
 
+	test('collects a separate safe task title without placing instructions in the view model', async () => {
+		const services = new RecordingServiceBindings();
+		const values = ['Safe dashboard title', 'Sensitive prompt body'];
+		const facade = new ServiceDashboardFacade(
+			services,
+			{ confirm: async () => true },
+			{
+				showInputBox: async (options) => {
+					const value = values.shift();
+					assert.equal(options.validateInput?.(value ?? ''), undefined);
+					return value;
+				},
+			},
+		);
+		await facade.runTask({
+			deviceId: 'device-1',
+			nodeId: 'node-1',
+			nodeInstanceId: 'instance-1',
+			workspaceId: 'workspace-1',
+		});
+
+		assert.deepStrictEqual(services.lastTaskRequest, {
+			target: {
+				deviceId: 'device-1',
+				nodeId: 'node-1',
+				nodeInstanceId: 'instance-1',
+				workspaceId: 'workspace-1',
+			},
+			title: 'Safe dashboard title',
+			instruction: 'Sensitive prompt body',
+		});
+		const viewModel = await services.getSnapshot();
+		assert.doesNotMatch(JSON.stringify(viewModel), /Sensitive prompt body/u);
+	});
+
 	test('dispatches all dashboard actions without sensitive values in messages', async () => {
 		const extension = getExtension();
 		const facade = new RecordingDashboardFacade();
@@ -354,7 +408,14 @@ suite('Dashboard', () => {
 			{ action: 'copyConnectionUrl' },
 			{ action: 'addPeer' },
 			{ action: 'removePeer', targetId: 'peer-1' },
-			{ action: 'runTask', peerId: 'peer-1', workspaceId: 'workspace-1' },
+			{
+				action: 'runTask',
+				deviceId: 'device-1',
+				nodeId: 'node-1',
+				nodeInstanceId: 'instance-1',
+				peerId: 'peer-1',
+				workspaceId: 'workspace-1',
+			},
 			{ action: 'cancelTask', targetId: 'task-1' },
 			{ action: 'answerTaskInput', targetId: 'task-1' },
 			{ action: 'refresh' },
@@ -362,7 +423,7 @@ suite('Dashboard', () => {
 
 		for (const action of actions) {
 			await view.webview.receive({
-				version: 1,
+				version: DASHBOARD_MESSAGE_VERSION,
 				uiInstanceId,
 				type: 'action',
 				...action,
@@ -378,7 +439,7 @@ suite('Dashboard', () => {
 			'copyConnectionUrl',
 			'addPeer',
 			'removePeer:peer-1',
-			'runTask:peer-1:workspace-1',
+			'runTask:device-1:node-1:instance-1:workspace-1:peer-1',
 			'cancelTask:task-1',
 			'answerTaskInput:task-1',
 		]);
@@ -431,8 +492,10 @@ class RecordingDashboardFacade implements DashboardFacade {
 		this.calls.push(`removePeer:${peerId}`);
 	}
 
-	public async runTask(peerId?: string, workspaceId?: string): Promise<void> {
-		this.calls.push(`runTask:${peerId ?? ''}:${workspaceId ?? ''}`);
+	public async runTask(target?: DashboardTaskTarget): Promise<void> {
+		this.calls.push(target === undefined
+			? 'runTask'
+			: `runTask:${target.deviceId}:${target.nodeId}:${target.nodeInstanceId}:${target.workspaceId}:${target.peerId ?? ''}`);
 	}
 
 	public async cancelTask(taskId: string): Promise<void> {
@@ -466,6 +529,11 @@ class RecordingServiceBindings implements DashboardServiceBindings {
 	private readonly changed = new vscode.EventEmitter<void>();
 	public readonly onDidChange = this.changed.event;
 	public stopCalls = 0;
+	public lastTaskRequest?: {
+		readonly target?: DashboardTaskTarget;
+		readonly title: string;
+		readonly instruction: string;
+	};
 
 	public getSnapshot(): Promise<DashboardSnapshot> {
 		return Promise.resolve(snapshot());
@@ -487,11 +555,13 @@ class RecordingServiceBindings implements DashboardServiceBindings {
 	public async addPeer(_connectionUrl: string): Promise<void> {}
 	public async removePeer(_peerId: string): Promise<void> {}
 
-	public async runTask(_request: {
-		readonly peerId?: string;
-		readonly workspaceId?: string;
+	public async runTask(request: {
+		readonly target?: DashboardTaskTarget;
+		readonly title: string;
 		readonly instruction: string;
-	}): Promise<void> {}
+	}): Promise<void> {
+		this.lastTaskRequest = request;
+	}
 
 	public async cancelTask(_taskId: string): Promise<void> {}
 	public async answerTaskInput(_taskId: string, _answer: string): Promise<void> {}
@@ -544,6 +614,7 @@ class TestWebviewView implements vscode.WebviewView {
 function snapshot(): DashboardSnapshot {
 	return {
 		device: {
+			deviceId: 'device-1',
 			name: 'test-device',
 			platform: 'test-platform',
 			architecture: 'test-architecture',
@@ -559,6 +630,48 @@ function snapshot(): DashboardSnapshot {
 			canStop: true,
 			canCopyConnectionUrl: true,
 		},
+		broker: {
+			state: 'running',
+			role: 'owner',
+			takeover: 'stable',
+			holder: 'thisWindow',
+		},
+		localNodes: [{
+			nodeId: 'node-1',
+			nodeInstanceId: 'instance-1',
+			label: 'This Window',
+			status: 'online',
+			thisWindow: true,
+			workspaces: [{
+				workspaceId: 'workspace-1',
+				name: 'service-workspace',
+				capabilityTags: ['typescript'],
+				enabled: true,
+				busy: false,
+				claimStatus: 'claimed',
+			}],
+		}],
+		remoteDevices: [{
+			deviceId: 'device-2',
+			peerId: 'peer-1',
+			name: 'remote-device',
+			state: 'online',
+			nodes: [{
+				nodeId: 'node-2',
+				nodeInstanceId: 'instance-2',
+				label: 'Remote Window',
+				status: 'online',
+				thisWindow: false,
+				workspaces: [{
+					workspaceId: 'workspace-2',
+					name: 'remote-workspace',
+					capabilityTags: [],
+					enabled: true,
+					busy: false,
+					claimStatus: 'claimed',
+				}],
+			}],
+		}],
 		workspaces: [],
 		peers: [],
 		tasks: [{

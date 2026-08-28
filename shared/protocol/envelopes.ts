@@ -31,6 +31,7 @@ export const rpcRequestSchema = z.discriminatedUnion('method', [
 	request(GATEWAY_METHODS.enrollmentCommit),
 	request(GATEWAY_METHODS.ping),
 	request(GATEWAY_METHODS.deviceGetInfo),
+	request(GATEWAY_METHODS.nodeList),
 	request(GATEWAY_METHODS.workspaceList),
 	request(GATEWAY_METHODS.taskStart),
 	request(GATEWAY_METHODS.taskGet),

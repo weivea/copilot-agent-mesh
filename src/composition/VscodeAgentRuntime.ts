@@ -29,9 +29,13 @@ import type { LocalDesktopWorkspaceGuard } from '../application/LocalDesktopWork
 import type { LocalTaskConfirmation } from '../application/RemoteTaskRunner';
 import type { WorkerPlatformSupport } from '../application/WorkerPlatformSupport';
 import type { TaskStartParams } from '../gateway/GatewayRouter';
-import type { LocalWorkspace, WorkspaceRegistry } from '../workspaces/WorkspaceRegistry';
+import type { LocalWorkspace } from '../workspaces/WorkspaceRegistry';
 import { canonicalTaskRequestHash } from '../domain/task';
-import type { WorkerOwnership } from '../storage/WorkerOwnerLock';
+import type {
+	WindowNodeTaskConfirmationHost,
+	WindowNodeTaskConfirmationRequest,
+	WindowNodeTaskConfirmationResult,
+} from '../node/WindowNodeTaskExecutor';
 import {
 	disabledE2eCapability,
 	isE2eCapabilityEnabled,
@@ -203,11 +207,10 @@ export class VscodeLocalTaskApproval implements LocalTaskConfirmation, FirstTask
 export function createVscodeAgentRuntime(
 	vscodeApi: typeof vscode,
 	context: vscode.ExtensionContext,
-	workspaces: WorkspaceRegistry,
+	workspaceResolver: WorkspaceResolver,
 	guard: LocalDesktopWorkspaceGuard,
 	approval: FirstTaskConfirmation,
 	workerPlatform: WorkerPlatformSupport,
-	ownership: WorkerOwnership,
 ): AgentRuntime {
 	const configuration = vscodeApi.workspace.getConfiguration(configurationSection);
 	const launcher = new AgentHostLauncher({
@@ -223,27 +226,10 @@ export function createVscodeAgentRuntime(
 		authBroker: new VscodeAuthBroker(vscodeApi.authentication, (resource) =>
 			resolveAuthenticationProvider(vscodeApi, resource)),
 		confirmation: approval,
-		workspaceResolver: new RegistryWorkspaceResolver(workspaces),
+		workspaceResolver,
 		configResolver: new VscodeSessionConfigurationResolver(vscodeApi),
 	});
-	return new GuardedAgentRuntime(runtime, guard, workerPlatform, ownership);
-}
-
-class RegistryWorkspaceResolver implements WorkspaceResolver {
-	public constructor(private readonly workspaces: WorkspaceRegistry) {}
-
-	public async resolve(workspaceId: string) {
-		try {
-			const workspace = await this.workspaces.resolveEnabled(workspaceId);
-			return {
-				workspaceId: workspace.workspaceId,
-				displayName: workspace.name,
-				uri: workspace.localUri,
-			};
-		} catch {
-			return undefined;
-		}
-	}
+	return new GuardedAgentRuntime(runtime, guard, workerPlatform);
 }
 
 class GuardedAgentRuntime implements AgentRuntime {
@@ -251,12 +237,11 @@ class GuardedAgentRuntime implements AgentRuntime {
 		private readonly delegate: AgentRuntime,
 		private readonly guard: LocalDesktopWorkspaceGuard,
 		private readonly workerPlatform: WorkerPlatformSupport,
-		private readonly ownership: WorkerOwnership,
 	) {}
 
 	public async probe(): Promise<AgentRuntimeProbe> {
 		this.guard.assertAllowed({ requireWorkspace: false });
-		if (!this.workerPlatform.supported || !this.ownership.isOwner()) {
+		if (!this.workerPlatform.supported) {
 			return {
 				available: false,
 				featureEnabled: false,
@@ -265,10 +250,9 @@ class GuardedAgentRuntime implements AgentRuntime {
 		}
 		return this.delegate.probe();
 	}
-
 	public async start(request: AgentTaskRequest): Promise<AgentTaskHandle> {
 		this.guard.assertAllowed({ requireWorkspace: false });
-		await this.ownership.assertOwner();
+		this.guard.assertAllowed({ requireWorkspace: false });
 		if (!this.workerPlatform.supported) {
 			throw new AgentRuntimeError(
 				this.workerPlatform.agentCode,
@@ -281,6 +265,46 @@ class GuardedAgentRuntime implements AgentRuntime {
 
 	public dispose(): Promise<void> {
 		return this.delegate.dispose();
+	}
+}
+
+/**
+ * Confirmation boundary for a task routed from one VS Code window to another.
+ * The complete prompt remains in the Extension Host and is never sent to the
+ * dashboard webview.
+ */
+export class VscodeWindowNodeTaskConfirmation implements WindowNodeTaskConfirmationHost {
+	public constructor(
+		private readonly vscodeApi: typeof vscode,
+		private readonly e2eCapability: E2eCapability = disabledE2eCapability,
+	) {}
+
+	public async confirm(
+		request: WindowNodeTaskConfirmationRequest,
+	): Promise<WindowNodeTaskConfirmationResult> {
+		assertPromptDisplayable(request.prompt);
+		if (isE2eCapabilityEnabled(this.e2eCapability)) {
+			return 'once';
+		}
+		const selected = await this.vscodeApi.window.showWarningMessage(
+			'Allow this Copilot Agent Mesh window task?',
+			{
+				modal: true,
+				detail: [
+					`Source window: ${request.sourceWindowLabel}`,
+					`Target window: ${request.targetWindowLabel}`,
+					`Workspace: ${request.workspaceDisplayName}`,
+					`Title: ${request.taskTitle}`,
+					'',
+					'Full prompt:',
+					request.prompt,
+					'',
+					'The agent may modify files and run commands in this workspace.',
+				].join('\n'),
+			},
+			'Run Once',
+		);
+		return selected === 'Run Once' ? 'once' : 'deny';
 	}
 }
 

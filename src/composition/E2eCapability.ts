@@ -48,7 +48,7 @@ export class E2eCapability {
 			|| role !== this.role
 			|| !secureEqual(this.nonce, nonce)
 		) {
-			throw new Error('The two-device E2E capability request was rejected.');
+			throw new Error('The gated E2E capability request was rejected.');
 		}
 	}
 }

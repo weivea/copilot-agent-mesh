@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
+import { MESH_PROTOCOL_VERSION } from '../../shared/protocol';
 import {
 	decodeFixedBase64Url,
 	derivePeerRoot,
@@ -231,7 +232,7 @@ export class PairingService {
 		}
 		url.pathname = '/agent-mesh/connect';
 		url.search = new URLSearchParams({
-			v: '1',
+			v: String(MESH_PROTOCOL_VERSION),
 			device: this.workerDeviceId,
 			invite: invitationId,
 		}).toString();
@@ -275,7 +276,10 @@ export class PairingService {
 	): Promise<Record<string, unknown>> {
 		await this.prune();
 		this.assertConnectionOpen(connectionId, generation);
-		if (params.protocolMin > 1 || params.protocolMax < 1) {
+		if (
+			params.protocolMin > MESH_PROTOCOL_VERSION
+			|| params.protocolMax < MESH_PROTOCOL_VERSION
+		) {
 			throw new PairingProtocolError('PROTOCOL_INCOMPATIBLE', 'No compatible Mesh protocol version.');
 		}
 		this.consumeNonce(params.clientNonce);
@@ -298,7 +302,7 @@ export class PairingService {
 			}
 			const secret = decodeFixedBase64Url(encodedSecret, SECRET_BYTES, 'pairing secret');
 			const transcript: EnrollmentTranscript = {
-				version: 1,
+				version: MESH_PROTOCOL_VERSION,
 				invitationId: invitation.invitationId,
 				workerDeviceId: this.workerDeviceId,
 				coordinatorDeviceId: params.coordinatorDeviceId,
@@ -317,7 +321,7 @@ export class PairingService {
 			});
 			return {
 				mode: 'enrollment',
-				version: 1,
+				version: MESH_PROTOCOL_VERSION,
 				workerDeviceId: this.workerDeviceId,
 				sessionId,
 				serverNonce,
@@ -336,7 +340,7 @@ export class PairingService {
 		}
 		const rootKey = decodeFixedBase64Url(encodedRoot, SECRET_BYTES, 'peer credential');
 		const transcript: ReconnectTranscript = {
-			version: 1,
+			version: MESH_PROTOCOL_VERSION,
 			peerId: peer.peerId,
 			workerDeviceId: this.workerDeviceId,
 			coordinatorDeviceId: params.coordinatorDeviceId,
@@ -355,7 +359,7 @@ export class PairingService {
 		});
 		return {
 			mode: 'reconnect',
-			version: 1,
+			version: MESH_PROTOCOL_VERSION,
 			workerDeviceId: this.workerDeviceId,
 			sessionId,
 			serverNonce,

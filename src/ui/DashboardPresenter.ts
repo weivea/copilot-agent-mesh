@@ -12,6 +12,9 @@ type DashboardTaskViewModel = Omit<DashboardTask, 'summary' | 'summaryTruncated'
 export interface DashboardViewModel {
 	readonly device: DashboardSnapshot['device'];
 	readonly listener: DashboardSnapshot['listener'];
+	readonly broker: NonNullable<DashboardSnapshot['broker']>;
+	readonly localNodes: readonly NonNullable<DashboardSnapshot['localNodes']>[number][];
+	readonly remoteDevices: readonly NonNullable<DashboardSnapshot['remoteDevices']>[number][];
 	readonly workspaces: DashboardSnapshot['workspaces'];
 	readonly peers: DashboardSnapshot['peers'];
 	readonly tasks: readonly DashboardTaskViewModel[];
@@ -31,6 +34,22 @@ export class DashboardPresenter {
 				tunnel: redactComponent(snapshot.listener.tunnel),
 				agentHost: redactComponent(snapshot.listener.agentHost),
 			},
+			broker: redactBroker(snapshot.broker ?? {
+				state: 'error',
+				role: 'contender',
+				takeover: 'error',
+				holder: 'none',
+				error: {
+					code: 'BROKER_UNAVAILABLE',
+					message: 'The local Device Broker lifecycle is unavailable.',
+				},
+			}),
+			localNodes: (snapshot.localNodes ?? []).map(redactNode),
+			remoteDevices: (snapshot.remoteDevices ?? []).map((device) => ({
+				...device,
+				name: redactRemoteText(device.name),
+				nodes: device.nodes.map(redactNode),
+			})),
 			workspaces: snapshot.workspaces.map((workspace) => ({
 				...workspace,
 				name: redactRemoteText(workspace.name),
@@ -57,6 +76,29 @@ export class DashboardPresenter {
 			errors: snapshot.errors.map(redactError),
 		};
 	}
+}
+
+function redactBroker(
+	broker: NonNullable<DashboardSnapshot['broker']>,
+): NonNullable<DashboardSnapshot['broker']> {
+	return {
+		...broker,
+		error: broker.error === undefined ? undefined : redactError(broker.error),
+	};
+}
+
+function redactNode(
+	node: NonNullable<DashboardSnapshot['localNodes']>[number],
+): NonNullable<DashboardSnapshot['localNodes']>[number] {
+	return {
+		...node,
+		label: redactRemoteText(node.label),
+		workspaces: node.workspaces.map((workspace) => ({
+			...workspace,
+			name: redactRemoteText(workspace.name),
+			capabilityTags: workspace.capabilityTags.map(redactRemoteText),
+		})),
+	};
 }
 
 function redactComponent(component: DashboardSnapshot['listener']['gateway']): DashboardSnapshot['listener']['gateway'] {

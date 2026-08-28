@@ -243,6 +243,24 @@ export class VscodePeerProfileStore implements PeerProfileStore {
 		});
 	}
 
+	public replace(
+		profile: PeerProfile,
+		expected: PeerProfileDeleteCondition,
+	): Promise<boolean> {
+		return this.mutate(async () => {
+			const profiles = this.read();
+			const current = profiles.find((candidate) => candidate.id === profile.id);
+			if (current === undefined || !matchesDeleteCondition(current, expected)) {
+				return false;
+			}
+			await this.state.update(peerProfilesKey, {
+				schemaVersion: 1,
+				profiles: replaceBy(profiles, profile, 'id'),
+			});
+			return true;
+		});
+	}
+
 	public delete(id: string, expected?: PeerProfileDeleteCondition): Promise<boolean> {
 		return this.mutate(async () => {
 			const current = this.read();

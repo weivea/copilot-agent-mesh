@@ -95,7 +95,7 @@ test('WebSocketPeerTransport closes on a malformed heartbeat result', async () =
 			};
 			if (request.method === 'mesh.hello') {
 				const transcript: ReconnectTranscript = {
-					version: 1,
+					version: 2,
 					peerId: 'peer',
 					workerDeviceId: 'worker',
 					coordinatorDeviceId: 'coordinator',
@@ -108,7 +108,7 @@ test('WebSocketPeerTransport closes on a malformed heartbeat result', async () =
 					id: request.id,
 					result: {
 						mode: 'reconnect',
-						version: 1,
+						version: 2,
 						workerDeviceId: 'worker',
 						sessionId,
 						serverNonce,
@@ -198,7 +198,7 @@ test('WebSocketPeerTransport rejects a socket closed while persisting an authent
 			};
 			if (request.method === 'mesh.hello') {
 				const transcript: ReconnectTranscript = {
-					version: 1,
+					version: 2,
 					peerId: 'peer',
 					workerDeviceId: 'worker',
 					coordinatorDeviceId: 'coordinator',
@@ -211,7 +211,7 @@ test('WebSocketPeerTransport rejects a socket closed while persisting an authent
 					id: request.id,
 					result: {
 						mode: 'reconnect',
-						version: 1,
+						version: 2,
 						workerDeviceId: 'worker',
 						sessionId: 'session',
 						serverNonce,

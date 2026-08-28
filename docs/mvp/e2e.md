@@ -1,4 +1,4 @@
-# MVP real two-instance E2E
+# MVP real VS Code E2E
 
 > Evidence date: 2026-08-25
 > Baseline: local `mvp-e2e-base` at `06775c7e2e8a18f7771507e4a739fad0b865d9a0`
@@ -12,6 +12,97 @@ public Dev Tunnel and may consume Copilot quota:
 ```sh
 MESH_TWO_DEVICE_E2E=1 npm run test:two-instance-real
 ```
+
+The same-user-data multi-window test is a separate explicit command. Its default mode
+launches real ordinary VS Code windows and covers local transport/lifecycle without
+starting Agent Host or consuming quota:
+
+```sh
+npm run test:multi-window-real
+```
+
+On macOS, VS Code limits its main Unix-domain socket path to 103 UTF-8 bytes. If
+the checkout path is too long, set `MESH_MULTI_WINDOW_E2E_RUNTIME_DIR` to a short
+absolute directory outside `/tmp` and `/var/tmp`; the harness creates and removes
+only its unique `mw-<run>` child there.
+
+```sh
+MESH_MULTI_WINDOW_E2E_RUNTIME_DIR=$HOME/.mw npm run test:multi-window-real
+```
+
+To add the production AHP task/cancellation path:
+
+```sh
+MESH_MULTI_WINDOW_E2E_TASKS=1 npm run test:multi-window-real
+```
+
+Optional authentication mapping uses
+`MESH_MULTI_WINDOW_E2E_AUTH_RESOURCE`,
+`MESH_MULTI_WINDOW_E2E_AUTH_PROVIDER`, and
+`MESH_MULTI_WINDOW_E2E_AUTH_SCOPES_JSON`. An exact `AGENT_AUTH_REQUIRED` result is recorded as blocked when the mapping or
+silent session is unavailable; the harness then records no authoritative
+start/get/cancel/output evidence.
+
+## Same-profile multi-window flow
+
+The multi-window harness uses exactly one temporary `--user-data-dir` and one
+`--extensions-dir` for every ordinary VS Code window. Each Extension Host creates
+a Window Node with process-lifetime random `nodeId`/`nodeInstanceId`, heartbeats,
+workspace claims, and its own real AHP runtime/handles. A nonce-authenticated test
+controller selects a mailbox by workspace basename plus node instance ID.
+
+The transport/lifecycle run proves:
+
+1. repo-a and repo-b publish two live Window Nodes and exactly one generation-fenced
+   Broker owner;
+2. the listener remains stopped, a configured Dev Tunnel sentinel is never invoked,
+   and the owned local IPC socket is the only local transport;
+3. closing/reopening repo-b marks the old node offline and reclaims the same
+   workspace ID;
+4. closing the Broker owner produces a new generation and the survivor reconnects;
+5. a symlinked second view of repo-a has one `claimed` and one `conflict` workspace,
+   and routing to the conflicting node fails before Agent Host access; and
+6. cleanup tracks exact PIDs/markers only and leaves no owned VS Code, Agent Host,
+   Dev Tunnel, or local IPC socket.
+
+The production local route is Window A → local Broker → Window B → real AHP →
+Broker store → Window A. It does not touch Dev Tunnel. With
+`MESH_MULTI_WINDOW_E2E_TASKS=1`, the harness attempts an explicit
+Device → Node → Workspace task through that route. A run may claim
+start/get/cancel/output only after authoritative AHP events are observed; an
+authentication block is not counted as task-path success.
+
+## Recorded 0.2.0 multi-window evidence
+
+The ordinary transport/lifecycle run passed on VS Code `1.134.0`, macOS arm64:
+
+- `.vscode-test/multi-window-evidence/6c119d7b-8596-4757-a129-7e31b412db5d.json`
+- two nodes observed in 129 ms and exactly one Broker;
+- Listener/Tunnel stopped and the configured sentinel untouched;
+- repo-b offline in 268 ms, then the same `workspaceId` reclaimed;
+- takeover changed the Broker generation;
+- a duplicate repo produced a workspace conflict; and
+- complete socket/process cleanup.
+
+The second opted-in real AHP run also passed its infrastructure/lifecycle
+assertions:
+
+- `.vscode-test/multi-window-evidence/7886dc25-37ef-4909-ac2b-6af2a506078c.json`
+- two nodes observed in 278 ms;
+- repo-b offline in 214 ms;
+- takeover in 1683 ms with the same `workspaceId`; and
+- zero Tunnel/socket/process residue.
+
+That run correctly stopped at `AGENT_AUTH_REQUIRED` because the fresh shared
+profile had no authentication mapping/session. It did **not** prove authoritative
+AHP start/get/cancel/output. Gate G0 therefore remains **No-Go**.
+
+The real two-device v2 run also passed one-Tunnel pairing, explicit remote
+Device → Node → Workspace discovery, and durable task acceptance. The Worker
+then reported `agentStartRequested` followed by `failed(AGENT_AUTH_REQUIRED)`;
+the harness removed the owned Tunnel and profiles and confirmed that all owned
+processes stopped. This proves remote multiplexing and cleanup, not an
+authenticated Agent turn.
 
 The fallback cleanup path is independently exercisable:
 
@@ -63,11 +154,11 @@ capability invokes production services and never replaces `AgentRuntime`.
    no longer reference an owned runtime path. Remove both profiles, extension
    directories, controls, workspace, and downloaded binary.
 
-The retained temporary evidence contains only `two-instance-evidence.json` and
-path/secret-sanitized host logs. It contains no invitation URL, token, account identity,
-filesystem path, or binary.
+Retained evidence is stored under `.vscode-test/multi-window-evidence/<run-id>.json`
+with path/secret-sanitized host logs. It contains no invitation URL, token,
+account identity, raw prompt/output, filesystem path, or binary.
 
-## Result
+## Earlier two-instance result
 
 The real run reached all transport and production task boundaries:
 
@@ -123,6 +214,7 @@ only `MESH_TWO_INSTANCE_E2E_OK` and forbids file changes and commands.
 | 12 | Multiple workspaces, one writer per workspace | Partial | Lease/concurrency behavior passes offline; this real run registered one temporary workspace. |
 | 13 | No Git/worktree management or injected Git prompt | Pass | Production request forwards the supplied prompt/criteria only; the real prompts contained no Git operation and the harness performed no repository mutation in the Worker workspace. |
 
-Summary: 6 pass, 6 partial, 1 blocked. The sole hard runtime blocker is explicit
-authentication for a disposable Worker profile; the partial items require additional
-OS/UI/multi-workspace coverage or depend on that authenticated authoritative turn.
+This earlier two-instance matrix remains historical evidence. The current hard
+runtime blocker is explicit authentication for a disposable Worker profile;
+OS/UI/multi-workspace coverage and an authenticated authoritative turn remain
+required before G0 can change.

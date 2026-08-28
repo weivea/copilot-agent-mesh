@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 
 import WebSocket, { type RawData } from 'ws';
 
-import { rpcNotificationSchema } from '../../shared/protocol';
+import { MESH_PROTOCOL_VERSION, rpcNotificationSchema } from '../../shared/protocol';
 import {
 	decodeFixedBase64Url,
 	derivePeerRoot,
@@ -18,7 +18,11 @@ import {
 	type ReconnectTranscript,
 } from '../gateway/PairingCrypto';
 import type { SecretStore } from '../gateway/SecretStore';
-import type { PeerProfile, PeerProfileStore } from './PeerProfile';
+import {
+	isUsablePeerProfile,
+	type PeerProfile,
+	type PeerProfileStore,
+} from './PeerProfile';
 
 export interface PeerSession {
 	readonly profile: PeerProfile;
@@ -175,6 +179,9 @@ export class WebSocketPeerTransport implements PeerTransport {
 		profiles: PeerProfileStore,
 		signal: AbortSignal,
 	): Promise<PeerSession> {
+		if (!isUsablePeerProfile(profile)) {
+			throw new PeerTransportError('AUTH_FAILED', 'Peer credentials are unavailable.');
+		}
 		if (profile.peerId !== undefined && profile.credentialKeyRef !== undefined) {
 			const client = await this.open(profile.rpcEndpoint, signal);
 			try {
@@ -220,15 +227,15 @@ export class WebSocketPeerTransport implements PeerTransport {
 		try {
 			const clientNonce = randomBase64Url(NONCE_BYTES);
 			const hello = objectResult(await client.request('mesh.hello', {
-				protocolMin: 1,
-				protocolMax: 1,
+				protocolMin: MESH_PROTOCOL_VERSION,
+				protocolMax: MESH_PROTOCOL_VERSION,
 				coordinatorDeviceId,
 				clientNonce,
 				invitationId: profile.invitationId,
 			}));
 			assertHello(hello, 'enrollment', profile.workerDeviceId);
 			const transcript: EnrollmentTranscript = {
-				version: 1,
+				version: MESH_PROTOCOL_VERSION,
 				invitationId: profile.invitationId,
 				workerDeviceId: profile.workerDeviceId,
 				coordinatorDeviceId,
@@ -351,15 +358,15 @@ export class WebSocketPeerTransport implements PeerTransport {
 		const rootKey = decodeFixedBase64Url(encodedRoot, 32, 'peer credential');
 		const clientNonce = randomBase64Url(NONCE_BYTES);
 		const hello = objectResult(await client.request('mesh.hello', {
-			protocolMin: 1,
-			protocolMax: 1,
+			protocolMin: MESH_PROTOCOL_VERSION,
+			protocolMax: MESH_PROTOCOL_VERSION,
 			coordinatorDeviceId,
 			clientNonce,
 			peerId: profile.peerId,
 		}));
 		assertHello(hello, 'reconnect', profile.workerDeviceId);
 		const transcript: ReconnectTranscript = {
-			version: 1,
+			version: MESH_PROTOCOL_VERSION,
 			peerId: profile.peerId,
 			workerDeviceId: profile.workerDeviceId,
 			coordinatorDeviceId,
@@ -622,7 +629,6 @@ class RpcWebSocketClient {
 			});
 			this.socket.close(1000, 'Peer disconnected.');
 			timer = setTimeout(() => this.socket.terminate(), 1_000);
-			timer.unref();
 		});
 	}
 
@@ -734,7 +740,7 @@ function assertHello(
 		'mode', 'version', 'workerDeviceId', 'sessionId', 'serverNonce', 'serverProof',
 	]);
 	if (value.mode !== mode
-		|| value.version !== 1
+		|| value.version !== MESH_PROTOCOL_VERSION
 		|| value.workerDeviceId !== workerDeviceId) {
 		throw new PeerTransportError('PROTOCOL_INCOMPATIBLE', 'Peer protocol response is incompatible.');
 	}

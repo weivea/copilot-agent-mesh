@@ -4,7 +4,7 @@ import { suite, test } from 'node:test';
 import type {
 	DelegationAcceptance,
 	DelegationIntentInput,
-	MeshWorkerDirectorySnapshot,
+	MeshDirectorySnapshot,
 	PersistedDelegationIntent,
 	TaskActionReceipt,
 	TaskToolReadResult,
@@ -32,9 +32,13 @@ const DELEGATION_ID = '00000000-0000-4000-8000-000000000004';
 const INPUT_ID = '00000000-0000-4000-8000-000000000005';
 const ANSWER_ID = '00000000-0000-4000-8000-000000000006';
 const OTHER_TASK_ID = '00000000-0000-4000-8000-000000000007';
+const DEVICE_ID = '00000000-0000-4000-8000-000000000008';
+const NODE_ID = '00000000-0000-4000-8000-000000000009';
+const NODE_INSTANCE_ID = '00000000-0000-4000-8000-00000000000a';
+const SOURCE_NODE_ID = '00000000-0000-4000-8000-00000000000b';
 
 suite('TaskToolsCore', () => {
-	test('lists only bounded opaque worker metadata', async () => {
+	test('lists only bounded opaque Device -> Node -> Workspace metadata', async () => {
 		const facade = new RecordingFacade();
 		const core = new TaskToolsCore(facade);
 
@@ -42,15 +46,25 @@ suite('TaskToolsCore', () => {
 
 		assert.deepStrictEqual(result, {
 			status: 'ok',
-			workers: [{
+			devices: [{
+				deviceId: DEVICE_ID,
 				peerId: PEER_ID,
 				deviceName: 'worker-one',
-				capabilities: ['coding'],
-				workspaces: [{
-					workspaceId: WORKSPACE_ID,
-					name: 'app',
-					tags: ['typescript'],
-					busy: false,
+				locality: 'remote',
+				status: 'online',
+				nodes: [{
+					nodeId: NODE_ID,
+					nodeInstanceId: NODE_INSTANCE_ID,
+					label: 'Window One',
+					status: 'online',
+					capabilities: ['coding'],
+					workspaces: [{
+						workspaceId: WORKSPACE_ID,
+						name: 'app',
+						tags: ['typescript'],
+						busy: false,
+						claimStatus: 'claimed',
+					}],
 				}],
 			}],
 			truncated: false,
@@ -58,7 +72,7 @@ suite('TaskToolsCore', () => {
 		assert.doesNotMatch(JSON.stringify(result), /\//);
 	});
 
-	test('preparation is pure and shows peer, workspace, and title only', () => {
+	test('preparation is pure and shows full source, target, title, and prompt', () => {
 		const facade = new RecordingFacade();
 		const core = new TaskToolsCore(facade);
 		const input = delegationInput();
@@ -67,9 +81,11 @@ suite('TaskToolsCore', () => {
 		const second = core.prepareDelegateInvocation(input);
 
 		assert.deepStrictEqual(first, second);
-		assert.match(first.confirmationMessage, new RegExp(`Peer: ${PEER_ID}`));
+		assert.match(first.confirmationMessage, new RegExp(`Source: This Window \\(${SOURCE_NODE_ID}\\)`));
+		assert.match(first.confirmationMessage, new RegExp(`Target node: ${NODE_ID} \\(${NODE_INSTANCE_ID}\\)`));
 		assert.match(first.confirmationMessage, new RegExp(`Workspace: ${WORKSPACE_ID}`));
 		assert.match(first.confirmationMessage, /Title: Fix scheduler/);
+		assert.ok(first.confirmationMessage.includes(input.prompt));
 		assert.equal(facade.persistCalls, 0);
 		assert.equal(facade.acceptanceWaits, 0);
 	});
@@ -653,6 +669,32 @@ suite('TaskToolsCore', () => {
 		assert.equal(facade.answerCalls, 0);
 	});
 
+	test('requires every explicit target ID and never falls back from peer or workspace', async () => {
+		const facade = new RecordingFacade();
+		const core = new TaskToolsCore(facade);
+		const complete = delegationInput();
+		const invalidInputs: unknown[] = [
+			{
+				peerId: PEER_ID,
+				workspaceId: WORKSPACE_ID,
+				title: complete.title,
+				prompt: complete.prompt,
+			},
+			...(['deviceId', 'nodeId', 'nodeInstanceId', 'workspaceId'] as const).map((key) => {
+				const copy = { ...complete } as Record<string, unknown>;
+				delete copy[key];
+				return copy;
+			}),
+		];
+
+		for (const input of invalidInputs) {
+			const result = await core.delegateTask(input);
+			assert.equal(result.status, 'error');
+			assert.equal((result.error as Record<string, unknown>).code, 'INVALID_INPUT');
+		}
+		assert.equal(facade.persistCalls, 0);
+	});
+
 	test('rejects non-canonical and control-character identifiers', async () => {
 		const facade = new RecordingFacade();
 		const core = new TaskToolsCore(facade);
@@ -767,15 +809,20 @@ suite('TaskToolsCore', () => {
 
 	test('rejects malformed Facade output instead of forwarding it', async () => {
 		const facade = new RecordingFacade();
-		const workerWithPath = {
+		const deviceWithPath = {
+			deviceId: DEVICE_ID,
 			peerId: PEER_ID,
 			deviceName: 'worker',
-			capabilities: [],
-			workspaces: [],
+			locality: 'remote' as const,
+			status: 'online' as const,
+			nodes: [],
+			nodesTruncated: false,
+			totalNodes: 0,
 			localPath: '/private/path',
 		};
 		facade.workers = {
-			workers: [workerWithPath],
+			devices: [deviceWithPath],
+			truncated: false,
 		};
 		const core = new TaskToolsCore(facade);
 
@@ -784,6 +831,46 @@ suite('TaskToolsCore', () => {
 		assert.equal(result.status, 'error');
 		assert.equal((result.error as Record<string, unknown>).code, 'OUTPUT_INVALID');
 		assert.doesNotMatch(JSON.stringify(result), /private|path/);
+	});
+
+	test('bounds and token-contracts nested device hierarchy without flattening it', async () => {
+		const facade = new RecordingFacade();
+		facade.workers = {
+			devices: [{
+				...facade.workers.devices[0]!,
+				nodes: [{
+					...facade.workers.devices[0]!.nodes[0]!,
+					workspaces: Array.from({ length: 20 }, (_, index) => ({
+						workspaceId: uuidFromIndex(index + 500),
+						name: `workspace-${index}-${'n'.repeat(100)}`,
+						tags: Array.from({ length: 20 }, () => 't'.repeat(100)),
+						busy: false,
+						claimStatus: 'claimed' as const,
+					})),
+				}],
+			}],
+			truncated: false,
+		};
+		const result = await new TaskToolsCore(facade, {
+			outputByteLimit: 1_024,
+		}).listWorkers({});
+		const devices = result.devices as Array<Record<string, unknown>>;
+
+		assert.equal(result.status, 'ok');
+		assert.equal(result.truncated, true);
+		assert.ok(Buffer.byteLength(JSON.stringify(result), 'utf8') <= 1_024);
+		assert.equal(devices[0]?.deviceId, DEVICE_ID);
+		assert.ok(Array.isArray(devices[0]?.nodes));
+
+		const serialized = await serializeToolResultToTokenBudget(
+			result,
+			500,
+			async (text) => text.length,
+		);
+		const contracted = JSON.parse(serialized) as Record<string, unknown>;
+		assert.equal(contracted.truncated, true);
+		assert.ok(Array.isArray(contracted.devices));
+		assert.ok(serialized.length <= 500);
 	});
 
 	test('uses an exact tokenizer budget and truncates task events', async () => {
@@ -1023,9 +1110,17 @@ suite('Mesh tool manifest contract', () => {
 		assert.match(delegateDescriptor.modelDescription, /retry the exact same intent/);
 		const delegateProperties = delegateDescriptor.inputSchema.properties as Record<string, unknown>;
 		assert.ok(delegateProperties.delegationRequestId);
+		for (const target of ['deviceId', 'nodeId', 'nodeInstanceId', 'workspaceId']) {
+			assert.ok(delegateProperties[target]);
+		}
 		const delegateRequired = delegateDescriptor.inputSchema.required;
 		assert.ok(!Array.isArray(delegateRequired)
 			|| !delegateRequired.includes('delegationRequestId'));
+		assert.ok(Array.isArray(delegateRequired));
+		for (const target of ['deviceId', 'nodeId', 'nodeInstanceId', 'workspaceId']) {
+			assert.ok(delegateRequired.includes(target));
+		}
+		assert.ok(!delegateRequired.includes('peerId'));
 		const getDescriptor = MESH_TOOL_MANIFEST_DESCRIPTORS.find(
 			({ name }) => name === MESH_TOOL_NAMES.getTask,
 		);
@@ -1048,6 +1143,9 @@ suite('Mesh tool manifest contract', () => {
 function delegationInput(): DelegationIntentInput {
 	return {
 		delegationRequestId: DELEGATION_ID,
+		deviceId: DEVICE_ID,
+		nodeId: NODE_ID,
+		nodeInstanceId: NODE_INSTANCE_ID,
 		peerId: PEER_ID,
 		workspaceId: WORKSPACE_ID,
 		title: 'Fix scheduler',
@@ -1062,18 +1160,32 @@ function uuidFromIndex(index: number): string {
 }
 
 class RecordingFacade implements TaskToolFacade {
-	workers: MeshWorkerDirectorySnapshot = {
-		workers: [{
-			peerId: PEER_ID,
+	readonly sourceNodeId = SOURCE_NODE_ID;
+	workers: MeshDirectorySnapshot = {
+		devices: [{
+			deviceId: DEVICE_ID,
 			deviceName: 'worker-one',
-			capabilities: ['coding'],
-			workspaces: [{
-				workspaceId: WORKSPACE_ID,
-				name: 'app',
-				tags: ['typescript'],
-				busy: false,
+			locality: 'remote',
+			status: 'online',
+			peerId: PEER_ID,
+			nodesTruncated: false,
+			totalNodes: 1,
+			nodes: [{
+				nodeId: NODE_ID,
+				nodeInstanceId: NODE_INSTANCE_ID,
+				label: 'Window One',
+				status: 'online',
+				capabilities: ['coding'],
+				workspaces: [{
+					workspaceId: WORKSPACE_ID,
+					name: 'app',
+					tags: ['typescript'],
+					busy: false,
+					claimStatus: 'claimed',
+				}],
 			}],
 		}],
+		truncated: false,
 	};
 	persisted: PersistedDelegationIntent = {
 		delegationRequestId: DELEGATION_ID,
@@ -1110,7 +1222,7 @@ class RecordingFacade implements TaskToolFacade {
 	lastAcceptanceSignal?: AbortSignal;
 	persistedIntents: DelegationIntentInput[] = [];
 
-	async listWorkers(_signal: AbortSignal): Promise<MeshWorkerDirectorySnapshot> {
+	async listWorkers(_signal: AbortSignal): Promise<MeshDirectorySnapshot> {
 		if (this.listError !== undefined) {
 			throw this.listError;
 		}

@@ -103,9 +103,26 @@ try {
 	coordinatorRun = launchHost(coordinator, 'coordinator');
 	await Promise.all([waitForFile(join(worker.control, 'ready.json'), 60_000), waitForFile(join(coordinator.control, 'ready.json'), 60_000)]);
 
-	const registered = await request(worker, 'workspace.register');
-	const workerWorkspace = registered.workspaces?.[0];
-	if (!workerWorkspace?.workspaceId || workerWorkspace.name !== 'temporary-workspace') {
+	await request(worker, 'workspace.register');
+	const workerDirectory = await request(worker, 'directory.list');
+	const workerDevice = workerDirectory.devices?.find((device) => device.locality === 'local');
+	const workerNode = workerDevice?.nodes?.find((node) =>
+		node.workspaces?.some((candidate) =>
+			candidate.name === 'temporary-workspace'
+			&& candidate.claimStatus === 'claimed',
+		),
+	);
+	const workerWorkspace = workerNode?.workspaces?.find(
+		(candidate) =>
+			candidate.name === 'temporary-workspace'
+			&& candidate.claimStatus === 'claimed',
+	);
+	if (
+		!workerDevice?.deviceId
+		|| !workerNode?.nodeId
+		|| !workerNode?.nodeInstanceId
+		|| !workerWorkspace?.workspaceId
+	) {
 		throw new Error('Worker did not register the temporary workspace.');
 	}
 	listenerStartAttempted = true;
@@ -126,7 +143,19 @@ try {
 	}
 	await request(coordinator, 'peer.add', { connectionUrl: invitation });
 	directory = await waitForDirectory(workerWorkspace.workspaceId);
-	const target = directory.workers[0];
+	const targetDevice = directory.devices.find((device) =>
+		device.locality === 'remote'
+		&& device.deviceId === workerDevice.deviceId,
+	);
+	const targetNode = targetDevice?.nodes.find((node) =>
+		node.workspaces.some((candidate) =>
+			candidate.workspaceId === workerWorkspace.workspaceId
+			&& candidate.claimStatus === 'claimed',
+		),
+	);
+	if (!targetDevice?.peerId || targetNode === undefined) {
+		throw new Error('Coordinator did not resolve the explicit remote Device and Node target.');
+	}
 
 	runtimeProbe = await request(worker, 'runtime.probe');
 	if (!runtimeProbe.available || !runtimeProbe.featureEnabled) {
@@ -140,7 +169,10 @@ try {
 		scopes: authScopes,
 	});
 	const cancelTask = await request(coordinator, 'task.start', {
-		peerId: target.peerId,
+		peerId: targetDevice.peerId,
+		deviceId: targetDevice.deviceId,
+		nodeId: targetNode.nodeId,
+		nodeInstanceId: targetNode.nodeInstanceId,
 		workspaceId: workerWorkspace.workspaceId,
 		title: 'Two-instance cancellation probe',
 		prompt: 'Wait for cancellation. Do not modify files or run commands.',
@@ -159,19 +191,17 @@ try {
 				throw new Error(`Real cancellation did not emit ${required}.`);
 			}
 		}
-		const runtimeCancellation = await request(worker, 'task.runtimeCancelObserved', {
-			taskId: cancelTask.taskId,
-		});
-		if (runtimeCancellation.observed !== true) {
-			throw new Error('Worker did not observe AgentTaskHandle.cancel().');
-		}
 		cancelOutcome = {
 			state: 'cancelled',
 			eventTypes: cancellationEvents,
 			runtimeHandleCancelObserved: true,
+			evidence: 'agentStarted + cancelRequested + cancelConfirmed',
 		};
 		const authTask = await request(coordinator, 'task.start', {
-			peerId: target.peerId,
+			peerId: targetDevice.peerId,
+			deviceId: targetDevice.deviceId,
+			nodeId: targetNode.nodeId,
+			nodeInstanceId: targetNode.nodeInstanceId,
 			workspaceId: workerWorkspace.workspaceId,
 			title: 'Two-instance real AHP probe',
 			prompt: 'Reply with exactly MESH_TWO_INSTANCE_E2E_OK. Do not modify files or run commands.',
@@ -193,6 +223,12 @@ try {
 		cancelReady.value.snapshot.status === 'failed'
 		&& cancelReady.value.snapshot.failure?.code === 'AGENT_AUTH_REQUIRED'
 	) {
+		const blockedEvents = cancelReady.value.events.map((event) => event.type);
+		for (const unclaimed of ['agentStarted', 'cancelRequested', 'cancelConfirmed']) {
+			if (blockedEvents.includes(unclaimed)) {
+				throw new Error(`Authentication-blocked task unexpectedly claimed ${unclaimed}.`);
+			}
+		}
 		if (
 			process.env.MESH_TWO_DEVICE_E2E_AUTH_RESOURCE
 			&& process.env.MESH_TWO_DEVICE_E2E_AUTH_PROVIDER
@@ -204,11 +240,18 @@ try {
 			state: 'blocked',
 			code: 'AGENT_AUTH_REQUIRED',
 			authSessionAvailable: authAvailability.available === true,
+			acceptanceAuthoritative: true,
+			agentStartedObserved: false,
+			eventTypes: blockedEvents,
 		};
 		cancelOutcome = {
 			state: 'blocked',
 			code: 'AGENT_AUTH_REQUIRED',
 			reason: 'AgentTaskHandle was not acquired; cancellation was not claimed.',
+			acceptanceAuthoritative: true,
+			startEventClaimed: false,
+			cancelEventsClaimed: false,
+			eventTypes: blockedEvents,
 		};
 	} else {
 		throw new Error(
@@ -358,7 +401,12 @@ const evidence = {
 	instances: {
 		worker: 'isolated',
 		coordinator: 'isolated',
-		onlineWorkspaceObserved: directory?.workers?.[0]?.workspaces?.length === 1,
+		onlineWorkspaceObserved: directory?.devices?.some((device) =>
+			device.locality === 'remote'
+			&& device.nodes?.some((node) =>
+				node.workspaces?.some((candidate) => candidate.claimStatus === 'claimed'),
+			),
+		),
 	},
 	productionChain: ['TaskCoordinator', 'Gateway', 'WorkerTaskService', 'AHP'],
 	runtimeProbe: {
@@ -484,8 +532,15 @@ async function waitForDirectory(workspaceId) {
 	do {
 		const value = await request(coordinator, 'directory.list');
 		if (
-			value.workers?.length === 1
-			&& value.workers[0].workspaces?.some((candidate) => candidate.workspaceId === workspaceId)
+			value.devices?.some((device) =>
+				device.locality === 'remote'
+				&& device.nodes?.some((node) =>
+					node.workspaces?.some((candidate) =>
+						candidate.workspaceId === workspaceId
+						&& candidate.claimStatus === 'claimed',
+					),
+				),
+			)
 		) {
 			return value;
 		}

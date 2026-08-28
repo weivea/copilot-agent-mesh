@@ -45,6 +45,7 @@ export interface AgentHostLauncherOptions {
 }
 
 export interface AgentHostLauncherDependencies {
+	readonly assertProcessControlSupported: () => void;
 	readonly runCommand: (
 		executable: string,
 		args: readonly string[],
@@ -81,6 +82,7 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 		dependencies: Partial<AgentHostLauncherDependencies> = {},
 	) {
 		this.dependencies = {
+			assertProcessControlSupported: assertOwnedProcessControlSupported,
 			runCommand: runOwnedCommand,
 			terminate: terminateOwnedProcessGroup,
 			remove: (path) => rm(path, { recursive: true, force: true }),
@@ -90,7 +92,7 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 
 	async probe(): Promise<AgentHostProbe> {
 		try {
-			assertOwnedProcessControlSupported();
+			this.dependencies.assertProcessControlSupported();
 			const result = await discoverCodeCli(
 				this.options.configuredCodeCli,
 				undefined,
@@ -117,7 +119,7 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 	private async launchOwned(signal: AbortSignal): Promise<LaunchedAgentHost> {
 		throwIfLaunchAborted(signal);
 		try {
-			assertOwnedProcessControlSupported();
+			this.dependencies.assertProcessControlSupported();
 		} catch {
 			throw new AgentRuntimeError(
 				'AGENT_UNAVAILABLE',

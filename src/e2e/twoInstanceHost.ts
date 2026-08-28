@@ -133,10 +133,21 @@ async function atomicJson(path: string, value: unknown): Promise<void> {
 
 function serializeError(error: unknown): Record<string, unknown> {
 	if (error instanceof Error) {
+		const data = 'data' in error
+			&& typeof error.data === 'object'
+			&& error.data !== null
+			&& !Array.isArray(error.data)
+			? error.data as Record<string, unknown>
+			: undefined;
+		const reason = typeof data?.reason === 'string' ? data.reason : undefined;
 		return {
 			name: error.name,
 			message: error.message,
-			...('code' in error && typeof error.code === 'string' ? { code: error.code } : {}),
+			...(reason === undefined
+				? 'code' in error && typeof error.code === 'string'
+					? { code: error.code }
+					: {}
+				: { code: reason }),
 		};
 	}
 	return { name: 'Error', message: String(error) };

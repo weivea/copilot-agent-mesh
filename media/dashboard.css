@@ -52,9 +52,19 @@ h2 {
 
 .item p,
 .item button,
+.item article,
 .component,
 .actions {
 	grid-column: 1 / -1;
+}
+
+.nested {
+	margin-top: 6px;
+	background: var(--vscode-sideBar-background);
+}
+
+.node {
+	gap: 8px;
 }
 
 .definition {

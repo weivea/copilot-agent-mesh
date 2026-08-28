@@ -6,6 +6,9 @@ import { MeshDomainError } from '../domain/errors';
 import {
 	getOwnedTask,
 	matchIdempotentStart,
+	matchIdempotentRoutedStart,
+	migrateTaskRecordV1,
+	type OwnedRoutedTaskStart,
 	type OwnedTaskStart,
 	type TaskRecord,
 } from '../domain/task';
@@ -13,14 +16,49 @@ import { systemClock, type Clock } from '../domain/ports';
 import { taskReducer, type TaskDomainEvent } from '../domain/taskReducer';
 import { compactTaskEventJournal } from '../domain/taskEvents';
 import { AtomicFileStore, StorageCorruptionError } from '../storage/AtomicFileStore';
+import type { WorkerOwnership } from '../storage/WorkerOwnerLock';
+
+export interface FileTaskStoreOptions {
+	readonly migrationDeviceId?: string;
+	readonly ownership?: WorkerOwnership;
+	readonly generation?: string;
+}
 
 export class FileTaskStore {
 	private mutationQueue: Promise<void> = Promise.resolve();
+	private migrationDeviceId: string | undefined;
+	private readonly ownership: WorkerOwnership | undefined;
+	private readonly generation: string | undefined;
 
 	public constructor(
 		private readonly files: AtomicFileStore,
 		private readonly clock: Clock = systemClock,
-	) {}
+		migrationDeviceIdOrOptions?: string | FileTaskStoreOptions,
+	) {
+		const options = typeof migrationDeviceIdOrOptions === 'string'
+			? { migrationDeviceId: migrationDeviceIdOrOptions }
+			: migrationDeviceIdOrOptions ?? {};
+		const migrationDeviceId = options.migrationDeviceId;
+		this.migrationDeviceId = migrationDeviceId === undefined
+			? undefined
+			: uuidSchema.parse(migrationDeviceId);
+		this.ownership = options.ownership;
+		this.generation = options.generation ?? options.ownership?.currentGeneration();
+		if (this.ownership !== undefined && this.generation === undefined) {
+			throw new Error('An ownership-fenced task store requires a Broker generation.');
+		}
+	}
+
+	public enableV2RoutingMigration(deviceId: string): void {
+		const parsed = uuidSchema.parse(deviceId);
+		if (
+			this.migrationDeviceId !== undefined
+			&& this.migrationDeviceId !== parsed
+		) {
+			throw new Error('Task routing migration is already bound to another device.');
+		}
+		this.migrationDeviceId = parsed;
+	}
 
 	public create(record: TaskRecord): Promise<void> {
 		return this.runExclusive(async () => {
@@ -42,6 +80,20 @@ export class FileTaskStore {
 		});
 	}
 
+	public createRoutedIdempotent(
+		request: OwnedRoutedTaskStart,
+		record: TaskRecord,
+	): Promise<{ readonly record: TaskRecord; readonly created: boolean }> {
+		return this.runExclusive(async () => {
+			const existing = matchIdempotentRoutedStart(await this.listUnlocked(), request);
+			if (existing !== undefined) {
+				return { record: existing, created: false };
+			}
+			const created = await this.createUnlocked(record);
+			return { record: created, created: true };
+		});
+	}
+
 	private async createUnlocked(record: TaskRecord): Promise<TaskRecord> {
 		const compacted = compactTaskEventJournal(record, this.clock.now().toISOString());
 		const validated = persistedTaskRecordSchema.safeParse(compacted);
@@ -52,10 +104,12 @@ export class FileTaskStore {
 		if (existing !== undefined) {
 			throw new MeshDomainError('TASK_ID_CONFLICT', 'Task already exists.');
 		}
+		await this.assertWritable('before');
 		await this.files.writeJson(
 			taskPath(validated.data.peerId, validated.data.taskId),
 			validated.data,
 		);
+		await this.assertWritable('during');
 		return validated.data;
 	}
 
@@ -71,10 +125,12 @@ export class FileTaskStore {
 		if (!validated.success) {
 			throw new TypeError(`Invalid task record: ${validated.error.message}`);
 		}
+		await this.assertWritable('before');
 		await this.files.writeJson(
 			taskPath(validated.data.peerId, validated.data.taskId),
 			validated.data,
 		);
+		await this.assertWritable('during');
 		return validated.data;
 	}
 
@@ -91,6 +147,23 @@ export class FileTaskStore {
 
 	public getOwned(peerId: string, taskId: string): Promise<TaskRecord | undefined> {
 		return this.runExclusive(() => this.getOwnedUnlocked(peerId, taskId));
+	}
+
+	public migrateOwnedV1(
+		peerId: string,
+		taskId: string,
+		deviceId: string,
+	): Promise<TaskRecord> {
+		return this.runExclusive(async () => {
+			const current = getOwnedTask(
+				await this.getOwnedUnlocked(peerId, taskId),
+				peerId,
+			);
+			if (current.schemaVersion === 2) {
+				return current;
+			}
+			return this.saveUnlocked(migrateTaskRecordV1(current, deviceId));
+		});
 	}
 
 	private async getOwnedUnlocked(
@@ -165,7 +238,10 @@ export class FileTaskStore {
 	}
 
 	private async compactOnRead(path: string, record: TaskRecord): Promise<TaskRecord> {
-		const compacted = compactTaskEventJournal(record, this.clock.now().toISOString());
+		const migrated = record.schemaVersion === 1 && this.migrationDeviceId !== undefined
+			? migrateTaskRecordV1(record, this.migrationDeviceId)
+			: record;
+		const compacted = compactTaskEventJournal(migrated, this.clock.now().toISOString());
 		if (compacted === record) {
 			return record;
 		}
@@ -173,8 +249,37 @@ export class FileTaskStore {
 		if (!validated.success) {
 			throw new StorageCorruptionError(path, validated.error.message);
 		}
+		await this.assertWritable('before');
 		await this.files.writeJson(path, validated.data);
+		await this.assertWritable('during');
 		return validated.data;
+	}
+
+	private async assertWritable(phase: 'before' | 'during'): Promise<void> {
+		const ownership = this.ownership;
+		if (ownership === undefined) {
+			return;
+		}
+		const generation = this.generation;
+		if (
+			generation === undefined
+			|| !ownership.isOwner()
+			|| ownership.currentGeneration() !== generation
+		) {
+			throw new MeshDomainError(
+				'WORKER_DRAINING',
+				`Device Broker generation changed ${phase} the shared task-file write.`,
+				true,
+			);
+		}
+		await ownership.assertOwner();
+		if (ownership.currentGeneration() !== generation) {
+			throw new MeshDomainError(
+				'WORKER_DRAINING',
+				`Device Broker generation changed ${phase} the shared task-file write.`,
+				true,
+			);
+		}
 	}
 
 	private runExclusive<T>(operation: () => Promise<T>): Promise<T> {

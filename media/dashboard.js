@@ -3,14 +3,14 @@
 
 	const vscode = acquireVsCodeApi();
 	const uiInstanceId = document.body.dataset.uiInstanceId;
-	const version = 1;
+	const version = 2;
 
 	document.addEventListener('click', (event) => {
 		const button = event.target.closest('button[data-action]');
 		if (!button) {
 			return;
 		}
-		postAction(button.dataset.action, button.dataset.targetId, button.dataset.peerId, button.dataset.workspaceId);
+		postAction(button.dataset);
 	});
 
 	window.addEventListener('message', (event) => {
@@ -27,39 +27,46 @@
 
 	vscode.postMessage({ version, uiInstanceId, type: 'ready' });
 
-	function postAction(action, targetId, peerId, workspaceId) {
+	function postAction(data) {
+		const action = data.action;
 		const message = { version, uiInstanceId, type: 'action', action };
-		if (targetId) {
-			message.targetId = targetId;
+		if (data.targetId) {
+			message.targetId = data.targetId;
 		}
-		if (peerId) {
-			message.peerId = peerId;
-		}
-		if (workspaceId) {
-			message.workspaceId = workspaceId;
+		for (const key of ['deviceId', 'nodeId', 'nodeInstanceId', 'peerId', 'workspaceId']) {
+			if (data[key]) {
+				message[key] = data[key];
+			}
 		}
 		vscode.postMessage(message);
 	}
 
 	function render(model) {
-		renderDevice(model.device);
+		currentModel = { deviceId: model.device.deviceId || '' };
+		renderDevice(model.device, model.broker);
 		renderListener(model.listener);
-		renderCollection('workspaces', model.workspaces, renderWorkspace, 'No workspaces registered.');
-		renderCollection('peers', model.peers, renderPeer, 'No remote devices configured.');
+		renderCollection('localNodes', model.localNodes, renderLocalNode, 'No local Window Nodes connected.');
+		renderCollection('remoteDevices', model.remoteDevices, renderRemoteDevice, 'No remote devices configured.');
 		renderCollection('tasks', model.tasks, renderTask, 'No delegated tasks.');
 		renderCollection('errors', model.errors, renderError, '');
 		setText(document.getElementById('announcement'), 'Dashboard refreshed.');
 	}
 
-	function renderDevice(device) {
+	function renderDevice(device, broker) {
 		const root = reset(document.getElementById('device'));
 		root.append(
 			definition('Name', device.name),
 			definition('Platform', `${device.platform} ${device.architecture}`),
 			definition('VS Code', device.vscodeVersion),
 			definition('Extension', device.extensionVersion),
+			definition('Broker role', broker.role === 'owner' ? 'Owner' : 'Contender'),
+			definition('Broker state', broker.state),
+			definition('Takeover', broker.takeover),
 			actionButton('Configure Name', 'configureDevice'),
 		);
+		if (broker.error) {
+			root.append(renderError(broker.error));
+		}
 	}
 
 	function renderListener(listener) {
@@ -95,33 +102,57 @@
 		root.append(actions);
 	}
 
-	function renderWorkspace(workspace) {
+	function renderWorkspace(workspace, target) {
 		const card = itemCard(workspace.name, workspace.enabled ? (workspace.busy ? 'Busy' : 'Enabled') : 'Disabled');
+		card.classList.add('nested');
+		card.append(textElement('p', `Claim: ${workspace.claimStatus}`, 'detail'));
 		if (workspace.capabilityTags.length > 0) {
 			card.append(textElement('p', workspace.capabilityTags.join(', '), 'tags'));
 		}
 		if (workspace.activeTaskId) {
 			card.append(textElement('p', 'An active task is using this workspace.', 'detail'));
 		}
-		card.append(actionButton('Remove', 'removeWorkspace', workspace.workspaceId, true));
+		if (workspace.claimStatus === 'claimed' && workspace.enabled && !workspace.busy) {
+			card.append(actionButton('Run Task', 'runTask', undefined, false, {
+				...target,
+				workspaceId: workspace.workspaceId,
+			}));
+		}
 		return card;
 	}
 
-	function renderPeer(peer) {
-		const card = itemCard(peer.name, peer.state);
-		const details = [];
-		if (peer.latencyMs !== undefined) {
-			details.push(`${peer.latencyMs} ms`);
+	function renderLocalNode(node) {
+		return renderNode(node, { deviceId: currentModel.deviceId }, node.thisWindow ? 'This Window' : undefined);
+	}
+
+	let currentModel = { deviceId: '' };
+
+	function renderRemoteDevice(device) {
+		const card = itemCard(device.name, device.state);
+		for (const node of device.nodes) {
+			card.append(renderNode(node, {
+				deviceId: device.deviceId,
+				peerId: device.peerId,
+			}));
 		}
-		if (peer.lastSeenLabel) {
-			details.push(peer.lastSeenLabel);
+		card.append(actionButton('Remove', 'removePeer', device.peerId, true));
+		return card;
+	}
+
+	function renderNode(node, route, suffix) {
+		const title = suffix ? `${node.label} · ${suffix}` : node.label;
+		const card = itemCard(title, node.status);
+		card.classList.add('node');
+		if (node.workspaces.length === 0) {
+			card.append(textElement('p', 'No claimed workspaces.', 'empty'));
 		}
-		details.push(`${peer.workspaceCount} workspaces`);
-		card.append(textElement('p', details.join(' · '), 'detail'));
-		card.append(
-			actionButton('Run Task', 'runTask', undefined, false, peer.peerId),
-			actionButton('Remove', 'removePeer', peer.peerId, true),
-		);
+		for (const workspace of node.workspaces) {
+			card.append(renderWorkspace(workspace, {
+				...route,
+				nodeId: node.nodeId,
+				nodeInstanceId: node.nodeInstanceId,
+			}));
+		}
 		return card;
 	}
 
@@ -191,18 +222,19 @@
 		return row;
 	}
 
-	function actionButton(label, action, targetId, dangerous, peerId, workspaceId) {
+	function actionButton(label, action, targetId, dangerous, route) {
 		const button = document.createElement('button');
 		button.type = 'button';
 		button.dataset.action = action;
 		if (targetId) {
 			button.dataset.targetId = targetId;
 		}
-		if (peerId) {
-			button.dataset.peerId = peerId;
-		}
-		if (workspaceId) {
-			button.dataset.workspaceId = workspaceId;
+		if (route) {
+			for (const key of ['deviceId', 'nodeId', 'nodeInstanceId', 'peerId', 'workspaceId']) {
+				if (route[key]) {
+					button.dataset[key] = route[key];
+				}
+			}
 		}
 		if (dangerous) {
 			button.className = 'danger';

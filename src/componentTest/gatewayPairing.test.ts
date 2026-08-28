@@ -206,8 +206,8 @@ suite('Gateway pairing component', { concurrency: 1 }, () => {
 		const second = await RawClient.open(fixture.endpoint);
 		try {
 			const params = {
-				protocolMin: 1,
-				protocolMax: 1,
+				protocolMin: 2,
+				protocolMax: 2,
 				coordinatorDeviceId: 'coordinator-device',
 				clientNonce: nonce,
 				invitationId: invitation.invitationId,
@@ -408,8 +408,8 @@ suite('Gateway pairing component', { concurrency: 1 }, () => {
 			await records.commitStarted;
 			now = 1_011;
 			const prune = pruneClient.request('mesh.hello', {
-				protocolMin: 1,
-				protocolMax: 1,
+				protocolMin: 2,
+				protocolMax: 2,
 				coordinatorDeviceId: 'prune-trigger',
 				clientNonce: randomBase64Url(NONCE_BYTES),
 				invitationId: 'missing-invitation',
@@ -770,8 +770,8 @@ suite('Gateway pairing component', { concurrency: 1 }, () => {
 			const protocolClose = protocol.closed();
 			await assert.rejects(
 				protocol.request('mesh.hello', {
-					protocolMin: 2,
-					protocolMax: 2,
+					protocolMin: 1,
+					protocolMax: 1,
 					coordinatorDeviceId: 'coordinator-device',
 					clientNonce: randomBase64Url(NONCE_BYTES),
 					invitationId: 'unused',
@@ -1184,14 +1184,14 @@ async function beginEnrollment(
 ): Promise<Enrollment> {
 	const clientNonce = randomBase64Url(NONCE_BYTES);
 	const hello = await client.request('mesh.hello', {
-		protocolMin: 1,
-		protocolMax: 1,
+		protocolMin: 2,
+		protocolMax: 2,
 		coordinatorDeviceId,
 		clientNonce,
 		invitationId,
 	}) as Record<string, string | number>;
 	const transcript: EnrollmentTranscript = {
-		version: 1,
+		version: 2,
 		invitationId,
 		workerDeviceId: String(hello.workerDeviceId),
 		coordinatorDeviceId,
@@ -1253,14 +1253,14 @@ async function reconnect(
 ): Promise<void> {
 	const clientNonce = randomBase64Url(NONCE_BYTES);
 	const hello = await client.request('mesh.hello', {
-		protocolMin: 1,
-		protocolMax: 1,
+		protocolMin: 2,
+		protocolMax: 2,
 		coordinatorDeviceId,
 		clientNonce,
 		peerId,
 	}) as Record<string, string | number>;
 	const transcript: ReconnectTranscript = {
-		version: 1,
+		version: 2,
 		peerId,
 		workerDeviceId: String(hello.workerDeviceId),
 		coordinatorDeviceId,
