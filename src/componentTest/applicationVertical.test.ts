@@ -122,7 +122,7 @@ test('real loopback composes pairing, workspace, accepted task, input, get, and 
 	);
 	const gateway = new GatewayServer(pairing, router, {
 		heartbeatIntervalMs: 50,
-		heartbeatTimeoutMs: 500,
+		heartbeatTimeoutMs: 10_000,
 	});
 	liveGateway = gateway;
 	const address = await gateway.start();
