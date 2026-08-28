@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { lstat, mkdir, rm } from 'node:fs/promises';
+import { sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { test } from 'node:test';
 
@@ -118,11 +119,11 @@ class MemoryFileSystem implements AtomicFileSystem {
 		if (!this.directories.has(path)) {
 			throw notFound();
 		}
-		const prefix = `${path}/`;
+		const prefix = `${path}${sep}`;
 		return [...this.files.keys()]
 			.filter((candidate) =>
 				candidate.startsWith(prefix)
-				&& !candidate.slice(prefix.length).includes('/'),
+				&& !candidate.slice(prefix.length).includes(sep),
 			)
 			.map((candidate) => candidate.slice(prefix.length));
 	}

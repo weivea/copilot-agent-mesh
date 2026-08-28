@@ -358,6 +358,7 @@ test('non-owner Window Node multiplexes remote v2 tasks over authenticated local
 		assert.equal(connection.startCalls, 1);
 
 		await broker.dispose();
+		await waitFor(() => node.snapshot().state !== 'online' || !node.snapshot().registered);
 		const restoredRemoteTasks = new ProductionRemoteTaskAdapter(
 			peers as unknown as PeerConnectionManager,
 			profiles,

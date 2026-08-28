@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { resolve, sep } from 'node:path';
 import { test } from 'node:test';
 
 import type { RoutedTaskStartParams } from '../../shared/protocol';
@@ -509,11 +509,11 @@ class MemoryFileSystem implements AtomicFileSystem {
 	}
 
 	public async readdir(path: string): Promise<readonly string[]> {
-		const prefix = `${path}/`;
+		const prefix = `${path}${sep}`;
 		return [...this.files.keys()]
 			.filter((candidate) =>
 				candidate.startsWith(prefix)
-				&& !candidate.slice(prefix.length).includes('/'),
+				&& !candidate.slice(prefix.length).includes(sep),
 			)
 			.map((candidate) => candidate.slice(prefix.length));
 	}

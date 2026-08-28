@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { sep } from 'node:path';
 import { test } from 'node:test';
 
 import {
@@ -114,11 +115,11 @@ class MemoryFileSystem implements AtomicFileSystem {
 		if (!this.directories.has(path)) {
 			throw notFound();
 		}
-		const prefix = `${path}/`;
+		const prefix = `${path}${sep}`;
 		return [...this.files.keys()]
 			.filter((candidate) =>
 				candidate.startsWith(prefix)
-				&& !candidate.slice(prefix.length).includes('/'),
+				&& !candidate.slice(prefix.length).includes(sep),
 			)
 			.map((candidate) => candidate.slice(prefix.length));
 	}

@@ -54,7 +54,9 @@ suite('DevTunnelJsonDecoder', () => {
 
 		assert.equal(computeSanitizedFixtureHash(fixture), DEVTUNNEL_HOSTED_FIXTURE_SHA256);
 		assert.equal(
-			computeSanitizedFixtureHash(fixture.replace(/\n/gu, '\r\n')),
+			computeSanitizedFixtureHash(
+				fixture.replace(/\r\n/gu, '\n').replace(/\n/gu, '\r\n'),
+			),
 			DEVTUNNEL_HOSTED_FIXTURE_SHA256,
 		);
 		assert.deepStrictEqual(
