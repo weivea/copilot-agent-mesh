@@ -201,6 +201,7 @@ export class LocalIpcHandlerError extends Error {
 		public readonly code: number,
 		message: string,
 		public readonly data?: JsonValue,
+		public readonly closeAfterResponse = false,
 	) {
 		super(message);
 		this.name = 'LocalIpcHandlerError';
@@ -1012,6 +1013,9 @@ class IpcPeer {
 						...(rpcError.data === undefined ? {} : { data: rpcError.data }),
 					},
 				});
+				if (rpcError.closeAfterResponse) {
+					this.close();
+				}
 			} catch (sendError: unknown) {
 				this.fail(safeError(sendError, SAFE_CLOSE_MESSAGE));
 			}

@@ -770,11 +770,13 @@ export class WindowNodeClient implements WorkspaceResolver {
 				method === LOCAL_BROKER_METHODS.taskStart
 				&& isClosedTaskStartGeneration(requestExecutor, error)
 			) {
-				setImmediate(() => {
-					if (this.session === session && !session.closed) {
-						session.close();
-					}
-				});
+				const mapped = toWindowNodeHandlerError(error);
+				throw new LocalIpcHandlerError(
+					mapped.code,
+					mapped.message,
+					mapped.data,
+					true,
+				);
 			}
 			throw toWindowNodeHandlerError(error);
 		}
