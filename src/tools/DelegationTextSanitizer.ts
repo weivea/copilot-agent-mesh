@@ -2,6 +2,7 @@ import {
 	containsCredentialText,
 	containsUnsafeDashboardText,
 } from '../ui/DashboardRedaction';
+import { redactRegisteredSensitiveValues } from '../security/SensitiveValueRedaction';
 
 const redaction = '[redacted sensitive details]';
 const redactionSentinel = '__MESH_REDACTED__';
@@ -20,6 +21,7 @@ export function sanitizeDelegationText(value: string, maxBytes: number): string 
 	}
 	// Inspect the original field before whitespace normalization can erase the
 	// boundary between an assignment value and a continuation line.
+	value = redactRegisteredSensitiveValues(value);
 	if (containsCredentialText(value)) {
 		return boundedUtf8(redaction, maxBytes);
 	}

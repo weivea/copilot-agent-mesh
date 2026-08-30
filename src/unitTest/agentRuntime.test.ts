@@ -13,6 +13,7 @@ import type {
 
 import {
 	AhpAgentRuntime,
+	buildMeshSessionTitle,
 	DELEGATED_AGENT_CLIENT_TOOLS,
 	type AhpConnection,
 	type AhpConnectionFactory,
@@ -495,6 +496,90 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 	assert.equal(launcher.host.disposed, true);
 });
 
+	test('delegated runtime sets the exact safe Session title and preserves terminal editor history', async () => {
+		const transport = new FakeAhpTransport();
+		transport.completeAfterTurnDispatch = true;
+		const launcher = new FakeLauncher();
+		launcher.host.preserveTerminalSession = true;
+		const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+
+		const handle = await runtime.start({
+			...taskRequest(),
+			sourceWindowName: 'frontend',
+			title: 'Implement bounded API',
+		});
+		const events = [];
+		for await (const event of handle.events) {
+			events.push(event);
+		}
+		assert.equal(events.at(-1)?.type, 'completed');
+		assert.deepEqual(transport.dispatched.slice(0, 2).map(({ channel, action }) => ({
+			channel,
+			action,
+		})), [
+			{
+				channel: transport.created?.sessionUri,
+				action: {
+					type: 'session/titleChanged',
+					title: 'Mesh · frontend → Implement bounded API',
+				},
+			},
+			{
+				channel: 'ahp-chat:/default',
+				action: transport.dispatched[1]?.action,
+			},
+		]);
+
+		await handle.dispose();
+		assert.equal(transport.disposeSessionCalls, 0);
+		assert.equal(transport.shutdownCalls, 1);
+	});
+
+	test('delegated title rejection removes the provisional Session and leaves no running orphan', async () => {
+		const transport = new FakeAhpTransport();
+		transport.rejectDispatchType = 'session/titleChanged';
+		const launcher = new FakeLauncher();
+		launcher.host.preserveTerminalSession = true;
+		const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+
+		await assert.rejects(
+			runtime.start({
+				...taskRequest(),
+				sourceWindowName: 'frontend',
+			}),
+			(error: unknown) => error instanceof AgentRuntimeError
+				&& error.message === 'The Agent Host rejected a delegated Session action.',
+		);
+		assert.equal(transport.disposeSessionCalls, 1);
+		assert.equal(transport.shutdownCalls, 1);
+		assert.equal(launcher.host.disposed, true);
+	});
+
+	test('delegated title sanitizer removes raw, encoded, and credential-shaped values', () => {
+		const title = buildMeshSessionTitle(
+			'/private/var/editor.sock',
+			'Inspect %2FUsers%2Fmesh%2Fdata token=ghp_abcdefghijklmnopqrstuvwxyz0123456789',
+		);
+		assert.match(title, /^Mesh · /u);
+		assert.doesNotMatch(title, /private|Users|ghp_|abcdefghijklmnopqrstuvwxyz|%2F/iu);
+		assert.ok(Buffer.byteLength(title, 'utf8') <= 256);
+	});
+
+	test('runtime rejects an incompatible selected protocol before Session creation', async () => {
+		const transport = new FakeAhpTransport();
+		transport.selectedProtocolVersion = '2.0.0';
+		const runtime = createRuntime(new FakeLauncher(), new FakeConnectionFactory([transport]));
+		await assert.rejects(
+			runtime.start(taskRequest()),
+			(error: unknown) => error instanceof AgentRuntimeError
+				&& error.code === 'AGENT_UNAVAILABLE'
+				&& error.message === 'The Agent Host selected an incompatible protocol version.',
+		);
+		assert.equal(transport.created, undefined);
+		assert.equal(transport.disposeSessionCalls, 0);
+		assert.equal(transport.shutdownCalls, 1);
+	});
+
 test('AHP subscription pump applies bounded output pressure before accepting terminal completion', async () => {
 	const transport = new FakeAhpTransport();
 	const launcher = new FakeLauncher();
@@ -742,13 +827,13 @@ test('start failure cleans the task, AHP connection, and owned host without losi
 			&& error.cause instanceof AggregateError
 			&& !error.message.includes('not-a-real-token'),
 	);
-	assert.equal(transport.disposeSessionCalls, 1);
+	assert.equal(transport.disposeSessionCalls, 0);
 	assert.equal(transport.shutdownCalls, 1);
 	assert.equal(launcher.host.disposed, true);
 
 	transport.shutdownFails = false;
 	await runtime.dispose();
-	assert.equal(transport.disposeSessionCalls, 1);
+	assert.equal(transport.disposeSessionCalls, 0);
 	assert.equal(transport.shutdownCalls, 2);
 });
 
@@ -792,6 +877,40 @@ test('connection failure cleans the detached owned host before surfacing startup
 	});
 
 	await assert.rejects(runtime.start(taskRequest()), AgentRuntimeError);
+	assert.equal(launcher.host.disposed, true);
+});
+
+test('runtime disposal aborts and awaits an in-flight editor connection start', async () => {
+	const launcher = new FakeLauncher();
+	let connectEntered!: () => void;
+	const entered = new Promise<void>((resolve) => {
+		connectEntered = resolve;
+	});
+	const runtime = new AhpAgentRuntime({
+		enabled: () => true,
+		launcher,
+		connections: {
+			connect: async (_host, signal) => {
+				connectEntered();
+				return new Promise<AhpConnection>((_resolve, reject) => {
+					const abort = () => reject(new Error('connection aborted'));
+					if (signal?.aborted === true) {
+						abort();
+					} else {
+						signal?.addEventListener('abort', abort, { once: true });
+					}
+				});
+			},
+		},
+		authBroker: new RecordingAuthBroker(),
+		confirmation: { confirm: async () => 'once' },
+		workspaceResolver: trustedWorkspaceResolver(),
+	});
+
+	const start = runtime.start(taskRequest());
+	await entered;
+	await runtime.dispose();
+	await assert.rejects(start, AgentRuntimeError);
 	assert.equal(launcher.host.disposed, true);
 });
 
@@ -2220,6 +2339,7 @@ class FakeHost implements LaunchedAgentHost {
 	readonly endpoint = new URL('ws://127.0.0.1:1234/?tkn=not-a-real-token');
 	readonly version = '1.134.0';
 	readonly registryProtocolVersion = '0.1.0';
+	preserveTerminalSession = false;
 	disposed = false;
 	disposeFailuresRemaining = 0;
 	private listeners = new Set<(error: AgentRuntimeError) => void>();
@@ -2261,6 +2381,8 @@ class FakeAhpTransport implements AhpConnection {
 	initialized = false;
 	initializedClientId = '';
 	ackDispatches = true;
+	rejectDispatchType: string | undefined;
+	selectedProtocolVersion = '1.0.0';
 	nextClientSeq = 1;
 	authenticated: Array<{ resource: string; token: string; scopes: readonly string[] }> = [];
 	created: {
@@ -2324,7 +2446,7 @@ class FakeAhpTransport implements AhpConnection {
 			});
 		}
 		return {
-			protocolVersion: '0.8.0',
+			protocolVersion: this.selectedProtocolVersion,
 			serverSeq: 1,
 			snapshots: [{
 				resource: 'ahp-root://',
@@ -2546,10 +2668,21 @@ class FakeAhpTransport implements AhpConnection {
 		this.nextClientSeq = Math.max(this.nextClientSeq, sequence + 1);
 		this.dispatched.push({ channel, action: record, clientSeq: sequence });
 		if (this.ackDispatches) {
-			this.emit(channel, record, {
+			const origin = {
 				clientId: this.initializedClientId,
 				clientSeq: sequence,
-			});
+			};
+			if (record.type === this.rejectDispatchType) {
+				this.queue(channel).push({
+					type: 'action',
+					params: {
+						...envelope(channel, record, 4, origin),
+						rejectionReason: 'Synthetic rejection.',
+					},
+				});
+			} else {
+				this.emit(channel, record, origin);
+			}
 		}
 		if (this.completeAfterTurnDispatch && record.type === 'chat/turnStarted') {
 			queueMicrotask(() => this.emitChat({

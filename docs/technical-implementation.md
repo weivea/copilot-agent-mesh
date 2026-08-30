@@ -682,6 +682,15 @@ VS Code Build 的 Host 版本与 SDK Offer 有交集，不能靠 Feature Flag �
 
 ### 10.2 启动与发现
 
+0.4.0 Peer Delegation 打开时，`AgentHostSourceSelector` 先按 VS Code product/platform
+推导当前 user-data（可由 machine-scope `copilotAgentMesh.agentHost.userDataDir` 绝对路径
+覆盖），执行有界 `code agent endpoints --user-data-dir <dir>`，并要求 registry 的
+canonical `userDataPath` 精确匹配。只接受唯一 live、schema-v2、`type: editor`、
+Unix socket、protocol `1.0.0` 的 endpoint。使用 `net.connect(path)` 后由 `ws@8.21.3`
+在该 socket 上发起唯一 `/?tkn=` Upgrade；连接、响应头、超时和取消均 fail closed。
+Editor 发现/连接/initialize/协议失败只回退 standalone 一次，并公开有界 source/degraded
+状态。Preview 关闭时继续使用以下既有 standalone 路径。
+
 推荐启动方式：
 
 1. 发现用户配置或已验证的 `code` CLI 绝对路径。
@@ -728,6 +737,7 @@ sequenceDiagram
     M->>H: resolve session config when required
     M->>H: createSession(sessionUri, provider, workingDirectories)
     M->>H: subscribe(sessionUri)
+    M->>H: session/titleChanged (acknowledged)
     H-->>M: session snapshot / ready / creationFailed
     M->>M: read defaultChat from session state
     M->>H: subscribe(chatUri)
@@ -747,6 +757,12 @@ sequenceDiagram
 - 处理 `AuthRequired`、Token 无效、无 Copilot 权限、配额不足和 Provider 消失。
 - 每次 `initialize` / `subscribe` 返回的 Snapshot 必须先应用，再消费后续 Action。
 - AHP 原始对象不穿过 Adapter 边界。
+- editor endpoint 的 token、socket/user-data/executable 路径和 instance ID 进入引用计数的
+  内存脱敏集合；raw、percent-encoded、JSON/cause 文本在日志、事件、错误和 Webview 前均
+  清除。
+- editor Turn 达到权威终态后关闭 AHP Client/socket，但不调用会触发
+  `root/sessionRemoved` 的 `disposeSession`；启动/标题失败仍删除 provisional Session，
+  standalone 生命周期保持不变。
 
 ### 10.4 Event 映射
 

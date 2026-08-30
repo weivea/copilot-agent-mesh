@@ -22,6 +22,7 @@ import {
 } from '../node';
 import { createDelegationGrant } from '../node/DelegationGrant';
 import { toWindowNodeHandlerError } from '../node/WindowNodeClient';
+import { registerSensitiveValues } from '../security/SensitiveValueRedaction';
 import type { NodeTaskEventParams, NodeTaskStartParams } from '../../shared/protocol';
 
 const DEVICE_ID = '00000000-0000-4000-8000-000000000001';
@@ -425,6 +426,7 @@ test('starts once for exact retries, rejects conflicts, and supplies complete co
 		},
 	});
 	assert.equal(fixture.runtime.requests.length, 1);
+	assert.equal(fixture.runtime.requests[0]?.sourceWindowName, 'Source Window');
 	assert.deepEqual(fixture.confirmations, [{
 		sourceWindowLabel: 'Source Window',
 		targetWindowLabel: 'Target Window',
@@ -494,6 +496,44 @@ test('maps and UTF-8 bounds runtime events while preserving terminal semantics',
 	}
 	assert.equal(handle.disposeCalls, 1);
 	await fixture.executor.dispose();
+});
+
+test('redacts registered endpoint values from task events and completion results', async () => {
+	const sensitive = [
+		'/private/var/mesh-editor.sock',
+		'/Users/mesh/Library/Application Support/Code',
+		'/opt/homebrew/bin/code',
+		'mesh-editor-connection-token',
+		'mesh-editor-instance-id',
+	];
+	const registration = registerSensitiveValues(sensitive);
+	const fixture = createFixture();
+	try {
+		await fixture.executor.start(startParams());
+		const handle = fixture.runtime.handles[0];
+		const unsafe = sensitive
+			.flatMap((value) => [value, encodeURIComponent(value)])
+			.join(' | ');
+		await handle.events.push({ type: 'progress', message: unsafe });
+		await handle.events.push({ type: 'output', text: unsafe });
+		await handle.events.push({
+			type: 'tool',
+			name: 'tool',
+			status: 'running',
+			summary: JSON.stringify({ cause: { message: unsafe } }),
+		});
+		await handle.events.push({ type: 'terminal', summary: `ws://localhost/?tkn=${sensitive[3]}` });
+		await handle.events.push({ type: 'completed' });
+		await waitFor(() => fixture.events.at(-1)?.event.type === 'completed');
+		const serialized = JSON.stringify(fixture.events);
+		for (const value of sensitive) {
+			assert.equal(serialized.includes(value), false);
+			assert.equal(serialized.toLowerCase().includes(encodeURIComponent(value).toLowerCase()), false);
+		}
+	} finally {
+		registration.dispose();
+		await fixture.executor.dispose();
+	}
 });
 
 test('publishes public input IDs and maps exact idempotent answers to the runtime request', async () => {

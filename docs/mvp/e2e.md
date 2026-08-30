@@ -101,6 +101,13 @@ P8 must update that harness before it can be used as 0.4.0 peer-delegation
 evidence. Transport/lifecycle mode remains valid because it does not start a
 peer task.
 
+P6 adds offline real-Unix-socket coverage for the editor transport and a safe local
+experiment boundary. On 2026-08-31, the macOS arm64 Stable endpoint command succeeded
+but returned zero editor endpoints, while Insiders user-data was absent. No write
+experiment could safely start, so editor AHP initialize and O1 target-window Chat
+Sessions visibility are **unverified**, not Pass or Fail. P8 must rerun with a live
+ordinary VS Code editor endpoint; only objective UI/session evidence may promote O1.
+
 ## Recorded 0.2.0 multi-window evidence
 
 The ordinary transport/lifecycle run passed on VS Code `1.134.0`, macOS arm64:

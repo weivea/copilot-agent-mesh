@@ -10,6 +10,36 @@ export const AGENT_RUNTIME_ERROR_CODES = [
 
 export type AgentRuntimeErrorCode = typeof AGENT_RUNTIME_ERROR_CODES[number];
 
+export type AgentHostSource = 'editor' | 'standalone';
+
+export type AgentHostDegradationReason =
+	| 'EDITOR_DISCOVERY_FAILED'
+	| 'EDITOR_START_FAILED'
+	| 'STANDALONE_START_FAILED';
+
+export type AgentHostSourceStatus =
+	| {
+		readonly source: 'editor';
+		readonly degraded: false;
+	}
+	| {
+		readonly source: 'standalone';
+		readonly degraded: false;
+	}
+	| {
+		readonly source: 'standalone';
+		readonly degraded: true;
+		readonly reason: AgentHostDegradationReason;
+		readonly message: string;
+	};
+
+export interface AgentHostSourceStatusProvider {
+	sourceStatus(): AgentHostSourceStatus;
+	onDidSourceStatusChange(listener: (status: AgentHostSourceStatus) => void): {
+		dispose(): void;
+	};
+}
+
 export class AgentRuntimeError extends Error {
 	constructor(
 		readonly code: AgentRuntimeErrorCode,
@@ -36,6 +66,7 @@ export interface AgentTaskRequest {
 	readonly prompt: string;
 	readonly acceptanceCriteria?: readonly string[];
 	readonly workspaceId: string;
+	readonly sourceWindowName?: string;
 	readonly providerId?: string;
 	readonly allowInteractiveAuthentication?: boolean;
 	readonly delegatedExecutionContext?: DelegatedExecutionContext;
@@ -184,6 +215,11 @@ export interface AgentRuntimeProbe {
 	readonly featureEnabled: boolean;
 	readonly version?: string;
 	readonly reason?: AgentRuntimeErrorCode;
+	readonly source?: AgentHostSource;
+	readonly degradation?: {
+		readonly reason: AgentHostDegradationReason;
+		readonly message: string;
+	};
 }
 
 export type AsyncEventQueuePriority = 'coalescible' | 'droppable' | 'nondroppable';

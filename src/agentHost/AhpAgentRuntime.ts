@@ -29,12 +29,17 @@ import {
 	type WorkspaceResolver,
 } from './AgentRuntime';
 import type { DelegatedToolInvocationRegistry } from '../tools/DelegatedToolInvocationRegistry';
+import { sanitizeDelegationText } from '../tools/DelegationTextSanitizer';
+import { redactRegisteredSensitiveValues } from '../security/SensitiveValueRedaction';
 import type { AgentHostLauncherLike, LaunchedAgentHost } from './AgentHostLauncher';
 import type { AuthBroker, ProtectedResource } from './AuthBroker';
 
 const rootUri = 'ahp-root://';
+const offeredProtocolVersion = '1.0.0';
 const sessionDefaultChatTimeoutMs = 60_000;
 const cancellationTimeoutMs = 15_000;
+const titleAcknowledgementTimeoutMs = 10_000;
+const sessionTitleBytes = 256;
 export const DELEGATED_AGENT_CLIENT_TOOLS: readonly never[] = Object.freeze([]);
 
 interface AuthenticationInFlight {
@@ -102,7 +107,7 @@ export interface AhpConnection {
 }
 
 export interface AhpConnectionFactory {
-	connect(endpoint: URL, signal?: AbortSignal): Promise<AhpConnection>;
+	connect(host: LaunchedAgentHost, signal?: AbortSignal): Promise<AhpConnection>;
 }
 
 export interface SessionConfigurationResolver {
@@ -136,6 +141,10 @@ export interface AhpAgentRuntimeOptions {
 
 export class AhpAgentRuntime implements AgentRuntime {
 	private readonly tasks = new Set<AhpTask>();
+	private readonly inFlightStarts = new Set<{
+		readonly controller: AbortController;
+		readonly operation: Promise<AgentTaskHandle>;
+	}>();
 	private disposed = false;
 	private disposePromise: Promise<void> | undefined;
 
@@ -154,7 +163,23 @@ export class AhpAgentRuntime implements AgentRuntime {
 		};
 	}
 
-	async start(request: AgentTaskRequest): Promise<AgentTaskHandle> {
+	start(request: AgentTaskRequest): Promise<AgentTaskHandle> {
+		const controller = new AbortController();
+		let tracked!: {
+			readonly controller: AbortController;
+			readonly operation: Promise<AgentTaskHandle>;
+		};
+		const operation = this.startTracked(request, controller.signal)
+			.finally(() => this.inFlightStarts.delete(tracked));
+		tracked = { controller, operation };
+		this.inFlightStarts.add(tracked);
+		return operation;
+	}
+
+	private async startTracked(
+		request: AgentTaskRequest,
+		signal: AbortSignal,
+	): Promise<AgentTaskHandle> {
 		if (this.disposed || !this.options.enabled()) {
 			throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'The production Agent Host runtime is disabled.');
 		}
@@ -171,7 +196,7 @@ export class AhpAgentRuntime implements AgentRuntime {
 		}
 		this.throwIfDisposed();
 
-		const host = await this.options.launcher.launch();
+		const host = await this.options.launcher.launch(signal);
 		if (this.disposed) {
 			const cleanup = await cleanupDetachedResources(host, undefined);
 			const error = new AgentRuntimeError('AGENT_UNAVAILABLE', 'The production Agent Host runtime was disposed during startup.');
@@ -180,7 +205,14 @@ export class AhpAgentRuntime implements AgentRuntime {
 		let connection: AhpConnection | undefined;
 		let task: AhpTask | undefined;
 		try {
-			connection = await this.options.connections.connect(host.endpoint);
+			try {
+				connection = await this.options.connections.connect(host, signal);
+			} catch {
+				throw new AgentRuntimeError(
+					'AGENT_UNAVAILABLE',
+					'The Agent Host connection could not be established.',
+				);
+			}
 			this.throwIfDisposed();
 			const createdTask = new AhpTask(
 				resolvedRequest,
@@ -229,12 +261,23 @@ export class AhpAgentRuntime implements AgentRuntime {
 
 	private async disposeResources(): Promise<void> {
 		this.disposed = true;
+		for (const start of this.inFlightStarts) {
+			start.controller.abort();
+		}
 		const failures: string[] = [];
 		await collectCleanupFailures(
-			[...this.tasks].map((task) => ({
-				label: 'dispose active Agent Host task',
-				run: () => task.dispose(),
-			})),
+			[
+				...[...this.inFlightStarts].map(({ operation }) => ({
+					label: 'stop in-flight Agent Host start',
+					run: async () => {
+						await operation.catch(() => undefined);
+					},
+				})),
+				...[...this.tasks].map((task) => ({
+					label: 'dispose active Agent Host task',
+					run: () => task.dispose(),
+				})),
+			],
 			failures,
 		);
 		await collectCleanupFailures([
@@ -253,14 +296,16 @@ export class AhpAgentRuntime implements AgentRuntime {
 }
 
 export class SdkAhpConnectionFactory implements AhpConnectionFactory {
-	async connect(endpoint: URL, signal?: AbortSignal): Promise<AhpConnection> {
-		if (typeof globalThis.WebSocket !== 'function') {
+	async connect(host: LaunchedAgentHost, signal?: AbortSignal): Promise<AhpConnection> {
+		if (host.openWebSocket === undefined && typeof globalThis.WebSocket !== 'function') {
 			throw new AgentRuntimeError(
 				'AGENT_UNAVAILABLE',
 				'The VS Code Extension Host does not provide the WebSocket transport required by AHP.',
 			);
 		}
-		const socket = await connectWebSocket(endpoint, 10_000, signal);
+		const socket = host.openWebSocket === undefined
+			? await connectWebSocket(host.endpoint, 10_000, signal)
+			: await host.openWebSocket(signal);
 		const [{ AhpClient }, { WebSocketTransport }, protocol] = await Promise.all([
 			import('@microsoft/agent-host-protocol/client'),
 			import('@microsoft/agent-host-protocol/ws'),
@@ -270,7 +315,10 @@ export class SdkAhpConnectionFactory implements AhpConnectionFactory {
 			socket.close();
 			throw new RecoveryStoppedCause();
 		}
-		const client = new AhpClient(WebSocketTransport.fromSocket(socket), { requestTimeoutMs: 30_000 });
+		const client = new AhpClient(
+			WebSocketTransport.fromSocket(socket as unknown as WebSocket),
+			{ requestTimeoutMs: 30_000 },
+		);
 		client.connect();
 		return new SdkAhpConnection(client, protocol.SUPPORTED_PROTOCOL_VERSIONS);
 	}
@@ -458,6 +506,7 @@ class AhpTask implements AgentTaskHandle {
 	private sessionCreated = false;
 	private lastSeenServerSeq = 0;
 	private terminal = false;
+	private authoritativeTurnTerminal = false;
 	private disposed = false;
 	private recovering = false;
 	private defaultChatResolve: ((uri: string) => void) | undefined;
@@ -475,6 +524,8 @@ class AhpTask implements AgentTaskHandle {
 		readonly channel: string;
 		readonly action: unknown;
 		readonly requestId?: string;
+		readonly resolveAcknowledgement?: () => void;
+		readonly rejectAcknowledgement?: (error: AgentRuntimeError) => void;
 	}>();
 	private nextClientSeq = 1;
 	private recoveryAbort: AbortController | undefined;
@@ -531,8 +582,22 @@ class AhpTask implements AgentTaskHandle {
 		this.exitSubscription = this.host.onExit((error) => this.fail(error));
 		const rootSubscription = this.connection.attachSubscription(rootUri);
 		this.subscriptions.set(rootUri, rootSubscription);
-		const initialized = await this.connection.initialize(this.clientId);
+		let initialized: AhpInitializeResult;
+		try {
+			initialized = await this.connection.initialize(this.clientId);
+		} catch {
+			throw new AgentRuntimeError(
+				'AGENT_UNAVAILABLE',
+				'The Agent Host protocol could not be initialized.',
+			);
+		}
 		this.throwIfTerminalError();
+		if (initialized.protocolVersion !== offeredProtocolVersion) {
+			throw new AgentRuntimeError(
+				'AGENT_UNAVAILABLE',
+				'The Agent Host selected an incompatible protocol version.',
+			);
+		}
 		this.lastSeenServerSeq = initialized.serverSeq;
 		const rootSnapshot = initialized.snapshots.find(({ resource }) => resource === rootUri);
 		if (rootSnapshot === undefined) {
@@ -565,6 +630,12 @@ class AhpTask implements AgentTaskHandle {
 		this.throwIfTerminalError();
 
 		await this.ensureStartupSubscription(this.sessionUri);
+		if (this.request.sourceWindowName !== undefined) {
+			await this.dispatchAcknowledged(this.sessionUri, {
+				type: 'session/titleChanged',
+				title: buildMeshSessionTitle(this.request.sourceWindowName, this.request.title),
+			});
+		}
 		// AHP 1.0 providers may create a provisional Session whose lifecycle stays
 		// `creating` until its first turn materializes it. The default Chat is the
 		// readiness boundary for that first dispatch; waiting for `session/ready`
@@ -677,6 +748,10 @@ class AhpTask implements AgentTaskHandle {
 			clearTimeout(this.cancellationTimer);
 		}
 		this.exitSubscription?.dispose();
+		for (const pending of this.unacknowledgedDispatches.values()) {
+			pending.rejectAcknowledgement?.(startupStopped);
+		}
+		this.unacknowledgedDispatches.clear();
 		this.events.close();
 		if (recovery !== undefined) {
 			await runCleanupPhase([{
@@ -733,7 +808,13 @@ class AhpTask implements AgentTaskHandle {
 		if (!this.sessionDisposed && this.shutdownConnections.has(this.connection)) {
 			this.sessionDisposed = true;
 		}
-		if (!this.sessionDisposed) {
+		if (!this.sessionCreated) {
+			this.sessionDisposed = true;
+		}
+		if (
+			!this.sessionDisposed
+			&& !(this.authoritativeTurnTerminal && this.host.preserveTerminalSession === true)
+		) {
 			await runCleanupPhase([{
 				label: 'dispose AHP session',
 				run: async () => {
@@ -894,16 +975,49 @@ class AhpTask implements AgentTaskHandle {
 		return operation;
 	}
 
-	private dispatchTracked(channel: string, action: unknown, requestId?: string): void {
+	private dispatchTracked(
+		channel: string,
+		action: unknown,
+		requestId?: string,
+		acknowledgement?: {
+			readonly resolve: () => void;
+			readonly reject: (error: AgentRuntimeError) => void;
+		},
+	): void {
 		const clientSeq = this.nextClientSeq;
 		this.nextClientSeq += 1;
-		this.unacknowledgedDispatches.set(clientSeq, { channel, action, requestId });
+		this.unacknowledgedDispatches.set(clientSeq, {
+			channel,
+			action,
+			requestId,
+			resolveAcknowledgement: acknowledgement?.resolve,
+			rejectAcknowledgement: acknowledgement?.reject,
+		});
 		try {
 			this.connection.dispatch(channel, action, clientSeq);
 		} catch (error) {
+			this.unacknowledgedDispatches.delete(clientSeq);
 			this.handleSubscriptionLoss();
 			throw normalizeRuntimeError(error);
 		}
+	}
+
+	private dispatchAcknowledged(channel: string, action: unknown): Promise<void> {
+		let resolveAcknowledgement!: () => void;
+		let rejectAcknowledgement!: (error: AgentRuntimeError) => void;
+		const acknowledgement = new Promise<void>((resolve, reject) => {
+			resolveAcknowledgement = resolve;
+			rejectAcknowledgement = reject;
+		});
+		this.dispatchTracked(channel, action, undefined, {
+			resolve: resolveAcknowledgement,
+			reject: rejectAcknowledgement,
+		});
+		return withTimeout(
+			acknowledgement,
+			titleAcknowledgementTimeoutMs,
+			'The Agent Host did not acknowledge the delegated Session title.',
+		);
 	}
 
 	private acknowledgeDispatch(envelope: ActionEnvelope): void {
@@ -915,7 +1029,15 @@ class AhpTask implements AgentTaskHandle {
 			return;
 		}
 		this.unacknowledgedDispatches.delete(envelope.origin.clientSeq);
-		if (envelope.rejectionReason === undefined && pending.requestId !== undefined) {
+		if (envelope.rejectionReason !== undefined) {
+			pending.rejectAcknowledgement?.(new AgentRuntimeError(
+				'TASK_EXECUTION_FAILED',
+				'The Agent Host rejected a delegated Session action.',
+			));
+			return;
+		}
+		pending.resolveAcknowledgement?.();
+		if (pending.requestId !== undefined) {
 			this.mapper.completeAnswer(pending.requestId);
 		}
 	}
@@ -1115,7 +1237,15 @@ class AhpTask implements AgentTaskHandle {
 			}
 		}
 		this.trackDeliveredResponseAction(action);
-		await this.emitMappedEvents(this.mapper.map(envelope));
+		await this.emitMappedEvents(
+			this.mapper.map(envelope),
+			envelope.channel === this.chatUri
+				&& (
+					action.type === 'chat/turnComplete'
+					|| action.type === 'chat/turnCancelled'
+					|| action.type === 'chat/error'
+				),
+		);
 	}
 
 	private trackDeliveredResponseAction(action: ActionEnvelope['action']): void {
@@ -1176,7 +1306,10 @@ class AhpTask implements AgentTaskHandle {
 		}
 	}
 
-	private async emitMappedEvents(events: readonly AgentRuntimeEvent[]): Promise<void> {
+	private async emitMappedEvents(
+		events: readonly AgentRuntimeEvent[],
+		authoritativeTurnTerminal = false,
+	): Promise<void> {
 		for (const event of events) {
 			const terminal = event.type === 'completed' || event.type === 'cancelled' || event.type === 'failed';
 			if (this.terminal) {
@@ -1184,6 +1317,7 @@ class AhpTask implements AgentTaskHandle {
 			}
 			if (terminal) {
 				this.terminal = true;
+				this.authoritativeTurnTerminal = authoritativeTurnTerminal;
 				await this.events.pushAndClose(event);
 				this.finishTerminal();
 				return;
@@ -1250,9 +1384,9 @@ class AhpTask implements AgentTaskHandle {
 			await this.restoreResponseParts(chatUri, turn.responseParts);
 		}
 		if (turn.state === 'complete') {
-			await this.emitMappedEvents([{ type: 'completed' }]);
+			await this.emitMappedEvents([{ type: 'completed' }], true);
 		} else if (turn.state === 'cancelled') {
-			await this.emitMappedEvents([{ type: 'cancelled' }]);
+			await this.emitMappedEvents([{ type: 'cancelled' }], true);
 		} else if (turn.state === 'error') {
 			await this.emitMappedEvents([{
 				type: 'failed',
@@ -1260,7 +1394,7 @@ class AhpTask implements AgentTaskHandle {
 					'TASK_EXECUTION_FAILED',
 					safeMessage(recoveredTurnErrorMessage(turn)),
 				),
-			}]);
+			}], true);
 		}
 	}
 
@@ -1621,7 +1755,7 @@ class AhpTask implements AgentTaskHandle {
 		let recoveredTerminals: readonly TerminalInfo[] = this.rootTerminals;
 		try {
 			candidate = await this.awaitRecoveryStep(
-				this.connectionFactory.connect(this.host.endpoint, signal),
+				this.connectionFactory.connect(this.host, signal),
 				signal,
 			);
 			candidateGeneration = {
@@ -1915,6 +2049,9 @@ function validateRequest(request: AgentTaskRequest): void {
 	if (request.workspaceId.trim().length === 0) {
 		throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'A registered workspace ID is required.');
 	}
+	if (request.sourceWindowName !== undefined && request.sourceWindowName.trim().length === 0) {
+		throw new AgentRuntimeError('TASK_EXECUTION_FAILED', 'A delegated task source window name cannot be empty.');
+	}
 }
 
 function validateWorkspace(workspaceId: string, workspace: ResolvedAgentTaskRequest['workspace']): void {
@@ -1954,6 +2091,12 @@ function buildPrompt(request: ResolvedAgentTaskRequest): string {
 		return request.prompt;
 	}
 	return `${request.prompt}\n\nAcceptance criteria:\n${request.acceptanceCriteria.map((item) => `- ${item}`).join('\n')}`;
+}
+
+export function buildMeshSessionTitle(sourceWindowName: string, taskTitle: string): string {
+	const source = sanitizeDelegationText(sourceWindowName, 80);
+	const summary = sanitizeDelegationText(taskTitle, 160);
+	return sanitizeDelegationText(`Mesh · ${source} → ${summary}`, sessionTitleBytes);
 }
 
 function readAuthRequiredResources(error: unknown): readonly ProtectedResource[] | undefined {
@@ -2180,7 +2323,7 @@ function normalizeRuntimeError(error: unknown): AgentRuntimeError {
 }
 
 function safeMessage(message: string): string {
-	return message
+	return redactRegisteredSensitiveValues(message)
 		.replace(/([?&](?:tkn|token)=)[^&\s"']+/giu, '$1<redacted>')
 		.replace(/("(?:connectionToken|token)"\s*:\s*")[^"]*(")/giu, '$1<redacted>$2')
 		.slice(0, 2_048);

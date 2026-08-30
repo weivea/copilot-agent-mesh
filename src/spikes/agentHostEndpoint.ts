@@ -180,7 +180,7 @@ async function abortableSleep(
 }
 
 export function redactSecrets(value: string, secrets: readonly string[] = []): string {
-	let redacted = value;
+	let redacted = redactRegisteredSensitiveValues(value);
 	for (const secret of secrets) {
 		if (secret.length > 0) {
 			redacted = redacted.split(secret).join('<redacted>');
@@ -260,3 +260,4 @@ function isValidPort(value: unknown): value is number {
 function isLoopbackHost(host: string): boolean {
 	return host === '127.0.0.1' || host === 'localhost' || host === '::1';
 }
+import { redactRegisteredSensitiveValues } from '../security/SensitiveValueRedaction';

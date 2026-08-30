@@ -208,7 +208,8 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		const nodeLabel = windowNodeLabel(nodeId);
 		const runtimeApproval = new VscodeLocalTaskApproval(vscode, rawState, e2eCapability);
 		const nodeConfirmation = new VscodeWindowNodeTaskConfirmation(vscode, e2eCapability);
-		let runtime!: AgentRuntime;
+		let runtime!: ReturnType<typeof createVscodeAgentRuntime>;
+		let sourceStatusSubscription: { dispose(): void } | undefined;
 		const nodeIdentity = createLocalBrokerIdentity(
 			context.globalStorageUri,
 			sharedProfile.deviceId,
@@ -221,6 +222,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			identity: nodeIdentity,
 			brokerKey,
 			executor: ({ workspaceResolver, eventSink }) => {
+				sourceStatusSubscription?.dispose();
 				runtime = createVscodeAgentRuntime(
 					vscode,
 					context,
@@ -230,6 +232,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 					workerPlatform,
 					delegatedToolInvocations,
 				);
+				sourceStatusSubscription = runtime.onDidSourceStatusChange(() => changeEvents.fire());
 				return new WindowNodeTaskExecutor({
 					nodeId,
 					nodeInstanceId,
@@ -265,6 +268,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		});
 		addApplicationCleanup(cleanup, () => node.dispose(), true);
 		addApplicationCleanup(cleanup, () => changeEvents.dispose());
+		addApplicationCleanup(cleanup, () => sourceStatusSubscription?.dispose());
 		await node.start();
 		const remoteTasks = new LocalIpcRemoteTaskAdapter(node);
 		const localTasks = new LocalBrokerTaskFacade(node, {

@@ -9,12 +9,20 @@ import {
 } from '../agentHost/AhpAgentRuntime';
 import { AgentHostLauncher } from '../agentHost/AgentHostLauncher';
 import {
+	AgentHostSourceSelector,
+	EditorAgentHostLauncher,
+} from '../agentHost/AgentHostSourceSelector';
+import { EditorAgentHostLocator } from '../agentHost/EditorAgentHostLocator';
+import { UnixSocketWebSocketConnector } from '../agentHost/UnixSocketWebSocketConnector';
+import {
 	formatSessionConfigDefault,
 	parseSessionConfigInput,
 	validateSessionConfigValue,
 } from '../agentHost/SessionConfigValue';
 import { AgentRuntimeError } from '../agentHost/AgentRuntime';
 import type {
+	AgentHostSourceStatus,
+	AgentHostSourceStatusProvider,
 	AgentRuntime,
 	AgentRuntimeProbe,
 	AgentTaskHandle,
@@ -182,31 +190,53 @@ export function createVscodeAgentRuntime(
 	approval: FirstTaskConfirmation,
 	workerPlatform: WorkerPlatformSupport,
 	delegatedToolInvocations?: DelegatedToolInvocationRegistry,
-): AgentRuntime {
+): AgentRuntime & AgentHostSourceStatusProvider {
 	const configuration = vscodeApi.workspace.getConfiguration(configurationSection);
 	const launcher = new AgentHostLauncher({
 		storageRoot: vscodeApi.Uri.joinPath(context.globalStorageUri, 'agent-host').fsPath,
 		configuredCodeCli: configuration.get<string>('codePath') || undefined,
 	});
-	const runtime = new AhpAgentRuntime({
+	const common = {
 		enabled: () => vscodeApi.workspace
 			.getConfiguration(configurationSection)
 			.get<boolean>('experimental.agentHost', false),
-		launcher,
-		connections: new SdkAhpConnectionFactory(),
 		authBroker: new VscodeAuthBroker(vscodeApi.authentication, (resource) =>
 			resolveAuthenticationProvider(vscodeApi, resource)),
 		confirmation: approval,
 		workspaceResolver,
 		configResolver: new VscodeSessionConfigurationResolver(vscodeApi),
 		delegatedToolInvocations,
+	};
+	const standalone = new AhpAgentRuntime({
+		...common,
+		launcher,
+		connections: new SdkAhpConnectionFactory(),
+	});
+	const editor = new AhpAgentRuntime({
+		...common,
+		launcher: new EditorAgentHostLauncher(
+			new EditorAgentHostLocator({
+				configuredCodeCli: configuration.get<string>('codePath') || undefined,
+				configuredUserDataDir: configuration.get<unknown>('agentHost.userDataDir'),
+				platform: { productName: vscodeApi.env.appName },
+			}),
+			new UnixSocketWebSocketConnector(),
+		),
+		connections: new SdkAhpConnectionFactory(),
+	});
+	const runtime = new AgentHostSourceSelector({
+		preferEditor: () => vscodeApi.workspace
+			.getConfiguration(configurationSection)
+			.get<boolean>('experimental.peerDelegation', false),
+		editor,
+		standalone,
 	});
 	return new GuardedAgentRuntime(runtime, guard, workerPlatform);
 }
 
-class GuardedAgentRuntime implements AgentRuntime {
+class GuardedAgentRuntime implements AgentRuntime, AgentHostSourceStatusProvider {
 	public constructor(
-		private readonly delegate: AgentRuntime,
+		private readonly delegate: AgentRuntime & AgentHostSourceStatusProvider,
 		private readonly guard: LocalDesktopWorkspaceGuard,
 		private readonly workerPlatform: WorkerPlatformSupport,
 	) {}
@@ -237,6 +267,16 @@ class GuardedAgentRuntime implements AgentRuntime {
 
 	public dispose(): Promise<void> {
 		return this.delegate.dispose();
+	}
+
+	public sourceStatus(): AgentHostSourceStatus {
+		return this.delegate.sourceStatus();
+	}
+
+	public onDidSourceStatusChange(listener: (status: AgentHostSourceStatus) => void): {
+		dispose(): void;
+	} {
+		return this.delegate.onDidSourceStatusChange(listener);
 	}
 }
 

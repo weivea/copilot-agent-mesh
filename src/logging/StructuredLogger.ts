@@ -1,4 +1,5 @@
 import type * as vscode from 'vscode';
+import { redactRegisteredSensitiveValues } from '../security/SensitiveValueRedaction';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
@@ -40,7 +41,7 @@ export class StructuredLogger implements vscode.Disposable {
 }
 
 export function redactText(value: string): string {
-	return value
+	return redactRegisteredSensitiveValues(value)
 		.replace(urlPattern, (candidate) => redactUrl(candidate))
 		.replace(posixPath, (candidate) => `${candidate[0]?.trim().length === 0 ? candidate[0] : ''}[local-path]`)
 		.replace(windowsPath, '[local-path]')

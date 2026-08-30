@@ -30,6 +30,7 @@ extend Worker support beyond macOS arm64 or authorize publication.
 | Local routing | Window A → Broker → Window B → real AHP → Broker store → Window A; no Tunnel | Authenticated start/output/cancel passed without touching Tunnel | Pass on tested build |
 | AHP package | TypeScript package `0.9.0` from pinned upstream commit `f19dd8b3942d029744a3bdd31d830f9428e8ea47`; negotiates AHP `1.0.0` | Current VS Code 1.135.0 Agent Host handshake and real turn passed | Pass; upstream revision is not yet tagged or npm-published |
 | AHP authentication | `https://api.github.com` → provider `github`, scopes `read:user`, `user:email` | Dedicated profile exposed a silent session accepted by Agent Host | Pass on tested profile |
+| Editor Agent Host source (0.4.0 P6) | schema-v2 editor endpoint, Unix socket WebSocket, AHP offer `1.0.0`; standalone fallback | Offline strict parser/socket/selector/lifecycle coverage. The 2026-08-31 macOS arm64 local registry had zero editor endpoints, so live initialize/O1 were not runnable there | Implemented; live connectivity and Chat Sessions visibility remain unverified for P8 |
 | Dev Tunnel CLI | Exact macOS arm64 build `1.0.2030+fc9273aa0f` | Existing exact-build lifecycle evidence; multi-window local route kept Listener/Tunnel stopped | Pass on macOS arm64 only |
 | Remote v2 route | One device Gateway/Tunnel → Broker → explicit Window Node | Historical two-device pairing/discovery and durable acceptance passed; its disposable Worker profile then stopped at `AGENT_AUTH_REQUIRED` | Transport/routing pass; authenticated two-device execution not yet run |
 | Artifact Store | Immutable bounded JSON with producer/consumer ownership, length, SHA-256, and revision | Size/count/media/hash/ownership/corruption/path/secret tests plus exact 153-byte contract handoff passed | Same-device Broker scope only; not arbitrary file transfer |
@@ -54,6 +55,10 @@ the listener and execute real AHP tasks remains platform-gated.
 | macOS | x64 | No owned Worker lifecycle evidence | Active client Window Node; Worker host unsupported |
 | Windows | x64 | Named-pipe and offline coverage; no Job Object-based real Agent Host/Tunnel gate | Active client Window Node; Worker host unsupported |
 | Linux | x64 | Unix IPC and offline coverage; no validated real Tunnel/Worker gate | Active client Window Node; Worker host unsupported |
+
+The P6 user-data strategy has offline Stable/Insiders/Linux/Windows/override tests.
+Those strategies do not change the support rows above: Windows, Linux, and macOS x64
+Worker Host execution and editor endpoint discovery remain unsupported/unverified.
 
 ## Migration and unsupported environments
 
