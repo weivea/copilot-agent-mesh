@@ -12,7 +12,7 @@ import {
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptDirectory, '..');
-const vsixPath = resolve(process.argv[2] ?? join(repositoryRoot, 'artifacts/copilot-agent-mesh-0.2.0-preview.vsix'));
+const vsixPath = resolve(process.argv[2] ?? join(repositoryRoot, 'artifacts/copilot-agent-mesh-0.3.0-preview.vsix'));
 const temporaryRoot = process.platform === 'win32' ? tmpdir() : '/tmp';
 const root = mkdtempSync(join(temporaryRoot, 'cam-vsix-'));
 const userDataDirectory = join(root, 'user-data');
@@ -54,7 +54,7 @@ try {
 		'--list-extensions',
 		'--show-versions',
 	]);
-	if (!listing.split(/\r?\n/u).includes('weivea.copilot-agent-mesh@0.2.0')) {
+	if (!listing.split(/\r?\n/u).includes('weivea.copilot-agent-mesh@0.3.0')) {
 		throw new Error(`Installed extension was not present in the isolated profile:\n${listing}`);
 	}
 

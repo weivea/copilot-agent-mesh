@@ -1,6 +1,6 @@
 # Copilot Agent Mesh
 
-Copilot Agent Mesh 0.2.0 Preview coordinates GitHub Copilot coding tasks across
+Copilot Agent Mesh 0.3.0 Preview coordinates GitHub Copilot coding tasks across
 trusted devices, VS Code windows, and local workspaces. It uses Mesh protocol v2;
 v1 peers are explicitly incompatible. Gate G0 has passed for the validated
 macOS arm64 Preview scope; this remains an evaluation build, not a cross-platform
@@ -23,6 +23,9 @@ Preview. Other platforms fail closed with `CLI_UNSUPPORTED` or
 - VS Code 1.103 or newer is required.
 - Real Worker execution is experimental, disabled by default, and may consume Copilot quota.
 - Enable `copilotAgentMesh.experimental.agentHost` only after reviewing the first-task confirmation and process ownership behavior.
+- Same-device multi-project collaboration is a separate Preview opt-in. Enable
+  `copilotAgentMesh.experimental.sameDeviceCollaboration` only after opening and
+  claiming at least two different local workspaces.
 - AHP authentication is not inferred. Every advertised protected-resource or authorization-server URL must be mapped explicitly in `copilotAgentMesh.experimental.authenticationProviders` to an installed VS Code authentication provider and its exact scopes. Missing mappings fail with `AGENT_AUTH_REQUIRED`.
 - Tunnel hosting requires a user-supplied `copilotAgentMesh.devTunnelPath` pointing to the exact validated macOS arm64 CLI build `1.0.2030+fc9273aa0f`. The extension does not search `PATH`, download, install, or upgrade Dev Tunnel.
 - A fresh shared profile has no authentication session by default. Real AHP E2E
@@ -44,16 +47,26 @@ See [Preview release and installation](./docs/mvp/release.md) for packaging, ins
 - Discover explicit Device → Node → Workspace targets, then delegate, poll,
   cancel, and answer tasks.
 - Run the production Agent Host/AHP adapter with explicit VS Code authentication.
-- Use five Copilot tools: list workers, delegate, get, cancel, and answer.
+- Use eight Copilot tools: the five task tools plus start/get/cancel for local
+  multi-project collaboration. Task input still uses `mesh_answer_task`.
 - Operate the Broker, owner/takeover state, local nodes, workspace conflicts,
-  remote nodes, listener, peers, and tasks from the Activity Bar Dashboard.
+  remote nodes, listener, peers, tasks, and Collaboration Runs from the Activity
+  Bar Dashboard.
 - Persist shared task/delegation state and bounded reducer events behind
   generation-fenced Broker writes.
+- Persist `CollaborationRun` DAGs and immutable, Broker-owned structured JSON
+  artifacts. The orchestrator runs backend implementation and contract
+  production, frontend consumption, then one validation task per workspace.
 
 Local tasks take the full direct route Window A → local Broker → Window B → real
 AHP → Broker store → Window A and never touch Dev Tunnel. Remote v2 traffic uses
 the device's single Gateway/Tunnel, is routed by the Broker to the selected node,
 and is multiplexed back to all local windows over IPC.
+
+Same-device collaboration uses that local route only. Artifact content is not a
+general file-transfer surface: media types, count, size, structure, ownership,
+consumer task, content length, and SHA-256 are validated; paths, credentials,
+raw logs, prompts, output, and transcripts are rejected.
 
 The final ordinary-window run passed on VS Code 1.135.0, macOS arm64, using a
 dedicated authenticated profile. It observed two Window Nodes in 133 ms, five
@@ -63,13 +76,21 @@ earlier two-device v2 run remains transport/routing evidence only because its
 disposable Worker profile stopped at `AGENT_AUTH_REQUIRED`. See
 [the E2E evidence](./docs/mvp/e2e.md).
 
+The 0.3.0 real multi-project run also passed on that scope. Two ordinary windows
+completed backend and frontend AHP turns, handed off one 153-byte
+`application/schema+json` artifact by exact ID and SHA-256, passed both workspace
+validations, reached `CollaborationRun.completed`, kept Listener/Tunnel stopped,
+survived the existing reclaim/takeover/conflict checks, and left zero owned
+process/socket residue. Evidence:
+`.vscode-test/multi-project-evidence/99d16bac-1b46-470d-9c7d-b9ebb74d4352.json`.
+
 ## Install the local Preview
 
 ```bash
 git submodule update --init --recursive
 npm ci
 npm run package:vsix
-code --install-extension artifacts/copilot-agent-mesh-0.2.0-preview.vsix
+code --install-extension artifacts/copilot-agent-mesh-0.3.0-preview.vsix
 ```
 
 Project documents:
@@ -112,6 +133,7 @@ npm test
 npm run verify
 npm run package:vsix
 npm run test:multi-window-real
+MESH_MULTI_PROJECT_E2E=1 npm run test:multi-project-real
 ```
 
 To opt into the real AHP path (which may consume quota):
@@ -122,6 +144,14 @@ MESH_MULTI_WINDOW_E2E_TASKS=1 npm run test:multi-window-real
 ```
 
 The short runtime path avoids the macOS Unix-domain socket path limit.
+
+The multi-project command is disabled unless `MESH_MULTI_PROJECT_E2E=1` is
+explicitly set. It requires a dedicated authenticated profile because it runs
+four real AHP tasks and may consume Copilot quota; see
+[the E2E guide](./docs/mvp/e2e.md).
+
+Cross-device collaboration is not implemented or verified. Windows, Linux, and
+macOS x64 remain unable to host Worker/AHP execution in this Preview.
 
 ## Project layout
 

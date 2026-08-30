@@ -2,7 +2,7 @@ import { DashboardViewModel } from './DashboardPresenter';
 import { containsUnsafeDashboardText } from './DashboardRedaction';
 import { TASK_STATUSES, utf8ByteLength } from '../../shared/protocol';
 
-export const DASHBOARD_MESSAGE_VERSION = 2 as const;
+export const DASHBOARD_MESSAGE_VERSION = 3 as const;
 
 export const DASHBOARD_ACTIONS = [
 	'configureDevice',
@@ -16,6 +16,10 @@ export const DASHBOARD_ACTIONS = [
 	'runTask',
 	'cancelTask',
 	'answerTaskInput',
+	'startCollaboration',
+	'getCollaboration',
+	'cancelCollaboration',
+	'answerCollaboration',
 	'refresh',
 ] as const;
 
@@ -61,6 +65,9 @@ const targetActions = new Set<DashboardAction>([
 	'removePeer',
 	'cancelTask',
 	'answerTaskInput',
+	'getCollaboration',
+	'cancelCollaboration',
+	'answerCollaboration',
 ]);
 
 export function parseDashboardInboundMessage(value: unknown): DashboardInboundMessage | undefined {
@@ -148,7 +155,19 @@ export function assertSafeDashboardOutboundMessage(value: DashboardOutboundMessa
 function assertDashboardViewModel(model: unknown): asserts model is DashboardViewModel {
 	assertExactRecord(
 		model,
-		['device', 'listener', 'broker', 'localNodes', 'remoteDevices', 'workspaces', 'peers', 'tasks', 'errors'],
+		[
+			'device',
+			'listener',
+			'broker',
+			'localNodes',
+			'remoteDevices',
+			'workspaces',
+			'peers',
+			'tasks',
+			'collaborationPreview',
+			'collaborationRuns',
+			'errors',
+		],
 		[],
 	);
 	assertExactRecord(
@@ -286,6 +305,77 @@ function assertDashboardViewModel(model: unknown): asserts model is DashboardVie
 		assertOptionalString(task.summary);
 		if (task.error !== undefined) {
 			assertDashboardError(task.error);
+		}
+	}
+
+	assertExactRecord(model.collaborationPreview, ['enabled', 'canStart'], []);
+	assertBoolean(model.collaborationPreview.enabled);
+	assertBoolean(model.collaborationPreview.canStart);
+	assertArray(model.collaborationRuns, 50);
+	for (const run of model.collaborationRuns) {
+		assertExactRecord(
+			run,
+			[
+				'runId',
+				'title',
+				'status',
+				'coordinatorNodeId',
+				'participants',
+				'tasks',
+				'artifacts',
+				'canCancel',
+				'canAnswer',
+			],
+			[],
+		);
+		assertIdentifier(run.runId);
+		assertString(run.title);
+		assertEnum(run.status, ['pending', 'running', 'blocked', 'needsInput', 'completed', 'failed', 'cancelled']);
+		assertIdentifier(run.coordinatorNodeId);
+		assertBoolean(run.canCancel);
+		assertBoolean(run.canAnswer);
+		assertArray(run.participants, 2);
+		for (const participant of run.participants) {
+			assertExactRecord(
+				participant,
+				['role', 'nodeId', 'nodeLabel', 'workspaceId', 'workspaceName'],
+				[],
+			);
+			assertEnum(participant.role, ['frontend', 'backend']);
+			assertIdentifier(participant.nodeId);
+			assertIdentifier(participant.workspaceId);
+			assertStrings(participant, ['nodeLabel', 'workspaceName']);
+		}
+		assertArray(run.tasks, 8);
+		for (const task of run.tasks) {
+			assertExactRecord(
+				task,
+				['taskId', 'title', 'role', 'kind', 'workspaceName', 'status', 'dependsOn'],
+				['validationStatus', 'blockCode', 'failureCode'],
+			);
+			assertIdentifier(task.taskId);
+			assertStrings(task, ['title', 'workspaceName']);
+			assertEnum(task.role, ['frontend', 'backend']);
+			assertEnum(task.kind, ['implementation', 'validation']);
+			assertEnum(task.status, ['pending', 'running', 'blocked', 'needsInput', 'completed', 'failed', 'cancelled']);
+			assertArray(task.dependsOn, 8);
+			task.dependsOn.forEach(assertIdentifier);
+			if (task.validationStatus !== undefined) {
+				assertEnum(task.validationStatus, ['passed', 'failed']);
+			}
+			assertOptionalString(task.blockCode);
+			assertOptionalString(task.failureCode);
+		}
+		assertArray(run.artifacts, 16);
+		for (const artifact of run.artifacts) {
+			assertExactRecord(
+				artifact,
+				['artifactId', 'label', 'mediaType', 'contentLength', 'sha256'],
+				[],
+			);
+			assertIdentifier(artifact.artifactId);
+			assertStrings(artifact, ['label', 'mediaType', 'sha256']);
+			assertBoundedInteger(artifact.contentLength, 1, 12 * 1_024);
 		}
 	}
 

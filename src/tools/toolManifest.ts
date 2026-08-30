@@ -4,6 +4,9 @@ export const MESH_TOOL_NAMES = {
 	getTask: 'mesh_get_task',
 	cancelTask: 'mesh_cancel_task',
 	answerTask: 'mesh_answer_task',
+	startCollaboration: 'mesh_start_collaboration',
+	getCollaboration: 'mesh_get_collaboration',
+	cancelCollaboration: 'mesh_cancel_collaboration',
 } as const;
 
 export type MeshToolName = typeof MESH_TOOL_NAMES[keyof typeof MESH_TOOL_NAMES];
@@ -24,6 +27,18 @@ const idSchema = {
 	minLength: 36,
 	maxLength: 36,
 	pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+} as const;
+
+const taskTargetSchema = {
+	type: 'object',
+	properties: {
+		deviceId: { ...idSchema, description: 'The local Device ID returned by mesh_list_workers.' },
+		nodeId: { ...idSchema, description: 'An explicit local Window Node ID returned by mesh_list_workers.' },
+		nodeInstanceId: { ...idSchema, description: 'The exact local Window Node instance ID.' },
+		workspaceId: { ...idSchema, description: 'An explicit claimed local Workspace ID.' },
+	},
+	required: ['deviceId', 'nodeId', 'nodeInstanceId', 'workspaceId'],
+	additionalProperties: false,
 } as const;
 
 export const MESH_TOOL_MANIFEST_DESCRIPTORS: readonly ToolManifestDescriptor[] = [
@@ -125,6 +140,62 @@ export const MESH_TOOL_MANIFEST_DESCRIPTORS: readonly ToolManifestDescriptor[] =
 				answer: { type: 'string', minLength: 1, maxLength: 32768, description: 'Answer text (maximum 32 KiB UTF-8).' },
 			},
 			required: ['taskId', 'inputId', 'answerId', 'answer'],
+			additionalProperties: false,
+		},
+	},
+	{
+		name: MESH_TOOL_NAMES.startCollaboration,
+		displayName: 'Start Local Multi-project Collaboration',
+		toolReferenceName: 'meshStartCollaboration',
+		canBeReferencedInPrompt: true,
+		modelDescription: 'Starts one durable Preview collaboration run across exactly two different claimed workspaces on the same local device. Call mesh_list_workers first and pass explicit frontend and backend Device -> Node -> Workspace targets. Omit collaborationRequestId for a fresh run; reuse the returned ID only for an exact retry. The Broker schedules backend implementation and structured contract production, frontend implementation using that exact authorized artifact, then one validation task per workspace. This path never starts a Listener or Dev Tunnel. Use mesh_get_collaboration to poll, mesh_cancel_collaboration to cancel the active task and pending dependencies, and mesh_answer_task with the active task/input IDs when input is required. Do not use this tool for Git, branch, worktree, commit, push, or pull request management.',
+		userDescription: 'Start a durable same-device frontend/backend collaboration across two explicitly selected workspaces.',
+		tags: ['copilot-agent-mesh'],
+		inputSchema: {
+			type: 'object',
+			properties: {
+				collaborationRequestId: { ...idSchema, description: 'Optional exact-retry identity. Omit for a fresh collaboration.' },
+				title: { type: 'string', minLength: 1, maxLength: 256, description: 'Non-sensitive collaboration title.' },
+				goal: { type: 'string', minLength: 1, maxLength: 65536, description: 'Complete implementation goal, limited to 64 KiB UTF-8.' },
+				frontend: { ...taskTargetSchema, description: 'Explicit frontend participant target.' },
+				backend: { ...taskTargetSchema, description: 'Explicit backend participant target.' },
+				timeoutMinutes: { type: 'integer', minimum: 1, maximum: 1440, default: 60 },
+			},
+			required: ['title', 'goal', 'frontend', 'backend'],
+			additionalProperties: false,
+		},
+	},
+	{
+		name: MESH_TOOL_NAMES.getCollaboration,
+		displayName: 'Get Local Collaboration',
+		toolReferenceName: 'meshGetCollaboration',
+		canBeReferencedInPrompt: true,
+		modelDescription: 'Returns a bounded same-device collaboration snapshot containing participant routes, dependency states, validation summaries, and immutable artifact metadata only. It never returns artifact content, raw prompts, raw output, local paths, or secrets. When a task needs input, use its taskId and inputId with mesh_answer_task.',
+		userDescription: 'Inspect a durable local multi-project collaboration run.',
+		tags: ['copilot-agent-mesh'],
+		inputSchema: {
+			type: 'object',
+			properties: {
+				runId: { ...idSchema, description: 'Collaboration run ID returned by mesh_start_collaboration.' },
+			},
+			required: ['runId'],
+			additionalProperties: false,
+		},
+	},
+	{
+		name: MESH_TOOL_NAMES.cancelCollaboration,
+		displayName: 'Cancel Local Collaboration',
+		toolReferenceName: 'meshCancelCollaboration',
+		canBeReferencedInPrompt: true,
+		modelDescription: 'Cancels the exact active task in an owned same-device collaboration run and marks every not-yet-started dependent task cancelled. Races with authoritative task completion are reconciled without starting a duplicate task.',
+		userDescription: 'Cancel a local multi-project collaboration run.',
+		tags: ['copilot-agent-mesh'],
+		inputSchema: {
+			type: 'object',
+			properties: {
+				runId: { ...idSchema, description: 'Owned collaboration run ID to cancel.' },
+			},
+			required: ['runId'],
 			additionalProperties: false,
 		},
 	},

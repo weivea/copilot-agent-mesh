@@ -1,6 +1,6 @@
 # Copilot Agent Mesh 技术实施方案
 
-> 状态：0.2.0 Preview Multi-window Mesh Nodes 实施基线；Gate G0 在 macOS
+> 状态：0.3.0 Preview Same-device Multi-project Collaboration；Gate G0 在 macOS
 > arm64 验证范围内 Go<br>
 > 日期：2026-08-30<br>
 > 依据：[产品需求文档 v0.3](../copilot-agent-mesh-prd.md)<br>
@@ -9,7 +9,8 @@
 > 当前实现采用 Mesh protocol v2；v1 Peer 明确不兼容。真实普通窗口 E2E 已通过
 > Device Broker、Window Node、本地 IPC、Workspace Claim、Takeover 和清理边界。
 > 最终 opted-in AHP 1.0 运行使用专用认证 Profile，已证明 authoritative
-> start/get/output/handle-cancel/cancelled 和零资源残留。
+> start/get/output/handle-cancel/cancelled 和零资源残留。0.3.0 在此本机控制面上增加
+> 持久 Collaboration Run、DAG 调度、不可变 JSON Artifact Store 和双 Workspace 验证。
 
 ## 1. 结论
 
@@ -31,7 +32,7 @@ Copilot Agent Mesh 可以按“VS Code 扩展 + 本地 Gateway + Microsoft Dev T
 | Agent 控制 | `@microsoft/agent-host-protocol`，精确锁定已验证版本 |
 | 本机控制面 | 稳定 Device Broker + 每普通窗口一个 Window Node |
 | 本机 IPC | macOS/Linux Unix socket；Windows named pipe；nonce + mutual HMAC |
-| 持久化 | Broker 独占的 `globalState` + `SecretStorage` + `globalStorageUri` 原子文件/事件日志 |
+| 持久化 | Broker 独占的 `globalState` + `SecretStorage` + `globalStorageUri` 原子 Task/Run/Artifact 文件与事件日志 |
 | 打包 | esbuild + `@vscode/vsce`，单一通用 VSIX |
 | 测试 | 纯单元、Loopback 组件、Extension Host、显式启用的真实 E2E |
 
@@ -132,7 +133,8 @@ flowchart LR
     A[Window Node A<br/>Tools + Dashboard + real AHP]
     B[Window Node B<br/>Tools + Dashboard + real AHP]
     Broker[Device Broker<br/>generation-fenced owner]
-    Store[Global task/delegation store<br/>reducer event log]
+    Store[Global task/run/artifact store<br/>reducer event log]
+    Orchestrator[Collaboration Orchestrator<br/>dependency DAG]
     Gateway[One Gateway]
     Tunnel[One Dev Tunnel]
     Remote[Remote protocol-v2 Device Broker]
@@ -140,6 +142,7 @@ flowchart LR
     A <-->|authenticated local IPC| Broker
     B <-->|authenticated local IPC| Broker
     Broker <--> Store
+    Broker <--> Orchestrator
     Broker <--> Gateway
     Gateway <--> Tunnel
     Tunnel <--> Remote
@@ -150,7 +153,7 @@ flowchart LR
 | 进程 | 所有者 | 职责 | 禁止暴露 |
 | --- | --- | --- | --- |
 | Broker-owner Extension Host | VS Code | Device Broker、Gateway、一个 Dev Tunnel、Peer Manager、全局 Store、远端路由、Node Registry | Secret、Agent Host token |
-| 其他普通 Extension Host | VS Code | 活跃 Window Node、UI、五个工具、Workspace Claim、自有真实 AHP Runtime/Handle | Broker key、Agent Host token |
+| 其他普通 Extension Host | VS Code | 活跃 Window Node、UI、八个工具、Workspace Claim、自有真实 AHP Runtime/Handle | Broker key、Agent Host token |
 | `devtunnel host` | Mesh 启动 | Relay host 长连接 | 配对密钥、任务内容 |
 | `code agent host` | Mesh 启动或发现 | AHP Server、Copilot Agent Session | AHP connection token |
 | VS Code Webview | Extension | 只显示 ViewModel、发送受限 UI 命令 | Secret、原始本地路径、未脱敏日志 |
@@ -214,6 +217,37 @@ Gateway/Tunnel → Broker → Target Node；Broker 在发送前持久化 Route C
 
 Schema v2 Migration 保留稳定 `deviceId`，并把 v1 Workspace/Task Data 转入
 Broker Store。未知或损坏的版本必须失败，不能静默重置或猜测。
+
+### 4.7 Same-device Collaboration Run
+
+0.3.0 新增 Broker-owned `CollaborationRun` 聚合。`runId`、
+`collaborationRequestId` 和每个 Task/Delegation ID 都是 canonical UUID；精确
+Request Hash 覆盖协调 Node、两种角色、完整目标、标题、目标与超时。相同 ID
+与相同 Payload 恢复同一 Run；任何字段变化都返回
+`COLLABORATION_ID_CONFLICT`。
+
+第一版固定 DAG：
+
+```text
+backend implementation + contract
+  -> frontend implementation with exact authorized artifact
+  -> backend validation
+  -> frontend validation
+```
+
+两个 Validation 节点在 Frontend 完成后可并行，但仍分别经过既有
+Workspace Lease，因此一个 Workspace 同时只有一个 Writer。依赖未完成的 Task
+不能调度；失败/取消向下游传播为显式 blocked/cancelled。Active Task 继续复用
+Broker Task Service、Window Node、AHP Handle、cancel/answer 与 Node-loss
+语义。Broker Takeover 只对账持久 Task ID；已接受 Task 不会再次启动。
+
+Artifact Store 只接受 `application/json`、`application/schema+json` 和
+`application/vnd.oai.openapi+json`。每个不可变记录包含 producer
+run/task、目标 consumer task、bounded label、content length、SHA-256、
+revision 和 JSON content。单 Artifact 12 KiB、单 Run 16 个、全 Store
+2 MiB；原子写、目录 sync 与 Generation Fence 和 Task Store 一致。Secret、
+Token、绝对路径、原始日志、Prompt、Output、Transcript 或越权读取全部明确
+失败，不存在 success-shaped fallback。
 
 ## 5. 建议目录结构
 
@@ -428,7 +462,7 @@ connection.draining
 
 `mesh.hello` 使用 `protocolMin` / `protocolMax`，而不是单个版本号。双方选择最高共同版本；无交集返回 `PROTOCOL_INCOMPATIBLE` 并关闭连接。
 
-0.2.0 只提供 protocol v2；v1 Peer 没有共同版本，明确
+0.3.0 继续只提供 protocol v2；v1 Peer 没有共同版本，明确
 `PROTOCOL_INCOMPATIBLE`。
 
 未知字段只可在明确标记为 forward-compatible 的对象中忽略。未知 Method、状态值、认证字段或影响授权的字段必须拒绝。
@@ -444,6 +478,10 @@ connection.draining
 | Task answer | 32 KiB |
 | 单条 output event | 16 KiB |
 | Terminal summary | 16 KiB |
+| Collaboration goal | 64 KiB |
+| 单 Artifact JSON content | 12 KiB |
+| 单 Run Artifacts | 16 |
+| Artifact Store content 总量 | 2 MiB |
 | Error message | 2 KiB |
 | 每 Peer 普通待发送队列 | 256 KiB 或 128 events |
 | 每 Peer 总待发送量 | 1 MiB Critical Frame + 256 KiB 普通流量，最多 144 events |
@@ -786,16 +824,18 @@ Login 过期、Build/Schema 不支持、ACE 过期和资源不存在属于 Perma
 
 ### 12.1 Manifest
 
-每个 Tool 必须同时存在于 `package.json.contributes.languageModelTools` 和运行时 `vscode.lm.registerTool`。0.2 注册：
+每个 Tool 必须同时存在于 `package.json.contributes.languageModelTools` 和运行时 `vscode.lm.registerTool`。0.3 注册：
 
 - `mesh_list_workers`
 - `mesh_delegate_task`
 - `mesh_get_task`
 - `mesh_cancel_task`
+- `mesh_answer_task`
+- `mesh_start_collaboration`
+- `mesh_get_collaboration`
+- `mesh_cancel_collaboration`
 
-`mesh_answer_task` 已包含在 0.2 的五个 Production Tool 中。
-
-五个 Tool 的 Target Contract 都是显式
+八个 Tool 的 Target Contract 都是显式
 `Device → Node → Workspace`；不能只靠 Workspace 名称或当前窗口隐式选路。
 
 Tool Name 合法，不能使用保留的 `copilot_` 或 `vscode_` 前缀。`canBeReferencedInPrompt: true` 时必须提供 `toolReferenceName`。[Tool Contribution Schema](https://github.com/microsoft/vscode/blob/1.103.0/src/vs/workbench/contrib/chat/common/tools/languageModelToolsContribution.ts)
@@ -811,6 +851,9 @@ Manifest 与 Runtime Registration 必须一一相等，并通过 Cold Extension 
 | get | 无 | 无 | 10 秒 |
 | cancel | 请求终止远程 Task | 必须 | 10 秒 |
 | answer | 将用户回答发送到远端 Task | 必须 | 10 秒 |
+| start collaboration | 创建/恢复同设备 Run 并调度首个 Ready Task | 必须 | 15 秒 |
+| get collaboration | 读取 bounded Run/DAG/Artifact metadata | 无 | 10 秒 |
+| cancel collaboration | 精确取消 Active Task 并终止未启动依赖 | 必须 | 10 秒 |
 
 `prepareInvocation` 必须无副作用，因为它可能执行后不调用 `invoke`。确认文案显示目标设备、Workspace 和任务摘要，不显示本地路径或 Secret。
 
@@ -840,7 +883,7 @@ new vscode.LanguageModelToolResult([
 | --- | --- | --- |
 | `globalState` | deviceId/name、Tunnel 元数据、Workspace 索引、Peer 非敏感 Profile、Task Summary 派生索引 | Secret、Token、完整 Prompt/Output |
 | `SecretStorage` | Invitation Secret、Pending/Active Peer Root Key、可选短期 Tunnel Token | Task Journal、日志 |
-| `globalStorageUri` | Task Recovery Record、有限 Event Journal、诊断文件 | Credential、源码副本、无限 Transcript |
+| `globalStorageUri` | Task/Collaboration Recovery Record、有限 Event Journal、受限 JSON Artifact、诊断文件 | Credential、源码副本、无限 Transcript、任意文件传输 |
 
 Broker Key 也位于 `SecretStorage`，只用于同 User Data 的本机 IPC Mutual HMAC。
 任何 Mesh Key 都不得传给 `globalState.setKeysForSync`；Device、Tunnel、Peer、
@@ -872,7 +915,10 @@ Task 与 Workspace Metadata 不通过 Settings Sync 跨设备复制。
 | Diagnostic File | 7 天、总计最多 10 MiB |
 | Peer Profile / Secret | 到撤销或轮换 |
 
-Worker-local File URI 不得放入远程 Artifact。0.2 Artifact 只传 opaque ID、Label 和可安全公开的 HTTPS URL；本地文件传输留待独立授权协议。
+Worker-local File URI 不得放入 Artifact。0.3 Artifact 只允许三种结构化 JSON
+media type；Wire/Dashboard 只传 opaque ID、Label、media type、size、SHA-256
+与 revision，Content 仅由 Broker 向精确 consumer task 读取。本地文件传输仍留待
+独立授权协议。
 
 Journal 主要保存状态、Progress 摘要和有限 Output Ring，不承诺 24 小时完整 Transcript。裁剪后保存 `earliestAvailableEventSeq`；`task.get` 返回 `eventsTruncated: true`，让 Coordinator 区分“没有事件”和“事件已清理”。
 
@@ -898,11 +944,12 @@ interface DashboardViewModel {
   workspaceConflicts: readonly WorkspaceConflictViewModel[];
   remoteNodes: readonly RemoteNodeViewModel[];
   tasks: readonly TaskViewModel[];
+  collaborationRuns: readonly CollaborationRunViewModel[];
 }
 ```
 
 Dashboard 明确显示 Broker Owner/Generation/Takeover、本机 Nodes、Workspace
-Claims/Conflicts 和 Remote Nodes。所有操作与五个 Tool 一样使用
+Claims/Conflicts、Remote Nodes 和 Collaboration Runs。所有操作与八个 Tool 一样使用
 Device → Node → Workspace Target。UI Command 进入 Extension Host 后通过 IPC
 交给 Broker/Application Service，再由权威 Store Event multiplex 刷新全部窗口。
 
@@ -1072,6 +1119,8 @@ zod
 - HMAC 固定向量、过期与重放。
 - Enrollment 两阶段提交、Commit Ack 丢失、Incomplete Handshake、每 Peer 独立 Invitation、离线 Peer 撤销。
 - Task Reducer、Lease、Idempotency。
+- Collaboration Reducer、DAG 循环拒绝、依赖失败传播、exact idempotency。
+- Artifact media/size/count/hash/ownership/corruption 与 Generation Fence。
 - Delegation Ack 丢失与相同 Request ID 重试。
 - Task Ownership：另一已认证 Peer 无法 Get/Cancel/Answer。
 - Backoff、Fake Clock、Retention。
@@ -1111,6 +1160,9 @@ zod
 4. **Multi-window E2E：** 相同 User Data 的普通 VS Code Windows，验证一个
    Broker、多 Node、IPC、Claim/Reclaim/Conflict、Takeover 与精确清理。默认不
    启动 AHP Task。
+5. **Multi-project E2E：** `MESH_MULTI_PROJECT_E2E=1 npm run
+   test:multi-project-real`，两个普通 Window/Workspace、真实 backend/frontend
+   AHP completion、精确 Artifact handoff、两边 Validation、Run completed 与零残留。
 
 环境变量：
 
@@ -1120,6 +1172,7 @@ MESH_AGENT_HOST_E2E=1
 MESH_TWO_DEVICE_E2E=1
 npm run test:multi-window-real
 MESH_MULTI_WINDOW_E2E_TASKS=1 npm run test:multi-window-real
+MESH_MULTI_PROJECT_E2E=1 npm run test:multi-project-real
 ```
 
 macOS Unix Socket 路径过长时使用短目录：
@@ -1143,6 +1196,12 @@ macOS arm64 已记录以下真实运行：
   VS Code 1.135.0 使用专用认证 Profile；2 Nodes / 133 ms，`agentStarted`，
   5 个 output，handle cancel，authoritative `cancelled`，Offline 210 ms，
   Takeover 1878 ms，相同 `workspaceId`，Duplicate Conflict，零残留。
+- `.vscode-test/multi-project-evidence/99d16bac-1b46-470d-9c7d-b9ebb74d4352.json`：
+  0.3.0 真实双项目运行；2 Nodes / 182 ms、exactly one Broker、两个不同 Claim，
+  backend/frontend 均有 `agentStarted`、output、turnComplete/completed，153-byte
+  schema Artifact 由 frontend 精确消费，两边 Validation 与独立检查通过，
+  Run completed，Listener/Tunnel Stopped，Takeover 993 ms，Profile Lock 释放且
+  Process/Socket/Timer 零残留。
 
 实施期间 Unit、Component、Extension Host 和完整 npm Test 均通过；最终发布
 验证完成前不在文档中固定数量。
@@ -1177,7 +1236,7 @@ Linux Extension Host Test 使用 `xvfb-run -a`。[VS Code CI](https://code.visua
 
 ## 21. Release Gate
 
-以下全部通过才可把 0.2.0 Preview Evaluation Package 提升为通过 G0 的发布候选。
+以下全部通过才可把 0.3.0 Preview Evaluation Package 提升为通过 G0 的发布候选。
 macOS arm64 验证范围现为 Go；这不表示已 Push/Release/Publish：
 
 1. Gateway 只监听 `127.0.0.1`，只公开 `/healthz` 和认证 RPC Upgrade。
@@ -1205,6 +1264,10 @@ macOS arm64 验证范围现为 Go；这不表示已 Push/Release/Publish：
 20. Node 丢失释放 Claim；当前 AHP 无 Recovery API 时 Task 明确失败为
     `TASK_RECOVERY_UNAVAILABLE`，且不重复执行。
 21. Authenticated Authoritative AHP start/get/cancel/output/handle-cancel 已通过。
+22. 两个普通 Window/Workspace 的 Collaboration Run 完成真实 backend →
+    Artifact → frontend → 双 Validation，重试/Takeover 不重复启动。
+23. Dashboard/Tool 不暴露 Artifact 内容、绝对路径、Secret、原始
+    Prompt/Output；同设备路径始终不触碰 Dev Tunnel。
 
 ## 22. 参考资料
 

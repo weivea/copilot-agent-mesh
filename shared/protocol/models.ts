@@ -41,6 +41,7 @@ export const taskFailureSchema = z.strictObject({
 	message: utf8String(PROTOCOL_LIMITS.errorMessageBytes, 'task failure message', 1),
 	retryable: z.boolean(),
 });
+export type TaskFailure = z.infer<typeof taskFailureSchema>;
 
 export const pendingInputSchema = z.strictObject({
 	inputId: uuidSchema,

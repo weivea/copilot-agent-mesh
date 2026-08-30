@@ -1,7 +1,7 @@
 # MVP Dashboard integration
 
 The dashboard is a secure presentation and command surface. It does not own device,
-listener, tunnel, workspace, peer, or task state.
+listener, tunnel, workspace, peer, task, collaboration, or artifact state.
 
 ## Facade contract
 
@@ -21,6 +21,10 @@ composition root should adapt the real stores and application services to
 | `runTask` | Collect the full task prompt in Extension Host UI and call the coordinator with optional safe peer/workspace IDs |
 | `cancelTask` | Confirm locally and cancel by `taskId` |
 | `answerTaskInput` | Collect the answer in Extension Host UI and submit it by `taskId` |
+| `startCollaboration` | Require the Preview opt-in, collect title/goal in Extension Host UI, explicitly select two different claimed workspaces and frontend/backend roles, confirm, then start |
+| `getCollaboration` | Refresh a selected run by opaque `runId` |
+| `cancelCollaboration` | Confirm locally, cancel the active task, and prevent pending dependencies from starting |
+| `answerCollaboration` | Resolve the active `needsInput` task and reuse the existing task answer channel |
 
 Destructive confirmations are a Facade responsibility and therefore remain an
 Extension Host security boundary. This includes listener stop, workspace/peer
@@ -31,11 +35,20 @@ reports services as unavailable. It never creates fake online state or fake task
 ## Message and data boundary
 
 The webview sends only action names and bounded opaque IDs. Connection URLs,
-pairing secrets, task prompts, complete output, answers, credentials, and local
+pairing secrets, task prompts, collaboration goals, artifact content, complete
+output, answers, credentials, and local
 paths never cross the message bus. Both directions are runtime validated, and
 outbound messages are rejected when they contain forbidden fields, local path
 shapes, secret URL fragments, or oversized strings. Foundation's complete task
 state set is reused directly, including `recovering` and `cancelling`.
+
+The Collaboration Runs model contains only opaque IDs, role, safe
+Node/Workspace labels, task kind/dependency/status, validation status, stable
+block/failure code, and artifact label/media type/size/SHA-256. It excludes
+worker deadlines, request hashes, absolute paths, raw task prompts/output, and
+artifact content. The start button remains disabled until
+`copilotAgentMesh.experimental.sameDeviceCollaboration` is enabled and two
+different non-busy claimed local workspaces are visible.
 
 Each resolved view receives a new `uiInstanceId`. Messages from stale instances
 are rejected, resolve/dispose cleanup is idempotent, and snapshot reads are

@@ -207,6 +207,90 @@ suite('Dashboard', () => {
 		}));
 	});
 
+	test('collaboration view model excludes goals and redacts participant and artifact text', () => {
+		const source = snapshot();
+		const model = new DashboardPresenter().present({
+			...source,
+			collaborationRuns: [{
+				runId: 'run-1',
+				title: 'Changed /Users/person/private-project',
+				status: 'running' as const,
+				coordinatorNodeId: 'node-1',
+				participants: [{
+					role: 'frontend',
+					nodeId: 'node-1',
+					nodeLabel: 'Window C:\\private\\frontend',
+					workspaceId: 'workspace-1',
+					workspaceName: 'src/private.ts',
+				}, {
+					role: 'backend',
+					nodeId: 'node-2',
+					nodeLabel: 'Backend Window',
+					workspaceId: 'workspace-2',
+					workspaceName: 'Backend',
+				}],
+				tasks: [{
+					taskId: 'task-1',
+					title: 'Open /tmp/contract.json',
+					role: 'backend',
+					kind: 'implementation',
+					workspaceName: 'Backend',
+					status: 'running',
+					dependsOn: [],
+				}],
+				artifacts: [{
+					artifactId: 'artifact-1',
+					label: 'Contract at /private/contract.json',
+					mediaType: 'application/schema+json',
+					contentLength: 100,
+					sha256: 'a'.repeat(64),
+				}],
+				canCancel: true,
+				canAnswer: false,
+			}],
+		});
+		const serialized = JSON.stringify(model);
+		assert.doesNotMatch(serialized, /Users|private-project|contract\.json|src\/private/u);
+		assert.doesNotMatch(serialized, /goal|prompt|fullOutput|content"/u);
+		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: 'instance-1',
+			type: 'dashboard.snapshot',
+			model,
+		}));
+	});
+
+	test('validates collaboration shape even when the delegated task list is empty', () => {
+		const model = new DashboardPresenter().present(snapshot());
+		const invalid = {
+			...model,
+			tasks: [],
+			collaborationRuns: [{
+				runId: 'run-1',
+				title: 'Collaboration',
+				status: 'running' as const,
+				coordinatorNodeId: 'node-1',
+				participants: [],
+				tasks: [],
+				artifacts: [{
+					artifactId: 'artifact-1',
+					label: 'Contract',
+					mediaType: 'application/json',
+					contentLength: 13 * 1_024,
+					sha256: 'a'.repeat(64),
+				}],
+				canCancel: true,
+				canAnswer: false,
+			}],
+		};
+		assert.throws(() => assertSafeDashboardOutboundMessage({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: 'instance-1',
+			type: 'dashboard.snapshot',
+			model: invalid,
+		}));
+	});
+
 	test('presents every Foundation task state and safely truncates valid UTF-8 summaries', () => {
 		const source = snapshot();
 		const presenter = new DashboardPresenter();
@@ -418,6 +502,10 @@ suite('Dashboard', () => {
 			},
 			{ action: 'cancelTask', targetId: 'task-1' },
 			{ action: 'answerTaskInput', targetId: 'task-1' },
+			{ action: 'startCollaboration' },
+			{ action: 'getCollaboration', targetId: 'run-1' },
+			{ action: 'cancelCollaboration', targetId: 'run-1' },
+			{ action: 'answerCollaboration', targetId: 'run-1' },
 			{ action: 'refresh' },
 		] as const;
 
@@ -442,6 +530,10 @@ suite('Dashboard', () => {
 			'runTask:device-1:node-1:instance-1:workspace-1:peer-1',
 			'cancelTask:task-1',
 			'answerTaskInput:task-1',
+			'startCollaboration',
+			'getCollaboration:run-1',
+			'cancelCollaboration:run-1',
+			'answerCollaboration:run-1',
 		]);
 		provider.dispose();
 	});
@@ -505,6 +597,22 @@ class RecordingDashboardFacade implements DashboardFacade {
 	public async answerTaskInput(taskId: string): Promise<void> {
 		this.calls.push(`answerTaskInput:${taskId}`);
 	}
+
+	public async startCollaboration(): Promise<void> {
+		this.calls.push('startCollaboration');
+	}
+
+	public async getCollaboration(runId: string): Promise<void> {
+		this.calls.push(`getCollaboration:${runId}`);
+	}
+
+	public async cancelCollaboration(runId: string): Promise<void> {
+		this.calls.push(`cancelCollaboration:${runId}`);
+	}
+
+	public async answerCollaboration(runId: string): Promise<void> {
+		this.calls.push(`answerCollaboration:${runId}`);
+	}
 }
 
 class DeferredDashboardFacade extends RecordingDashboardFacade {
@@ -565,6 +673,10 @@ class RecordingServiceBindings implements DashboardServiceBindings {
 
 	public async cancelTask(_taskId: string): Promise<void> {}
 	public async answerTaskInput(_taskId: string, _answer: string): Promise<void> {}
+	public async startCollaboration(_request: { readonly title: string; readonly goal: string }): Promise<void> {}
+	public async getCollaboration(_runId: string): Promise<void> {}
+	public async cancelCollaboration(_runId: string): Promise<void> {}
+	public async answerCollaboration(_runId: string, _answer: string): Promise<void> {}
 }
 
 class TestWebview implements vscode.Webview {
@@ -685,6 +797,11 @@ function snapshot(): DashboardSnapshot {
 			canCancel: true,
 			needsInput: false,
 		}],
+		collaborationPreview: {
+			enabled: true,
+			canStart: false,
+		},
+		collaborationRuns: [],
 		errors: [],
 	};
 }

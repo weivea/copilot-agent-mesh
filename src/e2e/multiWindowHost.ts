@@ -21,27 +21,36 @@ export async function run(): Promise<void> {
 		throw new Error('The Copilot Agent Mesh development extension is unavailable.');
 	}
 	const api = await extension.activate();
-	if (api.multiWindowE2e === undefined) {
-		throw new Error('The gated multi-window E2E API was not activated.');
+	const mode = process.env.MESH_MULTI_PROJECT_E2E === '1'
+		? 'multi-project'
+		: 'multi-window';
+	if ((mode === 'multi-project' ? api.multiProjectE2e : api.multiWindowE2e) === undefined) {
+		throw new Error(`The gated ${mode} E2E API was not activated.`);
 	}
-	return runWithApi(api);
+	return runWithApi(api, mode);
 }
 
-export async function runWithApi(api: AgentMeshExtensionApi): Promise<void> {
-	if (process.env.MESH_MULTI_WINDOW_E2E !== '1') {
-		throw new Error('MESH_MULTI_WINDOW_E2E=1 is required for the multi-window Extension Host.');
+export async function runWithApi(
+	api: AgentMeshExtensionApi,
+	mode: 'multi-window' | 'multi-project' = 'multi-window',
+): Promise<void> {
+	const environmentPrefix = mode === 'multi-project'
+		? 'MESH_MULTI_PROJECT_E2E'
+		: 'MESH_MULTI_WINDOW_E2E';
+	if (process.env[environmentPrefix] !== '1') {
+		throw new Error(`${environmentPrefix}=1 is required for the ${mode} Extension Host.`);
 	}
-	const controlRoot = process.env.MESH_MULTI_WINDOW_E2E_CONTROL_DIR;
-	const nonce = process.env.MESH_MULTI_WINDOW_E2E_NONCE;
+	const controlRoot = process.env[`${environmentPrefix}_CONTROL_DIR`];
+	const nonce = process.env[`${environmentPrefix}_NONCE`];
 	if (controlRoot === undefined || !isAbsolute(controlRoot)) {
-		throw new Error('MESH_MULTI_WINDOW_E2E_CONTROL_DIR must be an absolute path.');
+		throw new Error(`${environmentPrefix}_CONTROL_DIR must be an absolute path.`);
 	}
 	if (nonce === undefined) {
-		throw new Error('MESH_MULTI_WINDOW_E2E_NONCE is required.');
+		throw new Error(`${environmentPrefix}_NONCE is required.`);
 	}
-	const controller = api.multiWindowE2e;
+	const controller = mode === 'multi-project' ? api.multiProjectE2e : api.multiWindowE2e;
 	if (controller === undefined) {
-		throw new Error('The gated multi-window E2E API was not activated.');
+		throw new Error(`The gated ${mode} E2E API was not activated.`);
 	}
 	const folders = vscode.workspace.workspaceFolders;
 	if (

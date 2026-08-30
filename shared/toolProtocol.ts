@@ -1,4 +1,8 @@
-import type { TaskStatus } from './protocol';
+import type {
+	CollaborationRunSnapshot,
+	TaskStatus,
+	TaskTarget,
+} from './protocol';
 
 export const TASK_TOOL_LIMITS = {
 	idBytes: 36,
@@ -20,6 +24,8 @@ export const TASK_TOOL_LIMITS = {
 	maxTagsPerWorkspace: 32,
 	maxEvents: 100,
 	maxArtifacts: 32,
+	collaborationGoalBytes: 64 * 1024,
+	maxCollaborationRuns: 50,
 	minimumOutputBytes: 1_024,
 	defaultOutputBytes: 32 * 1024,
 } as const;
@@ -30,6 +36,9 @@ export const TASK_TOOL_DEADLINES_MS = {
 	getTask: 10_000,
 	cancelTask: 10_000,
 	answerTask: 10_000,
+	startCollaboration: 15_000,
+	getCollaboration: 10_000,
+	cancelCollaboration: 10_000,
 } as const;
 
 export const TASK_TOOL_ERROR_CODES = [
@@ -60,6 +69,17 @@ export const TASK_TOOL_ERROR_CODES = [
 	'LOCAL_FILE_WORKSPACE_REQUIRED',
 	'TASK_CANCELLATION_UNCONFIRMED',
 	'DELEGATION_NOT_FOUND',
+	'COLLABORATION_NOT_FOUND',
+	'COLLABORATION_ID_CONFLICT',
+	'COLLABORATION_NOT_CANCELLABLE',
+	'COLLABORATION_DAG_INVALID',
+	'ARTIFACT_NOT_FOUND',
+	'ARTIFACT_FORBIDDEN',
+	'ARTIFACT_INVALID',
+	'ARTIFACT_CORRUPT',
+	'ARTIFACT_LIMIT_EXCEEDED',
+	'FEATURE_DISABLED',
+	'VALIDATION_FAILED',
 	'INTERNAL_ERROR',
 ] as const;
 
@@ -209,4 +229,17 @@ export interface TaskToolReadResult {
 export interface TaskActionReceipt {
 	readonly taskId: string;
 	readonly status: TaskStatus;
+}
+
+export interface StartCollaborationToolInput {
+	readonly collaborationRequestId?: string;
+	readonly title: string;
+	readonly goal: string;
+	readonly frontend: TaskTarget;
+	readonly backend: TaskTarget;
+	readonly timeoutMinutes?: number;
+}
+
+export interface CollaborationRunToolResult {
+	readonly run: CollaborationRunSnapshot;
 }

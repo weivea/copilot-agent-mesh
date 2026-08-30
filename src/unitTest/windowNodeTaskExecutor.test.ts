@@ -29,6 +29,7 @@ const OWNER_ID = '00000000-0000-4000-8000-000000000005';
 const TASK_ID = '00000000-0000-4000-8000-000000000006';
 const INPUT_ID = '00000000-0000-4000-8000-000000000007';
 const ANSWER_ID = '00000000-0000-4000-8000-000000000008';
+const SECOND_INPUT_ID = '00000000-0000-4000-8000-00000000000b';
 
 test('preserves stable Agent runtime failures across the authenticated local IPC boundary', () => {
 	const auth = toWindowNodeHandlerError(
@@ -486,6 +487,111 @@ test('publishes public input IDs and maps exact idempotent answers to the runtim
 		outcome: 'accept',
 		values: { response: 'the answer' },
 	}]);
+	await handle.events.push({ type: 'completed' });
+	await waitFor(() => fixture.events.at(-1)?.event.type === 'completed');
+	await fixture.executor.dispose();
+});
+
+test('maps one bounded string answer across structured Agent input fields', async () => {
+	const fixture = createFixture();
+	await fixture.executor.start(startParams());
+	const handle = fixture.runtime.handles[0];
+	await handle.events.push({
+		type: 'inputRequired',
+		request: {
+			requestId: 'runtime-structured-input',
+			kind: 'chatInput',
+			prompt: 'Approve the requested operation.',
+			fields: [{
+				id: 'confirmed',
+				prompt: 'Confirm',
+				required: true,
+				type: 'boolean',
+			}, {
+				id: 'permission',
+				prompt: 'Permission',
+				required: true,
+				type: 'singleSelect',
+				options: [{ id: 'allow', label: 'Allow', approve: true }],
+			}],
+		},
+	});
+	await waitFor(() => fixture.events.some(({ event }) => event.type === 'inputRequired'));
+	await fixture.executor.answer({
+		nodeId: NODE_ID,
+		nodeInstanceId: NODE_INSTANCE_ID,
+		taskId: TASK_ID,
+		inputId: INPUT_ID,
+		answerId: ANSWER_ID,
+		answer: 'approve',
+	});
+	assert.deepEqual(handle.answers, [{
+		requestId: 'runtime-structured-input',
+		outcome: 'accept',
+		values: {
+			confirmed: true,
+			permission: 'allow',
+		},
+	}]);
+	await handle.events.push({ type: 'completed' });
+	await waitFor(() => fixture.events.at(-1)?.event.type === 'completed');
+	await fixture.executor.dispose();
+});
+
+test('queues concurrent Agent inputs and publishes them one at a time', async () => {
+	const inputIds = [INPUT_ID, SECOND_INPUT_ID];
+	const fixture = createFixture({
+		ids: { next: () => inputIds.shift()! },
+	});
+	await fixture.executor.start(startParams());
+	const handle = fixture.runtime.handles[0];
+	await handle.events.push({
+		type: 'inputRequired',
+		request: {
+			requestId: 'runtime-first-input',
+			kind: 'toolConfirmation',
+			prompt: 'Approve first tool?',
+		},
+	});
+	await handle.events.push({
+		type: 'inputRequired',
+		request: {
+			requestId: 'runtime-second-input',
+			kind: 'toolConfirmation',
+			prompt: 'Approve second tool?',
+		},
+	});
+	await waitFor(() => fixture.events.some(({ event }) => event.type === 'inputRequired'));
+	assert.equal(
+		fixture.events.filter(({ event }) => event.type === 'inputRequired').length,
+		1,
+	);
+	await fixture.executor.answer({
+		nodeId: NODE_ID,
+		nodeInstanceId: NODE_INSTANCE_ID,
+		taskId: TASK_ID,
+		inputId: INPUT_ID,
+		answerId: ANSWER_ID,
+		answer: 'approve',
+	});
+	await waitFor(() =>
+		fixture.events.filter(({ event }) => event.type === 'inputRequired').length === 2,
+	);
+	await fixture.executor.answer({
+		nodeId: NODE_ID,
+		nodeInstanceId: NODE_INSTANCE_ID,
+		taskId: TASK_ID,
+		inputId: SECOND_INPUT_ID,
+		answerId: '00000000-0000-4000-8000-00000000000c',
+		answer: 'approve',
+	});
+	assert.deepEqual(
+		handle.answers.map(({ requestId, outcome }) => ({ requestId, outcome })),
+		[
+			{ requestId: 'runtime-first-input', outcome: 'accept' },
+			{ requestId: 'runtime-second-input', outcome: 'accept' },
+		],
+	);
 	await handle.events.push({ type: 'completed' });
 	await waitFor(() => fixture.events.at(-1)?.event.type === 'completed');
 	await fixture.executor.dispose();

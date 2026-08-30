@@ -6,6 +6,35 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [Unreleased]
 
+## [0.3.0 Preview] - 2026-08-30
+
+- Added a generation-fenced, durable `CollaborationRun` aggregate with explicit
+  frontend/backend participants, task dependencies, idempotent request identity,
+  blocked/input/terminal propagation, takeover reconciliation, and exact
+  cancellation of active versus not-yet-started tasks.
+- Added a Broker-owned immutable Artifact Store limited to bounded structured JSON
+  media types. Artifacts carry producer run/task identity, explicit consumer task
+  authorization, content length, SHA-256, revision, and atomic recovery; forbidden
+  secrets, paths, raw logs, prompts, output, and transcripts fail closed.
+- Added the same-device orchestration sequence: backend contract/implementation →
+  frontend implementation consuming the exact contract artifact → backend and
+  frontend validation → aggregate completion.
+- Added `mesh_start_collaboration`, `mesh_get_collaboration`, and
+  `mesh_cancel_collaboration`, including manifest/runtime parity, safe error codes,
+  deadlines, confirmations, token contraction, and reuse of `mesh_answer_task`.
+- Added a Preview-gated Dashboard Collaboration Runs surface with explicit role and
+  workspace selection, task dependency/blocked/input/validation state, artifact
+  metadata, and start/get/cancel/answer actions. Raw goals and artifact content
+  never enter the webview.
+- Added the explicitly gated `MESH_MULTI_PROJECT_E2E=1 npm run
+  test:multi-project-real` harness for two ordinary VS Code windows, real AHP
+  completion, exact artifact handoff, per-workspace validation, local-route
+  isolation, and zero-residue cleanup evidence.
+- Passed that gate on VS Code 1.135.0/macOS arm64. Evidence
+  `99d16bac-1b46-470d-9c7d-b9ebb74d4352` records both authoritative completed
+  turns, exact Artifact ID/media type/153-byte size/SHA-256 consumption, two
+  passed validations, aggregate completion, no Listener/Tunnel use, released
+  profile lock, and zero owned process/socket residue.
 - Upgraded the production AHP client from the published 0.8.0 tarball to the
   TypeScript 0.9.0 client built from pinned upstream commit
   `f19dd8b3942d029744a3bdd31d830f9428e8ea47`, which negotiates AHP 1.0.0 with

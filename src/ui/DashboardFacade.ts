@@ -88,6 +88,44 @@ export interface DashboardSnapshot {
 			readonly action?: string;
 		};
 	}[];
+	readonly collaborationPreview: {
+		readonly enabled: boolean;
+		readonly canStart: boolean;
+	};
+	readonly collaborationRuns: readonly {
+		readonly runId: string;
+		readonly title: string;
+		readonly status: 'pending' | 'running' | 'blocked' | 'needsInput' | 'completed' | 'failed' | 'cancelled';
+		readonly coordinatorNodeId: string;
+		readonly participants: readonly {
+			readonly role: 'frontend' | 'backend';
+			readonly nodeId: string;
+			readonly nodeLabel: string;
+			readonly workspaceId: string;
+			readonly workspaceName: string;
+		}[];
+		readonly tasks: readonly {
+			readonly taskId: string;
+			readonly title: string;
+			readonly role: 'frontend' | 'backend';
+			readonly kind: 'implementation' | 'validation';
+			readonly workspaceName: string;
+			readonly status: 'pending' | 'running' | 'blocked' | 'needsInput' | 'completed' | 'failed' | 'cancelled';
+			readonly dependsOn: readonly string[];
+			readonly validationStatus?: 'passed' | 'failed';
+			readonly blockCode?: string;
+			readonly failureCode?: string;
+		}[];
+		readonly artifacts: readonly {
+			readonly artifactId: string;
+			readonly label: string;
+			readonly mediaType: string;
+			readonly contentLength: number;
+			readonly sha256: string;
+		}[];
+		readonly canCancel: boolean;
+		readonly canAnswer: boolean;
+	}[];
 	readonly errors: readonly {
 		readonly code: string;
 		readonly message: string;
@@ -141,6 +179,10 @@ export interface DashboardFacade {
 	runTask(target?: DashboardTaskTarget): Promise<void>;
 	cancelTask(taskId: string): Promise<void>;
 	answerTaskInput(taskId: string): Promise<void>;
+	startCollaboration(): Promise<void>;
+	getCollaboration(runId: string): Promise<void>;
+	cancelCollaboration(runId: string): Promise<void>;
+	answerCollaboration(runId: string): Promise<void>;
 }
 
 export interface DashboardServiceBindings {
@@ -161,6 +203,13 @@ export interface DashboardServiceBindings {
 	}): Promise<void>;
 	cancelTask(taskId: string): Promise<void>;
 	answerTaskInput(taskId: string, answer: string): Promise<void>;
+	startCollaboration(request: {
+		readonly title: string;
+		readonly goal: string;
+	}): Promise<void>;
+	getCollaboration(runId: string): Promise<void>;
+	cancelCollaboration(runId: string): Promise<void>;
+	answerCollaboration(runId: string, answer: string): Promise<void>;
 }
 
 export interface DashboardConfirmationHost {
@@ -293,6 +342,52 @@ export class ServiceDashboardFacade implements DashboardFacade {
 			await this.services.answerTaskInput(taskId, answer);
 		}
 	}
+
+	public async startCollaboration(): Promise<void> {
+		const title = await this.inputs.showInputBox({
+			title: 'Name Local Multi-project Collaboration',
+			prompt: 'Enter a non-sensitive title for the collaboration run.',
+			ignoreFocusOut: true,
+			validateInput: validateTaskTitle,
+		});
+		if (title === undefined) {
+			return;
+		}
+		const goal = await this.inputs.showInputBox({
+			title: 'Start Local Multi-project Collaboration',
+			prompt: 'Describe the complete frontend/backend goal. It stays in the Extension Host.',
+			ignoreFocusOut: true,
+			validateInput: validateCollaborationGoal,
+		});
+		if (goal !== undefined) {
+			await this.services.startCollaboration({
+				title: title.trim(),
+				goal: goal.trim(),
+			});
+		}
+	}
+
+	public getCollaboration(runId: string): Promise<void> {
+		return this.services.getCollaboration(runId);
+	}
+
+	public async cancelCollaboration(runId: string): Promise<void> {
+		if (await this.confirmations.confirm('Cancel this collaboration and its active task?', 'Cancel Collaboration')) {
+			await this.services.cancelCollaboration(runId);
+		}
+	}
+
+	public async answerCollaboration(runId: string): Promise<void> {
+		const answer = await this.inputs.showInputBox({
+			title: 'Answer Collaboration Task',
+			prompt: 'The answer stays in the Extension Host.',
+			ignoreFocusOut: true,
+			validateInput: (candidate) => candidate.trim().length > 0 ? undefined : 'An answer is required.',
+		});
+		if (answer !== undefined) {
+			await this.services.answerCollaboration(runId, answer.trim());
+		}
+	}
 }
 
 export class UnavailableDashboardFacade implements DashboardFacade {
@@ -339,6 +434,8 @@ export class UnavailableDashboardFacade implements DashboardFacade {
 			workspaces: [],
 			peers: [],
 			tasks: [],
+			collaborationPreview: { enabled: false, canStart: false },
+			collaborationRuns: [],
 			errors: [{
 				code: 'DASHBOARD_SERVICES_UNAVAILABLE',
 				message: 'Dashboard services have not been connected to the UI facade.',
@@ -403,6 +500,22 @@ export class UnavailableDashboardFacade implements DashboardFacade {
 		return this.unavailable('Task service');
 	}
 
+	public startCollaboration(): Promise<void> {
+		return this.unavailable('Collaboration service');
+	}
+
+	public getCollaboration(_runId: string): Promise<void> {
+		return this.unavailable('Collaboration service');
+	}
+
+	public cancelCollaboration(_runId: string): Promise<void> {
+		return this.unavailable('Collaboration service');
+	}
+
+	public answerCollaboration(_runId: string): Promise<void> {
+		return this.unavailable('Collaboration service');
+	}
+
 	private async unavailable(service: string): Promise<void> {
 		await vscode.window.showErrorMessage(`${service} is unavailable. The dashboard did not perform this action.`);
 	}
@@ -460,4 +573,14 @@ function validateTaskInstruction(candidate: string): string | undefined {
 	return utf8ByteLength(value) <= PROTOCOL_LIMITS.taskPromptBytes
 		? undefined
 		: `The task instruction must be at most ${PROTOCOL_LIMITS.taskPromptBytes} UTF-8 bytes.`;
+}
+
+function validateCollaborationGoal(candidate: string): string | undefined {
+	const value = candidate.trim();
+	if (value.length === 0) {
+		return 'A collaboration goal is required.';
+	}
+	return utf8ByteLength(value) <= PROTOCOL_LIMITS.collaborationGoalBytes
+		? undefined
+		: `The collaboration goal must be at most ${PROTOCOL_LIMITS.collaborationGoalBytes} UTF-8 bytes.`;
 }

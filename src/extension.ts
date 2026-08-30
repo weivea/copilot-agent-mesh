@@ -12,9 +12,14 @@ export async function activate(
 	context: vscode.ExtensionContext,
 ): Promise<AgentMeshExtensionApi> {
 	application = await createApplication(context);
-	if (process.env.MESH_MULTI_WINDOW_E2E === '1') {
+	const multiWindowMode = process.env.MESH_MULTI_WINDOW_E2E === '1';
+	const multiProjectMode = process.env.MESH_MULTI_PROJECT_E2E === '1';
+	if (multiWindowMode !== multiProjectMode) {
 		void import('./e2e/multiWindowHost.js')
-			.then(({ runWithApi }) => runWithApi(application!.api))
+			.then(({ runWithApi }) => runWithApi(
+				application!.api,
+				multiProjectMode ? 'multi-project' : 'multi-window',
+			))
 			.catch((error: unknown) => {
 				process.emitWarning(
 					error instanceof Error ? error.message : 'Multi-window E2E controller failed to load.',

@@ -18,6 +18,8 @@ export interface DashboardViewModel {
 	readonly workspaces: DashboardSnapshot['workspaces'];
 	readonly peers: DashboardSnapshot['peers'];
 	readonly tasks: readonly DashboardTaskViewModel[];
+	readonly collaborationPreview: DashboardSnapshot['collaborationPreview'];
+	readonly collaborationRuns: DashboardSnapshot['collaborationRuns'];
 	readonly errors: DashboardSnapshot['errors'];
 }
 
@@ -73,6 +75,28 @@ export class DashboardPresenter {
 					error: task.error === undefined ? undefined : redactError(task.error),
 				};
 			}),
+			collaborationPreview: snapshot.collaborationPreview,
+			collaborationRuns: snapshot.collaborationRuns.map((run) => ({
+				...run,
+				title: redactRemoteText(run.title),
+				participants: run.participants.map((participant) => ({
+					...participant,
+					nodeLabel: redactRemoteText(participant.nodeLabel),
+					workspaceName: redactRemoteText(participant.workspaceName),
+				})),
+				tasks: run.tasks.map((task) => ({
+					...task,
+					title: redactRemoteText(task.title),
+					workspaceName: redactRemoteText(task.workspaceName),
+					blockCode: optionalRedacted(task.blockCode),
+					failureCode: optionalRedacted(task.failureCode),
+				})),
+				artifacts: run.artifacts.map((artifact) => ({
+					...artifact,
+					label: redactRemoteText(artifact.label),
+					mediaType: redactRemoteText(artifact.mediaType),
+				})),
+			})),
 			errors: snapshot.errors.map(redactError),
 		};
 	}

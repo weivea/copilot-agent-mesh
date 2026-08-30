@@ -757,7 +757,6 @@ export class BrokerTaskService {
 			}
 			if (
 				current.state !== 'needsInput'
-				|| current.pendingInput?.inputId !== input.inputId
 			) {
 				throw new MeshDomainError(
 					'INPUT_NOT_PENDING',

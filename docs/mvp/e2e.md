@@ -62,6 +62,24 @@ MESH_MULTI_WINDOW_E2E_RUNTIME_DIR=$HOME/.mw \
 npm run test:multi-window-real
 ```
 
+The 0.3.0 same-device multi-project gate is separate and refuses to run unless
+explicitly enabled:
+
+```sh
+MESH_MULTI_PROJECT_E2E=1 \
+MESH_MULTI_PROJECT_E2E_PROFILE_DIR=$HOME/.mw-profile \
+MESH_MULTI_PROJECT_E2E_AUTH_RESOURCE='https://api.github.com' \
+MESH_MULTI_PROJECT_E2E_AUTH_PROVIDER='github' \
+MESH_MULTI_PROJECT_E2E_AUTH_SCOPES_JSON='["read:user","user:email"]' \
+MESH_MULTI_PROJECT_E2E_RUNTIME_DIR=$HOME/.mw \
+npm run test:multi-project-real
+```
+
+The profile and runtime safety rules are identical to the authenticated
+multi-window gate. The command creates two temporary non-sensitive projects and
+may consume Copilot quota through four real AHP tasks. An authentication block,
+`blocked`, `failed`, or `cancelled` run is a failure, never completion evidence.
+
 ## Same-profile multi-window flow
 
 The multi-window harness uses exactly one `--user-data-dir` and one temporary
@@ -135,6 +153,47 @@ The final authenticated run passed on VS Code `1.135.0`, macOS arm64:
 The evidence stores event kinds and booleans only; it contains no token, account,
 path, raw prompt, or raw output. Gate G0 is therefore **Go for the validated
 macOS arm64 Preview scope**.
+
+## Same-device multi-project flow
+
+The multi-project harness reuses the ordinary-window controller but enables the
+collaboration Preview and never enables Listener auto-start. It requires:
+
+1. two ordinary Window Nodes and exactly one generation-fenced Broker;
+2. two different claimed Workspace IDs;
+3. backend `agentStarted`, output, `chat/turnComplete` mapped to authoritative
+   `completed`, and a bounded structured contract;
+4. immutable Artifact ID, media type, size, and SHA-256 evidence without content;
+5. frontend consumption of that exact Artifact ID and SHA-256, followed by
+   frontend `agentStarted`, output, `turnComplete`, and `completed`;
+6. backend and frontend validation tasks plus independent harness validation;
+7. aggregate `CollaborationRun.completed`;
+8. Listener/Tunnel/sentinel untouched; and
+9. profile lock released with zero owned Agent Host, VS Code, Dev Tunnel, socket,
+   or timer residue.
+
+Evidence is written to
+`.vscode-test/multi-project-evidence/<run-id>.json`. It stores only opaque IDs,
+event kinds, booleans, sizes, hashes, exit codes, and cleanup counts. It never
+stores a path, token, account, raw prompt/output, transcript, or Artifact
+content.
+
+The authoritative 0.3.0 run passed:
+
+- `.vscode-test/multi-project-evidence/99d16bac-1b46-470d-9c7d-b9ebb74d4352.json`
+- two live nodes observed in 182 ms, exactly one Broker, and two different claims;
+- backend task `0239c025-0999-53d5-b6df-30087e98f870` emitted
+  `agentStarted`, output, input/answer events, and authoritative completed;
+- Artifact `d9e1a57c-d14a-543b-a4d9-a8dd8f5307f7` was
+  `application/schema+json`, 153 bytes, SHA-256
+  `344c878b325196143ea36a07e8af3c117074af6a096d54f6ebba2ea4220e50b9`;
+- frontend task `2ee5820f-2079-5a9d-8714-d3aa42676605` consumed that exact Artifact
+  ID and emitted `agentStarted`, output, input/answer events, and completed;
+- both stored validations passed and both independent project checks exited 0;
+- run `573dc04f-8341-511d-b058-36e363e8bd48` reached completed;
+- Listener/Tunnel stayed stopped, the Dev Tunnel sentinel was untouched, takeover
+  changed generation in 993 ms, and cleanup released the profile lock with zero
+  Agent Host, VS Code, Dev Tunnel, socket, or owned timer residue.
 
 The real two-device v2 run also passed one-Tunnel pairing, explicit remote
 Device → Node → Workspace discovery, and durable task acceptance. The Worker
@@ -246,11 +305,11 @@ only `MESH_TWO_INSTANCE_E2E_OK` and forbids file changes and commands.
 | 5 | Display/copy connection URL | Pass | Production invitation creation returned a valid HTTPS URL to in-memory IPC; the secret was not persisted as evidence. |
 | 6 | Add, save, and delete a connection | Partial | Real add/pair/save passed. Peer deletion is covered offline but was not exercised in this real run. |
 | 7 | Connection state, heartbeat, and workspace list UI | Pass | Production dashboard/directory observed the peer online and its workspace over the real Tunnel. |
-| 8 | Five mesh language-model tools | Partial | Offline extension/tool suites cover all five tools; authenticated real delegation/polling used the same production services, but Copilot itself did not invoke the LM tools. |
+| 8 | Eight mesh language-model tools | Partial | Offline extension/tool suites cover all eight tools; authenticated real service routing uses the same production facades, but Copilot itself invoking the LM tools is not claimed without separate evidence. |
 | 9 | macOS arm64 Worker invokes built-in Copilot over AHP | Pass | VS Code 1.135.0 authenticated through the explicit GitHub mapping. The real production AHP task emitted `agentStarted` and five output events, invoked `AgentTaskHandle.cancel()`, and reached authoritative `cancelled`. |
 | 10 | Coordinator UI shows task state/output summary | Partial | Production source-side snapshots exposed authenticated output and cancellation state, but the harness did not make a visual Dashboard assertion. |
 | 11 | `mesh_get_task` returns completion result to Copilot | Partial | Real source-side polling traversed the production Broker/Node route and returned output/cancellation events; Copilot LM-tool invocation and a completed (rather than cancelled) task result remain unverified. |
-| 12 | Multiple workspaces, one writer per workspace | Partial | Lease/concurrency behavior passes offline; this real run registered one temporary workspace. |
+| 12 | Multiple workspaces, one writer per workspace | Pass on validated scope | The 0.3.0 evidence completed two different claimed workspaces through the existing per-workspace lease; offline concurrency/recovery coverage remains green. |
 | 13 | No Git/worktree management or injected Git prompt | Pass | Production request forwards the supplied prompt/criteria only; the real prompts contained no Git operation and the harness performed no repository mutation in the Worker workspace. |
 
 This earlier two-instance matrix remains historical evidence. G0 is closed by the
