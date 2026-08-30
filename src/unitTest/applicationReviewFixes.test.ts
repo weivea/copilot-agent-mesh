@@ -239,6 +239,13 @@ test('production dashboard uses the safe unfiltered directory for self, conflict
 	const conflictNodeId = '00000000-0000-4000-8000-000000000022';
 	const taskId = '00000000-0000-4000-8000-000000000023';
 	const bindings = new ProductionDashboardBindings({
+		vscodeApi: {
+			window: { activeTextEditor: undefined },
+			workspace: {
+				getConfiguration: () => ({ get: () => false }),
+				getWorkspaceFolder: () => undefined,
+			},
+		},
 		changed: {
 			event: () => disposable,
 			fire: () => undefined,
@@ -254,6 +261,13 @@ test('production dashboard uses the safe unfiltered directory for self, conflict
 		node: {
 			nodeId: thisNodeId,
 			onDidChange: () => disposable,
+			selectPeerPolicyWorkspace: () => ({
+				kind: 'selected',
+				workspaceIdentity: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+				workspaceId,
+				workspaceName: 'Source Workspace',
+				claimStatus: 'claimed',
+			}),
 			listDashboardNodes: async () => ({
 				deviceId,
 				nodes: [

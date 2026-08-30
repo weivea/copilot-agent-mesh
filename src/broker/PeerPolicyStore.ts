@@ -14,6 +14,7 @@ import {
 	type AtomicFileStore,
 } from '../storage/AtomicFileStore';
 import type { WorkerOwnership } from '../storage/WorkerOwnerLock';
+import { foldWindowName, validateWindowName } from './WindowName';
 
 export const PEER_POLICY_PATH = 'peers/policy.json';
 export const MAX_PEER_POLICY_ENTRIES = 256;
@@ -35,6 +36,37 @@ export const peerPolicyDocumentSchema = z.strictObject({
 			(entries) => Object.keys(entries).length <= MAX_PEER_POLICY_ENTRIES,
 			`Peer policy entries cannot exceed ${MAX_PEER_POLICY_ENTRIES}`,
 		),
+}).superRefine((document, context) => {
+	const owners = new Map<string, string>();
+	for (const [identity, entry] of Object.entries(document.entries)) {
+		try {
+			validateWindowName(entry.windowName);
+		} catch {
+			context.addIssue({
+				code: 'custom',
+				path: ['entries', identity, 'windowName'],
+				message: 'Stored window name is unsafe',
+			});
+		}
+		const fold = foldWindowName(entry.windowName);
+		if (entry.windowNameFold !== fold) {
+			context.addIssue({
+				code: 'custom',
+				path: ['entries', identity, 'windowNameFold'],
+				message: 'Stored window name fold does not match the window name',
+			});
+		}
+		const owner = owners.get(fold);
+		if (owner !== undefined && owner !== identity) {
+			context.addIssue({
+				code: 'custom',
+				path: ['entries', identity, 'windowNameFold'],
+				message: 'Stored window names must be device-wide unique',
+			});
+		} else {
+			owners.set(fold, identity);
+		}
+	}
 });
 
 export type PeerPolicyEntry = z.infer<typeof peerPolicyEntrySchema>;
@@ -118,9 +150,22 @@ export class PeerPolicyStore {
 				);
 			}
 			const policy = update(structuredClone(current.entries[identity]));
+			validateWindowName(policy.windowName);
+			const windowNameFold = foldWindowName(policy.windowName);
+			const conflict = Object.entries(current.entries).find(
+				([candidateIdentity, candidate]) =>
+					candidateIdentity !== identity
+					&& candidate.windowNameFold === windowNameFold,
+			);
+			if (conflict !== undefined) {
+				throw new MeshDomainError(
+					'WINDOW_NAME_CONFLICT',
+					'Another workspace already uses an equivalent window name.',
+				);
+			}
 			const entry = peerPolicyEntrySchema.parse({
 				...policy,
-				windowNameFold: foldWindowName(policy.windowName),
+				windowNameFold,
 				updatedAt: this.options.clock.now().toISOString(),
 			});
 			const next = peerPolicyDocumentSchema.parse({
@@ -166,10 +211,6 @@ export class PeerPolicyStore {
 			throw generationChangedError(when);
 		}
 	}
-}
-
-function foldWindowName(value: string): string {
-	return value.normalize('NFKC').toLocaleLowerCase('en-US');
 }
 
 function generationChangedError(when: 'before' | 'during'): MeshDomainError {

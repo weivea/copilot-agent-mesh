@@ -2,12 +2,17 @@ import { randomBytes, randomUUID } from 'crypto';
 
 import * as vscode from 'vscode';
 
-import { DashboardFacade, UnavailableDashboardFacade } from './DashboardFacade';
+import {
+	DashboardActionError,
+	DashboardFacade,
+	UnavailableDashboardFacade,
+} from './DashboardFacade';
 import {
 	assertSafeDashboardOutboundMessage,
 	DASHBOARD_MESSAGE_VERSION,
 	DashboardInboundMessage,
 	DashboardOutboundMessage,
+	DashboardOutboundErrorCode,
 	parseDashboardInboundMessage,
 } from './DashboardMessages';
 import { DashboardPresenter } from './DashboardPresenter';
@@ -109,7 +114,11 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 		try {
 			await this.dispatch(message);
 			await this.publish(instance);
-		} catch {
+		} catch (error: unknown) {
+			if (error instanceof DashboardActionError) {
+				await this.postError(instance, error.code, error.message);
+				return;
+			}
 			await this.postError(
 				instance,
 				'ACTION_FAILED',
@@ -122,6 +131,9 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 		switch (message.action) {
 			case 'configureDevice':
 				await this.facade.configureDeviceName();
+				return;
+			case 'renameWindow':
+				await this.facade.renameCurrentWindow();
 				return;
 			case 'registerWorkspace':
 				await this.facade.registerCurrentWorkspace();
@@ -212,7 +224,7 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 
 	private async postError(
 		instance: ViewInstance,
-		code: 'INVALID_MESSAGE' | 'ACTION_FAILED' | 'UNSAFE_VIEW_MODEL',
+		code: DashboardOutboundErrorCode,
 		message: string,
 	): Promise<void> {
 		await this.safePost(instance, {
@@ -265,6 +277,7 @@ export function createDashboardHtml(
 	<header><h1>Copilot Agent Mesh</h1><button data-action="refresh" title="Refresh">Refresh</button></header>
 	<main>
 		<section aria-labelledby="device-heading"><h2 id="device-heading">This Device</h2><div id="device" class="card loading">Loading...</div></section>
+		<section aria-labelledby="this-window-heading"><h2 id="this-window-heading">This Window</h2><div id="thisWindow" class="card loading">Loading...</div></section>
 		<section aria-labelledby="listener-heading"><h2 id="listener-heading">Listener</h2><div id="listener" class="card loading">Loading...</div></section>
 		<section aria-labelledby="nodes-heading"><h2 id="nodes-heading">Local Window Nodes</h2><div id="localNodes" class="stack loading">Loading...</div><button data-action="registerWorkspace">Refresh Current Workspaces</button></section>
 		<section aria-labelledby="peers-heading"><h2 id="peers-heading">Remote Devices</h2><div id="remoteDevices" class="stack loading">Loading...</div><button data-action="addPeer">Add Connection</button></section>

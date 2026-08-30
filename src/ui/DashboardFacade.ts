@@ -5,6 +5,11 @@ import {
 	utf8ByteLength,
 	type TaskStatus,
 } from '../../shared/protocol';
+import { validateWindowName } from '../broker/WindowName';
+export {
+	DashboardActionError,
+	type DashboardActionErrorCode,
+} from './DashboardActionError';
 
 export type ListenerState = 'stopped' | 'starting' | 'running' | 'stopping' | 'error' | 'unavailable';
 export type PeerState = 'connecting' | 'online' | 'busy' | 'offline' | 'authFailed' | 'incompatible';
@@ -46,6 +51,14 @@ export interface DashboardSnapshot {
 			readonly message: string;
 			readonly action?: string;
 		};
+	};
+	readonly thisWindow: {
+		readonly name: string;
+		readonly workspaceName: string;
+		readonly claimStatus: 'claimed' | 'readOnly' | 'conflict' | 'unclaimed' | 'ambiguous';
+		readonly previewEnabled: boolean;
+		readonly canRename: boolean;
+		readonly detail?: string;
 	};
 	readonly localNodes?: readonly DashboardNodeSnapshot[];
 	readonly remoteDevices?: readonly {
@@ -131,6 +144,7 @@ export interface DashboardFacade {
 	getSnapshot(): Promise<DashboardSnapshot>;
 	onDidChange(listener: () => void): vscode.Disposable;
 	configureDeviceName(): Promise<void>;
+	renameCurrentWindow(): Promise<void>;
 	registerCurrentWorkspace(): Promise<void>;
 	removeWorkspace(workspaceId: string): Promise<void>;
 	startListener(): Promise<void>;
@@ -146,6 +160,7 @@ export interface DashboardServiceBindings {
 	getSnapshot(): Promise<DashboardSnapshot>;
 	onDidChange(listener: () => void): vscode.Disposable;
 	configureDeviceName(name: string): Promise<void>;
+	renameCurrentWindow(name: string): Promise<void>;
 	registerCurrentWorkspace(): Promise<void>;
 	removeWorkspace(workspaceId: string): Promise<void>;
 	startListener(): Promise<void>;
@@ -201,6 +216,20 @@ export class ServiceDashboardFacade implements DashboardFacade {
 		});
 		if (name !== undefined) {
 			await this.services.configureDeviceName(name.trim());
+		}
+	}
+
+	public async renameCurrentWindow(): Promise<void> {
+		const snapshot = await this.services.getSnapshot();
+		const name = await this.inputs.showInputBox({
+			title: 'Rename This Window',
+			prompt: 'Choose a device-wide unique display name for the current Workspace.',
+			value: snapshot.thisWindow.name,
+			ignoreFocusOut: true,
+			validateInput: validateWindowNameInput,
+		});
+		if (name !== undefined) {
+			await this.services.renameCurrentWindow(name);
 		}
 	}
 
@@ -321,6 +350,14 @@ export class UnavailableDashboardFacade implements DashboardFacade {
 					message: 'The local Device Broker lifecycle is unavailable.',
 				},
 			},
+			thisWindow: {
+				name: 'Unavailable',
+				workspaceName: 'No Workspace',
+				claimStatus: 'unclaimed',
+				previewEnabled: false,
+				canRename: false,
+				detail: 'Peer window delegation is unavailable.',
+			},
 			localNodes: [],
 			remoteDevices: [],
 			workspaces: [],
@@ -348,6 +385,10 @@ export class UnavailableDashboardFacade implements DashboardFacade {
 			await configuration.update('deviceName', value.trim(), vscode.ConfigurationTarget.Global);
 			this.changed.fire();
 		}
+	}
+
+	public renameCurrentWindow(): Promise<void> {
+		return this.unavailable('Window rename service');
 	}
 
 	public registerCurrentWorkspace(): Promise<void> {
@@ -443,4 +484,13 @@ function validateTaskInstruction(candidate: string): string | undefined {
 	return utf8ByteLength(value) <= PROTOCOL_LIMITS.taskPromptBytes
 		? undefined
 		: `The task instruction must be at most ${PROTOCOL_LIMITS.taskPromptBytes} UTF-8 bytes.`;
+}
+
+function validateWindowNameInput(candidate: string): string | undefined {
+	try {
+		validateWindowName(candidate);
+		return undefined;
+	} catch (error: unknown) {
+		return error instanceof Error ? error.message : 'The window name is invalid.';
+	}
 }

@@ -142,6 +142,127 @@ test('serializes concurrent mutations without losing either entry', async () => 
 	assert.equal(Object.keys(fixture.store.snapshot().entries).length, 2);
 });
 
+test('enforces normalized device-wide uniqueness and allows equivalent self-renames', async () => {
+	const fixture = createFixture();
+	await fixture.store.initialize();
+	const source = identity('source');
+	const target = identity('target');
+
+	await fixture.store.set(source, defaultPolicy('Ｆrontend'));
+	await fixture.store.set(source, defaultPolicy('FRONTEND'));
+	await assert.rejects(
+		fixture.store.set(target, defaultPolicy('frontend')),
+		hasReason('WINDOW_NAME_CONFLICT'),
+	);
+
+	assert.equal(fixture.store.get(source)?.windowName, 'FRONTEND');
+	assert.equal(fixture.store.get(target), undefined);
+});
+
+test('folds Unicode caseless Greek and German equivalents deterministically', async () => {
+	const fixture = createFixture();
+	await fixture.store.initialize();
+	await fixture.store.set(identity('greek-source'), defaultPolicy('ΟΣ'));
+	await assert.rejects(
+		fixture.store.set(identity('greek-target'), defaultPolicy('οσ')),
+		hasReason('WINDOW_NAME_CONFLICT'),
+	);
+	await fixture.store.set(identity('german-source'), defaultPolicy('Straße'));
+	await assert.rejects(
+		fixture.store.set(identity('german-target'), defaultPolicy('STRASSE')),
+		hasReason('WINDOW_NAME_CONFLICT'),
+	);
+});
+
+test('serializes concurrent equivalent claims so exactly one workspace wins', async () => {
+	const fixture = createFixture();
+	await fixture.store.initialize();
+	const claims = await Promise.allSettled([
+		fixture.store.set(identity('source-a'), defaultPolicy('Backend')),
+		fixture.store.set(identity('source-b'), defaultPolicy('ｂａｃｋｅｎｄ')),
+	]);
+
+	assert.equal(claims.filter(({ status }) => status === 'fulfilled').length, 1);
+	const rejected = claims.find(({ status }) => status === 'rejected');
+	assert.ok(rejected?.status === 'rejected');
+	assert.ok(hasReason('WINDOW_NAME_CONFLICT')(rejected.reason));
+	assert.equal(Object.keys(fixture.store.snapshot().entries).length, 1);
+});
+
+test('rejects invalid path, secret, control, empty, and oversized names without mutation', async () => {
+	const invalidNames = [
+		'',
+		'é'.repeat(129),
+		'backend/frontend',
+		'backend\\frontend',
+		'/Users/example/project',
+		'C:\\Users\\example\\project',
+		'file:///Users/example/project',
+		'ｆｉｌｅ：／／／Users／example／project',
+		'~/project',
+		'backend:project',
+		' backend',
+		'backend\u0000spoof',
+		'backend\u202Espoof',
+		'backend\u200Bspoof',
+		'Back\u034Fend',
+		'ghp_examplecredential',
+		'Bearer examplecredential',
+		'Bearer examplecredential',
+		'a'.repeat(64),
+		'Z'.repeat(40),
+		'Abcdefghijklmnopqrstuvwxyz0123456789_-XYZ',
+	];
+
+	for (const [index, name] of invalidNames.entries()) {
+		const fixture = createFixture();
+		await fixture.store.initialize();
+		await assert.rejects(
+			fixture.store.set(identity(`invalid-${index}`), defaultPolicy(name)),
+			hasReason('WINDOW_NAME_INVALID'),
+		);
+		assert.deepEqual(fixture.store.snapshot(), { schemaVersion: 1, entries: {} });
+	}
+});
+
+test('validates the UTF-8 bound before unsafe characters and secret shapes', async () => {
+	const fixture = createFixture();
+	await fixture.store.initialize();
+	await assert.rejects(
+		fixture.store.set(
+			identity('ordered-validation'),
+			defaultPolicy(`${'/'.repeat(300)}ghp_credential`),
+		),
+		(error: unknown) =>
+			error instanceof MeshDomainError
+			&& error.reason === 'WINDOW_NAME_INVALID'
+			&& error.message.includes('UTF-8 bytes'),
+	);
+});
+
+test('rejects persisted unsafe, duplicate, or non-canonical folded names as corruption', async () => {
+	for (const entries of [
+		{
+			[identity('unsafe')]: fullEntry('../unsafe', '../unsafe'),
+		},
+		{
+			[identity('source')]: fullEntry('Backend', 'backend'),
+			[identity('target')]: fullEntry('ＢＡＣＫＥＮＤ', 'backend'),
+		},
+		{
+			[identity('source')]: fullEntry('Backend', 'not-backend'),
+		},
+	]) {
+		const fileSystem = new MemoryAtomicFileSystem();
+		fileSystem.files.set(POLICY_FILE, JSON.stringify({ schemaVersion: 1, entries }));
+		const fixture = createFixture({ fileSystem });
+		await assert.rejects(
+			fixture.store.initialize(),
+			(error: unknown) => error instanceof StorageCorruptionError,
+		);
+	}
+});
+
 function createFixture(options: {
 	readonly ownership?: TestOwnership;
 	readonly fileSystem?: MemoryAtomicFileSystem;
@@ -168,6 +289,16 @@ function defaultPolicy(windowName = 'window') {
 		windowName,
 		acceptsIncoming: false,
 		allowlist: [] as string[],
+	};
+}
+
+function fullEntry(windowName: string, windowNameFold: string) {
+	return {
+		windowName,
+		windowNameFold,
+		acceptsIncoming: false,
+		allowlist: [] as string[],
+		updatedAt: NOW.toISOString(),
 	};
 }
 
@@ -248,4 +379,10 @@ function normalizeOperation(operation: string): string {
 		return 'rename:tmp->policy';
 	}
 	return 'sync-directory:peers';
+}
+
+function hasReason(reason: string) {
+	return (error: unknown) =>
+		error instanceof MeshDomainError
+		&& error.reason === reason;
 }

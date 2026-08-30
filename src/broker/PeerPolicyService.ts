@@ -27,6 +27,7 @@ import type {
 	TaskRouteRequest,
 } from './NodeRegistry';
 import type { PeerPolicyEntry, PeerPolicyStore } from './PeerPolicyStore';
+import { resolveWindowDisplayName } from './WindowName';
 
 export interface PeerPolicyServiceOptions {
 	readonly enabled: () => boolean;
@@ -52,7 +53,11 @@ export class PeerPolicyService implements PeerRouteAuthorizer {
 		const workspace = input.workspaceIdentity === undefined
 			? this.requireSingleOwnedWorkspace(identity)
 			: this.requireOwnedWorkspace(identity, input.workspaceIdentity);
-		return this.projectPolicy(workspace.workspaceIdentity, workspace.name);
+		return this.projectPolicy(
+			workspace.workspaceIdentity,
+			workspace.name,
+			identity.nodeId,
+		);
 	}
 
 	public async setPolicy(
@@ -76,7 +81,9 @@ export class PeerPolicyService implements PeerRouteAuthorizer {
 			);
 		}
 		const entry = await this.store.update(input.workspaceIdentity, (current) => ({
-			windowName: input.windowName ?? current?.windowName ?? owned.name,
+			windowName: input.windowName
+				?? current?.windowName
+				?? resolveWindowDisplayName(undefined, owned.name, identity.nodeId),
 			acceptsIncoming: input.acceptsIncoming ?? current?.acceptsIncoming ?? false,
 			allowlist: input.allowlist === undefined
 				? [...(current?.allowlist ?? [])]
@@ -91,6 +98,7 @@ export class PeerPolicyService implements PeerRouteAuthorizer {
 		if (!this.options.enabled()) {
 			return emptyDirectory(this.registry.list().deviceId);
 		}
+
 		const source = this.registry.peerNode(identity);
 		if (source === undefined) {
 			throw new MeshDomainError('POLICY_FORBIDDEN', 'The policy caller is not registered.');
@@ -121,6 +129,18 @@ export class PeerPolicyService implements PeerRouteAuthorizer {
 		});
 	}
 
+	public displayLabel(node: PeerNodeSnapshot): string {
+		const workspace = node.workspaces.length === 1 ? node.workspaces[0] : undefined;
+		const policy = workspace === undefined
+			? undefined
+			: this.store.get(workspace.workspaceIdentity);
+		return resolveWindowDisplayName(
+			policy?.windowName,
+			workspace?.name,
+			node.nodeId,
+		);
+	}
+
 	public listDashboard(caller: NodeIdentityParams): DashboardNodeDirectoryResult {
 		this.requireCaller(caller);
 		const raw = this.registry.list();
@@ -134,9 +154,10 @@ export class PeerPolicyService implements PeerRouteAuthorizer {
 				return {
 					nodeId: node.nodeId,
 					nodeInstanceId: node.nodeInstanceId,
-					label: safeDisplayName(
-						policy?.windowName ?? workspace?.name ?? node.label,
-						shortId(node.nodeId),
+					label: resolveWindowDisplayName(
+						policy?.windowName,
+						workspace?.name,
+						node.nodeId,
 					),
 					status: node.status,
 					workspaces: node.workspaces.map((entry) => ({
@@ -178,9 +199,10 @@ export class PeerPolicyService implements PeerRouteAuthorizer {
 					nodeId: shortId(node.nodeId),
 					nodeInstanceId: shortId(node.nodeInstanceId),
 					...(workspace === undefined ? {} : { workspaceId: shortId(workspace.workspaceId) }),
-					label: safeDisplayName(
-						policy?.windowName ?? workspace?.name ?? node.label,
-						shortId(node.nodeId),
+					label: resolveWindowDisplayName(
+						policy?.windowName,
+						workspace?.name,
+						node.nodeId,
 					),
 					...(node.workspaces.length > 1
 						? { workspaceName: `${node.workspaces.length} workspaces` }
@@ -312,9 +334,10 @@ export class PeerPolicyService implements PeerRouteAuthorizer {
 			: this.store.get(workspace.workspaceIdentity);
 		return {
 			...node,
-			label: safeDisplayName(
-				policy?.windowName ?? workspace?.name ?? node.label,
-				shortId(node.nodeId),
+			label: resolveWindowDisplayName(
+				policy?.windowName,
+				workspace?.name,
+				node.nodeId,
 			),
 			workspaces: node.workspaces.map((entry) => ({
 				...entry,
@@ -360,11 +383,16 @@ export class PeerPolicyService implements PeerRouteAuthorizer {
 		return node;
 	}
 
-	private projectPolicy(workspaceIdentity: string, fallbackName: string): NodePolicyResult {
+	private projectPolicy(
+		workspaceIdentity: string,
+		fallbackName: string,
+		nodeId: string,
+	): NodePolicyResult {
 		const entry = this.store.get(workspaceIdentity);
 		return nodePolicyResultSchema.parse({
 			workspaceIdentity,
-			windowName: entry?.windowName ?? fallbackName,
+			windowName: entry?.windowName
+				?? resolveWindowDisplayName(undefined, fallbackName, nodeId),
 			acceptsIncoming: entry?.acceptsIncoming ?? false,
 			allowlist: [...(entry?.allowlist ?? [])],
 		});

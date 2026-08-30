@@ -3,13 +3,13 @@
 The dashboard is a secure presentation and command surface. It does not own device,
 listener, tunnel, workspace, peer, or task state.
 
-The P2 peer-policy boundary deliberately does not add a Dashboard panel. The
-Broker nevertheless exposes a separate typed configuration projection for
-future peer controls. Unlike Tool-facing `node.list`, it includes every known
-same-device candidate, but only as bounded safe display labels, workspace
-display names, online/accept/busy/gate state, and short opaque IDs. It never
-contains absolute paths, full workspace identities, credentials, prompts, or
-outputs. Candidate display strings reuse the Dashboard path/secret guard.
+P3 adds a `This Window` panel with the effective window label, current Workspace
+display name, claim status, Preview status, and rename control. The control is
+disabled while the default-off Peer Delegation Preview is disabled. The strict
+`renameWindow` Webview action carries no name, path, Workspace ID, or
+`workspaceIdentity`; the Extension Host collects the name and derives the
+caller-owned claimed Workspace through `ProductionDashboardBindings` and
+`WindowNodeClient`.
 
 The existing Dashboard reads `node.dashboard.list`, not Tool-facing
 `node.list`. This safe unfiltered projection preserves this-window identity,
@@ -17,6 +17,14 @@ Workspace claim/conflict and busy state, active task naming, and
 directory-truncation warnings even while peer delegation is disabled or no
 target passes the authorization gate. Full workspace identities are removed at
 the Broker boundary.
+
+For multi-root windows, a single claimed Workspace is selected directly.
+Otherwise the active editor's Workspace must uniquely match an own claim; an
+ambiguous selection fails explicitly rather than mutating an arbitrary policy.
+Selection matches both the original VS Code Workspace URI and its canonical
+execution URI so symlinked roots retain stable active-Workspace provenance.
+Successful writes broadcast `node.policy.changed`, so all open dashboards
+re-render without reload.
 
 ## Facade contract
 
@@ -29,6 +37,7 @@ composition root should adapt the real stores and application services to
 | --- | --- |
 | `getSnapshot` / `onDidChange` | Read and observe device, listener, tunnel, AHP, workspace, peer, task, and stable error state |
 | `configureDeviceName` | Collect the name in Extension Host UI and persist it through the device service |
+| `renameCurrentWindow` | Collect a bounded name in Extension Host UI and invoke the authenticated own-Workspace policy RPC |
 | `registerCurrentWorkspace` / `removeWorkspace` | Register the active local workspace or confirm and remove by `workspaceId` |
 | `startListener` / `stopListener` | Drive the real gateway and tunnel lifecycle |
 | `copyConnectionUrl` | Obtain the one-time URL and write it directly with `vscode.env.clipboard`; never return or post it to the webview |
@@ -44,9 +53,10 @@ reports services as unavailable. It never creates fake online state or fake task
 
 ## Message and data boundary
 
-The webview sends only action names and bounded opaque IDs. Connection URLs,
-pairing secrets, task prompts, complete output, answers, credentials, and local
-paths never cross the message bus. Both directions are runtime validated, and
+The webview sends only action names and bounded opaque IDs. Window names,
+Workspace identities, connection URLs, pairing secrets, task prompts, complete
+output, answers, credentials, and local paths never cross the message bus.
+Both directions are runtime validated, and
 outbound messages are rejected when they contain forbidden fields, local path
 shapes, secret URL fragments, or oversized strings. Foundation's complete task
 state set is reused directly, including `recovering` and `cancelling`.

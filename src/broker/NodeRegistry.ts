@@ -154,6 +154,7 @@ export interface PeerRouteAuthorizer {
 		request: TaskRouteRequest,
 		context: PeerRouteAuthorizationContext,
 	): void;
+	displayLabel?(node: PeerNodeSnapshot): string;
 }
 
 export interface RegistryTimer {
@@ -421,7 +422,7 @@ export class NodeRegistry {
 		) {
 			return undefined;
 		}
-		return node.label;
+		return this.peerRouteAuthorizer?.displayLabel?.(this.peerSnapshot(node)) ?? node.label;
 	}
 
 	public setPeerRouteAuthorizer(authorizer: PeerRouteAuthorizer): void {

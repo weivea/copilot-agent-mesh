@@ -37,6 +37,16 @@ window may pass one of its own claimed `workspaceIdentity` values to
 rejects foreign identities. This selector never changes Tool source
 authorization, which remains derived from the registered Window Node.
 
+Window rename uses the same authenticated policy surface. Names are validated
+in length/character/path, secret-shape, then folded-uniqueness order. The Store
+performs uniqueness validation and partial-policy persistence in one
+generation-fenced serialized mutation; normalized or case-insensitive conflicts
+return `WINDOW_NAME_CONFLICT`, while invalid values return
+`WINDOW_NAME_INVALID`. Authorized directories, Dashboard directories, and
+task-source display labels reuse `windowNodeDescriptor.label` with stored name,
+safe Workspace display name, then short node ID fallback. Labels never affect
+authorization, route identity, Lease ownership, or Task ownership.
+
 All inputs are checked again at runtime with exact object properties and UTF-8
 byte limits. Facade output is parsed through a strict allowlist before it can
 reach a model. Unknown exceptions become a fixed safe text error and never

@@ -3,8 +3,13 @@ import { readFile } from 'fs/promises';
 
 import * as vscode from 'vscode';
 
+import {
+	ProductionDashboardBindings,
+	ProductionDashboardBindingsOptions,
+} from '../composition/ProductionDashboardBindings';
 import { AgentMeshViewProvider } from '../ui/AgentMeshViewProvider';
 import {
+	DashboardActionError,
 	DashboardFacade,
 	DashboardServiceBindings,
 	DashboardSnapshot,
@@ -37,6 +42,7 @@ suite('Dashboard', () => {
 		assert.ok(view.webview.html.includes(view.webview.cspSource));
 		assert.ok(view.webview.html.includes('dashboard.js'));
 		assert.ok(view.webview.html.includes('dashboard.css'));
+		assert.ok(view.webview.html.includes('This Window'));
 		provider.dispose();
 	});
 
@@ -79,6 +85,19 @@ suite('Dashboard', () => {
 			nodeInstanceId: 'instance-1',
 			workspaceId: 'workspace-1',
 		}));
+		assert.ok(parseDashboardInboundMessage({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: 'instance-1',
+			type: 'action',
+			action: 'renameWindow',
+		}));
+		assert.strictEqual(parseDashboardInboundMessage({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: 'instance-1',
+			type: 'action',
+			action: 'renameWindow',
+			workspaceIdentity: 'sha256:foreign',
+		}), undefined);
 	});
 
 	test('rejects secrets and path forms in otherwise valid outbound models', () => {
@@ -266,6 +285,39 @@ suite('Dashboard', () => {
 		} as never));
 	});
 
+	test('keeps This Window disabled when Preview is off and rejects identity leakage', () => {
+		const model = new DashboardPresenter().present({
+			...snapshot(),
+			thisWindow: {
+				name: 'This Window',
+				workspaceName: 'service-workspace',
+				claimStatus: 'claimed',
+				previewEnabled: false,
+				canRename: false,
+				detail: 'Enable Peer Delegation Preview to rename this window.',
+			},
+		});
+		assert.strictEqual(model.thisWindow.canRename, false);
+		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: 'instance-1',
+			type: 'dashboard.snapshot',
+			model,
+		}));
+		assert.throws(() => assertSafeDashboardOutboundMessage({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: 'instance-1',
+			type: 'dashboard.snapshot',
+			model: {
+				...model,
+				thisWindow: {
+					...model.thisWindow,
+					workspaceIdentity: 'sha256:abcdefghijklmnopqrstuvwxyz0123456789_______',
+				},
+			},
+		} as never));
+	});
+
 	test('isolates repeated resolves of the same view and makes repeated disposal safe', async () => {
 		const extension = getExtension();
 		const facade = new RecordingDashboardFacade();
@@ -391,6 +443,100 @@ suite('Dashboard', () => {
 		assert.doesNotMatch(JSON.stringify(viewModel), /Sensitive prompt body/u);
 	});
 
+	test('collects the window name in the Extension Host without accepting an identity from Webview', async () => {
+		const services = new RecordingServiceBindings();
+		const facade = new ServiceDashboardFacade(
+			services,
+			{ confirm: async () => true },
+			{
+				showInputBox: async (options) => {
+					assert.strictEqual(options.value, 'This Window');
+					assert.strictEqual(options.validateInput?.('Renamed Window'), undefined);
+					const whitespaceError = await options.validateInput?.(' Renamed Window ');
+					const pathError = await options.validateInput?.('ｆｉｌｅ：／／／private');
+					if (typeof whitespaceError !== 'string' || typeof pathError !== 'string') {
+						throw new Error('Expected string window-name validation errors.');
+					}
+					assert.match(whitespaceError, /surrounding whitespace/u);
+					assert.match(pathError, /path and URI/u);
+					return 'Renamed Window';
+				},
+			},
+		);
+
+		await facade.renameCurrentWindow();
+
+		assert.strictEqual(services.lastWindowName, 'Renamed Window');
+	});
+
+	test('surfaces safe explicit rename errors through the Dashboard message contract', async () => {
+		const extension = getExtension();
+		const facade = new RecordingDashboardFacade();
+		facade.renameError = new DashboardActionError(
+			'WINDOW_NAME_CONFLICT',
+			'Another Workspace already uses an equivalent window name.',
+		);
+		const provider = new AgentMeshViewProvider(facade, extension.extensionUri);
+		const view = new TestWebviewView();
+		provider.resolveWebviewView(view);
+		const uiInstanceId = getUiInstanceId(view.webview.html);
+
+		await view.webview.receive({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId,
+			type: 'action',
+			action: 'renameWindow',
+		});
+
+		assert.strictEqual(view.webview.sent[0]?.type, 'dashboard.error');
+		assert.strictEqual(view.webview.sent[0]?.code, 'WINDOW_NAME_CONFLICT');
+		assert.strictEqual(
+			view.webview.sent[0]?.message,
+			'Another Workspace already uses an equivalent window name.',
+		);
+		provider.dispose();
+	});
+
+	test('Production bindings derive the owned policy identity server-side and reject ambiguous selection', async () => {
+		const mutations: unknown[] = [];
+		const selected = createWindowRenameBindings({
+			enabled: true,
+			selection: {
+				kind: 'selected',
+				workspaceIdentity: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+				workspaceId: 'workspace-1',
+				workspaceName: 'service-workspace',
+				claimStatus: 'claimed',
+			},
+			mutations,
+		});
+		await selected.renameCurrentWindow('Backend');
+		assert.deepStrictEqual(mutations, [{
+			workspaceIdentity: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+			windowName: 'Backend',
+		}]);
+		selected.dispose();
+		selected.dispose();
+
+		const ambiguous = createWindowRenameBindings({
+			enabled: true,
+			selection: {
+				kind: 'unavailable',
+				workspaceName: 'Multiple Workspaces',
+				claimStatus: 'ambiguous',
+			},
+			mutations,
+		});
+		await assert.rejects(
+			ambiguous.renameCurrentWindow('Backend'),
+			(error: unknown) =>
+				error instanceof DashboardActionError
+				&& error.code === 'WORKSPACE_SELECTION_AMBIGUOUS',
+		);
+		assert.strictEqual(mutations.length, 1);
+		ambiguous.dispose();
+	});
+
 	test('dispatches all dashboard actions without sensitive values in messages', async () => {
 		const extension = getExtension();
 		const facade = new RecordingDashboardFacade();
@@ -401,6 +547,7 @@ suite('Dashboard', () => {
 
 		const actions = [
 			{ action: 'configureDevice' },
+			{ action: 'renameWindow' },
 			{ action: 'registerWorkspace' },
 			{ action: 'removeWorkspace', targetId: 'workspace-1' },
 			{ action: 'startListener' },
@@ -431,6 +578,7 @@ suite('Dashboard', () => {
 
 		assert.deepStrictEqual(facade.calls, [
 			'configureDevice',
+			'renameWindow',
 			'registerWorkspace',
 			'removeWorkspace:workspace-1',
 			'startListener',
@@ -449,6 +597,7 @@ class RecordingDashboardFacade implements DashboardFacade {
 	private readonly changed = new vscode.EventEmitter<void>();
 	public readonly calls: string[] = [];
 	public readonly onDidChange = this.changed.event;
+	public renameError?: DashboardActionError;
 
 	public getSnapshot(): Promise<DashboardSnapshot> {
 		return Promise.resolve(snapshot());
@@ -460,6 +609,13 @@ class RecordingDashboardFacade implements DashboardFacade {
 
 	public async configureDeviceName(): Promise<void> {
 		this.calls.push('configureDevice');
+	}
+
+	public async renameCurrentWindow(): Promise<void> {
+		if (this.renameError !== undefined) {
+			throw this.renameError;
+		}
+		this.calls.push('renameWindow');
 	}
 
 	public async registerCurrentWorkspace(): Promise<void> {
@@ -524,6 +680,7 @@ class RecordingServiceBindings implements DashboardServiceBindings {
 	private readonly changed = new vscode.EventEmitter<void>();
 	public readonly onDidChange = this.changed.event;
 	public stopCalls = 0;
+	public lastWindowName?: string;
 	public lastTaskRequest?: {
 		readonly target?: DashboardTaskTarget;
 		readonly title: string;
@@ -534,6 +691,9 @@ class RecordingServiceBindings implements DashboardServiceBindings {
 	}
 
 	public async configureDeviceName(_name: string): Promise<void> {}
+	public async renameCurrentWindow(name: string): Promise<void> {
+		this.lastWindowName = name;
+	}
 	public async registerCurrentWorkspace(): Promise<void> {}
 	public async removeWorkspace(_workspaceId: string): Promise<void> {}
 	public async startListener(): Promise<void> {}
@@ -628,6 +788,13 @@ function snapshot(): DashboardSnapshot {
 			role: 'owner',
 			takeover: 'stable',
 			holder: 'thisWindow',
+		},
+		thisWindow: {
+			name: 'This Window',
+			workspaceName: 'service-workspace',
+			claimStatus: 'claimed',
+			previewEnabled: true,
+			canRename: true,
 		},
 		localNodes: [{
 			nodeId: 'node-1',
@@ -725,6 +892,52 @@ function getUiInstanceId(html: string): string {
 
 function settle(): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+function createWindowRenameBindings(options: {
+	readonly enabled: boolean;
+	readonly selection:
+		| {
+			readonly kind: 'selected';
+			readonly workspaceIdentity: string;
+			readonly workspaceId: string;
+			readonly workspaceName: string;
+			readonly claimStatus: 'claimed';
+		}
+		| {
+			readonly kind: 'unavailable';
+			readonly workspaceName: string;
+			readonly claimStatus: 'ambiguous';
+		};
+	readonly mutations: unknown[];
+}): ProductionDashboardBindings {
+	const disposable = { dispose: () => undefined };
+	return new ProductionDashboardBindings({
+		vscodeApi: {
+			window: { activeTextEditor: undefined },
+			workspace: {
+				getConfiguration: () => ({
+					get: () => options.enabled,
+				}),
+				getWorkspaceFolder: () => undefined,
+			},
+		},
+		changed: {
+			event: () => disposable,
+			fire: () => undefined,
+		},
+		node: {
+			nodeId: 'node-1',
+			onDidChange: () => disposable,
+			selectPeerPolicyWorkspace: () => options.selection,
+			setPeerPolicy: async (mutation: unknown) => {
+				options.mutations.push(mutation);
+				return mutation;
+			},
+		},
+		guard: { assertAllowed: () => undefined },
+		lifecycle: { onDidChange: () => disposable },
+	} as unknown as ProductionDashboardBindingsOptions);
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {

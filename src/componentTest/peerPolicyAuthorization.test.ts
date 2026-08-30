@@ -96,6 +96,38 @@ test('default-off Tool listing stays empty while the safe Dashboard directory re
 	assert.doesNotMatch(JSON.stringify(dashboard), /sha256:|component-workspace/u);
 });
 
+test('rename updates every window immediately and rejects normalized conflicts over authenticated RPC', async (t) => {
+	const fixture = await createFixture();
+	t.after(() => fixture.dispose());
+	let notified!: () => void;
+	const notification = new Promise<void>((resolve) => {
+		notified = resolve;
+	});
+	const subscription = fixture.nodeB.onDidChange(notified);
+	t.after(() => subscription.dispose());
+
+	await fixture.nodeA.setPeerPolicy({
+		workspaceIdentity: IDENTITY_A,
+		windowName: 'Ｆrontend',
+	});
+	await notification;
+	const dashboard = await fixture.nodeB.listDashboardNodes();
+	assert.equal(
+		dashboard.nodes.find(({ nodeId }) => nodeId === NODE_A)?.label,
+		'Ｆrontend',
+	);
+	await assert.rejects(
+		fixture.nodeB.setPeerPolicy({
+			workspaceIdentity: IDENTITY_B,
+			windowName: 'frontend',
+		}),
+		(error: unknown) =>
+			error instanceof LocalIpcRemoteError
+			&& errorReason(error) === 'WINDOW_NAME_CONFLICT',
+	);
+	assert.equal((await fixture.nodeB.getPeerPolicy()).windowName, 'Repository B');
+});
+
 interface Fixture {
 	readonly nodeA: WindowNodeClient;
 	readonly nodeB: WindowNodeClient;

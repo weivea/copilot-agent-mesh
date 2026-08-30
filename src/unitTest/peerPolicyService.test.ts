@@ -5,6 +5,7 @@ import {
 	NodeRegistry,
 	PeerPolicyService,
 	PeerPolicyStore,
+	resolveWindowDisplayName,
 	type RegistryScheduler,
 } from '../broker';
 import { MeshDomainError } from '../domain/errors';
@@ -35,6 +36,14 @@ const NOW = new Date('2026-08-30T11:00:00.000Z');
 const IDENTITY_A = createOpaqueWorkspaceIdentity('workspace-a');
 const IDENTITY_B = createOpaqueWorkspaceIdentity('workspace-b');
 const IDENTITY_C = createOpaqueWorkspaceIdentity('workspace-c');
+
+test('falls through unsafe Workspace display names to the short node identity', () => {
+	assert.equal(resolveWindowDisplayName(undefined, ' Backend ', NODE_A), NODE_A.slice(0, 8));
+	assert.equal(
+		resolveWindowDisplayName(undefined, 'ｆｉｌｅ：／／／private', NODE_A),
+		NODE_A.slice(0, 8),
+	);
+});
 
 test('applies all four directional allowlist and accepting gate combinations', async (t) => {
 	const fixture = await createFixture();
@@ -189,6 +198,11 @@ test('retains offline allowlist identities and rebinds them to a new exact node 
 	const fixture = await createFixture();
 	t.after(() => fixture.registry.dispose());
 	await setGate(fixture, true, true);
+	await fixture.service.setPolicy(identityParams(NODE_B, INSTANCE_B), {
+		...identityParams(NODE_B, INSTANCE_B),
+		workspaceIdentity: IDENTITY_B,
+		windowName: 'Persistent Backend',
+	});
 
 	fixture.registry.unregister(identityParams(NODE_B, INSTANCE_B));
 	assert.deepEqual(fixture.service.getPolicy(identityParams(NODE_A, INSTANCE_A)).allowlist, [
@@ -208,6 +222,10 @@ test('retains offline allowlist identities and rebinds them to a new exact node 
 	assert.equal(
 		fixture.service.listAuthorized(identityParams(NODE_A, INSTANCE_A)).nodes[0]?.nodeInstanceId,
 		INSTANCE_B2,
+	);
+	assert.equal(
+		fixture.service.listAuthorized(identityParams(NODE_A, INSTANCE_A)).nodes[0]?.label,
+		'Persistent Backend',
 	);
 });
 
@@ -278,7 +296,7 @@ test('revocation is immediate and route acquisition rechecks after prevalidation
 	assert.equal(fixture.leases.isLeased(IDENTITY_B), false);
 });
 
-test('uses stable identities and exact instances rather than duplicate or spoofed labels', async (t) => {
+test('uses stable identities and exact instances rather than spoofed or renamed labels', async (t) => {
 	const fixture = await createFixture({ targetLabel: 'frontend' });
 	t.after(() => fixture.registry.dispose());
 	await fixture.service.setPolicy(identityParams(NODE_A, INSTANCE_A), {
@@ -290,18 +308,55 @@ test('uses stable identities and exact instances rather than duplicate or spoofe
 	await fixture.service.setPolicy(identityParams(NODE_B, INSTANCE_B), {
 		...identityParams(NODE_B, INSTANCE_B),
 		workspaceIdentity: IDENTITY_B,
-		windowName: 'frontend',
+		windowName: 'backend-renamed',
 		acceptsIncoming: true,
 	});
 
 	const listed = fixture.service.listAuthorized(identityParams(NODE_A, INSTANCE_A));
-	assert.equal(listed.nodes[0]?.label, 'frontend');
+	assert.equal(listed.nodes[0]?.label, 'backend-renamed');
 	assert.equal(listed.nodes[0]?.nodeId, NODE_B);
 	assert.equal(listed.nodes[0]?.workspaces[0]?.workspaceIdentity, IDENTITY_B);
+	assert.deepEqual(
+		fixture.service.getPolicy(identityParams(NODE_A, INSTANCE_A)).allowlist,
+		[IDENTITY_B],
+	);
 	await assert.rejects(
 		fixture.registry.validateTaskRoute(route(INSTANCE_B2)),
 		hasReason('PEER_OFFLINE'),
 	);
+	const acquired = await fixture.registry.acquireTaskRoute(route());
+	await fixture.service.setPolicy(identityParams(NODE_B, INSTANCE_B), {
+		...identityParams(NODE_B, INSTANCE_B),
+		workspaceIdentity: IDENTITY_B,
+		windowName: 'backend-display-only',
+	});
+	assert.equal(acquired.workspaceLeaseKey, IDENTITY_B);
+	assert.equal(fixture.leases.isLeased(IDENTITY_B), true);
+	assert.equal(fixture.registry.releaseTaskRoute(DEVICE, TASK), true);
+});
+
+test('rejects normalized rename collisions without changing policy gates', async (t) => {
+	const fixture = await createFixture();
+	t.after(() => fixture.registry.dispose());
+	await setGate(fixture, true, true);
+	await fixture.service.setPolicy(identityParams(NODE_A, INSTANCE_A), {
+		...identityParams(NODE_A, INSTANCE_A),
+		workspaceIdentity: IDENTITY_A,
+		windowName: 'Ｆrontend',
+	});
+	const before = fixture.service.getPolicy(identityParams(NODE_B, INSTANCE_B));
+
+	await assert.rejects(
+		fixture.service.setPolicy(identityParams(NODE_B, INSTANCE_B), {
+			...identityParams(NODE_B, INSTANCE_B),
+			workspaceIdentity: IDENTITY_B,
+			windowName: 'frontend',
+		}),
+		hasReason('WINDOW_NAME_CONFLICT'),
+	);
+
+	assert.deepEqual(fixture.service.getPolicy(identityParams(NODE_B, INSTANCE_B)), before);
+	await fixture.registry.validateTaskRoute(route());
 });
 
 test('keeps the configuration directory safe and separate from Tool visibility', async (t) => {
@@ -334,17 +389,20 @@ test('keeps the configuration directory safe and separate from Tool visibility',
 	assert.equal(authorized.nodes[0]?.workspaces[0]?.name, 'Workspace');
 });
 
-test('redacts credential-shaped candidate labels and forgets explicitly released workspaces', async (t) => {
+test('rejects credential-shaped names and forgets explicitly released workspaces', async (t) => {
 	const fixture = await createFixture();
 	t.after(() => fixture.registry.dispose());
-	await fixture.service.setPolicy(identityParams(NODE_B, INSTANCE_B), {
+	await assert.rejects(
+		fixture.service.setPolicy(identityParams(NODE_B, INSTANCE_B), {
 		...identityParams(NODE_B, INSTANCE_B),
 		workspaceIdentity: IDENTITY_B,
 		windowName: 'ghp_123456789012345678901234567890123456',
-	});
+		}),
+		hasReason('WINDOW_NAME_INVALID'),
+	);
 
 	let candidate = fixture.service.listCandidates(identityParams(NODE_A, INSTANCE_A)).candidates[0];
-	assert.equal(candidate?.label, NODE_B.slice(0, 8));
+	assert.equal(candidate?.label, 'Repository B');
 	assert.equal(candidate?.workspaceName, 'Repository B');
 
 	fixture.registry.releaseWorkspace({

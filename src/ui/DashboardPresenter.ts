@@ -13,6 +13,7 @@ export interface DashboardViewModel {
 	readonly device: DashboardSnapshot['device'];
 	readonly listener: DashboardSnapshot['listener'];
 	readonly broker: NonNullable<DashboardSnapshot['broker']>;
+	readonly thisWindow: DashboardSnapshot['thisWindow'];
 	readonly localNodes: readonly NonNullable<DashboardSnapshot['localNodes']>[number][];
 	readonly remoteDevices: readonly NonNullable<DashboardSnapshot['remoteDevices']>[number][];
 	readonly workspaces: DashboardSnapshot['workspaces'];
@@ -44,6 +45,12 @@ export class DashboardPresenter {
 					message: 'The local Device Broker lifecycle is unavailable.',
 				},
 			}),
+			thisWindow: {
+				...snapshot.thisWindow,
+				name: redactRemoteText(snapshot.thisWindow.name),
+				workspaceName: redactRemoteText(snapshot.thisWindow.workspaceName),
+				detail: optionalRedacted(snapshot.thisWindow.detail),
+			},
 			localNodes: (snapshot.localNodes ?? []).map(redactNode),
 			remoteDevices: (snapshot.remoteDevices ?? []).map((device) => ({
 				...device,
