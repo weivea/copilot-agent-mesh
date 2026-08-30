@@ -7,7 +7,7 @@
 // This script therefore runs upstream code generation and then compiles the client.
 
 import { spawnSync } from 'node:child_process';
-import { access, readFile, rm } from 'node:fs/promises';
+import { access, readFile, rm, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -19,6 +19,7 @@ const clientRoot = join(submoduleRoot, 'clients', 'typescript');
 const generatedTypes = join(clientRoot, 'src', 'types');
 const distributionRoot = join(clientRoot, 'dist');
 const entryPoint = join(distributionRoot, 'types', 'index.js');
+const generatedActionOrigin = join(submoduleRoot, 'types', 'action-origin.generated.ts');
 const require = createRequire(import.meta.url);
 
 const expectedCommit = 'f19dd8b3942d029744a3bdd31d830f9428e8ea47';
@@ -38,9 +39,10 @@ async function main() {
 	}
 	await rm(generatedTypes, { recursive: true, force: true });
 	await rm(distributionRoot, { recursive: true, force: true });
-	generateClientSources();
+	await generateClientSources();
 	compileClient();
 	await assertBuiltClient();
+	assertSubmoduleClean();
 	report('built', pinnedCommit);
 }
 
@@ -63,6 +65,11 @@ function readPinnedCommit() {
 	if (result.status !== 0) {
 		throw new Error('Unable to read the agent-host-protocol submodule commit.');
 	}
+	assertSubmoduleClean();
+	return result.stdout.trim();
+}
+
+function assertSubmoduleClean() {
 	const status = spawnSync(
 		'git',
 		['-C', submoduleRoot, 'status', '--porcelain', '--untracked-files=normal'],
@@ -74,16 +81,30 @@ function readPinnedCommit() {
 	if (status.stdout.trim().length > 0) {
 		throw new Error('The agent-host-protocol submodule has uncommitted source changes.');
 	}
-	return result.stdout.trim();
 }
 
-function generateClientSources() {
-	run(
-		process.execPath,
-		[require.resolve('tsx/cli'), join(submoduleRoot, 'scripts', 'generate.ts'), '--typescript'],
-		submoduleRoot,
-		'Upstream agent-host-protocol TypeScript generation failed.',
-	);
+async function generateClientSources() {
+	// The upstream generator rewrites this tracked file with LF. Preserve its
+	// checkout bytes so repeated builds do not dirty Windows CRLF worktrees.
+	const checkedOutActionOrigin = await readFile(generatedActionOrigin);
+	try {
+		run(
+			process.execPath,
+			[require.resolve('tsx/cli'), join(submoduleRoot, 'scripts', 'generate.ts'), '--typescript'],
+			submoduleRoot,
+			'Upstream agent-host-protocol TypeScript generation failed.',
+		);
+		const regeneratedActionOrigin = await readFile(generatedActionOrigin);
+		if (normalizeLineEndings(regeneratedActionOrigin) !== normalizeLineEndings(checkedOutActionOrigin)) {
+			throw new Error('Generated agent-host-protocol action origins do not match the pinned source.');
+		}
+	} finally {
+		await writeFile(generatedActionOrigin, checkedOutActionOrigin);
+	}
+}
+
+function normalizeLineEndings(contents) {
+	return contents.toString('utf8').replaceAll('\r\n', '\n');
 }
 
 function compileClient() {
