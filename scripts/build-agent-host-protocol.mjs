@@ -21,7 +21,7 @@ const distributionRoot = join(clientRoot, 'dist');
 const entryPoint = join(distributionRoot, 'types', 'index.js');
 const require = createRequire(import.meta.url);
 
-const expectedCommit = 'fa92d47d3f3ac6732af2019b52826d2d638a4219';
+const expectedCommit = 'f19dd8b3942d029744a3bdd31d830f9428e8ea47';
 const expectedClientVersion = '0.9.0';
 const expectedProtocolVersion = '1.0.0';
 

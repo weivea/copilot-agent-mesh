@@ -607,10 +607,12 @@ Coordinator 可以有本地 `created` 状态；Worker 的第一个持久状态�
 
 VS Code 1.135.0 Agent Host 要求 AHP 1.0.0，而 npm 最新发布仍是 0.8.0。当前实现
 因此用 Git Submodule 精确锁定上游 commit
-`fa92d47d3f3ac6732af2019b52826d2d638a4219`，从源码生成并构建 TypeScript
+`f19dd8b3942d029744a3bdd31d830f9428e8ea47`，从源码生成并构建 TypeScript
 0.9.0 Client；其 `SUPPORTED_PROTOCOL_VERSIONS` 包含 1.0.0。该 revision 尚未
 Tag 或发布到 npm，属于明确记录的 Preview 供应链限制。Phase 0 必须继续证明实际
 VS Code Build 的 Host 版本与 SDK Offer 有交集，不能靠 Feature Flag 绕过。
+当前 pin 是上游在 `60706330` 将首选 Offer 改为 0.9.0 之前的最新提交；不能直接
+跟随 `main`，因为测试中的 VS Code 1.135.0 Host 要求 `^1.0.0`。
 [AHP Versioning](https://github.com/microsoft/agent-host-protocol/blob/main/docs/specification/versioning.md)
 
 当前 `engines.vscode = ^1.103.0` 只足以覆盖 Language Model Tool API，不能自动证明对应版本的 `code agent host` 与目标 AHP 行为可用。Phase 0 完成后，将最低 VS Code 版本提高到验证通过的最低版本，并在启动时做 Capability Probe。

@@ -8,7 +8,7 @@ dist/extension.js. Development-only packages are not distributed in the VSIX.
 Copyright (c) Microsoft Corporation
 License: MIT
 Source: https://github.com/microsoft/agent-host-protocol
-Pinned commit: fa92d47d3f3ac6732af2019b52826d2d638a4219
+Pinned commit: f19dd8b3942d029744a3bdd31d830f9428e8ea47
 The complete license is distributed as
 third_party/agent-host-protocol/LICENSE.
 

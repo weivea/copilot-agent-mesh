@@ -2,7 +2,7 @@
 
 The MVP runtime is a production adapter over the TypeScript 0.9.0 client built
 from pinned `microsoft-agent-host-protocol` commit
-`fa92d47d3f3ac6732af2019b52826d2d638a4219`; it negotiates AHP 1.0.0 with
+`f19dd8b3942d029744a3bdd31d830f9428e8ea47`; it negotiates AHP 1.0.0 with
 VS Code 1.135.0 and does not use the Fake Agent. Fake AHP connections are limited
 to deterministic tests.
 

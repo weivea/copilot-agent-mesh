@@ -8,9 +8,11 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 - Upgraded the production AHP client from the published 0.8.0 tarball to the
   TypeScript 0.9.0 client built from pinned upstream commit
-  `fa92d47d3f3ac6732af2019b52826d2d638a4219`, which negotiates AHP 1.0.0 with
+  `f19dd8b3942d029744a3bdd31d830f9428e8ea47`, which negotiates AHP 1.0.0 with
   VS Code 1.135.0. The upstream source is an explicit Git submodule because this
-  client revision is not yet tagged or published to npm.
+  client revision is not yet tagged or published to npm. This is the newest
+  upstream commit before `60706330` changed the offer to AHP 0.9.0, which is
+  incompatible with the tested VS Code Host's `^1.0.0` requirement.
 - Added an opt-in persistent real-E2E profile, guarded against overlap with real
   VS Code user-data directories, so an interactive GitHub session can be reused
   without changing the default disposable-profile behavior.
