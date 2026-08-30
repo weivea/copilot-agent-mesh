@@ -1,4 +1,5 @@
 import * as assert from 'node:assert/strict';
+import { join } from 'node:path';
 import { test } from 'node:test';
 
 import { PROTOCOL_LIMITS } from '../../shared/protocol';
@@ -128,8 +129,10 @@ test('Artifact Store detects corruption and fences stale Broker generations', as
 		content: { type: 'object' },
 		createdAt: AT,
 	});
-	const path = `memory/artifacts/${ARTIFACT_ID}.json`;
-	const record = JSON.parse(memory.files.get(path)!);
+	const path = join('memory', 'artifacts', `${ARTIFACT_ID}.json`);
+	const stored = memory.files.get(path);
+	assert.ok(stored !== undefined, 'the artifact record must be persisted before corruption');
+	const record = JSON.parse(stored);
 	record.content = { type: 'array' };
 	memory.files.set(path, `${JSON.stringify(record)}\n`);
 	await assert.rejects(
