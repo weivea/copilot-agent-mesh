@@ -6,6 +6,8 @@ import {
 	GATEWAY_METHODS,
 	MESH_ERROR_CODES,
 	PROTOCOL_LIMITS,
+	dashboardNodeDirectoryResultSchema,
+	nodePolicyGetParamsSchema,
 	nodePolicyResultSchema,
 	nodePolicySetParamsSchema,
 	persistedTaskRecordSchema,
@@ -146,6 +148,16 @@ describe('protocol schemas', () => {
 		const workspaceIdentity = `sha256:${'A'.repeat(43)}`;
 		assert.equal(workspaceIdentitySchema.safeParse(workspaceIdentity).success, true);
 		assert.equal(workspaceIdentitySchema.safeParse(`sha256:${'A'.repeat(42)}`).success, false);
+		assert.equal(nodePolicyGetParamsSchema.safeParse({
+			nodeId: '00000000-0000-4000-8000-000000000010',
+			nodeInstanceId: '00000000-0000-4000-8000-000000000011',
+			workspaceIdentity,
+		}).success, true);
+		assert.equal(nodePolicyGetParamsSchema.safeParse({
+			nodeId: '00000000-0000-4000-8000-000000000010',
+			nodeInstanceId: '00000000-0000-4000-8000-000000000011',
+			workspaceIdentity: 'workspace-a',
+		}).success, false);
 		assert.equal(nodePolicySetParamsSchema.safeParse({
 			nodeId: '00000000-0000-4000-8000-000000000010',
 			nodeInstanceId: '00000000-0000-4000-8000-000000000011',
@@ -166,6 +178,45 @@ describe('protocol schemas', () => {
 			acceptsIncoming: false,
 			allowlist: [],
 		}).success, true);
+		assert.equal(dashboardNodeDirectoryResultSchema.safeParse({
+			deviceId: '00000000-0000-4000-8000-000000000012',
+			nodes: [{
+				nodeId: '00000000-0000-4000-8000-000000000010',
+				nodeInstanceId: '00000000-0000-4000-8000-000000000011',
+				label: 'frontend',
+				status: 'online',
+				workspaces: [{
+					workspaceId: '00000000-0000-4000-8000-000000000013',
+					name: 'project',
+					capabilityTags: [],
+					enabled: true,
+					busy: false,
+					claimStatus: 'claimed',
+				}],
+			}],
+			truncated: false,
+			totalNodes: 1,
+		}).success, true);
+		assert.equal(dashboardNodeDirectoryResultSchema.safeParse({
+			deviceId: '00000000-0000-4000-8000-000000000012',
+			nodes: [{
+				nodeId: '00000000-0000-4000-8000-000000000010',
+				nodeInstanceId: '00000000-0000-4000-8000-000000000011',
+				label: 'frontend',
+				status: 'online',
+				workspaces: [{
+					workspaceId: '00000000-0000-4000-8000-000000000013',
+					workspaceIdentity,
+					name: 'project',
+					capabilityTags: [],
+					enabled: true,
+					busy: false,
+					claimStatus: 'claimed',
+				}],
+			}],
+			truncated: false,
+			totalNodes: 1,
+		}).success, false);
 		for (const reason of [
 			'PEER_NOT_ALLOWED',
 			'PEER_NOT_ACCEPTING',

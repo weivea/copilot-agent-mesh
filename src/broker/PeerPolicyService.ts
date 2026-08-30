@@ -1,12 +1,16 @@
 import {
 	PROTOCOL_LIMITS,
+	dashboardNodeDirectoryResultSchema,
 	nodeDirectoryResultSchema,
 	nodeIdentityParamsSchema,
+	nodePolicyGetParamsSchema,
 	nodePolicyResultSchema,
 	nodePolicySetParamsSchema,
 	peerPolicyCandidateListResultSchema,
+	type DashboardNodeDirectoryResult,
 	type NodeDirectoryResult,
 	type NodeIdentityParams,
+	type NodePolicyGetParams,
 	type NodePolicyResult,
 	type NodePolicySetParams,
 	type PeerGateState,
@@ -38,9 +42,16 @@ export class PeerPolicyService implements PeerRouteAuthorizer {
 		private readonly options: PeerPolicyServiceOptions,
 	) {}
 
-	public getPolicy(caller: NodeIdentityParams): NodePolicyResult {
+	public getPolicy(caller: NodePolicyGetParams): NodePolicyResult {
 		this.assertEnabled();
-		const workspace = this.requireSingleOwnedWorkspace(caller);
+		const input = nodePolicyGetParamsSchema.parse(caller);
+		const identity = {
+			nodeId: input.nodeId,
+			nodeInstanceId: input.nodeInstanceId,
+		};
+		const workspace = input.workspaceIdentity === undefined
+			? this.requireSingleOwnedWorkspace(identity)
+			: this.requireOwnedWorkspace(identity, input.workspaceIdentity);
 		return this.projectPolicy(workspace.workspaceIdentity, workspace.name);
 	}
 
@@ -64,14 +75,13 @@ export class PeerPolicyService implements PeerRouteAuthorizer {
 				'A workspace cannot allowlist itself.',
 			);
 		}
-		const current = this.store.get(input.workspaceIdentity);
-		const entry = await this.store.set(input.workspaceIdentity, {
+		const entry = await this.store.update(input.workspaceIdentity, (current) => ({
 			windowName: input.windowName ?? current?.windowName ?? owned.name,
 			acceptsIncoming: input.acceptsIncoming ?? current?.acceptsIncoming ?? false,
 			allowlist: input.allowlist === undefined
 				? [...(current?.allowlist ?? [])]
 				: [...input.allowlist],
-		});
+		}));
 		this.changed();
 		return this.toResult(input.workspaceIdentity, entry);
 	}
@@ -108,6 +118,44 @@ export class PeerPolicyService implements PeerRouteAuthorizer {
 			nodes,
 			truncated: false,
 			totalNodes: nodes.length,
+		});
+	}
+
+	public listDashboard(caller: NodeIdentityParams): DashboardNodeDirectoryResult {
+		this.requireCaller(caller);
+		const raw = this.registry.list();
+		return dashboardNodeDirectoryResultSchema.parse({
+			deviceId: raw.deviceId,
+			nodes: raw.nodes.map((node) => {
+				const workspace = node.workspaces.length === 1 ? node.workspaces[0] : undefined;
+				const policy = workspace === undefined
+					? undefined
+					: this.store.get(workspace.workspaceIdentity);
+				return {
+					nodeId: node.nodeId,
+					nodeInstanceId: node.nodeInstanceId,
+					label: safeDisplayName(
+						policy?.windowName ?? workspace?.name ?? node.label,
+						shortId(node.nodeId),
+					),
+					status: node.status,
+					workspaces: node.workspaces.map((entry) => ({
+						workspaceId: entry.workspaceId,
+						name: safeDisplayName(entry.name, 'Workspace'),
+						capabilityTags: entry.capabilityTags.map((tag) =>
+							safeDisplayName(tag, 'Capability')
+						),
+						enabled: entry.enabled,
+						busy: entry.busy,
+						claimStatus: entry.claimStatus,
+						...(entry.activeTaskId === undefined
+							? {}
+							: { activeTaskId: entry.activeTaskId }),
+					})),
+				};
+			}),
+			truncated: raw.truncated,
+			totalNodes: raw.totalNodes,
 		});
 	}
 

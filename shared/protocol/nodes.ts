@@ -75,6 +75,45 @@ export const nodeDirectoryResultSchema = z.strictObject({
 	}
 });
 
+export const dashboardWorkspaceSummarySchema = z.strictObject({
+	workspaceId: uuidSchema,
+	name: utf8String(PROTOCOL_LIMITS.nameBytes, 'workspace name', 1),
+	capabilityTags: z.array(utf8String(64, 'capability tag', 1)).max(32),
+	enabled: z.boolean(),
+	busy: z.boolean(),
+	claimStatus: workspaceClaimStatusSchema,
+	activeTaskId: uuidSchema.optional(),
+});
+
+export const dashboardNodeDescriptorSchema = z.strictObject({
+	nodeId: uuidSchema,
+	nodeInstanceId: uuidSchema,
+	label: utf8String(PROTOCOL_LIMITS.nameBytes, 'window node label', 1),
+	status: nodeStatusSchema,
+	workspaces: z.array(dashboardWorkspaceSummarySchema).max(PROTOCOL_LIMITS.workspaceListCount),
+});
+
+export const dashboardNodeDirectoryResultSchema = z.strictObject({
+	deviceId: uuidSchema,
+	nodes: z.array(dashboardNodeDescriptorSchema).max(PROTOCOL_LIMITS.nodeListCount),
+	truncated: z.boolean(),
+	totalNodes: z.number().int().nonnegative().max(PROTOCOL_LIMITS.nodeListCount),
+}).superRefine((result, context) => {
+	validateTruncation(
+		result.nodes.length,
+		result.totalNodes,
+		result.truncated,
+		context,
+		['totalNodes'],
+	);
+	if (serializedLocalResultBytes(result) > PROTOCOL_LIMITS.frameBytes) {
+		context.addIssue({
+			code: 'custom',
+			message: 'Serialized dashboard node directory exceeds the protocol frame limit',
+		});
+	}
+});
+
 export const meshDeviceDirectoryEntrySchema = z.strictObject({
 	peerId: uuidSchema.optional(),
 	device: deviceInfoSchema,
@@ -224,7 +263,9 @@ export const nodeWorkspaceReleaseParamsSchema = nodeIdentityParamsSchema.extend(
 	workspaceId: uuidSchema,
 });
 
-export const nodePolicyGetParamsSchema = nodeIdentityParamsSchema;
+export const nodePolicyGetParamsSchema = nodeIdentityParamsSchema.extend({
+	workspaceIdentity: workspaceIdentitySchema.optional(),
+});
 
 export const nodePolicySetParamsSchema = nodeIdentityParamsSchema.extend({
 	workspaceIdentity: workspaceIdentitySchema,
@@ -372,6 +413,7 @@ export const LOCAL_BROKER_METHODS = {
 	heartbeat: 'node.heartbeat',
 	unregister: 'node.unregister',
 	list: 'node.list',
+	dashboardList: 'node.dashboard.list',
 	claimWorkspace: 'node.claimWorkspace',
 	releaseWorkspace: 'node.releaseWorkspace',
 	policyGet: 'node.policy.get',
@@ -407,6 +449,7 @@ export const localBrokerMethodParamsSchemas = {
 	[LOCAL_BROKER_METHODS.heartbeat]: nodeHeartbeatParamsSchema,
 	[LOCAL_BROKER_METHODS.unregister]: nodeIdentityParamsSchema,
 	[LOCAL_BROKER_METHODS.list]: z.strictObject({}),
+	[LOCAL_BROKER_METHODS.dashboardList]: nodeIdentityParamsSchema,
 	[LOCAL_BROKER_METHODS.claimWorkspace]: nodeWorkspaceClaimParamsSchema,
 	[LOCAL_BROKER_METHODS.releaseWorkspace]: nodeWorkspaceReleaseParamsSchema,
 	[LOCAL_BROKER_METHODS.policyGet]: nodePolicyGetParamsSchema,
@@ -429,6 +472,8 @@ export type WorkspaceClaimStatus = z.infer<typeof workspaceClaimStatusSchema>;
 export type NodeWorkspaceSummary = z.infer<typeof nodeWorkspaceSummarySchema>;
 export type WindowNodeDescriptor = z.infer<typeof windowNodeDescriptorSchema>;
 export type NodeDirectoryResult = z.infer<typeof nodeDirectoryResultSchema>;
+export type DashboardNodeDescriptor = z.infer<typeof dashboardNodeDescriptorSchema>;
+export type DashboardNodeDirectoryResult = z.infer<typeof dashboardNodeDirectoryResultSchema>;
 export type MeshDirectoryResult = z.infer<typeof meshDirectoryResultSchema>;
 export type BrokerRemoteListResult = z.infer<typeof brokerRemoteListResultSchema>;
 export type TaskTarget = z.infer<typeof taskTargetSchema>;
@@ -439,6 +484,7 @@ export type NodeIdentityParams = z.infer<typeof nodeIdentityParamsSchema>;
 export type NodeWorkspaceClaimParams = z.infer<typeof nodeWorkspaceClaimParamsSchema>;
 export type NodeWorkspaceReleaseParams = z.infer<typeof nodeWorkspaceReleaseParamsSchema>;
 export type WorkspaceIdentity = z.infer<typeof workspaceIdentitySchema>;
+export type NodePolicyGetParams = z.infer<typeof nodePolicyGetParamsSchema>;
 export type NodePolicySetParams = z.infer<typeof nodePolicySetParamsSchema>;
 export type NodePolicyResult = z.infer<typeof nodePolicyResultSchema>;
 export type PeerGateState = z.infer<typeof peerGateStateSchema>;

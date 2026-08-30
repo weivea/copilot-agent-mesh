@@ -104,6 +104,14 @@ suite('Copilot Agent Mesh', () => {
 		assert.strictEqual(api.brokerState().state, 'running');
 		assert.strictEqual(api.brokerState().owner, true);
 		assert.deepEqual((await api.node.listNodes()).nodes, []);
+		const dashboard = await api.node.listDashboardNodes();
+		const thisWindow = dashboard.nodes.find((node) =>
+			node.nodeId === api.nodeId
+			&& node.nodeInstanceId === api.nodeInstanceId,
+		);
+		assert.ok(thisWindow);
+		assert.strictEqual(thisWindow.workspaces.length, api.nodeState().workspaceCount);
+		assert.ok(!JSON.stringify(dashboard).includes('sha256:'));
 	});
 
 	test('defines the initial gateway protocol surface', () => {

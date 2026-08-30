@@ -80,13 +80,29 @@ test('authenticated broker RPC keeps Tool and configuration directories separate
 	);
 });
 
+test('default-off Tool listing stays empty while the safe Dashboard directory remains complete', async (t) => {
+	const fixture = await createFixture({ enabled: false });
+	t.after(() => fixture.dispose());
+
+	assert.deepEqual((await fixture.nodeA.listNodes()).nodes, []);
+	const dashboard = await fixture.nodeA.listDashboardNodes();
+	assert.equal(dashboard.nodes.length, 2);
+	assert.equal(dashboard.totalNodes, 2);
+	assert.equal(dashboard.truncated, false);
+	assert.equal(
+		dashboard.nodes.find(({ nodeId }) => nodeId === NODE_A)?.workspaces[0]?.workspaceId,
+		WORKSPACE_A,
+	);
+	assert.doesNotMatch(JSON.stringify(dashboard), /sha256:|component-workspace/u);
+});
+
 interface Fixture {
 	readonly nodeA: WindowNodeClient;
 	readonly nodeB: WindowNodeClient;
 	dispose(): Promise<void>;
 }
 
-async function createFixture(): Promise<Fixture> {
+async function createFixture(options: { readonly enabled?: boolean } = {}): Promise<Fixture> {
 	const tempDirectory = await mkdtemp(
 		process.platform === 'win32' ? join(tmpdir(), 'mesh-pp-') : '/tmp/mesh-pp-',
 	);
@@ -117,7 +133,7 @@ async function createFixture(): Promise<Fixture> {
 		scheduler: new NoopScheduler(),
 	});
 	const policies = new PeerPolicyService(peerStore, registry, {
-		enabled: () => true,
+		enabled: () => options.enabled ?? true,
 	});
 	registry.setPeerRouteAuthorizer(policies);
 	const taskService = new BrokerTaskService(DEVICE, registry, tasks, clock);

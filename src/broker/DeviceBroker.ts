@@ -317,6 +317,11 @@ export class DeviceBroker {
 			case LOCAL_BROKER_METHODS.list:
 				emptyParamsSchema.parse(params);
 				return toJsonValue(this.options.peerPolicies.listAuthorized(binding));
+			case LOCAL_BROKER_METHODS.dashboardList: {
+				const input = nodeIdentityParamsSchema.parse(params);
+				this.assertIdentity(binding, input);
+				return toJsonValue(this.options.peerPolicies.listDashboard(input));
+			}
 			case LOCAL_BROKER_METHODS.claimWorkspace: {
 				const input = nodeWorkspaceClaimParamsSchema.parse(params);
 				this.assertIdentity(binding, input);

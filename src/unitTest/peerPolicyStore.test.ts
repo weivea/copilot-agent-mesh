@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { join } from 'node:path';
 import { test } from 'node:test';
 
 import { MeshDomainError } from '../domain/errors';
@@ -17,7 +18,7 @@ import {
 } from './artifactStoreTestSupport';
 
 const ROOT = 'memory';
-const POLICY_FILE = `${ROOT}/${PEER_POLICY_PATH}`;
+const POLICY_FILE = join(ROOT, PEER_POLICY_PATH);
 const NOW = new Date('2026-08-30T10:00:00.000Z');
 
 test('defaults to an empty policy document without writing state', async () => {

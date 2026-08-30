@@ -93,6 +93,76 @@ test('defaults ambiguous multi-workspace sources to all-workspaces authorization
 	await fixture.registry.validateTaskRoute(route());
 });
 
+test('reads each owned multi-root policy explicitly and rejects foreign identities', async (t) => {
+	const fixture = await createFixture();
+	t.after(() => fixture.registry.dispose());
+	await fixture.registry.claimWorkspace(claim(
+		NODE_A,
+		INSTANCE_A,
+		WORKSPACE_C,
+		IDENTITY_C,
+		'Repository C',
+	));
+	await fixture.service.setPolicy(identityParams(NODE_A, INSTANCE_A), {
+		...identityParams(NODE_A, INSTANCE_A),
+		workspaceIdentity: IDENTITY_C,
+		allowlist: [IDENTITY_B],
+	});
+
+	assert.deepEqual(fixture.service.getPolicy({
+		...identityParams(NODE_A, INSTANCE_A),
+		workspaceIdentity: IDENTITY_C,
+	}).allowlist, [IDENTITY_B]);
+	assert.throws(
+		() => fixture.service.getPolicy({
+			...identityParams(NODE_A, INSTANCE_A),
+			workspaceIdentity: IDENTITY_B,
+		}),
+		hasReason('POLICY_FORBIDDEN'),
+	);
+	assert.throws(
+		() => fixture.service.getPolicy(identityParams(NODE_A, INSTANCE_A)),
+		hasReason('POLICY_FORBIDDEN'),
+	);
+});
+
+test('serializes same-identity partial patches without restoring revoked gates', async (t) => {
+	const fixture = await createFixture();
+	t.after(() => fixture.registry.dispose());
+	await setGate(fixture, true, true);
+
+	await Promise.all([
+		fixture.service.setPolicy(identityParams(NODE_A, INSTANCE_A), {
+			...identityParams(NODE_A, INSTANCE_A),
+			workspaceIdentity: IDENTITY_A,
+			allowlist: [],
+		}),
+		fixture.service.setPolicy(identityParams(NODE_A, INSTANCE_A), {
+			...identityParams(NODE_A, INSTANCE_A),
+			workspaceIdentity: IDENTITY_A,
+			windowName: 'renamed-source',
+		}),
+		fixture.service.setPolicy(identityParams(NODE_B, INSTANCE_B), {
+			...identityParams(NODE_B, INSTANCE_B),
+			workspaceIdentity: IDENTITY_B,
+			acceptsIncoming: false,
+		}),
+		fixture.service.setPolicy(identityParams(NODE_B, INSTANCE_B), {
+			...identityParams(NODE_B, INSTANCE_B),
+			workspaceIdentity: IDENTITY_B,
+			windowName: 'renamed-target',
+		}),
+	]);
+
+	const source = fixture.service.getPolicy(identityParams(NODE_A, INSTANCE_A));
+	const target = fixture.service.getPolicy(identityParams(NODE_B, INSTANCE_B));
+	assert.equal(source.windowName, 'renamed-source');
+	assert.deepEqual(source.allowlist, []);
+	assert.equal(target.windowName, 'renamed-target');
+	assert.equal(target.acceptsIncoming, false);
+	assert.equal(fixture.service.listAuthorized(identityParams(NODE_A, INSTANCE_A)).nodes.length, 0);
+});
+
 test('only lets a registered caller mutate its own claimed workspace policy', async (t) => {
 	const fixture = await createFixture();
 	t.after(() => fixture.registry.dispose());
@@ -238,6 +308,7 @@ test('keeps the configuration directory safe and separate from Tool visibility',
 	const fixture = await createFixture({
 		targetLabel: '/Users/private/secret-project',
 		targetWorkspaceName: 'C:\\private\\secret-project',
+		targetCapabilityTags: ['typescript', 'token=secret'],
 	});
 	t.after(() => fixture.registry.dispose());
 
@@ -251,6 +322,11 @@ test('keeps the configuration directory safe and separate from Tool visibility',
 	const serialized = JSON.stringify(configuration);
 	assert.doesNotMatch(serialized, /sha256:/u);
 	assert.doesNotMatch(serialized, /Users|private|secret-project/u);
+	const dashboard = fixture.service.listDashboard(identityParams(NODE_A, INSTANCE_A));
+	assert.deepEqual(dashboard.nodes[1]?.workspaces[0]?.capabilityTags, [
+		'typescript',
+		'Capability',
+	]);
 
 	await setGate(fixture, true, true);
 	const authorized = fixture.service.listAuthorized(identityParams(NODE_A, INSTANCE_A));
@@ -308,6 +384,7 @@ async function createFixture(options: {
 	readonly enabled?: boolean;
 	readonly targetLabel?: string;
 	readonly targetWorkspaceName?: string;
+	readonly targetCapabilityTags?: string[];
 } = {}): Promise<Fixture> {
 	const leases = new WorkspaceLeaseManager();
 	const registry = await NodeRegistry.create({
@@ -336,6 +413,7 @@ async function createFixture(options: {
 		WORKSPACE_B,
 		IDENTITY_B,
 		options.targetWorkspaceName ?? 'Repository B',
+		options.targetCapabilityTags,
 	));
 	const ownership = new TestOwnership();
 	const store = new PeerPolicyStore(
@@ -386,6 +464,7 @@ function claim(
 	workspaceId: string,
 	workspaceIdentity: string,
 	name: string,
+	capabilityTags: string[] = ['typescript'],
 ) {
 	return {
 		nodeId,
@@ -393,7 +472,7 @@ function claim(
 		workspaceId,
 		workspaceIdentity,
 		name,
-		capabilityTags: ['typescript'],
+		capabilityTags,
 	};
 }
 

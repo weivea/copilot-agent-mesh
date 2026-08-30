@@ -232,6 +232,124 @@ test('production dashboard persists the separate title without deriving it from 
 	bindings.dispose();
 });
 
+test('production dashboard uses the safe unfiltered directory for self, conflicts, truncation, and task names', async () => {
+	const disposable = { dispose: () => undefined };
+	const thisNodeId = '00000000-0000-4000-8000-000000000020';
+	const thisInstanceId = '00000000-0000-4000-8000-000000000021';
+	const conflictNodeId = '00000000-0000-4000-8000-000000000022';
+	const taskId = '00000000-0000-4000-8000-000000000023';
+	const bindings = new ProductionDashboardBindings({
+		changed: {
+			event: () => disposable,
+			fire: () => undefined,
+		},
+		profile: () => ({
+			deviceId,
+			name: 'This Device',
+			platform: 'darwin',
+			architecture: 'arm64',
+			vscodeVersion: '1.135.0',
+			extensionVersion: '0.4.0',
+		}),
+		node: {
+			nodeId: thisNodeId,
+			onDidChange: () => disposable,
+			listDashboardNodes: async () => ({
+				deviceId,
+				nodes: [
+					{
+						nodeId: thisNodeId,
+						nodeInstanceId: thisInstanceId,
+						label: 'This Window',
+						status: 'online',
+						workspaces: [{
+							workspaceId,
+							name: 'Source Workspace',
+							capabilityTags: ['typescript'],
+							enabled: true,
+							busy: true,
+							claimStatus: 'claimed',
+							activeTaskId: taskId,
+						}],
+					},
+					{
+						nodeId: conflictNodeId,
+						nodeInstanceId: '00000000-0000-4000-8000-000000000024',
+						label: 'Duplicate Window',
+						status: 'conflict',
+						workspaces: [{
+							workspaceId: '00000000-0000-4000-8000-000000000025',
+							name: 'Conflicting Workspace',
+							capabilityTags: [],
+							enabled: true,
+							busy: false,
+							claimStatus: 'conflict',
+						}],
+					},
+				],
+				truncated: true,
+				totalNodes: 3,
+			}),
+		},
+		localTasks: {},
+		remoteTasks: {
+			listDevices: async () => ({ devices: [], truncated: false, totalDevices: 0 }),
+			listKnownTasks: () => [],
+		},
+		runtime: {
+			probe: async () => ({ available: false, featureEnabled: false }),
+		},
+		guard: {
+			assertAllowed: () => undefined,
+		},
+		workerPlatform: {
+			supported: true,
+			listenerCode: 'CLI_UNSUPPORTED',
+			listenerMessage: 'Unsupported',
+			agentCode: 'AGENT_UNAVAILABLE',
+			agentMessage: 'Unavailable',
+		},
+		lifecycle: {
+			onDidChange: () => disposable,
+			snapshot: () => ({ state: 'running', owner: true }),
+		},
+		ownerRuntime: () => ({
+			listener: {
+				snapshot: () => ({
+					state: 'stopped',
+					tunnel: { state: 'stopped' },
+				}),
+			},
+			tasks: {
+				list: async () => [{
+					schemaVersion: 2,
+					taskId,
+					title: 'Named task',
+					peerId: deviceId,
+					sourceNodeId: thisNodeId,
+					workspaceId,
+					target: {
+						deviceId,
+						nodeId: thisNodeId,
+						nodeInstanceId: thisInstanceId,
+						workspaceId,
+					},
+					state: 'running',
+				}],
+			},
+		}),
+	} as unknown as ProductionDashboardBindingsOptions);
+
+	const snapshot = await bindings.getSnapshot();
+	assert.equal(snapshot.localNodes?.length, 2);
+	assert.equal(snapshot.localNodes?.find(({ thisWindow }) => thisWindow)?.workspaces[0]?.name, 'Source Workspace');
+	assert.ok(snapshot.errors.some(({ code }) => code === 'NODE_DIRECTORY_TRUNCATED'));
+	assert.ok(snapshot.errors.some(({ code }) => code === 'WORKSPACE_CLAIM_CONFLICT'));
+	assert.equal(snapshot.tasks[0]?.workspaceName, 'Source Workspace');
+	assert.equal(snapshot.tasks[0]?.phase, 'Window Node: This Window');
+	bindings.dispose();
+});
+
 test('local approval shows the full prompt and preapproval cannot be reused by title', async () => {
 	const calls: unknown[][] = [];
 	const choices: Array<string | undefined> = ['Run Once', undefined];

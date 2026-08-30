@@ -39,6 +39,7 @@ export const peerPolicyDocumentSchema = z.strictObject({
 
 export type PeerPolicyEntry = z.infer<typeof peerPolicyEntrySchema>;
 export type PeerPolicyDocument = z.infer<typeof peerPolicyDocumentSchema>;
+export type PeerPolicyValue = Omit<PeerPolicyEntry, 'updatedAt' | 'windowNameFold'>;
 
 export interface PeerPolicyStoreOptions {
 	readonly ownership: WorkerOwnership;
@@ -87,15 +88,22 @@ export class PeerPolicyStore {
 
 	public set(
 		workspaceIdentity: string,
-		policy: Omit<PeerPolicyEntry, 'updatedAt' | 'windowNameFold'>,
+		policy: PeerPolicyValue,
+	): Promise<PeerPolicyEntry> {
+		return this.update(workspaceIdentity, () => policy);
+	}
+
+	public update(
+		workspaceIdentity: string,
+		update: (current: PeerPolicyEntry | undefined) => PeerPolicyValue,
 	): Promise<PeerPolicyEntry> {
 		const identity = workspaceIdentitySchema.parse(workspaceIdentity);
-		return this.mutate(identity, policy);
+		return this.mutate(identity, update);
 	}
 
 	private mutate(
 		identity: WorkspaceIdentity,
-		policy: Omit<PeerPolicyEntry, 'updatedAt' | 'windowNameFold'>,
+		update: (current: PeerPolicyEntry | undefined) => PeerPolicyValue,
 	): Promise<PeerPolicyEntry> {
 		let result: PeerPolicyEntry | undefined;
 		const operation = this.serialize(async () => {
@@ -109,6 +117,7 @@ export class PeerPolicyStore {
 					`Peer policy entries cannot exceed ${MAX_PEER_POLICY_ENTRIES}.`,
 				);
 			}
+			const policy = update(structuredClone(current.entries[identity]));
 			const entry = peerPolicyEntrySchema.parse({
 				...policy,
 				windowNameFold: foldWindowName(policy.windowName),

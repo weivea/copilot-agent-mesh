@@ -7,11 +7,13 @@ import {
 	brokerRemoteTaskCancelParamsSchema,
 	brokerRemoteTaskGetParamsSchema,
 	brokerRemoteTaskStartParamsSchema,
+	dashboardNodeDirectoryResultSchema,
 	JSON_RPC_ERROR_CODES,
 	LOCAL_BROKER_METHODS,
 	LOCAL_BROKER_NOTIFICATIONS,
 	PROTOCOL_LIMITS,
 	nodeDirectoryResultSchema,
+	nodePolicyGetParamsSchema,
 	nodePolicyResultSchema,
 	nodePolicySetParamsSchema,
 	peerPolicyCandidateListResultSchema,
@@ -28,6 +30,7 @@ import {
 	utf8String,
 	uuidSchema,
 	windowNodeDescriptorSchema,
+	type DashboardNodeDirectoryResult,
 	type NodeDirectoryResult,
 	type NodePolicyResult,
 	type NodePolicySetParams,
@@ -313,13 +316,26 @@ export class WindowNodeClient implements WorkspaceResolver {
 		return this.request(LOCAL_BROKER_METHODS.list, {}, nodeDirectoryResultSchema);
 	}
 
-	public getPeerPolicy(): Promise<NodePolicyResult> {
+	public listDashboardNodes(): Promise<DashboardNodeDirectoryResult> {
 		return this.request(
-			LOCAL_BROKER_METHODS.policyGet,
+			LOCAL_BROKER_METHODS.dashboardList,
 			toJsonValue({
 				nodeId: this.nodeId,
 				nodeInstanceId: this.nodeInstanceId,
 			}),
+			dashboardNodeDirectoryResultSchema,
+		);
+	}
+
+	public getPeerPolicy(workspaceIdentity?: string): Promise<NodePolicyResult> {
+		const params = nodePolicyGetParamsSchema.parse({
+			nodeId: this.nodeId,
+			nodeInstanceId: this.nodeInstanceId,
+			...(workspaceIdentity === undefined ? {} : { workspaceIdentity }),
+		});
+		return this.request(
+			LOCAL_BROKER_METHODS.policyGet,
+			toJsonValue(params),
 			nodePolicyResultSchema,
 		);
 	}

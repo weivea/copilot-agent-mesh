@@ -31,6 +31,12 @@ checks immediately before route lease acquisition. Direct starts distinguish
 `PEER_MULTI_WORKSPACE`; the filtered list never reveals which failed gate hid a
 candidate.
 
+Policy configuration uses a separate authenticated RPC surface. A multi-root
+window may pass one of its own claimed `workspaceIdentity` values to
+`node.policy.get` to read and update each policy independently; the Broker
+rejects foreign identities. This selector never changes Tool source
+authorization, which remains derived from the registered Window Node.
+
 All inputs are checked again at runtime with exact object properties and UTF-8
 byte limits. Facade output is parsed through a strict allowlist before it can
 reach a model. Unknown exceptions become a fixed safe text error and never

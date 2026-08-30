@@ -230,11 +230,14 @@ Broker generation。损坏 JSON、未知版本或越界数据都显式失败。
 
 `PeerPolicyService` 是唯一策略裁决者。写入者必须是已认证的精确
 `nodeId`/`nodeInstanceId`，且只能修改自己当前 `claimed` 的 Workspace。Tool
-目录与配置目录刻意分离：`node.list` 只返回通过双重门的目标；配置投影可列出本设备
-候选，但只包含脱敏显示名、短 ID、在线/接收/busy/门状态。路由在取得 Workspace
+目录与 Dashboard/配置目录刻意分离：`node.list` 只返回通过双重门的目标；
+`node.dashboard.list` 返回 Dashboard 所需的全部本设备节点、Workspace
+claim/conflict、busy 和截断信号，但移除完整 `workspaceIdentity` 并脱敏显示文本；
+配置候选投影只包含脱敏显示名、短 ID、在线/接收/busy/门状态。路由在取得 Workspace
 Lease 前再次求值，关闭列出后撤销的 TOCTOU 窗口。多根来源窗口没有可认证的单一
-Workspace 上下文，因此必须由每个当前 `claimed` 的来源 Workspace 都 allowlist
-目标；目标窗口仍必须恰好 claim 一个 Workspace。
+Tool Workspace 上下文，因此必须由每个当前 `claimed` 的来源 Workspace 都 allowlist
+目标；`node.policy.get` 可显式选择调用者自己已 claim 的 Workspace 以逐项配置，
+但该选择不作为任务来源断言。目标窗口仍必须恰好 claim 一个 Workspace。
 
 ### 4.7 0.1 Migration
 
