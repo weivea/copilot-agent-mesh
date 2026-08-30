@@ -45,7 +45,6 @@ import {
 	type DashboardTaskDirection,
 } from '../../shared/protocol';
 import { MeshDomainError } from '../domain/errors';
-import type { TaskRecord } from '../domain/task';
 import { containsUnsafeDashboardText } from '../ui/DashboardRedaction';
 import {
 	LocalIpcHandlerError,
@@ -64,6 +63,7 @@ import type {
 import type {
 	BrokerTaskService,
 	BrokerTaskStartOutcome,
+	DashboardTaskIndexRecord,
 } from './BrokerTaskService';
 import type { NodeRegistry } from './NodeRegistry';
 import type {
@@ -619,7 +619,7 @@ export class DeviceBroker {
 				if (task === undefined || task.direction !== input.direction) {
 					throw new MeshDomainError('TASK_NOT_FOUND', 'The dashboard task action is stale.');
 				}
-				this.options.taskService.assertDashboardTaskCancellable(
+				await this.options.taskService.assertDashboardTaskCancellable(
 					binding.nodeId,
 					binding.nodeInstanceId,
 					task.ownerId,
@@ -647,7 +647,7 @@ export class DeviceBroker {
 				if (task === undefined || task.direction !== input.direction) {
 					throw new MeshDomainError('TASK_NOT_FOUND', 'The dashboard task action is stale.');
 				}
-				this.options.taskService.assertDashboardTaskCancellable(
+				await this.options.taskService.assertDashboardTaskCancellable(
 					binding.nodeId,
 					binding.nodeInstanceId,
 					task.ownerId,
@@ -1091,7 +1091,7 @@ export class DeviceBroker {
 	}
 
 	private dashboardTaskCounterpart(
-		record: TaskRecord,
+		record: DashboardTaskIndexRecord,
 		direction: DashboardTaskDirection,
 	): { readonly label: string; readonly workspaceName: string } {
 		if (record.schemaVersion !== 2) {
@@ -1338,7 +1338,7 @@ function toJsonValue(value: unknown): JsonValue {
 }
 
 function dashboardTaskDirection(
-	record: TaskRecord,
+	record: DashboardTaskIndexRecord,
 	binding: RegisteredSession,
 	deviceId: string,
 ): DashboardTaskDirection | undefined {

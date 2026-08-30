@@ -65,6 +65,12 @@ Broker rebuilds a bounded generation-scoped Dashboard task index from one
 startup scan, then updates it only from durable task transitions. Dashboard
 reads do not scan task files. State notifications are coalesced per session and
 event loop; non-state event bursts do not trigger Dashboard publication.
+Each of the 1,000 maximum index entries is a frozen, schema-validated projection
+bounded to 1 KiB. It contains only the task/owner/source/target/workspace,
+state, safe title, and timestamps required by the Dashboard; event journals,
+output, input payloads, failures, answers, recovery data, artifacts, and grants
+are never retained or cloned. Cancellation authorization re-reads the exact
+authoritative task record and live route at reserve and commit.
 
 Outgoing tasks are selected by exact source Node ownership; incoming tasks are
 selected by exact target Node instance. Their Webview records contain only a

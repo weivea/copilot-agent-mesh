@@ -5,21 +5,31 @@ import { test } from 'node:test';
 import {
 	LOCAL_BROKER_TASK_START_TIMEOUT_MS,
 	MESH_ERROR_CODES,
+	PROTOCOL_LIMITS,
 	nodeTaskStartParamsSchema,
+	timestampSchema,
 	type NodeTaskEventParams,
 	type RoutedTaskStartParams,
 	type TaskSnapshot,
 } from '../../shared/protocol';
 import {
 	BrokerTaskService,
+	DASHBOARD_TASK_INDEX_ENTRY_BYTES,
+	DASHBOARD_TASK_INDEX_LIMIT,
 	NodeRegistry,
+	projectDashboardTaskIndexRecord,
 	type BrokerTaskServiceOptions,
 	type NodeTaskBinding,
 	type RegistryScheduler,
 } from '../broker';
 import { MeshDomainError } from '../domain/errors';
-import { createAcceptedRoutedTask, createAcceptedTask } from '../domain/task';
+import {
+	createAcceptedRoutedTask,
+	createAcceptedTask,
+	type TaskRecord,
+} from '../domain/task';
 import type { StateStore } from '../domain/ports';
+import { taskReducer } from '../domain/taskReducer';
 import { GatewayRouter } from '../gateway/GatewayRouter';
 import {
 	LocalIpcRemoteError,
@@ -279,6 +289,117 @@ function nodeEvent(
 	};
 }
 
+test('dashboard index excludes a maximum journal and stays small at full capacity', async (t) => {
+	const fixture = await createFixture();
+	t.after(() => fixture.dispose());
+	const params = startParams();
+	let record: TaskRecord = createAcceptedRoutedTask({
+		...params,
+		peerId: DEVICE_ID,
+		workspaceLeaseKey: createOpaqueWorkspaceIdentity('dashboard-heavy-journal'),
+	}, AT);
+	record = taskReducer(record, { type: 'agentStartRequested', at: AT });
+	record = taskReducer(record, { type: 'agentStarted', at: AT });
+	for (let index = 0; index < 39; index += 1) {
+		record = taskReducer(record, {
+			type: 'output',
+			at: AT,
+			summary: `${index}`.padEnd(16_000, 'x'),
+		});
+	}
+	if (record.schemaVersion !== 2) {
+		throw new Error('Expected a routed v2 task record.');
+	}
+	record = {
+		...record,
+		title: '\u0001'.repeat(PROTOCOL_LIMITS.taskTitleBytes),
+		sourceWorkspaceIdentity: 'token=raw-sensitive-value',
+	};
+	assert.ok(Buffer.byteLength(JSON.stringify(record.events), 'utf8') > 600 * 1_024);
+
+	const projected = projectDashboardTaskIndexRecord(record);
+	assert.equal('events' in projected, false);
+	assert.equal('failure' in projected, false);
+	assert.equal('pendingInput' in projected, false);
+	assert.equal('recoveryDescriptor' in projected, false);
+	assert.equal('answeredInputs' in projected, false);
+	assert.equal('sourceWorkspaceIdentity' in projected, false);
+	assert.equal(projected.title, '[redacted sensitive details]');
+	assert.ok(Object.isFrozen(projected));
+	assert.ok(Buffer.byteLength(JSON.stringify(projected), 'utf8') <= DASHBOARD_TASK_INDEX_ENTRY_BYTES);
+	assert.ok(
+		Buffer.byteLength(
+			JSON.stringify(Array.from({ length: DASHBOARD_TASK_INDEX_LIMIT }, () => projected)),
+			'utf8',
+		) < 700 * 1_024,
+	);
+	const longFraction = `2026-08-25T12:00:00.${'1'.repeat(900)}Z`;
+	assert.equal(timestampSchema.safeParse(longFraction).success, true);
+	const fractionalProjection = projectDashboardTaskIndexRecord({
+		...record,
+		createdAt: longFraction,
+		updatedAt: longFraction,
+	});
+	assert.equal(fractionalProjection.createdAt, '2026-08-25T12:00:00.111Z');
+	assert.ok(
+		Buffer.byteLength(JSON.stringify(fractionalProjection), 'utf8')
+		<= DASHBOARD_TASK_INDEX_ENTRY_BYTES,
+	);
+
+	await fixture.store.create(record);
+	await fixture.service.initialize();
+	const listed = await fixture.service.listDashboardRecords();
+	assert.equal(listed.length, 1);
+	const listedRecord = listed[0];
+	assert.ok(listedRecord);
+	assert.equal('events' in listedRecord, false);
+	assert.equal(listedRecord.state, 'failed');
+	assert.ok(Buffer.byteLength(JSON.stringify(listed), 'utf8') <= DASHBOARD_TASK_INDEX_ENTRY_BYTES + 2);
+	assert.deepEqual(fixture.service.dashboardMetrics(), {
+		startupScans: 1,
+		storeListScans: 1,
+		reads: 1,
+		indexSize: 1,
+	});
+});
+
+test('dashboard index evicts the oldest terminal projection at its hard limit', async (t) => {
+	const fixture = await createFixture();
+	t.after(() => fixture.dispose());
+	for (let index = 0; index <= DASHBOARD_TASK_INDEX_LIMIT; index += 1) {
+		const taskId = indexedUuid(index + 1_000);
+		let record: TaskRecord = createAcceptedRoutedTask({
+			...startParams({
+				taskId,
+				delegationRequestId: indexedUuid(index + 3_000),
+			}),
+			peerId: DEVICE_ID,
+			workspaceLeaseKey: createOpaqueWorkspaceIdentity(`dashboard-eviction-${index}`),
+		}, AT);
+		record = taskReducer(record, {
+			type: 'failed',
+			at: index === 0
+				? '2026-08-25T00:00:00+14:00'
+				: index === 1
+					? '2026-08-24T23:00:00-12:00'
+					: new Date(Date.parse(AT) + index).toISOString(),
+			code: 'TASK_EXECUTION_FAILED',
+			message: 'Terminal history entry.',
+			retryable: false,
+		});
+		await fixture.store.create(record);
+	}
+	await fixture.service.initialize();
+	const listed = await fixture.service.listDashboardRecords();
+	assert.equal(listed.length, DASHBOARD_TASK_INDEX_LIMIT);
+	assert.equal(listed.some(({ taskId }) => taskId === indexedUuid(1_000)), false);
+	assert.equal(listed.some(({ taskId }) => taskId === indexedUuid(1_001)), true);
+	assert.equal(
+		listed.some(({ taskId }) => taskId === indexedUuid(1_000 + DASHBOARD_TASK_INDEX_LIMIT)),
+		true,
+	);
+});
+
 test('runs a local v2 task vertically and persists before notification', async (t) => {
 	let fixture: Fixture;
 	const notifications: number[] = [];
@@ -341,6 +462,43 @@ test('runs a local v2 task vertically and persists before notification', async (
 	assert.equal(completed.state, 'completed');
 	assert.equal(completed.events.at(-1)?.type, 'completed');
 	assert.deepEqual(notifications, [1, 2, 3, 4]);
+});
+
+test('dashboard cancellation revalidates the authoritative record and live route', async (t) => {
+	const fixture = await createFixture();
+	t.after(() => fixture.dispose());
+	fixture.session.handler = async (method) => method === 'node.task.start'
+		? {
+			taskId: TASK_ID,
+			nodeId: NODE_ID,
+			nodeInstanceId: INSTANCE_ID,
+		}
+		: null;
+	await fixture.service.startLocal({
+		nodeId: SOURCE_ID,
+		nodeInstanceId: INSTANCE_ID,
+	}, startParams());
+	await waitFor(async () =>
+		(await fixture.store.getOwned(DEVICE_ID, TASK_ID))?.state === 'running',
+	);
+	await fixture.service.assertDashboardTaskCancellable(
+		SOURCE_ID,
+		INSTANCE_ID,
+		DEVICE_ID,
+		TASK_ID,
+		'outgoing',
+	);
+	fixture.registry.releaseTaskRoute(DEVICE_ID, TASK_ID);
+	await assert.rejects(
+		fixture.service.assertDashboardTaskCancellable(
+			SOURCE_ID,
+			INSTANCE_ID,
+			DEVICE_ID,
+			TASK_ID,
+			'outgoing',
+		),
+		(error: unknown) => isReason(error, 'TASK_NOT_FOUND'),
+	);
 });
 
 test('returns a durable start acknowledgement while the target start is pending', async (t) => {
@@ -949,6 +1107,10 @@ function within<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
 
 function memoryRoot(): string {
 	return 'memory';
+}
+
+function indexedUuid(index: number): string {
+	return `00000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}`;
 }
 
 function notFound(): Error {

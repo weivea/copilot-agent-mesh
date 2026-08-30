@@ -1019,6 +1019,12 @@ durable transition 更新 generation-scoped、上限 1000 的 Dashboard index，
 read 不进入 FileTaskStore mutation queue。Task 时间在 Presenter 边界经 protocol schema
 验证后统一 `toISOString()`；扩展年份或损坏值只投影为 `Unknown`。
 
+Index value 不是 `TaskRecord` clone，而是严格 Zod schema 的 frozen minimal projection，
+单项序列化上限 1 KiB，仅含 Dashboard 分区/显示/重验所需的 task、owner、source、target、
+Workspace、state、safe title、created/updated time。最大 event journal、output、input、
+failure payload、answer、recovery、artifact、grant/runtime 字段都不会进入或在 read 时深拷贝。
+取消 reserve/commit 继续从精确 owner/task 文件读取权威 record，并核对 live route。
+
 ### 14.2 安全
 
 - 交互 UI 需要 Script 时只加载本地 Bundle。

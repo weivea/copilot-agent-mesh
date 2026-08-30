@@ -377,7 +377,7 @@ export const dashboardTaskSummarySchema = z.strictObject({
 	workspaceName: utf8String(PROTOCOL_LIMITS.nameBytes, 'task workspace name', 1),
 	title: utf8String(PROTOCOL_LIMITS.taskTitleBytes, 'task title', 1),
 	state: taskStatusSchema,
-	startedAt: timestampSchema,
+	startedAt: z.union([timestampSchema, z.literal('Unknown')]),
 	shortId: z.string().regex(/^[0-9a-f]{8}$/u),
 	canCancel: z.boolean(),
 });
