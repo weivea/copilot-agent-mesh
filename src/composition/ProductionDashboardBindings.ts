@@ -21,10 +21,8 @@ import type {
 } from '../broker/BrokerLifecycle';
 import type { DeviceProfile } from '../storage/DeviceProfileStore';
 import type { LocalBrokerTaskFacade } from '../tools/LocalBrokerTaskFacade';
-import type { LocalBrokerCollaborationFacade } from '../tools/LocalBrokerCollaborationFacade';
 import type {
 	DashboardNodeSnapshot,
-	DashboardPendingInput,
 	DashboardServiceBindings,
 	DashboardSnapshot,
 	DashboardTaskTarget,
@@ -41,7 +39,6 @@ export interface ProductionDashboardBindingsOptions {
 	readonly profile: () => DeviceProfile;
 	readonly node: WindowNodeClient;
 	readonly localTasks: LocalBrokerTaskFacade;
-	readonly localCollaborations: LocalBrokerCollaborationFacade;
 	readonly remoteTasks: LocalIpcRemoteTaskAdapter;
 	readonly runtime: AgentRuntime;
 	readonly guard: LocalDesktopWorkspaceGuard;
@@ -247,59 +244,6 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 			}));
 		const tasks: DashboardSnapshot['tasks'] = [...localTasks, ...remoteTasks];
 		const legacyWorkspaces = uniqueWorkspaces(localNodes);
-		const collaborationPreviewEnabled = this.options.vscodeApi.workspace
-			.getConfiguration('copilotAgentMesh')
-			.get<boolean>('experimental.sameDeviceCollaboration', false);
-		let collaborationRuns: DashboardSnapshot['collaborationRuns'] = [];
-		try {
-			const result = await this.options.node.listCollaborations();
-			collaborationRuns = result.runs.map((run) => ({
-				runId: run.runId,
-				title: run.title,
-				status: run.status,
-				coordinatorNodeId: run.coordinator.nodeId,
-				participants: run.participants.map((participant) => ({
-					role: participant.role,
-					nodeId: participant.target.nodeId,
-					nodeLabel: nodeNames.get(participant.target.nodeId) ?? 'Unavailable Window Node',
-					workspaceId: participant.target.workspaceId,
-					workspaceName: workspaceNames.get(participant.target.workspaceId) ?? 'Unavailable workspace',
-				})),
-				tasks: run.tasks.map((task) => ({
-					taskId: task.taskId,
-					title: task.title,
-					role: task.role,
-					kind: task.kind,
-					workspaceName: workspaceNames.get(task.target.workspaceId) ?? 'Unavailable workspace',
-					status: task.status,
-					dependsOn: [...task.dependsOn],
-					validationStatus: task.validation?.status,
-					blockCode: task.block?.code,
-					failureCode: task.failure?.code,
-					pendingInputId: task.pendingInput?.inputId,
-				})),
-				artifacts: run.artifacts.map((artifact) => ({
-					artifactId: artifact.artifactId,
-					label: artifact.label,
-					mediaType: artifact.mediaType,
-					contentLength: artifact.contentLength,
-					sha256: artifact.sha256,
-				})),
-				canCancel: !['completed', 'failed', 'cancelled'].includes(run.status),
-				canAnswer: run.tasks.some(({ status }) => status === 'needsInput'),
-			}));
-		} catch {
-			errors.push({
-				code: 'COLLABORATION_RECOVERY_READ_FAILED',
-				message: 'Collaboration run state could not be read from the local Broker.',
-				action: 'Wait for Broker takeover or refresh the dashboard.',
-			});
-		}
-		const availableCollaborationWorkspaces = localNodes.flatMap((node) =>
-			node.workspaces.filter((workspace) =>
-				workspace.claimStatus === 'claimed' && workspace.enabled && !workspace.busy,
-			),
-		);
 		const broker = brokerSnapshot(lifecycle);
 		return {
 			device: {
@@ -332,12 +276,6 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 				),
 			})),
 			tasks,
-			collaborationPreview: {
-				enabled: collaborationPreviewEnabled,
-				canStart: collaborationPreviewEnabled
-					&& new Set(availableCollaborationWorkspaces.map(({ workspaceId }) => workspaceId)).size >= 2,
-			},
-			collaborationRuns,
 			errors,
 		};
 	}
@@ -435,187 +373,6 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 		const controller = deadlineSignal(10_000);
 		try {
 			await this.options.localTasks.cancelOwnedTask({ taskId }, controller.signal);
-			this.options.changed.fire();
-		} finally {
-			controller.abort();
-		}
-	}
-
-	public async getTaskInput(taskId: string): Promise<DashboardPendingInput | undefined> {
-		const controller = deadlineSignal(10_000);
-		try {
-			const task = await this.options.localTasks.getTask(
-				{ taskId, maxEvents: 1 },
-				controller.signal,
-			);
-			const inputId = task.snapshot.pendingInput?.inputId;
-			if (inputId === undefined) {
-				return undefined;
-			}
-			return {
-				taskId,
-				inputId,
-				question: task.snapshot.pendingInput!.prompt,
-			};
-		} finally {
-			controller.abort();
-		}
-	}
-
-	public async answerTaskInput(
-		taskId: string,
-		inputId: string,
-		answer: string,
-	): Promise<void> {
-		const controller = deadlineSignal(10_000);
-		try {
-			await this.options.localTasks.answerOwnedTask({
-				taskId,
-				inputId,
-				answerId: randomUUID(),
-				answer,
-			}, controller.signal);
-			this.options.changed.fire();
-		} finally {
-			controller.abort();
-		}
-	}
-
-	public async startCollaboration(request: {
-		readonly title: string;
-		readonly goal: string;
-	}): Promise<void> {
-		const configuration = this.options.vscodeApi.workspace.getConfiguration('copilotAgentMesh');
-		if (!configuration.get<boolean>('experimental.sameDeviceCollaboration', false)) {
-			throw new Error('Same-device collaboration Preview is disabled.');
-		}
-		const profile = this.options.profile();
-		const directory = await this.options.node.listNodes();
-		const candidates = directory.nodes.flatMap((node) =>
-			node.workspaces
-				.filter((workspace) =>
-					workspace.claimStatus === 'claimed'
-					&& workspace.enabled
-					&& !workspace.busy,
-				)
-				.map((workspace) => ({
-					label: workspace.name,
-					description: `${node.label} · ${workspace.capabilityTags.join(', ')}`,
-					target: {
-						deviceId: profile.deviceId,
-						nodeId: node.nodeId,
-						nodeInstanceId: node.nodeInstanceId,
-						workspaceId: workspace.workspaceId,
-					},
-				})),
-		);
-		const frontend = (await this.options.vscodeApi.window.showQuickPick(candidates, {
-			title: 'Select the frontend Workspace',
-			placeHolder: 'Choose one explicitly claimed frontend Workspace',
-			ignoreFocusOut: true,
-		}))?.target;
-		if (frontend === undefined) {
-			return;
-		}
-		const backendCandidates = candidates.filter(({ target }) =>
-			target.workspaceId !== frontend.workspaceId,
-		);
-		const backend = (await this.options.vscodeApi.window.showQuickPick(backendCandidates, {
-			title: 'Select the backend Workspace',
-			placeHolder: 'Choose a different explicitly claimed backend Workspace',
-			ignoreFocusOut: true,
-		}))?.target;
-		if (backend === undefined) {
-			return;
-		}
-		const frontendName = candidates.find(({ target }) =>
-			target.workspaceId === frontend.workspaceId,
-		)?.label ?? 'frontend';
-		const backendName = backendCandidates.find(({ target }) =>
-			target.workspaceId === backend.workspaceId,
-		)?.label ?? 'backend';
-		const confirmed = await this.options.vscodeApi.window.showWarningMessage(
-			`Start "${request.title}" with frontend "${frontendName}" and backend "${backendName}"?`,
-			{ modal: true },
-			'Start Collaboration',
-		);
-		if (confirmed !== 'Start Collaboration') {
-			return;
-		}
-		const controller = deadlineSignal(15_000);
-		try {
-			await this.options.localCollaborations.startCollaboration({
-				collaborationRequestId: randomUUID(),
-				title: request.title,
-				goal: request.goal,
-				frontend,
-				backend,
-				timeoutMinutes: 60,
-			}, controller.signal);
-			this.options.changed.fire();
-		} finally {
-			controller.abort();
-		}
-	}
-
-	public async getCollaboration(runId: string): Promise<void> {
-		const controller = deadlineSignal(10_000);
-		try {
-			await this.options.localCollaborations.getCollaboration(runId, controller.signal);
-			this.options.changed.fire();
-		} finally {
-			controller.abort();
-		}
-	}
-
-	public async cancelCollaboration(runId: string): Promise<void> {
-		const controller = deadlineSignal(10_000);
-		try {
-			await this.options.localCollaborations.cancelCollaboration(runId, controller.signal);
-			this.options.changed.fire();
-		} finally {
-			controller.abort();
-		}
-	}
-
-	public async getCollaborationInput(
-		runId: string,
-	): Promise<DashboardPendingInput | undefined> {
-		const controller = deadlineSignal(10_000);
-		try {
-			const { run } = await this.options.localCollaborations.getCollaboration(
-				runId,
-				controller.signal,
-			);
-			const task = run.tasks.find(({ status }) => status === 'needsInput');
-			if (task?.pendingInput === undefined) {
-				return undefined;
-			}
-			return {
-				taskId: task.taskId,
-				inputId: task.pendingInput.inputId,
-				question: task.pendingInput.prompt,
-			};
-		} finally {
-			controller.abort();
-		}
-	}
-
-	public async answerCollaboration(
-		runId: string,
-		taskId: string,
-		inputId: string,
-		answer: string,
-	): Promise<void> {
-		const controller = deadlineSignal(10_000);
-		try {
-			await this.options.localCollaborations.answerCollaboration({
-				runId,
-				taskId,
-				inputId,
-				answerId: randomUUID(),
-				answer,
-			}, controller.signal);
 			this.options.changed.fire();
 		} finally {
 			controller.abort();

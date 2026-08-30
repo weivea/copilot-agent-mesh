@@ -1,8 +1,8 @@
 # Production Language Model Tools
 
 The MVP tool surface is implemented in `src/tools` and remains decoupled through
-`TaskToolFacade` and `CollaborationToolFacade`. Production composition supplies
-local Broker facades backed by persisted task and collaboration state; the tool classes never
+`TaskToolFacade`. Production composition supplies a local Broker facade backed
+by persisted task state; the tool classes never
 create tasks, simulate workers, inspect workspace files, or manage repository
 state.
 
@@ -15,12 +15,6 @@ state.
 | `mesh_get_task` | Returns a bounded snapshot, event cursor, event-gap indicator, and truncation indicator. | 10 s |
 | `mesh_cancel_task` | Requests cancellation through the owner-scoped Facade method. | 10 s |
 | `mesh_answer_task` | Sends an idempotent answer through the owner-scoped Facade method. | 10 s |
-| `mesh_start_collaboration` | Creates or exactly recovers a durable same-device frontend/backend run and starts only its first dependency-ready task. | 15 s |
-| `mesh_get_collaboration` | Returns bounded participants, DAG states, validation summaries, and artifact metadata; never artifact content. | 10 s |
-| `mesh_cancel_collaboration` | Cancels the exact active task and marks pending/blocked dependencies cancelled. | 10 s |
-
-`mesh_answer_task` is intentionally reused for a collaboration task in
-`needsInput`; no second answer protocol is introduced.
 
 `prepareInvocation` is pure. Delegate confirmation displays only peer ID,
 opaque workspace ID, and title summary. It never persists an intent or contacts
@@ -34,9 +28,7 @@ inside one `LanguageModelTextPart`; list and get results truncate bounded data
 rather than returning raw transcripts. When VS Code supplies
 `tokenizationOptions`, the adapter uses its model-specific `countTokens`
 function and shrinks events, worker lists, and optional snapshot fields to the
-actual token budget. Collaboration contraction first drops artifact/validation
-detail and then preserves the run ID, run status, task IDs/statuses, and pending
-input identity. If even the smallest JSON result does not fit, the adapter
+actual token budget. If even the smallest JSON result does not fit, the adapter
 returns an empty `LanguageModelTextPart` rather than exceeding the budget.
 
 Task event sequences are positive and strictly contiguous. The cursor always
@@ -134,22 +126,11 @@ used as a global deduplication key. Aborting the acceptance signal stops
 only that acknowledgement wait. Ownership is taken from the Facade's
 authenticated coordinator context, never from tool input.
 
-`CollaborationToolFacade` similarly exposes only start/get/cancel. Start requires
-two explicit local Device → Node → Workspace targets with different workspace
-IDs. A stable `collaborationRequestId` is generated when omitted and provides
-exact retry semantics; reuse with changed title, goal, role, route, or timeout
-fails with `COLLABORATION_ID_CONFLICT`.
-
-The tool result contains immutable artifact metadata (`artifactId`, producer,
-media type, size, SHA-256, revision) but not content. Content is read only inside
-the Broker for its authorized frontend task. The Tool layer cannot use the
-Artifact Store as file transfer.
-
 ## Parent-session wiring
 
-Copy the eight objects exported as `MESH_TOOL_MANIFEST_DESCRIPTORS` into
+Copy the five objects exported as `MESH_TOOL_MANIFEST_DESCRIPTORS` into
 `package.json.contributes.languageModelTools`. Register the same names by
-calling `registerMeshTaskTools(taskFacade, collaborationFacade)` during activation. The exported
+calling `registerMeshTaskTools(taskFacade)` during activation. The exported
 `assertMeshToolNameParity` and `getMeshColdActivationContract` helpers support
 manifest/runtime parity and cold implicit activation tests.
 

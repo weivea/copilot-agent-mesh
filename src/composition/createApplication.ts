@@ -30,7 +30,6 @@ import {
 	VscodeSecretStore,
 } from '../storage/VscodeStorageAdapters';
 import { LocalBrokerTaskFacade } from '../tools/LocalBrokerTaskFacade';
-import { LocalBrokerCollaborationFacade } from '../tools/LocalBrokerCollaborationFacade';
 import { registerMeshTaskTools } from '../tools/taskTools';
 import {
 	AgentMeshViewProvider,
@@ -81,11 +80,6 @@ export const APPLICATION_COMMANDS = {
 	removePeer: 'copilotAgentMesh.removePeer',
 	runTask: 'copilotAgentMesh.runTask',
 	cancelTask: 'copilotAgentMesh.cancelTask',
-	answerTask: 'copilotAgentMesh.answerTask',
-	startCollaboration: 'copilotAgentMesh.startCollaboration',
-	getCollaboration: 'copilotAgentMesh.getCollaboration',
-	cancelCollaboration: 'copilotAgentMesh.cancelCollaboration',
-	answerCollaboration: 'copilotAgentMesh.answerCollaboration',
 } as const;
 
 export interface AgentMeshExtensionApi {
@@ -101,7 +95,6 @@ export interface AgentMeshExtensionApi {
 	readonly listener?: ProductionBrokerRuntime['listener'];
 	readonly twoDeviceE2e?: TwoDeviceE2eApi;
 	readonly multiWindowE2e?: TwoDeviceE2eApi;
-	readonly multiProjectE2e?: TwoDeviceE2eApi;
 }
 
 export interface Application {
@@ -130,22 +123,18 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		const configuration = vscode.workspace.getConfiguration('copilotAgentMesh');
 		const twoDeviceE2eRequested = process.env.MESH_TWO_DEVICE_E2E === '1';
 		const multiWindowE2eRequested = process.env.MESH_MULTI_WINDOW_E2E === '1';
-		const multiProjectE2eRequested = process.env.MESH_MULTI_PROJECT_E2E === '1';
 		const requestedE2eScenarios = [
 			twoDeviceE2eRequested,
 			multiWindowE2eRequested,
-			multiProjectE2eRequested,
 		].filter(Boolean).length;
 		const oneE2eScenarioRequested = requestedE2eScenarios === 1;
 		const e2eCapability = E2eCapability.create({
 			mode: extensionRuntimeMode(context.extensionMode),
 			environmentEnabled: oneE2eScenarioRequested,
-			environmentNonce: multiProjectE2eRequested
-				? process.env.MESH_MULTI_PROJECT_E2E_NONCE
-				: multiWindowE2eRequested
+			environmentNonce: multiWindowE2eRequested
 					? process.env.MESH_MULTI_WINDOW_E2E_NONCE
 					: process.env.MESH_TWO_DEVICE_E2E_NONCE,
-			environmentRole: multiWindowE2eRequested || multiProjectE2eRequested
+			environmentRole: multiWindowE2eRequested
 				? 'coordinator'
 				: process.env.MESH_TWO_DEVICE_E2E_ROLE,
 			profileNonce: configuration.get<string>('e2e.nonce'),
@@ -279,7 +268,6 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 				?? sharedProfile.name,
 			remoteAdapter: remoteTasks,
 		});
-		const localCollaborations = new LocalBrokerCollaborationFacade(node);
 		const bindings = new ProductionDashboardBindings({
 			vscodeApi: vscode,
 			changed: changeEvents,
@@ -302,7 +290,6 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			},
 			node,
 			localTasks,
-			localCollaborations,
 			remoteTasks,
 			runtime,
 			guard,
@@ -319,7 +306,6 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			bindings,
 			node,
 			localTasks,
-			localCollaborations,
 			remoteTasks,
 			runtime,
 			lifecycle,
@@ -333,12 +319,8 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		const multiWindowE2e = multiWindowE2eRequested && requestedE2eScenarios === 1
 			? gatedE2e
 			: undefined;
-		const multiProjectE2e = multiProjectE2eRequested && requestedE2eScenarios === 1
-			? gatedE2e
-			: undefined;
-
 		contributions.push(
-			registerMeshTaskTools(localTasks, localCollaborations),
+			registerMeshTaskTools(localTasks),
 			vscode.window.registerWebviewViewProvider(AgentMeshViewProvider.viewType, dashboard),
 			...registerCommands(
 				dashboardFacade,
@@ -401,7 +383,6 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			},
 			...(twoDeviceE2e === undefined ? {} : { twoDeviceE2e }),
 			...(multiWindowE2e === undefined ? {} : { multiWindowE2e }),
-			...(multiProjectE2e === undefined ? {} : { multiProjectE2e }),
 		};
 		return {
 			api,
@@ -459,16 +440,14 @@ function registerCommands(
 		}
 	});
 	const selectTarget = async (
-		kind: 'workspace' | 'peer' | 'task' | 'collaboration',
+		kind: 'workspace' | 'peer' | 'task',
 	): Promise<string | undefined> => {
 		const snapshot = await facade.getSnapshot();
 		const values = kind === 'workspace'
 			? snapshot.workspaces.map((item) => ({ label: item.name, id: item.workspaceId }))
 			: kind === 'peer'
 				? snapshot.peers.map((item) => ({ label: item.name, id: item.peerId }))
-				: kind === 'task'
-					? snapshot.tasks.map((item) => ({ label: item.title, id: item.taskId }))
-					: snapshot.collaborationRuns.map((item) => ({ label: item.title, id: item.runId }));
+				: snapshot.tasks.map((item) => ({ label: item.title, id: item.taskId }));
 		return (await vscode.window.showQuickPick(values, {
 			title: `Select ${kind}`,
 			ignoreFocusOut: true,
@@ -514,32 +493,6 @@ function registerCommands(
 			const id = opaqueId(value) ?? await selectTarget('task');
 			if (id !== undefined) {
 				await facade.cancelTask(id);
-			}
-		}),
-		register(APPLICATION_COMMANDS.answerTask, false, async (value) => {
-			const id = opaqueId(value) ?? await selectTarget('task');
-			if (id !== undefined) {
-				await facade.answerTaskInput(id);
-			}
-		}),
-		register(APPLICATION_COMMANDS.startCollaboration, false, () =>
-			facade.startCollaboration()),
-		register(APPLICATION_COMMANDS.getCollaboration, false, async (value) => {
-			const id = opaqueId(value) ?? await selectTarget('collaboration');
-			if (id !== undefined) {
-				await facade.getCollaboration(id);
-			}
-		}),
-		register(APPLICATION_COMMANDS.cancelCollaboration, false, async (value) => {
-			const id = opaqueId(value) ?? await selectTarget('collaboration');
-			if (id !== undefined) {
-				await facade.cancelCollaboration(id);
-			}
-		}),
-		register(APPLICATION_COMMANDS.answerCollaboration, false, async (value) => {
-			const id = opaqueId(value) ?? await selectTarget('collaboration');
-			if (id !== undefined) {
-				await facade.answerCollaboration(id);
 			}
 		}),
 	];

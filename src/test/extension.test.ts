@@ -6,20 +6,14 @@ import {
 	GATEWAY_METHODS,
 	MESH_PROTOCOL_VERSION,
 	TASK_STATUSES,
-	collaborationRunSnapshotSchema,
 } from '../../shared/protocol';
 import { TaskToolFacade } from '../tools/taskToolFacade';
-import type { CollaborationToolFacade } from '../tools/collaborationToolFacade';
-import { createCollaborationRun } from '../domain/collaboration';
 import {
 	MeshAnswerTaskTool,
-	MeshCancelCollaborationTool,
 	MeshCancelTaskTool,
 	MeshDelegateTaskTool,
-	MeshGetCollaborationTool,
 	MeshGetTaskTool,
 	MeshListWorkersTool,
-	MeshStartCollaborationTool,
 } from '../tools/taskTools';
 import {
 	MESH_RUNTIME_TOOL_NAMES,
@@ -38,6 +32,14 @@ suite('Copilot Agent Mesh', () => {
 			['onStartupFinished'],
 		);
 		assert.deepStrictEqual(manifestTools.map(({ name }) => name), MESH_RUNTIME_TOOL_NAMES);
+		for (const removed of [
+			'mesh_start_collaboration',
+			'mesh_get_collaboration',
+			'mesh_cancel_collaboration',
+		]) {
+			assert.ok(!manifestTools.some(({ name }) => name === removed));
+			assert.ok(!vscode.lm.tools.some((tool) => tool.name === removed));
+		}
 
 		const cancellation = new vscode.CancellationTokenSource();
 		try {
@@ -70,6 +72,7 @@ suite('Copilot Agent Mesh', () => {
 		assert.ok(commands.some(({ command }) => command === 'copilotAgentMesh.runTask'));
 		assert.ok(commands.some(({ command }) => command === 'copilotAgentMesh.startListener'));
 		assert.ok(commands.some(({ command }) => command === 'copilotAgentMesh.registerWorkspace'));
+		assert.ok(!commands.some(({ command }) => /Collaboration|answerTask/u.test(command)));
 		assert.ok(views.some(({ id }) => id === 'copilotAgentMesh.dashboard'));
 		assert.deepStrictEqual(manifest.extensionKind, ['ui']);
 	});
@@ -79,6 +82,7 @@ suite('Copilot Agent Mesh', () => {
 		const properties = manifest.contributes.configuration.properties as Record<string, { default?: unknown }>;
 
 		assert.strictEqual(properties['copilotAgentMesh.experimental.agentHost']?.default, false);
+		assert.strictEqual(properties['copilotAgentMesh.experimental.sameDeviceCollaboration'], undefined);
 	});
 
 	test('activates successfully', async () => {
@@ -118,7 +122,6 @@ suite('Copilot Agent Mesh', () => {
 	test('all production tools contain tokenizer failures without retrying the tokenizer', async () => {
 		const taskId = '00000000-0000-4000-8000-000000000003';
 		const facade = createTaskToolFacade();
-		const collaborations = createCollaborationToolFacade();
 		let tokenizerCalls = 0;
 		const tokenizationOptions: vscode.LanguageModelToolTokenizationOptions = {
 			tokenBudget: 100,
@@ -166,21 +169,9 @@ suite('Copilot Agent Mesh', () => {
 						answer: 'Proceed.',
 					},
 				}, cancellation.token),
-				new MeshStartCollaborationTool(collaborations).invoke({
-					...invocationBase,
-					input: collaborationInput(),
-				}, cancellation.token),
-				new MeshGetCollaborationTool(collaborations).invoke({
-					...invocationBase,
-					input: { runId: collaborationSnapshot().runId },
-				}, cancellation.token),
-				new MeshCancelCollaborationTool(collaborations).invoke({
-					...invocationBase,
-					input: { runId: collaborationSnapshot().runId },
-				}, cancellation.token),
 			]);
 
-			assert.equal(tokenizerCalls, 8);
+			assert.equal(tokenizerCalls, 5);
 			for (const result of results) {
 				const [part] = result.content;
 				assert.ok(part instanceof vscode.LanguageModelTextPart);
@@ -231,60 +222,4 @@ function createTaskToolFacade(): TaskToolFacade {
 		cancelOwnedTask: async () => ({ taskId, status: 'cancelled' }),
 		answerOwnedTask: async () => ({ taskId, status: 'running' }),
 	};
-}
-
-function createCollaborationToolFacade(): CollaborationToolFacade {
-	return {
-		sourceNodeId: '00000000-0000-4000-8000-000000000007',
-		startCollaboration: async () => ({ run: collaborationSnapshot() }),
-		getCollaboration: async () => ({ run: collaborationSnapshot() }),
-		cancelCollaboration: async () => ({ run: collaborationSnapshot() }),
-	};
-}
-
-function collaborationInput() {
-	return {
-		title: 'Tokenizer collaboration',
-		goal: 'Verify the collaboration invocation catch boundary.',
-		frontend: {
-			deviceId: '00000000-0000-4000-8000-000000000001',
-			nodeId: '00000000-0000-4000-8000-000000000007',
-			nodeInstanceId: '00000000-0000-4000-8000-000000000008',
-			workspaceId: '00000000-0000-4000-8000-000000000002',
-		},
-		backend: {
-			deviceId: '00000000-0000-4000-8000-000000000001',
-			nodeId: '00000000-0000-4000-8000-000000000009',
-			nodeInstanceId: '00000000-0000-4000-8000-00000000000a',
-			workspaceId: '00000000-0000-4000-8000-00000000000b',
-		},
-	};
-}
-
-function collaborationSnapshot() {
-	const at = '2026-08-30T00:00:00.000Z';
-	const run = createCollaborationRun(
-		collaborationInput().frontend.nodeId,
-		{
-			...collaborationInput(),
-			collaborationRequestId: '00000000-0000-4000-8000-00000000000c',
-			timeoutMinutes: 60,
-		},
-		at,
-	);
-	return collaborationRunSnapshotSchema.parse({
-		schemaVersion: 1,
-		runId: run.runId,
-		collaborationRequestId: run.collaborationRequestId,
-		coordinator: run.coordinator,
-		participants: run.participants,
-		title: run.title,
-		tasks: run.tasks.map(({ workerDeadline: _workerDeadline, ...task }) => task),
-		status: run.status,
-		artifacts: [],
-		validations: [],
-		cancellationRequested: false,
-		createdAt: at,
-		updatedAt: at,
-	});
 }

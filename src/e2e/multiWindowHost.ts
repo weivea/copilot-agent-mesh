@@ -21,24 +21,16 @@ export async function run(): Promise<void> {
 		throw new Error('The Copilot Agent Mesh development extension is unavailable.');
 	}
 	const api = await extension.activate();
-	const mode = process.env.MESH_MULTI_PROJECT_E2E === '1'
-		? 'multi-project'
-		: 'multi-window';
-	if ((mode === 'multi-project' ? api.multiProjectE2e : api.multiWindowE2e) === undefined) {
-		throw new Error(`The gated ${mode} E2E API was not activated.`);
+	if (api.multiWindowE2e === undefined) {
+		throw new Error('The gated multi-window E2E API was not activated.');
 	}
-	return runWithApi(api, mode);
+	return runWithApi(api);
 }
 
-export async function runWithApi(
-	api: AgentMeshExtensionApi,
-	mode: 'multi-window' | 'multi-project' = 'multi-window',
-): Promise<void> {
-	const environmentPrefix = mode === 'multi-project'
-		? 'MESH_MULTI_PROJECT_E2E'
-		: 'MESH_MULTI_WINDOW_E2E';
+export async function runWithApi(api: AgentMeshExtensionApi): Promise<void> {
+	const environmentPrefix = 'MESH_MULTI_WINDOW_E2E';
 	if (process.env[environmentPrefix] !== '1') {
-		throw new Error(`${environmentPrefix}=1 is required for the ${mode} Extension Host.`);
+		throw new Error(`${environmentPrefix}=1 is required for the multi-window Extension Host.`);
 	}
 	const controlRoot = process.env[`${environmentPrefix}_CONTROL_DIR`];
 	const nonce = process.env[`${environmentPrefix}_NONCE`];
@@ -48,9 +40,9 @@ export async function runWithApi(
 	if (nonce === undefined) {
 		throw new Error(`${environmentPrefix}_NONCE is required.`);
 	}
-	const controller = mode === 'multi-project' ? api.multiProjectE2e : api.multiWindowE2e;
+	const controller = api.multiWindowE2e;
 	if (controller === undefined) {
-		throw new Error(`The gated ${mode} E2E API was not activated.`);
+		throw new Error('The gated multi-window E2E API was not activated.');
 	}
 	const folders = vscode.workspace.workspaceFolders;
 	if (

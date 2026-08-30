@@ -8,7 +8,6 @@ import type { WindowNodeClient } from '../node/WindowNodeClient';
 import type { LocalIpcRemoteTaskAdapter } from '../node/LocalIpcRemoteTaskAdapter';
 import type { LocalIpcEndpoint } from '../ipc';
 import type { LocalBrokerTaskFacade } from '../tools/LocalBrokerTaskFacade';
-import type { LocalBrokerCollaborationFacade } from '../tools/LocalBrokerCollaborationFacade';
 import type { ProductionDashboardBindings } from './ProductionDashboardBindings';
 import type { ProductionBrokerRuntime } from './ProductionBrokerRuntime';
 import {
@@ -31,7 +30,6 @@ export interface TwoDeviceE2eApiOptions {
 	readonly bindings: ProductionDashboardBindings;
 	readonly node: WindowNodeClient;
 	readonly localTasks: LocalBrokerTaskFacade;
-	readonly localCollaborations?: LocalBrokerCollaborationFacade;
 	readonly remoteTasks: LocalIpcRemoteTaskAdapter;
 	readonly runtime: AgentRuntime;
 	readonly lifecycle: BrokerLifecycle<ProductionBrokerRuntime>;
@@ -219,48 +217,6 @@ export function createTwoDeviceE2eApi(
 						controller.abort();
 					}
 				}
-				case 'collaboration.start': {
-					const controller = deadline(30_000);
-					try {
-						const frontend = explicitTarget(requiredRecord(params, 'frontend'));
-						const backend = explicitTarget(requiredRecord(params, 'backend'));
-						return await requireCollaborations(options).startCollaboration({
-							collaborationRequestId: optionalString(params, 'collaborationRequestId')
-								?? randomUUID(),
-							title: requiredString(params, 'title'),
-							goal: requiredString(params, 'goal'),
-							frontend,
-							backend,
-							timeoutMinutes: optionalNumber(params, 'timeoutMinutes') ?? 30,
-						}, controller.signal);
-					} finally {
-						controller.abort();
-					}
-				}
-				case 'collaboration.get': {
-					const controller = deadline(30_000);
-					try {
-						return await requireCollaborations(options).getCollaboration(
-							requiredString(params, 'runId'),
-							controller.signal,
-						);
-					} finally {
-						controller.abort();
-					}
-				}
-				case 'collaboration.list':
-					return options.node.listCollaborations();
-				case 'collaboration.cancel': {
-					const controller = deadline(30_000);
-					try {
-						return await requireCollaborations(options).cancelCollaboration(
-							requiredString(params, 'runId'),
-							controller.signal,
-						);
-					} finally {
-						controller.abort();
-					}
-				}
 				case 'runtime.probe':
 					return options.runtime.probe();
 				case 'auth.check': {
@@ -298,15 +254,6 @@ function requireOwner(options: TwoDeviceE2eApiOptions): ProductionBrokerRuntime 
 	}
 
 	return owner;
-}
-
-function requireCollaborations(
-	options: TwoDeviceE2eApiOptions,
-): LocalBrokerCollaborationFacade {
-	if (options.localCollaborations === undefined) {
-		throw new Error('The E2E collaboration facade is unavailable.');
-	}
-	return options.localCollaborations;
 }
 
 function explicitTarget(params: Record<string, unknown>) {

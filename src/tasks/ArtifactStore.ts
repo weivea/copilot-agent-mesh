@@ -4,19 +4,19 @@ import { z } from 'zod';
 
 import {
 	artifactMediaTypeSchema,
-	collaborationArtifactReferenceSchema,
+	artifactReferenceSchema,
 	PROTOCOL_LIMITS,
 	uuidSchema,
-	type CollaborationArtifactReference,
+	type ArtifactReference,
 } from '../../shared/protocol';
 import { MeshDomainError } from '../domain/errors';
 import type { JsonValue } from '../ipc';
 import { AtomicFileStore, StorageCorruptionError } from '../storage/AtomicFileStore';
 import type { WorkerOwnership } from '../storage/WorkerOwnerLock';
 
-const artifactRecordSchema = collaborationArtifactReferenceSchema.extend({
+const artifactRecordSchema = artifactReferenceSchema.extend({
 	schemaVersion: z.literal(1),
-	consumerTaskIds: z.array(uuidSchema).min(1).max(PROTOCOL_LIMITS.collaborationTaskCount),
+	consumerTaskIds: z.array(uuidSchema).min(1).max(PROTOCOL_LIMITS.artifactConsumerTaskCount),
 	content: z.json(),
 });
 
@@ -39,7 +39,7 @@ export interface ArtifactCreateInput {
 }
 
 export interface AuthorizedArtifact {
-	readonly reference: CollaborationArtifactReference;
+	readonly reference: ArtifactReference;
 	readonly content: JsonValue;
 }
 
@@ -59,7 +59,7 @@ export class ArtifactStore {
 		}
 	}
 
-	public create(input: ArtifactCreateInput): Promise<CollaborationArtifactReference> {
+	public create(input: ArtifactCreateInput): Promise<ArtifactReference> {
 		return this.runExclusive(async () => {
 			const record = createRecord(input);
 			const existing = await this.readRecordUnlocked(record.artifactId);
@@ -75,7 +75,7 @@ export class ArtifactStore {
 			const records = await this.listRecordsUnlocked();
 			if (
 				records.filter(({ runId }) => runId === record.runId).length
-					>= PROTOCOL_LIMITS.collaborationArtifactCount
+					>= PROTOCOL_LIMITS.artifactGroupCount
 				|| records.reduce((bytes, candidate) => bytes + candidate.contentLength, 0)
 					+ record.contentLength > PROTOCOL_LIMITS.artifactStoreBytes
 			) {
@@ -103,7 +103,7 @@ export class ArtifactStore {
 			if (artifact.runId !== parsedRunId || !artifact.consumerTaskIds.includes(parsedTaskId)) {
 				throw new MeshDomainError(
 					'ARTIFACT_FORBIDDEN',
-					'The artifact is not authorized for this collaboration task.',
+					'The artifact is not authorized for this task.',
 				);
 			}
 			return {
@@ -113,7 +113,7 @@ export class ArtifactStore {
 		});
 	}
 
-	public listForRun(runId: string): Promise<readonly CollaborationArtifactReference[]> {
+	public listForRun(runId: string): Promise<readonly ArtifactReference[]> {
 		return this.runExclusive(async () => {
 			const parsedRunId = uuidSchema.parse(runId);
 			return (await this.listRecordsUnlocked())
@@ -322,7 +322,7 @@ function containsForbiddenArtifactText(value: string): boolean {
 	);
 }
 
-function toReference(record: ArtifactRecord): CollaborationArtifactReference {
+function toReference(record: ArtifactRecord): ArtifactReference {
 	return {
 		artifactId: record.artifactId,
 		runId: record.runId,

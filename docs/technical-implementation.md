@@ -17,8 +17,8 @@
 > 当前实现采用 Mesh protocol v2；v1 Peer 明确不兼容。真实普通窗口 E2E 已通过
 > Device Broker、Window Node、本地 IPC、Workspace Claim、Takeover 和清理边界。
 > 最终 opted-in AHP 1.0 运行使用专用认证 Profile，已证明 authoritative
-> start/get/output/handle-cancel/cancelled 和零资源残留。0.3.0 在此本机控制面上增加
-> 持久 Collaboration Run、DAG 调度、不可变 JSON Artifact Store 和双 Workspace 验证。
+> start/get/output/handle-cancel/cancelled 和零资源残留。0.4.0 已移除 0.3.0 的
+> Collaboration Run、DAG 调度、Dashboard 协作入口与三个协作 Tool；Artifact Store 保留。
 
 ## 1. 结论
 
@@ -227,6 +227,9 @@ Schema v2 Migration 保留稳定 `deviceId`，并把 v1 Workspace/Task Data 转�
 Broker Store。未知或损坏的版本必须失败，不能静默重置或猜测。
 
 ### 4.7 Same-device Collaboration Run
+
+> 本节记录的 0.3.0 聚合自 0.4.0 起已删除。启动时仅清理旧
+> `mesh-state/collaborations` 目录，不迁移或恢复其中的数据。
 
 0.3.0 新增 Broker-owned `CollaborationRun` 聚合。`runId`、
 `collaborationRequestId` 和每个 Task/Delegation ID 都是 canonical UUID；精确
@@ -832,18 +835,15 @@ Login 过期、Build/Schema 不支持、ACE 过期和资源不存在属于 Perma
 
 ### 12.1 Manifest
 
-每个 Tool 必须同时存在于 `package.json.contributes.languageModelTools` 和运行时 `vscode.lm.registerTool`。0.3 注册：
+每个 Tool 必须同时存在于 `package.json.contributes.languageModelTools` 和运行时 `vscode.lm.registerTool`。当前注册：
 
 - `mesh_list_workers`
 - `mesh_delegate_task`
 - `mesh_get_task`
 - `mesh_cancel_task`
 - `mesh_answer_task`
-- `mesh_start_collaboration`
-- `mesh_get_collaboration`
-- `mesh_cancel_collaboration`
 
-八个 Tool 的 Target Contract 都是显式
+五个 Tool 的 Target Contract 都是显式
 `Device → Node → Workspace`；不能只靠 Workspace 名称或当前窗口隐式选路。
 
 Tool Name 合法，不能使用保留的 `copilot_` 或 `vscode_` 前缀。`canBeReferencedInPrompt: true` 时必须提供 `toolReferenceName`。[Tool Contribution Schema](https://github.com/microsoft/vscode/blob/1.103.0/src/vs/workbench/contrib/chat/common/tools/languageModelToolsContribution.ts)
@@ -859,9 +859,6 @@ Manifest 与 Runtime Registration 必须一一相等，并通过 Cold Extension 
 | get | 无 | 无 | 10 秒 |
 | cancel | 请求终止远程 Task | 必须 | 10 秒 |
 | answer | 将用户回答发送到远端 Task | 必须 | 10 秒 |
-| start collaboration | 创建/恢复同设备 Run 并调度首个 Ready Task | 必须 | 15 秒 |
-| get collaboration | 读取 bounded Run/DAG/Artifact metadata | 无 | 10 秒 |
-| cancel collaboration | 精确取消 Active Task 并终止未启动依赖 | 必须 | 10 秒 |
 
 `prepareInvocation` 必须无副作用，因为它可能执行后不调用 `invoke`。确认文案显示目标设备、Workspace 和任务摘要，不显示本地路径或 Secret。
 
@@ -891,7 +888,7 @@ new vscode.LanguageModelToolResult([
 | --- | --- | --- |
 | `globalState` | deviceId/name、Tunnel 元数据、Workspace 索引、Peer 非敏感 Profile、Task Summary 派生索引 | Secret、Token、完整 Prompt/Output |
 | `SecretStorage` | Invitation Secret、Pending/Active Peer Root Key、可选短期 Tunnel Token | Task Journal、日志 |
-| `globalStorageUri` | Task/Collaboration Recovery Record、有限 Event Journal、受限 JSON Artifact、诊断文件 | Credential、源码副本、无限 Transcript、任意文件传输 |
+| `globalStorageUri` | Task Recovery Record、有限 Event Journal、受限 JSON Artifact、诊断文件 | Credential、源码副本、无限 Transcript、任意文件传输 |
 
 Broker Key 也位于 `SecretStorage`，只用于同 User Data 的本机 IPC Mutual HMAC。
 任何 Mesh Key 都不得传给 `globalState.setKeysForSync`；Device、Tunnel、Peer、
@@ -952,12 +949,11 @@ interface DashboardViewModel {
   workspaceConflicts: readonly WorkspaceConflictViewModel[];
   remoteNodes: readonly RemoteNodeViewModel[];
   tasks: readonly TaskViewModel[];
-  collaborationRuns: readonly CollaborationRunViewModel[];
 }
 ```
 
 Dashboard 明确显示 Broker Owner/Generation/Takeover、本机 Nodes、Workspace
-Claims/Conflicts、Remote Nodes 和 Collaboration Runs。所有操作与八个 Tool 一样使用
+Claims/Conflicts、Remote Nodes 和 Tasks。所有操作与五个 Tool 一样使用
 Device → Node → Workspace Target。UI Command 进入 Extension Host 后通过 IPC
 交给 Broker/Application Service，再由权威 Store Event multiplex 刷新全部窗口。
 
@@ -1168,9 +1164,6 @@ zod
 4. **Multi-window E2E：** 相同 User Data 的普通 VS Code Windows，验证一个
    Broker、多 Node、IPC、Claim/Reclaim/Conflict、Takeover 与精确清理。默认不
    启动 AHP Task。
-5. **Multi-project E2E：** `MESH_MULTI_PROJECT_E2E=1 npm run
-   test:multi-project-real`，两个普通 Window/Workspace、真实 backend/frontend
-   AHP completion、精确 Artifact handoff、两边 Validation、Run completed 与零残留。
 
 环境变量：
 
@@ -1180,7 +1173,6 @@ MESH_AGENT_HOST_E2E=1
 MESH_TWO_DEVICE_E2E=1
 npm run test:multi-window-real
 MESH_MULTI_WINDOW_E2E_TASKS=1 npm run test:multi-window-real
-MESH_MULTI_PROJECT_E2E=1 npm run test:multi-project-real
 ```
 
 macOS Unix Socket 路径过长时使用短目录：
@@ -1272,9 +1264,7 @@ macOS arm64 验证范围现为 Go；这不表示已 Push/Release/Publish：
 20. Node 丢失释放 Claim；当前 AHP 无 Recovery API 时 Task 明确失败为
     `TASK_RECOVERY_UNAVAILABLE`，且不重复执行。
 21. Authenticated Authoritative AHP start/get/cancel/output/handle-cancel 已通过。
-22. 两个普通 Window/Workspace 的 Collaboration Run 完成真实 backend →
-    Artifact → frontend → 双 Validation，重试/Takeover 不重复启动。
-23. Dashboard/Tool 不暴露 Artifact 内容、绝对路径、Secret、原始
+22. Dashboard/Tool 不暴露 Artifact 内容、绝对路径、Secret、原始
     Prompt/Output；同设备路径始终不触碰 Dev Tunnel。
 
 ## 22. 参考资料

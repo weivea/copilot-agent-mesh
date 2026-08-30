@@ -14,6 +14,11 @@ const packageManifest: unknown = JSON.parse(
 	readFileSync(resolve(__dirname, '../../../package.json'), 'utf8'),
 );
 const currentVerification = verifyMeshToolManifestDescriptors(packageManifest);
+const removedCollaborationTools = [
+	'mesh_start_collaboration',
+	'mesh_get_collaboration',
+	'mesh_cancel_collaboration',
+] as const;
 const pendingReason = [
 	'Parent integration pending.',
 	`Missing: ${currentVerification.missingNames.join(', ') || 'none'}.`,
@@ -45,6 +50,7 @@ test('mechanical manifest application installs production tools and removes the 
 	});
 	assert.ok(!names.includes(LEGACY_MESH_SPIKE_TOOL_NAME));
 	assert.ok(MESH_RUNTIME_TOOL_NAMES.every((name) => names.includes(name)));
+	assert.ok(removedCollaborationTools.every((name) => !names.includes(name)));
 });
 
 function isRecord(value: unknown): value is Record<string, unknown> {
