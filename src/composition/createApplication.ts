@@ -277,6 +277,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		addApplicationCleanup(cleanup, () => sourceStatusSubscription?.dispose());
 		await node.start();
 		const remoteTasks = new LocalIpcRemoteTaskAdapter(node);
+		addApplicationCleanup(cleanup, () => remoteTasks.dispose());
 		const localTasks = new LocalBrokerTaskFacade(node, {
 			deviceName: () =>
 				currentOwnerRuntime?.device.current().name
@@ -308,7 +309,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			node,
 			localTasks,
 			remoteTasks,
-			runtime,
+			runtime: () => runtime,
 			guard,
 			workerPlatform,
 			lifecycle,
@@ -336,8 +337,20 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		const multiWindowE2e = multiWindowE2eRequested && requestedE2eScenarios === 1
 			? gatedE2e
 			: undefined;
+		let meshTools: vscode.Disposable | undefined;
+		const syncMeshTools = (): void => {
+			const enabled = vscode.workspace.getConfiguration('copilotAgentMesh')
+				.get<boolean>('experimental.peerDelegation', false);
+			if (enabled && meshTools === undefined) {
+				meshTools = registerMeshTaskTools(localTasks, { delegatedToolInvocations });
+			} else if (!enabled && meshTools !== undefined) {
+				meshTools.dispose();
+				meshTools = undefined;
+			}
+		};
+		syncMeshTools();
 		contributions.push(
-			registerMeshTaskTools(localTasks, { delegatedToolInvocations }),
+			{ dispose: () => meshTools?.dispose() },
 			vscode.window.registerWebviewViewProvider(AgentMeshViewProvider.viewType, dashboard),
 			...registerCommands(
 				dashboardFacade,
@@ -357,6 +370,12 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 				);
 			}),
 			vscode.workspace.onDidChangeConfiguration((event) => {
+				if (
+					event.affectsConfiguration('copilotAgentMesh.experimental.peerDelegation')
+				) {
+					syncMeshTools();
+					changeEvents.fire();
+				}
 				if (
 					event.affectsConfiguration('copilotAgentMesh.workspace.capabilityTags')
 				) {

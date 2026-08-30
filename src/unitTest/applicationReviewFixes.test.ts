@@ -191,6 +191,9 @@ test('production dashboard persists the separate title without deriving it from 
 	} | undefined;
 	const disposable = { dispose: () => undefined };
 	const bindings = new ProductionDashboardBindings({
+		vscodeApi: {
+			window: {},
+		},
 		changed: {
 			event: () => disposable,
 			fire: () => undefined,
@@ -304,6 +307,21 @@ test('production dashboard uses the safe unfiltered directory for self, conflict
 				truncated: true,
 				totalNodes: 3,
 			}),
+			listDashboardTasks: async () => ({
+				tasks: [{
+					actionHandle: 'a'.repeat(32),
+					direction: 'outgoing',
+					counterpartLabel: 'Target Window',
+					workspaceName: 'Target Workspace',
+					title: 'Named task',
+					state: 'running',
+					startedAt: '2026-08-30T12:00:00.000Z',
+					shortId: taskId.slice(0, 8),
+					canCancel: true,
+				}],
+				truncated: false,
+				totalTasks: 1,
+			}),
 		},
 		localTasks: {},
 		remoteTasks: {
@@ -361,6 +379,10 @@ test('production dashboard uses the safe unfiltered directory for self, conflict
 	assert.ok(snapshot.errors.some(({ code }) => code === 'WORKSPACE_CLAIM_CONFLICT'));
 	assert.equal(snapshot.tasks[0]?.workspaceName, 'Source Workspace');
 	assert.equal(snapshot.tasks[0]?.phase, 'Window Node: This Window');
+	assert.equal(snapshot.outgoingTasks?.length, 1);
+	const outgoingTask = snapshot.outgoingTasks?.[0];
+	assert.ok(outgoingTask);
+	assert.equal('direction' in outgoingTask, false);
 	bindings.dispose();
 });
 

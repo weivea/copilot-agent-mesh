@@ -14,8 +14,17 @@ import type { WindowNodeClient } from './WindowNodeClient';
  */
 export class LocalIpcRemoteTaskAdapter implements RemoteTaskRouteAdapter {
 	private readonly snapshots = new Map<string, TaskSnapshot | TaskSnapshotAfterEventSeq>();
+	private readonly taskSubscription: { dispose(): void };
 
-	public constructor(private readonly client: WindowNodeClient) {}
+	public constructor(private readonly client: WindowNodeClient) {
+		this.taskSubscription = typeof client.onTaskSnapshot === 'function'
+			? client.onTaskSnapshot((snapshot) => {
+				if (this.snapshots.has(snapshot.taskId)) {
+					this.remember(snapshot);
+				}
+			})
+			: { dispose: () => undefined };
+	}
 
 	public listDevices(signal: AbortSignal): Promise<MeshRemoteDirectorySnapshot> {
 		throwIfAborted(signal);
@@ -39,7 +48,7 @@ export class LocalIpcRemoteTaskAdapter implements RemoteTaskRouteAdapter {
 				route.peerId,
 				route.delegatedExecutionContext,
 			);
-		this.snapshots.set(snapshot.taskId, snapshot);
+		this.remember(snapshot);
 		return snapshot;
 	}
 
@@ -54,7 +63,7 @@ export class LocalIpcRemoteTaskAdapter implements RemoteTaskRouteAdapter {
 			signal,
 		);
 		if (snapshot !== undefined) {
-			this.snapshots.set(snapshot.taskId, snapshot);
+			this.remember(snapshot);
 		}
 		return snapshot;
 	}
@@ -66,7 +75,7 @@ export class LocalIpcRemoteTaskAdapter implements RemoteTaskRouteAdapter {
 		throwIfAborted(signal);
 		const snapshot = await raceAbort(this.client.cancelRemoteTask(taskId), signal);
 		if (snapshot !== undefined) {
-			this.snapshots.set(snapshot.taskId, snapshot);
+			this.remember(snapshot);
 		}
 		return snapshot;
 	}
@@ -84,13 +93,47 @@ export class LocalIpcRemoteTaskAdapter implements RemoteTaskRouteAdapter {
 			signal,
 		);
 		if (snapshot !== undefined) {
-			this.snapshots.set(snapshot.taskId, snapshot);
+			this.remember(snapshot);
 		}
 		return snapshot;
 	}
 
 	public listKnownTasks(): readonly (TaskSnapshot | TaskSnapshotAfterEventSeq)[] {
 		return [...this.snapshots.values()].map((snapshot) => structuredClone(snapshot));
+	}
+
+	public dispose(): void {
+		this.taskSubscription.dispose();
+		this.snapshots.clear();
+	}
+
+	private remember(snapshot: TaskSnapshot | TaskSnapshotAfterEventSeq): void {
+		const current = this.snapshots.get(snapshot.taskId);
+		if (
+			current !== undefined
+			&& (
+				snapshot.eventSeq < current.eventSeq
+				|| (
+					snapshot.eventSeq === current.eventSeq
+					&& 'afterEventSeq' in snapshot
+					&& !('afterEventSeq' in current)
+				)
+			)
+		) {
+			return;
+		}
+		this.snapshots.delete(snapshot.taskId);
+		this.snapshots.set(snapshot.taskId, snapshot);
+		while (this.snapshots.size > 500) {
+			const terminal = [...this.snapshots].find(([, candidate]) =>
+				['completed', 'failed', 'cancelled', 'timedOut'].includes(candidate.state)
+			);
+			const oldest = terminal?.[0] ?? this.snapshots.keys().next().value;
+			if (oldest === undefined) {
+				return;
+			}
+			this.snapshots.delete(oldest);
+		}
 	}
 }
 

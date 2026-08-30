@@ -6,7 +6,7 @@ import {
 	nodePolicyGetParamsSchema,
 	nodePolicyResultSchema,
 	nodePolicySetParamsSchema,
-	peerPolicyCandidateListResultSchema,
+	peerPolicyCandidateParamsSchema,
 	type DashboardNodeDirectoryResult,
 	type NodeDirectoryResult,
 	type NodeIdentityParams,
@@ -14,7 +14,8 @@ import {
 	type NodePolicyResult,
 	type NodePolicySetParams,
 	type PeerGateState,
-	type PeerPolicyCandidateListResult,
+	type PeerPolicyCandidate,
+	type PeerPolicyCandidateParams,
 	type WindowNodeDescriptor,
 } from '../../shared/protocol';
 import { MeshDomainError } from '../domain/errors';
@@ -32,6 +33,14 @@ import { foldWindowName, resolveWindowDisplayName } from './WindowName';
 export interface PeerPolicyServiceOptions {
 	readonly enabled: () => boolean;
 	readonly onDidChange?: () => void;
+}
+
+export interface PeerPolicyCandidateBinding {
+	readonly candidate: Omit<PeerPolicyCandidate, 'actionHandle'>;
+	readonly sourceWorkspaceIdentity: string;
+	readonly targetWorkspaceIdentity?: string;
+	readonly targetNodeId?: string;
+	readonly targetNodeInstanceId?: string;
 }
 
 export class PeerPolicyService implements PeerRouteAuthorizer {
@@ -171,42 +180,142 @@ export class PeerPolicyService implements PeerRouteAuthorizer {
 		});
 	}
 
-	public listCandidates(caller: NodeIdentityParams): PeerPolicyCandidateListResult {
+	public listCandidates(caller: PeerPolicyCandidateParams): readonly PeerPolicyCandidateBinding[] {
 		this.assertEnabled();
-		const identity = nodeIdentityParamsSchema.parse(caller);
-		const source = this.registry.peerNode(identity);
-		if (source === undefined) {
-			throw new MeshDomainError('POLICY_FORBIDDEN', 'The policy caller is not registered.');
-		}
+		const input = peerPolicyCandidateParamsSchema.parse(caller);
+		const identity = { nodeId: input.nodeId, nodeInstanceId: input.nodeInstanceId };
+		const source = this.requireCaller(identity);
+		this.requireOwnedWorkspace(identity, input.workspaceIdentity);
+		const sourcePolicy = this.projectPolicy(
+			input.workspaceIdentity,
+			source.workspaces.find(({ workspaceIdentity }) =>
+				workspaceIdentity === input.workspaceIdentity
+			)?.name ?? 'Workspace',
+			input.nodeId,
+		);
 		const labels = this.effectiveNodeLabels();
-		const candidates = this.registry.peerNodes()
-			.filter((node) => node.nodeId !== identity.nodeId)
-			.slice(0, PROTOCOL_LIMITS.nodeListCount)
+		const representedIdentities = new Set<string>();
+		const candidates: PeerPolicyCandidateBinding[] = this.registry.peerNodes()
 			.map((node) => {
 				const workspace = node.workspaces.length === 1 ? node.workspaces[0] : undefined;
+				if (workspace !== undefined) {
+					representedIdentities.add(workspace.workspaceIdentity);
+				}
 				const policy = workspace === undefined
 					? undefined
 					: this.store.get(workspace.workspaceIdentity);
+				const self = node.nodeId === identity.nodeId
+					&& node.nodeInstanceId === identity.nodeInstanceId;
+				const allowlisted = workspace !== undefined
+					&& sourcePolicy.allowlist.includes(workspace.workspaceIdentity);
+				const claimState = node.workspaces.length > 1
+					? 'multiWorkspace' as const
+					: workspace?.status === 'claimed'
+						? 'claimed' as const
+						: 'unclaimed' as const;
 				return {
-					nodeId: shortId(node.nodeId),
-					nodeInstanceId: shortId(node.nodeInstanceId),
-					...(workspace === undefined ? {} : { workspaceId: shortId(workspace.workspaceId) }),
-					label: labels.get(node.nodeId) ?? node.nodeId.slice(0, 8),
-					...(node.workspaces.length > 1
-						? { workspaceName: `${node.workspaces.length} workspaces` }
-						: workspace === undefined
-							? {}
-							: { workspaceName: safeDisplayName(workspace.name, 'Workspace') }),
-					online: node.online,
-					acceptsIncoming: policy?.acceptsIncoming ?? false,
-					busy: node.workspaces.some(({ busy }) => busy),
-					gateState: this.candidateGateState(source, node),
+					candidate: {
+						windowLabel: labels.get(node.nodeId) ?? node.nodeId.slice(0, 8),
+						workspaceName: node.workspaces.length > 1
+							? `${node.workspaces.length} workspaces`
+							: workspace === undefined
+								? 'No Workspace'
+								: safeDisplayName(workspace.name, 'Workspace'),
+						online: node.online,
+						acceptsIncoming: policy?.acceptsIncoming ?? false,
+						busy: node.workspaces.some(({ busy }) => busy),
+						allowlisted,
+						self,
+						canToggle: !self
+							&& workspace !== undefined
+							&& (node.online || allowlisted),
+						claimState,
+						gateState: self
+							? workspace?.status === 'claimed' ? 'allowed' : 'notClaimed'
+							: this.candidateGateState(source, node),
+					},
+					sourceWorkspaceIdentity: input.workspaceIdentity,
+					...(workspace === undefined ? {} : {
+						targetWorkspaceIdentity: workspace.workspaceIdentity,
+						targetNodeId: node.nodeId,
+						targetNodeInstanceId: node.nodeInstanceId,
+					}),
 				};
 			});
-		return peerPolicyCandidateListResultSchema.parse({
-			candidates,
-			truncated: false,
-			totalCandidates: candidates.length,
+			for (const targetWorkspaceIdentity of sourcePolicy.allowlist) {
+				if (
+					representedIdentities.has(targetWorkspaceIdentity)
+				) {
+				continue;
+			}
+			const stored = this.store.get(targetWorkspaceIdentity);
+			candidates.push({
+				candidate: {
+					windowLabel: safeDisplayName(stored?.windowName ?? 'Offline peer', 'Offline peer'),
+					workspaceName: 'Saved Workspace',
+					online: false,
+					acceptsIncoming: stored?.acceptsIncoming ?? false,
+					busy: false,
+					allowlisted: true,
+					self: false,
+					canToggle: true,
+					claimState: 'unclaimed',
+					gateState: 'offline',
+				},
+				sourceWorkspaceIdentity: input.workspaceIdentity,
+				targetWorkspaceIdentity,
+			});
+		}
+		return candidates.sort((left, right) =>
+			candidatePriority(left) - candidatePriority(right)
+			|| left.candidate.windowLabel.localeCompare(right.candidate.windowLabel),
+		);
+	}
+
+	public async setCandidateAllowed(
+		caller: NodeIdentityParams,
+		binding: PeerPolicyCandidateBinding,
+		allowed: boolean,
+	): Promise<NodePolicyResult> {
+		this.assertEnabled();
+		const identity = nodeIdentityParamsSchema.parse(caller);
+		this.requireOwnedWorkspace(identity, binding.sourceWorkspaceIdentity);
+		const targetWorkspaceIdentity = binding.targetWorkspaceIdentity;
+		if (targetWorkspaceIdentity === undefined || targetWorkspaceIdentity === binding.sourceWorkspaceIdentity) {
+			throw new MeshDomainError('POLICY_FORBIDDEN', 'The policy candidate cannot be selected.');
+		}
+		if (binding.targetNodeId !== undefined || binding.targetNodeInstanceId !== undefined) {
+			if (binding.targetNodeId === undefined || binding.targetNodeInstanceId === undefined) {
+				throw new MeshDomainError('POLICY_FORBIDDEN', 'The policy candidate binding is incomplete.');
+			}
+			const live = this.registry.peerNode({
+				nodeId: binding.targetNodeId,
+				nodeInstanceId: binding.targetNodeInstanceId,
+			});
+			const workspace = live?.workspaces.length === 1 ? live.workspaces[0] : undefined;
+			if (workspace?.workspaceIdentity !== targetWorkspaceIdentity) {
+				throw new MeshDomainError('POLICY_FORBIDDEN', 'The policy candidate is stale.');
+			}
+			if (allowed && (!live?.online || workspace.status !== 'claimed')) {
+				throw new MeshDomainError('POLICY_FORBIDDEN', 'Only a live claimed candidate can be allowlisted.');
+			}
+		} else if (allowed) {
+			throw new MeshDomainError('POLICY_FORBIDDEN', 'An offline policy entry cannot be newly allowlisted.');
+		}
+		const policy = this.getPolicy({
+			...identity,
+			workspaceIdentity: binding.sourceWorkspaceIdentity,
+		});
+		const allowlist = new Set(policy.allowlist);
+		if (allowed) {
+			allowlist.add(targetWorkspaceIdentity);
+		} else {
+			allowlist.delete(targetWorkspaceIdentity);
+		}
+		return this.setPolicy(identity, {
+			...identity,
+			workspaceIdentity: binding.sourceWorkspaceIdentity,
+			allowlist: [...allowlist],
 		});
 	}
 
@@ -479,10 +588,6 @@ function emptyDirectory(deviceId: string): NodeDirectoryResult {
 	};
 }
 
-function shortId(value: string): string {
-	return value.slice(0, 8);
-}
-
 function allocateEffectiveFallback(
 	nodeId: string,
 	index: number,
@@ -505,4 +610,10 @@ function safeDisplayName(value: string, fallback: string): string {
 		return fallback;
 	}
 	return value;
+}
+
+function candidatePriority(binding: PeerPolicyCandidateBinding): number {
+	return binding.candidate.allowlisted
+		? 0
+		: binding.candidate.self ? 1 : 2;
 }

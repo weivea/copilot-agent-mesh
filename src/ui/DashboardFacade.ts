@@ -3,6 +3,7 @@ import * as vscode from 'vscode';
 import {
 	PROTOCOL_LIMITS,
 	utf8ByteLength,
+	type DashboardTaskDirection,
 	type TaskStatus,
 } from '../../shared/protocol';
 import { validateWindowName } from '../broker/WindowName';
@@ -58,8 +59,21 @@ export interface DashboardSnapshot {
 		readonly claimStatus: 'claimed' | 'readOnly' | 'conflict' | 'unclaimed' | 'ambiguous';
 		readonly previewEnabled: boolean;
 		readonly canRename: boolean;
+		readonly acceptsIncoming: boolean;
+		readonly canSetAcceptIncoming: boolean;
+		readonly acceptActionHandle?: string;
+		readonly agentHost: {
+			readonly source: 'editor' | 'standalone' | 'unavailable';
+			readonly label: string;
+			readonly degraded: boolean;
+			readonly reason?: 'EDITOR_DISCOVERY_FAILED' | 'EDITOR_START_FAILED' | 'STANDALONE_START_FAILED';
+			readonly detail?: string;
+		};
 		readonly detail?: string;
 	};
+	readonly policyCandidates?: readonly DashboardPolicyCandidateSnapshot[];
+	readonly outgoingTasks?: readonly DashboardTaskSummarySnapshot[];
+	readonly incomingTasks?: readonly DashboardTaskSummarySnapshot[];
 	readonly localNodes?: readonly DashboardNodeSnapshot[];
 	readonly remoteDevices?: readonly {
 		readonly deviceId: string;
@@ -108,6 +122,31 @@ export interface DashboardSnapshot {
 	}[];
 }
 
+export interface DashboardPolicyCandidateSnapshot {
+	readonly actionHandle?: string;
+	readonly windowLabel: string;
+	readonly workspaceName: string;
+	readonly online: boolean;
+	readonly acceptsIncoming: boolean;
+	readonly busy: boolean;
+	readonly allowlisted: boolean;
+	readonly self: boolean;
+	readonly canToggle: boolean;
+	readonly claimState: 'claimed' | 'multiWorkspace' | 'unclaimed';
+	readonly gateState: 'allowed' | 'notAllowed' | 'notAccepting' | 'offline' | 'multiWorkspace' | 'notClaimed';
+}
+
+export interface DashboardTaskSummarySnapshot {
+	readonly actionHandle?: string;
+	readonly counterpartLabel: string;
+	readonly workspaceName: string;
+	readonly title: string;
+	readonly state: TaskState;
+	readonly startedAt: string;
+	readonly shortId: string;
+	readonly canCancel: boolean;
+}
+
 export interface DashboardNodeSnapshot {
 	readonly nodeId: string;
 	readonly nodeInstanceId: string;
@@ -138,6 +177,11 @@ export interface DashboardWindowRenameSession {
 	rename(name: string): Promise<void>;
 }
 
+export interface DashboardTaskCancellationSession {
+	cancel(): Promise<void>;
+	release(): Promise<void>;
+}
+
 /**
  * Application-service boundary for the dashboard.
  *
@@ -150,6 +194,9 @@ export interface DashboardFacade {
 	onDidChange(listener: () => void): vscode.Disposable;
 	configureDeviceName(): Promise<void>;
 	renameCurrentWindow(): Promise<void>;
+	setAcceptIncoming(actionHandle: string, enabled: boolean): Promise<void>;
+	setPeerAllowed(actionHandle: string, allowed: boolean): Promise<void>;
+	cancelDashboardTask(actionHandle: string, direction: DashboardTaskDirection): Promise<void>;
 	registerCurrentWorkspace(): Promise<void>;
 	removeWorkspace(workspaceId: string): Promise<void>;
 	startListener(): Promise<void>;
@@ -166,6 +213,12 @@ export interface DashboardServiceBindings {
 	onDidChange(listener: () => void): vscode.Disposable;
 	configureDeviceName(name: string): Promise<void>;
 	prepareWindowRename(): Promise<DashboardWindowRenameSession>;
+	setAcceptIncoming(actionHandle: string, enabled: boolean): Promise<void>;
+	setPeerAllowed(actionHandle: string, allowed: boolean): Promise<void>;
+	prepareDashboardTaskCancellation(
+		actionHandle: string,
+		direction: DashboardTaskDirection,
+	): Promise<DashboardTaskCancellationSession>;
 	registerCurrentWorkspace(): Promise<void>;
 	removeWorkspace(workspaceId: string): Promise<void>;
 	startListener(): Promise<void>;
@@ -236,6 +289,41 @@ export class ServiceDashboardFacade implements DashboardFacade {
 		if (name !== undefined) {
 			await session.rename(name);
 		}
+	}
+
+	public setAcceptIncoming(actionHandle: string, enabled: boolean): Promise<void> {
+		return this.services.setAcceptIncoming(actionHandle, enabled);
+	}
+
+	public setPeerAllowed(actionHandle: string, allowed: boolean): Promise<void> {
+		return this.services.setPeerAllowed(actionHandle, allowed);
+	}
+
+	public async cancelDashboardTask(
+		actionHandle: string,
+		direction: DashboardTaskDirection,
+	): Promise<void> {
+		const reservation = await this.services.prepareDashboardTaskCancellation(
+			actionHandle,
+			direction,
+		);
+		let approved: boolean;
+		try {
+			approved = await this.confirmations.confirm(
+				direction === 'incoming'
+					? 'Cancel this task running in this window?'
+					: 'Cancel this delegated task?',
+				'Cancel Task',
+			);
+		} catch (error: unknown) {
+			await reservation.release();
+			throw error;
+		}
+		if (!approved) {
+			await reservation.release();
+			return;
+		}
+		await reservation.cancel();
 	}
 
 	public registerCurrentWorkspace(): Promise<void> {
@@ -361,8 +449,18 @@ export class UnavailableDashboardFacade implements DashboardFacade {
 				claimStatus: 'unclaimed',
 				previewEnabled: false,
 				canRename: false,
+				acceptsIncoming: false,
+				canSetAcceptIncoming: false,
+				agentHost: {
+					source: 'unavailable',
+					label: 'Unavailable',
+					degraded: false,
+				},
 				detail: 'Peer window delegation is unavailable.',
 			},
+			policyCandidates: [],
+			outgoingTasks: [],
+			incomingTasks: [],
 			localNodes: [],
 			remoteDevices: [],
 			workspaces: [],
@@ -394,6 +492,21 @@ export class UnavailableDashboardFacade implements DashboardFacade {
 
 	public renameCurrentWindow(): Promise<void> {
 		return this.unavailable('Window rename service');
+	}
+
+	public setAcceptIncoming(_actionHandle: string, _enabled: boolean): Promise<void> {
+		return this.unavailable('Incoming task policy service');
+	}
+
+	public setPeerAllowed(_actionHandle: string, _allowed: boolean): Promise<void> {
+		return this.unavailable('Peer allowlist service');
+	}
+
+	public cancelDashboardTask(
+		_actionHandle: string,
+		_direction: DashboardTaskDirection,
+	): Promise<void> {
+		return this.unavailable('Dashboard task service');
 	}
 
 	public registerCurrentWorkspace(): Promise<void> {

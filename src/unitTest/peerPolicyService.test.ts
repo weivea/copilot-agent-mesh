@@ -417,9 +417,12 @@ test('allocates unique effective labels for identical claimed Workspace fallback
 	const dashboard = fixture.service.listDashboard(identityParams(NODE_A, INSTANCE_A));
 	const targetLabel = dashboard.nodes.find(({ nodeId }) => nodeId === NODE_B)?.label;
 	assert.ok(targetLabel);
+	const candidates = fixture.service.listCandidates({
+		...identityParams(NODE_A, INSTANCE_A),
+		workspaceIdentity: IDENTITY_A,
+	});
 	assert.equal(
-		fixture.service.listCandidates(identityParams(NODE_A, INSTANCE_A))
-			.candidates.find(({ nodeId }) => nodeId === NODE_B.slice(0, 8))?.label,
+		candidates.find(({ targetNodeId }) => targetNodeId === NODE_B)?.candidate.windowLabel,
 		targetLabel,
 	);
 	assert.equal(
@@ -439,13 +442,15 @@ test('keeps the configuration directory safe and separate from Tool visibility',
 	t.after(() => fixture.registry.dispose());
 
 	assert.equal(fixture.service.listAuthorized(identityParams(NODE_A, INSTANCE_A)).nodes.length, 0);
-	const configuration = fixture.service.listCandidates(identityParams(NODE_A, INSTANCE_A));
-	assert.equal(configuration.candidates.length, 1);
-	assert.equal(configuration.candidates[0]?.nodeId, NODE_B.slice(0, 8));
-	assert.equal(configuration.candidates[0]?.nodeInstanceId, INSTANCE_B.slice(0, 8));
-	assert.equal(configuration.candidates[0]?.label, NODE_B.slice(0, 8));
-	assert.equal(configuration.candidates[0]?.workspaceName, 'Workspace');
-	const serialized = JSON.stringify(configuration);
+	const configuration = fixture.service.listCandidates({
+		...identityParams(NODE_A, INSTANCE_A),
+		workspaceIdentity: IDENTITY_A,
+	});
+	const target = configuration.find(({ targetNodeId }) => targetNodeId === NODE_B)?.candidate;
+	assert.equal(configuration.length, 2);
+	assert.equal(target?.windowLabel, NODE_B.slice(0, 8));
+	assert.equal(target?.workspaceName, 'Workspace');
+	const serialized = JSON.stringify(configuration.map(({ candidate }) => candidate));
 	assert.doesNotMatch(serialized, /sha256:/u);
 	assert.doesNotMatch(serialized, /Users|private|secret-project/u);
 	const dashboard = fixture.service.listDashboard(identityParams(NODE_A, INSTANCE_A));
@@ -474,8 +479,11 @@ test('rejects credential-shaped names and forgets explicitly released workspaces
 		hasReason('WINDOW_NAME_INVALID'),
 	);
 
-	let candidate = fixture.service.listCandidates(identityParams(NODE_A, INSTANCE_A)).candidates[0];
-	assert.equal(candidate?.label, 'Repository B');
+	let candidate = fixture.service.listCandidates({
+		...identityParams(NODE_A, INSTANCE_A),
+		workspaceIdentity: IDENTITY_A,
+	}).find(({ targetNodeId }) => targetNodeId === NODE_B)?.candidate;
+	assert.equal(candidate?.windowLabel, 'Repository B');
 	assert.equal(candidate?.workspaceName, 'Repository B');
 
 	fixture.registry.releaseWorkspace({
@@ -483,8 +491,11 @@ test('rejects credential-shaped names and forgets explicitly released workspaces
 		workspaceId: WORKSPACE_B,
 	});
 	fixture.registry.unregister(identityParams(NODE_B, INSTANCE_B));
-	candidate = fixture.service.listCandidates(identityParams(NODE_A, INSTANCE_A)).candidates[0];
-	assert.equal(candidate?.workspaceName, undefined);
+	candidate = fixture.service.listCandidates({
+		...identityParams(NODE_A, INSTANCE_A),
+		workspaceIdentity: IDENTITY_A,
+	}).find(({ candidate: entry }) => !entry.self)?.candidate;
+	assert.equal(candidate?.workspaceName, 'No Workspace');
 	assert.equal(candidate?.gateState, 'offline');
 });
 

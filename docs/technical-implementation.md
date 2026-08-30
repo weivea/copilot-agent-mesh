@@ -1000,6 +1000,16 @@ Webview 的 `renameWindow` action 不接受 Workspace identity 或名称；名�
 InputBox 收集，目标由当前 Window Node 的 own claim 与 active editor 所属 Workspace
 服务端派生。多根窗口无法唯一选择时显式失败，Preview 默认关闭时控制禁用。
 
+P7 的 Webview 不再接收 Node/Workspace/Task 完整 ID。策略候选由 Broker 为当前认证 IPC
+Session 签发一次性随机句柄，绑定来源 Workspace、目标稳定 Workspace identity 与在线时的
+精确 Node instance；离线持久条目只允许撤销。View provider 再用 `uiInstanceId` 独立的一次性
+句柄包装。任务目录按精确 source/target 分成 Outgoing/Incoming，取消句柄同时绑定 task ID、
+方向和 owner/target 授权路径。确认前把显示句柄兑换为独立的有界 reservation，使确认期间
+的状态刷新不会重定向操作；拒绝时释放、执行时消费。除该明确的 in-flight reservation 外，
+刷新、策略/拓扑变化、消费、重放、跨 View、错误方向和 Dispose 全部 fail closed；显示名与
+8 位短 ID 永不参与路由或授权。Remote outgoing cache 同样由 Broker task notification 更新、
+有界保留，合并列表严格截断。状态变化由事件驱动，不轮询。
+
 ### 14.2 安全
 
 - 交互 UI 需要 Script 时只加载本地 Bundle。

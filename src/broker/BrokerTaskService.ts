@@ -229,6 +229,11 @@ export class BrokerTaskService {
 		return this.get(this.deviceId, taskId, afterEventSeq);
 	}
 
+	public async listDashboardRecords(): Promise<readonly TaskRecord[]> {
+		this.assertActive();
+		return (await this.store.list()).map((record) => structuredClone(record));
+	}
+
 	public cancel(ownerId: string, taskId: string): Promise<TaskSnapshot> {
 		this.assertActive();
 		const input = ownedTaskReadSchema.parse({ ownerId, taskId });
@@ -239,6 +244,24 @@ export class BrokerTaskService {
 		this.assertActive();
 		await this.assertLocalTaskSource(sourceNodeId, taskId);
 		return this.cancel(this.deviceId, taskId);
+	}
+
+	public async cancelForTarget(
+		nodeId: string,
+		nodeInstanceId: string,
+		taskId: string,
+	): Promise<TaskSnapshot> {
+		this.assertActive();
+		const record = (await this.store.list()).find((candidate) => candidate.taskId === taskId);
+		if (
+			record === undefined
+			|| record.schemaVersion !== 2
+			|| record.target.nodeId !== uuidSchema.parse(nodeId)
+			|| record.target.nodeInstanceId !== uuidSchema.parse(nodeInstanceId)
+		) {
+			throw new MeshDomainError('TASK_NOT_FOUND', 'The task is not owned by this target Window Node.');
+		}
+		return this.cancel(record.peerId, record.taskId);
 	}
 
 	public answer(
@@ -704,10 +727,7 @@ export class BrokerTaskService {
 				await this.requireOwned(ownerId, taskId),
 			);
 			if (!activeStates.has(record.state)) {
-				throw new MeshDomainError(
-					'TASK_NOT_CANCELLABLE',
-					'The task is no longer cancellable.',
-				);
+				return { record, route: undefined };
 			}
 			if (record.state === 'cancelling') {
 				this.scheduleCancellationDeadline(

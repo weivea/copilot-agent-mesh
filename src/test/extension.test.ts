@@ -24,7 +24,7 @@ import { TaskToolFacadeError } from '../tools/taskToolFacade';
 import type { AgentMeshExtensionApi } from '../composition/createApplication';
 
 suite('Copilot Agent Mesh', () => {
-	test('cold host has an implicit activation path for the contributed tool', async () => {
+	test('cold host keeps contributed Tools unavailable while Preview is off', async () => {
 		const extension = getExtension();
 		const manifestTools = extension.packageJSON.contributes.languageModelTools as Array<{ name: string }>;
 
@@ -52,7 +52,7 @@ suite('Copilot Agent Mesh', () => {
 			setTimeout(() => cancellation.cancel(), 0);
 			await invocation;
 		} catch (error) {
-			assert.match(String(error), /cancel/i);
+			assert.match(String(error), /does not have an implementation registered/i);
 		} finally {
 			cancellation.dispose();
 		}
@@ -61,6 +61,22 @@ suite('Copilot Agent Mesh', () => {
 		assert.ok(MESH_RUNTIME_TOOL_NAMES.every(
 			(name) => vscode.lm.tools.some((tool) => tool.name === name),
 		));
+
+		const configuration = vscode.workspace.getConfiguration('copilotAgentMesh');
+		try {
+			await configuration.update(
+				'experimental.peerDelegation',
+				true,
+				vscode.ConfigurationTarget.Global,
+			);
+			await waitForToolRegistration(MESH_TOOL_NAMES.listWorkers);
+		} finally {
+			await configuration.update(
+				'experimental.peerDelegation',
+				false,
+				vscode.ConfigurationTarget.Global,
+			);
+		}
 	});
 
 	test('contributes the dashboard and setup commands', () => {
@@ -273,6 +289,27 @@ function getExtension(): vscode.Extension<unknown> {
 	const extension = vscode.extensions.getExtension('weivea.copilot-agent-mesh');
 	assert.ok(extension, 'The Copilot Agent Mesh extension should be available.');
 	return extension;
+}
+
+async function waitForToolRegistration(name: string): Promise<void> {
+	for (let attempt = 0; attempt < 50; attempt += 1) {
+		const cancellation = new vscode.CancellationTokenSource();
+		try {
+			await vscode.lm.invokeTool(name, {
+				input: {},
+				toolInvocationToken: undefined,
+			}, cancellation.token);
+			return;
+		} catch (error: unknown) {
+			if (!/does not have an implementation registered/i.test(String(error))) {
+				throw error;
+			}
+		} finally {
+			cancellation.dispose();
+		}
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	assert.fail(`Tool ${name} did not register after enabling Peer Delegation Preview.`);
 }
 
 function createTaskToolFacade(): TaskToolFacade {
