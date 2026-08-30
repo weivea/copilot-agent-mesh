@@ -52,6 +52,7 @@ export type AnswerDispatch =
 
 export class AhpEventMapper {
 	private readonly pending = new Map<string, PendingInput>();
+	private readonly tools = new Map<string, { readonly toolName: string }>();
 
 	constructor(private readonly maxTextLength = 16_384) {}
 
@@ -79,6 +80,12 @@ export class AhpEventMapper {
 					? []
 					: [{ type: 'progress', message: bounded(action.activity, 1_024) }];
 			case 'chat/toolCallStart':
+				this.rememberTool(
+					envelope.channel,
+					action.turnId,
+					action.toolCallId,
+					action.toolName,
+				);
 				return [{
 					type: 'tool',
 					name: bounded(action.displayName, 256),
@@ -110,6 +117,12 @@ export class AhpEventMapper {
 							requestId,
 							kind: 'toolConfirmation',
 							prompt: 'Approve the tool result?',
+							confirmationEvidence: this.toolEvidence(
+								envelope.channel,
+								action.turnId,
+								action.toolCallId,
+								'result',
+							),
 						},
 					}];
 				}
@@ -240,6 +253,17 @@ export class AhpEventMapper {
 		this.pending.delete(requestId);
 	}
 
+	rememberTool(
+		chatUri: string,
+		turnId: string,
+		toolCallId: string,
+		toolName: string,
+	): void {
+		if (toolName.length > 0 && toolName.length <= 256) {
+			this.tools.set(toolKey(chatUri, turnId, toolCallId), { toolName });
+		}
+	}
+
 	private mapToolReady(
 		chatUri: string,
 		action: Extract<StateAction, { type: 'chat/toolCallReady' }>,
@@ -271,8 +295,32 @@ export class AhpEventMapper {
 					label: bounded(option.label, 256),
 					approve: option.kind === 'approve',
 				})),
+				confirmationEvidence: this.toolEvidence(
+					chatUri,
+					action.turnId,
+					action.toolCallId,
+					'operation',
+					parseFileEdits(action.edits),
+				),
 			},
 		}];
+	}
+
+	private toolEvidence(
+		chatUri: string,
+		turnId: string,
+		toolCallId: string,
+		phase: 'operation' | 'result',
+		fileEdits?: readonly { readonly beforeUri?: string; readonly afterUri?: string }[],
+	): AgentInputRequest['confirmationEvidence'] {
+		const tool = this.tools.get(toolKey(chatUri, turnId, toolCallId));
+		return tool === undefined
+			? undefined
+			: {
+				phase,
+				toolName: tool.toolName,
+				...(fileEdits === undefined ? {} : { fileEdits }),
+			};
 	}
 
 	private mapToolAuthentication(
@@ -336,6 +384,35 @@ export class AhpEventMapper {
 		};
 		return [{ type: 'inputRequired', request: mapped }];
 	}
+}
+
+function toolKey(chatUri: string, turnId: string, toolCallId: string): string {
+	return `${chatUri}\0${turnId}\0${toolCallId}`;
+}
+
+function parseFileEdits(
+	edits: Extract<StateAction, { type: 'chat/toolCallReady' }>['edits'],
+): readonly { readonly beforeUri?: string; readonly afterUri?: string }[] | undefined {
+	if (edits === undefined || !Array.isArray(edits.items) || edits.items.length > 128) {
+		return undefined;
+	}
+	const parsed: Array<{ beforeUri?: string; afterUri?: string }> = [];
+	for (const edit of edits.items) {
+		const beforeUri = edit.before?.uri;
+		const afterUri = edit.after?.uri;
+		if (
+			(beforeUri !== undefined && typeof beforeUri !== 'string')
+			|| (afterUri !== undefined && typeof afterUri !== 'string')
+			|| (beforeUri === undefined && afterUri === undefined)
+		) {
+			return undefined;
+		}
+		parsed.push({
+			...(beforeUri === undefined ? {} : { beforeUri }),
+			...(afterUri === undefined ? {} : { afterUri }),
+		});
+	}
+	return parsed.length === 0 ? undefined : parsed;
 }
 
 function mapResponsePart(part: unknown, maxLength: number): readonly AgentRuntimeEvent[] {

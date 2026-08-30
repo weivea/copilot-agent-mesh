@@ -18,10 +18,12 @@ state.
 
 `prepareInvocation` is side-effect free. Delegate confirmation resolves safe
 Window and Workspace display names and includes a bounded title summary,
-one-task scope, never-auto-approved categories, and the 60-minute maximum. It
+one-task scope, the structured in-Workspace file changes eligible for automatic
+approval, the terminal and sensitive categories that still require input, and
+the 60-minute maximum. It
 never displays IDs, paths, the raw prompt, or secrets, and it never persists an
-intent or contacts a worker. P4 keeps the native confirmation active and does
-not claim that P5 auto-approval is available.
+intent or contacts a worker. P5 never treats a working directory or arbitrary
+tool prose as proof that a terminal command is confined to the Workspace.
 
 Same-device peer delegation is default-off behind
 `copilotAgentMesh.experimental.peerDelegation`. When enabled, a local target is

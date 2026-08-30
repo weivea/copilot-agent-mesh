@@ -768,6 +768,7 @@ export class WindowNodeClient implements WorkspaceResolver {
 			));
 			const workspace: RegisteredLocalWorkspace = {
 				workspaceId: result.workspaceId,
+				workspaceIdentity,
 				displayName: entry.name,
 				uri: resolved.canonicalUri,
 			};

@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import {
 	LOCAL_BROKER_TASK_START_TIMEOUT_MS,
 	MESH_ERROR_CODES,
+	nodeTaskStartParamsSchema,
 	type NodeTaskEventParams,
 	type RoutedTaskStartParams,
 	type TaskSnapshot,
@@ -368,6 +369,22 @@ test('returns a durable start acknowledgement while the target start is pending'
 	const persisted = await fixture.store.getOwned(OWNER_ID, TASK_ID);
 	assert.equal(persisted?.state, 'startingAgent');
 	assert.equal(persisted?.events.at(-1)?.type, 'agentStartRequested');
+	const dispatched = nodeTaskStartParamsSchema.parse(
+		fixture.session.requests.find(({ method }) => method === 'node.task.start')?.params,
+	);
+	assert.equal(dispatched.delegationGrant.taskId, TASK_ID);
+	assert.equal(dispatched.delegationGrant.targetNodeId, NODE_ID);
+	assert.equal(dispatched.delegationGrant.targetNodeInstanceId, INSTANCE_ID);
+	assert.equal(
+		dispatched.delegationGrant.workspaceIdentity,
+		createOpaqueWorkspaceIdentity('opaque-workspace-identity'),
+	);
+	assert.equal(dispatched.delegationGrant.requestHash, persisted?.requestHash);
+	assert.deepEqual(dispatched.delegationGrant.autoApprove, [
+		'localTerminal',
+		'localFileWrite',
+	]);
+	assert.equal(JSON.stringify(persisted).includes('delegationGrant'), false);
 
 	startResult.resolve(nodeStartedResult({
 		recoveryDescriptor: {

@@ -231,6 +231,24 @@ export const routedTaskStartParamsSchema = z.strictObject({
 	workerDeadline: timestampSchema,
 });
 
+export const delegationGrantSchema = z.strictObject({
+	taskId: uuidSchema,
+	targetNodeId: uuidSchema,
+	targetNodeInstanceId: uuidSchema,
+	workspaceIdentity: workspaceIdentitySchema,
+	requestHash: z.string().regex(/^[0-9a-f]{64}$/u),
+	autoApprove: z.tuple([
+		z.literal('localTerminal'),
+		z.literal('localFileWrite'),
+	]),
+	neverAutoApprove: z.tuple([
+		z.literal('networkAuth'),
+		z.literal('crossWorkspaceWrite'),
+		z.literal('secretAccess'),
+		z.literal('externalPublish'),
+	]),
+});
+
 export const nodeRegisterParamsSchema = z.strictObject({
 	nodeId: uuidSchema,
 	nodeInstanceId: uuidSchema,
@@ -315,6 +333,7 @@ export const peerPolicyCandidateListResultSchema = z.strictObject({
 export const nodeTaskStartParamsSchema = routedTaskStartParamsSchema.extend({
 	authenticatedOwnerId: uuidSchema,
 	sourceLabel: utf8String(PROTOCOL_LIMITS.nameBytes, 'task source label', 1),
+	delegationGrant: delegationGrantSchema,
 });
 
 export const nodeTaskCancelParamsSchema = nodeIdentityParamsSchema.extend({
@@ -493,6 +512,7 @@ export type NodePolicyResult = z.infer<typeof nodePolicyResultSchema>;
 export type PeerGateState = z.infer<typeof peerGateStateSchema>;
 export type PeerPolicyCandidate = z.infer<typeof peerPolicyCandidateSchema>;
 export type PeerPolicyCandidateListResult = z.infer<typeof peerPolicyCandidateListResultSchema>;
+export type DelegationGrantProtocol = z.infer<typeof delegationGrantSchema>;
 export type NodeTaskStartParams = z.infer<typeof nodeTaskStartParamsSchema>;
 export type NodeTaskCancelParams = z.infer<typeof nodeTaskCancelParamsSchema>;
 export type NodeTaskAnswerParams = z.infer<typeof nodeTaskAnswerParamsSchema>;

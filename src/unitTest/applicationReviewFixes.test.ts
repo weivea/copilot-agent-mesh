@@ -403,6 +403,7 @@ test('local approval shows the full prompt and preapproval cannot be reused by t
 	assert.match(String((calls[0]?.[1] as { detail?: string })?.detail), /Workspace/u);
 	assert.match(String((calls[0]?.[1] as { detail?: string })?.detail), /Same title/u);
 	assert.ok(String((calls[0]?.[1] as { detail?: string })?.detail).includes(fullPrompt));
+	assert.deepEqual(calls[0]?.slice(2), ['Run Once']);
 
 	const changedRuntimeRequest = {
 		taskId: taskRequest.taskId,

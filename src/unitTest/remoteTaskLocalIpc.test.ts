@@ -228,6 +228,8 @@ class FakeRegistry {
 		this.nodes.delete(input.nodeId);
 	}
 
+	public assertDelegationSourceNotExecuting(): void {}
+
 	public dispose(): void {}
 }
 

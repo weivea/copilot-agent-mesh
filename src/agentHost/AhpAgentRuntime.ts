@@ -34,6 +34,7 @@ import type { AuthBroker, ProtectedResource } from './AuthBroker';
 const rootUri = 'ahp-root://';
 const sessionDefaultChatTimeoutMs = 60_000;
 const cancellationTimeoutMs = 15_000;
+export const DELEGATED_AGENT_CLIENT_TOOLS: readonly never[] = Object.freeze([]);
 
 interface AuthenticationInFlight {
 	readonly reason: 'initial' | 'challenge' | 'tokenInvalid';
@@ -163,7 +164,7 @@ export class AhpAgentRuntime implements AgentRuntime {
 		}
 		validateWorkspace(request.workspaceId, workspace);
 		const resolvedRequest: ResolvedAgentTaskRequest = { ...request, workspace };
-		if (await this.options.confirmation.confirm(resolvedRequest) === 'deny') {
+		if (await this.options.confirmation.confirm(resolvedRequest) !== 'once') {
 			throw new AgentRuntimeError('TASK_EXECUTION_FAILED', 'The local user denied this task.');
 		}
 		this.throwIfDisposed();
@@ -371,7 +372,7 @@ class SdkAhpConnection implements AhpConnection {
 			activeClient: {
 				clientId: params.clientId,
 				displayName: 'Copilot Agent Mesh',
-				tools: [],
+				tools: [...DELEGATED_AGENT_CLIENT_TOOLS],
 			},
 			progressToken: randomUUID(),
 		});
@@ -1338,12 +1339,22 @@ class AhpTask implements AgentTaskHandle {
 			toolCallId: tool.toolCallId,
 		};
 		if (tool.status === 'pending-confirmation') {
+			if (
+				typeof this.turnId === 'string'
+				&& typeof tool.toolCallId === 'string'
+				&& typeof tool.toolName === 'string'
+			) {
+				this.mapper.rememberTool(chatUri, this.turnId, tool.toolCallId, tool.toolName);
+			}
 			await this.handleEnvelope(envelopeFromSnapshot(chatUri, {
 				type: 'chat/toolCallReady',
 				...common,
 				invocationMessage: tool.invocationMessage,
 				confirmationTitle: tool.confirmationTitle,
 				options: tool.options,
+				edits: tool.edits,
+				toolInput: tool.toolInput,
+				riskAssessment: tool.riskAssessment,
 			}, this.lastSeenServerSeq));
 		} else if (tool.status === 'pending-result-confirmation') {
 			await this.handleEnvelope(envelopeFromSnapshot(chatUri, {

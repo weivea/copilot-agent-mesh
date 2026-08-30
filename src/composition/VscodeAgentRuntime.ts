@@ -43,19 +43,13 @@ import {
 } from './E2eCapability';
 
 const configurationSection = 'copilotAgentMesh';
-const taskApprovalStateKey = 'copilotAgentMesh.taskApprovals';
-
-interface TaskApprovalState {
-	readonly schemaVersion: 1;
-	readonly always: readonly string[];
-}
 
 export class VscodeLocalTaskApproval implements LocalTaskConfirmation, FirstTaskConfirmation {
 	private readonly preapprovedTasks = new Map<string, Map<string, PreapprovedTask>>();
 
 	public constructor(
 		private readonly vscodeApi: typeof vscode,
-		private readonly state: StateStore,
+		_state: StateStore,
 		private readonly e2eCapability: E2eCapability = disabledE2eCapability,
 	) {}
 
@@ -143,7 +137,6 @@ export class VscodeLocalTaskApproval implements LocalTaskConfirmation, FirstTask
 			});
 			return true;
 		}
-		const approvalKey = `${peerId}:${workspace.workspaceId}`;
 		const requestHash = canonicalTaskRequestHash({
 			...request,
 			acceptanceCriteria: [...request.acceptanceCriteria],
@@ -151,17 +144,6 @@ export class VscodeLocalTaskApproval implements LocalTaskConfirmation, FirstTask
 			workspaceLeaseKey: workspace.fileIdentity,
 		});
 		const cacheKey = `${peerId}:${workspace.workspaceId}:${requestHash}`;
-		const persisted = this.read();
-		if (persisted.always.includes(approvalKey)) {
-			this.cachePreapproval(request.taskId, {
-				cacheKey,
-				peerId,
-				workspaceId: workspace.workspaceId,
-				requestHash,
-				runtimeHash: remoteRuntimeApprovalHash(request),
-			});
-			return true;
-		}
 		const choice = await this.vscodeApi.window.showWarningMessage(
 			'Allow this remote Copilot Agent Mesh task?',
 			{
@@ -169,16 +151,9 @@ export class VscodeLocalTaskApproval implements LocalTaskConfirmation, FirstTask
 				detail: remoteApprovalDetail(peerId, request, workspace),
 			},
 			'Run Once',
-			'Always Allow for This Device and Workspace',
 		);
-		if (choice === undefined) {
+		if (choice !== 'Run Once') {
 			return false;
-		}
-		if (choice === 'Always Allow for This Device and Workspace') {
-			await this.state.update(taskApprovalStateKey, {
-				schemaVersion: 1,
-				always: [...new Set([...persisted.always, approvalKey])],
-			});
 		}
 		this.cachePreapproval(request.taskId, {
 			cacheKey,
@@ -196,12 +171,6 @@ export class VscodeLocalTaskApproval implements LocalTaskConfirmation, FirstTask
 		this.preapprovedTasks.set(taskId, approvals);
 	}
 
-	private read(): TaskApprovalState {
-		const value = this.state.get<TaskApprovalState>(taskApprovalStateKey);
-		return value?.schemaVersion === 1 && Array.isArray(value.always)
-			? value
-			: { schemaVersion: 1, always: [] };
-	}
 }
 
 export function createVscodeAgentRuntime(

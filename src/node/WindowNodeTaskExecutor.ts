@@ -27,6 +27,11 @@ import {
 } from '../agentHost/AgentRuntime';
 import { MeshDomainError } from '../domain/errors';
 import type { Clock, IdGenerator } from '../domain/ports';
+import {
+	assertDelegationGrantBinding,
+	canAutoApproveToolConfirmation,
+	type DelegationGrant,
+} from './DelegationGrant';
 
 const maximumTimerDelayMs = 2_147_483_647;
 
@@ -38,7 +43,7 @@ export interface WindowNodeTaskConfirmationRequest {
 	readonly prompt: string;
 }
 
-export type WindowNodeTaskConfirmationResult = boolean | 'once' | 'always' | 'deny';
+export type WindowNodeTaskConfirmationResult = 'once' | 'deny';
 
 export interface WindowNodeTaskConfirmationHost {
 	confirm(request: WindowNodeTaskConfirmationRequest): Promise<WindowNodeTaskConfirmationResult>;
@@ -72,12 +77,15 @@ interface AnswerOperation {
 
 interface ActiveTask {
 	readonly handle: AgentTaskHandle;
+	readonly workspace: RegisteredLocalWorkspace;
 	readonly pendingInputs: Map<string, PendingInput>;
 	readonly queuedInputs: AgentInputRequest[];
 	readonly answeredInputs: Map<string, string>;
 	readonly answerOperations: Map<string, AnswerOperation>;
+	readonly autoApprovedInputs: Set<string>;
 	outputSummary: string;
 	outputTail: string;
+	grant: DelegationGrant | undefined;
 	terminal: boolean;
 	cleanupRequired: boolean;
 	cancelComplete: boolean;
@@ -294,6 +302,7 @@ export class WindowNodeTaskExecutor {
 	): Promise<NodeTaskStartedResult> {
 		this.assertRecordWithinWorkerDeadline(record, params.workerDeadline);
 		const workspace = await this.resolveWorkspace(params.target.workspaceId);
+		const grant = assertDelegationGrantBinding(params, workspace);
 		this.assertRecordWithinWorkerDeadline(record, params.workerDeadline);
 		const probe = await this.options.runtime.probe();
 		if (!probe.featureEnabled || !probe.available) {
@@ -312,7 +321,7 @@ export class WindowNodeTaskExecutor {
 			taskTitle: params.title,
 			prompt: params.prompt,
 		});
-		if (confirmation === false || confirmation === 'deny') {
+		if (confirmation !== 'once') {
 			throw new MeshDomainError(
 				'TASK_EXECUTION_FAILED',
 				'The local user denied this remote task.',
@@ -353,12 +362,15 @@ export class WindowNodeTaskExecutor {
 		}
 		const active: ActiveTask = {
 			handle,
+			workspace,
 			pendingInputs: new Map(),
 			queuedInputs: [],
 			answeredInputs: new Map(),
 			answerOperations: new Map(),
+			autoApprovedInputs: new Set(),
 			outputSummary: '',
 			outputTail: '',
+			grant,
 			terminal: false,
 			cleanupRequired: false,
 			cancelComplete: false,
@@ -374,6 +386,7 @@ export class WindowNodeTaskExecutor {
 			);
 		}
 		if (handle.taskId !== params.taskId) {
+			this.destroyGrant(active);
 			active.cleanupRequired = true;
 			const cleanup = await Promise.allSettled([
 				this.cancelHandle(active),
@@ -388,6 +401,7 @@ export class WindowNodeTaskExecutor {
 		}
 
 		if (this.disposed) {
+			this.destroyGrant(active);
 			active.cleanupRequired = true;
 			const cleanup = await Promise.allSettled([
 				this.cancelHandle(active),
@@ -411,6 +425,7 @@ export class WindowNodeTaskExecutor {
 				},
 			});
 		} catch (error: unknown) {
+			this.destroyGrant(active);
 			active.cleanupRequired = true;
 			const cleanup = await Promise.allSettled([
 				this.cancelHandle(active),
@@ -439,6 +454,7 @@ export class WindowNodeTaskExecutor {
 				}
 			}
 			if (!this.disposed && !active.terminal) {
+				this.destroyGrant(active);
 				await this.publish(record, {
 					type: 'failed',
 					failure: {
@@ -452,6 +468,7 @@ export class WindowNodeTaskExecutor {
 				this.clearWorkerDeadline(record);
 			}
 		} catch (error: unknown) {
+			this.destroyGrant(active);
 			if (error instanceof EventSinkFailure) {
 				active.cleanupRequired = true;
 				const cleanup = await Promise.allSettled([
@@ -464,6 +481,7 @@ export class WindowNodeTaskExecutor {
 			if (!this.disposed && !active.terminal) {
 				try {
 					const failure = normalizeAgentFailure(error);
+					this.destroyGrant(active);
 					await this.publish(record, {
 						type: 'failed',
 						failure: {
@@ -486,6 +504,7 @@ export class WindowNodeTaskExecutor {
 				}
 			}
 		} finally {
+			this.destroyGrant(active);
 			this.clearWorkerDeadline(record);
 			const cleanup = await Promise.allSettled([this.disposeHandle(active)]);
 			throwCleanupFailures(cleanup, 'The Agent task handle could not be disposed.');
@@ -552,6 +571,7 @@ export class WindowNodeTaskExecutor {
 				await this.consumeInput(record, active, event.request);
 				return false;
 			case 'completed':
+				this.destroyGrant(active);
 				await this.publish(record, {
 					type: 'completed',
 					summary: structuredCompletionSummary(
@@ -564,6 +584,7 @@ export class WindowNodeTaskExecutor {
 				this.clearWorkerDeadline(record);
 				return true;
 			case 'cancelled':
+				this.destroyGrant(active);
 				await this.publish(record, {
 					type: 'cancelled',
 					summary: 'Task cancellation was confirmed.',
@@ -573,6 +594,7 @@ export class WindowNodeTaskExecutor {
 				this.clearWorkerDeadline(record);
 				return true;
 			case 'failed':
+				this.destroyGrant(active);
 				await this.publish(record, {
 					type: 'failed',
 					failure: {
@@ -593,7 +615,26 @@ export class WindowNodeTaskExecutor {
 		active: ActiveTask,
 		request: AgentInputRequest,
 	): Promise<void> {
-		if (!isStringAnswerableInput(request)) {
+		if (
+			request.kind === 'toolConfirmation'
+			&& active.grant !== undefined
+			&& !active.autoApprovedInputs.has(request.requestId)
+			&& await canAutoApproveToolConfirmation(
+				active.grant,
+				active.handle.taskId,
+				active.workspace,
+				request,
+			)
+		) {
+			active.autoApprovedInputs.add(request.requestId);
+			await active.handle.answer({
+				requestId: request.requestId,
+				outcome: 'accept',
+			});
+			return;
+		}
+		const inputKind = (request as { readonly kind: string }).kind;
+		if (isKnownAgentInputKind(inputKind) && !isStringAnswerableInput(request)) {
 			throw new AgentRuntimeError(
 				'TASK_EXECUTION_FAILED',
 				'The Agent runtime requested input that this protocol version cannot answer safely.',
@@ -758,6 +799,7 @@ export class WindowNodeTaskExecutor {
 	}
 
 	private async stopActiveTask(record: StartRecord, active: ActiveTask): Promise<void> {
+		this.destroyGrant(active);
 		active.terminal = true;
 		active.cleanupRequired = true;
 		record.terminal = true;
@@ -851,6 +893,7 @@ export class WindowNodeTaskExecutor {
 			.map(({ active }) => active)
 			.filter((active): active is ActiveTask => active !== undefined);
 		for (const active of activeTasks) {
+			this.destroyGrant(active);
 			active.cleanupRequired = true;
 		}
 		const cleanup = await Promise.allSettled(activeTasks.flatMap((active) => [
@@ -903,6 +946,10 @@ export class WindowNodeTaskExecutor {
 		}
 		return this.runtimeDisposal;
 	}
+
+	private destroyGrant(active: ActiveTask): void {
+		active.grant = undefined;
+	}
 }
 
 function startFingerprint(params: NodeTaskStartParams): string {
@@ -942,6 +989,12 @@ function toAgentAnswer(request: AgentInputRequest, answer: string): AgentTaskAns
 				: 'decline',
 		};
 	}
+	if (request.kind !== 'chatInput') {
+		throw new MeshDomainError(
+			'INPUT_NOT_PENDING',
+			'The pending input kind cannot be answered safely.',
+		);
+	}
 	const fields = request.fields ?? [];
 	return {
 		requestId: request.requestId,
@@ -958,6 +1011,13 @@ function isStringAnswerableInput(request: AgentInputRequest): boolean {
 			['string', 'number', 'integer', 'boolean', 'singleSelect', 'multiSelect'].includes(type),
 		) ?? true);
 }
+
+function isKnownAgentInputKind(value: string): value is AgentInputRequest['kind'] {
+	return value === 'chatInput'
+		|| value === 'toolConfirmation'
+		|| value === 'toolAuthentication';
+}
+
 
 function parseFieldAnswer(
 	field: NonNullable<AgentInputRequest['fields']>[number],

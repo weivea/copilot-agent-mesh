@@ -425,6 +425,22 @@ export class NodeRegistry {
 		return this.peerRouteAuthorizer?.displayLabel?.(this.peerSnapshot(node)) ?? node.label;
 	}
 
+	public assertDelegationSourceNotExecuting(identity: NodeIdentityParams): void {
+		this.assertReady();
+		const source = nodeIdentityParamsSchema.parse(identity);
+		const node = this.requireLiveNode(source);
+		const executingDelegatedTask = [...this.taskBindings.values()].some((binding) =>
+			binding.nodeId === node.nodeId
+				&& binding.nodeInstanceId === node.nodeInstanceId,
+		);
+		if (executingDelegatedTask) {
+			throw new MeshDomainError(
+				'DELEGATION_RECURSION',
+				'A delegated child task cannot delegate another task.',
+			);
+		}
+	}
+
 	public setPeerRouteAuthorizer(authorizer: PeerRouteAuthorizer): void {
 		this.assertNotDisposed();
 		if (this.peerRouteAuthorizer !== undefined && this.peerRouteAuthorizer !== authorizer) {

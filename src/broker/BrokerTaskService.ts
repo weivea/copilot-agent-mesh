@@ -23,10 +23,12 @@ import {
 import { MeshDomainError } from '../domain/errors';
 import {
 	createAcceptedRoutedTask,
+	canonicalRoutedTaskRequestHash,
 	matchIdempotentRoutedStart,
 	type OwnedRoutedTaskStart,
 	type TaskRecord,
 } from '../domain/task';
+import { createDelegationGrant } from '../node/DelegationGrant';
 import type { Clock } from '../domain/ports';
 import { taskReducer, type TaskDomainEvent } from '../domain/taskReducer';
 import {
@@ -523,6 +525,17 @@ export class BrokerTaskService {
 					...params,
 					authenticatedOwnerId: ownerId,
 					sourceLabel: sourceLabel ?? params.sourceNodeId ?? ownerId,
+					delegationGrant: createDelegationGrant({
+						taskId: params.taskId,
+						targetNodeId: route.nodeId,
+						targetNodeInstanceId: route.nodeInstanceId,
+						workspaceIdentity: route.workspaceLeaseKey,
+						requestHash: canonicalRoutedTaskRequestHash({
+							...params,
+							peerId: ownerId,
+							workspaceLeaseKey: route.workspaceLeaseKey,
+						}),
+					}),
 				}),
 				this.taskStartTimeoutMs(params.workerDeadline),
 			);

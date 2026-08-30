@@ -13,6 +13,7 @@ import type {
 
 import {
 	AhpAgentRuntime,
+	DELEGATED_AGENT_CLIENT_TOOLS,
 	type AhpConnection,
 	type AhpConnectionFactory,
 	type AhpSubscription,
@@ -44,6 +45,7 @@ import {
 	type ProtectedResource,
 } from '../agentHost/AuthBroker';
 import { OwnedCommandError } from '../spikes/ownedProcess';
+import { MESH_TOOL_NAMES } from '../tools/toolManifest';
 
 const workspaceUri = 'file:///tmp/copilot-agent-mesh-safe-workspace';
 const protectedResource = {
@@ -561,6 +563,27 @@ test('runtime resolves workspace IDs through the trusted registry and ignores fo
 	);
 	assert.equal(launcher.launchCalls, 1);
 	await runtime.dispose();
+});
+
+test('runtime explicitly rejects the removed legacy always approval', async () => {
+	const launcher = new FakeLauncher();
+	const runtime = new AhpAgentRuntime({
+		enabled: () => true,
+		launcher,
+		connections: new FakeConnectionFactory([new FakeAhpTransport()]),
+		authBroker: new RecordingAuthBroker(),
+		confirmation: {
+			confirm: async () => 'always' as never,
+		},
+		workspaceResolver: trustedWorkspaceResolver(),
+	});
+	await assert.rejects(
+		runtime.start(taskRequest()),
+		(error: unknown) =>
+			error instanceof AgentRuntimeError
+			&& error.code === 'TASK_EXECUTION_FAILED',
+	);
+	assert.equal(launcher.launchCalls, 0);
 });
 
 test('runtime attaches the root subscription before initialize and preserves notifications from that window', async () => {
@@ -1581,6 +1604,71 @@ test('event mapper reports authoritative turn completion and bounded terminal su
 		type: 'terminal/data',
 		data: '\u001B[31mhello\u001B[0m',
 	}, 11)), [{ type: 'terminal', summary: 'hello' }]);
+});
+
+test('delegated Agent sessions contribute no Mesh tools', () => {
+	assert.deepEqual(DELEGATED_AGENT_CLIENT_TOOLS, []);
+	for (const meshTool of Object.values(MESH_TOOL_NAMES)) {
+		assert.equal(DELEGATED_AGENT_CLIENT_TOOLS.includes(meshTool as never), false);
+	}
+});
+
+test('event mapper retains only structured file confirmation evidence', () => {
+	const mapper = new AhpEventMapper();
+	mapper.map(envelope('ahp-chat:/default', {
+		type: 'chat/toolCallStart',
+		turnId: 'turn-1',
+		toolCallId: 'tool-1',
+		toolName: 'write_file',
+		displayName: 'Write File',
+	}, 10));
+	const [event] = mapper.map(envelope('ahp-chat:/default', {
+		type: 'chat/toolCallReady',
+		turnId: 'turn-1',
+		toolCallId: 'tool-1',
+		invocationMessage: 'Write a file',
+		toolInput: '{"path":"/sensitive/raw/path"}',
+		riskAssessment: {
+			kind: 'model',
+			status: 'complete',
+			reason: 'Untrusted prose',
+			safety: 1,
+		},
+		edits: {
+			items: [{
+				after: {
+					uri: 'file:///workspace/new.ts',
+					content: { uri: 'ahp-content:/after' },
+				},
+			}],
+		},
+	}, 11));
+	assert.equal(event?.type, 'inputRequired');
+	if (event?.type !== 'inputRequired') {
+		return;
+	}
+	assert.deepEqual(event.request.confirmationEvidence, {
+		phase: 'operation',
+		toolName: 'write_file',
+		fileEdits: [{ afterUri: 'file:///workspace/new.ts' }],
+	});
+	assert.equal(JSON.stringify(event.request).includes('/sensitive/raw/path'), false);
+	assert.equal(JSON.stringify(event.request).includes('Untrusted prose'), false);
+
+	const mapperWithoutStart = new AhpEventMapper();
+	const [unknown] = mapperWithoutStart.map(envelope('ahp-chat:/default', {
+		type: 'chat/toolCallReady',
+		turnId: 'turn-1',
+		toolCallId: 'tool-1',
+		invocationMessage: 'Write a file',
+		edits: { items: [] },
+	}, 12));
+	assert.equal(
+		unknown?.type === 'inputRequired'
+			? unknown.request.confirmationEvidence
+			: 'unexpected',
+		undefined,
+	);
 });
 
 test('event mapper accepts AHP 1.0 and 0.8 turn error shapes', () => {

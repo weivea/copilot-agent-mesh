@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { pathToFileURL } from 'node:url';
 
 import type {
 	AgentRuntime,
@@ -11,6 +12,7 @@ import type {
 } from '../agentHost/AgentRuntime';
 import { AgentRuntimeError, createAgentRuntimeEventQueue } from '../agentHost/AgentRuntime';
 import { MeshDomainError } from '../domain/errors';
+import { canonicalRoutedTaskRequestHash } from '../domain/task';
 import { toDeviceBrokerHandlerError } from '../broker/DeviceBroker';
 import { LocalIpcRemoteError } from '../ipc';
 import {
@@ -18,6 +20,7 @@ import {
 	type WindowNodeTaskConfirmationRequest,
 	type WindowNodeTaskExecutorOptions,
 } from '../node';
+import { createDelegationGrant } from '../node/DelegationGrant';
 import { toWindowNodeHandlerError } from '../node/WindowNodeClient';
 import type { NodeTaskEventParams, NodeTaskStartParams } from '../../shared/protocol';
 
@@ -25,6 +28,7 @@ const DEVICE_ID = '00000000-0000-4000-8000-000000000001';
 const NODE_ID = '00000000-0000-4000-8000-000000000002';
 const NODE_INSTANCE_ID = '00000000-0000-4000-8000-000000000003';
 const WORKSPACE_ID = '00000000-0000-4000-8000-000000000004';
+const WORKSPACE_IDENTITY = `sha256:${'a'.repeat(43)}`;
 const OWNER_ID = '00000000-0000-4000-8000-000000000005';
 const TASK_ID = '00000000-0000-4000-8000-000000000006';
 const INPUT_ID = '00000000-0000-4000-8000-000000000007';
@@ -215,6 +219,7 @@ function createFixture(
 			resolve: async (workspaceId) => workspaceId === WORKSPACE_ID
 				? {
 					workspaceId,
+					workspaceIdentity: WORKSPACE_IDENTITY,
 					displayName: 'Current Workspace',
 					uri: 'file:///workspace',
 				}
@@ -244,7 +249,7 @@ function createFixture(
 }
 
 function startParams(changes: Partial<NodeTaskStartParams> = {}): NodeTaskStartParams {
-	return {
+	const params = {
 		delegationRequestId: '00000000-0000-4000-8000-000000000009',
 		taskId: TASK_ID,
 		target: {
@@ -261,6 +266,29 @@ function startParams(changes: Partial<NodeTaskStartParams> = {}): NodeTaskStartP
 		authenticatedOwnerId: OWNER_ID,
 		sourceLabel: 'Source Window',
 		...changes,
+	};
+	return {
+		...params,
+		delegationGrant: changes.delegationGrant ?? createDelegationGrant({
+			taskId: params.taskId,
+			targetNodeId: params.target.nodeId,
+			targetNodeInstanceId: params.target.nodeInstanceId,
+			workspaceIdentity: WORKSPACE_IDENTITY,
+			requestHash: canonicalRoutedTaskRequestHash({
+				delegationRequestId: params.delegationRequestId,
+				taskId: params.taskId,
+				target: params.target,
+				sourceNodeId: params.sourceNodeId,
+				sourceWorkspaceIdentity: params.sourceWorkspaceIdentity,
+				title: params.title,
+				prompt: params.prompt,
+				acceptanceCriteria: [...params.acceptanceCriteria],
+				timeoutMinutes: params.timeoutMinutes,
+				workerDeadline: params.workerDeadline,
+				peerId: params.authenticatedOwnerId,
+				workspaceLeaseKey: WORKSPACE_IDENTITY,
+			}),
+		}),
 	};
 }
 
@@ -421,6 +449,18 @@ test('reports confirmation denial as an explicit safe failure without starting t
 	await fixture.executor.dispose();
 });
 
+test('target executor rejects the removed legacy always confirmation', async () => {
+	const fixture = createFixture({
+		confirmationHost: { confirm: async () => 'always' as never },
+	});
+	await assert.rejects(
+		fixture.executor.start(startParams()),
+		(error: unknown) => isReason(error, 'TASK_EXECUTION_FAILED'),
+	);
+	assert.equal(fixture.runtime.requests.length, 0);
+	await fixture.executor.dispose();
+});
+
 test('maps and UTF-8 bounds runtime events while preserving terminal semantics', async () => {
 	const fixture = createFixture();
 	await fixture.executor.start(startParams());
@@ -489,6 +529,75 @@ test('publishes public input IDs and maps exact idempotent answers to the runtim
 	}]);
 	await handle.events.push({ type: 'completed' });
 	await waitFor(() => fixture.events.at(-1)?.event.type === 'completed');
+	await fixture.executor.dispose();
+});
+
+test('auto-approves one provable local file confirmation and escalates sensitive input', async () => {
+	const workspaceUri = `${pathToFileURL(process.cwd()).href}/`;
+	const fixture = createFixture({
+		workspaceResolver: {
+			resolve: async (workspaceId) => workspaceId === WORKSPACE_ID
+				? {
+					workspaceId,
+					workspaceIdentity: WORKSPACE_IDENTITY,
+					displayName: 'Current Workspace',
+					uri: workspaceUri,
+				}
+				: undefined,
+		},
+	});
+	const params = startParams();
+	await fixture.executor.start(params);
+	const handle = fixture.runtime.handles[0];
+	const safeRequest = {
+		requestId: 'safe-write',
+		kind: 'toolConfirmation',
+		prompt: 'Write file?',
+		confirmationEvidence: {
+			phase: 'operation',
+			toolName: 'write_file',
+			fileEdits: [{ afterUri: new URL('generated.ts', workspaceUri).href }],
+		},
+	} as const;
+	await handle.events.push({ type: 'inputRequired', request: safeRequest });
+	await waitFor(() => handle.answers.length === 1);
+	assert.deepEqual(handle.answers, [{
+		requestId: 'safe-write',
+		outcome: 'accept',
+	}]);
+	assert.equal(
+		fixture.events.some(({ event }) => event.type === 'inputRequired'),
+		false,
+	);
+
+	await handle.events.push({ type: 'inputRequired', request: safeRequest });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(handle.answers.length, 1);
+
+	await handle.events.push({
+		type: 'inputRequired',
+		request: {
+			requestId: 'authentication',
+			kind: 'toolAuthentication',
+			prompt: 'Authenticate?',
+		},
+	});
+	await waitFor(() => fixture.events.some(({ event }) => event.type === 'inputRequired'));
+	assert.equal(
+		fixture.events.filter(({ event }) => event.type === 'inputRequired').length,
+		1,
+	);
+
+	await handle.events.push({ type: 'completed' });
+	await waitFor(() => fixture.events.at(-1)?.event.type === 'completed');
+	await assert.rejects(
+		fixture.executor.start(startParams({
+			taskId: '00000000-0000-4000-8000-00000000000d',
+			delegationRequestId: '00000000-0000-4000-8000-00000000000e',
+			delegationGrant: params.delegationGrant,
+		})),
+		/The delegation grant is not bound/u,
+	);
 	await fixture.executor.dispose();
 });
 

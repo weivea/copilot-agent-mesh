@@ -454,6 +454,7 @@ export class DeviceBroker {
 						'The task source does not match the authenticated Window Node.',
 					);
 				}
+				this.options.registry.assertDelegationSourceNotExecuting(binding);
 				const snapshot = await this.startLocalRoute(
 					input,
 					{ nodeId: binding.nodeId },
@@ -516,6 +517,7 @@ export class DeviceBroker {
 						'The remote task source does not match the authenticated Window Node.',
 					);
 				}
+				this.options.registry.assertDelegationSourceNotExecuting(binding);
 				const routeInput: RoutedTaskStartParams = {
 					delegationRequestId: input.delegationRequestId,
 					taskId: input.taskId,
