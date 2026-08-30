@@ -237,6 +237,7 @@ suite('Dashboard', () => {
 					workspaceName: 'Backend',
 					status: 'running',
 					dependsOn: [],
+					pendingInputId: 'input-1',
 				}],
 				artifacts: [{
 					artifactId: 'artifact-1',
@@ -478,12 +479,14 @@ suite('Dashboard', () => {
 	test('shows the exact pending collaboration question in Extension Host UI and answers its exact input', async () => {
 		const services = new RecordingServiceBindings();
 		let shownPrompt: string | undefined;
+		let shownTitle: string | undefined;
 		const facade = new ServiceDashboardFacade(
 			services,
 			{ confirm: async () => true },
 			{
 				showInputBox: async (options) => {
 					shownPrompt = options.prompt;
+					shownTitle = options.title;
 					return '继续';
 				},
 			},
@@ -492,6 +495,7 @@ suite('Dashboard', () => {
 		await facade.answerCollaboration('run-1');
 
 		assert.equal(shownPrompt, 'Approve the backend tool call?');
+		assert.equal(shownTitle, 'Answer Collaboration Task · input-1');
 		assert.deepStrictEqual(services.lastCollaborationAnswer, {
 			runId: 'run-1',
 			taskId: 'task-1',
@@ -720,6 +724,9 @@ class RecordingServiceBindings implements DashboardServiceBindings {
 	public async getCollaboration(_runId: string): Promise<void> {}
 	public async cancelCollaboration(_runId: string): Promise<void> {}
 	public async getCollaborationInput(_runId: string) {
+		if (this.lastCollaborationAnswer !== undefined) {
+			return undefined;
+		}
 		return {
 			taskId: 'task-1',
 			inputId: 'input-1',

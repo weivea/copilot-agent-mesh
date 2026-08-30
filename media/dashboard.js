@@ -206,6 +206,13 @@
 			if (task.validationStatus) {
 				card.append(textElement('p', `Validation: ${task.validationStatus}`, 'detail'));
 			}
+			if (task.pendingInputId) {
+				card.append(textElement(
+					'p',
+					`Waiting for input ${task.pendingInputId.slice(0, 8)}`,
+					'action-hint',
+				));
+			}
 			if (task.blockCode) {
 				card.append(textElement('p', `Blocked: ${task.blockCode}`, 'action-hint'));
 			}

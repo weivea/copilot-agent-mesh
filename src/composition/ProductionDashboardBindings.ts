@@ -276,6 +276,7 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 					validationStatus: task.validation?.status,
 					blockCode: task.block?.code,
 					failureCode: task.failure?.code,
+					pendingInputId: task.pendingInput?.inputId,
 				})),
 				artifacts: run.artifacts.map((artifact) => ({
 					artifactId: artifact.artifactId,
@@ -440,7 +441,7 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 		}
 	}
 
-	public async getTaskInput(taskId: string): Promise<DashboardPendingInput> {
+	public async getTaskInput(taskId: string): Promise<DashboardPendingInput | undefined> {
 		const controller = deadlineSignal(10_000);
 		try {
 			const task = await this.options.localTasks.getTask(
@@ -449,7 +450,7 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 			);
 			const inputId = task.snapshot.pendingInput?.inputId;
 			if (inputId === undefined) {
-				throw new Error('The selected task is not waiting for input.');
+				return undefined;
 			}
 			return {
 				taskId,
@@ -577,7 +578,9 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 		}
 	}
 
-	public async getCollaborationInput(runId: string): Promise<DashboardPendingInput> {
+	public async getCollaborationInput(
+		runId: string,
+	): Promise<DashboardPendingInput | undefined> {
 		const controller = deadlineSignal(10_000);
 		try {
 			const { run } = await this.options.localCollaborations.getCollaboration(
@@ -586,7 +589,7 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 			);
 			const task = run.tasks.find(({ status }) => status === 'needsInput');
 			if (task?.pendingInput === undefined) {
-				throw new Error('The collaboration is not waiting for input.');
+				return undefined;
 			}
 			return {
 				taskId: task.taskId,

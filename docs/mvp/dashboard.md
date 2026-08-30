@@ -38,7 +38,10 @@ shows that question in a native Extension Host input box. The question is never
 added to the Dashboard ViewModel. Submission is conditional on the same
 `inputId`, preventing an answer from being applied to a newer queued question;
 approval prompts accept `approve`, `continue`, `继续`, `同意`, `批准`, `确认`,
-and `允许`.
+and `允许`. The card and native dialog show a short opaque input-ID prefix so
+multiple identical `Run in terminal?` requests are visibly distinct. One click
+continues through inputs that are already queued; later Agent requests appear as
+a new ID and require a new explicit confirmation.
 
 ## Message and data boundary
 

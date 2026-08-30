@@ -351,7 +351,7 @@ function assertDashboardViewModel(model: unknown): asserts model is DashboardVie
 			assertExactRecord(
 				task,
 				['taskId', 'title', 'role', 'kind', 'workspaceName', 'status', 'dependsOn'],
-				['validationStatus', 'blockCode', 'failureCode'],
+				['validationStatus', 'blockCode', 'failureCode', 'pendingInputId'],
 			);
 			assertIdentifier(task.taskId);
 			assertStrings(task, ['title', 'workspaceName']);
@@ -365,6 +365,7 @@ function assertDashboardViewModel(model: unknown): asserts model is DashboardVie
 			}
 			assertOptionalString(task.blockCode);
 			assertOptionalString(task.failureCode);
+			assertOptionalIdentifier(task.pendingInputId);
 		}
 		assertArray(run.artifacts, 16);
 		for (const artifact of run.artifacts) {

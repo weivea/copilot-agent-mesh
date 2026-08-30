@@ -115,6 +115,7 @@ export interface DashboardSnapshot {
 			readonly validationStatus?: 'passed' | 'failed';
 			readonly blockCode?: string;
 			readonly failureCode?: string;
+			readonly pendingInputId?: string;
 		}[];
 		readonly artifacts: readonly {
 			readonly artifactId: string;
@@ -208,7 +209,7 @@ export interface DashboardServiceBindings {
 		readonly instruction: string;
 	}): Promise<void>;
 	cancelTask(taskId: string): Promise<void>;
-	getTaskInput(taskId: string): Promise<DashboardPendingInput>;
+	getTaskInput(taskId: string): Promise<DashboardPendingInput | undefined>;
 	answerTaskInput(taskId: string, inputId: string, answer: string): Promise<void>;
 	startCollaboration(request: {
 		readonly title: string;
@@ -216,7 +217,7 @@ export interface DashboardServiceBindings {
 	}): Promise<void>;
 	getCollaboration(runId: string): Promise<void>;
 	cancelCollaboration(runId: string): Promise<void>;
-	getCollaborationInput(runId: string): Promise<DashboardPendingInput>;
+	getCollaborationInput(runId: string): Promise<DashboardPendingInput | undefined>;
 	answerCollaboration(
 		runId: string,
 		taskId: string,
@@ -346,6 +347,9 @@ export class ServiceDashboardFacade implements DashboardFacade {
 
 	public async answerTaskInput(taskId: string): Promise<void> {
 		const pending = await this.services.getTaskInput(taskId);
+		if (pending === undefined) {
+			return;
+		}
 		const answer = await this.inputs.showInputBox({
 			title: 'Answer Remote Task',
 			prompt: pendingQuestion(pending.question),
@@ -393,15 +397,21 @@ export class ServiceDashboardFacade implements DashboardFacade {
 	}
 
 	public async answerCollaboration(runId: string): Promise<void> {
-		const pending = await this.services.getCollaborationInput(runId);
-		const answer = await this.inputs.showInputBox({
-			title: 'Answer Collaboration Task',
-			prompt: pendingQuestion(pending.question),
-			placeHolder: '输入回答；确认授权可输入 approve、继续、同意或批准',
-			ignoreFocusOut: true,
-			validateInput: (candidate) => candidate.trim().length > 0 ? undefined : 'An answer is required.',
-		});
-		if (answer !== undefined) {
+		for (let index = 0; index < 32; index += 1) {
+			const pending = await this.services.getCollaborationInput(runId);
+			if (pending === undefined) {
+				return;
+			}
+			const answer = await this.inputs.showInputBox({
+				title: `Answer Collaboration Task · ${pending.inputId.slice(0, 8)}`,
+				prompt: pendingQuestion(pending.question),
+				placeHolder: '确认授权可输入 approve、继续、同意或批准；若有下一条会继续显示',
+				ignoreFocusOut: true,
+				validateInput: (candidate) => candidate.trim().length > 0 ? undefined : 'An answer is required.',
+			});
+			if (answer === undefined) {
+				return;
+			}
 			await this.services.answerCollaboration(
 				runId,
 				pending.taskId,
@@ -409,6 +419,7 @@ export class ServiceDashboardFacade implements DashboardFacade {
 				answer.trim(),
 			);
 		}
+		throw new Error('The collaboration exceeded the queued input interaction limit.');
 	}
 }
 
