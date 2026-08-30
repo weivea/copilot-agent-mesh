@@ -19,7 +19,10 @@ import {
 	parseSessionConfigInput,
 	validateSessionConfigValue,
 } from '../agentHost/SessionConfigValue';
-import { AgentRuntimeError } from '../agentHost/AgentRuntime';
+import {
+	AgentRuntimeApprovalCapabilityIssuer,
+	AgentRuntimeError,
+} from '../agentHost/AgentRuntime';
 import type {
 	AgentHostSourceStatus,
 	AgentHostSourceStatusProvider,
@@ -190,6 +193,7 @@ export function createVscodeAgentRuntime(
 	approval: FirstTaskConfirmation,
 	workerPlatform: WorkerPlatformSupport,
 	delegatedToolInvocations?: DelegatedToolInvocationRegistry,
+	approvalCapabilities = new AgentRuntimeApprovalCapabilityIssuer(),
 ): AgentRuntime & AgentHostSourceStatusProvider {
 	const configuration = vscodeApi.workspace.getConfiguration(configurationSection);
 	const launcher = new AgentHostLauncher({
@@ -203,6 +207,7 @@ export function createVscodeAgentRuntime(
 		authBroker: new VscodeAuthBroker(vscodeApi.authentication, (resource) =>
 			resolveAuthenticationProvider(vscodeApi, resource)),
 		confirmation: approval,
+		approvalCapabilities,
 		workspaceResolver,
 		configResolver: new VscodeSessionConfigurationResolver(vscodeApi),
 		delegatedToolInvocations,
@@ -230,6 +235,9 @@ export function createVscodeAgentRuntime(
 			.get<boolean>('experimental.peerDelegation', false),
 		editor,
 		standalone,
+		confirmation: approval,
+		workspaceResolver,
+		approvalCapabilities,
 	});
 	return new GuardedAgentRuntime(runtime, guard, workerPlatform);
 }

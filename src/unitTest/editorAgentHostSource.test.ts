@@ -28,6 +28,7 @@ import {
 } from '../agentHost/UnixSocketWebSocketConnector';
 import {
 	AgentRuntimeError,
+	AgentRuntimeApprovalCapabilityIssuer,
 	type AgentRuntime,
 	type AgentRuntimeProbe,
 	type AgentTaskHandle,
@@ -387,11 +388,11 @@ test('source selector uses editor first, falls back exactly once, publishes safe
 	const editor = new FakeRuntime();
 	const standalone = new FakeRuntime();
 	let preferEditor = false;
-	const selector = new AgentHostSourceSelector({
+	const selector = new AgentHostSourceSelector(selectorOptions({
 		preferEditor: () => preferEditor,
 		editor,
 		standalone,
-	});
+	}));
 	const changes: unknown[] = [];
 	selector.onDidSourceStatusChange((status) => changes.push(status));
 
@@ -423,11 +424,11 @@ test('source selector uses editor first, falls back exactly once, publishes safe
 test('source selector reports standalone failure explicitly and does not fallback for auth failures', async () => {
 	const editor = new FakeRuntime();
 	const standalone = new FakeRuntime();
-	const selector = new AgentHostSourceSelector({
+	const selector = new AgentHostSourceSelector(selectorOptions({
 		preferEditor: () => true,
 		editor,
 		standalone,
-	});
+	}));
 	editor.startError = new AgentRuntimeError('AGENT_UNAVAILABLE', 'editor unavailable');
 	standalone.startError = new Error('standalone unavailable');
 	await assert.rejects(
@@ -447,15 +448,41 @@ test('source selector reports standalone failure explicitly and does not fallbac
 	await selector.dispose();
 });
 
+test('source selector preserves the safe standalone fallback failure category', async () => {
+	const editor = new FakeRuntime();
+	const standalone = new FakeRuntime();
+	editor.startError = new AgentRuntimeError('AGENT_UNAVAILABLE', 'editor unavailable');
+	standalone.startError = new AgentRuntimeError(
+		'AGENT_AUTH_REQUIRED',
+		'/private/profile token=mesh-sensitive',
+	);
+	const selector = new AgentHostSourceSelector(selectorOptions({
+		preferEditor: () => true,
+		editor,
+		standalone,
+	}));
+
+	await assert.rejects(
+		selector.start(taskRequest()),
+		(error: unknown) => error instanceof AgentRuntimeError
+			&& error.code === 'AGENT_AUTH_REQUIRED'
+			&& error.message === 'The standalone Agent Host fallback requires authentication.'
+			&& !error.message.includes('private')
+			&& !error.message.includes('sensitive')
+			&& error.cause === undefined,
+	);
+	await selector.dispose();
+});
+
 test('source selector retains the actual degraded execution source across availability probes', async () => {
 	const editor = new FakeRuntime();
 	const standalone = new FakeRuntime();
 	editor.startError = new AgentRuntimeError('AGENT_UNAVAILABLE', 'editor connect failed');
-	const selector = new AgentHostSourceSelector({
+	const selector = new AgentHostSourceSelector(selectorOptions({
 		preferEditor: () => true,
 		editor,
 		standalone,
-	});
+	}));
 
 	await selector.start(taskRequest());
 	editor.probeResult = { available: true, featureEnabled: true };
@@ -478,11 +505,11 @@ test('source selector retains the actual degraded execution source across availa
 test('source status observer failures cannot orphan a successfully started handle', async () => {
 	const editor = new FakeRuntime();
 	const standalone = new FakeRuntime();
-	const selector = new AgentHostSourceSelector({
+	const selector = new AgentHostSourceSelector(selectorOptions({
 		preferEditor: () => true,
 		editor,
 		standalone,
-	});
+	}));
 	selector.onDidSourceStatusChange(() => {
 		throw new Error('observer failed');
 	});
@@ -493,6 +520,39 @@ test('source status observer failures cannot orphan a successfully started handl
 	assert.equal(standalone.starts, 0);
 	await handle.dispose();
 	await selector.dispose();
+});
+
+test('source selector disposal aborts a pending approval without starting either source', async () => {
+	const editor = new FakeRuntime();
+	const standalone = new FakeRuntime();
+	let approvalEntered!: () => void;
+	const entered = new Promise<void>((resolve) => {
+		approvalEntered = resolve;
+	});
+	const selector = new AgentHostSourceSelector({
+		...selectorOptions({
+			preferEditor: () => true,
+			editor,
+			standalone,
+		}),
+		confirmation: {
+			confirm: async () => {
+				approvalEntered();
+				return new Promise<'once'>(() => undefined);
+			},
+		},
+	});
+
+	const start = selector.start(taskRequest());
+	await entered;
+	await selector.dispose();
+	await assert.rejects(
+		start,
+		(error: unknown) => error instanceof AgentRuntimeError
+			&& error.code === 'AGENT_UNAVAILABLE',
+	);
+	assert.equal(editor.starts, 0);
+	assert.equal(standalone.starts, 0);
 });
 
 function createLocator(
@@ -672,5 +732,24 @@ function taskRequest(): AgentTaskRequest {
 		title: 'Safe task',
 		prompt: 'Safe prompt',
 		workspaceId: 'workspace-id',
+	};
+}
+
+function selectorOptions(options: {
+	readonly preferEditor: () => boolean;
+	readonly editor: AgentRuntime;
+	readonly standalone: AgentRuntime;
+}): ConstructorParameters<typeof AgentHostSourceSelector>[0] {
+	return {
+		...options,
+		confirmation: { confirm: async () => 'once' },
+		workspaceResolver: {
+			resolve: async (workspaceId) => ({
+				workspaceId,
+				displayName: 'Workspace',
+				uri: 'file:///workspace',
+			}),
+		},
+		approvalCapabilities: new AgentRuntimeApprovalCapabilityIssuer(),
 	};
 }

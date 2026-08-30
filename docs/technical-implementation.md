@@ -671,7 +671,8 @@ Coordinator 可以有本地 `created` 状态；Worker 的第一个持久状态�
 VS Code 1.135.0 Agent Host 要求 AHP 1.0.0，而 npm 最新发布仍是 0.8.0。当前实现
 因此用 Git Submodule 精确锁定上游 commit
 `f19dd8b3942d029744a3bdd31d830f9428e8ea47`，从源码生成并构建 TypeScript
-0.9.0 Client；其 `SUPPORTED_PROTOCOL_VERSIONS` 包含 1.0.0。该 revision 尚未
+0.9.0 Client；Mesh initialize 明确只 offer `["1.0.0"]`，不使用该包的 legacy
+`SUPPORTED_PROTOCOL_VERSIONS` 全集。该 revision 尚未
 Tag 或发布到 npm，属于明确记录的 Preview 供应链限制。Phase 0 必须继续证明实际
 VS Code Build 的 Host 版本与 SDK Offer 有交集，不能靠 Feature Flag 绕过。
 当前 pin 是上游在 `60706330` 将首选 Offer 改为 0.9.0 之前的最新提交；不能直接
@@ -690,6 +691,12 @@ Unix socket、protocol `1.0.0` 的 endpoint。使用 `net.connect(path)` 后由 
 在该 socket 上发起唯一 `/?tkn=` Upgrade；连接、响应头、超时和取消均 fail closed。
 Editor 发现/连接/initialize/协议失败只回退 standalone 一次，并公开有界 source/degraded
 状态。Preview 关闭时继续使用以下既有 standalone 路径。
+
+Source selector 先完成唯一 runtime approval，再用绑定完整 request 的 WeakMap capability
+覆盖 editor 与 standalone attempt。same-device task 只有在 Broker grant 精确校验且存在
+认证本地 `sourceNodeId` 后才直接获得该 capability，因此目标窗口不再重复确认；无该证明
+的 legacy/cross-device/direct task 在目标确认一次后获得 capability。该对象不进入 wire、
+日志或 Webview，模型字段与布尔值均不能伪造。
 
 推荐启动方式：
 

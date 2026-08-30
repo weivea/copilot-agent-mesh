@@ -67,6 +67,7 @@ export interface AgentTaskRequest {
 	readonly acceptanceCriteria?: readonly string[];
 	readonly workspaceId: string;
 	readonly sourceWindowName?: string;
+	readonly approvalCapability?: AgentRuntimeApprovalCapability;
 	readonly providerId?: string;
 	readonly allowInteractiveAuthentication?: boolean;
 	readonly delegatedExecutionContext?: DelegatedExecutionContext;
@@ -75,6 +76,31 @@ export interface AgentTaskRequest {
 		readonly workspaceId: string;
 		readonly requestHash: string;
 	};
+}
+
+export interface AgentRuntimeApprovalCapability {
+	readonly __agentRuntimeApprovalCapability: unique symbol;
+}
+
+export class AgentRuntimeApprovalCapabilityIssuer {
+	private readonly issued = new WeakMap<object, string>();
+
+	public issue(request: AgentTaskRequest): AgentRuntimeApprovalCapability {
+		const capability = Object.freeze(Object.create(null)) as AgentRuntimeApprovalCapability;
+		this.issued.set(capability, approvalFingerprint(request));
+		return capability;
+	}
+
+	public accepts(request: AgentTaskRequest): boolean {
+		return request.approvalCapability !== undefined
+			&& this.issued.get(request.approvalCapability) === approvalFingerprint(request);
+	}
+
+	public revoke(capability: AgentRuntimeApprovalCapability | undefined): void {
+		if (capability !== undefined) {
+			this.issued.delete(capability);
+		}
+	}
 }
 
 export interface ResolvedAgentTaskRequest extends AgentTaskRequest {
@@ -641,6 +667,23 @@ function agentRuntimeEventSize(event: AgentRuntimeEvent): number {
 function defaultEventSize(value: unknown): number {
 	const serialized = JSON.stringify(value);
 	return Buffer.byteLength(serialized === undefined ? String(value) : serialized, 'utf8');
+}
+
+function approvalFingerprint(request: AgentTaskRequest): string {
+	return JSON.stringify({
+		taskId: request.taskId,
+		title: request.title,
+		prompt: request.prompt,
+		acceptanceCriteria: request.acceptanceCriteria === undefined
+			? undefined
+			: [...request.acceptanceCriteria],
+		workspaceId: request.workspaceId,
+		sourceWindowName: request.sourceWindowName,
+		providerId: request.providerId,
+		allowInteractiveAuthentication: request.allowInteractiveAuthentication,
+		delegatedExecutionContext: request.delegatedExecutionContext,
+		approvalContext: request.approvalContext,
+	});
 }
 
 function positiveInteger(value: number, name: string): number {

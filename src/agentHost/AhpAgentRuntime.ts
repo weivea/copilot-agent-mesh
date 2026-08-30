@@ -18,6 +18,7 @@ import {
 	AsyncEventQueueCapacityError,
 	createAgentRuntimeEventQueue,
 	type AgentRecoveryDescriptor,
+	type AgentRuntimeApprovalCapabilityIssuer,
 	type AgentRuntime,
 	type AgentRuntimeEvent,
 	type AgentRuntimeProbe,
@@ -36,6 +37,7 @@ import type { AuthBroker, ProtectedResource } from './AuthBroker';
 
 const rootUri = 'ahp-root://';
 const offeredProtocolVersion = '1.0.0';
+export const AHP_PROTOCOL_OFFER: readonly ['1.0.0'] = Object.freeze(['1.0.0']);
 const sessionDefaultChatTimeoutMs = 60_000;
 const cancellationTimeoutMs = 15_000;
 const titleAcknowledgementTimeoutMs = 10_000;
@@ -133,6 +135,7 @@ export interface AhpAgentRuntimeOptions {
 	readonly connections: AhpConnectionFactory;
 	readonly authBroker: AuthBroker;
 	readonly confirmation: FirstTaskConfirmation;
+	readonly approvalCapabilities?: AgentRuntimeApprovalCapabilityIssuer;
 	readonly workspaceResolver: WorkspaceResolver;
 	readonly configResolver?: SessionConfigurationResolver;
 	readonly cancellationTimeoutMs?: number;
@@ -191,7 +194,10 @@ export class AhpAgentRuntime implements AgentRuntime {
 		}
 		validateWorkspace(request.workspaceId, workspace);
 		const resolvedRequest: ResolvedAgentTaskRequest = { ...request, workspace };
-		if (await this.options.confirmation.confirm(resolvedRequest) !== 'once') {
+		if (
+			this.options.approvalCapabilities?.accepts(request) !== true
+			&& await this.options.confirmation.confirm(resolvedRequest) !== 'once'
+		) {
 			throw new AgentRuntimeError('TASK_EXECUTION_FAILED', 'The local user denied this task.');
 		}
 		this.throwIfDisposed();
@@ -306,10 +312,9 @@ export class SdkAhpConnectionFactory implements AhpConnectionFactory {
 		const socket = host.openWebSocket === undefined
 			? await connectWebSocket(host.endpoint, 10_000, signal)
 			: await host.openWebSocket(signal);
-		const [{ AhpClient }, { WebSocketTransport }, protocol] = await Promise.all([
+		const [{ AhpClient }, { WebSocketTransport }] = await Promise.all([
 			import('@microsoft/agent-host-protocol/client'),
 			import('@microsoft/agent-host-protocol/ws'),
-			import('@microsoft/agent-host-protocol'),
 		]);
 		if (signal?.aborted === true) {
 			socket.close();
@@ -320,7 +325,7 @@ export class SdkAhpConnectionFactory implements AhpConnectionFactory {
 			{ requestTimeoutMs: 30_000 },
 		);
 		client.connect();
-		return new SdkAhpConnection(client, protocol.SUPPORTED_PROTOCOL_VERSIONS);
+		return new SdkAhpConnection(client, AHP_PROTOCOL_OFFER);
 	}
 }
 

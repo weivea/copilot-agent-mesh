@@ -10,7 +10,11 @@ import type {
 	AgentTaskHandle,
 	AgentTaskRequest,
 } from '../agentHost/AgentRuntime';
-import { AgentRuntimeError, createAgentRuntimeEventQueue } from '../agentHost/AgentRuntime';
+import {
+	AgentRuntimeApprovalCapabilityIssuer,
+	AgentRuntimeError,
+	createAgentRuntimeEventQueue,
+} from '../agentHost/AgentRuntime';
 import { MeshDomainError } from '../domain/errors';
 import { canonicalRoutedTaskRequestHash } from '../domain/task';
 import { toDeviceBrokerHandlerError } from '../broker/DeviceBroker';
@@ -202,6 +206,7 @@ interface Fixture {
 	readonly runtime: TestRuntime;
 	readonly events: NodeTaskEventParams[];
 	readonly confirmations: WindowNodeTaskConfirmationRequest[];
+	readonly approvalCapabilities: AgentRuntimeApprovalCapabilityIssuer;
 	readonly executor: WindowNodeTaskExecutor;
 }
 
@@ -211,6 +216,8 @@ function createFixture(
 	const runtime = new TestRuntime();
 	const events: NodeTaskEventParams[] = [];
 	const confirmations: WindowNodeTaskConfirmationRequest[] = [];
+	const approvalCapabilities = overrides.approvalCapabilities
+		?? new AgentRuntimeApprovalCapabilityIssuer();
 	const options: WindowNodeTaskExecutorOptions = {
 		nodeId: NODE_ID,
 		nodeInstanceId: NODE_INSTANCE_ID,
@@ -232,6 +239,7 @@ function createFixture(
 				return 'once';
 			},
 		},
+		approvalCapabilities,
 		eventSink: {
 			publish: async (event) => {
 				events.push(event);
@@ -245,6 +253,7 @@ function createFixture(
 		runtime,
 		events,
 		confirmations,
+		approvalCapabilities,
 		executor: new WindowNodeTaskExecutor(options),
 	};
 }
@@ -427,13 +436,11 @@ test('starts once for exact retries, rejects conflicts, and supplies complete co
 	});
 	assert.equal(fixture.runtime.requests.length, 1);
 	assert.equal(fixture.runtime.requests[0]?.sourceWindowName, 'Source Window');
-	assert.deepEqual(fixture.confirmations, [{
-		sourceWindowLabel: 'Source Window',
-		targetWindowLabel: 'Target Window',
-		workspaceDisplayName: 'Current Workspace',
-		taskTitle: 'Implement task',
-		prompt: 'Complete prompt text',
-	}]);
+	assert.deepEqual(fixture.confirmations, []);
+	assert.equal(
+		fixture.approvalCapabilities.accepts(fixture.runtime.requests[0]!),
+		true,
+	);
 	assert.throws(
 		() => fixture.executor.start(startParams({ title: 'Changed task' })),
 		(error: unknown) => isReason(error, 'TASK_ID_CONFLICT'),
@@ -446,7 +453,7 @@ test('reports confirmation denial as an explicit safe failure without starting t
 		confirmationHost: { confirm: async () => 'deny' },
 	});
 	await assert.rejects(
-		fixture.executor.start(startParams()),
+		fixture.executor.start(startParams({ sourceNodeId: undefined })),
 		(error: unknown) =>
 			isReason(error, 'TASK_EXECUTION_FAILED')
 			&& error instanceof Error
@@ -461,10 +468,22 @@ test('target executor rejects the removed legacy always confirmation', async () 
 		confirmationHost: { confirm: async () => 'always' as never },
 	});
 	await assert.rejects(
-		fixture.executor.start(startParams()),
+		fixture.executor.start(startParams({ sourceNodeId: undefined })),
 		(error: unknown) => isReason(error, 'TASK_EXECUTION_FAILED'),
 	);
 	assert.equal(fixture.runtime.requests.length, 0);
+	await fixture.executor.dispose();
+});
+
+test('ungranted legacy target prompts exactly once and preapproves its runtime boundary', async () => {
+	const fixture = createFixture();
+	await fixture.executor.start(startParams({ sourceNodeId: undefined }));
+	assert.equal(fixture.confirmations.length, 1);
+	assert.equal(fixture.runtime.requests.length, 1);
+	assert.equal(
+		fixture.approvalCapabilities.accepts(fixture.runtime.requests[0]!),
+		true,
+	);
 	await fixture.executor.dispose();
 });
 

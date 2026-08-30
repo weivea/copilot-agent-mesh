@@ -2,10 +2,13 @@ import {
 	AgentRuntimeError,
 	type AgentHostSourceStatus,
 	type AgentHostSourceStatusProvider,
+	type AgentRuntimeApprovalCapabilityIssuer,
 	type AgentRuntime,
 	type AgentRuntimeProbe,
 	type AgentTaskHandle,
 	type AgentTaskRequest,
+	type FirstTaskConfirmation,
+	type WorkspaceResolver,
 } from './AgentRuntime';
 import type {
 	AgentHostLauncherLike,
@@ -24,12 +27,19 @@ export interface AgentHostSourceSelectorOptions {
 	readonly preferEditor: () => boolean;
 	readonly editor: AgentRuntime;
 	readonly standalone: AgentRuntime;
+	readonly confirmation: FirstTaskConfirmation;
+	readonly workspaceResolver: WorkspaceResolver;
+	readonly approvalCapabilities: AgentRuntimeApprovalCapabilityIssuer;
 }
 
 export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceStatusProvider {
 	private readonly listeners = new Set<(status: AgentHostSourceStatus) => void>();
 	private status: AgentHostSourceStatus = { source: 'standalone', degraded: false };
 	private sourceSelected = false;
+	private readonly inFlightStarts = new Set<{
+		readonly controller: AbortController;
+		readonly operation: Promise<AgentTaskHandle>;
+	}>();
 	private disposed = false;
 	private disposal: Promise<void> | undefined;
 
@@ -61,8 +71,34 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 		return probeWithStatus(standalone, status);
 	}
 
-	public async start(request: AgentTaskRequest): Promise<AgentTaskHandle> {
+	public start(request: AgentTaskRequest): Promise<AgentTaskHandle> {
 		this.assertActive();
+		const controller = new AbortController();
+		let tracked!: {
+			readonly controller: AbortController;
+			readonly operation: Promise<AgentTaskHandle>;
+		};
+		const operation = this.startTracked(request, controller.signal)
+			.finally(() => this.inFlightStarts.delete(tracked));
+		tracked = { controller, operation };
+		this.inFlightStarts.add(tracked);
+		return operation;
+	}
+
+	private async startTracked(
+		request: AgentTaskRequest,
+		signal: AbortSignal,
+	): Promise<AgentTaskHandle> {
+		const approvedRequest = await this.approve(request, signal);
+		try {
+			throwIfSelectorAborted(signal);
+			return await this.startApproved(approvedRequest);
+		} finally {
+			this.options.approvalCapabilities.revoke(approvedRequest.approvalCapability);
+		}
+	}
+
+	private async startApproved(request: AgentTaskRequest): Promise<AgentTaskHandle> {
 		if (!this.options.preferEditor()) {
 			const handle = await this.options.standalone.start(request);
 			this.sourceSelected = true;
@@ -90,14 +126,41 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 			const handle = await this.options.standalone.start(request);
 			this.assertActive();
 			return handle;
-		} catch {
+		} catch (error: unknown) {
 			const failed = degradedStatus('STANDALONE_START_FAILED');
 			this.setStatus(failed);
+			throw normalizeFallbackFailure(error);
+		}
+	}
+
+	private async approve(request: AgentTaskRequest, signal: AbortSignal): Promise<AgentTaskRequest> {
+		throwIfSelectorAborted(signal);
+		if (this.options.approvalCapabilities.accepts(request)) {
+			return request;
+		}
+		const workspace = await abortableSelectorOperation(
+			this.options.workspaceResolver.resolve(request.workspaceId),
+			signal,
+		);
+		throwIfSelectorAborted(signal);
+		if (workspace === undefined || workspace.workspaceId !== request.workspaceId) {
 			throw new AgentRuntimeError(
 				'AGENT_UNAVAILABLE',
-				'The editor Agent Host was unavailable and the standalone fallback failed.',
+				'The requested workspace is not registered on this device.',
 			);
 		}
+		const confirmation = await abortableSelectorOperation(
+			this.options.confirmation.confirm({ ...request, workspace }),
+			signal,
+		);
+		throwIfSelectorAborted(signal);
+		if (confirmation !== 'once') {
+			throw new AgentRuntimeError('TASK_EXECUTION_FAILED', 'The local user denied this task.');
+		}
+		return {
+			...request,
+			approvalCapability: this.options.approvalCapabilities.issue(request),
+		};
 	}
 
 	public sourceStatus(): AgentHostSourceStatus {
@@ -125,7 +188,11 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 	}
 
 	private async disposeRuntimes(): Promise<void> {
+		for (const start of this.inFlightStarts) {
+			start.controller.abort();
+		}
 		const results = await Promise.allSettled([
+			...[...this.inFlightStarts].map(({ operation }) => operation.catch(() => undefined)),
 			this.options.editor.dispose(),
 			this.options.standalone.dispose(),
 		]);
@@ -278,6 +345,31 @@ function isFallbackEligible(error: unknown): boolean {
 	return error instanceof AgentRuntimeError && error.code === 'AGENT_UNAVAILABLE';
 }
 
+function normalizeFallbackFailure(error: unknown): AgentRuntimeError {
+	if (!(error instanceof AgentRuntimeError)) {
+		return new AgentRuntimeError(
+			'AGENT_UNAVAILABLE',
+			'The editor Agent Host was unavailable and the standalone fallback failed.',
+		);
+	}
+	const messages: Record<AgentRuntimeError['code'], string> = {
+		AGENT_UNAVAILABLE: 'The editor Agent Host was unavailable and the standalone fallback failed.',
+		AGENT_AUTH_REQUIRED: 'The standalone Agent Host fallback requires authentication.',
+		AGENT_AUTH_FAILED: 'The standalone Agent Host fallback could not authenticate.',
+		AGENT_CONFIG_REQUIRED: 'The standalone Agent Host fallback requires Session configuration.',
+		TASK_EXECUTION_FAILED: 'The standalone Agent Host fallback could not start the task.',
+		TASK_RECOVERY_UNAVAILABLE: 'The standalone Agent Host fallback could not recover the task.',
+		TASK_CANCELLATION_UNCONFIRMED: 'The standalone Agent Host fallback could not confirm cancellation.',
+	};
+	return new AgentRuntimeError(
+		error.code,
+		messages[error.code],
+		error.retryable,
+		undefined,
+		error.cleanupFailed,
+	);
+}
+
 function probeWithStatus(
 	probe: AgentRuntimeProbe,
 	status: AgentHostSourceStatus,
@@ -292,4 +384,44 @@ function probeWithStatus(
 			}
 			: undefined,
 	};
+}
+
+function throwIfSelectorAborted(signal: AbortSignal): void {
+	if (signal.aborted) {
+		throw new AgentRuntimeError(
+			'AGENT_UNAVAILABLE',
+			'The Agent Host source selection was cancelled during shutdown.',
+		);
+	}
+}
+
+function abortableSelectorOperation<T>(
+	operation: Promise<T>,
+	signal: AbortSignal,
+): Promise<T> {
+	throwIfSelectorAborted(signal);
+	return new Promise<T>((resolve, reject) => {
+		const handleAbort = () => {
+			signal.removeEventListener('abort', handleAbort);
+			reject(new AgentRuntimeError(
+				'AGENT_UNAVAILABLE',
+				'The Agent Host source selection was cancelled during shutdown.',
+			));
+		};
+		signal.addEventListener('abort', handleAbort, { once: true });
+		void operation.then(
+			(value) => {
+				signal.removeEventListener('abort', handleAbort);
+				if (!signal.aborted) {
+					resolve(value);
+				}
+			},
+			(error: unknown) => {
+				signal.removeEventListener('abort', handleAbort);
+				if (!signal.aborted) {
+					reject(error);
+				}
+			},
+		);
+	});
 }

@@ -19,10 +19,12 @@ import {
 import {
 	AgentRuntimeError,
 	type AgentInputRequest,
+	type AgentRuntimeApprovalCapabilityIssuer,
 	type AgentRuntime,
 	type AgentRuntimeEvent,
 	type AgentTaskAnswer,
 	type AgentTaskHandle,
+	type AgentTaskRequest,
 	type RegisteredLocalWorkspace,
 	type WorkspaceResolver,
 } from '../agentHost/AgentRuntime';
@@ -62,6 +64,7 @@ export interface WindowNodeTaskExecutorOptions {
 	readonly runtime: AgentRuntime;
 	readonly workspaceResolver: WorkspaceResolver;
 	readonly confirmationHost: WindowNodeTaskConfirmationHost;
+	readonly approvalCapabilities?: AgentRuntimeApprovalCapabilityIssuer;
 	readonly eventSink: WindowNodeTaskEventSink;
 	readonly ids: IdGenerator | (() => string);
 	readonly clock: Clock | (() => Date);
@@ -324,18 +327,35 @@ export class WindowNodeTaskExecutor {
 		}
 		this.assertRecordWithinWorkerDeadline(record, params.workerDeadline);
 		this.assertActive();
-		const confirmation = await this.options.confirmationHost.confirm({
-			sourceWindowLabel: params.sourceLabel,
-			targetWindowLabel: this.nodeLabel,
-			workspaceDisplayName: workspace.displayName,
-			taskTitle: params.title,
+		const baseRuntimeRequest = {
+			taskId: params.taskId,
+			title: params.title,
 			prompt: params.prompt,
-		});
-		if (confirmation !== 'once') {
-			throw new MeshDomainError(
-				'TASK_EXECUTION_FAILED',
-				'The local user denied this remote task.',
-			);
+			acceptanceCriteria: [...params.acceptanceCriteria],
+			workspaceId: workspace.workspaceId,
+			sourceWindowName: params.sourceLabel,
+			allowInteractiveAuthentication: true,
+			delegatedExecutionContext: { ...params.delegatedExecutionContext },
+			approvalContext: {
+				peerId: params.authenticatedOwnerId,
+				workspaceId: workspace.workspaceId,
+				requestHash: record.fingerprint,
+			},
+		} satisfies AgentTaskRequest;
+		if (params.sourceNodeId === undefined) {
+			const confirmation = await this.options.confirmationHost.confirm({
+				sourceWindowLabel: params.sourceLabel,
+				targetWindowLabel: this.nodeLabel,
+				workspaceDisplayName: workspace.displayName,
+				taskTitle: params.title,
+				prompt: params.prompt,
+			});
+			if (confirmation !== 'once') {
+				throw new MeshDomainError(
+					'TASK_EXECUTION_FAILED',
+					'The local user denied this remote task.',
+				);
+			}
 		}
 		this.assertRecordWithinWorkerDeadline(record, params.workerDeadline);
 		this.assertActive();
@@ -343,20 +363,10 @@ export class WindowNodeTaskExecutor {
 		let handle: AgentTaskHandle;
 		record.runtimeStartPending = true;
 		try {
+			const approvalCapability = this.options.approvalCapabilities?.issue(baseRuntimeRequest);
 			handle = await this.options.runtime.start({
-				taskId: params.taskId,
-				title: params.title,
-				prompt: params.prompt,
-				acceptanceCriteria: [...params.acceptanceCriteria],
-				workspaceId: workspace.workspaceId,
-				sourceWindowName: params.sourceLabel,
-				allowInteractiveAuthentication: true,
-				delegatedExecutionContext: { ...params.delegatedExecutionContext },
-				approvalContext: {
-					peerId: params.authenticatedOwnerId,
-					workspaceId: workspace.workspaceId,
-					requestHash: record.fingerprint,
-				},
+				...baseRuntimeRequest,
+				...(approvalCapability === undefined ? {} : { approvalCapability }),
 			});
 		} catch (error: unknown) {
 			if (record.deadlineExpired) {

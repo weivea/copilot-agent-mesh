@@ -2,7 +2,8 @@
 
 The MVP runtime is a production adapter over the TypeScript 0.9.0 client built
 from pinned `microsoft-agent-host-protocol` commit
-`f19dd8b3942d029744a3bdd31d830f9428e8ea47`; it negotiates AHP 1.0.0 with
+`f19dd8b3942d029744a3bdd31d830f9428e8ea47`; it offers exactly `["1.0.0"]`
+and negotiates AHP 1.0.0 with
 VS Code 1.135.0 and does not use the Fake Agent. Fake AHP connections are limited
 to deterministic tests.
 
@@ -29,6 +30,15 @@ uses its own `net.connect` + authenticated WebSocket Upgrade + AHP client. Disco
 connection, initialize, or protocol failure falls back to the existing standalone
 launcher exactly once and exposes `standalone` plus a bounded degradation reason.
 With Peer Delegation disabled, the historical standalone behavior is unchanged.
+
+Source fallback sits below one runtime approval boundary. An exact local
+`DelegationGrant` validated by the target Window Node produces an in-memory,
+WeakMap-backed capability bound to the complete request; same-device peer tasks
+therefore show no target Node/runtime modal because the parent's native
+Continue/Cancel was the sole consent. Legacy, direct, and cross-device tasks without
+that local-source proof retain exactly one target confirmation, whose capability
+covers both source attempts. The capability is not a wire/model boolean and carries
+no serializable grant, path, or identity data.
 
 1. Probe a configured or known VS Code CLI candidate with `code --version`.
 2. Create an owned instance directory, owner-only token file, dedicated user/server data directories, and an isolated process group.

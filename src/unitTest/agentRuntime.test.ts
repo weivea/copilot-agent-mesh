@@ -13,6 +13,7 @@ import type {
 
 import {
 	AhpAgentRuntime,
+	AHP_PROTOCOL_OFFER,
 	buildMeshSessionTitle,
 	DELEGATED_AGENT_CLIENT_TOOLS,
 	type AhpConnection,
@@ -29,6 +30,10 @@ import {
 	type LaunchedAgentHost,
 } from '../agentHost/AgentHostLauncher';
 import {
+	AgentHostSourceSelector,
+} from '../agentHost/AgentHostSourceSelector';
+import {
+	AgentRuntimeApprovalCapabilityIssuer,
 	AgentRuntimeError,
 	AgentRuntimeLifecycle,
 	AsyncEventQueue,
@@ -37,7 +42,10 @@ import {
 	type AgentRuntimeEvent,
 	type AgentRuntimeErrorCode,
 	type AgentTaskRequest,
+	type FirstTaskConfirmation,
 } from '../agentHost/AgentRuntime';
+import { VscodeLocalTaskApproval } from '../composition/VscodeAgentRuntime';
+import type { StateStore } from '../domain/ports';
 import { DelegatedToolInvocationRegistry } from '../tools/DelegatedToolInvocationRegistry';
 import { MESH_TOOL_NAMES } from '../tools/toolManifest';
 import {
@@ -566,8 +574,9 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 	});
 
 	test('runtime rejects an incompatible selected protocol before Session creation', async () => {
+		assert.deepEqual(AHP_PROTOCOL_OFFER, ['1.0.0']);
 		const transport = new FakeAhpTransport();
-		transport.selectedProtocolVersion = '2.0.0';
+		transport.selectedProtocolVersion = '0.9.0';
 		const runtime = createRuntime(new FakeLauncher(), new FakeConnectionFactory([transport]));
 		await assert.rejects(
 			runtime.start(taskRequest()),
@@ -578,6 +587,107 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 		assert.equal(transport.created, undefined);
 		assert.equal(transport.disposeSessionCalls, 0);
 		assert.equal(transport.shutdownCalls, 1);
+	});
+
+	test('real selector runtimes never prompt target for validated peer approval across source outcomes', async () => {
+		for (const outcome of ['editor', 'fallback', 'failure'] as const) {
+			let modalCount = 0;
+			const approval = new VscodeLocalTaskApproval({
+				window: {
+					showWarningMessage: async () => {
+						modalCount += 1;
+						return 'Run Once';
+					},
+				},
+			} as never, {} as StateStore);
+			const capabilities = new AgentRuntimeApprovalCapabilityIssuer();
+			const editorTransport = new FakeAhpTransport();
+			const standaloneTransport = new FakeAhpTransport();
+			const editorLauncher = outcome === 'editor'
+				? new FakeLauncher()
+				: new FailingLauncher();
+			const standaloneLauncher = outcome === 'failure'
+				? new FailingLauncher()
+				: new FakeLauncher();
+			const editor = sourceRuntime(
+				editorLauncher,
+				new FakeConnectionFactory([editorTransport]),
+				approval,
+				capabilities,
+			);
+			const standalone = sourceRuntime(
+				standaloneLauncher,
+				new FakeConnectionFactory([standaloneTransport]),
+				approval,
+				capabilities,
+			);
+			const selector = new AgentHostSourceSelector({
+				preferEditor: () => true,
+				editor,
+				standalone,
+				confirmation: approval,
+				workspaceResolver: trustedWorkspaceResolver(),
+				approvalCapabilities: capabilities,
+			});
+			const request = taskRequest();
+			const approved = {
+				...request,
+				approvalCapability: capabilities.issue(request),
+			};
+
+			if (outcome === 'failure') {
+				await assert.rejects(
+					selector.start(approved),
+					(error: unknown) => error instanceof AgentRuntimeError
+						&& error.code === 'AGENT_UNAVAILABLE',
+				);
+			} else {
+				const handle = await selector.start(approved);
+				await handle.dispose();
+			}
+			assert.equal(modalCount, 0, outcome);
+			assert.equal(capabilities.accepts(approved), false, outcome);
+			await selector.dispose();
+		}
+	});
+
+	test('real selector runtimes prompt an ungranted task once before editor fallback', async () => {
+		let modalCount = 0;
+		const approval = new VscodeLocalTaskApproval({
+			window: {
+				showWarningMessage: async () => {
+					modalCount += 1;
+					return 'Run Once';
+				},
+			},
+		} as never, {} as StateStore);
+		const capabilities = new AgentRuntimeApprovalCapabilityIssuer();
+		const standaloneTransport = new FakeAhpTransport();
+		const editor = sourceRuntime(
+			new FailingLauncher(),
+			new FakeConnectionFactory([]),
+			approval,
+			capabilities,
+		);
+		const standalone = sourceRuntime(
+			new FakeLauncher(),
+			new FakeConnectionFactory([standaloneTransport]),
+			approval,
+			capabilities,
+		);
+		const selector = new AgentHostSourceSelector({
+			preferEditor: () => true,
+			editor,
+			standalone,
+			confirmation: approval,
+			workspaceResolver: trustedWorkspaceResolver(),
+			approvalCapabilities: capabilities,
+		});
+
+		const handle = await selector.start(taskRequest());
+		assert.equal(modalCount, 1);
+		await handle.dispose();
+		await selector.dispose();
 	});
 
 test('AHP subscription pump applies bounded output pressure before accepting terminal completion', async () => {
@@ -2173,6 +2283,25 @@ function createRuntime(
 	});
 }
 
+function sourceRuntime(
+	launcher: AgentHostLauncherLike,
+	connections: AhpConnectionFactory,
+	confirmation: FirstTaskConfirmation,
+	approvalCapabilities: AgentRuntimeApprovalCapabilityIssuer,
+): AhpAgentRuntime {
+	return new AhpAgentRuntime({
+		enabled: () => true,
+		launcher,
+		connections,
+		authBroker: new RecordingAuthBroker(),
+		confirmation,
+		approvalCapabilities,
+		workspaceResolver: trustedWorkspaceResolver(),
+		configResolver: { resolve: async () => ({ model: 'test-model' }) },
+		cancellationTimeoutMs: 100,
+	});
+}
+
 function taskRequest(): AgentTaskRequest {
 	return {
 		taskId: 'task-1',
@@ -2333,6 +2462,18 @@ class FakeLauncher implements AgentHostLauncherLike {
 	async dispose(): Promise<void> {
 		await this.host.dispose();
 	}
+}
+
+class FailingLauncher implements AgentHostLauncherLike {
+	public async probe(): Promise<AgentHostProbe> {
+		return { available: false };
+	}
+
+	public async launch(): Promise<LaunchedAgentHost> {
+		throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'Synthetic source failure.');
+	}
+
+	public async dispose(): Promise<void> {}
 }
 
 class FakeHost implements LaunchedAgentHost {
