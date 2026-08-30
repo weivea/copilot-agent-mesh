@@ -154,8 +154,10 @@ export interface DelegationIntentInput {
 	readonly acceptanceCriteria: readonly string[];
 	readonly timeoutMinutes?: number;
 	/**
-	 * Internal authenticated source provenance. This is derived by the Window
-	 * Node and is never accepted from Language Model Tool input.
+	 * Internal authenticated source scope provenance. A single claimed source
+	 * uses its Workspace identity; multiple claims use their canonical set
+	 * identity. This is derived by the Window Node and is never accepted from
+	 * Language Model Tool input.
 	 */
 	readonly sourceWorkspaceIdentity?: string;
 }

@@ -19,13 +19,13 @@ import {
 	TaskValidationSummary,
 } from '../../shared/toolProtocol';
 import { TASK_STATUSES, TaskStatus } from '../../shared/protocol';
-import { redactRemoteText } from '../ui/DashboardRedaction';
 import {
 	DelegationWaiter,
 	type DelegationOutcome,
 	type ToolCancellation,
 	type ToolClock,
 } from './DelegationWaiter';
+import { sanitizeDelegationText } from './DelegationTextSanitizer';
 import { TaskToolFacade, TaskToolFacadeError } from './taskToolFacade';
 import { MESH_TOOL_NAMES } from './toolManifest';
 
@@ -363,7 +363,7 @@ export class TaskToolsCore {
 				TASK_TOOL_LIMITS.errorMessageBytes,
 			),
 		});
-		return this.fitResult(this.compactDelegationOutcome(
+		return this.fitDelegationResult(this.compactDelegationOutcome(
 			await waiter.wait(),
 			identity.delegationRequestId,
 		));
@@ -978,6 +978,26 @@ export class TaskToolsCore {
 			throw new Error('outputByteLimit cannot hold the minimum safe result.');
 		}
 		return fallback;
+	}
+
+	private fitDelegationResult(result: ToolJsonResult): ToolJsonResult {
+		let candidate = result;
+		while (utf8JsonBytes(candidate) > this.outputByteLimit) {
+			const smaller = shrinkCompactDelegationResult(candidate);
+			if (smaller === undefined || utf8JsonBytes(smaller) >= utf8JsonBytes(candidate)) {
+				const fallback = compactDelegationOutputFailure(candidate);
+				if (fallback === undefined) {
+					throw new Error('Compact delegation result is missing required identity.');
+				}
+				candidate = fallback;
+				break;
+			}
+			candidate = smaller;
+		}
+		if (utf8JsonBytes(candidate) > this.outputByteLimit) {
+			throw new Error('outputByteLimit cannot hold compact delegation identity.');
+		}
+		return candidate;
 	}
 }
 
@@ -1899,18 +1919,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function safeDelegationText(value: string, maxBytes: number): string {
-	const redacted = redactRemoteText(value);
-	if (Buffer.byteLength(redacted, 'utf8') <= maxBytes) {
-		return redacted;
-	}
-	let result = '';
-	for (const character of redacted) {
-		if (Buffer.byteLength(result + character, 'utf8') > maxBytes) {
-			break;
-		}
-		result += character;
-	}
-	return result;
+	return sanitizeDelegationText(value, maxBytes);
 }
 
 function normalizeErrorCode(code: string): TaskToolErrorCode {
@@ -1950,48 +1959,6 @@ function compactDelegationResult(value: ToolJsonResult): ToolJsonResult | undefi
 		return undefined;
 	}
 
-	function shrinkCompactDelegationResult(value: ToolJsonResult): ToolJsonResult | undefined {
-		if (value.s === 0 && isRecord(value.r)) {
-			const result = value.r;
-			if (Array.isArray(result.artifacts) && result.artifacts.length > 0) {
-				return { ...value, r: { ...result, artifacts: result.artifacts.slice(0, -1) } };
-			}
-			if (result.artifacts !== undefined) {
-				const { artifacts: _artifacts, ...withoutArtifacts } = result;
-				return { ...value, r: withoutArtifacts };
-			}
-			if (result.validation !== undefined) {
-				const { validation: _validation, ...withoutValidation } = result;
-				return { ...value, r: withoutValidation };
-			}
-			if (typeof result.summary === 'string' && result.summary.length > 1) {
-				return {
-					...value,
-					r: { summary: halveUtf8(result.summary, 1) },
-				};
-			}
-			return compactDelegationOutputFailure(value);
-		}
-		if (value.s === 1 && typeof value.q === 'string' && value.q.length > 1) {
-			return { ...value, q: halveUtf8(value.q, 1) };
-		}
-		if (value.s === 1) {
-			return compactDelegationOutputFailure(value);
-		}
-		return undefined;
-	}
-
-	function compactDelegationOutputFailure(value: ToolJsonResult): ToolJsonResult | undefined {
-		if (typeof value.t !== 'string' || typeof value.d !== 'string') {
-			return undefined;
-		}
-		return {
-			s: 2,
-			t: value.t,
-			d: value.d,
-			e: 'OUTPUT_TOO_LARGE',
-		};
-	}
 	if (value.status === 'pending') {
 		return {
 			s: 0,
@@ -2017,4 +1984,47 @@ function compactDelegationResult(value: ToolJsonResult): ToolJsonResult | undefi
 		};
 	}
 	return undefined;
+}
+
+function shrinkCompactDelegationResult(value: ToolJsonResult): ToolJsonResult | undefined {
+	if (value.s === 0 && isRecord(value.r)) {
+		const result = value.r;
+		if (Array.isArray(result.artifacts) && result.artifacts.length > 0) {
+			return { ...value, r: { ...result, artifacts: result.artifacts.slice(0, -1) } };
+		}
+		if (result.artifacts !== undefined) {
+			const { artifacts: _artifacts, ...withoutArtifacts } = result;
+			return { ...value, r: withoutArtifacts };
+		}
+		if (result.validation !== undefined) {
+			const { validation: _validation, ...withoutValidation } = result;
+			return { ...value, r: withoutValidation };
+		}
+		if (typeof result.summary === 'string' && result.summary.length > 1) {
+			return {
+				...value,
+				r: { summary: halveUtf8(result.summary, 1) },
+			};
+		}
+		return compactDelegationOutputFailure(value);
+	}
+	if (value.s === 1 && typeof value.q === 'string' && value.q.length > 1) {
+		return { ...value, q: halveUtf8(value.q, 1) };
+	}
+	if (value.s === 1) {
+		return compactDelegationOutputFailure(value);
+	}
+	return undefined;
+}
+
+function compactDelegationOutputFailure(value: ToolJsonResult): ToolJsonResult | undefined {
+	if (typeof value.t !== 'string' || typeof value.d !== 'string') {
+		return undefined;
+	}
+	return {
+		s: 2,
+		t: value.t,
+		d: value.d,
+		e: 'OUTPUT_TOO_LARGE',
+	};
 }

@@ -14,6 +14,10 @@ import {
 	LocalBrokerTaskFacade,
 } from '../tools/LocalBrokerTaskFacade';
 import { TaskToolFacadeError } from '../tools/taskToolFacade';
+import {
+	createOpaqueWorkspaceIdentity,
+	createWorkspaceScopeIdentity,
+} from '../workspaces/OpaqueWorkspaceIdentity';
 
 const DEVICE_ID = '00000000-0000-4000-8000-000000000001';
 const NODE_ID = '00000000-0000-4000-8000-000000000002';
@@ -143,6 +147,18 @@ test('source Workspace identity scopes stable delegation keys independently of d
 	assert.notEqual(independent.taskId, first.taskId);
 	assert.equal(independent.taskId, deterministicTaskId(DELEGATION_ID, SOURCE_IDENTITY_B));
 	assert.equal(client.lastStart?.sourceWorkspaceIdentity, SOURCE_IDENTITY_B);
+});
+
+test('claimed Workspace-set scope is order-stable and changes only with membership', () => {
+	const sourceC = createOpaqueWorkspaceIdentity('source-workspace-c');
+	const first = createWorkspaceScopeIdentity([SOURCE_IDENTITY_A, SOURCE_IDENTITY_B]);
+	const reordered = createWorkspaceScopeIdentity([SOURCE_IDENTITY_B, SOURCE_IDENTITY_A]);
+	const changed = createWorkspaceScopeIdentity([SOURCE_IDENTITY_A, sourceC]);
+
+	assert.equal(first, reordered);
+	assert.notEqual(first, changed);
+	assert.equal(createWorkspaceScopeIdentity([SOURCE_IDENTITY_A]), SOURCE_IDENTITY_A);
+	assert.throws(() => createWorkspaceScopeIdentity([]), /scope is invalid/u);
 });
 
 test('task subscription reconciles an authoritative snapshot after Broker reconnect', async () => {

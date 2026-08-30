@@ -10,6 +10,7 @@ import {
 	NodeRegistry,
 	PeerPolicyService,
 	PeerPolicyStore,
+	TaskRouteCatalog,
 	type RegistryScheduler,
 } from '../broker';
 import type { StateStore } from '../domain/ports';
@@ -35,8 +36,10 @@ const INSTANCE_A = uuid(204);
 const INSTANCE_B = uuid(205);
 const WORKSPACE_A = uuid(206);
 const WORKSPACE_B = uuid(207);
+const WORKSPACE_C = uuid(208);
 const IDENTITY_A = createOpaqueWorkspaceIdentity('component-workspace-a');
 const IDENTITY_B = createOpaqueWorkspaceIdentity('component-workspace-b');
+const IDENTITY_C = createOpaqueWorkspaceIdentity('component-workspace-c');
 
 test('authenticated broker RPC keeps Tool and configuration directories separate', async (t) => {
 	const fixture = await createFixture();
@@ -245,14 +248,89 @@ test('two windows and one Broker deliver authoritative delegation outcomes witho
 	});
 });
 
+test('stable claimed-set source scope survives focus changes, no editor, and Broker takeover', async (t) => {
+	const fixture = await createFixture({
+		sourceWorkspaceIdentities: ['component-workspace-a', 'component-workspace-c'],
+	});
+	t.after(() => fixture.dispose());
+	for (const workspaceIdentity of [IDENTITY_A, IDENTITY_C]) {
+		await fixture.nodeA.setPeerPolicy({
+			workspaceIdentity,
+			allowlist: [IDENTITY_B],
+		});
+	}
+	await fixture.nodeB.setPeerPolicy({
+		workspaceIdentity: IDENTITY_B,
+		acceptsIncoming: true,
+	});
+
+	const scope = fixture.nodeA.delegationSourceScopeIdentity();
+	assert.equal(
+		fixture.nodeA.selectPeerPolicyWorkspace('file:///component-workspace-a').kind,
+		'selected',
+	);
+	assert.equal(fixture.nodeA.delegationSourceScopeIdentity(), scope);
+	assert.equal(
+		fixture.nodeA.selectPeerPolicyWorkspace('file:///component-workspace-c').kind,
+		'selected',
+	);
+	assert.equal(fixture.nodeA.delegationSourceScopeIdentity(), scope);
+	assert.equal(fixture.nodeA.selectPeerPolicyWorkspace().kind, 'unavailable');
+	assert.equal(fixture.nodeA.delegationSourceScopeIdentity(), scope);
+
+	const facade = new LocalBrokerTaskFacade(fixture.nodeA, {
+		deviceName: 'Component Device',
+		now: () => new Date('2026-08-30T12:00:00.000Z'),
+		sourceWorkspaceIdentity: () => fixture.nodeA.delegationSourceScopeIdentity(),
+	});
+	const core = new TaskToolsCore(facade);
+	const input = delegationInput(220);
+	const invocation = core.delegateTask(input);
+	const taskId = await startedTaskId(fixture.executorB, invocation);
+	await fixture.nodeB.publishTaskEvent(taskEvent(taskId, {
+		type: 'completed',
+		summary: 'Stable scope completed.',
+	}));
+	assert.equal((await invocation).t, taskId);
+	fixture.nodeA.selectPeerPolicyWorkspace('file:///component-workspace-a');
+	assert.equal((await core.delegateTask(input)).t, taskId);
+	fixture.nodeA.selectPeerPolicyWorkspace('file:///component-workspace-c');
+	assert.equal((await core.delegateTask(input)).t, taskId);
+	fixture.nodeA.selectPeerPolicyWorkspace();
+	assert.equal((await core.delegateTask(input)).t, taskId);
+	assert.equal(fixture.executorB.startCount, 1);
+
+	await fixture.restartBroker();
+	const takeoverCore = new TaskToolsCore(new LocalBrokerTaskFacade(fixture.nodeA, {
+		deviceName: 'Component Device',
+		now: () => new Date('2026-08-30T12:00:00.000Z'),
+		sourceWorkspaceIdentity: () => fixture.nodeA.delegationSourceScopeIdentity(),
+	}));
+	assert.equal((await takeoverCore.delegateTask(input)).t, taskId);
+	assert.deepEqual(await takeoverCore.delegateTask({
+		...input,
+		prompt: 'Changed semantics after takeover.',
+	}), {
+		s: 2,
+		t: taskId,
+		d: input.delegationRequestId,
+		e: 'IDEMPOTENCY_CONFLICT',
+	});
+	assert.equal(fixture.executorB.startCount, 1);
+});
+
 interface Fixture {
 	readonly nodeA: WindowNodeClient;
 	readonly nodeB: WindowNodeClient;
 	readonly executorB: RecordingExecutor;
+	restartBroker(): Promise<void>;
 	dispose(): Promise<void>;
 }
 
-async function createFixture(options: { readonly enabled?: boolean } = {}): Promise<Fixture> {
+async function createFixture(options: {
+	readonly enabled?: boolean;
+	readonly sourceWorkspaceIdentities?: readonly string[];
+} = {}): Promise<Fixture> {
 	const tempDirectory = await mkdtemp(
 		process.platform === 'win32' ? join(tmpdir(), 'mesh-pp-') : '/tmp/mesh-pp-',
 	);
@@ -266,62 +344,102 @@ async function createFixture(options: { readonly enabled?: boolean } = {}): Prom
 	const files = new AtomicFileStore('memory', new MemoryAtomicFileSystem(), {
 		next: () => `temp-${Math.random().toString(16).slice(2)}`,
 	});
-	const tasks = new FileTaskStore(files, clock);
 	const peerStore = new PeerPolicyStore(files, {
 		ownership,
 		generation: ownership.generation,
 		clock,
 	});
 	await peerStore.initialize();
-	const workspaceIds = [WORKSPACE_A, WORKSPACE_B];
-	const registry = await NodeRegistry.create({
-		deviceId: DEVICE,
-		state: new MemoryState(),
-		ids: { next: () => workspaceIds.shift()! },
-		clock,
-		workspaceLeases: new WorkspaceLeaseManager(),
-		scheduler: new NoopScheduler(),
-	});
-	const policies = new PeerPolicyService(peerStore, registry, {
-		enabled: () => options.enabled ?? true,
-	});
-	registry.setPeerRouteAuthorizer(policies);
+	const registryState = new MemoryState();
+	const routeState = new MemoryState();
+	const workspaceIds = [
+		WORKSPACE_A,
+		...(options.sourceWorkspaceIdentities?.length === 2 ? [WORKSPACE_C] : []),
+		WORKSPACE_B,
+	];
+	let registry: NodeRegistry;
+	let policies: PeerPolicyService;
+	let taskService: BrokerTaskService;
 	let broker: DeviceBroker | undefined;
-	const taskService = new BrokerTaskService(DEVICE, registry, tasks, clock, {
-		onTaskSnapshot: (snapshot, sourceNodeId) => {
-			broker?.publishTaskSnapshot(snapshot, sourceNodeId);
-		},
-	});
-	await taskService.initialize();
-	broker = new DeviceBroker({
-		identity,
-		brokerKey: Buffer.alloc(32, 0x5a),
-		ownership,
-		registry,
-		peerPolicies: policies,
-		taskService,
-		requestTimeoutMs: 2_000,
-	});
-	await broker.start();
+	const startBroker = async (): Promise<void> => {
+		registry = await NodeRegistry.create({
+			deviceId: DEVICE,
+			state: registryState,
+			ids: { next: () => workspaceIds.shift()! },
+			clock,
+			workspaceLeases: new WorkspaceLeaseManager(),
+			scheduler: new NoopScheduler(),
+		});
+		policies = new PeerPolicyService(peerStore, registry, {
+			enabled: () => options.enabled ?? true,
+		});
+		registry.setPeerRouteAuthorizer(policies);
+		taskService = new BrokerTaskService(
+			DEVICE,
+			registry,
+			new FileTaskStore(files, clock),
+			clock,
+			{
+				onTaskSnapshot: (snapshot, sourceNodeId) => {
+					broker?.publishTaskSnapshot(snapshot, sourceNodeId);
+				},
+			},
+		);
+		await taskService.initialize();
+		broker = new DeviceBroker({
+			identity,
+			brokerKey: Buffer.alloc(32, 0x5a),
+			ownership,
+			registry,
+			peerPolicies: policies,
+			taskService,
+			taskRoutes: new TaskRouteCatalog(routeState, clock.now),
+			requestTimeoutMs: 2_000,
+		});
+		await broker.start();
+	};
+	await startBroker();
 	const executorB = new RecordingExecutor();
-	const nodeA = nodeClient(identity, NODE_A, INSTANCE_A, 'component-workspace-a');
-	const nodeB = nodeClient(
-		identity,
-		NODE_B,
-		INSTANCE_B,
-		'component-workspace-b',
-		executorB,
-	);
-	await nodeA.start();
-	await nodeB.start();
+	let nodeA: WindowNodeClient;
+	let nodeB: WindowNodeClient;
+	const startNodes = async (): Promise<void> => {
+		nodeA = nodeClient(
+			identity,
+			NODE_A,
+			INSTANCE_A,
+			options.sourceWorkspaceIdentities ?? ['component-workspace-a'],
+		);
+		nodeB = nodeClient(
+			identity,
+			NODE_B,
+			INSTANCE_B,
+			['component-workspace-b'],
+			executorB,
+		);
+		await nodeA.start();
+		await nodeB.start();
+	};
+	await startNodes();
 	return {
-		nodeA,
-		nodeB,
+		get nodeA() {
+			return nodeA;
+		},
+		get nodeB() {
+			return nodeB;
+		},
 		executorB,
+		restartBroker: async () => {
+			await nodeA.dispose();
+			await nodeB.dispose();
+			await broker?.dispose();
+			broker = undefined;
+			await startBroker();
+			await startNodes();
+		},
 		dispose: async () => {
 			await nodeA.dispose().catch(() => undefined);
 			await nodeB.dispose().catch(() => undefined);
-			await broker.dispose().catch(() => undefined);
+			await broker?.dispose().catch(() => undefined);
 			await rm(tempDirectory, { recursive: true, force: true });
 		},
 	};
@@ -331,7 +449,7 @@ function nodeClient(
 	identity: LocalIpcIdentity,
 	nodeId: string,
 	nodeInstanceId: string,
-	fileIdentity: string,
+	fileIdentities: readonly string[],
 	executor: WindowNodeExecutor = noopExecutor(),
 ): WindowNodeClient {
 	return new WindowNodeClient({
@@ -342,14 +460,14 @@ function nodeClient(
 		label: nodeId === NODE_A ? 'frontend' : 'backend',
 		capabilities: ['tasks'],
 		executor,
-		workspaceSource: () => [{
+		workspaceSource: () => fileIdentities.map((fileIdentity, index) => ({
 			localUri: `file:///${fileIdentity}`,
-			name: nodeId === NODE_A ? 'Repository A' : 'Repository B',
+			name: nodeId === NODE_A ? `Repository ${index + 1}` : 'Repository B',
 			capabilityTags: ['typescript'],
-		}],
+		})),
 		fileIdentityResolver: {
 			resolve: async (uri) => ({
-				identity: fileIdentity,
+				identity: new URL(uri).pathname.slice(1),
 				canonicalUri: uri,
 			}),
 		},

@@ -235,7 +235,7 @@ export class DelegationWaiter {
 									label: this.options.sanitizeText(artifact.label),
 									...(artifact.mediaType === undefined
 										? {}
-										: { mediaType: artifact.mediaType }),
+										: { mediaType: this.options.sanitizeText(artifact.mediaType) }),
 								})),
 							}),
 					},

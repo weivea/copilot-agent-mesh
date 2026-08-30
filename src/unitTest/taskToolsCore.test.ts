@@ -17,6 +17,7 @@ import {
 	ToolCancellation,
 	ToolClock,
 } from '../tools/taskToolsCore';
+import { sanitizeDelegationText } from '../tools/DelegationTextSanitizer';
 import {
 	assertMeshToolNameParity,
 	getMeshColdActivationContract,
@@ -111,6 +112,99 @@ suite('TaskToolsCore', () => {
 		});
 		assert.equal(clock.createdTimers, 1);
 		assert.equal(clock.activeTimers, 0);
+	});
+
+	test('preserves safe multiline delegation text while removing sensitive spans', async () => {
+		const raw = [
+			'First safe line\r\nSecond safe line\twith details.',
+			'Path /Users/private/project and token=ghp_abcdefghijklmnopqrstuvwxyz.',
+			'Final safe line.',
+		].join('\n');
+		const sanitized = sanitizeDelegationText(raw, 2_048);
+
+		assert.match(sanitized, /First safe line Second safe line with details\./u);
+		assert.match(sanitized, /Final safe line\./u);
+		assert.match(sanitized, /redacted sensitive details/u);
+		assert.doesNotMatch(sanitized, /Users|private|project|ghp_|abcdefghijklmnopqrstuvwxyz/u);
+		assert.doesNotMatch(sanitized, /[\r\n\t]/u);
+
+		for (const credential of [
+			'Authorization: Basic QWxhZGRpbjpvcGVu',
+			'db_password: hunter2',
+			'x_api_key: abcdefgh',
+			'session_token : abcdef123456',
+			'password: password: hunter2',
+			'api_key: "" AKIAIOSFODNN7EXAMPLE',
+			'secret = secret = topsecretvalue',
+			'password:\u0001hunter2',
+			'password: \u202ehunter2',
+		]) {
+			const result = sanitizeDelegationText(`Safe before. ${credential} Safe after.`, 2_048);
+			assert.doesNotMatch(
+				result,
+				/QWxhZGRpbjpvcGVu|hunter2|abcdefgh|abcdef123456|AKIAIOSFODNN7EXAMPLE|topsecretvalue/u,
+				credential,
+			);
+			assert.match(result, /Safe before\./u);
+			assert.match(result, /Safe after\./u);
+		}
+		assert.equal(
+			sanitizeDelegationText('MIME text/plain is safe.', 2_048),
+			'MIME text/plain is safe.',
+		);
+		assert.doesNotMatch(
+			sanitizeDelegationText('Read etc/passwd only if needed.', 2_048),
+			/etc\/passwd/u,
+		);
+	});
+
+	test('sanitizes multiline completed results, input questions, and tracked events by span', async () => {
+		const facade = new RecordingFacade();
+		facade.delegationSnapshot = {
+			taskId: TASK_ID,
+			status: 'completed',
+			title: 'Fix scheduler',
+			updatedAt: '2026-08-25T00:00:01.000Z',
+			summary: 'Built scheduler.\r\nTests pass.\tReport: /Users/private/report.txt',
+			artifacts: [{
+				artifactId: ANSWER_ID,
+				label: 'Safe report at /Users/private/report.txt',
+				mediaType: 'text/plain token=ghp_abcdefghijklmnopqrstuvwxyz',
+			}],
+		};
+		const completed = await new TaskToolsCore(facade).delegateTask(delegationInput());
+		const completedText = JSON.stringify(completed);
+		assert.match(completedText, /Built scheduler\. Tests pass\. Report:/u);
+		assert.match(completedText, /Safe report at/u);
+		assert.doesNotMatch(completedText, /Users|private|report\.txt|ghp_|abcdefghijklmnopqrstuvwxyz/u);
+
+		facade.delegationSnapshot = {
+			taskId: TASK_ID,
+			status: 'needsInput',
+			title: 'Fix scheduler',
+			updatedAt: '2026-08-25T00:00:02.000Z',
+			pendingInput: {
+				inputId: INPUT_ID,
+				prompt: 'Choose queue:\r\nA\tor B. Inspect /Users/private/config.json first.',
+			},
+		};
+		const needsInput = await new TaskToolsCore(facade).delegateTask(delegationInput());
+		assert.match(String(needsInput.q), /Choose queue: A or B\. Inspect/u);
+		assert.doesNotMatch(String(needsInput.q), /Users|private|config\.json/u);
+
+		facade.taskRead = {
+			...facade.taskRead,
+			events: [{
+				sequence: 1,
+				type: 'progress',
+				at: '2026-08-25T00:00:00.000Z',
+				summary: 'Compiled.\r\nTests\tpassed. bearer ghp_abcdefghijklmnopqrstuvwxyz',
+			}],
+		};
+		const tracked = await new TaskToolsCore(facade).getTask({ taskId: TASK_ID });
+		const event = (tracked.events as Array<Record<string, unknown>>)[0]!;
+		assert.match(String(event.summary), /Compiled\. Tests passed\./u);
+		assert.doesNotMatch(String(event.summary), /bearer|ghp_|abcdefghijklmnopqrstuvwxyz/iu);
 	});
 
 	test('generates a fresh delegation identity when the caller omits one', async () => {
@@ -747,6 +841,79 @@ suite('TaskToolsCore', () => {
 			d: DELEGATION_ID,
 			e: 'TUNNEL_UNAVAILABLE',
 		});
+	});
+
+	test('keeps compact delegation identity under the minimum byte budget', async () => {
+		const escaping = '"\\\\\r\n\t'.repeat(3_000);
+		const facade = new RecordingFacade();
+		facade.delegationSnapshot = {
+			taskId: TASK_ID,
+			status: 'completed',
+			title: 'Fix scheduler',
+			updatedAt: '2026-08-25T00:00:01.000Z',
+			summary: escaping,
+			validation: { status: 'passed', summary: escaping },
+			artifacts: Array.from({ length: 32 }, (_, index) => ({
+				artifactId: uuidFromIndex(index + 900),
+				label: escaping.slice(0, 512),
+				mediaType: `text/plain; ${escaping.slice(0, 128)}`,
+			})),
+		};
+		const completed = await new TaskToolsCore(facade, {
+			outputByteLimit: 1_024,
+		}).delegateTask(delegationInput());
+		assert.equal(completed.t, TASK_ID);
+		assert.equal(completed.d, DELEGATION_ID);
+		assert.ok(completed.s === 0 || completed.s === 2);
+		if (completed.s === 2) {
+			assert.deepStrictEqual(completed, {
+				s: 2,
+				t: TASK_ID,
+				d: DELEGATION_ID,
+				e: 'OUTPUT_TOO_LARGE',
+			});
+		}
+		assert.ok(Buffer.byteLength(JSON.stringify(completed), 'utf8') <= 1_024);
+
+		facade.delegationSnapshot = {
+			taskId: TASK_ID,
+			status: 'needsInput',
+			title: 'Fix scheduler',
+			updatedAt: '2026-08-25T00:00:02.000Z',
+			pendingInput: { inputId: INPUT_ID, prompt: escaping },
+		};
+		const needsInput = await new TaskToolsCore(facade, {
+			outputByteLimit: 1_024,
+		}).delegateTask(delegationInput());
+		assert.equal(needsInput.t, TASK_ID);
+		assert.equal(needsInput.d, DELEGATION_ID);
+		assert.ok(needsInput.s === 1 || needsInput.s === 2);
+		assert.equal(needsInput.s === 1 ? needsInput.i : needsInput.e, (
+			needsInput.s === 1 ? INPUT_ID : 'OUTPUT_TOO_LARGE'
+		));
+		assert.ok(Buffer.byteLength(JSON.stringify(needsInput), 'utf8') <= 1_024);
+
+		facade.delegationSnapshot = {
+			taskId: TASK_ID,
+			status: 'failed',
+			title: 'Fix scheduler',
+			updatedAt: '2026-08-25T00:00:03.000Z',
+			failure: {
+				code: 'TASK_EXECUTION_FAILED',
+				message: escaping.slice(0, 2_048),
+				retryable: false,
+			},
+		};
+		assert.deepStrictEqual(
+			await new TaskToolsCore(facade, { outputByteLimit: 1_024 })
+				.delegateTask(delegationInput()),
+			{
+				s: 2,
+				t: TASK_ID,
+				d: DELEGATION_ID,
+				e: 'TASK_EXECUTION_FAILED',
+			},
+		);
 	});
 
 	test('rejects unknown properties and UTF-8 byte oversize before side effects', async () => {

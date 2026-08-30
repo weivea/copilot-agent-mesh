@@ -171,7 +171,7 @@ function canonicalizePercentEncoding(value: string): string[] | undefined {
 	return canonical.includes('%') ? undefined : forms;
 }
 
-function containsCredentialAssignment(value: string): boolean {
+export function containsCredentialAssignment(value: string): boolean {
 	for (let separator = 0; separator < value.length; separator += 1) {
 		if (value[separator] !== '=' && value[separator] !== ':') {
 			continue;

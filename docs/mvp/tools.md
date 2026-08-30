@@ -99,9 +99,12 @@ wire form before any generic error or empty-text fallback:
 
 The branch-specific fields are exact: `r` appears only for completion; `i` and
 `q` only for needs-input; and `x` only for cancellation. Every compact branch
-preserves `t` and `d`. Questions, result summaries, and error text are bounded
-and redacted before token contraction. If the matching compact form cannot fit,
-the result is empty text rather than a semantically different generic result.
+preserves `t` and `d`. Questions, result summaries, and error text normalize benign multiline
+whitespace, redact unsafe path/credential/control spans, and remain bounded
+before token contraction. Safe surrounding content is retained. Byte-budget
+contraction always preserves `t` and `d`; if a completed or needs-input payload
+cannot fit, it becomes exact compact failure
+`{s:2,t,d,e:"OUTPUT_TOO_LARGE"}` rather than an identity-free generic result.
 
 Cancelling a VS Code `CancellationToken` sends exactly one task cancellation
 request and continues waiting for an authoritative cancelled or failed state.
@@ -117,9 +120,12 @@ recovers the same task whether acknowledgement was lost or the task is still
 in flight, while a fresh invocation creates a new task even when a terminal
 historical intent has identical semantics.
 
-The idempotency key is stable source Workspace identity plus
-`delegationRequestId`; display names and Window Node instance IDs do not define
-ownership. Exact retries reuse the task ID and never restart an accepted task.
+The idempotency key is stable source Workspace scope identity plus
+`delegationRequestId`; a single claimed source uses its Workspace identity and
+multiple claimed sources use their sorted canonical set hash. Active editor,
+display names, and Window Node instance IDs do not define the scope. P2
+authorization still checks every claimed source Workspace separately. Exact
+retries reuse the task ID and never restart an accepted task.
 Changing target, title, prompt, criteria, or timeout returns
 `IDEMPOTENCY_CONFLICT`. Broker generation takeover restores the persisted route
 mapping before accepting another start.

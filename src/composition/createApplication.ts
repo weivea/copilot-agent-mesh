@@ -267,17 +267,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 				?? profile?.name
 				?? sharedProfile.name,
 			remoteAdapter: remoteTasks,
-			sourceWorkspaceIdentity: () => {
-				const activeUri = vscode.window.activeTextEditor?.document.uri;
-				const activeWorkspace = activeUri === undefined
-					? undefined
-					: vscode.workspace.getWorkspaceFolder(activeUri)?.uri.toString();
-				const selected = node.selectPeerPolicyWorkspace(activeWorkspace);
-				if (selected.kind !== 'selected') {
-					throw new Error('A single claimed source Workspace is required for delegation.');
-				}
-				return selected.workspaceIdentity;
-			},
+			sourceWorkspaceIdentity: () => node.delegationSourceScopeIdentity(),
 		});
 		const bindings = new ProductionDashboardBindings({
 			vscodeApi: vscode,

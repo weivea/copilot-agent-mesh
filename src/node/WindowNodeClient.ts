@@ -63,7 +63,10 @@ import {
 	NodeFileIdentityResolver,
 	type FileIdentityFileSystem,
 } from '../workspaces/NodeFileIdentityResolver';
-import { createOpaqueWorkspaceIdentity } from '../workspaces/OpaqueWorkspaceIdentity';
+import {
+	createOpaqueWorkspaceIdentity,
+	createWorkspaceScopeIdentity,
+} from '../workspaces/OpaqueWorkspaceIdentity';
 import type { FileIdentityResolver } from '../workspaces/WorkspaceRegistry';
 import {
 	WindowNodeTaskExecutorDisposalError,
@@ -357,6 +360,14 @@ export class WindowNodeClient implements WorkspaceResolver {
 			workspaceName: observations.length === 0 ? 'No Workspace' : 'Multiple Workspaces',
 			claimStatus: observations.length === 0 ? 'unclaimed' : 'ambiguous',
 		};
+	}
+
+	public delegationSourceScopeIdentity(): string {
+		return createWorkspaceScopeIdentity(
+			[...this.observations.values()]
+				.filter(({ status }) => status === 'claimed')
+				.map(({ workspaceIdentity }) => workspaceIdentity),
+		);
 	}
 
 	public listNodes(): Promise<NodeDirectoryResult> {

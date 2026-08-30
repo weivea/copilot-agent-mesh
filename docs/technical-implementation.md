@@ -67,7 +67,7 @@ Mesh 只负责选择设备与 Workspace、传递任务、转发 Agent 事件、�
 
 0.4.0 行为定义为：
 
-1. Coordinator 以 `(sourceWorkspaceIdentity, delegationRequestId)` 建立持久映射，并在发送前确定 `taskId` 与精确语义 Hash。
+1. Coordinator 以 `(sourceWorkspaceScopeIdentity, delegationRequestId)` 建立持久映射，并在发送前确定 `taskId` 与精确语义 Hash。单根来源直接使用其 Workspace identity；多根来源使用所有当前 claimed Workspace identities 的排序 canonical set hash，绝不依赖 active editor。0.4.0 wire 字段仍沿用 `sourceWorkspaceIdentity` 名称；P2 方向授权继续逐项验证认证来源 Node 的完整 claim 集合。
 2. Tool 在 `task.start` 前订阅目标任务的 Broker 权威快照，再启动或对账，因此不会丢失快速终态。
 3. 同一调用等待 completed、needsInput、failed 或 cancelled；结果始终保留 `taskId` 与 `delegationRequestId`，并按分支只返回 result、input、error 或 cancellation reason。
 4. `timeoutMinutes` 默认为 60 且最大为 60，只建立一个预算 Timer。预算到期或 VS Code CancellationToken 触发时精确发送一次取消，并继续等待权威 cancelled 或 failed。
@@ -641,7 +641,7 @@ Coordinator 可以有本地 `created` 状态；Worker 的第一个持久状态�
 ### 9.2 不变量
 
 1. `delegationRequestId` 和 `taskId` 都由 Coordinator 使用 UUID 生成，并在网络发送前持久化。
-2. Source Broker 幂等键是 `(sourceWorkspaceIdentity, delegationRequestId)`；Worker 边界仍以认证 Peer 约束任务所有权，`taskId` 在该所有者内唯一。
+2. Source Broker 幂等键是 `(sourceWorkspaceScopeIdentity, delegationRequestId)`；单根 scope 等于 Workspace identity，多根 scope 是排序 claimed identity 集合的 canonical hash。Worker 边界仍以认证 Peer 约束任务所有权，P2 授权仍检查来源 Node 的完整 claim 集合，`taskId` 在该所有者内唯一。
 3. Request Hash 使用验证后语义字段的规范化 length-prefixed 表示：Source Workspace Identity、Delegation ID、Task ID、精确 Target、Title 原始 UTF-8、Prompt 原始 UTF-8、逐条 Acceptance Criteria 和 Worker Deadline。禁止修改/归一化 Prompt 文本。
 4. 同幂等键、同 Hash 返回原任务；同键、不同语义返回 `IDEMPOTENCY_CONFLICT`。真正的 Task ID 所有权碰撞仍返回 `TASK_ID_CONFLICT`。
 5. `task.get`、`cancel`、`answer` 必须验证任务所有权；其他 Peer 统一看到 `TASK_NOT_FOUND`。
