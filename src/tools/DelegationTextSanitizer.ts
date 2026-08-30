@@ -1,5 +1,5 @@
 import {
-	containsCredentialAssignment,
+	containsCredentialText,
 	containsUnsafeDashboardText,
 } from '../ui/DashboardRedaction';
 
@@ -7,14 +7,8 @@ const redaction = '[redacted sensitive details]';
 const redactionSentinel = '__MESH_REDACTED__';
 const benignWhitespacePattern = /[\t\r\n]+/gu;
 const remainingControlPattern = /[\u0000-\u001f\u007f-\u009f]/gu;
-const bidiControlPattern = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
-const credentialKeyPattern = String.raw`[A-Za-z0-9_-]*(?:api[_-]?key|authorization|credential|password|private[_-]?key|secret|tkn|token)`;
-const credentialValuePattern = String.raw`(?:"[^"]*"|'[^']*')(?:\s+\S+)?|(?:basic|bearer|digest|negotiate|token)\s+\S+|\S+`;
-const credentialAssignmentPattern = new RegExp(
-	String.raw`(?<![A-Za-z0-9])${credentialKeyPattern}\s*[:=]\s*(?:${credentialKeyPattern}\s*[:=]\s*)*(?:${credentialValuePattern})`,
-	'giu',
-);
-const bearerPattern = /\bbearer\s+[^\s]+/giu;
+const formatControlPattern = /\p{Cf}/gu;
+const credentialObfuscationPattern = /[\u0000-\u001f\u007f-\u009f\p{Cf}]/gu;
 
 /**
  * Preserves useful remote task prose while removing unsafe spans. Dashboard
@@ -25,21 +19,23 @@ export function sanitizeDelegationText(value: string, maxBytes: number): string 
 	if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) {
 		throw new TypeError('Delegation text byte limit must be a positive integer.');
 	}
+	// Inspect the original field before whitespace normalization can erase the
+	// boundary between an assignment value and a continuation line.
+	if (
+		containsCredentialText(value)
+		|| containsCredentialText(value.replace(credentialObfuscationPattern, ''))
+	) {
+		return boundedUtf8(redaction, maxBytes);
+	}
 	let sanitized = value
 		.replace(benignWhitespacePattern, ' ')
-		.replace(bidiControlPattern, redactionSentinel)
+		.replace(formatControlPattern, redactionSentinel)
 		.replace(remainingControlPattern, redactionSentinel)
-		.replace(credentialAssignmentPattern, redactionSentinel)
-		.replace(bearerPattern, redactionSentinel)
 		.replace(/\S+/gu, (span) =>
 			containsUnsafeDelegationSpan(span) ? redactionSentinel : span)
 		.replace(/\s+/gu, ' ')
 		.trim();
-	if (containsCredentialAssignment(sanitized.toLowerCase())) {
-		sanitized = redaction;
-	} else {
-		sanitized = sanitized.replaceAll(redactionSentinel, redaction);
-	}
+	sanitized = sanitized.replaceAll(redactionSentinel, redaction);
 	if (sanitized.length === 0) {
 		sanitized = redaction;
 	}

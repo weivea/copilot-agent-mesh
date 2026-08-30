@@ -117,7 +117,7 @@ suite('TaskToolsCore', () => {
 	test('preserves safe multiline delegation text while removing sensitive spans', async () => {
 		const raw = [
 			'First safe line\r\nSecond safe line\twith details.',
-			'Path /Users/private/project and token=ghp_abcdefghijklmnopqrstuvwxyz.',
+			'Path /Users/private/project is omitted.',
 			'Final safe line.',
 		].join('\n');
 		const sanitized = sanitizeDelegationText(raw, 2_048);
@@ -125,11 +125,31 @@ suite('TaskToolsCore', () => {
 		assert.match(sanitized, /First safe line Second safe line with details\./u);
 		assert.match(sanitized, /Final safe line\./u);
 		assert.match(sanitized, /redacted sensitive details/u);
-		assert.doesNotMatch(sanitized, /Users|private|project|ghp_|abcdefghijklmnopqrstuvwxyz/u);
+		assert.doesNotMatch(sanitized, /Users|private|project/u);
 		assert.doesNotMatch(sanitized, /[\r\n\t]/u);
 
 		for (const credential of [
+			'token=abc\r\ndef',
+			'token=abc\ndef',
+			'token=abc\tdef',
+			'token%3Dabc SECRETTAIL encoded prose',
+			'api%5Fkey%3A%20hunter2 SECRETTAIL encoded prose',
+			'token=abc%\r\nSECRETTAIL malformed-percent prose',
+			'api_key: sk-100%pure\nSECRETTAIL malformed-percent prose',
+			'to\u0001ken=SECRETVAL control-obfuscated prose',
+			'to\u200bken=SECRETVAL zero-width-obfuscated prose',
+			'to\u200cken=SECRETVAL zero-width-nonjoiner prose',
+			'to\u200dken=SECRETVAL zero-width-joiner prose',
+			'to\u2060ken=SECRETVAL word-joiner prose',
+			'to\u00adken=SECRETVAL soft-hyphen prose',
+			'api_key: sk-ABCDEF\r\nGHIJKL more text',
 			'Authorization: Basic QWxhZGRpbjpvcGVu',
+			'Authorization: Bearer first second third',
+			'secret: "quoted multi word secret" plausible prose',
+			"secret: 'single quoted secret' plausible prose",
+			'secret: unquoted multi word secret and prose',
+			'secret: value followed by plausible prose',
+			'secret:\r\ncontinued secret tail and prose',
 			'db_password: hunter2',
 			'x_api_key: abcdefgh',
 			'session_token : abcdef123456',
@@ -140,13 +160,7 @@ suite('TaskToolsCore', () => {
 			'password: \u202ehunter2',
 		]) {
 			const result = sanitizeDelegationText(`Safe before. ${credential} Safe after.`, 2_048);
-			assert.doesNotMatch(
-				result,
-				/QWxhZGRpbjpvcGVu|hunter2|abcdefgh|abcdef123456|AKIAIOSFODNN7EXAMPLE|topsecretvalue/u,
-				credential,
-			);
-			assert.match(result, /Safe before\./u);
-			assert.match(result, /Safe after\./u);
+			assert.equal(result, '[redacted sensitive details]', credential);
 		}
 		assert.equal(
 			sanitizeDelegationText('MIME text/plain is safe.', 2_048),
@@ -155,6 +169,88 @@ suite('TaskToolsCore', () => {
 		assert.doesNotMatch(
 			sanitizeDelegationText('Read etc/passwd only if needed.', 2_048),
 			/etc\/passwd/u,
+		);
+	});
+
+	test('fails closed on credential continuations through delegate and get paths', async () => {
+		const credentialFields = [
+			'token=abc\r\ndef unique-tail-1',
+			'token=abc\ndef unique-tail-2',
+			'token=abc\tdef unique-tail-3',
+			'Authorization: Bearer first second unique-tail-4',
+			'secret: "quoted multi word" unique-tail-5 plausible prose',
+			'secret: unquoted multi word unique-tail-6 plausible prose',
+			'password: password: hunter2 unique-tail-7',
+			'api_key:\r\ncontinued unique-tail-8 plausible prose',
+			'token%3Dabc unique-tail-9 encoded prose',
+			'to\u0001ken=abc unique-tail-10 control-obfuscated prose',
+			'token=abc%\r\nunique-tail-11 malformed-percent prose',
+			'to\u200cken=abc unique-tail-12 format-obfuscated prose',
+		];
+		for (const field of credentialFields) {
+			const facade = new RecordingFacade();
+			facade.delegationSnapshot = {
+				taskId: TASK_ID,
+				status: 'completed',
+				title: 'Fix scheduler',
+				updatedAt: '2026-08-25T00:00:01.000Z',
+				summary: field,
+			};
+			const delegated = await new TaskToolsCore(facade).delegateTask(delegationInput());
+			assert.equal(
+				(delegated.r as Record<string, unknown>).summary,
+				'[redacted sensitive details]',
+				field,
+			);
+			assert.equal(delegated.t, TASK_ID);
+			assert.equal(delegated.d, DELEGATION_ID);
+
+			facade.taskRead = {
+				snapshot: {
+					taskId: TASK_ID,
+					status: 'completed',
+					title: 'Fix scheduler',
+					updatedAt: '2026-08-25T00:00:01.000Z',
+					summary: field,
+				},
+				eventCursor: 1,
+				events: [{
+					sequence: 1,
+					type: 'progress',
+					at: '2026-08-25T00:00:00.000Z',
+					summary: field,
+				}],
+				truncated: false,
+			};
+			const tracked = await new TaskToolsCore(facade).getTask({ taskId: TASK_ID });
+			assert.equal(
+				(tracked.snapshot as Record<string, unknown>).summary,
+				'[redacted sensitive details]',
+				field,
+			);
+			assert.equal(
+				(tracked.events as Array<Record<string, unknown>>)[0]?.summary,
+				'[redacted sensitive details]',
+				field,
+			);
+			for (const fragment of field.split(/[:=\s"']+/u).filter((part) => part.startsWith('unique-tail'))) {
+				assert.doesNotMatch(JSON.stringify({ delegated, tracked }), new RegExp(fragment, 'u'));
+			}
+		}
+
+		const safe = 'First safe line\r\nSecond safe line\twith normal prose.';
+		const safeFacade = new RecordingFacade();
+		safeFacade.delegationSnapshot = {
+			taskId: TASK_ID,
+			status: 'completed',
+			title: 'Fix scheduler',
+			updatedAt: '2026-08-25T00:00:01.000Z',
+			summary: safe,
+		};
+		const safeResult = await new TaskToolsCore(safeFacade).delegateTask(delegationInput());
+		assert.equal(
+			(safeResult.r as Record<string, unknown>).summary,
+			'First safe line Second safe line with normal prose.',
 		);
 	});
 
@@ -203,8 +299,7 @@ suite('TaskToolsCore', () => {
 		};
 		const tracked = await new TaskToolsCore(facade).getTask({ taskId: TASK_ID });
 		const event = (tracked.events as Array<Record<string, unknown>>)[0]!;
-		assert.match(String(event.summary), /Compiled\. Tests passed\./u);
-		assert.doesNotMatch(String(event.summary), /bearer|ghp_|abcdefghijklmnopqrstuvwxyz/iu);
+		assert.equal(event.summary, '[redacted sensitive details]');
 	});
 
 	test('generates a fresh delegation identity when the caller omits one', async () => {

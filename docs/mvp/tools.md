@@ -100,8 +100,11 @@ wire form before any generic error or empty-text fallback:
 The branch-specific fields are exact: `r` appears only for completion; `i` and
 `q` only for needs-input; and `x` only for cancellation. Every compact branch
 preserves `t` and `d`. Questions, result summaries, and error text normalize benign multiline
-whitespace, redact unsafe path/credential/control spans, and remain bounded
-before token contraction. Safe surrounding content is retained. Byte-budget
+whitespace, redact unsafe path/control spans, and remain bounded before token
+contraction. A field containing a recognized credential assignment or bearer
+credential is redacted in full before whitespace normalization, so continuation
+text cannot escape the credential boundary; otherwise safe surrounding content
+is retained. Byte-budget
 contraction always preserves `t` and `d`; if a completed or needs-input payload
 cannot fit, it becomes exact compact failure
 `{s:2,t,d,e:"OUTPUT_TOO_LARGE"}` rather than an identity-free generic result.

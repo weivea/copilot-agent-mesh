@@ -28,6 +28,14 @@ export function containsUnsafeDashboardText(value: string): boolean {
 	return containsUnsafeDashboardTextAtDepth(value, 0);
 }
 
+export function containsCredentialText(value: string): boolean {
+	if (containsCredentialTextRaw(value)) {
+		return true;
+	}
+	const canonicalForms = canonicalizePercentEncoding(value);
+	return canonicalForms !== undefined && canonicalForms.some(containsCredentialTextRaw);
+}
+
 function containsUnsafeDashboardTextAtDepth(value: string, depth: number): boolean {
 	const canonicalForms = canonicalizePercentEncoding(value);
 	if (canonicalForms === undefined) {
@@ -40,14 +48,7 @@ function containsUnsafeDashboardTextAtDepth(value: string, depth: number): boole
 	}
 	const canonical = canonicalForms[canonicalForms.length - 1];
 	const lower = canonical.toLowerCase();
-	if (
-		lower.includes('file://')
-		|| lower.includes('api_key=')
-		|| lower.includes('api-key=')
-		|| lower.includes('bearer ')
-		|| githubTokenPrefixes.some((prefix) => lower.includes(prefix))
-		|| containsCredentialAssignment(lower)
-	) {
+	if (lower.includes('file://') || containsCredentialText(value)) {
 		return true;
 	}
 	return lexicalTokens(lower).some(isPathToken);
@@ -171,11 +172,12 @@ function canonicalizePercentEncoding(value: string): string[] | undefined {
 	return canonical.includes('%') ? undefined : forms;
 }
 
-export function containsCredentialAssignment(value: string): boolean {
+function containsCredentialAssignment(value: string): boolean {
 	for (let separator = 0; separator < value.length; separator += 1) {
 		if (value[separator] !== '=' && value[separator] !== ':') {
 			continue;
 		}
+
 		let cursor = separator - 1;
 		while (cursor >= 0 && isCredentialPadding(value[cursor])) {
 			cursor -= 1;
@@ -195,6 +197,15 @@ export function containsCredentialAssignment(value: string): boolean {
 		}
 	}
 	return false;
+}
+
+function containsCredentialTextRaw(value: string): boolean {
+	const lower = value.toLowerCase();
+	return lower.includes('api_key=')
+		|| lower.includes('api-key=')
+		|| lower.includes('bearer ')
+		|| githubTokenPrefixes.some((prefix) => lower.includes(prefix))
+		|| containsCredentialAssignment(lower);
 }
 
 function isCredentialPadding(character: string): boolean {
