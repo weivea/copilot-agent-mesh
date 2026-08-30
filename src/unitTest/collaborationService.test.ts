@@ -149,6 +149,43 @@ test('orchestrator cancellation stops the exact active task and cancels pending 
 	await fixture.service.dispose();
 });
 
+test('either participant can answer the exact pending collaboration input', async () => {
+	const fixture = createFixture();
+	const run = await fixture.service.start(caller, startParams());
+	const backendTaskId = fixture.tasks.starts[0].taskId;
+	const inputId = uuid(80);
+	fixture.tasks.needInput(backendTaskId, inputId);
+	fixture.service.observeTaskSnapshot(fixture.tasks.require(backendTaskId));
+	const waiting = await fixture.service.get(caller, run.runId);
+	assert.equal(waiting.status, 'needsInput');
+
+	const answered = await fixture.service.answer(
+		{
+			nodeId: BACKEND_NODE_ID,
+			nodeInstanceId: BACKEND_INSTANCE_ID,
+		},
+		{
+			runId: run.runId,
+			taskId: backendTaskId,
+			inputId,
+			answerId: uuid(81),
+			answer: 'approve',
+		},
+	);
+
+	assert.equal(answered.status, 'running');
+	assert.equal(answered.tasks[0].status, 'running');
+	assert.equal(answered.tasks[0].pendingInput, undefined);
+	assert.deepStrictEqual(fixture.tasks.answers, [{
+		ownerId: DEVICE_ID,
+		taskId: backendTaskId,
+		inputId,
+		answerId: uuid(81),
+		answer: 'approve',
+	}]);
+	await fixture.service.dispose();
+});
+
 test('orchestrator blocks dependencies on failure and rejects unavailable participant routes', async () => {
 	const fixture = createFixture();
 	const run = await fixture.service.start(caller, startParams());
@@ -219,6 +256,13 @@ function createFixture(
 class FakeTaskService implements CollaborationTaskService {
 	public readonly starts: RoutedTaskStartParams[] = [];
 	public readonly cancelled: string[] = [];
+	public readonly answers: Array<{
+		readonly ownerId: string;
+		readonly taskId: string;
+		readonly inputId: string;
+		readonly answerId: string;
+		readonly answer: string;
+	}> = [];
 	private readonly snapshots = new Map<string, TaskSnapshot>();
 	private readonly requests = new Map<string, RoutedTaskStartParams>();
 
@@ -274,6 +318,34 @@ class FakeTaskService implements CollaborationTaskService {
 		const snapshot = taskSnapshot(request, 'cancelled', 'Task cancellation was confirmed.');
 		this.snapshots.set(taskId, snapshot);
 		return snapshot;
+	}
+
+	public async answer(
+		ownerId: string,
+		taskId: string,
+		inputId: string,
+		answerId: string,
+		answer: string,
+	): Promise<TaskSnapshot> {
+		const request = this.requests.get(taskId);
+		const current = this.snapshots.get(taskId);
+		if (
+			request === undefined
+			|| current?.state !== 'needsInput'
+			|| current.pendingInput?.inputId !== inputId
+		) {
+			throw new MeshDomainError('INPUT_NOT_PENDING', 'Input not pending.');
+		}
+		this.answers.push({ ownerId, taskId, inputId, answerId, answer });
+		const snapshot = taskRunningAfterAnswerSnapshot(request);
+		this.snapshots.set(taskId, snapshot);
+		return snapshot;
+	}
+
+	public needInput(taskId: string, inputId: string): void {
+		const request = this.requests.get(taskId);
+		assert.ok(request);
+		this.snapshots.set(taskId, taskNeedsInputSnapshot(request, inputId));
 	}
 
 	public complete(taskId: string, summary: string): void {
@@ -332,6 +404,46 @@ function taskSnapshot(
 		events: event,
 		eventsTruncated: false,
 		deviceId: DEVICE_ID,
+	});
+}
+
+function taskNeedsInputSnapshot(
+	request: RoutedTaskStartParams,
+	inputId: string,
+): TaskSnapshot {
+	return taskSnapshotSchema.parse({
+		...taskSnapshot(request, 'running'),
+		state: 'needsInput',
+		updatedAt: AT,
+		eventSeq: 1,
+		pendingInput: {
+			inputId,
+			prompt: 'Run in terminal?',
+		},
+		events: [{
+			eventSeq: 1,
+			at: AT,
+			type: 'inputRequired',
+		}],
+	});
+}
+
+function taskRunningAfterAnswerSnapshot(
+	request: RoutedTaskStartParams,
+): TaskSnapshot {
+	return taskSnapshotSchema.parse({
+		...taskSnapshot(request, 'running'),
+		updatedAt: AT,
+		eventSeq: 2,
+		events: [{
+			eventSeq: 1,
+			at: AT,
+			type: 'inputRequired',
+		}, {
+			eventSeq: 2,
+			at: AT,
+			type: 'inputAnswered',
+		}],
 	});
 }
 

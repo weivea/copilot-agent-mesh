@@ -21,6 +21,7 @@ type CollaborationClient = Pick<
 	| 'startCollaboration'
 	| 'getCollaboration'
 	| 'cancelCollaboration'
+	| 'answerCollaboration'
 >;
 
 export class LocalBrokerCollaborationFacade implements CollaborationToolFacade {
@@ -76,6 +77,27 @@ export class LocalBrokerCollaborationFacade implements CollaborationToolFacade {
 			return {
 				run: collaborationRunSnapshotSchema.parse(
 					await raceAbort(this.client.cancelCollaboration(runId), signal),
+				),
+			};
+		} catch (error: unknown) {
+			throw toFacadeError(error);
+		}
+	}
+
+	public async answerCollaboration(
+		input: {
+			readonly runId: string;
+			readonly taskId: string;
+			readonly inputId: string;
+			readonly answerId: string;
+			readonly answer: string;
+		},
+		signal: AbortSignal,
+	): Promise<CollaborationRunToolResult> {
+		try {
+			return {
+				run: collaborationRunSnapshotSchema.parse(
+					await raceAbort(this.client.answerCollaboration(input), signal),
 				),
 			};
 		} catch (error: unknown) {

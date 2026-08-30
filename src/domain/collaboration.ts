@@ -17,6 +17,7 @@ export type CollaborationRun = PersistedCollaborationRun;
 
 export type CollaborationDomainEvent =
 	| { readonly type: 'taskDispatching'; readonly taskId: string; readonly at: string }
+	| { readonly type: 'taskRunning'; readonly taskId: string; readonly at: string }
 	| {
 		readonly type: 'taskNeedsInput';
 		readonly taskId: string;
@@ -206,6 +207,21 @@ export function collaborationReducer(
 					...task,
 					status: 'running',
 					block: undefined,
+					pendingInput: undefined,
+				};
+			});
+			break;
+		case 'taskRunning':
+			tasks = updateTask(tasks, event.taskId, (task) => {
+				if (task.status === 'running') {
+					return task;
+				}
+				if (task.status !== 'needsInput') {
+					throw invalidTransition(task.status, event.type);
+				}
+				return {
+					...task,
+					status: 'running',
 					pendingInput: undefined,
 				};
 			});

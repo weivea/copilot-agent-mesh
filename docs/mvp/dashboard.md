@@ -41,7 +41,11 @@ approval prompts accept `approve`, `continue`, `继续`, `同意`, `批准`, `�
 and `允许`. The card and native dialog show a short opaque input-ID prefix so
 multiple identical `Run in terminal?` requests are visibly distinct. One click
 continues through inputs that are already queued; later Agent requests appear as
-a new ID and require a new explicit confirmation.
+a new ID and require a new explicit confirmation. Collaboration answers use a
+Broker-owned `runId + taskId + inputId` operation, so either live participant
+window can answer without bypassing run membership or current-input checks. The
+aggregate consumes the authoritative resumed task snapshot and clears the old
+`needsInput` immediately.
 
 ## Message and data boundary
 

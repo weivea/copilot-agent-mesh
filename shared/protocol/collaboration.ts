@@ -165,11 +165,19 @@ export const collaborationRunParamsSchema = z.strictObject({
 	runId: uuidSchema,
 });
 
+export const collaborationAnswerParamsSchema = collaborationRunParamsSchema.extend({
+	taskId: uuidSchema,
+	inputId: uuidSchema,
+	answerId: uuidSchema,
+	answer: utf8String(PROTOCOL_LIMITS.taskAnswerBytes, 'collaboration answer', 1),
+});
+
 export const COLLABORATION_LOCAL_METHODS = {
 	start: 'broker.collaboration.start',
 	get: 'broker.collaboration.get',
 	list: 'broker.collaboration.list',
 	cancel: 'broker.collaboration.cancel',
+	answer: 'broker.collaboration.answer',
 } as const;
 
 export const localCollaborationMethodParamsSchemas = {
@@ -177,6 +185,7 @@ export const localCollaborationMethodParamsSchemas = {
 	[COLLABORATION_LOCAL_METHODS.get]: collaborationRunParamsSchema,
 	[COLLABORATION_LOCAL_METHODS.list]: z.strictObject({}),
 	[COLLABORATION_LOCAL_METHODS.cancel]: collaborationRunParamsSchema,
+	[COLLABORATION_LOCAL_METHODS.answer]: collaborationAnswerParamsSchema,
 } as const;
 
 export const collaborationListResultSchema = z.strictObject({
@@ -212,6 +221,7 @@ export type PersistedCollaborationRun = z.infer<typeof persistedCollaborationRun
 export type CollaborationTaskRecord = PersistedCollaborationRun['tasks'][number];
 export type CollaborationRunSnapshot = z.infer<typeof collaborationRunSnapshotSchema>;
 export type CollaborationStartParams = z.infer<typeof collaborationStartParamsSchema>;
+export type CollaborationAnswerParams = z.infer<typeof collaborationAnswerParamsSchema>;
 export type CollaborationListResult = z.infer<typeof collaborationListResultSchema>;
 
 function validateRun(

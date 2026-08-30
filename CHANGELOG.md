@@ -40,7 +40,10 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
   answers are bound to the exact pending input ID, and common Chinese approval
   terms such as `继续`、`同意` and `批准` are accepted. Repeated identical
   confirmations now expose a short input-ID prefix and already queued requests
-  continue in the same interaction, making successful answers visible.
+  continue in the same interaction, making successful answers visible. Answers
+  now route through the Broker-owned Collaboration aggregate, so either current
+  participant window can answer, and the run immediately clears stale
+  `needsInput` after the underlying task resumes.
 - Upgraded the production AHP client from the published 0.8.0 tarball to the
   TypeScript 0.9.0 client built from pinned upstream commit
   `f19dd8b3942d029744a3bdd31d830f9428e8ea47`, which negotiates AHP 1.0.0 with

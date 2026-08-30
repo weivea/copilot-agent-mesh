@@ -609,19 +609,8 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 	): Promise<void> {
 		const controller = deadlineSignal(10_000);
 		try {
-			const { run } = await this.options.localCollaborations.getCollaboration(
+			await this.options.localCollaborations.answerCollaboration({
 				runId,
-				controller.signal,
-			);
-			const task = run.tasks.find((candidate) =>
-				candidate.taskId === taskId
-				&& candidate.status === 'needsInput'
-				&& candidate.pendingInput?.inputId === inputId,
-			);
-			if (task === undefined) {
-				throw new Error('The collaboration input changed before the answer was submitted.');
-			}
-			await this.options.localTasks.answerOwnedTask({
 				taskId,
 				inputId,
 				answerId: randomUUID(),

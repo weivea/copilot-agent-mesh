@@ -11,6 +11,7 @@ import {
 	JSON_RPC_ERROR_CODES,
 	LOCAL_BROKER_METHODS,
 	collaborationListResultSchema,
+	collaborationAnswerParamsSchema,
 	collaborationRunParamsSchema,
 	collaborationRunSnapshotSchema,
 	collaborationStartParamsSchema,
@@ -496,6 +497,12 @@ export class DeviceBroker {
 				const input = collaborationRunParamsSchema.parse(params);
 				return toJsonValue(collaborationRunSnapshotSchema.parse(
 					await this.requireCollaborationService().cancel(binding, input.runId),
+				));
+			}
+			case COLLABORATION_LOCAL_METHODS.answer: {
+				const input = collaborationAnswerParamsSchema.parse(params);
+				return toJsonValue(collaborationRunSnapshotSchema.parse(
+					await this.requireCollaborationService().answer(binding, input),
 				));
 			}
 			default:

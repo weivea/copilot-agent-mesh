@@ -12,6 +12,7 @@ import {
 	LOCAL_BROKER_METHODS,
 	PROTOCOL_LIMITS,
 	collaborationListResultSchema,
+	collaborationAnswerParamsSchema,
 	collaborationRunSnapshotSchema,
 	collaborationStartParamsSchema,
 	nodeDirectoryResultSchema,
@@ -30,6 +31,7 @@ import {
 	windowNodeDescriptorSchema,
 	type NodeDirectoryResult,
 	type CollaborationListResult,
+	type CollaborationAnswerParams,
 	type CollaborationRunSnapshot,
 	type CollaborationStartParams,
 	type NodeStatus,
@@ -341,6 +343,16 @@ export class WindowNodeClient implements WorkspaceResolver {
 		return this.request(
 			COLLABORATION_LOCAL_METHODS.cancel,
 			toJsonValue({ runId }),
+			collaborationRunSnapshotSchema,
+		);
+	}
+
+	public answerCollaboration(
+		input: CollaborationAnswerParams,
+	): Promise<CollaborationRunSnapshot> {
+		return this.request(
+			COLLABORATION_LOCAL_METHODS.answer,
+			toJsonValue(collaborationAnswerParamsSchema.parse(input)),
 			collaborationRunSnapshotSchema,
 		);
 	}

@@ -8,6 +8,7 @@ import {
 	collaborationStartParamsSchema,
 	PROTOCOL_LIMITS,
 	type CollaborationListResult,
+	type CollaborationAnswerParams,
 	type CollaborationRunSnapshot,
 	type CollaborationStartParams,
 	type CollaborationValidationSummary,
@@ -76,6 +77,7 @@ export type CollaborationTaskService = Pick<
 	| 'reconcileStartFailure'
 	| 'getLocal'
 	| 'cancel'
+	| 'answer'
 >;
 
 export type CollaborationNodeRegistry = Pick<NodeRegistry, 'list'>;
@@ -210,6 +212,37 @@ export class CollaborationService {
 					await this.applyTaskSnapshot(run.runId, snapshot as TaskSnapshot);
 				}
 			}
+			await this.reconcileRun(run.runId);
+			return this.snapshot(await this.requireAccessible(caller, run.runId));
+		});
+	}
+
+	public answer(
+		caller: CollaborationCaller,
+		input: CollaborationAnswerParams,
+	): Promise<CollaborationRunSnapshot> {
+		return this.runExclusive(async () => {
+			const run = await this.requireAccessible(caller, input.runId);
+			const task = run.tasks.find((candidate) =>
+				candidate.taskId === input.taskId
+				&& candidate.status === 'needsInput'
+				&& candidate.pendingInput?.inputId === input.inputId,
+			);
+			if (task === undefined) {
+				throw new MeshDomainError(
+					'INPUT_NOT_PENDING',
+					'The collaboration input is no longer pending.',
+				);
+			}
+			const snapshot = await this.tasks.answer(
+				this.deviceId,
+				task.taskId,
+				input.inputId,
+				input.answerId,
+				input.answer,
+			);
+			await this.taskRoutes.markSnapshot(snapshot);
+			await this.applyTaskSnapshot(run.runId, snapshot);
 			await this.reconcileRun(run.runId);
 			return this.snapshot(await this.requireAccessible(caller, run.runId));
 		});
@@ -410,6 +443,12 @@ export class CollaborationService {
 					at,
 					inputId: snapshot.pendingInput.inputId,
 					prompt: snapshot.pendingInput.prompt,
+				});
+			} else if (task.status === 'needsInput') {
+				run = await this.runs.transition(run.runId, {
+					type: 'taskRunning',
+					taskId: task.taskId,
+					at,
 				});
 			}
 			this.changed();
