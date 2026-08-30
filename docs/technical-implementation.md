@@ -1,5 +1,13 @@
 # Copilot Agent Mesh 技术实施方案
 
+> **⚠️ 同设备协作章节自 0.4.0 起被取代。**<br>
+> Collaboration Run、DAG 调度与 Dashboard 协作入口已作废，替换为
+> [0.4.0 技术设计：Peer Window Delegation](0.4.0-peer-delegation-design.md)。
+> Agent Host 集成方式也已依据
+> [Editor Agent Host Endpoint Spike](spikes/editor-agent-host.md) 调整为优先连接
+> 用户实例的 `editor` endpoint。Broker、Window Node、Workspace Lease、本地 IPC、
+> Task 生命周期与脱敏边界等章节**仍然有效**。
+
 > 状态：0.3.0 Preview Same-device Multi-project Collaboration；Gate G0 在 macOS
 > arm64 验证范围内 Go<br>
 > 日期：2026-08-30<br>

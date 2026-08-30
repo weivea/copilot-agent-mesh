@@ -6,6 +6,31 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [Unreleased]
 
+- Documented the 0.4.0 Peer Window Delegation redesign. Same-device multi-project
+  collaboration moves from the Dashboard-driven fixed frontend/backend DAG to
+  Copilot Chat driven peer window delegation: each window is its own primary node,
+  authorizes peers through a directional workspace allowlist plus a receive-side
+  "accept incoming tasks" gate, can be renamed for human reference, and delegates
+  through the existing five Mesh Tools. See
+  `docs/0.4.0-peer-delegation-requirements.md`.
+- Documented the 0.4.0 technical design covering the Broker-owned peer policy
+  store, double authorization gate and distinguishable error codes, long-running
+  `mesh_delegate_task` with authoritative terminal outcomes, per-task delegation
+  grants, recursion prevention, Dashboard rework, and the test matrix. See
+  `docs/0.4.0-peer-delegation-design.md`.
+- Added the Editor Agent Host Endpoint spike. A running VS Code instance exposes a
+  `type: "editor"` AHP endpoint over a Unix socket that negotiates protocol
+  `1.0.0`, reuses the signed-in Copilot identity, and lists the user's real chat
+  sessions. This replaces the isolated standalone host as the preferred runtime
+  source and makes child-task visibility in the target window plausible; the
+  standalone launcher stays as an explicitly degraded fallback. See
+  `docs/spikes/editor-agent-host.md`.
+- Recorded that the stable VS Code tool confirmation surface offers only
+  Continue/Cancel, so delegation authorization is a binary confirmation whose scope
+  is stated in the confirmation body rather than a third button.
+- Marked the collaboration sections of the PRD and the technical implementation
+  plan as superseded. No code has changed yet; 0.3.0 behaviour is unaffected.
+
 ## [0.3.0 Preview] - 2026-08-30
 
 - Added a generation-fenced, durable `CollaborationRun` aggregate with explicit
