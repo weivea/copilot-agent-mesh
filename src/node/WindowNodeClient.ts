@@ -9,8 +9,12 @@ import {
 	brokerRemoteTaskStartParamsSchema,
 	JSON_RPC_ERROR_CODES,
 	LOCAL_BROKER_METHODS,
+	LOCAL_BROKER_NOTIFICATIONS,
 	PROTOCOL_LIMITS,
 	nodeDirectoryResultSchema,
+	nodePolicyResultSchema,
+	nodePolicySetParamsSchema,
+	peerPolicyCandidateListResultSchema,
 	nodeStatusSchema,
 	nodeTaskAnswerParamsSchema,
 	nodeTaskCancelParamsSchema,
@@ -25,7 +29,10 @@ import {
 	uuidSchema,
 	windowNodeDescriptorSchema,
 	type NodeDirectoryResult,
+	type NodePolicyResult,
+	type NodePolicySetParams,
 	type NodeStatus,
+	type PeerPolicyCandidateListResult,
 	type NodeTaskEventParams,
 	type RoutedTaskStartParams,
 	type TaskSnapshot,
@@ -304,6 +311,43 @@ export class WindowNodeClient implements WorkspaceResolver {
 
 	public listNodes(): Promise<NodeDirectoryResult> {
 		return this.request(LOCAL_BROKER_METHODS.list, {}, nodeDirectoryResultSchema);
+	}
+
+	public getPeerPolicy(): Promise<NodePolicyResult> {
+		return this.request(
+			LOCAL_BROKER_METHODS.policyGet,
+			toJsonValue({
+				nodeId: this.nodeId,
+				nodeInstanceId: this.nodeInstanceId,
+			}),
+			nodePolicyResultSchema,
+		);
+	}
+
+	public setPeerPolicy(
+		patch: Omit<NodePolicySetParams, 'nodeId' | 'nodeInstanceId'>,
+	): Promise<NodePolicyResult> {
+		const params = nodePolicySetParamsSchema.parse({
+			nodeId: this.nodeId,
+			nodeInstanceId: this.nodeInstanceId,
+			...patch,
+		});
+		return this.request(
+			LOCAL_BROKER_METHODS.policySet,
+			toJsonValue(params),
+			nodePolicyResultSchema,
+		);
+	}
+
+	public listPeerPolicyCandidates(): Promise<PeerPolicyCandidateListResult> {
+		return this.request(
+			LOCAL_BROKER_METHODS.policyCandidates,
+			toJsonValue({
+				nodeId: this.nodeId,
+				nodeInstanceId: this.nodeInstanceId,
+			}),
+			peerPolicyCandidateListResultSchema,
+		);
 	}
 
 	public listRemoteDevices(): Promise<MeshRemoteDirectorySnapshot> {
@@ -722,6 +766,10 @@ export class WindowNodeClient implements WorkspaceResolver {
 			}
 			requestExecutor = executor;
 			switch (method) {
+				case LOCAL_BROKER_NOTIFICATIONS.policyChanged:
+					z.strictObject({}).parse(params);
+					this.changed();
+					return null;
 				case LOCAL_BROKER_METHODS.taskStart: {
 					const input = nodeTaskStartParamsSchema.parse(params);
 					this.assertTaskTarget(input.target.nodeId, input.target.nodeInstanceId);

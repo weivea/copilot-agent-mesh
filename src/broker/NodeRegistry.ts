@@ -105,6 +105,8 @@ export interface TaskRouteRequest {
 	readonly workspaceId: string;
 	readonly ownerId: string;
 	readonly taskId: string;
+	readonly sourceNodeId?: string;
+	readonly sourceNodeInstanceId?: string;
 }
 
 export interface TaskRoute {
@@ -122,6 +124,36 @@ export interface AuthenticatedNodeTaskEvent {
 	readonly nodeId: string;
 	readonly nodeInstanceId: string;
 	readonly taskId: string;
+}
+
+export interface PeerWorkspaceSnapshot {
+	readonly workspaceId: string;
+	readonly workspaceIdentity: string;
+	readonly name: string;
+	readonly status: WorkspaceClaimStatus;
+	readonly busy: boolean;
+}
+
+export interface PeerNodeSnapshot {
+	readonly nodeId: string;
+	readonly nodeInstanceId: string;
+	readonly label: string;
+	readonly status: NodeStatus;
+	readonly online: boolean;
+	readonly workspaces: readonly PeerWorkspaceSnapshot[];
+}
+
+export interface PeerRouteAuthorizationContext {
+	readonly source: PeerNodeSnapshot | undefined;
+	readonly target: PeerNodeSnapshot | undefined;
+	readonly targetWorkspaceIdentity: string | undefined;
+}
+
+export interface PeerRouteAuthorizer {
+	assertRouteAllowed(
+		request: TaskRouteRequest,
+		context: PeerRouteAuthorizationContext,
+	): void;
 }
 
 export interface RegistryTimer {
@@ -165,6 +197,7 @@ interface NodeRecord {
 	session: LocalIpcSession | undefined;
 	removeCloseListener: (() => void) | undefined;
 	readonly workspaces: Map<string, WorkspaceObservation>;
+	readonly workspaceHistory: Map<string, WorkspaceObservation>;
 }
 
 interface ActiveWorkspaceClaim {
@@ -190,6 +223,7 @@ export class NodeRegistry {
 	private timer: RegistryTimer | undefined;
 	private initializing: Promise<void> | undefined;
 	private operationQueue: Promise<void> = Promise.resolve();
+	private peerRouteAuthorizer: PeerRouteAuthorizer | undefined;
 	private disposed = false;
 
 	public constructor(private readonly options: NodeRegistryOptions) {
@@ -303,6 +337,7 @@ export class NodeRegistry {
 			session,
 			removeCloseListener: undefined,
 			workspaces: new Map(),
+			workspaceHistory: new Map(),
 		};
 		node.removeCloseListener = this.listenForNodeClose(node, session);
 		this.nodes.set(node.nodeId, node);
@@ -389,6 +424,31 @@ export class NodeRegistry {
 		return node.label;
 	}
 
+	public setPeerRouteAuthorizer(authorizer: PeerRouteAuthorizer): void {
+		this.assertNotDisposed();
+		if (this.peerRouteAuthorizer !== undefined && this.peerRouteAuthorizer !== authorizer) {
+			throw new Error('The Node Registry peer route authorizer is already configured.');
+		}
+		this.peerRouteAuthorizer = authorizer;
+	}
+
+	public peerNode(identity: NodeIdentityParams): PeerNodeSnapshot | undefined {
+		this.assertReady();
+		const parsed = nodeIdentityParamsSchema.parse(identity);
+		const node = this.nodes.get(parsed.nodeId);
+		if (node === undefined || node.nodeInstanceId !== parsed.nodeInstanceId) {
+			return undefined;
+		}
+		return this.peerSnapshot(node);
+	}
+
+	public peerNodes(): readonly PeerNodeSnapshot[] {
+		this.assertReady();
+		return [...this.nodes.values()]
+			.sort((left, right) => left.nodeId.localeCompare(right.nodeId))
+			.map((node) => this.peerSnapshot(node));
+	}
+
 	public claimWorkspace(params: NodeWorkspaceClaimParams): Promise<WorkspaceClaimResult> {
 		return this.runExclusive(async () => {
 			this.assertReady();
@@ -402,11 +462,13 @@ export class NodeRegistry {
 			const active = this.claims.get(input.workspaceIdentity);
 
 			if (!catalogEntry.enabled) {
-				node.workspaces.set(input.workspaceIdentity, {
+				const observation = {
 					workspaceId: catalogEntry.workspaceId,
 					workspaceIdentity: input.workspaceIdentity,
 					status: 'readOnly',
-				});
+				} as const;
+				node.workspaces.set(input.workspaceIdentity, observation);
+				node.workspaceHistory.set(input.workspaceIdentity, observation);
 				return claimResult(catalogEntry.workspaceId, 'readOnly');
 			}
 			if (
@@ -416,11 +478,13 @@ export class NodeRegistry {
 					|| active.nodeInstanceId !== node.nodeInstanceId
 				)
 			) {
-				node.workspaces.set(input.workspaceIdentity, {
+				const observation = {
 					workspaceId: catalogEntry.workspaceId,
 					workspaceIdentity: input.workspaceIdentity,
 					status: 'conflict',
-				});
+				} as const;
+				node.workspaces.set(input.workspaceIdentity, observation);
+				node.workspaceHistory.set(input.workspaceIdentity, observation);
 				return claimResult(catalogEntry.workspaceId, 'conflict');
 			}
 			if (
@@ -435,11 +499,13 @@ export class NodeRegistry {
 				nodeId: node.nodeId,
 				nodeInstanceId: node.nodeInstanceId,
 			});
-			node.workspaces.set(input.workspaceIdentity, {
+			const observation = {
 				workspaceId: catalogEntry.workspaceId,
 				workspaceIdentity: input.workspaceIdentity,
 				status: 'claimed',
-			});
+			} as const;
+			node.workspaces.set(input.workspaceIdentity, observation);
+			node.workspaceHistory.set(input.workspaceIdentity, observation);
 			return claimResult(catalogEntry.workspaceId, 'claimed');
 		});
 	}
@@ -463,6 +529,7 @@ export class NodeRegistry {
 			this.claims.delete(observation.workspaceIdentity);
 		}
 		node.workspaces.delete(observation.workspaceIdentity);
+		node.workspaceHistory.delete(observation.workspaceIdentity);
 	}
 
 	public acquireTaskRoute(request: TaskRouteRequest): Promise<TaskRoute> {
@@ -741,6 +808,10 @@ export class NodeRegistry {
 	} {
 		this.assertReady();
 		const identity = taskRouteRequestSchema.parse(request);
+		this.peerRouteAuthorizer?.assertRouteAllowed(
+			identity,
+			this.peerRouteAuthorizationContext(identity),
+		);
 		const node = this.requireLiveNode(identity);
 		const claim = [...this.claims.values()].find(
 			(candidate) =>
@@ -863,10 +934,12 @@ export class NodeRegistry {
 				const owner = this.options.workspaceLeases.owner(observation.workspaceIdentity);
 				return {
 					workspaceId: catalog.workspaceId,
+					workspaceIdentity: observation.workspaceIdentity,
 					name: catalog.name,
 					capabilityTags: [...catalog.capabilityTags],
 					enabled: catalog.enabled,
 					busy: owner !== undefined,
+					acceptsIncoming: false,
 					claimStatus: observation.status,
 					...(owner === undefined ? {} : { activeTaskId: owner.taskId }),
 				};
@@ -880,6 +953,58 @@ export class NodeRegistry {
 			startedAt: node.startedAt,
 			lastHeartbeatAt: node.lastHeartbeatAt,
 			workspaces,
+		};
+	}
+
+	private peerRouteAuthorizationContext(
+		request: TaskRouteRequest,
+	): PeerRouteAuthorizationContext {
+		const source = request.sourceNodeId === undefined || request.sourceNodeInstanceId === undefined
+			? undefined
+			: this.peerNode({
+				nodeId: request.sourceNodeId,
+				nodeInstanceId: request.sourceNodeInstanceId,
+			});
+		const target = this.peerNode({
+			nodeId: request.nodeId,
+			nodeInstanceId: request.nodeInstanceId,
+		});
+		const targetWorkspaceIdentity = this.catalog!.workspaces.find(
+			(workspace) => workspace.workspaceId === request.workspaceId,
+		)?.workspaceIdentity;
+		return { source, target, targetWorkspaceIdentity };
+	}
+
+	private peerSnapshot(node: NodeRecord): PeerNodeSnapshot {
+		const online = (
+			(node.status === 'online' || node.status === 'busy')
+			&& node.session !== undefined
+			&& !node.session.closed
+		);
+		const observations = online ? node.workspaces : node.workspaceHistory;
+		return {
+			nodeId: node.nodeId,
+			nodeInstanceId: node.nodeInstanceId,
+			label: node.label,
+			status: node.status,
+			online,
+			workspaces: [...observations.values()]
+				.sort((left, right) => left.workspaceId.localeCompare(right.workspaceId))
+				.map((observation) => {
+					const catalog = this.catalog!.workspaces.find(
+						(workspace) => workspace.workspaceId === observation.workspaceId,
+					);
+					if (catalog === undefined) {
+						throw new Error('Peer workspace is missing from the catalog.');
+					}
+					return {
+						workspaceId: observation.workspaceId,
+						workspaceIdentity: observation.workspaceIdentity,
+						name: catalog.name,
+						status: online ? observation.status : 'readOnly',
+						busy: this.options.workspaceLeases.isLeased(observation.workspaceIdentity),
+					};
+				}),
 		};
 	}
 
@@ -945,6 +1070,16 @@ const taskRouteRequestSchema = z.strictObject({
 	workspaceId: uuidSchema,
 	ownerId: uuidSchema,
 	taskId: uuidSchema,
+	sourceNodeId: uuidSchema.optional(),
+	sourceNodeInstanceId: uuidSchema.optional(),
+}).superRefine((request, context) => {
+	if ((request.sourceNodeId === undefined) !== (request.sourceNodeInstanceId === undefined)) {
+		context.addIssue({
+			code: 'custom',
+			path: ['sourceNodeInstanceId'],
+			message: 'Source node ID and instance ID must be provided together',
+		});
+	}
 });
 
 const nodeTaskEventIdentitySchema = z.strictObject({

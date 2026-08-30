@@ -6,6 +6,8 @@ import {
 	GATEWAY_METHODS,
 	MESH_ERROR_CODES,
 	PROTOCOL_LIMITS,
+	nodePolicyResultSchema,
+	nodePolicySetParamsSchema,
 	persistedTaskRecordSchema,
 	rpcErrorResponseSchema,
 	rpcNotificationSchema,
@@ -15,6 +17,7 @@ import {
 	taskStartParamsSchema,
 	utf8ByteLength,
 	webviewOutboundMessageSchema,
+	workspaceIdentitySchema,
 	workspaceListResultSchema,
 } from '../../../shared/protocol';
 import { createAcceptedTask } from '../../domain/task';
@@ -137,6 +140,43 @@ describe('protocol schemas', () => {
 				state: 'running',
 			},
 		}).success, true);
+	});
+
+	test('validates strict peer policy schemas and stable peer error mappings', () => {
+		const workspaceIdentity = `sha256:${'A'.repeat(43)}`;
+		assert.equal(workspaceIdentitySchema.safeParse(workspaceIdentity).success, true);
+		assert.equal(workspaceIdentitySchema.safeParse(`sha256:${'A'.repeat(42)}`).success, false);
+		assert.equal(nodePolicySetParamsSchema.safeParse({
+			nodeId: '00000000-0000-4000-8000-000000000010',
+			nodeInstanceId: '00000000-0000-4000-8000-000000000011',
+			workspaceIdentity,
+			windowName: 'frontend',
+			acceptsIncoming: true,
+			allowlist: [`sha256:${'B'.repeat(43)}`],
+		}).success, true);
+		assert.equal(nodePolicySetParamsSchema.safeParse({
+			nodeId: '00000000-0000-4000-8000-000000000010',
+			nodeInstanceId: '00000000-0000-4000-8000-000000000011',
+			workspaceIdentity,
+			unknown: true,
+		}).success, false);
+		assert.equal(nodePolicyResultSchema.safeParse({
+			workspaceIdentity,
+			windowName: 'frontend',
+			acceptsIncoming: false,
+			allowlist: [],
+		}).success, true);
+		for (const reason of [
+			'PEER_NOT_ALLOWED',
+			'PEER_NOT_ACCEPTING',
+			'PEER_OFFLINE',
+			'PEER_MULTI_WORKSPACE',
+			'WINDOW_NAME_CONFLICT',
+			'POLICY_FORBIDDEN',
+			'DELEGATION_RECURSION',
+		] as const) {
+			assert.equal(typeof MESH_ERROR_CODES[reason], 'number');
+		}
 	});
 
 	test('requires task.completed outer metadata and failure to match a terminal snapshot', () => {

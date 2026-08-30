@@ -9,8 +9,11 @@ import {
 	brokerRemoteTaskStartParamsSchema,
 	JSON_RPC_ERROR_CODES,
 	LOCAL_BROKER_METHODS,
+	LOCAL_BROKER_NOTIFICATIONS,
 	nodeHeartbeatParamsSchema,
 	nodeIdentityParamsSchema,
+	nodePolicyGetParamsSchema,
+	nodePolicySetParamsSchema,
 	nodeRegisterParamsSchema,
 	nodeTaskAnswerParamsSchema,
 	nodeTaskCancelParamsSchema,
@@ -47,6 +50,7 @@ import type {
 	BrokerTaskStartOutcome,
 } from './BrokerTaskService';
 import type { NodeRegistry } from './NodeRegistry';
+import type { PeerPolicyService } from './PeerPolicyService';
 import {
 	TaskRouteCatalog,
 	type TaskRouteRecord,
@@ -69,6 +73,7 @@ export interface DeviceBrokerOptions extends LocalIpcSessionOptions {
 	readonly brokerKey: Buffer | string;
 	readonly ownership: BrokerOwnership;
 	readonly registry: NodeRegistry;
+	readonly peerPolicies: PeerPolicyService;
 	readonly taskService: BrokerTaskService;
 	readonly remoteTaskService?: RemoteTaskRouteAdapter;
 	readonly taskRoutes?: TaskRouteCatalog;
@@ -83,7 +88,9 @@ export class DeviceBroker {
 	private readonly server: LocalIpcServer;
 	public readonly taskRoutes: TaskRouteCatalog;
 	private readonly registrations = new WeakMap<LocalIpcSession, RegisteredSession>();
+	private readonly sessions = new Set<LocalIpcSession>();
 	private readonly activeHandlers = new Set<Promise<JsonValue>>();
+	private readonly policySubscription: { dispose(): void };
 	private started = false;
 	private disposed = false;
 	private disposeRequested = false;
@@ -97,6 +104,9 @@ export class DeviceBroker {
 			throw new Error('Only the current Broker owner can construct a Device Broker.');
 		}
 		this.taskRoutes = options.taskRoutes ?? new TaskRouteCatalog();
+		this.policySubscription = options.peerPolicies.onDidChange(() => {
+			this.notifyPolicyChanged();
+		});
 		this.server = new LocalIpcServer({
 			identity: options.identity,
 			brokerKey: options.brokerKey,
@@ -117,7 +127,11 @@ export class DeviceBroker {
 			}),
 			handler: (method, params, session) => this.handleSafely(method, params, session),
 			onSession: (session) => {
-				session.onClose(() => this.registrations.delete(session));
+				this.sessions.add(session);
+				session.onClose(() => {
+					this.registrations.delete(session);
+					this.sessions.delete(session);
+				});
 			},
 			onError: options.onError,
 		});
@@ -235,6 +249,21 @@ export class DeviceBroker {
 		return operation;
 	}
 
+	private notifyPolicyChanged(): void {
+		for (const session of [...this.sessions]) {
+			if (session.closed || this.registrations.get(session) === undefined) {
+				continue;
+			}
+			void session.notify(LOCAL_BROKER_NOTIFICATIONS.policyChanged, {}).catch(
+				(error: unknown) => this.options.onError?.(
+					error instanceof Error
+						? error
+						: new Error('A peer policy notification failed.'),
+				),
+			);
+		}
+	}
+
 	private async handle(
 		method: string,
 		params: JsonValue,
@@ -287,7 +316,7 @@ export class DeviceBroker {
 			}
 			case LOCAL_BROKER_METHODS.list:
 				emptyParamsSchema.parse(params);
-				return toJsonValue(this.options.registry.list());
+				return toJsonValue(this.options.peerPolicies.listAuthorized(binding));
 			case LOCAL_BROKER_METHODS.claimWorkspace: {
 				const input = nodeWorkspaceClaimParamsSchema.parse(params);
 				this.assertIdentity(binding, input);
@@ -299,6 +328,21 @@ export class DeviceBroker {
 				this.assertIdentity(binding, input);
 				this.options.registry.releaseWorkspace(input);
 				return null;
+			}
+			case LOCAL_BROKER_METHODS.policyGet: {
+				const input = nodePolicyGetParamsSchema.parse(params);
+				this.assertIdentity(binding, input);
+				return toJsonValue(this.options.peerPolicies.getPolicy(input));
+			}
+			case LOCAL_BROKER_METHODS.policySet: {
+				const input = nodePolicySetParamsSchema.parse(params);
+				this.assertIdentity(binding, input);
+				return toJsonValue(await this.options.peerPolicies.setPolicy(binding, input));
+			}
+			case LOCAL_BROKER_METHODS.policyCandidates: {
+				const input = nodeIdentityParamsSchema.parse(params);
+				this.assertIdentity(binding, input);
+				return toJsonValue(this.options.peerPolicies.listCandidates(input));
 			}
 			case LOCAL_BROKER_METHODS.taskStart: {
 				const input = routedTaskStartParamsSchema.parse(params);
@@ -312,9 +356,9 @@ export class DeviceBroker {
 					input,
 					{ nodeId: binding.nodeId },
 					this.options.identity.deviceId,
-					() => this.options.taskService.prevalidateLocal(binding.nodeId, input),
+					() => this.options.taskService.prevalidateLocal(binding, input),
 					(outcome) =>
-						this.options.taskService.startLocal(binding.nodeId, input, outcome),
+						this.options.taskService.startLocal(binding, input, outcome),
 				);
 				return toJsonValue(snapshot);
 			}
@@ -642,6 +686,7 @@ export class DeviceBroker {
 	}
 
 	private async disposeOnce(): Promise<void> {
+		this.policySubscription.dispose();
 		const failures: unknown[] = [];
 		if (!this.serverDisposed) {
 			try {

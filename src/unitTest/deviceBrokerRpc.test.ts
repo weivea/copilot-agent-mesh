@@ -23,6 +23,7 @@ import {
 	BrokerTaskService,
 	DeviceBroker,
 	NodeRegistry,
+	type PeerPolicyService,
 	type NodeTaskBinding,
 	type RegistryScheduler,
 } from '../broker';
@@ -237,6 +238,7 @@ async function createBroker(
 			dispose: () => Promise.resolve(),
 		},
 		registry,
+		peerPolicies: passthroughPeerPolicies(registry),
 		taskService: service,
 		requestTimeoutMs: 2_000,
 	});
@@ -363,6 +365,7 @@ test('DeviceBroker retries only resources whose disposal failed', async () => {
 				registryDisposeCalls += 1;
 			},
 		} as unknown as NodeRegistry,
+		peerPolicies: passthroughPeerPolicies(),
 		taskService: {
 			dispose: async () => {
 				taskServiceDisposeCalls += 1;
@@ -425,6 +428,7 @@ test('DeviceBroker closes sessions and drains active handlers before shared stat
 				disposalOrder.push('registry');
 			},
 		} as unknown as NodeRegistry,
+		peerPolicies: passthroughPeerPolicies(),
 		taskService: {
 			dispose: async () => {
 				disposalOrder.push('task-service');
@@ -887,6 +891,18 @@ test('executor cleanup failure blocks reconnect and workspace reclaim', async ()
 		await rm(first.identity.tempDirectory, { recursive: true, force: true });
 	}
 });
+
+function passthroughPeerPolicies(registry?: NodeRegistry): PeerPolicyService {
+	return {
+		listAuthorized: () => registry?.list() ?? {
+			deviceId: DEVICE_ID,
+			nodes: [],
+			truncated: false,
+			totalNodes: 0,
+		},
+		onDidChange: () => ({ dispose: () => undefined }),
+	} as unknown as PeerPolicyService;
+}
 
 async function waitFor(predicate: () => Promise<boolean>): Promise<void> {
 	const deadline = Date.now() + 3_000;

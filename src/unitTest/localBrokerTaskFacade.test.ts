@@ -264,10 +264,12 @@ class FakeWindowNodeClient {
 				lastHeartbeatAt: '2026-08-25T00:00:01.000Z',
 				workspaces: [{
 					workspaceId: WORKSPACE_ID,
+					workspaceIdentity: `sha256:${'A'.repeat(43)}`,
 					name: 'Repository',
 					capabilityTags: ['typescript'],
 					enabled: true,
 					busy: false,
+					acceptsIncoming: false,
 					claimStatus: 'claimed',
 				}],
 			}, {

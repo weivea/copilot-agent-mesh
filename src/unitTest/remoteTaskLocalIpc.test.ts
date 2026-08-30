@@ -18,6 +18,7 @@ import {
 	TaskRouteCatalog,
 	type BrokerTaskService,
 	type NodeRegistry,
+	type PeerPolicyService,
 } from '../broker';
 import {
 	ProductionRemoteTaskAdapter,
@@ -661,6 +662,7 @@ async function createBroker(
 	remoteTasks: ProductionRemoteTaskAdapter,
 	state: StateStore,
 ): Promise<DeviceBroker> {
+	const registry = new FakeRegistry() as unknown as NodeRegistry;
 	const broker = new DeviceBroker({
 		identity,
 		brokerKey: key,
@@ -673,7 +675,11 @@ async function createBroker(
 			onDidLoseOwnership: () => ({ dispose: () => undefined }),
 			dispose: () => Promise.resolve(),
 		},
-		registry: new FakeRegistry() as unknown as NodeRegistry,
+		registry,
+		peerPolicies: {
+			listAuthorized: () => registry.list(),
+			onDidChange: () => ({ dispose: () => undefined }),
+		} as unknown as PeerPolicyService,
 		taskService: new FakeLocalTaskService() as unknown as BrokerTaskService,
 		remoteTaskService: remoteTasks,
 		taskRoutes: new TaskRouteCatalog(state, () => new Date(CREATED_AT)),
@@ -740,10 +746,12 @@ function remoteDirectory(): NodeDirectoryResult {
 			lastHeartbeatAt: CREATED_AT,
 			workspaces: [{
 				workspaceId: REMOTE_WORKSPACE_ID,
+				workspaceIdentity: `sha256:${'R'.repeat(43)}`,
 				name: 'Remote Workspace',
 				capabilityTags: ['typescript'],
 				enabled: true,
 				busy: false,
+				acceptsIncoming: false,
 				claimStatus: 'claimed',
 			}],
 		}],

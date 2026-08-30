@@ -221,12 +221,27 @@ Window A → Local Broker → Window B → real AHP → Broker Store → Window 
 Gateway/Tunnel → Broker → Target Node；Broker 在发送前持久化 Route Catalog，
 并通过 IPC 将权威 Task/Event 更新 multiplex 到全部本机窗口。
 
-### 4.6 0.1 Migration
+### 4.6 Peer Window Policy 与双重授权门
+
+0.4.0 的 Broker 独占 `mesh-state/peers/policy.json`。版本 1 的策略按不可逆
+`workspaceIdentity` 保存窗口显示名、`acceptsIncoming` 和单向 allowlist；不保存路径。
+Store 复用原子临时文件、file fsync、rename、directory fsync，并在持久化前后检查
+Broker generation。损坏 JSON、未知版本或越界数据都显式失败。
+
+`PeerPolicyService` 是唯一策略裁决者。写入者必须是已认证的精确
+`nodeId`/`nodeInstanceId`，且只能修改自己当前 `claimed` 的 Workspace。Tool
+目录与配置目录刻意分离：`node.list` 只返回通过双重门的目标；配置投影可列出本设备
+候选，但只包含脱敏显示名、短 ID、在线/接收/busy/门状态。路由在取得 Workspace
+Lease 前再次求值，关闭列出后撤销的 TOCTOU 窗口。多根来源窗口没有可认证的单一
+Workspace 上下文，因此必须由每个当前 `claimed` 的来源 Workspace 都 allowlist
+目标；目标窗口仍必须恰好 claim 一个 Workspace。
+
+### 4.7 0.1 Migration
 
 Schema v2 Migration 保留稳定 `deviceId`，并把 v1 Workspace/Task Data 转入
 Broker Store。未知或损坏的版本必须失败，不能静默重置或猜测。
 
-### 4.7 Same-device Collaboration Run
+### 4.8 Same-device Collaboration Run
 
 > 本节记录的 0.3.0 聚合自 0.4.0 起已删除。启动时仅清理旧
 > `mesh-state/collaborations` 目录，不迁移或恢复其中的数据。
@@ -1081,6 +1096,7 @@ Category：
 | `copilotAgentMesh.taskRetentionDays` | `30` | Terminal Summary 保留 |
 | `copilotAgentMesh.logLevel` | `info` | 日志级别 |
 | `copilotAgentMesh.experimental.agentHost` | `false` | Phase 0 验证前默认关闭 |
+| `copilotAgentMesh.experimental.peerDelegation` | `false` | 同设备 Peer Window 目录、策略与接收路由；默认拒绝 |
 
 本地端口、Tunnel ID、Peer ID 不应作为普通 Setting 暴露；由 Store 管理并通过 UI 操作。
 
