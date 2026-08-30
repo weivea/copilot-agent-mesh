@@ -179,6 +179,51 @@ test('registers and lists deterministic Window Node descriptors', async (t) => {
 	assert.equal(directory.nodes[0].status, 'online');
 });
 
+test('binds mandatory delegation principals to exact window and child sessions', async (t) => {
+	const { registry } = await createFixture();
+	t.after(() => registry.dispose());
+	const session = new FakeSession();
+	registry.register(registration(), session.asRoute());
+	const claimed = await registry.claimWorkspace(claim());
+	const windowPrincipal = registry.windowDelegationPrincipal(session.asRoute(), {
+		nodeId: NODE_A,
+		nodeInstanceId: INSTANCE_A,
+	});
+	assert.doesNotThrow(() => registry.assertDelegationPrincipal(
+		session.asRoute(),
+		{ nodeId: NODE_A, nodeInstanceId: INSTANCE_A },
+		windowPrincipal,
+	));
+	assert.throws(() => registry.assertDelegationPrincipal(
+		session.asRoute(),
+		{ nodeId: NODE_A, nodeInstanceId: INSTANCE_A },
+		{ ...windowPrincipal, capability: 'x'.repeat(43) },
+	), /invalid or expired/u);
+
+	const route = await registry.acquireTaskRoute({
+		nodeId: NODE_A,
+		nodeInstanceId: INSTANCE_A,
+		workspaceId: claimed.workspaceId,
+		ownerId: OWNER_A,
+		taskId: TASK_A,
+	});
+	assert.throws(() => registry.assertDelegationPrincipal(
+		session.asRoute(),
+		{ nodeId: NODE_A, nodeInstanceId: INSTANCE_A },
+		route.delegatedExecutionContext,
+	), /cannot delegate/u);
+	assert.equal(registry.releaseTaskRoute(OWNER_A, TASK_A), true);
+	assert.throws(() => registry.assertDelegationPrincipal(
+		session.asRoute(),
+		{ nodeId: NODE_A, nodeInstanceId: INSTANCE_A },
+		route.delegatedExecutionContext,
+	), /invalid or expired/u);
+	assert.doesNotMatch(
+		JSON.stringify(registry.list()),
+		/"(?:capability|delegationPrincipal)":/u,
+	);
+});
+
 test('fences duplicate registrations and rejects instance reuse across node IDs', async (t) => {
 	const { registry } = await createFixture();
 	t.after(() => registry.dispose());

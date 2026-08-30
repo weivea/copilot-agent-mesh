@@ -249,6 +249,27 @@ export const delegationGrantSchema = z.strictObject({
 	]),
 });
 
+export const delegatedExecutionContextSchema = z.strictObject({
+	kind: z.literal('delegatedChild'),
+	taskId: uuidSchema,
+	capability: z.string().regex(/^[A-Za-z0-9_-]{43}$/u),
+});
+
+export const windowDelegationPrincipalSchema = z.strictObject({
+	kind: z.literal('window'),
+	capability: z.string().regex(/^[A-Za-z0-9_-]{43}$/u),
+});
+
+export const delegationPrincipalSchema = z.discriminatedUnion('kind', [
+	windowDelegationPrincipalSchema,
+	delegatedExecutionContextSchema,
+]);
+
+export const nodeRegistrationResultSchema = z.strictObject({
+	node: windowNodeDescriptorSchema,
+	delegationPrincipal: windowDelegationPrincipalSchema,
+});
+
 export const nodeRegisterParamsSchema = z.strictObject({
 	nodeId: uuidSchema,
 	nodeInstanceId: uuidSchema,
@@ -334,6 +355,7 @@ export const nodeTaskStartParamsSchema = routedTaskStartParamsSchema.extend({
 	authenticatedOwnerId: uuidSchema,
 	sourceLabel: utf8String(PROTOCOL_LIMITS.nameBytes, 'task source label', 1),
 	delegationGrant: delegationGrantSchema,
+	delegatedExecutionContext: delegatedExecutionContextSchema,
 });
 
 export const nodeTaskCancelParamsSchema = nodeIdentityParamsSchema.extend({
@@ -346,7 +368,11 @@ export const nodeTaskAnswerParamsSchema = nodeTaskCancelParamsSchema.extend({
 	answer: utf8String(PROTOCOL_LIMITS.taskAnswerBytes, 'task answer', 1),
 });
 
-export const brokerRemoteTaskStartParamsSchema = routedTaskStartParamsSchema.extend({
+export const brokerLocalTaskStartParamsSchema = routedTaskStartParamsSchema.extend({
+	delegationPrincipal: delegationPrincipalSchema,
+});
+
+export const brokerRemoteTaskStartParamsSchema = brokerLocalTaskStartParamsSchema.extend({
 	peerId: uuidSchema,
 });
 
@@ -513,6 +539,9 @@ export type PeerGateState = z.infer<typeof peerGateStateSchema>;
 export type PeerPolicyCandidate = z.infer<typeof peerPolicyCandidateSchema>;
 export type PeerPolicyCandidateListResult = z.infer<typeof peerPolicyCandidateListResultSchema>;
 export type DelegationGrantProtocol = z.infer<typeof delegationGrantSchema>;
+export type DelegatedExecutionContext = z.infer<typeof delegatedExecutionContextSchema>;
+export type DelegationPrincipal = z.infer<typeof delegationPrincipalSchema>;
+export type WindowDelegationPrincipal = z.infer<typeof windowDelegationPrincipalSchema>;
 export type NodeTaskStartParams = z.infer<typeof nodeTaskStartParamsSchema>;
 export type NodeTaskCancelParams = z.infer<typeof nodeTaskCancelParamsSchema>;
 export type NodeTaskAnswerParams = z.infer<typeof nodeTaskAnswerParamsSchema>;

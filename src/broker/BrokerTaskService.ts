@@ -421,6 +421,7 @@ export class BrokerTaskService {
 			ownerId,
 			taskId: params.taskId,
 			workspaceLeaseKey: route.workspaceLeaseKey,
+			delegatedExecutionContext: route.delegatedExecutionContext,
 			session: route.session,
 		};
 		const request: OwnedRoutedTaskStart = {
@@ -536,6 +537,7 @@ export class BrokerTaskService {
 							workspaceLeaseKey: route.workspaceLeaseKey,
 						}),
 					}),
+					delegatedExecutionContext: route.delegatedExecutionContext,
 				}),
 				this.taskStartTimeoutMs(params.workerDeadline),
 			);

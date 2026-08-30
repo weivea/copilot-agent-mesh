@@ -269,6 +269,11 @@ function startParams(changes: Partial<NodeTaskStartParams> = {}): NodeTaskStartP
 	};
 	return {
 		...params,
+		delegatedExecutionContext: changes.delegatedExecutionContext ?? {
+			kind: 'delegatedChild',
+			taskId: params.taskId,
+			capability: 'd'.repeat(43),
+		},
 		delegationGrant: changes.delegationGrant ?? createDelegationGrant({
 			taskId: params.taskId,
 			targetNodeId: params.target.nodeId,
@@ -549,6 +554,10 @@ test('auto-approves one provable local file confirmation and escalates sensitive
 	const params = startParams();
 	await fixture.executor.start(params);
 	const handle = fixture.runtime.handles[0];
+	assert.deepEqual(
+		fixture.executor.delegatedExecutionContext(TASK_ID),
+		params.delegatedExecutionContext,
+	);
 	const safeRequest = {
 		requestId: 'safe-write',
 		kind: 'toolConfirmation',
@@ -590,6 +599,7 @@ test('auto-approves one provable local file confirmation and escalates sensitive
 
 	await handle.events.push({ type: 'completed' });
 	await waitFor(() => fixture.events.at(-1)?.event.type === 'completed');
+	assert.equal(fixture.executor.delegatedExecutionContext(TASK_ID), undefined);
 	await assert.rejects(
 		fixture.executor.start(startParams({
 			taskId: '00000000-0000-4000-8000-00000000000d',

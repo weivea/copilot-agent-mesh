@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { test } from 'node:test';
 
 import type {
+	NodeRegisterParams,
 	RoutedTaskStartParams,
 	TaskSnapshot,
 } from '../../shared/protocol';
@@ -252,6 +253,9 @@ interface ClientFixture {
 	readonly confirmations: WindowNodeTaskConfirmationRequest[];
 	readonly executorCreations: () => number;
 	readonly previousGenerationWasDrained: () => boolean;
+	readonly executionContext: (
+		taskId: string,
+	) => ReturnType<WindowNodeTaskExecutor['delegatedExecutionContext']>;
 }
 
 function createClient(
@@ -264,6 +268,7 @@ function createClient(
 	const confirmations: WindowNodeTaskConfirmationRequest[] = [];
 	let executorCreations = 0;
 	let previousGenerationWasDrained = true;
+	let executor: WindowNodeTaskExecutor | undefined;
 	const client = new WindowNodeClient({
 		nodeId,
 		nodeInstanceId,
@@ -278,7 +283,7 @@ function createClient(
 				);
 			}
 			executorCreations += 1;
-			return new WindowNodeTaskExecutor({
+			executor = new WindowNodeTaskExecutor({
 				nodeId,
 				nodeInstanceId,
 				nodeLabel: label,
@@ -294,6 +299,7 @@ function createClient(
 				ids: { next: () => INPUT_ID },
 				clock: { now: () => new Date() },
 			});
+			return executor;
 		},
 		workspaceSource: {
 			list: () => [{
@@ -316,6 +322,7 @@ function createClient(
 		confirmations,
 		executorCreations: () => executorCreations,
 		previousGenerationWasDrained: () => previousGenerationWasDrained,
+		executionContext: (taskId) => executor?.delegatedExecutionContext(taskId),
 	};
 }
 
@@ -423,7 +430,15 @@ test('DeviceBroker closes sessions and drains active handlers before shared stat
 			dispose: () => Promise.resolve(),
 		},
 		registry: {
-			register: () => ({}),
+			register: (input: NodeRegisterParams) => ({
+				...input,
+				lastHeartbeatAt: input.startedAt,
+				workspaces: [],
+			}),
+			windowDelegationPrincipal: () => ({
+				kind: 'window',
+				capability: 'w'.repeat(43),
+			}),
 			dispose: () => {
 				disposalOrder.push('registry');
 			},
@@ -659,12 +674,14 @@ test('routes authenticated local RPC across two nodes and fences workspace execu
 			outcome: 'accept',
 		});
 		assert.notEqual((await clientB.getTask(TASK_B)).state, 'needsInput');
+		const executionContext = windowA.executionContext(TASK_B);
+		assert.ok(executionContext);
 		await assert.rejects(
-			clientA.startTask(task(indexedUuid(80_000), indexedUuid(80_001), {
+			clientA.startTaskFromDelegatedChild(task(indexedUuid(80_000), indexedUuid(80_001), {
 				nodeId: NODE_A,
 				nodeInstanceId: INSTANCE_A,
 				workspaceId: nodeA.workspaces[0].workspaceId,
-			})),
+			}), executionContext),
 			(error: unknown) =>
 				error instanceof LocalIpcRemoteError
 				&& error.code === MESH_ERROR_CODES.DELEGATION_RECURSION,

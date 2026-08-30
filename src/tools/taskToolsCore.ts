@@ -218,9 +218,9 @@ export class TaskToolsCore {
 				`Workspace: ${workspaceName}`,
 				`Task: ${summary}`,
 				'Continue grants approval for this task only.',
-				'Automatically approved: structured file changes proven to stay inside this Workspace.',
-				'Terminal commands and operations without authoritative path evidence still require confirmation.',
-				'Never auto-approved: network authentication, cross-Workspace writes, secret access, or external publishing.',
+				'Automatically approved: non-control-plane structured file changes proven to stay inside this Workspace.',
+				'Terminal commands, execution/instruction-control files, and operations without authoritative path evidence still require confirmation.',
+				'Never auto-approved: network authentication, cross-Workspace writes, secret access, external publishing, or Workspace command configuration.',
 				'The task may run for at most 60 minutes.',
 			].join('\n'),
 		};

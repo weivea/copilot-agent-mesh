@@ -14,6 +14,7 @@ import {
 	type NodeTaskEventParams,
 	type NodeTaskStartedResult,
 	type NodeTaskStartParams,
+	type DelegatedExecutionContext,
 } from '../../shared/protocol';
 import {
 	AgentRuntimeError,
@@ -86,6 +87,7 @@ interface ActiveTask {
 	outputSummary: string;
 	outputTail: string;
 	grant: DelegationGrant | undefined;
+	delegatedExecutionContext: DelegatedExecutionContext | undefined;
 	terminal: boolean;
 	cleanupRequired: boolean;
 	cancelComplete: boolean;
@@ -296,6 +298,13 @@ export class WindowNodeTaskExecutor {
 		return this.disposed;
 	}
 
+	public delegatedExecutionContext(taskId: string): DelegatedExecutionContext | undefined {
+		const active = this.starts.get(uuidSchema.parse(taskId))?.active;
+		return active?.delegatedExecutionContext === undefined
+			? undefined
+			: { ...active.delegatedExecutionContext };
+	}
+
 	private async startCore(
 		params: NodeTaskStartParams,
 		record: StartRecord,
@@ -371,6 +380,7 @@ export class WindowNodeTaskExecutor {
 			outputSummary: '',
 			outputTail: '',
 			grant,
+			delegatedExecutionContext: { ...params.delegatedExecutionContext },
 			terminal: false,
 			cleanupRequired: false,
 			cancelComplete: false,
@@ -949,6 +959,7 @@ export class WindowNodeTaskExecutor {
 
 	private destroyGrant(active: ActiveTask): void {
 		active.grant = undefined;
+		active.delegatedExecutionContext = undefined;
 	}
 }
 

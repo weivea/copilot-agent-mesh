@@ -228,7 +228,14 @@ class FakeRegistry {
 		this.nodes.delete(input.nodeId);
 	}
 
-	public assertDelegationSourceNotExecuting(): void {}
+	public assertDelegationPrincipal(): void {}
+
+	public windowDelegationPrincipal(): {
+		readonly kind: 'window';
+		readonly capability: string;
+	} {
+		return { kind: 'window', capability: 'w'.repeat(43) };
+	}
 
 	public dispose(): void {}
 }

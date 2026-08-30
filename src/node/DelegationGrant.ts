@@ -1,4 +1,4 @@
-import { realpath } from 'node:fs/promises';
+import { lstat, realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -19,6 +19,82 @@ const fileWriteToolNames = new Set(['write_file']);
 const encodedUnsafePath = /%(?:2e|2f|5c|25|00)/iu;
 const rawDotSegment = /(?:^|\/)\.{1,2}(?:\/|$)/u;
 const windowsDrivePath = /^\/?[a-z]:[\\/]/iu;
+const vcsControlRoots = new Set(['.git', '.hg', '.svn', '.husky', '.githooks']);
+const vcsControlFiles = new Set(['.gitconfig', '.gitmodules', '.hgrc', '.hgsub']);
+const ciControlRoots = new Set(['.buildkite', '.circleci', '.teamcity']);
+const ciControlFiles = new Set([
+	'.drone.yml',
+	'.gitlab-ci.yml',
+	'.travis.yml',
+	'appveyor.yml',
+	'azure-pipelines.yml',
+	'bitbucket-pipelines.yml',
+	'cloudbuild.yaml',
+	'cloudbuild.yml',
+	'jenkinsfile',
+]);
+const agentInstructionFiles = new Set([
+	'agents.md',
+	'claude.md',
+	'gemini.md',
+	'.cursorrules',
+	'.windsurfrules',
+]);
+const vcsHookConfigurationFiles = new Set([
+	'.pre-commit-config.yml',
+	'.pre-commit-config.yaml',
+	'lefthook.yml',
+	'lefthook.yaml',
+	'.lefthook.yml',
+	'.lefthook.yaml',
+	'lefthook-local.yml',
+	'lefthook-local.yaml',
+]);
+const packageExecutionControlFiles = new Set([
+	'.npmrc',
+	'.yarnrc',
+	'.yarnrc.yml',
+	'build.gradle',
+	'build.gradle.kts',
+	'bun.lock',
+	'bun.lockb',
+	'bunfig.toml',
+	'cargo.lock',
+	'cargo.toml',
+	'composer.json',
+	'composer.lock',
+	'deno.json',
+	'deno.jsonc',
+	'gemfile',
+	'gemfile.lock',
+	'npm-shrinkwrap.json',
+	'package-lock.json',
+	'package.json',
+	'pipfile',
+	'pipfile.lock',
+	'poetry.lock',
+	'pom.xml',
+	'pnpm-lock.yaml',
+	'pnpm-workspace.yaml',
+	'pnpm-workspace.yml',
+	'pyproject.toml',
+	'setup.cfg',
+	'setup.py',
+	'settings.gradle',
+	'settings.gradle.kts',
+	'uv.lock',
+	'yarn.lock',
+]);
+const vscodeControlFiles = new Set(['tasks.json', 'settings.json', 'launch.json', 'mcp.json']);
+const githubControlRoots = new Set([
+	'actions',
+	'agents',
+	'chatmodes',
+	'instructions',
+	'prompts',
+	'skills',
+	'workflows',
+]);
 const toolConfirmationEvidenceSchema = z.strictObject({
 	phase: z.enum(['operation', 'result']),
 	toolName: z.string().min(1).max(256),
@@ -107,17 +183,31 @@ export async function canAutoApproveToolConfirmation(
 		return false;
 	}
 	try {
-		const workspacePath = await canonicalExistingPath(parseFileUri(workspace.uri));
+		const workspaceInputPath = parseFileUri(workspace.uri);
+		const workspacePath = await canonicalExistingPath(workspaceInputPath);
 		for (const edit of evidence.data.fileEdits) {
-			const paths = [
+			const uriPaths = [
 				...(edit.beforeUri === undefined
 					? []
-					: [await canonicalExistingPath(parseFileUri(edit.beforeUri))]),
+					: [{
+						input: parseFileUri(edit.beforeUri),
+						canonicalize: canonicalExistingPath,
+					}]),
 				...(edit.afterUri === undefined
 					? []
-					: [await canonicalPotentialPath(parseFileUri(edit.afterUri))]),
+					: [{
+						input: parseFileUri(edit.afterUri),
+						canonicalize: canonicalPotentialPath,
+					}]),
 			];
-			for (const targetPath of paths) {
+			for (const uriPath of uriPaths) {
+				if (
+					!isContained(workspaceInputPath, uriPath.input)
+					|| isSensitiveWorkspacePath(workspaceInputPath, uriPath.input)
+				) {
+					return false;
+				}
+				const targetPath = await uriPath.canonicalize(uriPath.input);
 				if (
 					!isContained(workspacePath, targetPath)
 					|| isSensitiveWorkspacePath(workspacePath, targetPath)
@@ -168,9 +258,28 @@ async function canonicalPotentialPath(filePath: string): Promise<string> {
 		if (!isMissingPath(error)) {
 			throw error;
 		}
-		const parent = await realpath(dirname(filePath));
+		await assertDirectoryEntryAbsent(filePath);
+		const inputParent = dirname(filePath);
+		const parent = await realpath(inputParent);
+		await assertDirectoryEntryAbsent(filePath);
+		const verifiedParent = await realpath(inputParent);
+		if (verifiedParent !== parent) {
+			throw new Error('The target parent changed during canonicalization.');
+		}
 		return resolve(parent, basename(filePath));
 	}
+}
+
+async function assertDirectoryEntryAbsent(filePath: string): Promise<void> {
+	try {
+		await lstat(filePath);
+	} catch (error: unknown) {
+		if (isMissingPath(error)) {
+			return;
+		}
+		throw error;
+	}
+	throw new Error('The target directory entry exists but cannot be canonicalized.');
 }
 
 function isContained(workspacePath: string, targetPath: string): boolean {
@@ -179,10 +288,21 @@ function isContained(workspacePath: string, targetPath: string): boolean {
 }
 
 function isSensitiveWorkspacePath(workspacePath: string, targetPath: string): boolean {
-	const components = relative(workspacePath, targetPath)
-		.split(sep)
-		.map((component) => component.toLowerCase());
-	return components.some((component) =>
+	const relativeComponents = relative(workspacePath, targetPath).split(sep);
+	const absoluteComponents = resolve(targetPath).split(sep).filter((component) => component !== '');
+	return hasSensitivePathComponents(relativeComponents)
+		|| hasSensitivePathComponents(absoluteComponents);
+}
+
+function hasSensitivePathComponents(rawComponents: readonly string[]): boolean {
+	const components = rawComponents.map((component) => component.toLowerCase());
+	return isProtectedControlPlanePath(components)
+		|| rawComponents.some((component) =>
+			component.normalize('NFKC') !== component
+				|| component.replace(/[ .]+$/u, '') !== component
+				|| /\p{Cf}/u.test(component),
+		)
+		|| components.some((component) =>
 		component === '.ssh'
 			|| component === '.aws'
 			|| component === '.azure'
@@ -192,6 +312,40 @@ function isSensitiveWorkspacePath(workspacePath: string, targetPath: string): bo
 			|| component === 'credentials'
 			|| component === 'secrets',
 	);
+}
+
+function isProtectedControlPlanePath(components: readonly string[]): boolean {
+	for (let index = 0; index < components.length; index += 1) {
+		const root = components[index];
+		const second = components[index + 1];
+		if (
+			vcsControlRoots.has(root)
+			|| vcsControlFiles.has(root)
+			|| ciControlRoots.has(root)
+			|| ciControlFiles.has(root)
+			|| agentInstructionFiles.has(root)
+			|| vcsHookConfigurationFiles.has(root)
+			|| packageExecutionControlFiles.has(root)
+			|| root.endsWith('.code-workspace')
+			|| root === '.devcontainer'
+			|| root === '.devcontainer.json'
+			|| (
+				root === '.github'
+				&& (
+					second === 'copilot-instructions.md'
+					|| (second !== undefined && githubControlRoots.has(second))
+				)
+			)
+			|| (
+				root === '.vscode'
+				&& second !== undefined
+				&& vscodeControlFiles.has(second)
+			)
+		) {
+			return true;
+		}
+	}
+	return false;
 }
 
 function isMissingPath(error: unknown): boolean {
