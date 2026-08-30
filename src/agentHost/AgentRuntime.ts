@@ -38,6 +38,7 @@ export interface AgentTaskRequest {
 	readonly workspaceId: string;
 	readonly providerId?: string;
 	readonly allowInteractiveAuthentication?: boolean;
+	readonly delegatedExecutionContext?: DelegatedExecutionContext;
 	readonly approvalContext?: {
 		readonly peerId: string;
 		readonly workspaceId: string;
@@ -612,3 +613,4 @@ function positiveInteger(value: number, name: string): number {
 	}
 	return value;
 }
+import type { DelegatedExecutionContext } from '../../shared/protocol';

@@ -28,6 +28,7 @@ import {
 	type ResolvedAgentTaskRequest,
 	type WorkspaceResolver,
 } from './AgentRuntime';
+import type { DelegatedToolInvocationRegistry } from '../tools/DelegatedToolInvocationRegistry';
 import type { AgentHostLauncherLike, LaunchedAgentHost } from './AgentHostLauncher';
 import type { AuthBroker, ProtectedResource } from './AuthBroker';
 
@@ -130,6 +131,7 @@ export interface AhpAgentRuntimeOptions {
 	readonly workspaceResolver: WorkspaceResolver;
 	readonly configResolver?: SessionConfigurationResolver;
 	readonly cancellationTimeoutMs?: number;
+	readonly delegatedToolInvocations?: DelegatedToolInvocationRegistry;
 }
 
 export class AhpAgentRuntime implements AgentRuntime {
@@ -188,6 +190,7 @@ export class AhpAgentRuntime implements AgentRuntime {
 				this.options.authBroker,
 				this.options.configResolver ?? new DefaultSessionConfigurationResolver(),
 				this.options.cancellationTimeoutMs ?? cancellationTimeoutMs,
+				this.options.delegatedToolInvocations,
 				() => this.tasks.delete(createdTask),
 			);
 			task = createdTask;
@@ -492,6 +495,7 @@ class AhpTask implements AgentTaskHandle {
 	private readonly deliveredResponsePartStates = new Set<string>();
 	private readonly deliveredResponsePartOrdinals = new Map<string, number>();
 	private readonly retainedRecoveryCandidates = new Set<RecoveryCandidateCleanup>();
+	private delegatedCorrelationEnabled = true;
 
 	constructor(
 		private readonly request: ResolvedAgentTaskRequest,
@@ -501,6 +505,7 @@ class AhpTask implements AgentTaskHandle {
 		private readonly authBroker: AuthBroker,
 		private readonly configResolver: SessionConfigurationResolver,
 		private readonly cancelTimeoutMs: number,
+		private readonly delegatedToolInvocations: DelegatedToolInvocationRegistry | undefined,
 		private readonly didDispose: () => void,
 	) {
 		this.taskId = request.taskId;
@@ -613,6 +618,7 @@ class AhpTask implements AgentTaskHandle {
 			return;
 		}
 		this.assertWritable();
+		this.clearDelegatedToolInvocations();
 		await this.events.push({ type: 'progress', message: 'Cancellation requested.' });
 		this.dispatchTracked(this.chatUri, {
 			type: 'chat/turnCancelled',
@@ -656,6 +662,7 @@ class AhpTask implements AgentTaskHandle {
 
 	private async disposeResources(): Promise<void> {
 		this.disposed = true;
+		this.clearDelegatedToolInvocations();
 		const recovery = this.recoveryPromise;
 		this.recoveryAbort?.abort();
 		this.authenticationAbort.abort();
@@ -1082,6 +1089,7 @@ class AhpTask implements AgentTaskHandle {
 		this.lastSeenServerSeq = Math.max(this.lastSeenServerSeq, envelope.serverSeq);
 		this.acknowledgeDispatch(envelope);
 		const action = envelope.action;
+		this.trackDelegatedToolInvocation(envelope);
 		if (envelope.channel === rootUri) {
 			if (action.type === 'root/agentsChanged') {
 				const selected = action.agents.find(({ provider }) => provider === this.provider?.provider);
@@ -1579,6 +1587,8 @@ class AhpTask implements AgentTaskHandle {
 		if (this.recoveryPromise !== undefined || this.disposed || this.terminal) {
 			return;
 		}
+		this.delegatedCorrelationEnabled = false;
+		this.clearDelegatedToolInvocations();
 		const abort = new AbortController();
 		this.recoveryAbort = abort;
 		const operation = this.recover(abort.signal);
@@ -1729,6 +1739,7 @@ class AhpTask implements AgentTaskHandle {
 			this.subscriptions = recoveredSubscriptions;
 			this.generation = candidateGeneration;
 			this.recovering = false;
+			this.delegatedCorrelationEnabled = true;
 			for (const [uri, subscription] of recoveredSubscriptions) {
 				this.startSubscription(uri, subscription, candidateGeneration);
 			}
@@ -1818,6 +1829,7 @@ class AhpTask implements AgentTaskHandle {
 			return;
 		}
 		this.terminalError = error;
+		this.clearDelegatedToolInvocations();
 		this.defaultChatReject?.(error);
 		this.terminal = true;
 		void this.events.pushAndClose({ type: 'failed', error }).then(() => this.finishTerminal());
@@ -1825,10 +1837,62 @@ class AhpTask implements AgentTaskHandle {
 
 	private finishTerminal(): void {
 		this.terminal = true;
+		this.clearDelegatedToolInvocations();
 		if (this.cancellationTimer !== undefined) {
 			clearTimeout(this.cancellationTimer);
 		}
 		this.events.close();
+	}
+
+	private trackDelegatedToolInvocation(envelope: ActionEnvelope): void {
+		const context = this.request.delegatedExecutionContext;
+		if (
+			context === undefined
+			|| this.delegatedToolInvocations === undefined
+			|| !this.delegatedCorrelationEnabled
+			|| envelope.channel !== this.chatUri
+		) {
+			return;
+		}
+		if (
+			envelope.action.type === 'chat/turnComplete'
+			|| envelope.action.type === 'chat/turnCancelled'
+			|| envelope.action.type === 'chat/error'
+		) {
+			this.clearDelegatedToolInvocations();
+			return;
+		}
+		if (
+			!('toolCallId' in envelope.action)
+			|| typeof envelope.action.toolCallId !== 'string'
+			|| !('turnId' in envelope.action)
+			|| typeof envelope.action.turnId !== 'string'
+		) {
+			return;
+		}
+		const invocationId = `${envelope.action.turnId}\0${envelope.action.toolCallId}`;
+		if (envelope.action.type === 'chat/toolCallReady') {
+			const toolName = this.mapper.toolName(
+				envelope.channel,
+				envelope.action.turnId,
+				envelope.action.toolCallId,
+			);
+			if (toolName !== undefined) {
+				this.delegatedToolInvocations.observe({
+					scopeId: this.sessionUri,
+					invocationId,
+					toolName,
+					toolInput: envelope.action.toolInput,
+					context,
+				});
+			}
+		} else if (envelope.action.type === 'chat/toolCallComplete') {
+			this.delegatedToolInvocations.forget(this.sessionUri, invocationId);
+		}
+	}
+
+	private clearDelegatedToolInvocations(): void {
+		this.delegatedToolInvocations?.clearScope(this.sessionUri);
 	}
 }
 

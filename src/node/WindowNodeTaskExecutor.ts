@@ -349,6 +349,7 @@ export class WindowNodeTaskExecutor {
 				acceptanceCriteria: [...params.acceptanceCriteria],
 				workspaceId: workspace.workspaceId,
 				allowInteractiveAuthentication: true,
+				delegatedExecutionContext: { ...params.delegatedExecutionContext },
 				approvalContext: {
 					peerId: params.authenticatedOwnerId,
 					workspaceId: workspace.workspaceId,

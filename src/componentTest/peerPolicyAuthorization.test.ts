@@ -22,7 +22,9 @@ import type { BrokerOwnership } from '../storage/WorkerOwnerLock';
 import { FileTaskStore } from '../tasks/FileTaskStore';
 import { WorkspaceLeaseManager } from '../tasks/WorkspaceLeaseManager';
 import { LocalBrokerTaskFacade } from '../tools/LocalBrokerTaskFacade';
+import { DelegatedToolInvocationRegistry } from '../tools/DelegatedToolInvocationRegistry';
 import { TaskToolsCore } from '../tools/taskToolsCore';
+import { MESH_TOOL_NAMES } from '../tools/toolManifest';
 import { createOpaqueWorkspaceIdentity } from '../workspaces/OpaqueWorkspaceIdentity';
 import {
 	MemoryAtomicFileSystem,
@@ -350,42 +352,60 @@ test('delegated child context blocks recursion without blocking the window prima
 	const childContext = fixture.executorB.lastStart?.delegatedExecutionContext;
 	assert.ok(childContext);
 
-	const primaryTask = taskFromBToC(uuid(234), uuid(235));
+	const facadeB = new LocalBrokerTaskFacade(fixture.nodeB, {
+		deviceName: 'Component Device',
+		now: () => new Date('2026-08-30T12:00:00.000Z'),
+		sourceWorkspaceIdentity: () => IDENTITY_B,
+	});
+	const delegatedToolInvocations = new DelegatedToolInvocationRegistry();
+	t.after(() => delegatedToolInvocations.dispose());
+	const primaryCore = new TaskToolsCore(facadeB, { delegatedToolInvocations });
+	const primaryInput = delegationFromBToC(234);
+	const primaryTaskId = facadeB.identifyDelegation(primaryInput).taskId;
 	const primaryStarted = executorC.nextStartedTaskId();
-	const primaryStart = await fixture.nodeB.startTask(primaryTask);
+	const primary = primaryCore.delegateTask(primaryInput);
 	await primaryStarted;
-	assert.equal(primaryStart.taskId, primaryTask.taskId);
+	assert.equal(executorC.lastStart?.taskId, primaryTaskId);
 
-	await assert.rejects(
-		fixture.nodeB.startTaskFromDelegatedChild(
-			taskFromBToC(uuid(236), uuid(237)),
-			childContext,
-		),
-		(error: unknown) =>
-			error instanceof LocalIpcRemoteError
-			&& errorReason(error) === 'DELEGATION_RECURSION',
-	);
+	const childCore = new TaskToolsCore(facadeB, { delegatedToolInvocations });
+	const childInput = delegationFromBToC(236);
+	delegatedToolInvocations.observe({
+		scopeId: 'ahp-session:/component-child',
+		invocationId: 'turn-1\u0000tool-1',
+		toolName: MESH_TOOL_NAMES.delegateTask,
+		toolInput: JSON.stringify(childInput),
+		context: childContext,
+	});
+	const childResult = await childCore.delegateTask(childInput);
+	assert.equal(childResult.e, 'DELEGATION_RECURSION');
+	const duplicateChildResult = await childCore.delegateTask(childInput);
+	assert.equal(duplicateChildResult.e, 'DELEGATION_RECURSION');
+	assert.equal(delegatedToolInvocations.size, 1);
+	delegatedToolInvocations.forget('ahp-session:/component-child', 'turn-1\u0000tool-1');
+	assert.equal(delegatedToolInvocations.size, 0);
 
 	await nodeC.publishTaskEvent(taskEventFor(
 		NODE_C,
 		INSTANCE_C,
-		primaryTask.taskId,
+		primaryTaskId,
 		{ type: 'completed', summary: 'Primary delegation completed.' },
 	));
+	assert.equal((await primary).s, 0);
 	await fixture.nodeB.publishTaskEvent(taskEvent(incomingTaskId, {
 		type: 'completed',
 		summary: 'Incoming child task completed.',
 	}));
 
-	await assert.rejects(
-		fixture.nodeB.startTaskFromDelegatedChild(
-			taskFromBToC(uuid(238), uuid(239)),
-			childContext,
-		),
-		(error: unknown) =>
-			error instanceof LocalIpcRemoteError
-			&& errorReason(error) === 'AUTH_FAILED',
-	);
+	const staleInput = delegationFromBToC(238);
+	delegatedToolInvocations.observe({
+		scopeId: 'ahp-session:/component-child',
+		invocationId: 'turn-1\u0000tool-2',
+		toolName: MESH_TOOL_NAMES.delegateTask,
+		toolInput: JSON.stringify(staleInput),
+		context: childContext,
+	});
+	const staleResult = await childCore.delegateTask(staleInput);
+	assert.equal(staleResult.e, 'AUTH_FAILED');
 	assert.equal(executorC.startCount, 1);
 });
 
@@ -639,6 +659,20 @@ function delegationInput(index: number) {
 		title: `Component delegation ${index}`,
 		prompt: 'Perform the bounded component delegation.',
 		acceptanceCriteria: [],
+		timeoutMinutes: 60,
+	};
+}
+
+function delegationFromBToC(index: number) {
+	return {
+		delegationRequestId: uuid(index),
+		deviceId: DEVICE,
+		nodeId: NODE_C,
+		nodeInstanceId: INSTANCE_C,
+		workspaceId: WORKSPACE_D,
+		title: 'Component nested task',
+		prompt: 'Attempt delegation from Window B.',
+		acceptanceCriteria: ['Reach Window C'],
 		timeoutMinutes: 60,
 	};
 }

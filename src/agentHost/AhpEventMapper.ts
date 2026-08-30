@@ -264,6 +264,10 @@ export class AhpEventMapper {
 		}
 	}
 
+	toolName(chatUri: string, turnId: string, toolCallId: string): string | undefined {
+		return this.tools.get(toolKey(chatUri, turnId, toolCallId))?.toolName;
+	}
+
 	private mapToolReady(
 		chatUri: string,
 		action: Extract<StateAction, { type: 'chat/toolCallReady' }>,

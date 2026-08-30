@@ -29,6 +29,7 @@ import {
 	VscodeGlobalStateStore,
 	VscodeSecretStore,
 } from '../storage/VscodeStorageAdapters';
+import { DelegatedToolInvocationRegistry } from '../tools/DelegatedToolInvocationRegistry';
 import { LocalBrokerTaskFacade } from '../tools/LocalBrokerTaskFacade';
 import { registerMeshTaskTools } from '../tools/taskTools';
 import {
@@ -118,6 +119,8 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 				uriScheme: folder.uri.scheme,
 			})),
 		}));
+		const delegatedToolInvocations = new DelegatedToolInvocationRegistry();
+		addApplicationCleanup(cleanup, () => delegatedToolInvocations.dispose());
 		guard.assertAllowed({ requireWorkspace: false });
 		const workerPlatform = getWorkerPlatformSupport();
 		const configuration = vscode.workspace.getConfiguration('copilotAgentMesh');
@@ -159,6 +162,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		lifecycle = new BrokerLifecycle(
 			ownership,
 			async (generation) => {
+				delegatedToolInvocations.clear();
 				const ownerRuntime = await ProductionBrokerRuntime.create({
 					vscodeApi: vscode,
 					context,
@@ -173,6 +177,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 					logger,
 					onDidChange: () => changeEvents.fire(),
 					onDisposed: (disposed) => {
+						delegatedToolInvocations.clear();
 						if (currentOwnerRuntime === disposed) {
 							currentOwnerRuntime = undefined;
 						}
@@ -223,6 +228,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 					guard,
 					runtimeApproval,
 					workerPlatform,
+					delegatedToolInvocations,
 				);
 				return new WindowNodeTaskExecutor({
 					nodeId,
@@ -321,7 +327,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			? gatedE2e
 			: undefined;
 		contributions.push(
-			registerMeshTaskTools(localTasks),
+			registerMeshTaskTools(localTasks, { delegatedToolInvocations }),
 			vscode.window.registerWebviewViewProvider(AgentMeshViewProvider.viewType, dashboard),
 			...registerCommands(
 				dashboardFacade,

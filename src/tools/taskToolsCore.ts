@@ -18,7 +18,11 @@ import {
 	TaskToolSnapshot,
 	TaskValidationSummary,
 } from '../../shared/toolProtocol';
-import { TASK_STATUSES, TaskStatus } from '../../shared/protocol';
+import {
+	TASK_STATUSES,
+	type DelegatedExecutionContext,
+	TaskStatus,
+} from '../../shared/protocol';
 import {
 	DelegationWaiter,
 	type DelegationOutcome,
@@ -28,6 +32,7 @@ import {
 import { sanitizeDelegationText } from './DelegationTextSanitizer';
 import { TaskToolFacade, TaskToolFacadeError } from './taskToolFacade';
 import { MESH_TOOL_NAMES } from './toolManifest';
+import type { DelegatedToolInvocationRegistry } from './DelegatedToolInvocationRegistry';
 
 export type { ToolCancellation, ToolClock } from './DelegationWaiter';
 
@@ -78,6 +83,7 @@ export interface TaskToolsCoreOptions {
 	readonly clock?: ToolClock;
 	readonly outputByteLimit?: number;
 	readonly id?: () => string;
+	readonly delegatedToolInvocations?: DelegatedToolInvocationRegistry;
 }
 
 interface OperationSuccess<T> {
@@ -173,6 +179,7 @@ export class TaskToolsCore {
 	private readonly clock: ToolClock;
 	private readonly outputByteLimit: number;
 	private readonly id: () => string;
+	private readonly delegatedToolInvocations: DelegatedToolInvocationRegistry | undefined;
 
 	constructor(
 		private readonly facade: TaskToolFacade,
@@ -181,6 +188,7 @@ export class TaskToolsCore {
 		this.clock = options.clock ?? systemClock;
 		this.outputByteLimit = options.outputByteLimit ?? TASK_TOOL_LIMITS.defaultOutputBytes;
 		this.id = options.id ?? randomUUID;
+		this.delegatedToolInvocations = options.delegatedToolInvocations;
 		if (
 			!Number.isSafeInteger(this.outputByteLimit)
 			|| this.outputByteLimit < TASK_TOOL_LIMITS.minimumOutputBytes
@@ -282,8 +290,10 @@ export class TaskToolsCore {
 			readonly delegationRequestId: string;
 			readonly timeoutMinutes: number;
 		};
+		let delegatedExecutionContext: DelegatedExecutionContext | undefined;
 		try {
 			const parsed = parseDelegateTaskInput(rawInput);
+			delegatedExecutionContext = this.delegatedToolInvocations?.consume(parsed);
 			input = {
 				...parsed,
 				delegationRequestId: parsed.delegationRequestId ?? this.id(),
@@ -321,7 +331,7 @@ export class TaskToolsCore {
 			},
 			start: async (onTaskAvailable) => {
 				const persisted = parsePersistedIntent(
-					await this.facade.persistDelegationIntent(input),
+					await this.facade.persistDelegationIntent(input, delegatedExecutionContext),
 				);
 				if (
 					persisted.taskId !== identity.taskId

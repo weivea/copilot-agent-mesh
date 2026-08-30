@@ -9,6 +9,7 @@ import type {
 	TaskToolReadResult,
 	TaskToolSnapshot,
 } from '../../shared/toolProtocol';
+import type { DelegatedExecutionContext } from '../../shared/protocol';
 
 export interface DelegationTargetDisplay {
 	readonly windowName: string;
@@ -42,7 +43,10 @@ export interface TaskToolFacade {
 	 * with the same delegationRequestId recovers the same task, while reusing
 	 * that ID for another payload conflicts. Inputs without an ID are fresh.
 	 */
-	persistDelegationIntent(intent: DelegationIntentInput): Promise<PersistedDelegationIntent>;
+	persistDelegationIntent(
+		intent: DelegationIntentInput,
+		context?: DelegatedExecutionContext,
+	): Promise<PersistedDelegationIntent>;
 
 	/** @deprecated The P4 delegate path subscribes to authoritative task snapshots. */
 	waitForDelegationAcceptance(

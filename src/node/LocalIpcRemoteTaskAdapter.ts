@@ -1,4 +1,5 @@
 import type {
+	DelegatedExecutionContext,
 	RoutedTaskStartParams,
 	TaskSnapshot,
 	TaskSnapshotAfterEventSeq,
@@ -23,12 +24,21 @@ export class LocalIpcRemoteTaskAdapter implements RemoteTaskRouteAdapter {
 
 	public async startTask(
 		input: RoutedTaskStartParams,
-		route: { readonly peerId?: string },
+		route: {
+			readonly peerId?: string;
+			readonly delegatedExecutionContext?: DelegatedExecutionContext;
+		},
 	): Promise<TaskSnapshot> {
 		if (route.peerId === undefined) {
 			throw new TypeError('An explicit remote peer route is required.');
 		}
-		const snapshot = await this.client.startRemoteTask(input, route.peerId);
+		const snapshot = route.delegatedExecutionContext === undefined
+			? await this.client.startRemoteTask(input, route.peerId)
+			: await this.client.startRemoteTaskFromDelegatedChild(
+				input,
+				route.peerId,
+				route.delegatedExecutionContext,
+			);
 		this.snapshots.set(snapshot.taskId, snapshot);
 		return snapshot;
 	}

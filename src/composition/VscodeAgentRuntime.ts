@@ -28,6 +28,7 @@ import type { StateStore } from '../domain/ports';
 import type { LocalDesktopWorkspaceGuard } from '../application/LocalDesktopWorkspaceGuard';
 import type { LocalTaskConfirmation } from '../application/RemoteTaskRunner';
 import type { WorkerPlatformSupport } from '../application/WorkerPlatformSupport';
+import type { DelegatedToolInvocationRegistry } from '../tools/DelegatedToolInvocationRegistry';
 import type { TaskStartParams } from '../gateway/GatewayRouter';
 import type { LocalWorkspace } from '../workspaces/WorkspaceRegistry';
 import { canonicalTaskRequestHash } from '../domain/task';
@@ -180,6 +181,7 @@ export function createVscodeAgentRuntime(
 	guard: LocalDesktopWorkspaceGuard,
 	approval: FirstTaskConfirmation,
 	workerPlatform: WorkerPlatformSupport,
+	delegatedToolInvocations?: DelegatedToolInvocationRegistry,
 ): AgentRuntime {
 	const configuration = vscodeApi.workspace.getConfiguration(configurationSection);
 	const launcher = new AgentHostLauncher({
@@ -197,6 +199,7 @@ export function createVscodeAgentRuntime(
 		confirmation: approval,
 		workspaceResolver,
 		configResolver: new VscodeSessionConfigurationResolver(vscodeApi),
+		delegatedToolInvocations,
 	});
 	return new GuardedAgentRuntime(runtime, guard, workerPlatform);
 }
