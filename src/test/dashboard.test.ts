@@ -186,7 +186,7 @@ suite('Dashboard', () => {
 			assert.throws(() => assertSafeDashboardOutboundMessage({
 				...base,
 				model: withTaskSummary(safeModel, unsafeText),
-			}));
+			}), `Expected rejection for ${JSON.stringify(unsafeText)}`);
 		}
 		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({
 			...base,

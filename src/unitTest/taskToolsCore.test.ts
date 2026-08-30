@@ -39,6 +39,40 @@ const NODE_INSTANCE_ID = '00000000-0000-4000-8000-00000000000a';
 const SOURCE_NODE_ID = '00000000-0000-4000-8000-00000000000b';
 const SOURCE_WORKSPACE_IDENTITY = `sha256:${'A'.repeat(43)}`;
 const ENCODED_CONTROL_CREDENTIAL_FIELDS = encodedControlCredentialFields();
+const INSERTED_CODE_POINT_CREDENTIAL_FIELDS = insertedCodePointCredentialFields();
+const QUOTED_CONTEXT_CREDENTIAL_FIELDS = [
+	"don't reveal secret=hunter2 unique-tail-quote-1 prose",
+	"the user's api_key: hunter2 unique-tail-quote-2 prose",
+	'Unmatched "context then password=hunter2 unique-tail-quote-3 prose',
+	'{"note": "secret=hunter2 unique-tail-quote-4 leaked in log"}',
+	'don\'t leak {"password":"hunter2 unique-tail-quote-5"}',
+	'user\'s config {"secret":"hunter2 unique-tail-quote-6"}',
+	'password%22:%22hunter2 unique-tail-quote-7 encoded quote',
+	'secret%2527%3A%2527hunter2 unique-tail-quote-8 nested encoded quote',
+	'api key = hunter2 unique-tail-space-1 prose',
+	'private key: hunter2 unique-tail-space-2 prose',
+	'user[api key]=hunter2 unique-tail-space-3 prose',
+	'credentials[ password ]: hunter2 unique-tail-space-4 prose',
+];
+const SAFE_INTERNATIONAL_PROSE = [
+	'状态: 正常',
+	'状態: 正常です',
+	'Résumé: prêt',
+	"L'équipe: prête",
+	'密码: 已更新',
+	'Международный пароль: обновлён',
+	'国際化 password policy: 更新済み',
+	'The password policy: updated',
+	'password ポリシー: 更新済み',
+	'国際化 password ポリシー: 更新済み',
+	'token 一覧: 3件',
+	'secret сканер: готов',
+	'credential マネージャ: OK',
+	'authorization 流れ: 完了',
+	'the token — 期限: 30日',
+	'Le « secret » : rien',
+	`${'長'.repeat(512)}: 正常`,
+];
 
 function encodedControlCredentialFields(): string[] {
 	const controls = [
@@ -78,6 +112,73 @@ function encodedControlCredentialFields(): string[] {
 		'to%01ken=\r\nhunter2 unique-tail-control-continuation prose',
 		'to\u200b%01ken: hunter2 unique-tail-control-mixed prose',
 	];
+}
+
+function insertedCodePointCredentialFields(): string[] {
+	const sensitiveKeys = [
+		'api_key',
+		'authorization',
+		'credential',
+		'password',
+		'private_key',
+		'secret',
+		'tkn',
+		'token',
+	];
+	const insertions = [
+		{ name: 'c0', value: '\u0001' },
+		{ name: 'cf', value: '\u200c' },
+		{ name: 'mn-combining', value: '\u0300' },
+		{ name: 'me-combining', value: '\u0488' },
+		{ name: 'private-use', value: '\ue000' },
+		{ name: 'surrogate', value: '\ud800' },
+		{ name: 'variation-emoji', value: '\ufe0f' },
+		{ name: 'variation-17', value: '\ufe00' },
+		{ name: 'variation-supplement', value: '\u{e0100}' },
+		{ name: 'mongolian-variation', value: '\u180b' },
+		{ name: 'khmer-inherent', value: '\u17b4' },
+		{ name: 'hangul-filler', value: '\u3164' },
+		{ name: 'choseong-filler', value: '\u115f' },
+		{ name: 'jungseong-filler', value: '\u1160' },
+		{ name: 'braille-blank', value: '\u2800' },
+		{ name: 'emoji', value: '\u{1f600}' },
+	];
+	const separators = ['=', ':', ' = ', ':\r\n'];
+	const fields: string[] = [];
+	let index = 0;
+	for (const key of sensitiveKeys) {
+		for (let position = 0; position <= key.length; position += 1) {
+			for (const insertion of insertions) {
+				for (let encodingRounds = 0; encodingRounds <= 3; encodingRounds += 1) {
+					index += 1;
+					const inserted = encodeInsertedCodePoint(insertion.value, encodingRounds);
+					const obfuscatedKey = key.slice(0, position) + inserted + key.slice(position);
+					const separator = separators[index % separators.length];
+					fields.push(
+						`${obfuscatedKey}${separator}hunter2 unique-tail-property-${index} `
+						+ `${insertion.name}-${encodingRounds}-${position} prose`,
+					);
+				}
+			}
+		}
+	}
+	return [
+		...fields,
+		`password${'\u0300'.repeat(512)}=hunter2 unique-tail-property-long-raw prose`,
+		`authorization${encodeURIComponent('\u3164').repeat(512)}:hunter2 `
+			+ 'unique-tail-property-long-encoded prose',
+	];
+}
+
+function encodeInsertedCodePoint(value: string, rounds: number): string {
+	if (rounds === 0) {
+		return value;
+	}
+	let encoded = value === '\ud800' ? '%ED%A0%80' : encodeURIComponent(value);
+	for (let round = 1; round < rounds; round += 1) {
+		encoded = encodeURIComponent(encoded);
+	}
+	return encoded;
 }
 
 suite('TaskToolsCore', () => {
@@ -206,6 +307,8 @@ suite('TaskToolsCore', () => {
 			'api_%zzkey = hunter2 malformed-api-key prose',
 			'api%255Fkey%3A%20hunter2%zz mixed-valid-invalid prose',
 			...ENCODED_CONTROL_CREDENTIAL_FIELDS,
+			...INSERTED_CODE_POINT_CREDENTIAL_FIELDS,
+			...QUOTED_CONTEXT_CREDENTIAL_FIELDS,
 		]) {
 			const result = sanitizeDelegationText(`Safe before. ${credential} Safe after.`, 2_048);
 			assert.equal(result, '[redacted sensitive details]', credential);
@@ -226,6 +329,9 @@ suite('TaskToolsCore', () => {
 			sanitizeDelegationText('Read etc/passwd only if needed.', 2_048),
 			/etc\/passwd/u,
 		);
+		for (const prose of SAFE_INTERNATIONAL_PROSE) {
+			assert.equal(sanitizeDelegationText(prose, 2_048), prose);
+		}
 	});
 
 	test('fails closed on credential continuations through delegate and get paths', async () => {
@@ -250,6 +356,8 @@ suite('TaskToolsCore', () => {
 			'api%255Fkey%3A%20hunter2%zz unique-tail-18 mixed-valid-invalid prose',
 			'pa%zzssword\r\nhunter2 unique-tail-19 continuation prose',
 			...ENCODED_CONTROL_CREDENTIAL_FIELDS,
+			...INSERTED_CODE_POINT_CREDENTIAL_FIELDS,
+			...QUOTED_CONTEXT_CREDENTIAL_FIELDS,
 		];
 		for (const field of credentialFields) {
 			const facade = new RecordingFacade();
@@ -316,6 +424,32 @@ suite('TaskToolsCore', () => {
 			(safeResult.r as Record<string, unknown>).summary,
 			'First safe line Second safe line with normal prose.',
 		);
+		for (const prose of SAFE_INTERNATIONAL_PROSE) {
+			safeFacade.delegationSnapshot = {
+				...safeFacade.delegationSnapshot,
+				summary: prose,
+			};
+			const delegated = await new TaskToolsCore(safeFacade).delegateTask(delegationInput());
+			assert.equal((delegated.r as Record<string, unknown>).summary, prose);
+
+			safeFacade.taskRead = {
+				...safeFacade.taskRead,
+				snapshot: {
+					...safeFacade.taskRead.snapshot,
+					summary: prose,
+				},
+				events: [{
+					...safeFacade.taskRead.events[0],
+					summary: prose,
+				}],
+			};
+			const tracked = await new TaskToolsCore(safeFacade).getTask({ taskId: TASK_ID });
+			assert.equal((tracked.snapshot as Record<string, unknown>).summary, prose);
+			assert.equal(
+				(tracked.events as Array<Record<string, unknown>>)[0]?.summary,
+				prose,
+			);
+		}
 	});
 
 	test('sanitizes multiline completed results, input questions, and tracked events by span', async () => {

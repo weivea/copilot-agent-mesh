@@ -1,7 +1,10 @@
 const maximumCanonicalLength = 16 * 1024;
 const maximumDecodeRounds = 4;
 const maximumUriInspectionDepth = 4;
+const maximumCredentialKeyCandidateLength = 256;
 const credentialObfuscationPattern = /[\u0000-\u001f\u007f-\u009f\p{Cf}]/gu;
+const ignoredCredentialCategoryPattern = /[\p{M}\p{S}\p{C}\p{Z}]/u;
+const defaultIgnorableCredentialPattern = /\p{Default_Ignorable_Code_Point}/u;
 const sensitiveCredentialKeySuffixes = [
 	'apikey',
 	'authorization',
@@ -173,30 +176,77 @@ function canonicalizePercentEncoding(value: string): string[] | undefined {
 }
 
 function containsCredentialAssignment(value: string): boolean {
-	for (let separator = 0; separator < value.length; separator += 1) {
-		if (value[separator] !== '=' && value[separator] !== ':') {
-			continue;
-		}
+	let token = '';
+	let containsSensitiveSegment = false;
 
-		let cursor = separator - 1;
-		while (cursor >= 0 && isCredentialPadding(value[cursor])) {
-			cursor -= 1;
+	const resetCandidate = (): void => {
+		token = '';
+		containsSensitiveSegment = false;
+	};
+	const endSegment = (): void => {
+		if (isSensitiveCredentialKey(token)) {
+			containsSensitiveSegment = true;
 		}
-		const keyEnd = cursor + 1;
-		while (
-			cursor >= 0
-			&& isCredentialKeyCharacter(value[cursor])
-		) {
-			cursor -= 1;
+		token = '';
+	};
+	const appendIdentifier = (character: string): void => {
+		token += character.toLowerCase();
+		if (token.length > maximumCredentialKeyCandidateLength) {
+			token = token.slice(-maximumCredentialKeyCandidateLength);
 		}
-		if (keyEnd === cursor + 1) {
+	};
+
+	for (const character of value) {
+		if (isIgnoredCredentialInsertion(character)) {
 			continue;
 		}
-		if (containsSensitiveCredentialKeySegment(value.slice(cursor + 1, keyEnd))) {
-			return true;
+		if (character === '=' || character === ':') {
+			if (containsSensitiveSegment || isSensitiveCredentialKey(token)) {
+				return true;
+			}
+			resetCandidate();
+			continue;
+		}
+		if (isAsciiAlphanumeric(character)) {
+			appendIdentifier(character);
+		} else if (character === '[' || character === ']') {
+			endSegment();
+		} else if (
+			character !== '_'
+			&& character !== '-'
+			&& character !== '+'
+			&& character !== ' '
+			&& character !== '"'
+			&& character !== '\''
+		) {
+			resetCandidate();
 		}
 	}
 	return false;
+}
+
+function isIgnoredCredentialInsertion(character: string): boolean {
+	const code = character.codePointAt(0);
+	if (code === undefined) {
+		return false;
+	}
+	return code <= 31
+		|| code === 127
+		|| (
+			code > 127
+			&& (
+				ignoredCredentialCategoryPattern.test(character)
+				|| defaultIgnorableCredentialPattern.test(character)
+			)
+		);
+}
+
+function isAsciiAlphanumeric(character: string): boolean {
+	if (isAsciiLetter(character)) {
+		return true;
+	}
+	const code = character.charCodeAt(0);
+	return code >= 48 && code <= 57;
 }
 
 function containsCredentialTextRaw(value: string): boolean {
@@ -206,18 +256,6 @@ function containsCredentialTextRaw(value: string): boolean {
 		|| lower.includes('bearer ')
 		|| githubTokenPrefixes.some((prefix) => lower.includes(prefix))
 		|| containsCredentialAssignment(lower);
-}
-
-function isCredentialPadding(character: string): boolean {
-	return character === '"' || character === '\'' || character.trim().length === 0;
-}
-
-function isCredentialKeyCharacter(character: string): boolean {
-	return isIdentifierCharacter(character)
-		|| character.trim().length === 0
-		|| character === '['
-		|| character === ']'
-		|| character === '+';
 }
 
 function isIdentifierCharacter(character: string | undefined): boolean {

@@ -109,8 +109,19 @@ inspection. Malformed, undecodable, or excessively nested percent encoding fails
 closed by redacting the full field, because it can otherwise split a credential
 key from its value. Every decoded form also removes C0, C1, and Unicode format
 controls for credential-key inspection, preventing encoded controls from splitting
-a key while preserving ordinary valid percent-encoded prose. Canonical inspection
-is bounded to a fixed number of linear decode passes. Byte-budget
+a key. Credential assignment parsing examines a bounded candidate before `=` or
+`:`, treats clear ASCII punctuation as structural boundaries, and normalizes
+wrapper quotes, apostrophes, key whitespace, separators, and inserted Unicode
+marks, symbols, controls, private-use/surrogate code points, separators, and
+default-ignorables away from ASCII alphanumerics. This catches variation selectors,
+combining marks, fillers, visible emoji, quoted-key, and spaced-key obfuscation.
+Ordinary Unicode letters, numbers, and punctuation remain structural prose
+boundaries, so international labels are not collapsed into credential keys.
+Ordinary valid percent-encoded prose remains available. Canonical inspection is
+bounded to a fixed number of linear decode
+passes. Assignment parsing makes one forward pass with rolling normalized key
+state capped at 256 code units, so long runs of ignored filler cannot exhaust a
+backward-search budget or introduce quadratic rescans. Byte-budget
 contraction always preserves `t` and `d`; if a completed or needs-input payload
 cannot fit, it becomes exact compact failure
 `{s:2,t,d,e:"OUTPUT_TOO_LARGE"}` rather than an identity-free generic result.
