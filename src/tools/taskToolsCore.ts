@@ -152,6 +152,17 @@ const safeErrorMessages: Readonly<Record<TaskToolErrorCode, string>> = {
 	LOCAL_FILE_WORKSPACE_REQUIRED: 'The task requires a local filesystem-backed workspace.',
 	TASK_CANCELLATION_UNCONFIRMED: 'The remote task cancellation was not confirmed.',
 	DELEGATION_NOT_FOUND: 'The delegation intent was not found.',
+	COLLABORATION_NOT_FOUND: 'The collaboration run was not found.',
+	COLLABORATION_ID_CONFLICT: 'The collaboration identity conflicts with another request.',
+	COLLABORATION_NOT_CANCELLABLE: 'The collaboration run is no longer cancellable.',
+	COLLABORATION_DAG_INVALID: 'The collaboration participants or dependency graph are invalid.',
+	ARTIFACT_NOT_FOUND: 'The required collaboration artifact was not found.',
+	ARTIFACT_FORBIDDEN: 'The collaboration artifact is not authorized for this task.',
+	ARTIFACT_INVALID: 'The collaboration artifact failed its bounded JSON policy.',
+	ARTIFACT_CORRUPT: 'The collaboration artifact failed its integrity check.',
+	ARTIFACT_LIMIT_EXCEEDED: 'The collaboration artifact count or byte limit was exceeded.',
+	FEATURE_DISABLED: 'Same-device multi-project collaboration Preview is disabled.',
+	VALIDATION_FAILED: 'A workspace validation failed.',
 	INTERNAL_ERROR: 'The mesh operation failed without a safe diagnostic.',
 };
 
@@ -1464,6 +1475,92 @@ function shrinkToolResult(value: ToolJsonResult): ToolJsonResult | undefined {
 	const compactDelegation = compactDelegationResult(value);
 	if (compactDelegation !== undefined) {
 		return compactDelegation;
+	}
+	if (isRecord(value.run)) {
+		const run = value.run;
+		if (Array.isArray(run.artifacts) && run.artifacts.length > 0) {
+			return {
+				...value,
+				run: { ...run, artifacts: run.artifacts.slice(0, -1) },
+				truncated: true,
+			};
+		}
+		if (Array.isArray(run.validations) && run.validations.length > 0) {
+			return {
+				...value,
+				run: { ...run, validations: run.validations.slice(0, -1) },
+				truncated: true,
+			};
+		}
+		if (
+			Array.isArray(run.tasks)
+			&& run.tasks.some((task) =>
+				isRecord(task)
+				&& Object.keys(task).some((key) =>
+					!['taskId', 'role', 'kind', 'status', 'pendingInput'].includes(key),
+				),
+			)
+		) {
+			return {
+				...value,
+				run: {
+					...run,
+					tasks: run.tasks.map((task) => {
+						if (!isRecord(task)) {
+							return task;
+						}
+						return {
+							taskId: task.taskId,
+							role: task.role,
+							kind: task.kind,
+							status: task.status,
+							...(task.pendingInput === undefined
+								? {}
+								: { pendingInput: task.pendingInput }),
+						};
+					}),
+				},
+				truncated: true,
+			};
+		}
+		if (Array.isArray(run.participants) && run.participants.length > 0) {
+			const { participants: _participants, ...withoutParticipants } = run;
+			return { ...value, run: withoutParticipants, truncated: true };
+		}
+		if (
+			Array.isArray(run.tasks)
+			&& run.tasks.length > 0
+			&& typeof run.runId === 'string'
+			&& typeof run.status === 'string'
+		) {
+			return {
+				status: typeof value.status === 'string' ? value.status : 'ok',
+				run: {
+					runId: run.runId,
+					status: run.status,
+					tasks: run.tasks.map((task) =>
+						isRecord(task)
+							? {
+								taskId: task.taskId,
+								status: task.status,
+								...(task.pendingInput === undefined
+									? {}
+									: { pendingInput: task.pendingInput }),
+							}
+							: task,
+					),
+				},
+				...(value.answerTool === undefined ? {} : { answerTool: value.answerTool }),
+				truncated: true,
+			};
+		}
+		if (typeof run.runId === 'string' && typeof run.status === 'string') {
+			return {
+				status: typeof value.status === 'string' ? value.status : 'ok',
+				run: { runId: run.runId, status: run.status },
+				truncated: true,
+			};
+		}
 	}
 	if (Array.isArray(value.events) && value.events.length > 0) {
 		const [removed, ...events] = value.events;

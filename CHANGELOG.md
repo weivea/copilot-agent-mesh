@@ -6,6 +6,69 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [Unreleased]
 
+- Documented the 0.4.0 Peer Window Delegation redesign. Same-device multi-project
+  collaboration moves from the Dashboard-driven fixed frontend/backend DAG to
+  Copilot Chat driven peer window delegation: each window is its own primary node,
+  authorizes peers through a directional workspace allowlist plus a receive-side
+  "accept incoming tasks" gate, can be renamed for human reference, and delegates
+  through the existing five Mesh Tools. See
+  `docs/0.4.0-peer-delegation-requirements.md`.
+- Documented the 0.4.0 technical design covering the Broker-owned peer policy
+  store, double authorization gate and distinguishable error codes, long-running
+  `mesh_delegate_task` with authoritative terminal outcomes, per-task delegation
+  grants, recursion prevention, Dashboard rework, and the test matrix. See
+  `docs/0.4.0-peer-delegation-design.md`.
+- Added the Editor Agent Host Endpoint spike. A running VS Code instance exposes a
+  `type: "editor"` AHP endpoint over a Unix socket that negotiates protocol
+  `1.0.0`, reuses the signed-in Copilot identity, and lists the user's real chat
+  sessions. This replaces the isolated standalone host as the preferred runtime
+  source and makes child-task visibility in the target window plausible; the
+  standalone launcher stays as an explicitly degraded fallback. See
+  `docs/spikes/editor-agent-host.md`.
+- Recorded that the stable VS Code tool confirmation surface offers only
+  Continue/Cancel, so delegation authorization is a binary confirmation whose scope
+  is stated in the confirmation body rather than a third button.
+- Marked the collaboration sections of the PRD and the technical implementation
+  plan as superseded. No code has changed yet; 0.3.0 behaviour is unaffected.
+
+## [0.3.0 Preview] - 2026-08-30
+
+- Added a generation-fenced, durable `CollaborationRun` aggregate with explicit
+  frontend/backend participants, task dependencies, idempotent request identity,
+  blocked/input/terminal propagation, takeover reconciliation, and exact
+  cancellation of active versus not-yet-started tasks.
+- Added a Broker-owned immutable Artifact Store limited to bounded structured JSON
+  media types. Artifacts carry producer run/task identity, explicit consumer task
+  authorization, content length, SHA-256, revision, and atomic recovery; forbidden
+  secrets, paths, raw logs, prompts, output, and transcripts fail closed.
+- Added the same-device orchestration sequence: backend contract/implementation →
+  frontend implementation consuming the exact contract artifact → backend and
+  frontend validation → aggregate completion.
+- Added `mesh_start_collaboration`, `mesh_get_collaboration`, and
+  `mesh_cancel_collaboration`, including manifest/runtime parity, safe error codes,
+  deadlines, confirmations, token contraction, and reuse of `mesh_answer_task`.
+- Added a Preview-gated Dashboard Collaboration Runs surface with explicit role and
+  workspace selection, task dependency/blocked/input/validation state, artifact
+  metadata, and start/get/cancel/answer actions. Raw goals and artifact content
+  never enter the webview.
+- Added the explicitly gated `MESH_MULTI_PROJECT_E2E=1 npm run
+  test:multi-project-real` harness for two ordinary VS Code windows, real AHP
+  completion, exact artifact handoff, per-workspace validation, local-route
+  isolation, and zero-residue cleanup evidence.
+- Passed that gate on VS Code 1.135.0/macOS arm64. Evidence
+  `99d16bac-1b46-470d-9c7d-b9ebb74d4352` records both authoritative completed
+  turns, exact Artifact ID/media type/153-byte size/SHA-256 consumption, two
+  passed validations, aggregate completion, no Listener/Tunnel use, released
+  profile lock, and zero owned process/socket residue.
+- Fixed Dashboard input handling so the pending Agent question is shown in the
+  native Extension Host input box without crossing the webview message bus,
+  answers are bound to the exact pending input ID, and common Chinese approval
+  terms such as `继续`、`同意` and `批准` are accepted. Repeated identical
+  confirmations now expose a short input-ID prefix and already queued requests
+  continue in the same interaction, making successful answers visible. Answers
+  now route through the Broker-owned Collaboration aggregate, so either current
+  participant window can answer, and the run immediately clears stale
+  `needsInput` after the underlying task resumes.
 - Upgraded the production AHP client from the published 0.8.0 tarball to the
   TypeScript 0.9.0 client built from pinned upstream commit
   `f19dd8b3942d029744a3bdd31d830f9428e8ea47`, which negotiates AHP 1.0.0 with

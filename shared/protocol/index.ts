@@ -1,4 +1,5 @@
 export * from './constants';
+export * from './collaboration';
 export * from './envelopes';
 export * from './errors';
 export * from './limits';

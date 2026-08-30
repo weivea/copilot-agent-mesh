@@ -1,6 +1,6 @@
 # Preview release engineering
 
-> Version: `0.2.0` Preview
+> Version: `0.3.0` Preview
 > Gate status: G0 **Go for validated macOS arm64 scope**
 
 This document describes a reproducible evaluation package. It does not authorize
@@ -23,6 +23,18 @@ fail closed instead of launching Worker processes.
 The package speaks Mesh protocol v2. Protocol-v1 peers are incompatible. Upgrade
 migration preserves the 0.1 device ID and v1 workspace/task data in schema v2;
 unknown or corrupt persisted versions fail.
+
+Same-device multi-project collaboration is a separate Preview opt-in:
+
+```json
+{
+  "copilotAgentMesh.experimental.sameDeviceCollaboration": true
+}
+```
+
+It requires two different claimed local workspaces and the real Agent Host
+setting. It uses authenticated local IPC only and does not require or start the
+Listener or Dev Tunnel.
 
 The real Agent Host/AHP runtime requires:
 
@@ -55,7 +67,7 @@ npm run verify
 The package command creates:
 
 ```text
-artifacts/copilot-agent-mesh-0.2.0-preview.vsix
+artifacts/copilot-agent-mesh-0.3.0-preview.vsix
 ```
 
 The production bundle is separate from VSIX creation:
@@ -77,8 +89,8 @@ Inspect and hash the result independently:
 
 ```sh
 npx vsce ls --no-dependencies
-unzip -Z1 artifacts/copilot-agent-mesh-0.2.0-preview.vsix
-shasum -a 256 artifacts/copilot-agent-mesh-0.2.0-preview.vsix
+unzip -Z1 artifacts/copilot-agent-mesh-0.3.0-preview.vsix
+shasum -a 256 artifacts/copilot-agent-mesh-0.3.0-preview.vsix
 ```
 
 ## Real multi-window verification
@@ -122,6 +134,35 @@ authentication session, `agentStarted`, five output events,
 socket, or Tunnel residue. G0 is Go only for this validated macOS arm64 Preview
 scope.
 
+## Real multi-project verification
+
+The same-device frontend/backend gate is disabled unless explicitly enabled:
+
+```sh
+MESH_MULTI_PROJECT_E2E=1 \
+MESH_MULTI_PROJECT_E2E_PROFILE_DIR=$HOME/.mw-profile \
+MESH_MULTI_PROJECT_E2E_AUTH_RESOURCE='https://api.github.com' \
+MESH_MULTI_PROJECT_E2E_AUTH_PROVIDER='github' \
+MESH_MULTI_PROJECT_E2E_AUTH_SCOPES_JSON='["read:user","user:email"]' \
+MESH_MULTI_PROJECT_E2E_RUNTIME_DIR=$HOME/.mw \
+npm run test:multi-project-real
+```
+
+It launches two ordinary windows with two temporary non-sensitive projects,
+requires exactly one Broker and two claims, completes real backend and frontend
+AHP turns, verifies the immutable contract hash without recording content, runs
+both validations, requires aggregate `completed`, leaves Listener/Tunnel
+stopped, releases the dedicated profile lock, and rejects any residual Agent
+Host, VS Code, Tunnel, socket, or timer resource. It may consume Copilot quota
+and is never an ordinary CI task.
+
+Evidence
+`.vscode-test/multi-project-evidence/99d16bac-1b46-470d-9c7d-b9ebb74d4352.json`
+passed on VS Code 1.135.0/macOS arm64 with both real implementation tasks
+completed, exact 153-byte contract handoff, two validation passes, aggregate
+completion, stopped Listener/Tunnel, released profile lock, and zero owned
+residue.
+
 ## Isolated activation smoke
 
 The smoke command installs the VSIX into temporary user-data and extension
@@ -153,6 +194,9 @@ cleanup review; the success path may consume Copilot quota.
 `test:multi-window-real` is also an explicit real-window release check rather than
 an ordinary unit/component gate. Its AHP branch must never run unless
 `MESH_MULTI_WINDOW_E2E_TASKS=1` is set.
+`test:multi-project-real` additionally requires `MESH_MULTI_PROJECT_E2E=1` and a
+dedicated authenticated profile; blocked/cancelled outcomes never count as
+completed.
 
 ## Manual release checklist
 

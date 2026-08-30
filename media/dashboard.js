@@ -3,7 +3,7 @@
 
 	const vscode = acquireVsCodeApi();
 	const uiInstanceId = document.body.dataset.uiInstanceId;
-	const version = 2;
+	const version = 3;
 
 	document.addEventListener('click', (event) => {
 		const button = event.target.closest('button[data-action]');
@@ -48,6 +48,14 @@
 		renderCollection('localNodes', model.localNodes, renderLocalNode, 'No local Window Nodes connected.');
 		renderCollection('remoteDevices', model.remoteDevices, renderRemoteDevice, 'No remote devices configured.');
 		renderCollection('tasks', model.tasks, renderTask, 'No delegated tasks.');
+		renderCollection('collaborationRuns', model.collaborationRuns, renderCollaborationRun, model.collaborationPreview.enabled
+			? 'No collaboration runs.'
+			: 'Enable the same-device collaboration Preview setting to start a run.');
+		const startCollaboration = document.getElementById('startCollaboration');
+		startCollaboration.disabled = !model.collaborationPreview.canStart;
+		startCollaboration.title = model.collaborationPreview.enabled
+			? (model.collaborationPreview.canStart ? '' : 'Open and claim two different available local workspaces.')
+			: 'Enable copilotAgentMesh.experimental.sameDeviceCollaboration.';
 		renderCollection('errors', model.errors, renderError, '');
 		setText(document.getElementById('announcement'), 'Dashboard refreshed.');
 	}
@@ -177,6 +185,58 @@
 		if (task.canCancel) {
 			card.append(actionButton('Cancel', 'cancelTask', task.taskId, true));
 		}
+		return card;
+	}
+
+	function renderCollaborationRun(run) {
+		const card = itemCard(run.title, run.status);
+		for (const participant of run.participants) {
+			card.append(textElement(
+				'p',
+				`${participant.role}: ${participant.nodeLabel} · ${participant.workspaceName}`,
+				'detail',
+			));
+		}
+		for (const task of run.tasks) {
+			const dependency = task.dependsOn.length === 0
+				? 'ready'
+				: `depends on ${task.dependsOn.join(', ')}`;
+			const line = `${task.role} ${task.kind}: ${task.status} · ${task.workspaceName} · ${dependency}`;
+			card.append(textElement('p', line, 'phase'));
+			if (task.validationStatus) {
+				card.append(textElement('p', `Validation: ${task.validationStatus}`, 'detail'));
+			}
+			if (task.pendingInputId) {
+				card.append(textElement(
+					'p',
+					`Waiting for input ${task.pendingInputId.slice(0, 8)}`,
+					'action-hint',
+				));
+			}
+			if (task.blockCode) {
+				card.append(textElement('p', `Blocked: ${task.blockCode}`, 'action-hint'));
+			}
+			if (task.failureCode) {
+				card.append(textElement('p', `Failed: ${task.failureCode}`, 'action-hint'));
+			}
+		}
+		for (const artifact of run.artifacts) {
+			card.append(textElement(
+				'p',
+				`Artifact: ${artifact.label} · ${artifact.mediaType} · ${artifact.contentLength} bytes · SHA-256 ${artifact.sha256.slice(0, 12)}…`,
+				'detail',
+			));
+		}
+		const actions = document.createElement('div');
+		actions.className = 'actions';
+		actions.append(actionButton('Refresh Run', 'getCollaboration', run.runId));
+		if (run.canAnswer) {
+			actions.append(actionButton('Answer Input', 'answerCollaboration', run.runId));
+		}
+		if (run.canCancel) {
+			actions.append(actionButton('Cancel', 'cancelCollaboration', run.runId, true));
+		}
+		card.append(actions);
 		return card;
 	}
 

@@ -73,9 +73,11 @@ interface AnswerOperation {
 interface ActiveTask {
 	readonly handle: AgentTaskHandle;
 	readonly pendingInputs: Map<string, PendingInput>;
+	readonly queuedInputs: AgentInputRequest[];
 	readonly answeredInputs: Map<string, string>;
 	readonly answerOperations: Map<string, AnswerOperation>;
 	outputSummary: string;
+	outputTail: string;
 	terminal: boolean;
 	cleanupRequired: boolean;
 	cancelComplete: boolean;
@@ -232,9 +234,10 @@ export class WindowNodeTaskExecutor {
 			throw new MeshDomainError('INPUT_NOT_PENDING', 'The requested input is not pending.');
 		}
 
-		const operation = active.handle.answer(toAgentAnswer(pending.request, params.answer)).then(() => {
+		const operation = active.handle.answer(toAgentAnswer(pending.request, params.answer)).then(async () => {
 			active.pendingInputs.delete(params.inputId);
 			active.answeredInputs.set(params.inputId, params.answerId);
+			await this.publishNextInput(record, active);
 		});
 		active.answerOperations.set(params.inputId, {
 			answerId: params.answerId,
@@ -351,9 +354,11 @@ export class WindowNodeTaskExecutor {
 		const active: ActiveTask = {
 			handle,
 			pendingInputs: new Map(),
+			queuedInputs: [],
 			answeredInputs: new Map(),
 			answerOperations: new Map(),
 			outputSummary: '',
+			outputTail: '',
 			terminal: false,
 			cleanupRequired: false,
 			cancelComplete: false,
@@ -513,6 +518,10 @@ export class WindowNodeTaskExecutor {
 					active.outputSummary + event.text,
 					PROTOCOL_LIMITS.terminalSummaryBytes,
 				);
+				active.outputTail = boundUtf8Tail(
+					active.outputTail + event.text,
+					PROTOCOL_LIMITS.terminalSummaryBytes,
+				);
 				await this.publish(record, {
 					type: 'output',
 					summary: boundUtf8(event.text, PROTOCOL_LIMITS.outputEventBytes),
@@ -545,7 +554,10 @@ export class WindowNodeTaskExecutor {
 			case 'completed':
 				await this.publish(record, {
 					type: 'completed',
-					summary: active.outputSummary || 'Task completed.',
+					summary: structuredCompletionSummary(
+						active.outputSummary,
+						active.outputTail,
+					) || 'Task completed.',
 				});
 				active.terminal = true;
 				record.terminal = true;
@@ -581,12 +593,42 @@ export class WindowNodeTaskExecutor {
 		active: ActiveTask,
 		request: AgentInputRequest,
 	): Promise<void> {
-		if (!isStringAnswerableInput(request) || active.pendingInputs.size > 0) {
+		if (!isStringAnswerableInput(request)) {
 			throw new AgentRuntimeError(
 				'TASK_EXECUTION_FAILED',
 				'The Agent runtime requested input that this protocol version cannot answer safely.',
 			);
 		}
+		if (active.pendingInputs.size > 0) {
+			if (active.queuedInputs.length >= 32) {
+				throw new AgentRuntimeError(
+					'TASK_EXECUTION_FAILED',
+					'The Agent runtime exceeded the pending input queue limit.',
+				);
+			}
+			active.queuedInputs.push(request);
+			return;
+		}
+		await this.publishInput(record, active, request);
+	}
+
+	private async publishNextInput(
+		record: StartRecord,
+		active: ActiveTask,
+	): Promise<void> {
+		const next = active.queuedInputs[0];
+		if (next === undefined || active.terminal) {
+			return;
+		}
+		await this.publishInput(record, active, next);
+		active.queuedInputs.shift();
+	}
+
+	private async publishInput(
+		record: StartRecord,
+		active: ActiveTask,
+		request: AgentInputRequest,
+	): Promise<void> {
 		const publicInputId = this.id();
 		const pending = { publicInputId, request };
 		active.pendingInputs.set(publicInputId, pending);
@@ -886,7 +928,7 @@ function toAgentAnswer(request: AgentInputRequest, answer: string): AgentTaskAns
 		);
 		return {
 			requestId: request.requestId,
-			outcome: selected?.approve === true || ['yes', 'approve', 'accept'].includes(normalized)
+			outcome: selected?.approve === true || isAffirmative(normalized)
 				? 'accept'
 				: 'decline',
 			selectedOptionId: selected?.id,
@@ -895,30 +937,105 @@ function toAgentAnswer(request: AgentInputRequest, answer: string): AgentTaskAns
 	if (request.kind === 'toolAuthentication') {
 		return {
 			requestId: request.requestId,
-			outcome: ['yes', 'approve', 'accept', 'authenticate'].includes(normalized)
+			outcome: isAffirmative(normalized) || normalized === 'authenticate'
 				? 'accept'
 				: 'decline',
 		};
 	}
-	const field = request.fields?.[0];
-	if (field === undefined || request.fields?.length !== 1 || field.type !== 'string') {
-		throw new MeshDomainError(
-			'INPUT_NOT_PENDING',
-			'The requested input cannot be answered by this protocol version.',
-		);
-	}
+	const fields = request.fields ?? [];
 	return {
 		requestId: request.requestId,
 		outcome: 'accept',
-		values: { [field.id]: answer },
+		values: Object.fromEntries(
+			fields.map((field) => [field.id, parseFieldAnswer(field, answer)]),
+		),
 	};
 }
 
 function isStringAnswerableInput(request: AgentInputRequest): boolean {
-	if (request.kind !== 'chatInput') {
-		return true;
+	return request.kind !== 'chatInput'
+		|| (request.fields?.every(({ type }) =>
+			['string', 'number', 'integer', 'boolean', 'singleSelect', 'multiSelect'].includes(type),
+		) ?? true);
+}
+
+function parseFieldAnswer(
+	field: NonNullable<AgentInputRequest['fields']>[number],
+	answer: string,
+): string | number | boolean | readonly string[] {
+	const trimmed = answer.trim();
+	switch (field.type) {
+		case 'string':
+			return answer;
+		case 'number':
+		case 'integer': {
+			const value = Number(trimmed);
+			if (!Number.isFinite(value) || (field.type === 'integer' && !Number.isInteger(value))) {
+				throw new MeshDomainError(
+					'INPUT_NOT_PENDING',
+					'The task answer is not a valid number for the pending input.',
+				);
+			}
+			return value;
+		}
+		case 'boolean':
+			if (isAffirmative(trimmed.toLowerCase())) {
+				return true;
+			}
+			if (['false', 'no', 'decline', 'deny'].includes(trimmed.toLowerCase())) {
+				return false;
+			}
+			throw new MeshDomainError(
+				'INPUT_NOT_PENDING',
+				'The task answer is not a valid boolean for the pending input.',
+			);
+		case 'singleSelect':
+			return selectOption(field.options, trimmed);
+		case 'multiSelect':
+			return trimmed
+				.split(',')
+				.map((value) => selectOption(field.options, value.trim()));
 	}
-	return request.fields?.length === 1 && request.fields[0]?.type === 'string';
+}
+
+function selectOption(
+	options: NonNullable<AgentInputRequest['fields']>[number]['options'],
+	answer: string,
+): string {
+	const normalized = answer.toLowerCase();
+	const selected = options?.find((option) =>
+		option.id === answer || option.label.toLowerCase() === normalized,
+	) ?? (
+		isAffirmative(normalized)
+			? options?.find((option) => /(?:^|[\s_-])(yes|approve|accept|allow)(?:$|[\s_-])/iu.test(
+				`${option.id} ${option.label}`,
+			))
+			: undefined
+	) ?? (options?.length === 1 ? options[0] : undefined);
+	if (selected === undefined) {
+		throw new MeshDomainError(
+			'INPUT_NOT_PENDING',
+			'The task answer does not match a pending input option.',
+		);
+	}
+	return selected.id;
+}
+
+function isAffirmative(answer: string): boolean {
+	return [
+		'yes',
+		'approve',
+		'accept',
+		'continue',
+		'ok',
+		'是',
+		'可以',
+		'继续',
+		'同意',
+		'批准',
+		'确认',
+		'允许',
+	].includes(answer);
 }
 
 function boundUtf8(value: string, maxBytes: number): string {
@@ -936,6 +1053,37 @@ function boundUtf8(value: string, maxBytes: number): string {
 		bytes += size;
 	}
 	return result;
+}
+
+function boundUtf8Tail(value: string, maxBytes: number): string {
+	if (Buffer.byteLength(value, 'utf8') <= maxBytes) {
+		return value;
+	}
+	let result = '';
+	let bytes = 0;
+	for (const character of [...value].reverse()) {
+		const size = Buffer.byteLength(character, 'utf8');
+		if (bytes + size > maxBytes) {
+			break;
+		}
+		result = character + result;
+		bytes += size;
+	}
+	return result;
+}
+
+function structuredCompletionSummary(prefix: string, tail: string): string {
+	for (const [start, end] of [
+		['MESH_CONTRACT_ARTIFACT_V1_BEGIN', 'MESH_CONTRACT_ARTIFACT_V1_END'],
+		['MESH_VALIDATION_RESULT_V1_BEGIN', 'MESH_VALIDATION_RESULT_V1_END'],
+	] as const) {
+		const startIndex = tail.lastIndexOf(start);
+		const endIndex = tail.indexOf(end, startIndex + start.length);
+		if (startIndex >= 0 && endIndex >= 0) {
+			return tail.slice(startIndex, endIndex + end.length);
+		}
+	}
+	return prefix;
 }
 
 function rejectedReasons(results: readonly PromiseSettledResult<unknown>[]): unknown[] {

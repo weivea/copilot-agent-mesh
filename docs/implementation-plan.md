@@ -4,7 +4,7 @@
 > Node；仅 macOS arm64 支持 Worker Host/真实任务执行。Windows、Linux、macOS
 > x64 和其他架构可以作为 Broker Client/Window Node，但不能 Host Worker。
 
-> 状态：0.2.0 Preview Multi-window Mesh Nodes 已实现；Gate G0 在 macOS arm64
+> 状态：0.3.0 Preview Same-device Multi-project Collaboration 已实现；Gate G0 在 macOS arm64
 > 验证范围内 Go<br>
 > 日期：2026-08-30<br>
 > 依据：[PRD v0.3](../copilot-agent-mesh-prd.md) 与 [技术实施方案](./technical-implementation.md)<br>
@@ -17,7 +17,7 @@
 
 首版交付结果：
 
-- 一个 `0.2.0` Preview VSIX；Protocol v2，v1 Peer 明确不兼容。
+- 一个 `0.3.0` Preview VSIX；Protocol v2，v1 Peer 明确不兼容。
 - 一个稳定 Device Broker 和每普通窗口一个活跃 Window Node；非 Owner Window
   不是只读。
 - macOS arm64 Worker 可注册本机 Workspace、启动本地 Gateway 和 Dev Tunnel。
@@ -43,16 +43,17 @@
 - Loopback Gateway、Pairing、Peer、Heartbeat、重连和任务 RPC。
 - 精确版本 Dev Tunnel Provider、HTTPS/WSS Readiness、续期和精确清理。
 - Production Agent Host/AHP Runtime、认证边界、Session/Chat/Terminal/Input 映射。
-- 五个 Production Language Model Tools 和安全交互 Dashboard。
+- 八个 Production Language Model Tools 和安全交互 Dashboard。
 - TaskCoordinator、WorkerTaskService、Composition Root 和启动/关闭恢复。
 - 双实例真实 E2E、三平台离线 CI、Preview VSIX 和隔离安装 activation smoke。
 - 普通窗口同 User Data E2E：一个 Broker、多 Node、Claim/Reclaim/Conflict、
   Takeover Generation 和零残留清理。
+- Broker-owned Collaboration Run DAG、不可变受限 JSON Artifact Store、backend →
+  frontend 精确 handoff、双 Workspace Validation、cancel/answer/recovery。
 
 Preview 后续 Gate：
 
-- 使用显式 VS Code Authentication Mapping 完成真实 AHP `turnComplete` E2E。
-- 在真实 Copilot 会话中验证五个 Tool 的自动选择与完成结果消费。
+- 在真实 Copilot 会话中验证八个 Tool 的自动选择与完成结果消费。
 - Windows/Linux Worker 的进程树所有权、Dev Tunnel 版本和完整 E2E。
 - 多 Workspace 真实并发、重启恢复和人工 UI 验收扩展矩阵。
 
@@ -66,11 +67,13 @@ Preview 后续 Gate：
    Store → Window A，绝不接触 Dev Tunnel。
 4. Remote v2 Route 为一个 Device Gateway/Tunnel → Broker → Target Node；Route
    Catalog 在 Send 前持久化，结果通过 IPC multiplex 到全部本机窗口。
-5. 五个 Tool 和 Dashboard 使用显式 Device → Node → Workspace Target。
+5. 八个 Tool 和 Dashboard 使用显式 Device → Node → Workspace Target。
    Dashboard 显示 Broker Owner/Takeover、本机 Nodes/Conflicts 和 Remote Nodes，
    ViewModel 不含 Secret、Path、Raw Prompt/Output。
 6. 0.1 Migration 保留 Device ID 与 v1 Workspace/Task Data 进入 Schema v2；
    Unknown/Corrupt Version Fail Closed。
+7. Collaboration Run 和 Artifact Store 只能由当前 Broker Generation 写入；
+   Artifact 只允许受限 JSON 和精确 consumer task，不能成为任意文件传输接口。
 
 ## 3. 决策 Gate
 

@@ -1,6 +1,7 @@
 import { z } from 'zod';
 
 import {
+	COLLABORATION_LOCAL_METHODS,
 	MESH_ERROR_CODES,
 	brokerRemoteListResultSchema,
 	brokerRemoteTaskAnswerParamsSchema,
@@ -10,6 +11,10 @@ import {
 	JSON_RPC_ERROR_CODES,
 	LOCAL_BROKER_METHODS,
 	PROTOCOL_LIMITS,
+	collaborationListResultSchema,
+	collaborationAnswerParamsSchema,
+	collaborationRunSnapshotSchema,
+	collaborationStartParamsSchema,
 	nodeDirectoryResultSchema,
 	nodeStatusSchema,
 	nodeTaskAnswerParamsSchema,
@@ -25,6 +30,10 @@ import {
 	uuidSchema,
 	windowNodeDescriptorSchema,
 	type NodeDirectoryResult,
+	type CollaborationListResult,
+	type CollaborationAnswerParams,
+	type CollaborationRunSnapshot,
+	type CollaborationStartParams,
 	type NodeStatus,
 	type NodeTaskEventParams,
 	type RoutedTaskStartParams,
@@ -304,6 +313,48 @@ export class WindowNodeClient implements WorkspaceResolver {
 
 	public listNodes(): Promise<NodeDirectoryResult> {
 		return this.request(LOCAL_BROKER_METHODS.list, {}, nodeDirectoryResultSchema);
+	}
+
+	public startCollaboration(input: CollaborationStartParams): Promise<CollaborationRunSnapshot> {
+		return this.request(
+			COLLABORATION_LOCAL_METHODS.start,
+			toJsonValue(collaborationStartParamsSchema.parse(input)),
+			collaborationRunSnapshotSchema,
+		);
+	}
+
+	public getCollaboration(runId: string): Promise<CollaborationRunSnapshot> {
+		return this.request(
+			COLLABORATION_LOCAL_METHODS.get,
+			toJsonValue({ runId }),
+			collaborationRunSnapshotSchema,
+		);
+	}
+
+	public listCollaborations(): Promise<CollaborationListResult> {
+		return this.request(
+			COLLABORATION_LOCAL_METHODS.list,
+			{},
+			collaborationListResultSchema,
+		);
+	}
+
+	public cancelCollaboration(runId: string): Promise<CollaborationRunSnapshot> {
+		return this.request(
+			COLLABORATION_LOCAL_METHODS.cancel,
+			toJsonValue({ runId }),
+			collaborationRunSnapshotSchema,
+		);
+	}
+
+	public answerCollaboration(
+		input: CollaborationAnswerParams,
+	): Promise<CollaborationRunSnapshot> {
+		return this.request(
+			COLLABORATION_LOCAL_METHODS.answer,
+			toJsonValue(collaborationAnswerParamsSchema.parse(input)),
+			collaborationRunSnapshotSchema,
+		);
 	}
 
 	public listRemoteDevices(): Promise<MeshRemoteDirectorySnapshot> {

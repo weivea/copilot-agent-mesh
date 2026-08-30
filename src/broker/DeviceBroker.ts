@@ -1,6 +1,7 @@
 import { z } from 'zod';
 
 import {
+	COLLABORATION_LOCAL_METHODS,
 	MESH_ERROR_CODES,
 	brokerRemoteListResultSchema,
 	brokerRemoteTaskAnswerParamsSchema,
@@ -9,6 +10,11 @@ import {
 	brokerRemoteTaskStartParamsSchema,
 	JSON_RPC_ERROR_CODES,
 	LOCAL_BROKER_METHODS,
+	collaborationListResultSchema,
+	collaborationAnswerParamsSchema,
+	collaborationRunParamsSchema,
+	collaborationRunSnapshotSchema,
+	collaborationStartParamsSchema,
 	nodeHeartbeatParamsSchema,
 	nodeIdentityParamsSchema,
 	nodeRegisterParamsSchema,
@@ -46,6 +52,7 @@ import type {
 	BrokerTaskService,
 	BrokerTaskStartOutcome,
 } from './BrokerTaskService';
+import type { CollaborationService } from './CollaborationService';
 import type { NodeRegistry } from './NodeRegistry';
 import {
 	TaskRouteCatalog,
@@ -70,6 +77,7 @@ export interface DeviceBrokerOptions extends LocalIpcSessionOptions {
 	readonly ownership: BrokerOwnership;
 	readonly registry: NodeRegistry;
 	readonly taskService: BrokerTaskService;
+	readonly collaborationService?: CollaborationService;
 	readonly remoteTaskService?: RemoteTaskRouteAdapter;
 	readonly taskRoutes?: TaskRouteCatalog;
 	readonly handshakeTimeoutMs?: number;
@@ -90,6 +98,7 @@ export class DeviceBroker {
 	private disposal: Promise<void> | undefined;
 	private serverDisposed = false;
 	private taskServiceDisposed = false;
+	private collaborationServiceDisposed = false;
 	private registryDisposed = false;
 
 	public constructor(private readonly options: DeviceBrokerOptions) {
@@ -267,6 +276,7 @@ export class DeviceBroker {
 				nodeId: input.nodeId,
 				nodeInstanceId: input.nodeInstanceId,
 			});
+			this.options.collaborationService?.topologyChanged();
 			return toJsonValue(descriptor);
 		}
 
@@ -275,13 +285,16 @@ export class DeviceBroker {
 			case LOCAL_BROKER_METHODS.heartbeat: {
 				const input = nodeHeartbeatParamsSchema.parse(params);
 				this.assertIdentity(binding, input);
-				return toJsonValue(this.options.registry.heartbeat(input));
+				const descriptor = this.options.registry.heartbeat(input);
+				this.options.collaborationService?.topologyChanged();
+				return toJsonValue(descriptor);
 			}
 			case LOCAL_BROKER_METHODS.unregister: {
 				const input = nodeIdentityParamsSchema.parse(params);
 				this.assertIdentity(binding, input);
 				this.options.registry.unregister(input, false);
 				this.registrations.delete(session);
+				this.options.collaborationService?.topologyChanged();
 				return null;
 			}
 			case LOCAL_BROKER_METHODS.list:
@@ -290,12 +303,15 @@ export class DeviceBroker {
 			case LOCAL_BROKER_METHODS.claimWorkspace: {
 				const input = nodeWorkspaceClaimParamsSchema.parse(params);
 				this.assertIdentity(binding, input);
-				return toJsonValue(await this.options.registry.claimWorkspace(input));
+				const result = await this.options.registry.claimWorkspace(input);
+				this.options.collaborationService?.topologyChanged();
+				return toJsonValue(result);
 			}
 			case LOCAL_BROKER_METHODS.releaseWorkspace: {
 				const input = nodeWorkspaceReleaseParamsSchema.parse(params);
 				this.assertIdentity(binding, input);
 				this.options.registry.releaseWorkspace(input);
+				this.options.collaborationService?.topologyChanged();
 				return null;
 			}
 			case LOCAL_BROKER_METHODS.taskStart: {
@@ -460,6 +476,35 @@ export class DeviceBroker {
 				await this.taskRoutes.markSnapshot(snapshot);
 				return toJsonValue(taskSnapshotSchema.parse(snapshot));
 			}
+			case COLLABORATION_LOCAL_METHODS.start: {
+				const input = collaborationStartParamsSchema.parse(params);
+				return toJsonValue(collaborationRunSnapshotSchema.parse(
+					await this.requireCollaborationService().start(binding, input),
+				));
+			}
+			case COLLABORATION_LOCAL_METHODS.get: {
+				const input = collaborationRunParamsSchema.parse(params);
+				return toJsonValue(collaborationRunSnapshotSchema.parse(
+					await this.requireCollaborationService().get(binding, input.runId),
+				));
+			}
+			case COLLABORATION_LOCAL_METHODS.list:
+				emptyParamsSchema.parse(params);
+				return toJsonValue(collaborationListResultSchema.parse(
+					await this.requireCollaborationService().list(binding),
+				));
+			case COLLABORATION_LOCAL_METHODS.cancel: {
+				const input = collaborationRunParamsSchema.parse(params);
+				return toJsonValue(collaborationRunSnapshotSchema.parse(
+					await this.requireCollaborationService().cancel(binding, input.runId),
+				));
+			}
+			case COLLABORATION_LOCAL_METHODS.answer: {
+				const input = collaborationAnswerParamsSchema.parse(params);
+				return toJsonValue(collaborationRunSnapshotSchema.parse(
+					await this.requireCollaborationService().answer(binding, input),
+				));
+			}
 			default:
 				throw new LocalIpcHandlerError(
 					JSON_RPC_ERROR_CODES.METHOD_NOT_FOUND,
@@ -567,7 +612,19 @@ export class DeviceBroker {
 				true,
 			);
 		}
+
 		return this.options.remoteTaskService;
+	}
+
+	private requireCollaborationService(): CollaborationService {
+		const service = this.options.collaborationService;
+		if (service === undefined) {
+			throw new MeshDomainError(
+				'FEATURE_DISABLED',
+				'Same-device collaboration is unavailable.',
+			);
+		}
+		return service;
 	}
 
 	private async getRoutedTask(
@@ -650,6 +707,13 @@ export class DeviceBroker {
 		}
 		await this.drainActiveHandlers();
 		for (const resource of [
+			{
+				pending: () => !this.collaborationServiceDisposed,
+				dispose: () => this.options.collaborationService?.dispose() ?? Promise.resolve(),
+				complete: () => {
+					this.collaborationServiceDisposed = true;
+				},
+			},
 			{
 				pending: () => !this.taskServiceDisposed,
 				dispose: () => this.options.taskService.dispose(),

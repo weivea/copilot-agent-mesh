@@ -370,6 +370,32 @@ describe('task domain', () => {
 		}), answered);
 	});
 
+	test('records an answered input while a queued input remains pending', () => {
+		const running = { ...createAcceptedTask(taskRequest(), AT), state: 'running' as const };
+		const first = taskReducer(running, {
+			type: 'inputRequired',
+			at: LATER,
+			inputId: IDS.input,
+			prompt: 'First?',
+		});
+		const secondInputId = '00000000-0000-4000-8000-00000000000e';
+		const second = taskReducer(first, {
+			type: 'inputRequired',
+			at: LATER,
+			inputId: secondInputId,
+			prompt: 'Second?',
+		});
+		const answered = taskReducer(second, {
+			type: 'inputAnswered',
+			at: LATER,
+			inputId: IDS.input,
+			answerId: IDS.answer,
+		});
+		assert.equal(answered.state, 'needsInput');
+		assert.equal(answered.pendingInput?.inputId, secondInputId);
+		assert.equal(answered.answeredInputs[IDS.input], IDS.answer);
+	});
+
 	test('accepts cancellation from every active state and confirms only from cancelling', () => {
 		for (const state of ACTIVE_TASK_STATUSES) {
 			const record = { ...createAcceptedTask(taskRequest(), AT), state };

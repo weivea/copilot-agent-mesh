@@ -64,7 +64,7 @@ export function taskReducer(record: TaskRecord, event: TaskDomainEvent): TaskRec
 			);
 		case 'inputRequired':
 			return transition(
-				requireState(record, event, ['running']),
+				requireState(record, event, ['running', 'needsInput']),
 				event,
 				{ state: 'needsInput', pendingInput: { inputId: event.inputId, prompt: event.prompt } },
 			);
@@ -72,7 +72,10 @@ export function taskReducer(record: TaskRecord, event: TaskDomainEvent): TaskRec
 			if (record.answeredInputs[event.inputId] === event.answerId) {
 				return record;
 			}
-			if (record.pendingInput?.inputId !== event.inputId) {
+			if (
+				record.pendingInput?.inputId !== event.inputId
+				&& (record.state !== 'needsInput' || record.pendingInput === undefined)
+			) {
 				throw new MeshDomainError('INPUT_NOT_PENDING', 'The requested input is not pending.');
 			}
 			const answeredInputs = {
@@ -82,7 +85,9 @@ export function taskReducer(record: TaskRecord, event: TaskDomainEvent): TaskRec
 			return transition(
 				requireState(record, event, ['needsInput']),
 				event,
-				{ state: 'running', pendingInput: undefined, answeredInputs },
+				record.pendingInput?.inputId === event.inputId
+					? { state: 'running', pendingInput: undefined, answeredInputs }
+					: { answeredInputs },
 			);
 		}
 		case 'recoveryStarted':

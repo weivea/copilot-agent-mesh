@@ -1,5 +1,14 @@
 # Copilot Agent Mesh 产品需求文档
 
+> **⚠️ 0.4.0 起本文档的编排与 UX 章节已被取代。**<br>
+> 同设备跨项目协作的交互模型已从「Dashboard 驱动 + 前后端固定 DAG」改为
+> 「Copilot Chat 驱动的对等窗口委派」。请以
+> [0.4.0 需求文档：Peer Window Delegation](docs/0.4.0-peer-delegation-requirements.md)
+> 与 [0.4.0 技术设计](docs/0.4.0-peer-delegation-design.md) 为准。<br>
+> 本文档中关于设备身份、Workspace 注册、监听/Gateway/Dev Tunnel、跨设备路径、
+> 安全模型与非功能需求的章节**仍然有效**；关于 Collaboration Run、
+> `mesh_start_collaboration` 系列 Tool 与 Dashboard 协作入口的内容**已作废**。
+
 > Preview platform scope: every ordinary VS Code window under one User Data is an
 > active Window Node. Worker hosting and real task execution are currently
 > supported only on macOS arm64; other platforms can participate as Broker

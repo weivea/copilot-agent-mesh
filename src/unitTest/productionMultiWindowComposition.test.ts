@@ -52,9 +52,10 @@ test('production composition uses per-window runtime and local Broker tools', ()
 	assert.match(application, /new WindowNodeTaskExecutor/u);
 	assert.match(application, /createVscodeAgentRuntime/u);
 	assert.match(application, /new LocalBrokerTaskFacade/u);
+	assert.match(application, /new LocalBrokerCollaborationFacade/u);
 	assert.match(application, /new LocalIpcRemoteTaskAdapter\(node\)/u);
 	assert.match(application, /remoteAdapter: remoteTasks/u);
-	assert.match(application, /registerMeshTaskTools\(localTasks\)/u);
+	assert.match(application, /registerMeshTaskTools\(localTasks, localCollaborations\)/u);
 	assert.match(owner, /new ProductionRemoteTaskAdapter\(\s*peers,\s*peerProfiles,\s*fencedState/u);
 	assert.match(owner, /remoteTaskService: remoteTasks/u);
 	assert.doesNotMatch(application, /WorkerTaskService|registerMeshTaskTools\(coordinator\)/u);

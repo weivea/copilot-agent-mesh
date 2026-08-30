@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
-const archivePath = resolve(process.argv[2] ?? 'artifacts/copilot-agent-mesh-0.2.0-preview.vsix');
+const archivePath = resolve(process.argv[2] ?? 'artifacts/copilot-agent-mesh-0.3.0-preview.vsix');
 const archive = readFileSync(archivePath);
 const entries = readCentralDirectory(archive).sort();
 

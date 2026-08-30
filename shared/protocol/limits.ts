@@ -17,6 +17,13 @@ export const PROTOCOL_LIMITS = {
 	errorMessageBytes: 2 * 1_024,
 	nameBytes: 256,
 	identifierBytes: 128,
+	collaborationGoalBytes: 64 * 1_024,
+	collaborationListCount: 50,
+	collaborationTaskCount: 8,
+	collaborationArtifactCount: 16,
+	artifactLabelBytes: 256,
+	artifactContentBytes: 12 * 1_024,
+	artifactStoreBytes: 2 * 1_024 * 1_024,
 } as const;
 
 const textEncoder = new TextEncoder();

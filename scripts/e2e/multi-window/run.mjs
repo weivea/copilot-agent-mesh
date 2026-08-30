@@ -26,6 +26,13 @@ import {
 } from '@vscode/test-electron';
 
 const terminalStates = new Set(['completed', 'failed', 'cancelled', 'timedOut']);
+const multiProjectMode = process.argv.includes('--multi-project');
+const environmentPrefix = multiProjectMode
+	? 'MESH_MULTI_PROJECT_E2E'
+	: 'MESH_MULTI_WINDOW_E2E';
+if (multiProjectMode && process.env.MESH_MULTI_PROJECT_E2E !== '1') {
+	throw new Error('MESH_MULTI_PROJECT_E2E=1 is required for the real multi-project E2E.');
+}
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptDirectory, '../../..');
 const require = createRequire(import.meta.url);
@@ -60,16 +67,20 @@ if (
 }
 
 const runId = randomUUID();
-const configuredRuntimeBase = process.env.MESH_MULTI_WINDOW_E2E_RUNTIME_DIR;
+const configuredRuntimeBase = process.env[`${environmentPrefix}_RUNTIME_DIR`];
 const runtimeBase = configuredRuntimeBase === undefined
 	? join(repositoryRoot, '.mw')
 	: resolve(configuredRuntimeBase);
 const runRoot = join(runtimeBase, `mw-${runId.slice(0, 8)}`);
-const evidenceRoot = join(repositoryRoot, '.vscode-test', 'multi-window-evidence');
+const evidenceRoot = join(
+	repositoryRoot,
+	'.vscode-test',
+	multiProjectMode ? 'multi-project-evidence' : 'multi-window-evidence',
+);
 const evidencePath = join(evidenceRoot, `${runId}.json`);
 // Opt-in only. When unset the run keeps its throwaway per-run profile, which has no
 // authentication sessions and therefore cannot exercise authenticated Agent turns.
-const configuredProfileBase = process.env.MESH_MULTI_WINDOW_E2E_PROFILE_DIR;
+const configuredProfileBase = process.env[`${environmentPrefix}_PROFILE_DIR`];
 const persistentProfile = configuredProfileBase !== undefined;
 const profileBase = persistentProfile ? resolve(configuredProfileBase) : undefined;
 const userDataDirectory = persistentProfile
@@ -98,7 +109,7 @@ const reopenedRepoBPath = join(workspacesDirectory, 'reopen-b', 'repo-b');
 const duplicateRepoAPath = join(workspacesDirectory, 'repo-a-duplicate');
 const sentinelPath = join(runRoot, 'devtunnel-sentinel');
 const sentinelInvocationPath = join(runRoot, 'devtunnel-invoked.json');
-const realTaskEnabled = process.env.MESH_MULTI_WINDOW_E2E_TASKS === '1';
+const realTaskEnabled = multiProjectMode || process.env.MESH_MULTI_WINDOW_E2E_TASKS === '1';
 const nonce = randomUUID();
 const ownedMarkers = [
 	runRoot,
@@ -123,7 +134,9 @@ let persistentProfileLockOwned = false;
 let evidence = {
 	schemaVersion: 1,
 	runId,
-	mode: realTaskEnabled ? 'transport-and-ahp' : 'transport-lifecycle',
+	mode: multiProjectMode
+		? 'same-device-multi-project'
+		: realTaskEnabled ? 'transport-and-ahp' : 'transport-lifecycle',
 	sharedProfile: {
 		oneUserDataDirectory: false,
 		oneExtensionsDirectory: false,
@@ -135,6 +148,9 @@ let evidence = {
 		reason: realTaskEnabled
 			? undefined
 			: 'Set MESH_MULTI_WINDOW_E2E_TASKS=1 to opt into production AHP/quota use.',
+	},
+	collaboration: {
+		state: multiProjectMode ? 'not-run' : 'not-applicable',
 	},
 	reopen: { state: 'not-run' },
 	takeover: { state: 'not-run' },
@@ -255,7 +271,21 @@ try {
 		ownedDevTunnelProcesses: 0,
 	};
 
-	if (realTaskEnabled) {
+	if (multiProjectMode) {
+		evidence.collaboration = await runProductionCollaboration(
+			repoA,
+			repoB,
+			initialDevice,
+			repoAWorkspace,
+			repoBWorkspace,
+		);
+		evidence.task = {
+			state: evidence.collaboration.state,
+			backendTaskId: evidence.collaboration.backend.taskId,
+			frontendTaskId: evidence.collaboration.frontend.taskId,
+		};
+		await assertTunnelUntouched();
+	} else if (realTaskEnabled) {
 		evidence.task = await runProductionTask(repoA, repoB, initialDevice, repoBWorkspace);
 		await assertTunnelUntouched();
 	}
@@ -469,6 +499,7 @@ try {
 			agentHostProcesses: agentHosts.length,
 			testVscodeProcesses: testProcesses.length,
 			devTunnelProcesses: testProcesses.filter(isDevTunnelProcess).length,
+			ownedTimers: testProcesses.length === 0 ? 0 : undefined,
 			sentinelInvoked,
 			sentinelUnchanged,
 			trackedPidCount: historicalOwnedPids.size,
@@ -543,6 +574,52 @@ async function prepareRun() {
 			'utf8',
 		),
 	]);
+	if (multiProjectMode) {
+		await Promise.all([
+			writeFile(join(repoAPath, 'package.json'), `${JSON.stringify({
+				name: 'mesh-e2e-frontend',
+				private: true,
+				type: 'module',
+				scripts: { test: 'node test.mjs' },
+			})}\n`, 'utf8'),
+			writeFile(
+				join(repoAPath, 'client.mjs'),
+				"export function createItemsRequest() { throw new Error('not implemented'); }\n"
+					+ "export function renderItem() { throw new Error('not implemented'); }\n",
+				'utf8',
+			),
+			writeFile(
+				join(repoAPath, 'test.mjs'),
+				"import assert from 'node:assert/strict';\n"
+					+ "import { createItemsRequest, renderItem } from './client.mjs';\n"
+					+ "assert.deepEqual(createItemsRequest(), { method: 'GET', path: '/api/items' });\n"
+					+ "assert.equal(renderItem({ id: '1', name: 'Sample' }), '1: Sample');\n",
+				'utf8',
+			),
+			writeFile(join(repoBPath, 'package.json'), `${JSON.stringify({
+				name: 'mesh-e2e-backend',
+				private: true,
+				type: 'module',
+				scripts: { test: 'node test.mjs' },
+			})}\n`, 'utf8'),
+			writeFile(
+				join(repoBPath, 'server.mjs'),
+				"export function getItems() { throw new Error('not implemented'); }\n",
+				'utf8',
+			),
+			writeFile(
+				join(repoBPath, 'test.mjs'),
+				"import assert from 'node:assert/strict';\n"
+					+ "import { readFile } from 'node:fs/promises';\n"
+					+ "import { getItems } from './server.mjs';\n"
+					+ "const contract = JSON.parse(await readFile(new URL('./contract.json', import.meta.url), 'utf8'));\n"
+					+ "assert.equal(contract.endpoint, '/api/items');\n"
+					+ "assert.deepEqual(contract.item.required, ['id', 'name']);\n"
+					+ "assert.deepEqual(getItems(), [{ id: '1', name: 'Sample' }]);\n",
+				'utf8',
+			),
+		]);
+	}
 	await Promise.all([
 		symlink(repoAPath, reopenedRepoAPath, 'dir'),
 		symlink(repoBPath, reopenedRepoBPath, 'dir'),
@@ -616,10 +693,10 @@ async function releasePersistentProfileLock() {
 }
 
 async function writeSettings() {
-	const authenticationResource = process.env.MESH_MULTI_WINDOW_E2E_AUTH_RESOURCE;
-	const authenticationProvider = process.env.MESH_MULTI_WINDOW_E2E_AUTH_PROVIDER;
+	const authenticationResource = process.env[`${environmentPrefix}_AUTH_RESOURCE`];
+	const authenticationProvider = process.env[`${environmentPrefix}_AUTH_PROVIDER`];
 	const authenticationScopes = parseStringArray(
-		process.env.MESH_MULTI_WINDOW_E2E_AUTH_SCOPES_JSON,
+		process.env[`${environmentPrefix}_AUTH_SCOPES_JSON`],
 		[],
 	);
 	const mappings = authenticationResource && authenticationProvider
@@ -636,6 +713,7 @@ async function writeSettings() {
 			'copilotAgentMesh.deviceName': 'Same-profile E2E Device',
 			'copilotAgentMesh.codePath': codeCliPath,
 			'copilotAgentMesh.experimental.agentHost': realTaskEnabled,
+			'copilotAgentMesh.experimental.sameDeviceCollaboration': multiProjectMode,
 			'copilotAgentMesh.experimental.authenticationProviders': mappings,
 			'copilotAgentMesh.devTunnelPath': sentinelPath,
 			'copilotAgentMesh.listener.autoStart': false,
@@ -702,9 +780,11 @@ function launchWindow(workspacePath) {
 	delete environment.MESH_TWO_DEVICE_E2E;
 	delete environment.MESH_TWO_DEVICE_E2E_NONCE;
 	delete environment.MESH_TWO_DEVICE_E2E_ROLE;
-	environment.MESH_MULTI_WINDOW_E2E = '1';
-	environment.MESH_MULTI_WINDOW_E2E_CONTROL_DIR = controlRoot;
-	environment.MESH_MULTI_WINDOW_E2E_NONCE = nonce;
+	delete environment.MESH_MULTI_WINDOW_E2E;
+	delete environment.MESH_MULTI_PROJECT_E2E;
+	environment[environmentPrefix] = '1';
+	environment[`${environmentPrefix}_CONTROL_DIR`] = controlRoot;
+	environment[`${environmentPrefix}_NONCE`] = nonce;
 	const child = spawn(vscodeExecutablePath, args, {
 		env: environment,
 		shell: false,
@@ -869,6 +949,210 @@ async function waitForDirectory(controller, predicate, timeoutMs, message) {
 	throw new Error(`${message}; last directory: ${JSON.stringify(latest)}.`);
 }
 
+async function runProductionCollaboration(
+	source,
+	backendController,
+	device,
+	frontendWorkspace,
+	backendWorkspace,
+) {
+	for (const controller of [source, backendController]) {
+		const probe = await request(controller, 'runtime.probe', {}, 30_000);
+		if (probe.available !== true || probe.featureEnabled !== true) {
+			throw new Error(
+				`Production Agent Host runtime unavailable: ${probe.reason ?? 'probe failed'}.`,
+			);
+		}
+	}
+	const providerId = process.env[`${environmentPrefix}_AUTH_PROVIDER`] ?? 'github';
+	const scopes = parseStringArray(
+		process.env[`${environmentPrefix}_AUTH_SCOPES_JSON`],
+		[],
+	);
+	for (const controller of [source, backendController]) {
+		const authentication = await request(controller, 'auth.check', { providerId, scopes });
+		if (authentication.available !== true) {
+			throw new Error(
+				`Authenticated multi-project E2E requires a ${providerId} session in the shared profile.`,
+			);
+		}
+	}
+	const frontendNode = requireDirectoryNode(device, source.nodeId);
+	const backendNode = requireDirectoryNode(device, backendController.nodeId);
+	const collaborationRequestId = randomUUID();
+	const started = await request(source, 'collaboration.start', {
+		collaborationRequestId,
+		title: 'Implement and consume the items API',
+		goal: [
+			'Backend: implement getItems() in server.mjs, create contract.json with endpoint "/api/items"',
+			'and make npm test pass. Write contract.json and use the exact same object as the structured',
+			'contract artifact content: {"endpoint":"/api/items","method":"GET","item":{"type":"object",',
+			'"required":["id","name"],"properties":{"id":{"type":"string"},"name":{"type":"string"}}}}.',
+			'Frontend: implement createItemsRequest() and renderItem() in client.mjs from that contract',
+			'and make npm test pass. Do not modify the other workspace.',
+		].join(' '),
+		frontend: {
+			deviceId: device.deviceId,
+			nodeId: frontendNode.nodeId,
+			nodeInstanceId: frontendNode.nodeInstanceId,
+			workspaceId: frontendWorkspace.workspaceId,
+		},
+		backend: {
+			deviceId: device.deviceId,
+			nodeId: backendNode.nodeId,
+			nodeInstanceId: backendNode.nodeInstanceId,
+			workspaceId: backendWorkspace.workspaceId,
+		},
+		timeoutMinutes: 30,
+	}, 180_000);
+	assert.equal(typeof started.run?.runId, 'string', 'Collaboration start did not return a run ID.');
+	assert.equal(started.run.collaborationRequestId, collaborationRequestId);
+	const runId = started.run.runId;
+	const observed = new Map();
+	let latestRun = started.run;
+	const deadline = Date.now() + 30 * 60_000;
+	while (Date.now() < deadline) {
+		const current = await request(source, 'collaboration.get', { runId }, 60_000);
+		latestRun = current.run;
+		for (const task of latestRun.tasks) {
+			try {
+				const previous = observed.get(task.taskId);
+				const read = await request(source, 'task.get', {
+					taskId: task.taskId,
+					afterEventSequence: previous?.eventCursor ?? 0,
+					maxEvents: 100,
+				}, 30_000);
+				observed.set(task.taskId, {
+					status: read.snapshot.status,
+					eventCursor: read.eventCursor,
+					eventTypes: [...new Set([
+						...(previous?.eventTypes ?? []),
+						...read.events.map((event) => event.type),
+					])],
+				});
+				if (read.snapshot.status === 'needsInput' && read.snapshot.pendingInput) {
+					await request(source, 'task.answer', {
+						taskId: task.taskId,
+						inputId: read.snapshot.pendingInput.inputId,
+						answerId: randomUUID(),
+						answer: 'approve',
+					}, 30_000);
+				}
+			} catch (error) {
+				if (!(error instanceof E2eRequestError && error.code === 'TASK_NOT_FOUND')) {
+					throw error;
+				}
+			}
+		}
+		if (latestRun.status === 'completed') {
+			break;
+		}
+		if (latestRun.status === 'failed' || latestRun.status === 'cancelled') {
+			throw new Error(
+				`Collaboration ${runId} became ${latestRun.status}: ${JSON.stringify(
+					latestRun.tasks.map(({ taskId, status, failure, block }) => ({
+						taskId,
+						status,
+						failure: failure?.code,
+						block: block?.code,
+					})),
+				)}.`,
+			);
+		}
+		await delay(250);
+	}
+	assert.equal(latestRun.status, 'completed', 'Collaboration did not complete before the deadline.');
+	for (const task of latestRun.tasks) {
+		for (let page = 0; page < 20; page += 1) {
+			const previous = observed.get(task.taskId);
+			const read = await request(source, 'task.get', {
+				taskId: task.taskId,
+				afterEventSequence: previous?.eventCursor ?? 0,
+				maxEvents: 100,
+			}, 30_000);
+			observed.set(task.taskId, {
+				status: read.snapshot.status,
+				eventCursor: read.eventCursor,
+				eventTypes: [...new Set([
+					...(previous?.eventTypes ?? []),
+					...read.events.map((event) => event.type),
+				])],
+			});
+			if (read.events.length < 100) {
+				break;
+			}
+		}
+	}
+	const backend = requireCollaborationTask(latestRun, 'backend', 'implementation');
+	const frontend = requireCollaborationTask(latestRun, 'frontend', 'implementation');
+	const backendEvents = requireCompletedTaskEvents(observed, backend.taskId, 'backend');
+	const frontendEvents = requireCompletedTaskEvents(observed, frontend.taskId, 'frontend');
+	const artifact = latestRun.artifacts[0];
+	assert.ok(artifact, 'Collaboration did not publish a contract artifact.');
+	assert.equal(artifact.producerTaskId, backend.taskId);
+	assert.ok(backend.artifactIds.includes(artifact.artifactId));
+	assert.ok(frontend.artifactIds.includes(artifact.artifactId));
+	assert.match(artifact.sha256, /^[a-f0-9]{64}$/u);
+	assert.ok(artifact.contentLength > 0);
+
+	const contractFile = JSON.parse(await readFile(join(repoBPath, 'contract.json'), 'utf8'));
+	const contractHash = createHash('sha256')
+		.update(canonicalJson(contractFile), 'utf8')
+		.digest('hex');
+	assert.equal(contractHash, artifact.sha256, 'Backend contract file and immutable artifact differ.');
+	const backendValidation = runWorkspaceValidation(repoBPath);
+	const frontendValidation = runWorkspaceValidation(repoAPath);
+	assert.equal(backendValidation, 0, 'Independent backend validation failed.');
+	assert.equal(frontendValidation, 0, 'Independent frontend validation failed.');
+	assert.equal(latestRun.validations.length, 2);
+	assert.ok(latestRun.validations.every(({ status }) => status === 'passed'));
+	await waitForNoAgentHostProcesses(30_000);
+	return {
+		state: 'completed',
+		runId,
+		collaborationRequestId,
+		windowNodes: {
+			frontend: source.nodeId,
+			backend: backendController.nodeId,
+		},
+		workspaceClaims: {
+			frontend: frontendWorkspace.workspaceId,
+			backend: backendWorkspace.workspaceId,
+		},
+		backend: {
+			taskId: backend.taskId,
+			agentStarted: backendEvents.includes('agentStarted'),
+			output: backendEvents.includes('output'),
+			turnComplete: backendEvents.includes('completed'),
+			completed: observed.get(backend.taskId).status === 'completed',
+			eventTypes: backendEvents,
+		},
+		artifact: {
+			artifactId: artifact.artifactId,
+			mediaType: artifact.mediaType,
+			contentLength: artifact.contentLength,
+			sha256: artifact.sha256,
+			contentRecorded: false,
+		},
+		frontend: {
+			taskId: frontend.taskId,
+			consumedArtifactId: artifact.artifactId,
+			agentStarted: frontendEvents.includes('agentStarted'),
+			output: frontendEvents.includes('output'),
+			turnComplete: frontendEvents.includes('completed'),
+			completed: observed.get(frontend.taskId).status === 'completed',
+			eventTypes: frontendEvents,
+		},
+		validation: {
+			backend: 'passed',
+			frontend: 'passed',
+			independentBackendExitCode: backendValidation,
+			independentFrontendExitCode: frontendValidation,
+		},
+		runCompleted: true,
+	};
+}
+
 async function runProductionTask(source, target, device, workspace) {
 	const probe = await request(target, 'runtime.probe', {}, 30_000);
 	if (probe.available !== true || probe.featureEnabled !== true) {
@@ -876,6 +1160,7 @@ async function runProductionTask(source, target, device, workspace) {
 			`Production Agent Host runtime unavailable: ${probe.reason ?? 'probe failed'}.`,
 		);
 	}
+
 	const providerId = process.env.MESH_MULTI_WINDOW_E2E_AUTH_PROVIDER ?? 'github';
 	const scopes = parseStringArray(
 		process.env.MESH_MULTI_WINDOW_E2E_AUTH_SCOPES_JSON,
@@ -1039,6 +1324,51 @@ async function runProductionTask(source, target, device, workspace) {
 		inputAnswered,
 		eventTypes,
 	};
+}
+
+function requireCollaborationTask(run, role, kind) {
+	const task = run.tasks.find((candidate) =>
+		candidate.role === role && candidate.kind === kind,
+	);
+	assert.ok(task, `Missing ${role} ${kind} collaboration task.`);
+	assert.equal(task.status, 'completed');
+	return task;
+}
+
+function requireCompletedTaskEvents(observed, taskId, label) {
+	const task = observed.get(taskId);
+	assert.ok(task, `Missing ${label} task evidence.`);
+	assert.equal(task.status, 'completed');
+	for (const required of ['agentStarted', 'output', 'completed']) {
+		assert.ok(task.eventTypes.includes(required), `${label} task omitted ${required}.`);
+	}
+	return task.eventTypes;
+}
+
+function runWorkspaceValidation(workspacePath) {
+	const result = spawnSync(process.execPath, ['test.mjs'], {
+		cwd: workspacePath,
+		env: { ...process.env },
+		encoding: 'utf8',
+		timeout: 30_000,
+	});
+	if (result.error !== undefined) {
+		throw result.error;
+	}
+	return result.status;
+}
+
+function canonicalJson(value) {
+	if (Array.isArray(value)) {
+		return `[${value.map(canonicalJson).join(',')}]`;
+	}
+	if (value !== null && typeof value === 'object') {
+		return `{${Object.keys(value)
+			.sort()
+			.map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+			.join(',')}}`;
+	}
+	return JSON.stringify(value);
 }
 
 async function waitForTask(controller, taskId, timeoutMs) {

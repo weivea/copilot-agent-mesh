@@ -8,6 +8,7 @@ import type { WindowNodeClient } from '../node/WindowNodeClient';
 import type { LocalIpcRemoteTaskAdapter } from '../node/LocalIpcRemoteTaskAdapter';
 import type { LocalIpcEndpoint } from '../ipc';
 import type { LocalBrokerTaskFacade } from '../tools/LocalBrokerTaskFacade';
+import type { LocalBrokerCollaborationFacade } from '../tools/LocalBrokerCollaborationFacade';
 import type { ProductionDashboardBindings } from './ProductionDashboardBindings';
 import type { ProductionBrokerRuntime } from './ProductionBrokerRuntime';
 import {
@@ -30,6 +31,7 @@ export interface TwoDeviceE2eApiOptions {
 	readonly bindings: ProductionDashboardBindings;
 	readonly node: WindowNodeClient;
 	readonly localTasks: LocalBrokerTaskFacade;
+	readonly localCollaborations?: LocalBrokerCollaborationFacade;
 	readonly remoteTasks: LocalIpcRemoteTaskAdapter;
 	readonly runtime: AgentRuntime;
 	readonly lifecycle: BrokerLifecycle<ProductionBrokerRuntime>;
@@ -133,16 +135,27 @@ export function createTwoDeviceE2eApi(
 					const controller = deadline(30_000);
 					try {
 						const taskId = requiredString(params, 'taskId');
+						const afterEventSequence = optionalNumber(params, 'afterEventSequence');
+						const maxEvents = optionalNumber(params, 'maxEvents') ?? 100;
+						if (maxEvents < 1 || maxEvents > 100) {
+							throw new TypeError('maxEvents must be between 1 and 100.');
+						}
 						const remote = await options.remoteTasks.getTask(
 							taskId,
-							undefined,
+							afterEventSequence,
 							controller.signal,
 						);
 						if (remote !== undefined) {
 							return toE2eTaskReadResult(remote);
 						}
 						return await options.localTasks.getTask(
-							{ taskId, maxEvents: 100 },
+							{
+								taskId,
+								maxEvents,
+								...(afterEventSequence === undefined
+									? {}
+									: { afterEventSequence }),
+							},
 							controller.signal,
 						);
 					} finally {
@@ -206,6 +219,48 @@ export function createTwoDeviceE2eApi(
 						controller.abort();
 					}
 				}
+				case 'collaboration.start': {
+					const controller = deadline(30_000);
+					try {
+						const frontend = explicitTarget(requiredRecord(params, 'frontend'));
+						const backend = explicitTarget(requiredRecord(params, 'backend'));
+						return await requireCollaborations(options).startCollaboration({
+							collaborationRequestId: optionalString(params, 'collaborationRequestId')
+								?? randomUUID(),
+							title: requiredString(params, 'title'),
+							goal: requiredString(params, 'goal'),
+							frontend,
+							backend,
+							timeoutMinutes: optionalNumber(params, 'timeoutMinutes') ?? 30,
+						}, controller.signal);
+					} finally {
+						controller.abort();
+					}
+				}
+				case 'collaboration.get': {
+					const controller = deadline(30_000);
+					try {
+						return await requireCollaborations(options).getCollaboration(
+							requiredString(params, 'runId'),
+							controller.signal,
+						);
+					} finally {
+						controller.abort();
+					}
+				}
+				case 'collaboration.list':
+					return options.node.listCollaborations();
+				case 'collaboration.cancel': {
+					const controller = deadline(30_000);
+					try {
+						return await requireCollaborations(options).cancelCollaboration(
+							requiredString(params, 'runId'),
+							controller.signal,
+						);
+					} finally {
+						controller.abort();
+					}
+				}
 				case 'runtime.probe':
 					return options.runtime.probe();
 				case 'auth.check': {
@@ -241,7 +296,17 @@ function requireOwner(options: TwoDeviceE2eApiOptions): ProductionBrokerRuntime 
 	if (owner === undefined || options.lifecycle.snapshot().state !== 'running') {
 		throw new Error('The E2E action requires the current Broker owner.');
 	}
+
 	return owner;
+}
+
+function requireCollaborations(
+	options: TwoDeviceE2eApiOptions,
+): LocalBrokerCollaborationFacade {
+	if (options.localCollaborations === undefined) {
+		throw new Error('The E2E collaboration facade is unavailable.');
+	}
+	return options.localCollaborations;
 }
 
 function explicitTarget(params: Record<string, unknown>) {
@@ -251,6 +316,28 @@ function explicitTarget(params: Record<string, unknown>) {
 		nodeInstanceId: requiredString(params, 'nodeInstanceId'),
 		workspaceId: requiredString(params, 'workspaceId'),
 	};
+}
+
+function requiredRecord(
+	params: Record<string, unknown>,
+	key: string,
+): Record<string, unknown> {
+	const value = params[key];
+	if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+		throw new TypeError(`${key} must be an object.`);
+	}
+	return value as Record<string, unknown>;
+}
+
+function optionalNumber(params: Record<string, unknown>, key: string): number | undefined {
+	const value = params[key];
+	if (value === undefined) {
+		return undefined;
+	}
+	if (!Number.isSafeInteger(value)) {
+		throw new TypeError(`${key} must be an integer.`);
+	}
+	return value as number;
 }
 
 function requiredString(

@@ -10,6 +10,7 @@ import { TaskCoordinator } from '../application/TaskCoordinator';
 import type { WorkerPlatformSupport } from '../application/WorkerPlatformSupport';
 import {
 	BrokerTaskService,
+	CollaborationService,
 	DeviceBroker,
 	NodeRegistry,
 	TaskRouteCatalog,
@@ -30,6 +31,12 @@ import {
 } from '../storage/AtomicFileStore';
 import type { BrokerOwnership } from '../storage/BrokerOwnerLock';
 import { FencedStateStore } from '../storage/BrokerOwnerLock';
+import {
+	ArtifactStore,
+} from '../tasks/ArtifactStore';
+import {
+	FileCollaborationStore,
+} from '../tasks/FileCollaborationStore';
 import {
 	DeviceProfileStore,
 	type DeviceProfile,
@@ -68,6 +75,9 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 	public readonly leases: WorkspaceLeaseManager;
 	public readonly registry: NodeRegistry;
 	public readonly tasks: FileTaskStore;
+	public readonly collaborationRuns: FileCollaborationStore;
+	public readonly artifacts: ArtifactStore;
+	public readonly collaborations: CollaborationService;
 	public readonly brokerTasks: BrokerTaskService;
 	public readonly broker: DeviceBroker;
 	public readonly peerProfiles: VscodePeerProfileStore;
@@ -96,6 +106,9 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 			readonly leases: WorkspaceLeaseManager;
 			readonly registry: NodeRegistry;
 			readonly tasks: FileTaskStore;
+			readonly collaborationRuns: FileCollaborationStore;
+			readonly artifacts: ArtifactStore;
+			readonly collaborations: CollaborationService;
 			readonly brokerTasks: BrokerTaskService;
 			readonly broker: DeviceBroker;
 			readonly peerProfiles: VscodePeerProfileStore;
@@ -111,6 +124,9 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 		this.leases = components.leases;
 		this.registry = components.registry;
 		this.tasks = components.tasks;
+		this.collaborationRuns = components.collaborationRuns;
+		this.artifacts = components.artifacts;
+		this.collaborations = components.collaborations;
 		this.brokerTasks = components.brokerTasks;
 		this.broker = components.broker;
 		this.peerProfiles = components.peerProfiles;
@@ -175,7 +191,16 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 			ownership: options.ownership,
 			generation: options.generation,
 		});
+		const collaborationRuns = new FileCollaborationStore(files, {
+			ownership: options.ownership,
+			generation: options.generation,
+		});
+		const artifacts = new ArtifactStore(files, {
+			ownership: options.ownership,
+			generation: options.generation,
+		});
 		let brokerTasks: BrokerTaskService | undefined;
+		let collaborations: CollaborationService | undefined;
 		const registry = new NodeRegistry({
 			deviceId: profile.deviceId,
 			state: fencedState,
@@ -205,6 +230,7 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 					if (taskRoutes.get(snapshot.taskId) !== undefined) {
 						await taskRoutes.markSnapshot(snapshot);
 					}
+					collaborations?.observeTaskSnapshot(snapshot);
 				},
 				onBackgroundError: (error) => options.logger.error(
 					'broker',
@@ -244,12 +270,33 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 			peerProfiles,
 			fencedState,
 		);
+		collaborations = new CollaborationService(
+			profile.deviceId,
+			registry,
+			brokerTasks,
+			taskRoutes,
+			collaborationRuns,
+			artifacts,
+			systemClock,
+			{
+				enabled: () => options.vscodeApi.workspace
+					.getConfiguration('copilotAgentMesh')
+					.get<boolean>('experimental.sameDeviceCollaboration', false),
+				onDidChange: options.onDidChange,
+				onBackgroundError: (error) => options.logger.error(
+					'collaboration',
+					'A collaboration lifecycle background operation failed.',
+					error,
+				),
+			},
+		);
 		const broker = new DeviceBroker({
 			identity: options.identityFor(profile.deviceId),
 			brokerKey,
 			ownership: options.ownership,
 			registry,
 			taskService: brokerTasks,
+			collaborationService: collaborations,
 			remoteTaskService: remoteTasks,
 			taskRoutes,
 			onError: (error) => options.logger.error(
@@ -291,6 +338,9 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 			leases,
 			registry,
 			tasks,
+			collaborationRuns,
+			artifacts,
+			collaborations,
 			brokerTasks,
 			broker,
 			peerProfiles,
@@ -322,6 +372,7 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 			}
 		}
 		await this.broker.start();
+		await this.collaborations.initialize();
 		await this.peers.restore();
 		await this.restoreListener();
 		await this.coordinator.refreshKnownTasks().catch((error: unknown) => {
