@@ -1,6 +1,10 @@
 # AgentHost / AHP runtime
 
-The MVP runtime is a production adapter over `@microsoft/agent-host-protocol@0.8.0`; it does not use the Fake Agent. Fake AHP connections are limited to deterministic component tests.
+The MVP runtime is a production adapter over the TypeScript 0.9.0 client built
+from pinned `microsoft-agent-host-protocol` commit
+`fa92d47d3f3ac6732af2019b52826d2d638a4219`; it negotiates AHP 1.0.0 with
+VS Code 1.135.0 and does not use the Fake Agent. Fake AHP connections are limited
+to deterministic tests.
 
 ## Enable and invoke
 
@@ -23,7 +27,10 @@ The first-task safety decision is an injected `FirstTaskConfirmation`. The VS Co
 3. Diff strict `code agent endpoints` JSON and require exactly one new standalone endpoint matching both an owned PID and the generated token. Stdout/stderr are drained but never interpreted as readiness.
 4. Connect to the loopback endpoint, initialize AHP, apply the root snapshot, and dynamically select an advertised provider.
 5. Authenticate advertised required resources, resolve Session configuration (including dynamic completions), create the Session with the registered workspace URI, and apply the Session snapshot before processing actions.
-6. Wait for `session/ready` and `defaultChat`, subscribe to the Chat, then dispatch only the supplied prompt plus acceptance criteria.
+6. Wait for `defaultChat`, subscribe to the Chat, then dispatch only the supplied
+   prompt plus acceptance criteria. AHP 1.0 providers may keep a provisional
+   Session in `creating` until that first turn materializes it, so startup must
+   not wait for `session/ready` before dispatch.
 7. Map bounded Chat output/reasoning, tool lifecycle and confirmation, elicited input, MCP authentication, Terminal summaries, and authoritative completion/cancellation/error actions to Mesh-neutral events.
 
 Mapped events enter a queue bounded by both serialized UTF-8 bytes and event
@@ -98,14 +105,26 @@ Both request a no-file-change response. The success-turn command exits successfu
 
 ## Verified result
 
-On 2026-08-25, macOS arm64 with VS Code `1.134.0` reached the real AHP `0.8.0` Host, initialized the root snapshot, discovered the provider dynamically, and stopped at the expected production boundary:
+On 2026-08-30, macOS arm64 with VS Code `1.135.0` negotiated AHP `1.0.0`,
+authenticated through the explicit GitHub mapping, and completed the production
+start/output/cancel path:
 
 ```json
 {
-  "outcome": "blocked",
-  "code": "AGENT_AUTH_REQUIRED",
-  "reason": "Authentication requires an explicit user action in VS Code. Resource: GitHub Copilot."
+  "outcome": "passed",
+  "task": {
+    "state": "cancelled",
+    "authSessionAvailable": true,
+    "startAuthoritative": true,
+    "getAuthoritative": true,
+    "cancelAuthoritative": true,
+    "agentTaskHandleCancelInvoked": true,
+    "terminalAuthoritative": true,
+    "outputObserved": true
+  }
 }
 ```
 
-This is not reported as Session or Turn success. A real turn remains dependent on running inside VS Code with an explicitly configured authentication-provider mapping and user-approved interactive authentication.
+The sanitized evidence is
+`.vscode-test/multi-window-evidence/2ab62a03-51ba-45ef-a01a-0e3829f7ae7c.json`;
+it stores no raw prompt, output, token, account, or path.

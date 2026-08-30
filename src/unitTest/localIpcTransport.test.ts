@@ -287,6 +287,37 @@ suite('authenticated local IPC transport', () => {
 		}
 	});
 
+	test('a bounded per-request timeout can extend a long-running request', async () => {
+		const identity = testIdentity();
+		const server = new LocalIpcServer({
+			identity,
+			brokerKey: key,
+			handler: async (method) => {
+				assert.equal(method, 'slow-start');
+				await new Promise((resolve) => setTimeout(resolve, 50));
+				return 'started';
+			},
+		});
+		const client = new LocalIpcClient({
+			identity,
+			brokerKey: key,
+			clientId: 'long-running-window',
+			requestTimeoutMs: 10,
+		});
+		try {
+			await server.listen();
+			const session = await client.connect();
+			assert.equal(
+				await session.request('slow-start', null, 2_000),
+				'started',
+			);
+			assert.equal(session.closed, false);
+		} finally {
+			client.dispose();
+			await server.dispose();
+		}
+	});
+
 	test('cleans up disconnected sessions and pending requests', async () => {
 		const identity = testIdentity();
 		const server = new LocalIpcServer({

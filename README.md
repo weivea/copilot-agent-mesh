@@ -2,8 +2,9 @@
 
 Copilot Agent Mesh 0.2.0 Preview coordinates GitHub Copilot coding tasks across
 trusted devices, VS Code windows, and local workspaces. It uses Mesh protocol v2;
-v1 peers are explicitly incompatible. This package is an evaluation build, not a
-declaration that the end-to-end G0 release gate has passed.
+v1 peers are explicitly incompatible. Gate G0 has passed for the validated
+macOS arm64 Preview scope; this remains an evaluation build, not a cross-platform
+Worker or general-availability claim.
 
 One stable **Device Broker** owns pairing, peer roots, the Gateway, one Dev Tunnel,
 the peer manager, global task/delegation persistence, reducer/event log, remote
@@ -24,9 +25,12 @@ Preview. Other platforms fail closed with `CLI_UNSUPPORTED` or
 - Enable `copilotAgentMesh.experimental.agentHost` only after reviewing the first-task confirmation and process ownership behavior.
 - AHP authentication is not inferred. Every advertised protected-resource or authorization-server URL must be mapped explicitly in `copilotAgentMesh.experimental.authenticationProviders` to an installed VS Code authentication provider and its exact scopes. Missing mappings fail with `AGENT_AUTH_REQUIRED`.
 - Tunnel hosting requires a user-supplied `copilotAgentMesh.devTunnelPath` pointing to the exact validated macOS arm64 CLI build `1.0.2030+fc9273aa0f`. The extension does not search `PATH`, download, install, or upgrade Dev Tunnel.
-- A fresh shared profile has no authentication mapping/session by default. The
-  opted-in real AHP run therefore stops correctly at `AGENT_AUTH_REQUIRED`.
-- Gate G0 remains **No-Go**: authenticated AHP Session/Turn E2E has not passed, so this Preview does not claim a full end-to-end MVP.
+- A fresh shared profile has no authentication session by default. Real AHP E2E
+  uses an explicitly configured, dedicated persistent test profile; it never
+  defaults to the developer's normal VS Code profile.
+- Gate G0 is **Go for the validated macOS arm64 Preview scope**: a real
+  authenticated AHP turn produced output, invoked `AgentTaskHandle.cancel()`,
+  reached `cancelled`, and left no owned process, socket, or Tunnel residue.
 
 See [Preview release and installation](./docs/mvp/release.md) for packaging, installation, and verification instructions.
 
@@ -51,17 +55,18 @@ AHP → Broker store → Window A and never touch Dev Tunnel. Remote v2 traffic 
 the device's single Gateway/Tunnel, is routed by the Broker to the selected node,
 and is multiplexed back to all local windows over IPC.
 
-The ordinary-window lifecycle E2E passed on VS Code 1.134.0, macOS arm64. A second
-opted-in AHP run passed the same infrastructure assertions but correctly stopped
-at `AGENT_AUTH_REQUIRED`; it did **not** prove authoritative AHP
-start/get/cancel/output. The real two-device v2 run also passed single-Tunnel
-pairing, explicit Device → Node → Workspace discovery, and durable acceptance,
-then recorded `agentStartRequested → failed(AGENT_AUTH_REQUIRED)` with exact
-Tunnel/profile/process cleanup. See [the E2E evidence](./docs/mvp/e2e.md).
+The final ordinary-window run passed on VS Code 1.135.0, macOS arm64, using a
+dedicated authenticated profile. It observed two Window Nodes in 133 ms, five
+real output events, authoritative start/get/cancel, `cancelled`, Broker takeover
+in 1878 ms, workspace reclaim/conflict, and exact zero-residue cleanup. The
+earlier two-device v2 run remains transport/routing evidence only because its
+disposable Worker profile stopped at `AGENT_AUTH_REQUIRED`. See
+[the E2E evidence](./docs/mvp/e2e.md).
 
 ## Install the local Preview
 
 ```bash
+git submodule update --init --recursive
 npm ci
 npm run package:vsix
 code --install-extension artifacts/copilot-agent-mesh-0.2.0-preview.vsix
@@ -84,6 +89,7 @@ Requirements:
 Install dependencies and build the extension:
 
 ```bash
+git submodule update --init --recursive
 npm install
 npm run compile
 ```

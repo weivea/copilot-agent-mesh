@@ -1,5 +1,10 @@
 # Agent Host / AHP Spike
 
+> Historical snapshot from 2026-08-25. The current 0.2.0 Preview uses the
+> pinned TypeScript 0.9.0 source client, negotiates AHP 1.0.0 with VS Code
+> 1.135.0, and has since passed the authenticated turn gate documented in
+> [MVP real VS Code E2E](../mvp/e2e.md).
+
 ## Gate
 
 **P0.2 overall: NO-GO.** The current macOS build passes owned process startup, JSON endpoint discovery, token/PID/URL validation, WebSocket transport, AHP version negotiation, `initialize`, Root snapshot, and dynamic provider discovery. Authentication, Session configuration/creation, Chat subscription, a harmless Turn, cancellation, reconnect, replay, crash recovery, approval/input, MCP auth, and Terminal channels remain unverified and must not be treated as passing.
@@ -22,7 +27,10 @@
 
 The configured Microsoft npm proxy exposed only package `0.7.0` during the spike. A real handshake with that exact package failed with JSON-RPC `-32005`: the Host reported version `0.8.0` and accepted `^0.8.0`. Package `0.8.0` was therefore not guessed: it was resolved from the official tag above, generated and packed from that commit, checked against the npm CDN package contents, and successfully negotiated with the Host.
 
-Because a clean install through the configured proxy cannot fetch `0.8.0`, the audited 327 KiB release tarball is committed at `vendor/microsoft-agent-host-protocol-0.8.0.tgz`. `package.json` uses that immutable local source and `package-lock.json` pins SHA-512 `Tg1EsWXENx55RB3igfaSTclxvck2RcBS+LPRSGxi86yLhoeJgldtjSH5aDZZTll0tSw7fzbkSOte3/B9ExRFVg==`. The harness independently verifies the installed package metadata is exactly `0.8.0`.
+At the time of this spike, the audited 327 KiB 0.8.0 release tarball was
+committed under `vendor/`, and the lockfile pinned its SHA-512. The current
+Preview has replaced that historical dependency with the pinned upstream
+TypeScript 0.9.0 source described above.
 
 ## Harness
 

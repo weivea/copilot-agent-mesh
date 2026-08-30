@@ -132,7 +132,7 @@ export class AhpEventMapper {
 					type: 'failed',
 					error: new AgentRuntimeError(
 						'TASK_EXECUTION_FAILED',
-						bounded(action.error.message, 2_048),
+						bounded(chatErrorMessage(action), 2_048),
 					),
 				}];
 			case 'terminal/data':
@@ -349,6 +349,19 @@ function mapResponsePart(part: unknown, maxLength: number): readonly AgentRuntim
 		return [{ type: 'progress', message: bounded(part.content, maxLength) }];
 	}
 	return [];
+}
+
+function chatErrorMessage(value: unknown): string {
+	if (!isRecord(value)) {
+		return 'The Agent Host turn failed.';
+	}
+	if (isRecord(value.part) && isRecord(value.part.error) && typeof value.part.error.message === 'string') {
+		return value.part.error.message;
+	}
+	if (isRecord(value.error) && typeof value.error.message === 'string') {
+		return value.error.message;
+	}
+	return 'The Agent Host turn failed.';
 }
 
 function parseQuestion(value: unknown): Question {

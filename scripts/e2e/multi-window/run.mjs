@@ -67,7 +67,26 @@ const runtimeBase = configuredRuntimeBase === undefined
 const runRoot = join(runtimeBase, `mw-${runId.slice(0, 8)}`);
 const evidenceRoot = join(repositoryRoot, '.vscode-test', 'multi-window-evidence');
 const evidencePath = join(evidenceRoot, `${runId}.json`);
-const userDataDirectory = join(runRoot, 'user-data');
+// Opt-in only. When unset the run keeps its throwaway per-run profile, which has no
+// authentication sessions and therefore cannot exercise authenticated Agent turns.
+const configuredProfileBase = process.env.MESH_MULTI_WINDOW_E2E_PROFILE_DIR;
+const persistentProfile = configuredProfileBase !== undefined;
+const profileBase = persistentProfile ? resolve(configuredProfileBase) : undefined;
+const userDataDirectory = persistentProfile
+	? join(profileBase, 'user-data')
+	: join(runRoot, 'user-data');
+const meshGlobalStorageDirectory = join(
+	userDataDirectory,
+	'User',
+	'globalStorage',
+	'weivea.copilot-agent-mesh',
+);
+const profileLockDirectory = persistentProfile
+	? join(profileBase, '.copilot-agent-mesh-e2e-lock')
+	: undefined;
+const profileLockOwnerPath = persistentProfile
+	? join(profileLockDirectory, 'owner')
+	: undefined;
 const extensionsDirectory = join(runRoot, 'extensions');
 const controlRoot = join(runRoot, 'control');
 const logsDirectory = join(runRoot, 'logs');
@@ -83,7 +102,6 @@ const realTaskEnabled = process.env.MESH_MULTI_WINDOW_E2E_TASKS === '1';
 const nonce = randomUUID();
 const ownedMarkers = [
 	runRoot,
-	userDataDirectory,
 	extensionsDirectory,
 	controlRoot,
 	sentinelPath,
@@ -101,6 +119,7 @@ let codeCliPath;
 let sentinelDigest;
 let primaryFailure;
 let cleanupFailure;
+let persistentProfileLockOwned = false;
 let evidence = {
 	schemaVersion: 1,
 	runId,
@@ -108,6 +127,7 @@ let evidence = {
 	sharedProfile: {
 		oneUserDataDirectory: false,
 		oneExtensionsDirectory: false,
+		persistentProfile,
 	},
 	initial: { state: 'not-run' },
 	task: {
@@ -125,6 +145,11 @@ let evidence = {
 
 try {
 	assertUsableRuntimePath();
+	await acquirePersistentProfileLock();
+	assertPersistentProfileIdle();
+	if (persistentProfile) {
+		ownedMarkers.push(meshGlobalStorageDirectory);
+	}
 	await prepareRun();
 	vscodeExecutablePath = process.env.MESH_VSCODE_EXECUTABLE
 		? resolve(process.env.MESH_VSCODE_EXECUTABLE)
@@ -207,6 +232,7 @@ try {
 	evidence.sharedProfile = {
 		oneUserDataDirectory: true,
 		oneExtensionsDirectory: true,
+		persistentProfile,
 		windowOpenCount: windowOpenRecords.length + 1,
 	};
 
@@ -447,11 +473,13 @@ try {
 			sentinelUnchanged,
 			trackedPidCount: historicalOwnedPids.size,
 			maximumOwnedProcessCount,
+			profileLockReleased: !persistentProfile,
 			runtimeRemoved: false,
 		};
 		if (!cleanupPassed) {
 			throw new Error('Owned multi-window E2E cleanup was not fully confirmed.');
 		}
+		evidence.cleanup.profileLockReleased = await releasePersistentProfileLock();
 		await rm(runRoot, { recursive: true, force: true });
 		if (!await isAbsent(runRoot)) {
 			throw new Error('The owned multi-window E2E runtime directory remains.');
@@ -486,6 +514,12 @@ console.log(JSON.stringify({
 }));
 
 async function prepareRun() {
+	// A reused profile must not carry mesh Device/Node state between runs, or the
+	// directory assertions would observe stale nodes. Authentication lives in VS Code's
+	// own secret storage, which is deliberately left untouched.
+	if (persistentProfile) {
+		await rm(meshGlobalStorageDirectory, { recursive: true, force: true });
+	}
 	await Promise.all([
 		mkdir(join(userDataDirectory, 'User'), { recursive: true }),
 		mkdir(extensionsDirectory, { recursive: true }),
@@ -523,6 +557,62 @@ async function prepareRun() {
 	await writeFile(sentinelPath, sentinel, { encoding: 'utf8', mode: 0o700 });
 	await chmod(sentinelPath, 0o700);
 	sentinelDigest = createHash('sha256').update(sentinel).digest('hex');
+}
+
+async function acquirePersistentProfileLock() {
+	if (!persistentProfile) {
+		return;
+	}
+	await mkdir(profileBase, { recursive: true });
+	try {
+		await mkdir(profileLockDirectory);
+		persistentProfileLockOwned = true;
+		await writeFile(profileLockOwnerPath, `${runId}\n`, { encoding: 'utf8', mode: 0o600 });
+	} catch (error) {
+		if (persistentProfileLockOwned) {
+			await rm(profileLockDirectory, { recursive: true, force: true });
+			persistentProfileLockOwned = false;
+		}
+		if (error?.code === 'EEXIST') {
+			throw new Error(
+				'The persistent multi-window E2E profile is already locked by another run.',
+			);
+		}
+		throw error;
+	}
+}
+
+function assertPersistentProfileIdle() {
+	if (!persistentProfile) {
+		return;
+	}
+	const users = readProcessTable().filter(({ pid, command }) =>
+		pid !== process.pid
+		&& command.includes('--user-data-dir')
+		&& command.includes(userDataDirectory),
+	);
+	if (users.length > 0) {
+		throw new Error(
+			'The persistent multi-window E2E profile is already in use. '
+			+ 'Close its VS Code and Agent Host processes before retrying.',
+		);
+	}
+}
+
+async function releasePersistentProfileLock() {
+	if (!persistentProfile) {
+		return true;
+	}
+	if (!persistentProfileLockOwned) {
+		return false;
+	}
+	const owner = await readFile(profileLockOwnerPath, 'utf8');
+	if (owner.trim() !== runId) {
+		throw new Error('The persistent multi-window E2E profile lock ownership changed.');
+	}
+	await rm(profileLockDirectory, { recursive: true, force: false });
+	persistentProfileLockOwned = false;
+	return true;
 }
 
 async function writeSettings() {
@@ -885,12 +975,11 @@ async function runProductionTask(source, target, device, workspace) {
 	);
 	const observedSignals = new Set(latest.events.map((event) => event.type));
 	let inputAnswered = false;
-	const observationDeadline = Date.now() + 15_000;
+	const observationDeadline = Date.now() + 120_000;
 	while (
 		Date.now() < observationDeadline
 		&& !terminalStates.has(latest.snapshot.status)
 		&& !observedSignals.has('output')
-		&& !observedSignals.has('progress')
 	) {
 		if (latest.snapshot.status === 'needsInput' && latest.snapshot.pendingInput) {
 			await request(source, 'task.answer', {
@@ -912,6 +1001,10 @@ async function runProductionTask(source, target, device, workspace) {
 			`The cancellation probe became ${latest.snapshot.status} before cancel was exercised.`,
 		);
 	}
+	assert.ok(
+		observedSignals.has('output'),
+		'The cancellation probe did not emit real Agent output before the observation deadline.',
+	);
 	const cancelReceipt = await request(
 		source,
 		'task.cancel',
@@ -938,6 +1031,7 @@ async function runProductionTask(source, target, device, workspace) {
 		startAuthoritative: true,
 		getAuthoritative: true,
 		cancelAuthoritative: true,
+		agentTaskHandleCancelInvoked: true,
 		terminalAuthoritative: true,
 		outputObserved: eventTypes.includes('output'),
 		progressObserved: eventTypes.includes('progress'),
@@ -1241,6 +1335,7 @@ function assertUsableRuntimePath() {
 	)) {
 		throw new Error('MESH_MULTI_WINDOW_E2E_RUNTIME_DIR must not use /tmp or /var/tmp.');
 	}
+	assertUsableProfilePath();
 	if (process.platform !== 'darwin') {
 		return;
 	}
@@ -1253,6 +1348,71 @@ function assertUsableRuntimePath() {
 			+ 'to a short absolute non-/tmp directory.',
 		);
 	}
+}
+
+function assertUsableProfilePath() {
+	if (!persistentProfile) {
+		return;
+	}
+	if (!isAbsolute(configuredProfileBase)) {
+		throw new Error('MESH_MULTI_WINDOW_E2E_PROFILE_DIR must be an absolute path.');
+	}
+	if (profileBase === dirname(profileBase)) {
+		throw new Error('MESH_MULTI_WINDOW_E2E_PROFILE_DIR must not be a filesystem root.');
+	}
+	const forbiddenRoots = ['/tmp', '/var/tmp', '/private/tmp'];
+	if (forbiddenRoots.some((root) =>
+		profileBase === root || profileBase.startsWith(`${root}${sep}`),
+	)) {
+		throw new Error('MESH_MULTI_WINDOW_E2E_PROFILE_DIR must not use /tmp or /var/tmp.');
+	}
+	if (
+		profileBase === runtimeBase
+		|| isWithin(runtimeBase, profileBase)
+		|| isWithin(profileBase, runtimeBase)
+	) {
+		throw new Error(
+			'MESH_MULTI_WINDOW_E2E_PROFILE_DIR must be outside the run directory; '
+			+ 'the run directory is deleted during cleanup.',
+		);
+	}
+	// A persistent profile is written to and reused. It must never be aimed at a real
+	// VS Code installation profile, whose sessions and state belong to the developer.
+	for (const realProfile of realVscodeUserDataDirectories()) {
+		if (
+			profileBase === realProfile
+			|| isWithin(realProfile, profileBase)
+			|| isWithin(profileBase, realProfile)
+		) {
+			throw new Error(
+				'MESH_MULTI_WINDOW_E2E_PROFILE_DIR must not overlap a real VS Code user data directory. '
+				+ 'Use a dedicated directory such as ~/.mw-profile.',
+			);
+		}
+	}
+}
+
+function realVscodeUserDataDirectories() {
+	const home = homedir();
+	const candidates = [
+		join(home, 'Library', 'Application Support', 'Code'),
+		join(home, 'Library', 'Application Support', 'Code - Insiders'),
+		join(home, '.config', 'Code'),
+		join(home, '.config', 'Code - Insiders'),
+		join(home, '.vscode'),
+		join(home, '.vscode-insiders'),
+	];
+	if (typeof process.env.APPDATA === 'string' && process.env.APPDATA.length > 0) {
+		candidates.push(
+			join(process.env.APPDATA, 'Code'),
+			join(process.env.APPDATA, 'Code - Insiders'),
+		);
+	}
+	return candidates;
+}
+
+function isWithin(parent, candidate) {
+	return candidate.startsWith(`${parent}${sep}`);
 }
 
 function safeFailure(error) {
@@ -1270,7 +1430,10 @@ function safeFailure(error) {
 }
 
 function sanitize(value) {
-	return value
+	const withoutProfile = persistentProfile
+		? value.split(profileBase).join('<profile>')
+		: value;
+	return withoutProfile
 		.split(runRoot).join('<runtime>')
 		.split(repositoryRoot).join('<repository>')
 		.split(homedir()).join('<home>');

@@ -4,8 +4,9 @@
 > Node；仅 macOS arm64 支持 Worker Host/真实任务执行。Windows、Linux、macOS
 > x64 和其他架构可以作为 Broker Client/Window Node，但不能 Host Worker。
 
-> 状态：0.2.0 Preview Multi-window Mesh Nodes 已实现；Gate G0 No-Go<br>
-> 日期：2026-08-25<br>
+> 状态：0.2.0 Preview Multi-window Mesh Nodes 已实现；Gate G0 在 macOS arm64
+> 验证范围内 Go<br>
+> 日期：2026-08-30<br>
 > 依据：[PRD v0.3](../copilot-agent-mesh-prd.md) 与 [技术实施方案](./technical-implementation.md)<br>
 > 兼容性 Gate：[Compatibility Matrix](./compatibility-matrix.md)<br>
 > 计划方式：按技术 Gate 推进，不以未经验证的日历日期承诺
@@ -220,6 +221,12 @@ readiness 契约。详见 [Compatibility Matrix](./compatibility-matrix.md) 和 
 opted-in Real AHP Run 因 Fresh Shared Profile 没有 Authentication Mapping/Session
 正确停在 `AGENT_AUTH_REQUIRED`。Authoritative start/get/cancel/output 仍未证明，
 因此 G0 继续 No-Go。
+
+2026-08-30 更新：VS Code 1.135.0 / macOS arm64 使用专用持久测试 Profile 和精确
+GitHub Auth Mapping 完成真实 AHP 1.0 Turn；观察到 `agentStarted`、5 个 output
+事件、`AgentTaskHandle.cancel()` 和 authoritative `cancelled`，并确认零
+Tunnel/Socket/Agent Host/VS Code 残留。G0 在该 Preview 范围内转为 Go；不扩展到
+其他 Worker 平台或 Publish/Release 授权。
 
 ## 6. Phase 1：工程与领域基础
 
@@ -774,11 +781,12 @@ Contract Test 断言 Manifest 与 Runtime Registration Name 完全一致，并�
 
 ### P8.3 真实平台验证 — XL
 
-- macOS arm64 VS Code 1.134.0 普通窗口同 User Data。
+- macOS arm64 VS Code 1.135.0 普通窗口同 User Data。
 - Windows x64。
 - Linux x64。
 - 两设备真实 Tunnel。
-- 真实 Copilot Task；没有 authoritative AHP start/get/cancel/output 前保持 No-Go。
+- 真实 Copilot Task；authoritative AHP start/get/cancel/output 已在 macOS arm64
+  范围通过。
 - Suspend/Resume、Network Loss、VS Code Reload。
 
 已记录：
@@ -791,13 +799,22 @@ Contract Test 断言 Manifest 与 Runtime Registration Name 完全一致，并�
   opted-in AHP，2 Nodes / 278 ms，offline 214 ms，takeover 1683 ms，相同
   `workspaceId`，零 residue；因 Fresh Shared Profile 无 Auth Mapping/Session 在
   `AGENT_AUTH_REQUIRED` 正确阻塞，未证明 authoritative start/get/cancel/output。
+- `.vscode-test/multi-window-evidence/2ab62a03-51ba-45ef-a01a-0e3829f7ae7c.json`：
+  VS Code 1.135.0 authenticated AHP 1.0，2 Nodes / 133 ms，5 个 output，
+  handle cancel，authoritative `cancelled`，offline 210 ms，takeover 1878 ms，
+  相同 `workspaceId`，duplicate conflict，零 residue。
 
 复现：
 
 ```sh
 npm run test:multi-window-real
 MESH_MULTI_WINDOW_E2E_RUNTIME_DIR=$HOME/.mw \
-MESH_MULTI_WINDOW_E2E_TASKS=1 npm run test:multi-window-real
+MESH_MULTI_WINDOW_E2E_TASKS=1 \
+MESH_MULTI_WINDOW_E2E_PROFILE_DIR=$HOME/.mw-profile \
+MESH_MULTI_WINDOW_E2E_AUTH_RESOURCE=https://api.github.com \
+MESH_MULTI_WINDOW_E2E_AUTH_PROVIDER=github \
+MESH_MULTI_WINDOW_E2E_AUTH_SCOPES_JSON='["read:user","user:email"]' \
+npm run test:multi-window-real
 ```
 
 实施期间 Unit/Component/Extension Host/完整 npm Test 已通过；最终验证前不写死

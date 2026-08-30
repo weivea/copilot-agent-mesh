@@ -3,6 +3,7 @@ import { sep } from 'node:path';
 import { test } from 'node:test';
 
 import {
+	LOCAL_BROKER_TASK_START_TIMEOUT_MS,
 	MESH_ERROR_CODES,
 	type NodeTaskEventParams,
 	type RoutedTaskStartParams,
@@ -127,7 +128,7 @@ class MemoryFileSystem implements AtomicFileSystem {
 
 class FakeSession {
 	public closed = false;
-	public requests: { method: string; params: JsonValue }[] = [];
+	public requests: { method: string; params: JsonValue; timeoutMs?: number }[] = [];
 	public handler: (method: string, params: JsonValue) => Promise<JsonValue> = async (
 		method,
 	) => method === 'node.task.start'
@@ -139,8 +140,8 @@ class FakeSession {
 		: null;
 	private readonly listeners = new Set<(error?: Error) => void>();
 
-	public async request(method: string, params: JsonValue): Promise<JsonValue> {
-		this.requests.push({ method, params });
+	public async request(method: string, params: JsonValue, timeoutMs?: number): Promise<JsonValue> {
+		this.requests.push({ method, params, timeoutMs });
 		return this.handler(method, params);
 	}
 
@@ -356,6 +357,10 @@ test('returns a durable start acknowledgement while the target start is pending'
 	assert.equal(
 		fixture.session.requests.filter(({ method }) => method === 'node.task.start').length,
 		1,
+	);
+	assert.equal(
+		fixture.session.requests.find(({ method }) => method === 'node.task.start')?.timeoutMs,
+		LOCAL_BROKER_TASK_START_TIMEOUT_MS,
 	);
 	const persisted = await fixture.store.getOwned(OWNER_ID, TASK_ID);
 	assert.equal(persisted?.state, 'startingAgent');

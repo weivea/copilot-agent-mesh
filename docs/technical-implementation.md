@@ -1,14 +1,15 @@
 # Copilot Agent Mesh 技术实施方案
 
-> 状态：0.2.0 Preview Multi-window Mesh Nodes 实施基线；Gate G0 No-Go<br>
-> 日期：2026-08-25<br>
+> 状态：0.2.0 Preview Multi-window Mesh Nodes 实施基线；Gate G0 在 macOS
+> arm64 验证范围内 Go<br>
+> 日期：2026-08-30<br>
 > 依据：[产品需求文档 v0.3](../copilot-agent-mesh-prd.md)<br>
 > 首版范围：本机桌面 Workspace；不支持 SSH、WSL、Dev Containers、Codespaces 或 vscode.dev
 
 > 当前实现采用 Mesh protocol v2；v1 Peer 明确不兼容。真实普通窗口 E2E 已通过
 > Device Broker、Window Node、本地 IPC、Workspace Claim、Takeover 和清理边界。
-> opted-in AHP 运行正确停止于 `AGENT_AUTH_REQUIRED`，未证明 authoritative
-> start/get/cancel/output，因此 Gate G0 保持 No-Go。
+> 最终 opted-in AHP 1.0 运行使用专用认证 Profile，已证明 authoritative
+> start/get/output/handle-cancel/cancelled 和零资源残留。
 
 ## 1. 结论
 
@@ -604,7 +605,13 @@ Coordinator 可以有本地 `created` 状态；Worker 的第一个持久状态�
 
 ### 10.1 版本策略
 
-调研时已发布 TypeScript Tag 为 `@microsoft/agent-host-protocol@0.8.0`，而 AHP `main` 已进入 `1.0.0` 演进；不能假定 npm 0.8.0 与当前 VS Code Agent Host 兼容。首个可工作的 SDK 必须精确锁定，不使用 `^`；Phase 0 必须证明实际 VS Code Build 的 Host 版本与 SDK 导出的 `SUPPORTED_PROTOCOL_VERSIONS` 有交集，否则 No-Go，等待或锁定匹配 SDK，不能仅靠 Feature Flag 绕过。[AHP 0.8 Release Metadata](https://github.com/microsoft/agent-host-protocol/blob/typescript/v0.8.0/clients/typescript/release-metadata.json) · [AHP Versioning](https://github.com/microsoft/agent-host-protocol/blob/main/docs/specification/versioning.md)
+VS Code 1.135.0 Agent Host 要求 AHP 1.0.0，而 npm 最新发布仍是 0.8.0。当前实现
+因此用 Git Submodule 精确锁定上游 commit
+`fa92d47d3f3ac6732af2019b52826d2d638a4219`，从源码生成并构建 TypeScript
+0.9.0 Client；其 `SUPPORTED_PROTOCOL_VERSIONS` 包含 1.0.0。该 revision 尚未
+Tag 或发布到 npm，属于明确记录的 Preview 供应链限制。Phase 0 必须继续证明实际
+VS Code Build 的 Host 版本与 SDK Offer 有交集，不能靠 Feature Flag 绕过。
+[AHP Versioning](https://github.com/microsoft/agent-host-protocol/blob/main/docs/specification/versioning.md)
 
 当前 `engines.vscode = ^1.103.0` 只足以覆盖 Language Model Tool API，不能自动证明对应版本的 `code agent host` 与目标 AHP 行为可用。Phase 0 完成后，将最低 VS Code 版本提高到验证通过的最低版本，并在启动时做 Capability Probe。
 
@@ -1119,7 +1126,7 @@ macOS Unix Socket 路径过长时使用短目录：
 MESH_MULTI_WINDOW_E2E_RUNTIME_DIR=$HOME/.mw npm run test:multi-window-real
 ```
 
-VS Code 1.134.0 macOS arm64 已记录两次真实运行：
+macOS arm64 已记录以下真实运行：
 
 - `.vscode-test/multi-window-evidence/6c119d7b-8596-4757-a129-7e31b412db5d.json`：
   2 Nodes / 129 ms，
@@ -1130,6 +1137,10 @@ VS Code 1.134.0 macOS arm64 已记录两次真实运行：
   278 ms，Offline 214 ms，Takeover 1683 ms，相同 `workspaceId`，零残留；因 Fresh
   Shared Profile 无 Auth Mapping/Session 正确停在 `AGENT_AUTH_REQUIRED`。它没有
   证明 authoritative AHP start/get/cancel/output。
+- `.vscode-test/multi-window-evidence/2ab62a03-51ba-45ef-a01a-0e3829f7ae7c.json`：
+  VS Code 1.135.0 使用专用认证 Profile；2 Nodes / 133 ms，`agentStarted`，
+  5 个 output，handle cancel，authoritative `cancelled`，Offline 210 ms，
+  Takeover 1878 ms，相同 `workspaceId`，Duplicate Conflict，零残留。
 
 实施期间 Unit、Component、Extension Host 和完整 npm Test 均通过；最终发布
 验证完成前不在文档中固定数量。
@@ -1164,8 +1175,8 @@ Linux Extension Host Test 使用 `xvfb-run -a`。[VS Code CI](https://code.visua
 
 ## 21. Release Gate
 
-以下全部通过才可把 0.2.0 Preview Evaluation Package 提升为通过 G0 的发布候选；
-当前仍为 No-Go，不表示已 Push/Release/Publish：
+以下全部通过才可把 0.2.0 Preview Evaluation Package 提升为通过 G0 的发布候选。
+macOS arm64 验证范围现为 Go；这不表示已 Push/Release/Publish：
 
 1. Gateway 只监听 `127.0.0.1`，只公开 `/healthz` 和认证 RPC Upgrade。
 2. 未认证 Peer 无法读取设备、Workspace 或 Task 信息。
@@ -1191,8 +1202,7 @@ Linux Extension Host Test 使用 `xvfb-run -a`。[VS Code CI](https://code.visua
     Route Catalog。
 20. Node 丢失释放 Claim；当前 AHP 无 Recovery API 时 Task 明确失败为
     `TASK_RECOVERY_UNAVAILABLE`，且不重复执行。
-21. Authenticated Authoritative AHP start/get/cancel/output 通过；当前该项被
-    `AGENT_AUTH_REQUIRED` 阻塞。
+21. Authenticated Authoritative AHP start/get/cancel/output/handle-cancel 已通过。
 
 ## 22. 参考资料
 
