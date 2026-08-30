@@ -30,6 +30,7 @@ import type {
 	DashboardServiceBindings,
 	DashboardSnapshot,
 	DashboardTaskTarget,
+	DashboardWindowRenameSession,
 } from '../ui/DashboardFacade';
 import {
 	DashboardActionError,
@@ -302,7 +303,7 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 		this.options.changed.fire();
 	}
 
-	public async renameCurrentWindow(name: string): Promise<void> {
+	public async prepareWindowRename(): Promise<DashboardWindowRenameSession> {
 		this.options.guard.assertAllowed({ requireWorkspace: false });
 		if (!this.peerDelegationEnabled()) {
 			throw new DashboardActionError(
@@ -314,25 +315,52 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 			this.activeWorkspaceUri(),
 		);
 		if (selection.kind !== 'selected') {
-			throw selection.claimStatus === 'ambiguous'
-				? new DashboardActionError(
-					'WORKSPACE_SELECTION_AMBIGUOUS',
-					'Select an editor in the Workspace you want to rename, then retry.',
-				)
-				: new DashboardActionError(
-					'POLICY_FORBIDDEN',
-					'Only a Workspace claimed by this window can be renamed.',
-				);
+			throw renameSelectionError(selection.claimStatus);
 		}
+		let policy;
 		try {
-			await this.options.node.setPeerPolicy({
-				workspaceIdentity: selection.workspaceIdentity,
-				windowName: name,
-			});
+			policy = await this.options.node.getPeerPolicy(selection.workspaceIdentity);
 		} catch (error: unknown) {
 			throw toDashboardPolicyError(error);
 		}
-		this.options.changed.fire();
+		return {
+			currentName: resolveWindowDisplayName(
+				policy.windowName,
+				selection.workspaceName,
+				this.options.node.nodeId,
+			),
+			rename: async (name: string) => {
+				this.options.guard.assertAllowed({ requireWorkspace: false });
+				if (!this.peerDelegationEnabled()) {
+					throw new DashboardActionError(
+						'PEER_DELEGATION_DISABLED',
+						'Enable the Peer Delegation Preview before renaming this window.',
+					);
+				}
+				const live = this.options.node.selectPeerPolicyWorkspace(
+					this.activeWorkspaceUri(),
+				);
+				if (
+					live.kind !== 'selected'
+					|| live.workspaceIdentity !== selection.workspaceIdentity
+					|| live.workspaceId !== selection.workspaceId
+				) {
+					throw new DashboardActionError(
+						'WORKSPACE_SELECTION_AMBIGUOUS',
+						'The active Workspace changed while renaming. Reopen rename and try again.',
+					);
+				}
+				try {
+					await this.options.node.setPeerPolicy({
+						workspaceIdentity: selection.workspaceIdentity,
+						windowName: name,
+					});
+				} catch (error: unknown) {
+					throw toDashboardPolicyError(error);
+				}
+				this.options.changed.fire();
+			},
+		};
 	}
 
 	public async registerCurrentWorkspace(): Promise<void> {
@@ -634,6 +662,20 @@ function toDashboardPolicyError(error: unknown): Error {
 	return error instanceof Error
 		? error
 		: new Error('The window rename failed without diagnostic details.');
+}
+
+function renameSelectionError(
+	claimStatus: 'unclaimed' | 'readOnly' | 'conflict' | 'ambiguous',
+): DashboardActionError {
+	return claimStatus === 'ambiguous'
+		? new DashboardActionError(
+			'WORKSPACE_SELECTION_AMBIGUOUS',
+			'Select an editor in the Workspace you want to rename, then retry.',
+		)
+		: new DashboardActionError(
+			'POLICY_FORBIDDEN',
+			'Only a Workspace claimed by this window can be renamed.',
+		);
 }
 
 function remoteErrorReason(error: LocalIpcRemoteError): DashboardActionErrorCode | undefined {

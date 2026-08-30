@@ -510,7 +510,8 @@ suite('Dashboard', () => {
 			},
 			mutations,
 		});
-		await selected.renameCurrentWindow('Backend');
+		const rename = await selected.prepareWindowRename();
+		await rename.rename('Backend');
 		assert.deepStrictEqual(mutations, [{
 			workspaceIdentity: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
 			windowName: 'Backend',
@@ -528,13 +529,54 @@ suite('Dashboard', () => {
 			mutations,
 		});
 		await assert.rejects(
-			ambiguous.renameCurrentWindow('Backend'),
+			ambiguous.prepareWindowRename(),
 			(error: unknown) =>
 				error instanceof DashboardActionError
 				&& error.code === 'WORKSPACE_SELECTION_AMBIGUOUS',
 		);
 		assert.strictEqual(mutations.length, 1);
 		ambiguous.dispose();
+	});
+
+	test('rejects rename when the active Workspace changes while the input is open', async () => {
+		const mutations: unknown[] = [];
+		let selection: WindowRenameSelection = {
+			kind: 'selected',
+			workspaceIdentity: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+			workspaceId: 'workspace-a',
+			workspaceName: 'Workspace A',
+			claimStatus: 'claimed',
+		};
+		const bindings = createWindowRenameBindings({
+			enabled: true,
+			selection: () => selection,
+			mutations,
+		});
+		const facade = new ServiceDashboardFacade(
+			bindings,
+			{ confirm: async () => true },
+			{
+				showInputBox: async () => {
+					selection = {
+						kind: 'selected',
+						workspaceIdentity: 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+						workspaceId: 'workspace-b',
+						workspaceName: 'Workspace B',
+						claimStatus: 'claimed',
+					};
+					return 'Renamed Window';
+				},
+			},
+		);
+
+		await assert.rejects(
+			facade.renameCurrentWindow(),
+			(error: unknown) =>
+				error instanceof DashboardActionError
+				&& error.code === 'WORKSPACE_SELECTION_AMBIGUOUS',
+		);
+		assert.deepStrictEqual(mutations, []);
+		bindings.dispose();
 	});
 
 	test('dispatches all dashboard actions without sensitive values in messages', async () => {
@@ -691,8 +733,13 @@ class RecordingServiceBindings implements DashboardServiceBindings {
 	}
 
 	public async configureDeviceName(_name: string): Promise<void> {}
-	public async renameCurrentWindow(name: string): Promise<void> {
-		this.lastWindowName = name;
+	public async prepareWindowRename() {
+		return {
+			currentName: 'This Window',
+			rename: async (name: string) => {
+				this.lastWindowName = name;
+			},
+		};
 	}
 	public async registerCurrentWorkspace(): Promise<void> {}
 	public async removeWorkspace(_workspaceId: string): Promise<void> {}
@@ -894,21 +941,23 @@ function settle(): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+type WindowRenameSelection =
+	| {
+		readonly kind: 'selected';
+		readonly workspaceIdentity: string;
+		readonly workspaceId: string;
+		readonly workspaceName: string;
+		readonly claimStatus: 'claimed';
+	}
+	| {
+		readonly kind: 'unavailable';
+		readonly workspaceName: string;
+		readonly claimStatus: 'ambiguous';
+	};
+
 function createWindowRenameBindings(options: {
 	readonly enabled: boolean;
-	readonly selection:
-		| {
-			readonly kind: 'selected';
-			readonly workspaceIdentity: string;
-			readonly workspaceId: string;
-			readonly workspaceName: string;
-			readonly claimStatus: 'claimed';
-		}
-		| {
-			readonly kind: 'unavailable';
-			readonly workspaceName: string;
-			readonly claimStatus: 'ambiguous';
-		};
+	readonly selection: WindowRenameSelection | (() => WindowRenameSelection);
 	readonly mutations: unknown[];
 }): ProductionDashboardBindings {
 	const disposable = { dispose: () => undefined };
@@ -929,7 +978,14 @@ function createWindowRenameBindings(options: {
 		node: {
 			nodeId: 'node-1',
 			onDidChange: () => disposable,
-			selectPeerPolicyWorkspace: () => options.selection,
+			selectPeerPolicyWorkspace: () =>
+				typeof options.selection === 'function' ? options.selection() : options.selection,
+			getPeerPolicy: async (workspaceIdentity: string) => ({
+				workspaceIdentity,
+				windowName: 'This Window',
+				acceptsIncoming: false,
+				allowlist: [],
+			}),
 			setPeerPolicy: async (mutation: unknown) => {
 				options.mutations.push(mutation);
 				return mutation;

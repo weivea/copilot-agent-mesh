@@ -11,6 +11,12 @@ disabled while the default-off Peer Delegation Preview is disabled. The strict
 caller-owned claimed Workspace through `ProductionDashboardBindings` and
 `WindowNodeClient`.
 
+Before opening the InputBox, the bindings create an Extension Host-only rename
+session that closes over the selected identity and safe prefill. Submission
+revalidates that Preview remains enabled and the live claimed/active Workspace
+still matches that identity. A changed or ambiguous selection fails with
+`WORKSPACE_SELECTION_AMBIGUOUS`; it never retargets the rename.
+
 The existing Dashboard reads `node.dashboard.list`, not Tool-facing
 `node.list`. This safe unfiltered projection preserves this-window identity,
 Workspace claim/conflict and busy state, active task naming, and
@@ -37,7 +43,7 @@ composition root should adapt the real stores and application services to
 | --- | --- |
 | `getSnapshot` / `onDidChange` | Read and observe device, listener, tunnel, AHP, workspace, peer, task, and stable error state |
 | `configureDeviceName` | Collect the name in Extension Host UI and persist it through the device service |
-| `renameCurrentWindow` | Collect a bounded name in Extension Host UI and invoke the authenticated own-Workspace policy RPC |
+| `prepareWindowRename` / `renameCurrentWindow` | Capture one owned Workspace before collecting a bounded name, revalidate it on submit, then invoke the authenticated policy RPC |
 | `registerCurrentWorkspace` / `removeWorkspace` | Register the active local workspace or confirm and remove by `workspaceId` |
 | `startListener` / `stopListener` | Drive the real gateway and tunnel lifecycle |
 | `copyConnectionUrl` | Obtain the one-time URL and write it directly with `vscode.env.clipboard`; never return or post it to the webview |

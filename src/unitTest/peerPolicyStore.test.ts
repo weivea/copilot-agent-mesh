@@ -12,6 +12,7 @@ import {
 	PeerPolicyStore,
 	type PeerPolicyDocument,
 } from '../broker/PeerPolicyStore';
+import { validateWindowName } from '../broker/WindowName';
 import {
 	MemoryAtomicFileSystem,
 	TestOwnership,
@@ -198,6 +199,7 @@ test('rejects invalid path, secret, control, empty, and oversized names without 
 		'/Users/example/project',
 		'C:\\Users\\example\\project',
 		'file:///Users/example/project',
+		'%2FUsers%2Fprivate%2Fsecret-project',
 		'ｆｉｌｅ：／／／Users／example／project',
 		'~/project',
 		'backend:project',
@@ -207,11 +209,12 @@ test('rejects invalid path, secret, control, empty, and oversized names without 
 		'backend\u200Bspoof',
 		'Back\u034Fend',
 		'ghp_examplecredential',
+		'project-api_key=supersecret',
 		'Bearer examplecredential',
 		'Bearer examplecredential',
 		'a'.repeat(64),
-		'Z'.repeat(40),
 		'Abcdefghijklmnopqrstuvwxyz0123456789_-XYZ',
+		'k9m2v7q4x8n3c6b5z1p0r7t2y9w4h8j6s3d5f1g0',
 	];
 
 	for (const [index, name] of invalidNames.entries()) {
@@ -222,6 +225,19 @@ test('rejects invalid path, secret, control, empty, and oversized names without 
 			hasReason('WINDOW_NAME_INVALID'),
 		);
 		assert.deepEqual(fixture.store.snapshot(), { schemaVersion: 1, entries: {} });
+	}
+});
+
+test('allows long ordinary descriptive names that do not have credible token entropy', async () => {
+	const fixture = createFixture();
+	await fixture.store.initialize();
+	for (const [index, name] of [
+		'Backend-worker-for-the-customer-checkout-service-in-west-europe',
+		'Frontend-Analytics-Migration-Workspace-Canary',
+	].entries()) {
+		const workspaceIdentity = identity(`descriptive-${index}`);
+		await fixture.store.set(workspaceIdentity, defaultPolicy(name));
+		assert.equal(fixture.store.get(workspaceIdentity)?.windowName, name);
 	}
 });
 
@@ -240,27 +256,84 @@ test('validates the UTF-8 bound before unsafe characters and secret shapes', asy
 	);
 });
 
-test('rejects persisted unsafe, duplicate, or non-canonical folded names as corruption', async () => {
-	for (const entries of [
-		{
-			[identity('unsafe')]: fullEntry('../unsafe', '../unsafe'),
+test('migrates structurally valid P2 policies while preserving gates and restartability', async () => {
+	const unicode = identity('unicode');
+	const pathFallback = identity('path-fallback');
+	const secretFallback = identity('secret-fallback');
+	const fileSystem = new MemoryAtomicFileSystem();
+	fileSystem.files.set(POLICY_FILE, JSON.stringify({
+		schemaVersion: 1,
+		entries: {
+			[unicode]: {
+				...fullEntry('Straße', 'straße'),
+				acceptsIncoming: true,
+				allowlist: [pathFallback],
+			},
+			[pathFallback]: {
+				...fullEntry('file:///Users/private/workspace', 'file:///users/private/workspace'),
+				allowlist: [unicode],
+			},
+			[secretFallback]: fullEntry(
+				'Abcdefghijklmnopqrstuvwxyz0123456789_-XYZ',
+				'abcdefghijklmnopqrstuvwxyz0123456789_-xyz',
+			),
 		},
-		{
-			[identity('source')]: fullEntry('Backend', 'backend'),
-			[identity('target')]: fullEntry('ＢＡＣＫＥＮＤ', 'backend'),
+	}));
+
+	const fixture = createFixture({ fileSystem });
+	await fixture.store.initialize();
+	const migrated = fixture.store.snapshot();
+	assert.equal(migrated.entries[unicode]?.windowName, 'Straße');
+	assert.equal(migrated.entries[unicode]?.windowNameFold, 'strasse');
+	assert.equal(migrated.entries[unicode]?.acceptsIncoming, true);
+	assert.deepEqual(migrated.entries[unicode]?.allowlist, [pathFallback]);
+	assert.deepEqual(migrated.entries[pathFallback]?.allowlist, [unicode]);
+	for (const entry of Object.values(migrated.entries)) {
+		validateWindowName(entry.windowName);
+	}
+	assert.equal(
+		new Set(Object.values(migrated.entries).map(({ windowNameFold }) => windowNameFold)).size,
+		3,
+	);
+	assert.notEqual(migrated.entries[pathFallback]?.windowName, 'file:///Users/private/workspace');
+	assert.notEqual(
+		migrated.entries[secretFallback]?.windowName,
+		'Abcdefghijklmnopqrstuvwxyz0123456789_-XYZ',
+	);
+
+	const restarted = createFixture({ fileSystem });
+	await restarted.store.initialize();
+	assert.deepEqual(restarted.store.snapshot(), migrated);
+});
+
+test('generation-fences the known-format P2 compatibility rewrite', async () => {
+	const ownership = new TestOwnership();
+	const fileSystem = new MemoryAtomicFileSystem();
+	fileSystem.files.set(POLICY_FILE, JSON.stringify({
+		schemaVersion: 1,
+		entries: {
+			[identity('unicode')]: fullEntry('Straße', 'straße'),
 		},
-		{
+	}));
+	ownership.owner = false;
+	const fixture = createFixture({ ownership, fileSystem });
+	await assert.rejects(fixture.store.initialize(), hasReason('WORKER_DRAINING'));
+	assert.match(fileSystem.files.get(POLICY_FILE) ?? '', /"windowNameFold":"straße"/u);
+});
+
+test('rejects non-canonical legacy folds as corruption', async () => {
+	const fileSystem = new MemoryAtomicFileSystem();
+	fileSystem.files.set(POLICY_FILE, JSON.stringify({
+		schemaVersion: 1,
+		entries: {
 			[identity('source')]: fullEntry('Backend', 'not-backend'),
 		},
-	]) {
-		const fileSystem = new MemoryAtomicFileSystem();
-		fileSystem.files.set(POLICY_FILE, JSON.stringify({ schemaVersion: 1, entries }));
-		const fixture = createFixture({ fileSystem });
-		await assert.rejects(
-			fixture.store.initialize(),
-			(error: unknown) => error instanceof StorageCorruptionError,
-		);
-	}
+	}));
+	const fixture = createFixture({ fileSystem });
+	await assert.rejects(
+		fixture.store.initialize(),
+		(error: unknown) => error instanceof StorageCorruptionError,
+	);
 });
 
 function createFixture(options: {

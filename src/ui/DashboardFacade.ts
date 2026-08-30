@@ -133,6 +133,11 @@ export interface DashboardTaskTarget {
 	readonly peerId?: string;
 }
 
+export interface DashboardWindowRenameSession {
+	readonly currentName: string;
+	rename(name: string): Promise<void>;
+}
+
 /**
  * Application-service boundary for the dashboard.
  *
@@ -160,7 +165,7 @@ export interface DashboardServiceBindings {
 	getSnapshot(): Promise<DashboardSnapshot>;
 	onDidChange(listener: () => void): vscode.Disposable;
 	configureDeviceName(name: string): Promise<void>;
-	renameCurrentWindow(name: string): Promise<void>;
+	prepareWindowRename(): Promise<DashboardWindowRenameSession>;
 	registerCurrentWorkspace(): Promise<void>;
 	removeWorkspace(workspaceId: string): Promise<void>;
 	startListener(): Promise<void>;
@@ -220,16 +225,16 @@ export class ServiceDashboardFacade implements DashboardFacade {
 	}
 
 	public async renameCurrentWindow(): Promise<void> {
-		const snapshot = await this.services.getSnapshot();
+		const session = await this.services.prepareWindowRename();
 		const name = await this.inputs.showInputBox({
 			title: 'Rename This Window',
 			prompt: 'Choose a device-wide unique display name for the current Workspace.',
-			value: snapshot.thisWindow.name,
+			value: session.currentName,
 			ignoreFocusOut: true,
 			validateInput: validateWindowNameInput,
 		});
 		if (name !== undefined) {
-			await this.services.renameCurrentWindow(name);
+			await session.rename(name);
 		}
 	}
 

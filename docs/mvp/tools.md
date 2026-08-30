@@ -44,8 +44,13 @@ generation-fenced serialized mutation; normalized or case-insensitive conflicts
 return `WINDOW_NAME_CONFLICT`, while invalid values return
 `WINDOW_NAME_INVALID`. Authorized directories, Dashboard directories, and
 task-source display labels reuse `windowNodeDescriptor.label` with stored name,
-safe Workspace display name, then short node ID fallback. Labels never affect
-authorization, route identity, Lease ownership, or Task ownership.
+safe Workspace display name, then short node ID fallback. Claimed Workspace
+fallbacks participate in uniqueness: explicit names win, duplicate fallbacks
+deterministically use a short ID, and user renames that collide with any
+effective name fail without suffixing. Structurally valid P2 schema-v1 policy
+files are generation-fenced into the current safe fold while preserving gates;
+malformed or unknown data still fails. Labels never affect authorization, route
+identity, Lease ownership, or Task ownership.
 
 All inputs are checked again at runtime with exact object properties and UTF-8
 byte limits. Facade output is parsed through a strict allowlist before it can

@@ -47,14 +47,36 @@ export function validateWindowName(value: string): void {
 		|| longHexPattern.test(compact)
 		|| maskedSecretPattern.test(compact)
 		|| tokenAssignmentPattern.test(normalized)
+		|| containsUnsafeDashboardText(normalized)
 		|| (
 			compact.length >= 40
 			&& base64UrlPattern.test(compact)
-			&& /[A-Za-z]/u.test(compact)
+			&& shannonEntropy(compact) >= 4
+			&& !isSegmentedDescription(normalized)
 		)
 	) {
 		throw invalidWindowName('Window names cannot resemble credentials, tokens, or secrets.');
 	}
+}
+
+function isSegmentedDescription(value: string): boolean {
+	const segments = value.split(/[-_]/u);
+	return segments.length >= 3
+		&& segments.every((segment) => /^[A-Za-z][A-Za-z0-9]{1,19}$/u.test(segment))
+		&& segments.some((segment) => /^[A-Z][a-z]/u.test(segment));
+}
+
+function shannonEntropy(value: string): number {
+	const counts = new Map<string, number>();
+	for (const character of value) {
+		counts.set(character, (counts.get(character) ?? 0) + 1);
+	}
+	let entropy = 0;
+	for (const count of counts.values()) {
+		const probability = count / value.length;
+		entropy -= probability * Math.log2(probability);
+	}
+	return entropy;
 }
 
 export function resolveWindowDisplayName(
