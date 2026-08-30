@@ -266,7 +266,9 @@ test('locator normalizes command failure, timeout, and cancellation without sens
 	);
 });
 
-test('Unix socket connector performs authenticated upgrade, scrubs inspectable URL, and isolates concurrent clients', async () => {
+test('Unix socket connector performs authenticated upgrade, scrubs inspectable URL, and isolates concurrent clients', {
+	skip: process.platform === 'win32',
+}, async () => {
 	await withSocketPath(async (socketPath) => {
 		const { server, webSockets } = await startWebSocketServer(socketPath, 'connection-token');
 		try {
@@ -293,7 +295,9 @@ test('Unix socket connector performs authenticated upgrade, scrubs inspectable U
 	});
 });
 
-test('Unix socket connector rejects token/status/header failures, timeout, cancellation, and early close safely', async () => {
+test('Unix socket connector rejects token/status/header failures, timeout, cancellation, and early close safely', {
+	skip: process.platform === 'win32',
+}, async () => {
 	await withSocketPath(async (socketPath) => {
 		const { server, webSockets } = await startWebSocketServer(socketPath, 'expected-token');
 		try {

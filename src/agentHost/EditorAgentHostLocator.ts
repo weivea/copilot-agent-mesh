@@ -2,7 +2,6 @@ import { realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import {
 	isAbsolute,
-	join,
 	posix,
 	win32,
 } from 'node:path';
@@ -297,7 +296,7 @@ function strategyFor(platform: NodeJS.Platform): EditorAgentHostUserDataStrategy
 	switch (platform) {
 		case 'darwin':
 			return {
-				derive: (context) => join(
+				derive: (context) => posix.join(
 					context.homeDirectory,
 					'Library',
 					'Application Support',
