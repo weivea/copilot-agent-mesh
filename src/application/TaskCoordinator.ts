@@ -22,7 +22,6 @@ import type {
 import type { StateStore } from '../domain/ports';
 import { isUsablePeerProfile, type PeerProfileStore } from '../peer/PeerProfile';
 import { PeerRpcError } from '../peer/WebSocketPeerTransport';
-import type { TaskToolFacade } from '../tools/taskToolFacade';
 import { TaskToolFacadeError } from '../tools/taskToolFacade';
 import type { LocalDesktopWorkspaceGuard } from './LocalDesktopWorkspaceGuard';
 import { MeshDomainError } from '../domain/errors';
@@ -76,7 +75,7 @@ export interface CoordinatorPeerManager {
 	get(profileId: string): CoordinatorPeerConnection | undefined;
 }
 
-export class TaskCoordinator implements TaskToolFacade {
+export class TaskCoordinator {
 	private mutation = Promise.resolve();
 	private readonly taskCache = new Map<string, TaskSnapshot | TaskSnapshotAfterEventSeq>();
 	private readonly intentPayloads = new Map<string, CoordinatorDelegationInput>();
@@ -153,6 +152,14 @@ export class TaskCoordinator implements TaskToolFacade {
 		if ('deviceId' in input) {
 			return Promise.reject(new TaskToolFacadeError('PROTOCOL_INCOMPATIBLE'));
 		}
+		const timeoutMinutes = input.timeoutMinutes ?? 60;
+		if (
+			!Number.isSafeInteger(timeoutMinutes)
+			|| timeoutMinutes < 1
+			|| timeoutMinutes > 60
+		) {
+			return Promise.reject(new TaskToolFacadeError('INVALID_INPUT'));
+		}
 		return this.mutate(async () => {
 			await this.assertOwner();
 			const requestHash = hashIntent(input);
@@ -163,7 +170,7 @@ export class TaskCoordinator implements TaskToolFacade {
 			);
 			if (existing !== undefined) {
 				if (existing.requestHash !== requestHash) {
-					throw new TaskToolFacadeError('TASK_ID_CONFLICT');
+					throw new TaskToolFacadeError('IDEMPOTENCY_CONFLICT');
 				}
 				this.intentPayloads.set(existing.taskId, {
 					...input,
@@ -176,7 +183,6 @@ export class TaskCoordinator implements TaskToolFacade {
 				};
 			}
 			const now = this.now();
-			const timeoutMinutes = input.timeoutMinutes ?? 60;
 			const intent: StoredDelegationIntent = {
 				schemaVersion: 1,
 				delegationRequestId,

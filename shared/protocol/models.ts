@@ -112,6 +112,8 @@ export const persistedTaskRecordV2Schema = z.strictObject({
 	...persistedTaskRecordCommonFields,
 	target: persistedTaskRoutingTargetSchema,
 	sourceNodeId: uuidSchema.optional(),
+	sourceWorkspaceIdentity: utf8String(1_024, 'source workspace identity', 1).optional(),
+	timeoutMinutes: z.number().int().min(1).max(60).optional(),
 });
 
 export const persistedTaskRecordSchema = z.discriminatedUnion('schemaVersion', [

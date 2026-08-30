@@ -55,6 +55,12 @@ abstract class TaskToolBase {
 			})),
 		]);
 	}
+
+	protected unbudgetedResult(value: ToolJsonResult): vscode.LanguageModelToolResult {
+		return new vscode.LanguageModelToolResult([
+			new vscode.LanguageModelTextPart(JSON.stringify(value)),
+		]);
+	}
 }
 
 export class MeshListWorkersTool extends TaskToolBase implements vscode.LanguageModelTool<EmptyInput> {
@@ -71,11 +77,11 @@ export class MeshListWorkersTool extends TaskToolBase implements vscode.Language
 }
 
 export class MeshDelegateTaskTool extends TaskToolBase implements vscode.LanguageModelTool<DelegateTaskInput> {
-	prepareInvocation(
+	async prepareInvocation(
 		options: vscode.LanguageModelToolInvocationPrepareOptions<DelegateTaskInput>,
-		_token: vscode.CancellationToken,
-	): vscode.PreparedToolInvocation {
-		const preparation = this.core().prepareDelegateInvocation(options.input);
+		token: vscode.CancellationToken,
+	): Promise<vscode.PreparedToolInvocation> {
+		const preparation = await this.core().prepareDelegateInvocation(options.input, token);
 		return {
 			invocationMessage: preparation.invocationMessage,
 			confirmationMessages: {
@@ -89,10 +95,18 @@ export class MeshDelegateTaskTool extends TaskToolBase implements vscode.Languag
 		options: vscode.LanguageModelToolInvocationOptions<DelegateTaskInput>,
 		token: vscode.CancellationToken,
 	): Promise<vscode.LanguageModelToolResult> {
+		let value: ToolJsonResult;
 		try {
-			return await this.result(await this.core().delegateTask(options.input, token), options);
+			value = await this.core().delegateTask(options.input, token);
 		} catch {
 			return this.internalError();
+		}
+		try {
+			return await this.result(value, options);
+		} catch {
+			return typeof value.s === 'number'
+				? this.unbudgetedResult(value)
+				: this.internalError();
 		}
 	}
 }

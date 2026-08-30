@@ -46,8 +46,11 @@ Terminal states are `completed`, `failed`, `cancelled`, and `timedOut`.
 - Workspace leases are owned by the compound `(peerId, taskId)` identity, so
   equal task IDs from different peers cannot acquire or release each other's
   lease.
-- Start idempotency is scoped by peer and checks both `delegationRequestId` and
-  `taskId`. Reuse with a different canonical hash returns `TASK_ID_CONFLICT`.
+- Source Broker start idempotency is scoped by stable source Workspace identity
+  and `delegationRequestId`; exact semantic retries reuse the same `taskId`.
+  Reuse with a different canonical hash returns `IDEMPOTENCY_CONFLICT`.
+  Authenticated Worker ownership remains peer-scoped, and a true task-ID
+  ownership collision returns `TASK_ID_CONFLICT`.
 - The canonical hash uses UTF-8 byte-length-prefixed semantic fields. Prompt,
   title, and acceptance criteria are not trimmed, line-ending-normalized, or
   otherwise rewritten.

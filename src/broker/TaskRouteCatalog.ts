@@ -30,6 +30,7 @@ const taskRouteRecordSchema = z.strictObject({
 	peerId: uuidSchema.optional(),
 	sourceNodeId: uuidSchema.optional(),
 	sourcePeerId: uuidSchema.optional(),
+	sourceWorkspaceIdentity: z.string().regex(/^sha256:[A-Za-z0-9_-]{43}$/u).optional(),
 	createdAt: timestampSchema,
 	state: routeStateSchema,
 	terminalAt: timestampSchema.optional(),
@@ -83,7 +84,8 @@ const taskRouteCatalogSchema = z.strictObject({
 				message: 'Task route IDs must be unique',
 			});
 		}
-		if (delegationIds.has(route.delegationRequestId)) {
+		const delegationKey = `${route.sourceWorkspaceIdentity ?? 'legacy'}:${route.delegationRequestId}`;
+		if (delegationIds.has(delegationKey)) {
 			context.addIssue({
 				code: 'custom',
 				path: ['routes', index, 'delegationRequestId'],
@@ -91,7 +93,7 @@ const taskRouteCatalogSchema = z.strictObject({
 			});
 		}
 		taskIds.add(route.taskId);
-		delegationIds.add(route.delegationRequestId);
+		delegationIds.add(delegationKey);
 	}
 });
 
@@ -243,6 +245,10 @@ export class TaskRouteCatalog {
 		return route === undefined ? undefined : structuredClone(route);
 	}
 
+	public list(): readonly TaskRouteRecord[] {
+		return [...this.routes.values()].map((route) => structuredClone(route));
+	}
+
 	public requireForNode(taskId: string, sourceNodeId: string): TaskRouteRecord {
 		const route = this.get(taskId);
 		const source = uuidSchema.parse(sourceNodeId);
@@ -335,7 +341,7 @@ export class TaskRouteCatalog {
 		input: RoutedTaskStartParams,
 		route: Pick<
 			TaskRouteRecord,
-			'routeKind' | 'peerId' | 'sourceNodeId' | 'sourcePeerId'
+			'routeKind' | 'peerId' | 'sourceNodeId' | 'sourcePeerId' | 'sourceWorkspaceIdentity'
 		>,
 	): Promise<TaskRouteRecord> {
 		return this.reserveCore(input, route, false) as Promise<TaskRouteRecord>;
@@ -345,7 +351,7 @@ export class TaskRouteCatalog {
 		input: RoutedTaskStartParams,
 		route: Pick<
 			TaskRouteRecord,
-			'routeKind' | 'peerId' | 'sourceNodeId' | 'sourcePeerId'
+			'routeKind' | 'peerId' | 'sourceNodeId' | 'sourcePeerId' | 'sourceWorkspaceIdentity'
 		>,
 	): Promise<TaskRouteReservation> {
 		return this.reserveCore(input, route, true) as Promise<TaskRouteReservation>;
@@ -355,7 +361,7 @@ export class TaskRouteCatalog {
 		input: RoutedTaskStartParams,
 		route: Pick<
 			TaskRouteRecord,
-			'routeKind' | 'peerId' | 'sourceNodeId' | 'sourcePeerId'
+			'routeKind' | 'peerId' | 'sourceNodeId' | 'sourcePeerId' | 'sourceWorkspaceIdentity'
 		>,
 		asAttempt: boolean,
 	): Promise<TaskRouteRecord | TaskRouteReservation> {
@@ -365,7 +371,10 @@ export class TaskRouteCatalog {
 			const requestHash = canonicalRouteRequestHash(params, route);
 			const existing = catalog.routes.find((candidate) =>
 				candidate.taskId === params.taskId
-				|| candidate.delegationRequestId === params.delegationRequestId,
+				|| (
+					candidate.delegationRequestId === params.delegationRequestId
+					&& candidate.sourceWorkspaceIdentity === params.sourceWorkspaceIdentity
+				),
 			);
 			if (existing !== undefined) {
 				if (
@@ -376,10 +385,11 @@ export class TaskRouteCatalog {
 					|| existing.peerId !== route.peerId
 					|| existing.sourceNodeId !== route.sourceNodeId
 					|| existing.sourcePeerId !== route.sourcePeerId
+					|| existing.sourceWorkspaceIdentity !== params.sourceWorkspaceIdentity
 					|| !sameTarget(existing.target, params.target)
 				) {
 					throw new MeshDomainError(
-						'TASK_ID_CONFLICT',
+						'IDEMPOTENCY_CONFLICT',
 						'Task identifiers are already bound to another authoritative route.',
 					);
 				}
@@ -394,6 +404,9 @@ export class TaskRouteCatalog {
 				requestHash,
 				target: params.target,
 				...route,
+				...(params.sourceWorkspaceIdentity === undefined
+					? {}
+					: { sourceWorkspaceIdentity: params.sourceWorkspaceIdentity }),
 				createdAt: this.now().toISOString(),
 				state: 'ambiguous',
 			});
@@ -452,13 +465,16 @@ export class TaskRouteCatalog {
 		input: RoutedTaskStartParams,
 		route: Pick<
 			TaskRouteRecord,
-			'routeKind' | 'peerId' | 'sourceNodeId' | 'sourcePeerId'
+			'routeKind' | 'peerId' | 'sourceNodeId' | 'sourcePeerId' | 'sourceWorkspaceIdentity'
 		>,
 	): void {
 		const params = routedTaskStartParamsSchema.parse(input);
 		const existing = [...this.routes.values()].find((candidate) =>
 			candidate.taskId === params.taskId
-			|| candidate.delegationRequestId === params.delegationRequestId,
+			|| (
+				candidate.delegationRequestId === params.delegationRequestId
+				&& candidate.sourceWorkspaceIdentity === params.sourceWorkspaceIdentity
+			),
 		);
 		if (
 			existing !== undefined
@@ -470,11 +486,12 @@ export class TaskRouteCatalog {
 				|| existing.peerId !== route.peerId
 				|| existing.sourceNodeId !== route.sourceNodeId
 				|| existing.sourcePeerId !== route.sourcePeerId
+				|| existing.sourceWorkspaceIdentity !== params.sourceWorkspaceIdentity
 				|| !sameTarget(existing.target, params.target)
 			)
 		) {
 			throw new MeshDomainError(
-				'TASK_ID_CONFLICT',
+				'IDEMPOTENCY_CONFLICT',
 				'Task identifiers are already bound to another authoritative route.',
 			);
 		}
@@ -531,7 +548,7 @@ function canonicalRouteRequestHash(
 	input: RoutedTaskStartParams,
 	route: Pick<
 		TaskRouteRecord,
-		'routeKind' | 'peerId' | 'sourceNodeId' | 'sourcePeerId'
+		'routeKind' | 'peerId' | 'sourceNodeId' | 'sourcePeerId' | 'sourceWorkspaceIdentity'
 	>,
 ): string {
 	const fields = [
@@ -540,6 +557,7 @@ function canonicalRouteRequestHash(
 		route.peerId ?? '',
 		route.sourceNodeId ?? '',
 		route.sourcePeerId ?? '',
+		input.sourceWorkspaceIdentity ?? '',
 		input.delegationRequestId,
 		input.taskId,
 		input.target.deviceId,
@@ -547,6 +565,7 @@ function canonicalRouteRequestHash(
 		input.target.nodeInstanceId,
 		input.target.workspaceId,
 		input.sourceNodeId ?? '',
+		String(input.timeoutMinutes ?? ''),
 		input.title,
 		input.prompt,
 		String(input.acceptanceCriteria.length),
@@ -580,6 +599,7 @@ function sameRouteRecord(left: TaskRouteRecord, right: TaskRouteRecord): boolean
 		&& left.peerId === right.peerId
 		&& left.sourceNodeId === right.sourceNodeId
 		&& left.sourcePeerId === right.sourcePeerId
+		&& left.sourceWorkspaceIdentity === right.sourceWorkspaceIdentity
 		&& left.createdAt === right.createdAt
 		&& left.state === right.state
 		&& left.terminalAt === right.terminalAt

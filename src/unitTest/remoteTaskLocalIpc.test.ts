@@ -4,6 +4,7 @@ import { mkdir, rm } from 'node:fs/promises';
 import { test } from 'node:test';
 
 import {
+	GATEWAY_NOTIFICATIONS,
 	MESH_ERROR_CODES,
 	MESH_PROTOCOL_VERSION,
 	type NodeDirectoryResult,
@@ -330,6 +331,27 @@ test('non-owner Window Node multiplexes remote v2 tasks over authenticated local
 		});
 		assert.equal(connection.startCalls, 1);
 		assert.equal(connection.lastStart?.sourceNodeId, undefined);
+		assert.equal(connection.lastStart?.timeoutMinutes, 60);
+		const notified = new Promise<TaskSnapshot>((resolve) => {
+			const registration = node.onTaskSnapshot((snapshot) => {
+				registration.dispose();
+				resolve(snapshot);
+			});
+		});
+		await broker.reconcileRemoteTaskNotification(
+			PEER_ID,
+			GATEWAY_NOTIFICATIONS.taskStateChanged,
+			{ taskId: persisted.taskId },
+		);
+		assert.equal((await notified).state, 'needsInput');
+		const restoredNotification = new Promise<TaskSnapshot>((resolve) => {
+			const registration = node.onTaskSnapshot((snapshot) => {
+				registration.dispose();
+				resolve(snapshot);
+			});
+		});
+		await broker.reconcileRemoteTasks();
+		assert.equal((await restoredNotification).taskId, persisted.taskId);
 
 		const read = await facade.getTask({
 			taskId: persisted.taskId,
@@ -353,7 +375,7 @@ test('non-owner Window Node multiplexes remote v2 tasks over authenticated local
 			}, PEER_ID),
 			(error: unknown) => (
 				error instanceof LocalIpcRemoteError
-				&& error.code === MESH_ERROR_CODES.TASK_ID_CONFLICT
+				&& error.code === MESH_ERROR_CODES.IDEMPOTENCY_CONFLICT
 			),
 		);
 		assert.equal(connection.startCalls, 1);
@@ -595,7 +617,7 @@ test('a post-send remote timeout retains ambiguity and changed retries conflict'
 			node.startRemoteTask({ ...input, prompt: 'Changed retry payload.' }, PEER_ID),
 			(error: unknown) =>
 				error instanceof LocalIpcRemoteError
-				&& error.code === MESH_ERROR_CODES.TASK_ID_CONFLICT,
+				&& error.code === MESH_ERROR_CODES.IDEMPOTENCY_CONFLICT,
 		);
 		assert.equal(connection.startCalls, 1);
 		assert.equal(remoteRoutes(state).length, 1);

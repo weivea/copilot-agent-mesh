@@ -1,17 +1,41 @@
 import type {
 	DelegationAcceptance,
+	DelegationIdentity,
 	DelegationIntentInput,
 	MeshDirectorySnapshot,
 	PersistedDelegationIntent,
 	TaskActionReceipt,
 	TaskToolErrorCode,
 	TaskToolReadResult,
+	TaskToolSnapshot,
 } from '../../shared/toolProtocol';
+
+export interface DelegationTargetDisplay {
+	readonly windowName: string;
+	readonly workspaceName: string;
+}
+
+export interface TaskSnapshotSubscription {
+	dispose(): void;
+}
 
 export interface TaskToolFacade {
 	readonly sourceNodeId?: string;
 
 	listWorkers(signal: AbortSignal): Promise<MeshDirectorySnapshot>;
+
+	identifyDelegation?(intent: DelegationIntentInput): DelegationIdentity;
+
+	describeDelegationTarget?(
+		intent: DelegationIntentInput,
+		signal: AbortSignal,
+	): Promise<DelegationTargetDisplay>;
+
+	subscribeToTask?(
+		taskId: string,
+		listener: (snapshot: TaskToolSnapshot) => void,
+		onError: (error: unknown) => void,
+	): TaskSnapshotSubscription;
 
 	/**
 	 * Resolves only after the intent and both IDs are durable. An exact retry
@@ -20,10 +44,7 @@ export interface TaskToolFacade {
 	 */
 	persistDelegationIntent(intent: DelegationIntentInput): Promise<PersistedDelegationIntent>;
 
-	/**
-	 * Aborting the signal stops only this acknowledgement wait. It must not
-	 * cancel or mutate a task that may already have been accepted by a worker.
-	 */
+	/** @deprecated The P4 delegate path subscribes to authoritative task snapshots. */
 	waitForDelegationAcceptance(
 		request: Pick<PersistedDelegationIntent, 'delegationRequestId' | 'taskId'>,
 		signal: AbortSignal,

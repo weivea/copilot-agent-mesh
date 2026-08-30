@@ -221,11 +221,13 @@ export const routedTaskStartParamsSchema = z.strictObject({
 	taskId: uuidSchema,
 	target: taskTargetSchema,
 	sourceNodeId: uuidSchema.optional(),
+	sourceWorkspaceIdentity: workspaceIdentitySchema.optional(),
 	title: utf8String(PROTOCOL_LIMITS.taskTitleBytes, 'task title', 1),
 	prompt: utf8String(PROTOCOL_LIMITS.taskPromptBytes, 'task prompt', 1),
 	acceptanceCriteria: z.array(
 		utf8String(PROTOCOL_LIMITS.acceptanceCriterionBytes, 'acceptance criterion', 1),
 	).max(PROTOCOL_LIMITS.acceptanceCriteriaCount),
+	timeoutMinutes: z.number().int().min(1).max(60).optional(),
 	workerDeadline: timestampSchema,
 });
 
@@ -433,6 +435,7 @@ export const LOCAL_BROKER_METHODS = {
 
 export const LOCAL_BROKER_NOTIFICATIONS = {
 	policyChanged: 'node.policy.changed',
+	taskSnapshot: 'node.task.snapshot',
 } as const;
 
 /**

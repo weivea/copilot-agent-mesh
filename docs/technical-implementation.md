@@ -24,7 +24,7 @@
 
 Copilot Agent Mesh 可以按“VS Code 扩展 + 本地 Gateway + Microsoft Dev Tunnels + Agent Host/AHP”的方向实现，但必须把以下三项作为首版的技术边界：
 
-1. **Language Model Tool 是一次性请求/响应 API。** 稳定 API 没有持久进度流，也不能在旧的 Copilot Turn 结束后主动追加结果。因此 `mesh_delegate_task` 应立即返回 `pending + taskId`，由 `mesh_get_task` 查询结果，而不是让 Tool 调用等待完整编码任务。[VS Code Tool API](https://code.visualstudio.com/api/extension-guides/ai/tools)
+1. **Language Model Tool 是一次性请求/响应 API，但 Promise 可以长时等待。** 稳定 API 没有持久进度流，也不能在旧 Copilot Turn 结束后主动追加结果；0.4.0 因此让 `mesh_delegate_task` 的同一次调用订阅 Broker 权威状态并等待 completed、needsInput、failed 或 cancelled。正常路径不轮询 `mesh_get_task`；宿主异常中断后仍用保留的 `taskId` 恢复查询。[VS Code Tool API](https://code.visualstudio.com/api/extension-guides/ai/tools)
 2. **Agent Host/AHP 可用，但仍在快速演进。** `code agent host` 已公开文档化，TypeScript AHP Client 已发布；真实 Copilot Provider 发现、认证、Session 创建和恢复仍必须先通过 Phase 0 Spike，并由功能开关保护。[Agent Host](https://code.visualstudio.com/docs/agents/concepts/agent-host) · [AHP TypeScript Client](https://github.com/microsoft/agent-host-protocol/tree/main/clients/typescript)
 3. **Dev Tunnels 仍是 Public Preview。** CLI 命令和 JSON 输出必须按已验证版本解码；Tunnel 只能作为传输通道，不能作为 Mesh 身份认证边界。[Dev Tunnels Overview](https://learn.microsoft.com/en-us/azure/developer/dev-tunnels/overview) · [CLI Reference](https://learn.microsoft.com/en-us/azure/developer/dev-tunnels/cli-commands)
 
@@ -61,33 +61,19 @@ Mesh 只负责选择设备与 Workspace、传递任务、转发 Agent 事件、�
 
 ## 3. 调研后需要修正的 PRD 假设
 
-### 3.1 Tool 结果不能可靠地“完成后自动返回”
+### 3.1 Tool 在同一次调用中等待权威结果
 
 稳定的 `LanguageModelTool.invoke` 只返回一次 `LanguageModelToolResult`，没有稳定的 Tool Progress 流。当前源码中的 Tool Progress 属于 Proposed API，不应成为 Marketplace 扩展依赖。[VS Code API](https://code.visualstudio.com/api/references/vscode-api#LanguageModelTool) · [VS Code Tool 实现](https://github.com/microsoft/vscode/blob/main/src/vs/workbench/api/common/extHostLanguageModelTools.ts)
 
-因此 0.2 / protocol v2 行为定义为：
+0.4.0 行为定义为：
 
-1. `mesh_delegate_task` 创建持久任务并取得 Worker `accepted`。
-2. Coordinator 在发送前先持久化 `DelegationIntent`，包含 `delegationRequestId`、目标 Peer/Workspace 和精确任务语义 Hash。
-3. `task.start` 同时携带 `delegationRequestId` 与 `taskId`；Worker 为两者建立持久映射并保证幂等。
-4. Tool 使用自己的确认计时器与 VS Code `CancellationToken` 竞争，在 10–20 秒应用层确认预算内返回：
-
-   ```json
-   {
-     "status": "pending",
-     "delegationRequestId": "uuid",
-     "taskId": "uuid",
-     "pollTool": "mesh_get_task",
-     "cancelTool": "mesh_cancel_task"
-   }
-   ```
-
-5. 若 Worker 已接受但 Ack 丢失，Coordinator 使用相同 `delegationRequestId` / `taskId` 重发，Worker 返回原任务，不再次启动 Agent。
-6. Tool 被取消后，已持久化的 Delegation 继续由后台协调器对账；相同任务意图的重试优先恢复未确认 Delegation，显式创建重复任务必须再次确认。
-7. 主 Agent 可调用 `mesh_get_task`；用户也可在 Dashboard 查看任务。
-8. 任务完成不能主动写回已结束的旧 Chat Turn。
-
-Phase 0 必须验证 Copilot Agent 在收到上述结构化结果后会合理调用 `mesh_get_task`。若模型行为不稳定，UI 必须明确要求用户继续当前会话并查询任务。
+1. Coordinator 以 `(sourceWorkspaceIdentity, delegationRequestId)` 建立持久映射，并在发送前确定 `taskId` 与精确语义 Hash。
+2. Tool 在 `task.start` 前订阅目标任务的 Broker 权威快照，再启动或对账，因此不会丢失快速终态。
+3. 同一调用等待 completed、needsInput、failed 或 cancelled；结果始终保留 `taskId` 与 `delegationRequestId`，并按分支只返回 result、input、error 或 cancellation reason。
+4. `timeoutMinutes` 默认为 60 且最大为 60，只建立一个预算 Timer。预算到期或 VS Code CancellationToken 触发时精确发送一次取消，并继续等待权威 cancelled 或 failed。
+5. 若 Worker 已接受但 Ack 丢失，使用同一幂等键与完全相同语义重试会恢复原任务，不再次启动 Agent；语义变化返回 `IDEMPOTENCY_CONFLICT`。
+6. `mesh_get_task` 只用于 Tool 宿主异常中断后的恢复或显式追踪其他任务，不是正常路径轮询器。
+7. 任务完成不能主动写回已经结束的旧 Chat Turn；因此调用在等待期间必须保持未完成。
 
 ### 3.2 Agent Host 端口不能通过自定义 `READY:<port>` 文本解析
 
@@ -655,9 +641,9 @@ Coordinator 可以有本地 `created` 状态；Worker 的第一个持久状态�
 ### 9.2 不变量
 
 1. `delegationRequestId` 和 `taskId` 都由 Coordinator 使用 UUID 生成，并在网络发送前持久化。
-2. Worker 幂等键是 `(authenticatedPeerId, delegationRequestId)`；`taskId` 也必须在该 Peer 内唯一。
-3. Request Hash 使用验证后语义字段的规范化 length-prefixed 表示：Peer ID、Delegation ID、Task ID、Workspace ID、Title 原始 UTF-8、Prompt 原始 UTF-8、逐条 Acceptance Criteria 和 Worker Deadline。禁止修改/归一化 Prompt 文本。
-4. 同 Delegation ID、同 Hash 返回原任务；同 ID、不同 Hash 返回 `TASK_ID_CONFLICT`。
+2. Source Broker 幂等键是 `(sourceWorkspaceIdentity, delegationRequestId)`；Worker 边界仍以认证 Peer 约束任务所有权，`taskId` 在该所有者内唯一。
+3. Request Hash 使用验证后语义字段的规范化 length-prefixed 表示：Source Workspace Identity、Delegation ID、Task ID、精确 Target、Title 原始 UTF-8、Prompt 原始 UTF-8、逐条 Acceptance Criteria 和 Worker Deadline。禁止修改/归一化 Prompt 文本。
+4. 同幂等键、同 Hash 返回原任务；同键、不同语义返回 `IDEMPOTENCY_CONFLICT`。真正的 Task ID 所有权碰撞仍返回 `TASK_ID_CONFLICT`。
 5. `task.get`、`cancel`、`answer` 必须验证任务所有权；其他 Peer 统一看到 `TASK_NOT_FOUND`。
 6. 返回 `accepted` 前必须获得 Workspace Lease。
 7. 一个 Workspace 同时最多一个非终态任务；0.2 不排队，直接返回 `WORKSPACE_BUSY`。
@@ -883,16 +869,16 @@ Manifest 与 Runtime Registration 必须一一相等，并通过 Cold Extension 
 | Tool | Side effect | Confirmation | Deadline |
 | --- | --- | --- | ---: |
 | list | 无 | 无 | 5 秒 |
-| delegate | 创建远程 Agent Task | 必须 | 15 秒内返回 accepted/pending |
+| delegate | 创建或对账一个 Agent Task，并等待权威结果 | 必须 | 默认及最大 60 分钟 |
 | get | 无 | 无 | 10 秒 |
 | cancel | 请求终止远程 Task | 必须 | 10 秒 |
 | answer | 将用户回答发送到远端 Task | 必须 | 10 秒 |
 
 `prepareInvocation` 必须无副作用，因为它可能执行后不调用 `invoke`。确认文案显示目标设备、Workspace 和任务摘要，不显示本地路径或 Secret。
 
-表中的 Deadline 是 Mesh 自己的应用层 Timer，不是 VS Code 提供的 Tool Timeout。每个 Tool 都将 Transport Ack、Timer 和 `CancellationToken` 竞争；Promise 结束后，已接受的 Worker Task 与该 Promise 解耦。
+表中的 Deadline 是 Mesh 自己的应用层 Timer，不是 VS Code 提供的 Tool Timeout。Delegate 只有一个预算 Timer；预算或 `CancellationToken` 触发后发送一次精确取消，并继续等待 Broker 的权威 cancelled 或 failed 状态。所有退出分支释放 Timer、任务订阅与 Token 注册。
 
-Delegate 在发送前保存 `DelegationIntent`。若“Worker 已接受、响应丢失”，后台协调器用同一 `delegationRequestId` 重试并恢复原 `taskId`；测试必须覆盖 Tool 被取消后重试不启动第二个 Agent。
+Delegate 在发送前保存 `DelegationIntent`。若“Worker 已接受、响应丢失”，后台协调器用同一 source Workspace 身份、`delegationRequestId` 和语义重试并恢复原 `taskId`；测试必须覆盖 Broker takeover 与 Tool 取消后重试不启动第二个 Agent。
 
 ### 12.3 Result
 
@@ -1078,6 +1064,20 @@ Mesh 业务错误使用稳定正整数：
 1022 TUNNEL_ACCESS_EXPIRED
 1023 TASK_CANCELLATION_UNCONFIRMED
 1024 DELEGATION_NOT_FOUND
+1025 PEER_NOT_ALLOWED
+1026 PEER_NOT_ACCEPTING
+1027 PEER_OFFLINE
+1028 PEER_MULTI_WORKSPACE
+1029 ARTIFACT_NOT_FOUND
+1030 ARTIFACT_FORBIDDEN
+1031 ARTIFACT_INVALID
+1032 ARTIFACT_CORRUPT
+1033 ARTIFACT_LIMIT_EXCEEDED
+1034 WINDOW_NAME_CONFLICT
+1035 POLICY_FORBIDDEN
+1036 DELEGATION_RECURSION
+1037 WINDOW_NAME_INVALID
+1038 IDEMPOTENCY_CONFLICT
 ```
 
 `message` 必须可安全显示；`data.reason` 是稳定 Machine Code。远端 Error 不包含本地路径、Secret、Token、原始 Agent Host Stack 或 Process Command Line。

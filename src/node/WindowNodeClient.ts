@@ -237,6 +237,7 @@ export class WindowNodeClient implements WorkspaceResolver {
 	private rejectFirstConnection: ((error: Error) => void) | undefined;
 	private reconnectAttempt = 0;
 	private readonly stateListeners = new Set<() => void>();
+	private readonly taskSnapshotListeners = new Set<(snapshot: TaskSnapshot) => void>();
 	private stateValue: WindowNodeClientState = 'idle';
 	private registered = false;
 	private started = false;
@@ -298,6 +299,11 @@ export class WindowNodeClient implements WorkspaceResolver {
 	public onDidChange(listener: () => void): { dispose(): void } {
 		this.stateListeners.add(listener);
 		return { dispose: () => this.stateListeners.delete(listener) };
+	}
+
+	public onTaskSnapshot(listener: (snapshot: TaskSnapshot) => void): { dispose(): void } {
+		this.taskSnapshotListeners.add(listener);
+		return { dispose: () => this.taskSnapshotListeners.delete(listener) };
 	}
 
 	public start(): Promise<void> {
@@ -828,6 +834,13 @@ export class WindowNodeClient implements WorkspaceResolver {
 					z.strictObject({}).parse(params);
 					this.changed();
 					return null;
+				case LOCAL_BROKER_NOTIFICATIONS.taskSnapshot: {
+					const snapshot = taskSnapshotSchema.parse(params);
+					for (const listener of [...this.taskSnapshotListeners]) {
+						listener(snapshot);
+					}
+					return null;
+				}
 				case LOCAL_BROKER_METHODS.taskStart: {
 					const input = nodeTaskStartParamsSchema.parse(params);
 					this.assertTaskTarget(input.target.nodeId, input.target.nodeInstanceId);
@@ -1281,6 +1294,7 @@ export class WindowNodeClient implements WorkspaceResolver {
 			this.rejectFirstConnection = undefined;
 		}
 		this.stateListeners.clear();
+		this.taskSnapshotListeners.clear();
 		if (failures.length > 0) {
 			throw new AggregateError(failures, 'Window Node client cleanup failed.');
 		}

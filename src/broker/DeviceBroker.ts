@@ -2,6 +2,7 @@ import { z } from 'zod';
 
 import {
 	MESH_ERROR_CODES,
+	GATEWAY_NOTIFICATIONS,
 	brokerRemoteListResultSchema,
 	brokerRemoteTaskAnswerParamsSchema,
 	brokerRemoteTaskCancelParamsSchema,
@@ -254,12 +255,108 @@ export class DeviceBroker {
 			if (session.closed || this.registrations.get(session) === undefined) {
 				continue;
 			}
+
 			void session.notify(LOCAL_BROKER_NOTIFICATIONS.policyChanged, {}).catch(
 				(error: unknown) => this.options.onError?.(
 					error instanceof Error
 						? error
 						: new Error('A peer policy notification failed.'),
 				),
+			);
+		}
+	}
+
+	public publishTaskSnapshot(snapshot: TaskSnapshot, sourceNodeId?: string): void {
+		const source = sourceNodeId;
+		if (source === undefined) {
+			return;
+		}
+		for (const session of [...this.sessions]) {
+			const binding = this.registrations.get(session);
+			if (session.closed || binding?.nodeId !== source) {
+				continue;
+			}
+			void session.notify(
+				LOCAL_BROKER_NOTIFICATIONS.taskSnapshot,
+				toJsonValue(snapshot),
+			).catch((error: unknown) => this.options.onError?.(
+				error instanceof Error
+					? error
+					: new Error('A task snapshot notification failed.'),
+			));
+		}
+	}
+
+	public async reconcileRemoteTaskNotification(
+		profileId: string,
+		method: string,
+		params: Record<string, unknown>,
+	): Promise<void> {
+		if (
+			method !== GATEWAY_NOTIFICATIONS.taskStateChanged
+			&& method !== GATEWAY_NOTIFICATIONS.taskInputRequired
+			&& method !== GATEWAY_NOTIFICATIONS.taskCompleted
+		) {
+			return;
+		}
+		const peerId = uuidSchema.parse(profileId);
+		const taskId = uuidSchema.parse(params.taskId);
+		const route = this.taskRoutes.get(taskId);
+		if (
+			route === undefined
+			|| route.routeKind !== 'remote'
+			|| route.peerId !== peerId
+			|| route.sourceNodeId === undefined
+		) {
+			return;
+		}
+		const snapshot = await this.requireRemoteTaskService().getTask(
+			taskId,
+			undefined,
+			new AbortController().signal,
+		);
+		if (snapshot === undefined || 'afterEventSeq' in snapshot) {
+			throw new MeshDomainError(
+				'TASK_NOT_FOUND',
+				'The notified remote task has no authoritative snapshot.',
+			);
+		}
+		await this.taskRoutes.markSnapshot(snapshot);
+		this.publishTaskSnapshot(snapshot, route.sourceNodeId);
+	}
+
+	public async reconcileRemoteTasks(): Promise<void> {
+		const failures: unknown[] = [];
+		for (const route of this.taskRoutes.list()) {
+			if (
+				route.routeKind !== 'remote'
+				|| route.sourceNodeId === undefined
+				|| route.state === 'completed'
+				|| route.state === 'failed'
+				|| route.state === 'cancelled'
+				|| route.state === 'timedOut'
+			) {
+				continue;
+			}
+			try {
+				const snapshot = await this.requireRemoteTaskService().getTask(
+					route.taskId,
+					undefined,
+					new AbortController().signal,
+				);
+				if (snapshot === undefined || 'afterEventSeq' in snapshot) {
+					continue;
+				}
+				await this.taskRoutes.markSnapshot(snapshot);
+				this.publishTaskSnapshot(snapshot, route.sourceNodeId);
+			} catch (error: unknown) {
+				failures.push(error);
+			}
+		}
+		if (failures.length > 0) {
+			throw new AggregateError(
+				failures,
+				'One or more retained remote tasks could not be reconciled.',
 			);
 		}
 	}
@@ -424,9 +521,11 @@ export class DeviceBroker {
 					taskId: input.taskId,
 					target: input.target,
 					sourceNodeId: input.sourceNodeId,
+					sourceWorkspaceIdentity: input.sourceWorkspaceIdentity,
 					title: input.title,
 					prompt: input.prompt,
 					acceptanceCriteria: input.acceptanceCriteria,
+					timeoutMinutes: input.timeoutMinutes,
 					workerDeadline: input.workerDeadline,
 				};
 				const { sourceNodeId: _sourceNodeId, ...remoteInput } = routeInput;

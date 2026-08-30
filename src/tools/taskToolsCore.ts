@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 
 import {
 	DelegationIntentInput,
+	DelegationIdentity,
 	MeshDirectorySnapshot,
 	PersistedDelegationIntent,
 	TASK_TOOL_DEADLINES_MS,
@@ -18,17 +19,17 @@ import {
 	TaskValidationSummary,
 } from '../../shared/toolProtocol';
 import { TASK_STATUSES, TaskStatus } from '../../shared/protocol';
+import { redactRemoteText } from '../ui/DashboardRedaction';
+import {
+	DelegationWaiter,
+	type DelegationOutcome,
+	type ToolCancellation,
+	type ToolClock,
+} from './DelegationWaiter';
 import { TaskToolFacade, TaskToolFacadeError } from './taskToolFacade';
 import { MESH_TOOL_NAMES } from './toolManifest';
 
-export interface ToolCancellation {
-	readonly isCancellationRequested: boolean;
-	onCancellationRequested(listener: () => void): { dispose(): void };
-}
-
-export interface ToolClock {
-	createTimer(delayMs: number): ToolDeadlineTimer;
-}
+export type { ToolCancellation, ToolClock } from './DelegationWaiter';
 
 export interface ToolDeadlineTimer {
 	readonly promise: Promise<void>;
@@ -139,6 +140,7 @@ const safeErrorMessages: Readonly<Record<TaskToolErrorCode, string>> = {
 	WORKSPACE_BUSY: 'The selected workspace is busy.',
 	TASK_NOT_FOUND: 'The task was not found.',
 	TASK_ID_CONFLICT: 'The task identifiers conflict with a different delegation.',
+	IDEMPOTENCY_CONFLICT: 'The delegation request ID is already bound to different task semantics.',
 	TASK_NOT_CANCELLABLE: 'The task is not cancellable in its current state.',
 	INPUT_NOT_PENDING: 'The requested task input is no longer pending.',
 	AGENT_UNAVAILABLE: 'The remote coding agent is unavailable.',
@@ -187,20 +189,38 @@ export class TaskToolsCore {
 		}
 	}
 
-	prepareDelegateInvocation(rawInput: unknown): DelegateInvocationPreparation {
+	async prepareDelegateInvocation(
+		rawInput: unknown,
+		cancellation: ToolCancellation = neverCancelled,
+	): Promise<DelegateInvocationPreparation> {
 		const input = parseDelegateTaskInput(rawInput);
-		const source = this.facade.sourceNodeId === undefined
-			? 'This Window'
-			: `This Window (${this.facade.sourceNodeId})`;
+		const displayOutcome = await this.runBounded(
+			(signal) => {
+				if (this.facade.describeDelegationTarget === undefined) {
+					throw new TaskToolFacadeError('OUTPUT_INVALID');
+				}
+				return this.facade.describeDelegationTarget(input, signal);
+			},
+			TASK_TOOL_DEADLINES_MS.listWorkers,
+			cancellation,
+		);
+		if (displayOutcome.kind !== 'success') {
+			throw new Error('The selected delegation target is unavailable.');
+		}
+		const windowName = safeDelegationText(displayOutcome.value.windowName, 256);
+		const workspaceName = safeDelegationText(displayOutcome.value.workspaceName, 256);
+		const summary = safeDelegationText(input.title, TASK_TOOL_LIMITS.titleBytes);
 		return {
-			invocationMessage: `Waiting up to ${TASK_TOOL_DEADLINES_MS.delegateTask / 1_000}s for durable broker acceptance`,
-			confirmationTitle: 'Delegate this task to a mesh worker?',
+			invocationMessage: `Delegating to “${windowName}”…`,
+			confirmationTitle: `Delegate to “${windowName}”`,
 			confirmationMessage: [
-				`Source: ${source}`,
-				`Target node: ${input.nodeId} (${input.nodeInstanceId})`,
-				`Workspace: ${input.workspaceId}`,
-				`Title: ${input.title}`,
-				`Prompt:\n${input.prompt}`,
+				`Target window: ${windowName}`,
+				`Workspace: ${workspaceName}`,
+				`Task: ${summary}`,
+				'This Continue authorizes starting one task only.',
+				'P4 does not auto-approve operations; existing terminal and file confirmations remain in effect.',
+				'Never auto-approved: network authentication, cross-Workspace writes, secret access, or external publishing.',
+				'The task may run for at most 60 minutes.',
 			].join('\n'),
 		};
 	}
@@ -257,77 +277,134 @@ export class TaskToolsCore {
 		rawInput: unknown,
 		cancellation: ToolCancellation = neverCancelled,
 	): Promise<ToolJsonResult> {
-		let input: DelegationIntentInput & { readonly delegationRequestId: string };
+		let input: DelegationIntentInput & {
+			readonly delegationRequestId: string;
+			readonly timeoutMinutes: number;
+		};
 		try {
 			const parsed = parseDelegateTaskInput(rawInput);
 			input = {
 				...parsed,
 				delegationRequestId: parsed.delegationRequestId ?? this.id(),
+				timeoutMinutes: parsed.timeoutMinutes
+					?? TASK_TOOL_LIMITS.defaultTimeoutMinutes,
 			};
 		} catch {
 			return this.errorResult('INVALID_INPUT');
 		}
 
-		if (cancellation.isCancellationRequested) {
-			return this.cancelledResult();
+		let identity: DelegationIdentity;
+		try {
+			if (this.facade.identifyDelegation === undefined) {
+				throw new TaskToolFacadeError('OUTPUT_INVALID');
+			}
+			identity = this.facade.identifyDelegation(input);
+			input = {
+				...input,
+				sourceWorkspaceIdentity: identity.sourceWorkspaceIdentity,
+			};
+		} catch (error: unknown) {
+			return this.errorFromUnknown(error);
 		}
-
-		let persisted: PersistedDelegationIntent | undefined;
-		const durablePersistence = Promise.resolve()
-			.then(() => this.facade.persistDelegationIntent(input))
-			.then((value) => {
-				try {
-					return parsePersistedIntent(value);
-				} catch {
+		const timeoutMinutes = input.timeoutMinutes;
+		const waiter = new DelegationWaiter({
+			taskId: identity.taskId,
+			timeoutMinutes,
+			cancellation,
+			clock: this.clock,
+			subscribe: (listener, onError) => {
+				if (this.facade.subscribeToTask === undefined) {
 					throw new TaskToolFacadeError('OUTPUT_INVALID');
 				}
-			});
-		const outcome = await this.runBounded(
-			async (signal) => {
-				persisted = await durablePersistence;
-				if (signal.aborted) {
-					throw new TaskToolFacadeError('CANCELLED', true);
-				}
-				return this.facade.waitForDelegationAcceptance({
-					delegationRequestId: persisted.delegationRequestId,
-					taskId: persisted.taskId,
-				}, signal);
+				return this.facade.subscribeToTask(identity.taskId, listener, onError);
 			},
-			TASK_TOOL_DEADLINES_MS.delegateTask,
-			cancellation,
-		);
-
-		if (outcome.kind === 'success') {
-			if (persisted === undefined) {
-				return this.errorResult('INTERNAL_ERROR');
-			}
-			try {
-				parseDelegationAcceptance(outcome.value);
-			} catch {
-				return this.delegateFailureResult(persisted, 'OUTPUT_INVALID');
-			}
-			return this.fitResult({
-				status: 'pending',
-				delegationRequestId: persisted.delegationRequestId,
-				taskId: persisted.taskId,
-				recovered: persisted.recovered,
-				pollTool: MESH_TOOL_NAMES.getTask,
-				cancelTool: MESH_TOOL_NAMES.cancelTask,
-			});
-		}
-		if (outcome.kind === 'cancelled' || outcome.kind === 'timeout') {
-			if (persisted === undefined) {
-				return this.delegatePersistencePendingResult(
-					outcome.kind,
-					input.delegationRequestId,
+			start: async (onTaskAvailable) => {
+				const persisted = parsePersistedIntent(
+					await this.facade.persistDelegationIntent(input),
 				);
-			}
-			return this.delegateWaitResult(outcome.kind, persisted);
+				if (
+					persisted.taskId !== identity.taskId
+					|| persisted.delegationRequestId !== identity.delegationRequestId
+				) {
+					throw new TaskToolFacadeError('OUTPUT_INVALID');
+				}
+				onTaskAvailable();
+				const read = await this.facade.getTask(
+					{ taskId: identity.taskId, maxEvents: 1 },
+					new AbortController().signal,
+				);
+				return parseTaskReadResult(read, 1).snapshot;
+			},
+			cancel: async () => {
+				try {
+					const receipt = await this.facade.cancelOwnedTask(
+						{ taskId: identity.taskId },
+						new AbortController().signal,
+					);
+					if (receipt.taskId !== identity.taskId) {
+						throw new TaskToolFacadeError('OUTPUT_INVALID');
+					}
+				} catch (error: unknown) {
+					if (
+						!(error instanceof TaskToolFacadeError)
+						|| error.code !== 'TASK_NOT_CANCELLABLE'
+					) {
+						throw error;
+					}
+				}
+				const read = await this.facade.getTask(
+					{ taskId: identity.taskId, maxEvents: 1 },
+					new AbortController().signal,
+				);
+				return parseTaskReadResult(read, 1).snapshot;
+			},
+			sanitizeText: (value) => safeDelegationText(
+				value,
+				TASK_TOOL_LIMITS.errorMessageBytes,
+			),
+		});
+		return this.fitResult(this.compactDelegationOutcome(
+			await waiter.wait(),
+			identity.delegationRequestId,
+		));
+	}
+
+	private compactDelegationOutcome(
+		outcome: DelegationOutcome,
+		delegationRequestId: string,
+	): ToolJsonResult {
+		switch (outcome.kind) {
+			case 'completed':
+				return {
+					s: 0,
+					t: outcome.taskId,
+					d: delegationRequestId,
+					r: outcome.result,
+				};
+			case 'needsInput':
+				return {
+					s: 1,
+					t: outcome.taskId,
+					d: delegationRequestId,
+					i: outcome.inputId,
+					q: safeDelegationText(outcome.question, TASK_TOOL_LIMITS.errorMessageBytes),
+				};
+			case 'failed':
+				return {
+					s: 2,
+					t: outcome.taskId,
+					d: delegationRequestId,
+					e: normalizeErrorCode(outcome.code),
+				};
+			case 'cancelled':
+				return {
+					s: 3,
+					t: outcome.taskId,
+					d: delegationRequestId,
+					e: outcome.code,
+					x: outcome.reason,
+				};
 		}
-		if (persisted === undefined) {
-			return this.errorFromUnknown(outcome.error);
-		}
-		return this.delegateFailureFromUnknown(persisted, outcome.error);
 	}
 
 	async getTask(
@@ -493,78 +570,11 @@ export class TaskToolsCore {
 		});
 	}
 
-	private delegateWaitResult(
-		status: 'cancelled' | 'timeout',
-		persisted: PersistedDelegationIntent,
-	): ToolJsonResult {
-		const code = status === 'cancelled' ? 'CANCELLED' : 'TIMEOUT';
-		return this.fitResult({
-			status,
-			delegationRequestId: persisted.delegationRequestId,
-			taskId: persisted.taskId,
-			recovered: persisted.recovered,
-			pollTool: MESH_TOOL_NAMES.getTask,
-			cancelTool: MESH_TOOL_NAMES.cancelTask,
-			error: {
-				code,
-				message: status === 'cancelled'
-					? 'The current acknowledgement wait was cancelled; the durable delegation remains available for polling or explicit cancellation.'
-					: 'Worker acceptance was not confirmed before the application deadline; the durable delegation remains available for polling or explicit cancellation.',
-				retryable: true,
-			},
-		});
-	}
-
-	private delegatePersistencePendingResult(
-		waitStatus: 'cancelled' | 'timeout',
-		delegationRequestId: string,
-	): ToolJsonResult {
-		return this.fitResult({
-			status: 'pending',
-			phase: 'persisting',
-			delegationRequestId,
-			waitStatus,
-			reconciliationPending: true,
-			retrySameIntent: true,
-			retryTool: MESH_TOOL_NAMES.delegateTask,
-		});
-	}
-
 	private errorFromUnknown(error: unknown): ToolJsonResult {
 		if (error instanceof TaskToolFacadeError && TASK_TOOL_ERROR_CODES.includes(error.code)) {
 			return this.errorResult(error.code, error.retryable);
 		}
 		return this.errorResult('INTERNAL_ERROR');
-	}
-
-	private delegateFailureFromUnknown(
-		persisted: PersistedDelegationIntent,
-		error: unknown,
-	): ToolJsonResult {
-		if (error instanceof TaskToolFacadeError && TASK_TOOL_ERROR_CODES.includes(error.code)) {
-			return this.delegateFailureResult(persisted, error.code, error.retryable);
-		}
-		return this.delegateFailureResult(persisted, 'INTERNAL_ERROR');
-	}
-
-	private delegateFailureResult(
-		persisted: PersistedDelegationIntent,
-		code: TaskToolErrorCode,
-		retryable = false,
-	): ToolJsonResult {
-		return this.fitResult({
-			status: 'error',
-			delegationRequestId: persisted.delegationRequestId,
-			taskId: persisted.taskId,
-			recovered: persisted.recovered,
-			pollTool: MESH_TOOL_NAMES.getTask,
-			cancelTool: MESH_TOOL_NAMES.cancelTask,
-			error: {
-				code,
-				message: safeErrorMessages[code],
-				retryable,
-			},
-		});
 	}
 
 	private errorResult(code: TaskToolErrorCode, retryable = false): ToolJsonResult {
@@ -700,29 +710,106 @@ export class TaskToolsCore {
 		} = {
 			status: 'ok',
 			snapshot: {
-				...read.snapshot,
+				taskId: read.snapshot.taskId,
+				status: read.snapshot.status,
+				title: safeDelegationText(read.snapshot.title, TASK_TOOL_LIMITS.titleBytes),
+				updatedAt: read.snapshot.updatedAt,
+				...(read.snapshot.phase === undefined
+					? {}
+					: {
+						phase: safeDelegationText(
+							read.snapshot.phase,
+							TASK_TOOL_LIMITS.errorMessageBytes,
+						),
+					}),
+				...(read.snapshot.summary === undefined
+					? {}
+					: {
+						summary: safeDelegationText(
+							read.snapshot.summary,
+							TASK_TOOL_LIMITS.errorMessageBytes,
+						),
+					}),
 				...(read.snapshot.validation === undefined
 					? {}
-					: { validation: { ...read.snapshot.validation } }),
+					: {
+						validation: {
+							status: read.snapshot.validation.status,
+							...(read.snapshot.validation.summary === undefined
+								? {}
+								: {
+									summary: safeDelegationText(
+										read.snapshot.validation.summary,
+										TASK_TOOL_LIMITS.errorMessageBytes,
+									),
+								}),
+						},
+					}),
 				...(read.snapshot.artifacts === undefined
 					? {}
-					: { artifacts: read.snapshot.artifacts.map((artifact) => ({ ...artifact })) }),
+					: {
+						artifacts: read.snapshot.artifacts.map((artifact) => ({
+							artifactId: artifact.artifactId,
+							label: safeDelegationText(
+								artifact.label,
+								TASK_TOOL_LIMITS.errorMessageBytes,
+							),
+							...(artifact.mediaType === undefined
+								? {}
+								: {
+									mediaType: safeDelegationText(
+										artifact.mediaType,
+										TASK_TOOL_LIMITS.errorMessageBytes,
+									),
+								}),
+						})),
+					}),
 				...(read.snapshot.pendingInput === undefined
 					? {}
 					: {
 						pendingInput: {
-							...read.snapshot.pendingInput,
+							inputId: read.snapshot.pendingInput.inputId,
+							prompt: safeDelegationText(
+								read.snapshot.pendingInput.prompt,
+								TASK_TOOL_LIMITS.errorMessageBytes,
+							),
 							...(read.snapshot.pendingInput.choices === undefined
 								? {}
-								: { choices: [...read.snapshot.pendingInput.choices] }),
+								: {
+									choices: read.snapshot.pendingInput.choices.map((choice) =>
+										safeDelegationText(
+											choice,
+											TASK_TOOL_LIMITS.errorMessageBytes,
+										)),
+								}),
 						},
 					}),
 				...(read.snapshot.failure === undefined
 					? {}
-					: { failure: { ...read.snapshot.failure } }),
+					: {
+						failure: {
+							code: safeDelegationText(
+								read.snapshot.failure.code,
+								TASK_TOOL_LIMITS.errorMessageBytes,
+							),
+							message: safeDelegationText(
+								read.snapshot.failure.message,
+								TASK_TOOL_LIMITS.errorMessageBytes,
+							),
+							retryable: read.snapshot.failure.retryable,
+						},
+					}),
 			},
 			eventCursor: read.eventCursor,
-			events: read.events.map((event) => ({ ...event })),
+			events: read.events.map((event) => ({
+				sequence: event.sequence,
+				type: safeDelegationText(event.type, TASK_TOOL_LIMITS.errorMessageBytes),
+				at: event.at,
+				summary: safeDelegationText(
+					event.summary,
+					TASK_TOOL_LIMITS.errorMessageBytes,
+				),
+			})),
 			...(read.eventGap === undefined ? {} : { eventGap: { ...read.eventGap } }),
 			...(read.snapshot.status === 'needsInput' ? { answerTool: MESH_TOOL_NAMES.answerTask } : {}),
 			truncated: read.truncated,
@@ -934,7 +1021,12 @@ export function parseDelegateTaskInput(value: unknown): DelegationIntentInput {
 		);
 	const timeoutMinutes = input.timeoutMinutes === undefined
 		? undefined
-		: expectInteger(input.timeoutMinutes, 'timeoutMinutes', 1, 1_440);
+		: expectInteger(
+			input.timeoutMinutes,
+			'timeoutMinutes',
+			1,
+			TASK_TOOL_LIMITS.maxTimeoutMinutes,
+		);
 	return {
 		...(delegationRequestId === undefined ? {} : { delegationRequestId }),
 		deviceId,
@@ -997,7 +1089,7 @@ export async function serializeToolResultToTokenBudget(
 		const smaller = shrinkToolResult(candidate);
 		if (smaller === undefined) {
 			if (isCompactDelegationResult(candidate)) {
-				return '';
+				return serialized;
 			}
 			for (const fallback of [
 				'{"status":"error","error":{"code":"OUTPUT_TOO_LARGE"}}',
@@ -1015,7 +1107,7 @@ export async function serializeToolResultToTokenBudget(
 		const smallerSerialized = JSON.stringify(smaller);
 		if (smallerSerialized === serialized) {
 			if (isCompactDelegationResult(candidate)) {
-				return '';
+				return serialized;
 			}
 			for (const fallback of [
 				'{"status":"error","error":{"code":"OUTPUT_TOO_LARGE"}}',
@@ -1806,6 +1898,27 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+function safeDelegationText(value: string, maxBytes: number): string {
+	const redacted = redactRemoteText(value);
+	if (Buffer.byteLength(redacted, 'utf8') <= maxBytes) {
+		return redacted;
+	}
+	let result = '';
+	for (const character of redacted) {
+		if (Buffer.byteLength(result + character, 'utf8') > maxBytes) {
+			break;
+		}
+		result += character;
+	}
+	return result;
+}
+
+function normalizeErrorCode(code: string): TaskToolErrorCode {
+	return (TASK_TOOL_ERROR_CODES as readonly string[]).includes(code)
+		? code as TaskToolErrorCode
+		: 'TASK_EXECUTION_FAILED';
+}
+
 function isCompactDelegationResult(value: ToolJsonResult): boolean {
 	return typeof value.s === 'number'
 		&& value.s >= 0
@@ -1814,7 +1927,7 @@ function isCompactDelegationResult(value: ToolJsonResult): boolean {
 
 function compactDelegationResult(value: ToolJsonResult): ToolJsonResult | undefined {
 	if (isCompactDelegationResult(value)) {
-		return undefined;
+		return shrinkCompactDelegationResult(value);
 	}
 	if (
 		value.status === 'pending'
@@ -1835,6 +1948,49 @@ function compactDelegationResult(value: ToolJsonResult): ToolJsonResult | undefi
 		|| typeof value.delegationRequestId !== 'string'
 	) {
 		return undefined;
+	}
+
+	function shrinkCompactDelegationResult(value: ToolJsonResult): ToolJsonResult | undefined {
+		if (value.s === 0 && isRecord(value.r)) {
+			const result = value.r;
+			if (Array.isArray(result.artifacts) && result.artifacts.length > 0) {
+				return { ...value, r: { ...result, artifacts: result.artifacts.slice(0, -1) } };
+			}
+			if (result.artifacts !== undefined) {
+				const { artifacts: _artifacts, ...withoutArtifacts } = result;
+				return { ...value, r: withoutArtifacts };
+			}
+			if (result.validation !== undefined) {
+				const { validation: _validation, ...withoutValidation } = result;
+				return { ...value, r: withoutValidation };
+			}
+			if (typeof result.summary === 'string' && result.summary.length > 1) {
+				return {
+					...value,
+					r: { summary: halveUtf8(result.summary, 1) },
+				};
+			}
+			return compactDelegationOutputFailure(value);
+		}
+		if (value.s === 1 && typeof value.q === 'string' && value.q.length > 1) {
+			return { ...value, q: halveUtf8(value.q, 1) };
+		}
+		if (value.s === 1) {
+			return compactDelegationOutputFailure(value);
+		}
+		return undefined;
+	}
+
+	function compactDelegationOutputFailure(value: ToolJsonResult): ToolJsonResult | undefined {
+		if (typeof value.t !== 'string' || typeof value.d !== 'string') {
+			return undefined;
+		}
+		return {
+			s: 2,
+			t: value.t,
+			d: value.d,
+			e: 'OUTPUT_TOO_LARGE',
+		};
 	}
 	if (value.status === 'pending') {
 		return {

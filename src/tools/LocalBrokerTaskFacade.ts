@@ -5,6 +5,7 @@ import {
 	PROTOCOL_LIMITS,
 	utf8String,
 	uuidSchema,
+	workspaceIdentitySchema,
 	type NodeDirectoryResult,
 	type RoutedTaskStartParams,
 	type TaskSnapshot,
@@ -12,7 +13,9 @@ import {
 } from '../../shared/protocol';
 import {
 	TASK_TOOL_ERROR_CODES,
+	TASK_TOOL_LIMITS,
 	type DelegationAcceptance,
+	type DelegationIdentity,
 	type DelegationIntentInput,
 	type MeshDeviceToolSummary,
 	type MeshDirectorySnapshot,
@@ -21,12 +24,15 @@ import {
 	type TaskActionReceipt,
 	type TaskToolErrorCode,
 	type TaskToolReadResult,
+	type TaskToolSnapshot,
 } from '../../shared/toolProtocol';
 import { LocalIpcRemoteError } from '../ipc';
 import type { WindowNodeClient } from '../node/WindowNodeClient';
 import {
 	TaskToolFacadeError,
+	type DelegationTargetDisplay,
 	type TaskToolFacade,
+	type TaskSnapshotSubscription,
 } from './taskToolFacade';
 
 type WindowNodeFacadeClient = Pick<
@@ -40,7 +46,11 @@ type WindowNodeFacadeClient = Pick<
 	| 'getTask'
 	| 'cancelTask'
 	| 'answerTask'
->;
+> & {
+	readonly onTaskSnapshot?: WindowNodeClient['onTaskSnapshot'];
+	readonly onDidChange?: WindowNodeClient['onDidChange'];
+	readonly snapshot?: () => { readonly registered: boolean };
+};
 
 export interface RemoteTaskRouteAdapter {
 	listDevices(signal: AbortSignal): Promise<MeshRemoteDirectorySnapshot>;
@@ -76,6 +86,7 @@ export interface LocalBrokerTaskFacadeOptions {
 	readonly deviceName: string | (() => string);
 	readonly remoteAdapter?: RemoteTaskRouteAdapter;
 	readonly now?: () => Date;
+	readonly sourceWorkspaceIdentity?: () => string;
 }
 
 export class LocalBrokerTaskFacade implements TaskToolFacade {
@@ -118,6 +129,7 @@ export class LocalBrokerTaskFacade implements TaskToolFacade {
 			)) {
 				throw new TaskToolFacadeError('OUTPUT_INVALID');
 			}
+
 			return {
 				devices: [
 					{
@@ -153,6 +165,116 @@ export class LocalBrokerTaskFacade implements TaskToolFacade {
 		}
 	}
 
+	public identifyDelegation(intent: DelegationIntentInput): DelegationIdentity {
+		if (intent.delegationRequestId === undefined) {
+			throw new TaskToolFacadeError('INVALID_INPUT');
+		}
+		const sourceWorkspaceIdentity = workspaceIdentitySchema.parse(
+			intent.sourceWorkspaceIdentity
+				?? this.options.sourceWorkspaceIdentity?.()
+				?? fallbackSourceWorkspaceIdentity(this.sourceNodeId),
+		);
+		const delegationRequestId = uuidSchema.parse(intent.delegationRequestId);
+		const hasAuthenticatedSource = intent.sourceWorkspaceIdentity !== undefined
+			|| this.options.sourceWorkspaceIdentity !== undefined;
+		return {
+			delegationRequestId,
+			sourceWorkspaceIdentity,
+			taskId: deterministicTaskId(
+				delegationRequestId,
+				hasAuthenticatedSource ? sourceWorkspaceIdentity : undefined,
+			),
+		};
+	}
+
+	public async describeDelegationTarget(
+		intent: DelegationIntentInput,
+		signal: AbortSignal,
+	): Promise<DelegationTargetDisplay> {
+		const directory = await this.listWorkers(signal);
+		const device = directory.devices.find(({ deviceId }) => deviceId === intent.deviceId);
+		const node = device?.nodes.find(({ nodeId, nodeInstanceId }) =>
+			nodeId === intent.nodeId && nodeInstanceId === intent.nodeInstanceId,
+		);
+		const workspace = node?.workspaces.find(({ workspaceId }) =>
+			workspaceId === intent.workspaceId,
+		);
+		if (node === undefined || workspace === undefined) {
+			throw new TaskToolFacadeError('WORKSPACE_NOT_FOUND');
+		}
+		return {
+			windowName: node.label,
+			workspaceName: workspace.name,
+		};
+	}
+
+	public subscribeToTask(
+		taskId: string,
+		listener: (snapshot: TaskToolSnapshot) => void,
+		onError: (error: unknown) => void,
+	): TaskSnapshotSubscription {
+		const parsedTaskId = uuidSchema.parse(taskId);
+		let disposed = false;
+		let registered = this.client.snapshot?.().registered ?? true;
+		let reconciliation = Promise.resolve();
+		const reportError = (error: unknown): void => {
+			try {
+				onError(error);
+			} catch {
+				// Notification callbacks must not escape into the Window Node transport.
+			}
+		};
+		const snapshotRegistration = this.client.onTaskSnapshot?.((snapshot) => {
+			if (!disposed && snapshot.taskId === parsedTaskId) {
+				try {
+					listener(toToolReadResult(snapshot, undefined, 1).snapshot);
+				} catch (error: unknown) {
+					reportError(error);
+				}
+			}
+		}) ?? { dispose: () => undefined };
+		const stateRegistration = this.client.onDidChange?.(() => {
+			const nextRegistered = this.client.snapshot?.().registered ?? true;
+			const reconnected = !registered && nextRegistered;
+			registered = nextRegistered;
+			if (!reconnected || disposed) {
+				return;
+			}
+			reconciliation = reconciliation.then(async () => {
+				if (disposed) {
+					return;
+				}
+				try {
+					const snapshot = await this.client.getTask(parsedTaskId);
+					if (!disposed) {
+						listener(toToolReadResult(snapshot, undefined, 1).snapshot);
+					}
+				} catch (error: unknown) {
+					const facadeError = toFacadeError(error);
+					if (
+						!disposed
+						&& (
+							!(facadeError instanceof TaskToolFacadeError)
+							|| facadeError.code !== 'TUNNEL_UNAVAILABLE'
+						)
+					) {
+						reportError(facadeError);
+					}
+				}
+			});
+		}) ?? { dispose: () => undefined };
+		return {
+			dispose: () => {
+				if (disposed) {
+					return;
+				}
+				disposed = true;
+				stateRegistration.dispose();
+				snapshotRegistration.dispose();
+			},
+		};
+	}
+
 	public persistDelegationIntent(
 		intent: DelegationIntentInput,
 	): Promise<PersistedDelegationIntent> {
@@ -171,8 +293,8 @@ export class LocalBrokerTaskFacade implements TaskToolFacade {
 			throw new TaskToolFacadeError('INVALID_INPUT');
 		}
 		try {
-			const delegationRequestId = uuidSchema.parse(intent.delegationRequestId);
-			const taskId = deterministicTaskId(delegationRequestId);
+			const identity = this.identifyDelegation(intent);
+			const { delegationRequestId, taskId, sourceWorkspaceIdentity } = identity;
 			const target = {
 				deviceId: uuidSchema.parse(intent.deviceId),
 				nodeId: uuidSchema.parse(intent.nodeId),
@@ -203,9 +325,12 @@ export class LocalBrokerTaskFacade implements TaskToolFacade {
 				taskId,
 				target,
 				sourceNodeId: this.sourceNodeId,
+				sourceWorkspaceIdentity,
 				title: intent.title,
 				prompt: intent.prompt,
 				acceptanceCriteria: [...intent.acceptanceCriteria],
+				timeoutMinutes: intent.timeoutMinutes
+					?? TASK_TOOL_LIMITS.defaultTimeoutMinutes,
 				workerDeadline: workerDeadline(
 					intent.timeoutMinutes,
 					existing,
@@ -233,7 +358,19 @@ export class LocalBrokerTaskFacade implements TaskToolFacade {
 	): Promise<DelegationAcceptance> {
 		try {
 			throwIfAborted(signal);
-			if (deterministicTaskId(request.delegationRequestId) !== request.taskId) {
+			const sourceWorkspaceIdentity = workspaceIdentitySchema.parse(
+				this.options.sourceWorkspaceIdentity?.()
+					?? fallbackSourceWorkspaceIdentity(this.sourceNodeId),
+			);
+			if (
+				deterministicTaskId(
+					request.delegationRequestId,
+					this.options.sourceWorkspaceIdentity === undefined
+						? undefined
+						: sourceWorkspaceIdentity,
+				)
+				!== request.taskId
+			) {
 				throw new TaskToolFacadeError('DELEGATION_NOT_FOUND');
 			}
 			const persisted = await this.readRoutedTask(request.taskId, undefined, signal);
@@ -333,10 +470,19 @@ export class LocalBrokerTaskFacade implements TaskToolFacade {
 	}
 }
 
-export function deterministicTaskId(delegationRequestId: string): string {
+export function deterministicTaskId(
+	delegationRequestId: string,
+	sourceWorkspaceIdentity?: string,
+): string {
 	const requestId = uuidSchema.parse(delegationRequestId);
 	const bytes = createHash('sha256')
-		.update('copilot-agent-mesh/task-tool/v2\0', 'utf8')
+		.update(sourceWorkspaceIdentity === undefined
+			? 'copilot-agent-mesh/task-tool/v2\0'
+			: 'copilot-agent-mesh/task-tool/v3\0', 'utf8')
+		.update(sourceWorkspaceIdentity === undefined
+			? ''
+			: workspaceIdentitySchema.parse(sourceWorkspaceIdentity), 'utf8')
+		.update('\0', 'utf8')
 		.update(requestId, 'utf8')
 		.digest()
 		.subarray(0, 16);
@@ -354,8 +500,14 @@ function workerDeadline(
 	const minutes = timeoutMinutes !== undefined
 		&& Number.isSafeInteger(timeoutMinutes)
 		&& timeoutMinutes >= 1
+		&& timeoutMinutes <= TASK_TOOL_LIMITS.maxTimeoutMinutes
 		? timeoutMinutes
-		: 60;
+		: timeoutMinutes === undefined
+			? TASK_TOOL_LIMITS.defaultTimeoutMinutes
+			: undefined;
+	if (minutes === undefined) {
+		throw new TaskToolFacadeError('INVALID_INPUT');
+	}
 	if (existing === undefined) {
 		return new Date(now.valueOf() + minutes * 60_000).toISOString();
 	}
@@ -473,4 +625,11 @@ function isAbortError(error: unknown): error is Error {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function fallbackSourceWorkspaceIdentity(sourceNodeId: string): string {
+	return `sha256:${createHash('sha256')
+		.update('copilot-agent-mesh/test-source-workspace\0', 'utf8')
+		.update(sourceNodeId, 'utf8')
+		.digest('base64url')}`;
 }

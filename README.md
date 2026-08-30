@@ -41,10 +41,10 @@ See [Preview release and installation](./docs/mvp/release.md) for packaging, ins
 - Run one generation-fenced Device Broker, authenticated local IPC, loopback
   Gateway, and exact-build Microsoft Dev Tunnel per User Data.
 - Pair devices with one-time invitations and application-layer mutual authentication.
-- Discover explicit Device → Node → Workspace targets, then delegate, poll,
+- Discover explicit Device → Node → Workspace targets, then delegate and wait,
   cancel, and answer tasks.
 - Run the production Agent Host/AHP adapter with explicit VS Code authentication.
-- Use the five Copilot task tools to discover workers and delegate, poll, cancel,
+- Use the five Copilot task tools to discover workers, delegate, recover, cancel,
   or answer tasks.
 - Operate the Broker, owner/takeover state, local nodes, workspace conflicts,
   remote nodes, listener, peers, and tasks from the Activity Bar Dashboard.

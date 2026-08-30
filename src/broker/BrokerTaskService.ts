@@ -59,7 +59,10 @@ export interface BrokerTaskNotificationSink {
 
 export interface BrokerTaskServiceOptions {
 	readonly notificationSink?: BrokerTaskNotificationSink;
-	readonly onTaskSnapshot?: (snapshot: TaskSnapshot) => Promise<void> | void;
+	readonly onTaskSnapshot?: (
+		snapshot: TaskSnapshot,
+		sourceNodeId?: string,
+	) => Promise<void> | void;
 	readonly onDidChange?: () => void;
 	readonly onBackgroundError?: (error: Error) => void;
 	readonly cancellationDeadlineMs?: number;
@@ -570,7 +573,10 @@ export class BrokerTaskService {
 		event: Extract<TaskDomainEvent, { readonly type: 'agentStartRequested' }>,
 	): Promise<void> {
 		try {
-			await this.options.onTaskSnapshot?.(this.snapshot(record));
+			await this.options.onTaskSnapshot?.(
+				this.snapshot(record),
+				record.schemaVersion === 2 ? record.sourceNodeId : undefined,
+			);
 		} catch {
 			this.recordBackgroundFailure(
 				'The accepted task snapshot could not be published safely.',
@@ -634,7 +640,11 @@ export class BrokerTaskService {
 			record.peerId === ownerId
 			&& (
 				record.taskId === params.taskId
-				|| record.delegationRequestId === params.delegationRequestId
+				|| (
+					record.delegationRequestId === params.delegationRequestId
+					&& record.schemaVersion === 2
+					&& record.sourceWorkspaceIdentity === params.sourceWorkspaceIdentity
+				)
 			),
 		);
 		if (identifierMatch === undefined) {
@@ -647,7 +657,7 @@ export class BrokerTaskService {
 		};
 		const existing = matchIdempotentRoutedStart(records, request);
 		if (existing === undefined) {
-			throw new MeshDomainError('TASK_ID_CONFLICT', 'Task identifiers conflict.');
+			throw new MeshDomainError('IDEMPOTENCY_CONFLICT', 'Delegation idempotency semantics conflict.');
 		}
 		return existing;
 	}
@@ -932,7 +942,10 @@ export class BrokerTaskService {
 				this.clearCancellationDeadline(ownerId, taskId);
 				this.clearWorkerDeadline(ownerId, taskId);
 			}
-			await this.options.onTaskSnapshot?.(this.snapshot(record));
+			await this.options.onTaskSnapshot?.(
+				this.snapshot(record),
+				record.schemaVersion === 2 ? record.sourceNodeId : undefined,
+			);
 			return record;
 		}
 		if (terminalStates.has(record.state)) {
@@ -940,7 +953,10 @@ export class BrokerTaskService {
 			this.clearWorkerDeadline(ownerId, taskId);
 			this.registry.releaseTaskRoute(ownerId, taskId);
 		}
-		await this.options.onTaskSnapshot?.(this.snapshot(record));
+		await this.options.onTaskSnapshot?.(
+			this.snapshot(record),
+			record.schemaVersion === 2 ? record.sourceNodeId : undefined,
+		);
 		await this.options.notificationSink?.publish(record, event);
 		this.changed();
 		return record;
@@ -1055,6 +1071,8 @@ export class BrokerTaskService {
 		delete wire.workspaceLeaseKey;
 		delete wire.target;
 		delete wire.sourceNodeId;
+		delete wire.sourceWorkspaceIdentity;
+		delete wire.timeoutMinutes;
 		if (afterEventSeq === undefined) {
 			return taskSnapshotSchema.parse({
 				...wire,

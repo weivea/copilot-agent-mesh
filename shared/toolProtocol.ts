@@ -22,6 +22,8 @@ export const TASK_TOOL_LIMITS = {
 	maxArtifacts: 32,
 	minimumOutputBytes: 1_024,
 	defaultOutputBytes: 32 * 1024,
+	defaultTimeoutMinutes: 60,
+	maxTimeoutMinutes: 60,
 } as const;
 
 export const TASK_TOOL_DEADLINES_MS = {
@@ -47,6 +49,7 @@ export const TASK_TOOL_ERROR_CODES = [
 	'WORKSPACE_BUSY',
 	'TASK_NOT_FOUND',
 	'TASK_ID_CONFLICT',
+	'IDEMPOTENCY_CONFLICT',
 	'TASK_NOT_CANCELLABLE',
 	'INPUT_NOT_PENDING',
 	'AGENT_UNAVAILABLE',
@@ -150,12 +153,23 @@ export interface DelegationIntentInput {
 	readonly prompt: string;
 	readonly acceptanceCriteria: readonly string[];
 	readonly timeoutMinutes?: number;
+	/**
+	 * Internal authenticated source provenance. This is derived by the Window
+	 * Node and is never accepted from Language Model Tool input.
+	 */
+	readonly sourceWorkspaceIdentity?: string;
 }
 
 export interface PersistedDelegationIntent {
 	readonly delegationRequestId: string;
 	readonly taskId: string;
 	readonly recovered: boolean;
+}
+
+export interface DelegationIdentity {
+	readonly delegationRequestId: string;
+	readonly taskId: string;
+	readonly sourceWorkspaceIdentity: string;
 }
 
 export interface DelegationAcceptance {

@@ -36,6 +36,7 @@ const DEVICE_ID = '00000000-0000-4000-8000-000000000008';
 const NODE_ID = '00000000-0000-4000-8000-000000000009';
 const NODE_INSTANCE_ID = '00000000-0000-4000-8000-00000000000a';
 const SOURCE_NODE_ID = '00000000-0000-4000-8000-00000000000b';
+const SOURCE_WORKSPACE_IDENTITY = `sha256:${'A'.repeat(43)}`;
 
 suite('TaskToolsCore', () => {
 	test('lists only bounded opaque Device -> Node -> Workspace metadata', async () => {
@@ -72,39 +73,44 @@ suite('TaskToolsCore', () => {
 		assert.doesNotMatch(JSON.stringify(result), /\//);
 	});
 
-	test('preparation is pure and shows full source, target, title, and prompt', () => {
+	test('preparation is pure and shows the safe target scope without prompt or IDs', async () => {
 		const facade = new RecordingFacade();
 		const core = new TaskToolsCore(facade);
 		const input = delegationInput();
 
-		const first = core.prepareDelegateInvocation(input);
-		const second = core.prepareDelegateInvocation(input);
+		const first = await core.prepareDelegateInvocation(input);
+		const second = await core.prepareDelegateInvocation(input);
 
 		assert.deepStrictEqual(first, second);
-		assert.match(first.confirmationMessage, new RegExp(`Source: This Window \\(${SOURCE_NODE_ID}\\)`));
-		assert.match(first.confirmationMessage, new RegExp(`Target node: ${NODE_ID} \\(${NODE_INSTANCE_ID}\\)`));
-		assert.match(first.confirmationMessage, new RegExp(`Workspace: ${WORKSPACE_ID}`));
-		assert.match(first.confirmationMessage, /Title: Fix scheduler/);
-		assert.ok(first.confirmationMessage.includes(input.prompt));
+		assert.equal(first.invocationMessage, 'Delegating to “Window One”…');
+		assert.equal(first.confirmationTitle, 'Delegate to “Window One”');
+		assert.match(first.confirmationMessage, /Target window: Window One/);
+		assert.match(first.confirmationMessage, /Workspace: app/);
+		assert.match(first.confirmationMessage, /Task: Fix scheduler/);
+		assert.match(first.confirmationMessage, /does not auto-approve operations/);
+		assert.match(first.confirmationMessage, /at most 60 minutes/);
+		assert.doesNotMatch(first.confirmationMessage, new RegExp(NODE_ID));
+		assert.doesNotMatch(first.confirmationMessage, new RegExp(WORKSPACE_ID));
+		assert.ok(!first.confirmationMessage.includes(input.prompt));
 		assert.equal(facade.persistCalls, 0);
 		assert.equal(facade.acceptanceWaits, 0);
 	});
 
-	test('persists before waiting and returns pending after acceptance', async () => {
+	test('returns the exact completed compact contract after an authoritative event', async () => {
 		const facade = new RecordingFacade();
-		const core = new TaskToolsCore(facade);
+		const clock = new ManualClock();
+		const core = new TaskToolsCore(facade, { clock });
 
 		const result = await core.delegateTask(delegationInput());
 
-		assert.deepStrictEqual(facade.callOrder, ['persist', 'wait']);
 		assert.deepStrictEqual(result, {
-			status: 'pending',
-			delegationRequestId: DELEGATION_ID,
-			taskId: TASK_ID,
-			recovered: false,
-			pollTool: MESH_TOOL_NAMES.getTask,
-			cancelTool: MESH_TOOL_NAMES.cancelTask,
+			s: 0,
+			t: TASK_ID,
+			d: DELEGATION_ID,
+			r: { summary: 'Scheduler fixed.' },
 		});
+		assert.equal(clock.createdTimers, 1);
+		assert.equal(clock.activeTimers, 0);
 	});
 
 	test('generates a fresh delegation identity when the caller omits one', async () => {
@@ -128,141 +134,206 @@ suite('TaskToolsCore', () => {
 		);
 	});
 
-	test('a cancelled acknowledgement wait retains intent and never requests remote cancellation', async () => {
+	test('defaults timeoutMinutes to 60 and rejects every invalid budget explicitly', async () => {
 		const facade = new RecordingFacade();
-		facade.acceptance = new Promise(() => undefined);
-		const cancellation = new ManualCancellation();
 		const core = new TaskToolsCore(facade);
-		const invocation = core.delegateTask(delegationInput(), cancellation);
-		for (let index = 0; index < 10 && facade.acceptanceWaits === 0; index += 1) {
-			await Promise.resolve();
+		const { timeoutMinutes: _timeoutMinutes, ...withoutTimeout } = delegationInput();
+		await core.delegateTask(withoutTimeout);
+		assert.equal(facade.persistedIntents[0]?.timeoutMinutes, 60);
+
+		for (const timeoutMinutes of [0, 61, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+			const result = await core.delegateTask({
+				...delegationInput(),
+				timeoutMinutes,
+			});
+			assert.equal(result.status, 'error');
+			assert.equal((result.error as Record<string, unknown>).code, 'INVALID_INPUT');
 		}
-
-		cancellation.cancel();
-		const result = await invocation;
-
-		assert.equal(result.status, 'cancelled');
-		assert.equal(result.taskId, TASK_ID);
-		assert.equal(result.pollTool, MESH_TOOL_NAMES.getTask);
 		assert.equal(facade.persistCalls, 1);
-		assert.equal(facade.cancelCalls, 0);
-		assert.equal(facade.lastAcceptanceSignal?.aborted, true);
 	});
 
-	test('an acknowledgement timeout retains IDs for poll and cancel', async () => {
+	test('returns exact needsInput, failed, and peer-cancelled branch-only fields', async () => {
 		const facade = new RecordingFacade();
-		facade.acceptance = new Promise(() => undefined);
+		facade.delegationSnapshot = {
+			taskId: TASK_ID,
+			status: 'needsInput',
+			title: 'Fix scheduler',
+			updatedAt: '2026-08-25T00:00:01.000Z',
+			pendingInput: { inputId: INPUT_ID, prompt: 'Which queue?' },
+		};
+		const needsInput = await new TaskToolsCore(facade).delegateTask(delegationInput());
+		assert.deepStrictEqual(needsInput, {
+			s: 1,
+			t: TASK_ID,
+			d: DELEGATION_ID,
+			i: INPUT_ID,
+			q: 'Which queue?',
+		});
+
+		facade.delegationSnapshot = {
+			taskId: TASK_ID,
+			status: 'failed',
+			title: 'Fix scheduler',
+			updatedAt: '2026-08-25T00:00:02.000Z',
+			failure: { code: 'AGENT_UNAVAILABLE', message: 'Agent unavailable.', retryable: true },
+		};
+		const failed = await new TaskToolsCore(facade).delegateTask(delegationInput());
+		assert.deepStrictEqual(failed, {
+			s: 2,
+			t: TASK_ID,
+			d: DELEGATION_ID,
+			e: 'AGENT_UNAVAILABLE',
+		});
+
+		facade.delegationSnapshot = {
+			taskId: TASK_ID,
+			status: 'cancelled',
+			title: 'Fix scheduler',
+			updatedAt: '2026-08-25T00:00:03.000Z',
+		};
+		const cancelled = await new TaskToolsCore(facade).delegateTask(delegationInput());
+		assert.deepStrictEqual(cancelled, {
+			s: 3,
+			t: TASK_ID,
+			d: DELEGATION_ID,
+			e: 'CANCELLED',
+			x: 'peer',
+		});
+	});
+
+	test('token cancellation sends one cancel and waits for authoritative cancellation', async () => {
+		const facade = new RecordingFacade();
+		facade.delegationSnapshot = runningSnapshot();
+		facade.taskRead = { ...facade.taskRead, snapshot: runningSnapshot() };
+		const cancellation = new ManualCancellation();
 		const clock = new ManualClock();
 		const core = new TaskToolsCore(facade, { clock });
-		const invocation = core.delegateTask(delegationInput());
-		await Promise.resolve();
-		await Promise.resolve();
+		const invocation = core.delegateTask(delegationInput(), cancellation);
+		await settleMicrotasks();
 
-		clock.advanceBy(15_000);
-		const result = await invocation;
-
-		assert.equal(result.status, 'timeout');
-		assert.equal(result.delegationRequestId, DELEGATION_ID);
-		assert.equal(result.taskId, TASK_ID);
-		assert.equal(result.pollTool, MESH_TOOL_NAMES.getTask);
-		assert.equal(result.cancelTool, MESH_TOOL_NAMES.cancelTask);
-		assert.equal(facade.cancelCalls, 0);
-	});
-
-	test('bounds an unresolved durable persistence wait at the overall delegate deadline', async () => {
-		const facade = new RecordingFacade();
-		facade.persistence = new Promise(() => undefined);
-		const clock = new ManualClock();
-		const core = new TaskToolsCore(facade, { clock, id: () => DELEGATION_ID });
-		const { delegationRequestId: _delegationRequestId, ...freshInput } = delegationInput();
-		const invocation = core.delegateTask(freshInput);
-		await Promise.resolve();
-		await Promise.resolve();
-
-		clock.advanceBy(15_000);
+		cancellation.cancel();
+		cancellation.cancel();
+		await settleMicrotasks();
+		assert.equal(facade.cancelCalls, 1);
+		facade.emitTask(cancelledSnapshot());
 		const result = await invocation;
 
 		assert.deepStrictEqual(result, {
-			status: 'pending',
-			phase: 'persisting',
-			delegationRequestId: DELEGATION_ID,
-			waitStatus: 'timeout',
-			reconciliationPending: true,
-			retrySameIntent: true,
-			retryTool: MESH_TOOL_NAMES.delegateTask,
+			s: 3,
+			t: TASK_ID,
+			d: DELEGATION_ID,
+			e: 'CANCELLED',
+			x: 'token',
 		});
-		assert.equal(facade.acceptanceWaits, 0);
-		assert.equal(facade.persistedIntents[0]?.delegationRequestId, DELEGATION_ID);
+		assert.equal(clock.activeTimers, 0);
+		assert.equal(cancellation.listenerCount, 0);
+	});
+
+	test('budget expiry sends one cancel and waits for authoritative cancellation', async () => {
+		const facade = new RecordingFacade();
+		facade.delegationSnapshot = runningSnapshot();
+		facade.taskRead = { ...facade.taskRead, snapshot: runningSnapshot() };
+		const clock = new ManualClock();
+		const core = new TaskToolsCore(facade, { clock });
+		const invocation = core.delegateTask(delegationInput());
+		await settleMicrotasks();
+
+		clock.advanceBy(30 * 60_000);
+		await settleMicrotasks();
+		assert.equal(facade.cancelCalls, 1);
+		facade.emitTask(cancelledSnapshot());
+		const result = await invocation;
+
+		assert.deepStrictEqual(result, {
+			s: 3,
+			t: TASK_ID,
+			d: DELEGATION_ID,
+			e: 'TIMEOUT',
+			x: 'budget',
+		});
 		assert.equal(clock.activeTimers, 0);
 	});
 
-	test('cancels only the caller wait while durable persistence continues', async () => {
+	test('completion that wins before cancellation is returned as completed', async () => {
 		const facade = new RecordingFacade();
-		facade.persistence = new Promise(() => undefined);
-		const clock = new ManualClock();
+		facade.delegationSnapshot = runningSnapshot();
+		facade.taskRead = { ...facade.taskRead, snapshot: runningSnapshot() };
 		const cancellation = new ManualCancellation();
-		const core = new TaskToolsCore(facade, { clock });
-		const invocation = core.delegateTask(delegationInput(), cancellation);
-		await Promise.resolve();
-		await Promise.resolve();
-
+		const invocation = new TaskToolsCore(facade).delegateTask(delegationInput(), cancellation);
+		await settleMicrotasks();
+		facade.emitTask({
+			...runningSnapshot(),
+			status: 'completed',
+			summary: 'Completion won.',
+		});
 		cancellation.cancel();
 		const result = await invocation;
 
-		assert.equal(result.status, 'pending');
-		assert.equal(result.phase, 'persisting');
-		assert.equal(result.waitStatus, 'cancelled');
-		assert.equal(result.reconciliationPending, true);
-		assert.equal(facade.acceptanceWaits, 0);
-		assert.equal(clock.activeTimers, 0);
-	});
-
-	test('recovers the same durable IDs when persistence resolves after caller timeout', async () => {
-		const facade = new RecordingFacade();
-		const persistence = new Deferred<PersistedDelegationIntent>();
-		facade.persistence = persistence.promise;
-		const clock = new ManualClock();
-		const core = new TaskToolsCore(facade, { clock });
-		const firstInvocation = core.delegateTask(delegationInput());
-		await Promise.resolve();
-		await Promise.resolve();
-		clock.advanceBy(15_000);
-		const first = await firstInvocation;
-
-		persistence.resolve({
-			delegationRequestId: DELEGATION_ID,
-			taskId: TASK_ID,
-			recovered: true,
+		assert.deepStrictEqual(result, {
+			s: 0,
+			t: TASK_ID,
+			d: DELEGATION_ID,
+			r: { summary: 'Completion won.' },
 		});
-		await Promise.resolve();
-		await Promise.resolve();
-		const retry = await core.delegateTask(delegationInput());
-
-		assert.equal(first.status, 'pending');
-		assert.equal(retry.status, 'pending');
-		assert.equal(retry.delegationRequestId, DELEGATION_ID);
-		assert.equal(retry.taskId, TASK_ID);
-		assert.equal(retry.recovered, true);
-		assert.equal(facade.persistCalls, 2);
-		assert.equal(facade.acceptanceWaits, 1);
+		assert.equal(facade.cancelCalls, 0);
 	});
 
-	test('an explicit ACK retry relies on durable Facade recovery and keeps the same IDs', async () => {
+	test('terminal completion wins when cancellation reports not cancellable', async () => {
 		const facade = new RecordingFacade();
-		facade.persisted = {
-			delegationRequestId: DELEGATION_ID,
-			taskId: TASK_ID,
-			recovered: true,
+		facade.delegationSnapshot = runningSnapshot();
+		facade.taskRead = { ...facade.taskRead, snapshot: runningSnapshot() };
+		const cancellation = new ManualCancellation();
+		const invocation = new TaskToolsCore(facade).delegateTask(
+			delegationInput(),
+			cancellation,
+		);
+		await settleMicrotasks();
+		facade.cancelError = new TaskToolFacadeError('TASK_NOT_CANCELLABLE');
+		facade.taskRead = {
+			...facade.taskRead,
+			snapshot: {
+				...runningSnapshot(),
+				status: 'completed',
+				summary: 'Completion won before cancellation.',
+			},
 		};
-		const core = new TaskToolsCore(facade);
+		cancellation.cancel();
 
-		const first = await core.delegateTask(delegationInput());
-		const retry = await core.delegateTask(delegationInput());
+		assert.deepStrictEqual(await invocation, {
+			s: 0,
+			t: TASK_ID,
+			d: DELEGATION_ID,
+			r: { summary: 'Completion won before cancellation.' },
+		});
+	});
 
-		assert.equal(facade.persistCalls, 2);
-		assert.equal(first.taskId, TASK_ID);
-		assert.equal(retry.taskId, TASK_ID);
-		assert.equal(retry.recovered, true);
+	test('pending cancellation survives an initial read failure after durable start', async () => {
+		const facade = new RecordingFacade();
+		facade.delegationSnapshot = runningSnapshot();
+		facade.taskRead = { ...facade.taskRead, snapshot: runningSnapshot() };
+		facade.getTaskErrors.push(new TaskToolFacadeError('TUNNEL_UNAVAILABLE', true));
+		let resolvePersistence!: (value: PersistedDelegationIntent) => void;
+		facade.persistence = new Promise((resolve) => {
+			resolvePersistence = resolve;
+		});
+		const cancellation = new ManualCancellation();
+		const invocation = new TaskToolsCore(facade).delegateTask(
+			delegationInput(),
+			cancellation,
+		);
+		cancellation.cancel();
+		resolvePersistence(facade.persisted);
+		await settleMicrotasks();
+
+		assert.equal(facade.cancelCalls, 1);
+		facade.emitTask(cancelledSnapshot());
+		assert.deepStrictEqual(await invocation, {
+			s: 3,
+			t: TASK_ID,
+			d: DELEGATION_ID,
+			e: 'CANCELLED',
+			x: 'token',
+		});
 	});
 
 	test('gets a bounded snapshot with event-gap and truncation metadata', async () => {
@@ -453,6 +524,38 @@ suite('TaskToolsCore', () => {
 		assert.ok(Buffer.byteLength(JSON.stringify(result), 'utf8') <= 1_024);
 	});
 
+	test('redacts every remote-derived task and event text field', async () => {
+		const facade = new RecordingFacade();
+		const sensitive = '/Users/private/project';
+		facade.taskRead = {
+			snapshot: {
+				taskId: TASK_ID,
+				status: 'completed',
+				title: `Task ${sensitive}`,
+				updatedAt: '2026-08-25T00:00:00.000Z',
+				phase: `Phase ${sensitive}`,
+				summary: `Summary ${sensitive}`,
+				validation: { status: 'passed', summary: `Validated ${sensitive}` },
+				artifacts: [{
+					artifactId: ANSWER_ID,
+					label: `Report ${sensitive}`,
+					mediaType: `text/plain; source=${sensitive}`,
+				}],
+			},
+			eventCursor: 1,
+			events: [{
+				sequence: 1,
+				type: `progress-${sensitive}`,
+				at: '2026-08-25T00:00:00.000Z',
+				summary: `Output ${sensitive}`,
+			}],
+			truncated: false,
+		};
+
+		const result = await new TaskToolsCore(facade).getTask({ taskId: TASK_ID });
+		assert.doesNotMatch(JSON.stringify(result), /Users|private|project/u);
+	});
+
 	test('preserves maximum-length task and input IDs at the minimum output budget', async () => {
 		const facade = new RecordingFacade();
 		const taskId = TASK_ID;
@@ -633,17 +736,17 @@ suite('TaskToolsCore', () => {
 
 	test('keeps durable IDs when acceptance fails after persistence', async () => {
 		const facade = new RecordingFacade();
-		facade.acceptance = Promise.reject(new TaskToolFacadeError('TUNNEL_UNAVAILABLE', true));
+		facade.persistence = Promise.reject(new TaskToolFacadeError('TUNNEL_UNAVAILABLE', true));
 		const core = new TaskToolsCore(facade);
 
 		const result = await core.delegateTask(delegationInput());
 
-		assert.equal(result.status, 'error');
-		assert.equal(result.delegationRequestId, DELEGATION_ID);
-		assert.equal(result.taskId, TASK_ID);
-		assert.equal(result.pollTool, MESH_TOOL_NAMES.getTask);
-		assert.equal(result.cancelTool, MESH_TOOL_NAMES.cancelTask);
-		assert.equal((result.error as Record<string, unknown>).code, 'TUNNEL_UNAVAILABLE');
+		assert.deepStrictEqual(result, {
+			s: 2,
+			t: TASK_ID,
+			d: DELEGATION_ID,
+			e: 'TUNNEL_UNAVAILABLE',
+		});
 	});
 
 	test('rejects unknown properties and UTF-8 byte oversize before side effects', async () => {
@@ -922,37 +1025,53 @@ suite('TaskToolsCore', () => {
 		assert.equal(await countTokens(boundary), expected.length);
 	});
 
-	test('preserves delegation IDs and retry semantics at a 100-character budget', async () => {
+	test('preserves completed delegation IDs at a compact token budget', async () => {
 		const result = {
-			status: 'pending',
-			delegationRequestId: DELEGATION_ID,
-			taskId: TASK_ID,
-			recovered: true,
-			pollTool: MESH_TOOL_NAMES.getTask,
-			cancelTool: MESH_TOOL_NAMES.cancelTask,
+			s: 0,
+			t: TASK_ID,
+			d: DELEGATION_ID,
+			r: { summary: 'Task completed with a deliberately long bounded summary.' },
 		};
 		const countCharacters = async (text: string): Promise<number> => text.length;
 
-		const serialized = await serializeToolResultToTokenBudget(result, 100, countCharacters);
+		const serialized = await serializeToolResultToTokenBudget(result, 200, countCharacters);
 		const compact = JSON.parse(serialized) as Record<string, unknown>;
-		const tooSmall = await serializeToolResultToTokenBudget(
+		const contracted = await serializeToolResultToTokenBudget(
 			result,
 			serialized.length - 1,
 			countCharacters,
 		);
 
-		assert.ok(serialized.length <= 100);
-		assert.deepStrictEqual(compact, {
-			s: 0,
+		assert.ok(serialized.length <= 200);
+		assert.equal(compact.s, 0);
+		assert.equal(compact.t, TASK_ID);
+		assert.equal(compact.d, DELEGATION_ID);
+		assert.ok(typeof (compact.r as Record<string, unknown>).summary === 'string');
+		const smaller = JSON.parse(contracted) as Record<string, unknown>;
+		assert.equal(smaller.t, TASK_ID);
+		assert.equal(smaller.d, DELEGATION_ID);
+	});
+
+	test('never drops delegation identity when a caller supplies an impossible token budget', async () => {
+		const result = {
+			s: 3,
 			t: TASK_ID,
 			d: DELEGATION_ID,
-		});
-		assert.equal(tooSmall, '');
+			e: 'TIMEOUT',
+			x: 'budget',
+		};
+		const serialized = await serializeToolResultToTokenBudget(
+			result,
+			0,
+			async (text) => text.length,
+		);
+
+		assert.deepStrictEqual(JSON.parse(serialized), result);
 	});
 
 	test('preserves conflict error semantics in a 200-character compact result', async () => {
 		const facade = new RecordingFacade();
-		facade.acceptance = Promise.reject(new TaskToolFacadeError('TASK_ID_CONFLICT'));
+		facade.persistence = Promise.reject(new TaskToolFacadeError('IDEMPOTENCY_CONFLICT'));
 		const result = await new TaskToolsCore(facade).delegateTask(delegationInput());
 		const countCharacters = async (text: string): Promise<number> => text.length;
 
@@ -964,53 +1083,48 @@ suite('TaskToolsCore', () => {
 			s: 2,
 			t: TASK_ID,
 			d: DELEGATION_ID,
-			e: 'TASK_ID_CONFLICT',
-			r: 0,
+			e: 'IDEMPOTENCY_CONFLICT',
 		});
 	});
 
-	test('distinguishes reconciliation waits from accepted pending at 100 characters', async () => {
+	test('preserves exact cancelled compact fields at a compact token budget', async () => {
 		const result = {
-			status: 'timeout',
-			delegationRequestId: DELEGATION_ID,
-			taskId: TASK_ID,
-			recovered: false,
-			pollTool: MESH_TOOL_NAMES.getTask,
-			cancelTool: MESH_TOOL_NAMES.cancelTask,
-			error: {
-				code: 'TIMEOUT',
-				message: 'The caller wait ended.',
-				retryable: true,
-			},
+			s: 3,
+			t: TASK_ID,
+			d: DELEGATION_ID,
+			e: 'TIMEOUT',
+			x: 'budget',
 		};
 		const countCharacters = async (text: string): Promise<number> => text.length;
 
-		const serialized = await serializeToolResultToTokenBudget(result, 100, countCharacters);
+		const serialized = await serializeToolResultToTokenBudget(result, 200, countCharacters);
 
 		assert.deepStrictEqual(JSON.parse(serialized), {
-			s: 1,
+			s: 3,
 			t: TASK_ID,
 			d: DELEGATION_ID,
-			r: 1,
+			e: 'TIMEOUT',
+			x: 'budget',
 		});
-		assert.ok(serialized.length <= 100);
+		assert.ok(serialized.length <= 200);
 	});
 
-	test('preserves pre-ID persistence reconciliation at a 100-character budget', async () => {
-		const facade = new RecordingFacade();
-		facade.persistence = new Promise(() => undefined);
-		const clock = new ManualClock();
-		const invocation = new TaskToolsCore(facade, { clock }).delegateTask(delegationInput());
-		await Promise.resolve();
-		await Promise.resolve();
-		clock.advanceBy(15_000);
-		const result = await invocation;
+	test('contracts completed summaries without dropping task identity', async () => {
+		const result = {
+			s: 0,
+			t: TASK_ID,
+			d: DELEGATION_ID,
+			r: { summary: 'x'.repeat(4_096) },
+		};
 		const countCharacters = async (text: string): Promise<number> => text.length;
 
-		const serialized = await serializeToolResultToTokenBudget(result, 100, countCharacters);
+		const serialized = await serializeToolResultToTokenBudget(result, 200, countCharacters);
+		const parsed = JSON.parse(serialized) as Record<string, unknown>;
 
-		assert.deepStrictEqual(JSON.parse(serialized), { s: 3, d: DELEGATION_ID, r: 1 });
-		assert.ok(serialized.length <= 100);
+		assert.equal(parsed.t, TASK_ID);
+		assert.equal(parsed.d, DELEGATION_ID);
+		assert.ok(parsed.s === 0 || parsed.s === 2);
+		assert.ok(serialized.length <= 200);
 	});
 
 	test('preserves the minimal needsInput contract at a 300-character token budget', async () => {
@@ -1080,12 +1194,14 @@ suite('TaskToolsCore', () => {
 		facade.listError = new TaskToolFacadeError('RATE_LIMITED', true);
 		await core.listWorkers({});
 		facade.listError = undefined;
-		facade.acceptance = new Promise(() => undefined);
+		facade.delegationSnapshot = runningSnapshot();
+		facade.taskRead = { ...facade.taskRead, snapshot: runningSnapshot() };
 		const cancellation = new ManualCancellation();
 		const cancelled = core.delegateTask(delegationInput(), cancellation);
-		await Promise.resolve();
-		await Promise.resolve();
+		await settleMicrotasks();
 		cancellation.cancel();
+		await settleMicrotasks();
+		facade.emitTask(cancelledSnapshot());
 		await cancelled;
 
 		assert.equal(clock.activeTimers, 0);
@@ -1113,10 +1229,17 @@ suite('Mesh tool manifest contract', () => {
 			({ name }) => name === MESH_TOOL_NAMES.delegateTask,
 		);
 		assert.ok(delegateDescriptor);
-		assert.match(delegateDescriptor.modelDescription, /s state/);
-		assert.match(delegateDescriptor.modelDescription, /retry the exact same intent/);
+		assert.match(delegateDescriptor.modelDescription, /s=0 completed/);
+		assert.match(delegateDescriptor.modelDescription, /IDEMPOTENCY_CONFLICT/);
+		assert.match(delegateDescriptor.modelDescription, /normal-path mesh_get_task polling is unnecessary/);
 		const delegateProperties = delegateDescriptor.inputSchema.properties as Record<string, unknown>;
 		assert.ok(delegateProperties.delegationRequestId);
+		assert.deepStrictEqual(delegateProperties.timeoutMinutes, {
+			type: 'integer',
+			minimum: 1,
+			maximum: 60,
+			default: 60,
+		});
 		for (const target of ['deviceId', 'nodeId', 'nodeInstanceId', 'workspaceId']) {
 			assert.ok(delegateProperties[target]);
 		}
@@ -1132,9 +1255,8 @@ suite('Mesh tool manifest contract', () => {
 			({ name }) => name === MESH_TOOL_NAMES.getTask,
 		);
 		assert.ok(getDescriptor);
-		assert.match(getDescriptor.modelDescription, /only needsInput snapshots expose mesh_answer_task/);
-		assert.match(getDescriptor.modelDescription, /Failed and timedOut snapshots include safe failure/);
-		assert.match(getDescriptor.modelDescription, /eventGap identifies every omitted leading event/);
+		assert.match(getDescriptor.modelDescription, /abnormal mesh_delegate_task interruption recovery/);
+		assert.match(getDescriptor.modelDescription, /Do not poll/);
 	});
 
 	test('exports the cold implicit activation contract for every tool', () => {
@@ -1164,6 +1286,30 @@ function delegationInput(): DelegationIntentInput {
 
 function uuidFromIndex(index: number): string {
 	return `00000000-0000-4000-8000-${index.toString().padStart(12, '0')}`;
+}
+
+function runningSnapshot(): TaskToolSnapshot {
+	return {
+		taskId: TASK_ID,
+		status: 'running',
+		title: 'Fix scheduler',
+		updatedAt: '2026-08-25T00:00:00.000Z',
+	};
+}
+
+function cancelledSnapshot(): TaskToolSnapshot {
+	return {
+		taskId: TASK_ID,
+		status: 'cancelled',
+		title: 'Fix scheduler',
+		updatedAt: '2026-08-25T00:00:02.000Z',
+	};
+}
+
+async function settleMicrotasks(): Promise<void> {
+	for (let index = 0; index < 12; index += 1) {
+		await Promise.resolve();
+	}
 }
 
 class RecordingFacade implements TaskToolFacade {
@@ -1218,16 +1364,53 @@ class RecordingFacade implements TaskToolFacade {
 		}],
 		truncated: false,
 	};
+	delegationSnapshot: TaskToolSnapshot = {
+		taskId: TASK_ID,
+		status: 'completed',
+		title: 'Fix scheduler',
+		updatedAt: '2026-08-25T00:00:01.000Z',
+		summary: 'Scheduler fixed.',
+	};
 	listError: unknown;
+	readonly getTaskErrors: unknown[] = [];
 	persistCalls = 0;
 	acceptanceWaits = 0;
 	cancelCalls = 0;
 	answerCalls = 0;
 	cancelStatus: TaskActionReceipt['status'] = 'cancelled';
+	cancelError?: unknown;
 	responseTaskId?: string;
 	callOrder: string[] = [];
 	lastAcceptanceSignal?: AbortSignal;
 	persistedIntents: DelegationIntentInput[] = [];
+	private readonly taskListeners = new Set<(snapshot: TaskToolSnapshot) => void>();
+
+	identifyDelegation(intent: DelegationIntentInput) {
+		return {
+			delegationRequestId: intent.delegationRequestId ?? DELEGATION_ID,
+			taskId: this.persisted.taskId,
+			sourceWorkspaceIdentity: SOURCE_WORKSPACE_IDENTITY,
+		};
+	}
+
+	async describeDelegationTarget() {
+		return { windowName: 'Window One', workspaceName: 'app' };
+	}
+
+	subscribeToTask(
+		_taskId: string,
+		listener: (snapshot: TaskToolSnapshot) => void,
+		_onError: (error: unknown) => void,
+	) {
+		this.taskListeners.add(listener);
+		return { dispose: () => this.taskListeners.delete(listener) };
+	}
+
+	emitTask(snapshot: TaskToolSnapshot): void {
+		for (const listener of [...this.taskListeners]) {
+			listener(snapshot);
+		}
+	}
 
 	async listWorkers(_signal: AbortSignal): Promise<MeshDirectorySnapshot> {
 		if (this.listError !== undefined) {
@@ -1240,10 +1423,12 @@ class RecordingFacade implements TaskToolFacade {
 		this.persistCalls += 1;
 		this.callOrder.push('persist');
 		this.persistedIntents.push(intent);
-		return this.persistence ?? {
+		const persisted = await (this.persistence ?? Promise.resolve({
 			...this.persisted,
 			delegationRequestId: intent.delegationRequestId ?? this.persisted.delegationRequestId,
-		};
+		}));
+		queueMicrotask(() => this.emitTask(this.delegationSnapshot));
+		return persisted;
 	}
 
 	async waitForDelegationAcceptance(
@@ -1260,6 +1445,10 @@ class RecordingFacade implements TaskToolFacade {
 		_request: { readonly taskId: string; readonly afterEventSequence?: number; readonly maxEvents: number },
 		_signal: AbortSignal,
 	): Promise<TaskToolReadResult> {
+		const error = this.getTaskErrors.shift();
+		if (error !== undefined) {
+			throw error;
+		}
 		return this.taskRead;
 	}
 
@@ -1268,6 +1457,9 @@ class RecordingFacade implements TaskToolFacade {
 		_signal: AbortSignal,
 	): Promise<TaskActionReceipt> {
 		this.cancelCalls += 1;
+		if (this.cancelError !== undefined) {
+			throw this.cancelError;
+		}
 		return { taskId: this.responseTaskId ?? request.taskId, status: this.cancelStatus };
 	}
 
@@ -1335,6 +1527,10 @@ class ManualCancellation implements ToolCancellation {
 	onCancellationRequested(listener: () => void): { dispose(): void } {
 		this.listeners.add(listener);
 		return { dispose: () => this.listeners.delete(listener) };
+	}
+
+	get listenerCount(): number {
+		return this.listeners.size;
 	}
 
 	cancel(): void {
