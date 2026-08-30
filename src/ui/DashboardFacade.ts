@@ -158,6 +158,12 @@ export interface DashboardTaskTarget {
 	readonly peerId?: string;
 }
 
+export interface DashboardPendingInput {
+	readonly taskId: string;
+	readonly inputId: string;
+	readonly question: string;
+}
+
 /**
  * Application-service boundary for the dashboard.
  *
@@ -202,14 +208,21 @@ export interface DashboardServiceBindings {
 		readonly instruction: string;
 	}): Promise<void>;
 	cancelTask(taskId: string): Promise<void>;
-	answerTaskInput(taskId: string, answer: string): Promise<void>;
+	getTaskInput(taskId: string): Promise<DashboardPendingInput>;
+	answerTaskInput(taskId: string, inputId: string, answer: string): Promise<void>;
 	startCollaboration(request: {
 		readonly title: string;
 		readonly goal: string;
 	}): Promise<void>;
 	getCollaboration(runId: string): Promise<void>;
 	cancelCollaboration(runId: string): Promise<void>;
-	answerCollaboration(runId: string, answer: string): Promise<void>;
+	getCollaborationInput(runId: string): Promise<DashboardPendingInput>;
+	answerCollaboration(
+		runId: string,
+		taskId: string,
+		inputId: string,
+		answer: string,
+	): Promise<void>;
 }
 
 export interface DashboardConfirmationHost {
@@ -332,14 +345,16 @@ export class ServiceDashboardFacade implements DashboardFacade {
 	}
 
 	public async answerTaskInput(taskId: string): Promise<void> {
+		const pending = await this.services.getTaskInput(taskId);
 		const answer = await this.inputs.showInputBox({
 			title: 'Answer Remote Task',
-			prompt: 'The answer stays in the Extension Host.',
+			prompt: pendingQuestion(pending.question),
+			placeHolder: '输入回答；确认授权可输入 approve、继续、同意或批准',
 			ignoreFocusOut: true,
 			validateInput: (candidate) => candidate.trim().length > 0 ? undefined : 'An answer is required.',
 		});
 		if (answer !== undefined) {
-			await this.services.answerTaskInput(taskId, answer);
+			await this.services.answerTaskInput(taskId, pending.inputId, answer.trim());
 		}
 	}
 
@@ -378,14 +393,21 @@ export class ServiceDashboardFacade implements DashboardFacade {
 	}
 
 	public async answerCollaboration(runId: string): Promise<void> {
+		const pending = await this.services.getCollaborationInput(runId);
 		const answer = await this.inputs.showInputBox({
 			title: 'Answer Collaboration Task',
-			prompt: 'The answer stays in the Extension Host.',
+			prompt: pendingQuestion(pending.question),
+			placeHolder: '输入回答；确认授权可输入 approve、继续、同意或批准',
 			ignoreFocusOut: true,
 			validateInput: (candidate) => candidate.trim().length > 0 ? undefined : 'An answer is required.',
 		});
 		if (answer !== undefined) {
-			await this.services.answerCollaboration(runId, answer.trim());
+			await this.services.answerCollaboration(
+				runId,
+				pending.taskId,
+				pending.inputId,
+				answer.trim(),
+			);
 		}
 	}
 }
@@ -583,4 +605,19 @@ function validateCollaborationGoal(candidate: string): string | undefined {
 	return utf8ByteLength(value) <= PROTOCOL_LIMITS.collaborationGoalBytes
 		? undefined
 		: `The collaboration goal must be at most ${PROTOCOL_LIMITS.collaborationGoalBytes} UTF-8 bytes.`;
+}
+
+function pendingQuestion(question: string): string {
+	const maximumBytes = 2 * 1_024;
+	if (utf8ByteLength(question) <= maximumBytes) {
+		return question;
+	}
+	let result = '';
+	for (const character of question) {
+		if (utf8ByteLength(`${result}${character}…`) > maximumBytes) {
+			break;
+		}
+		result += character;
+	}
+	return `${result}…`;
 }

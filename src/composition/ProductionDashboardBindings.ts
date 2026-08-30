@@ -24,6 +24,7 @@ import type { LocalBrokerTaskFacade } from '../tools/LocalBrokerTaskFacade';
 import type { LocalBrokerCollaborationFacade } from '../tools/LocalBrokerCollaborationFacade';
 import type {
 	DashboardNodeSnapshot,
+	DashboardPendingInput,
 	DashboardServiceBindings,
 	DashboardSnapshot,
 	DashboardTaskTarget,
@@ -439,7 +440,7 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 		}
 	}
 
-	public async answerTaskInput(taskId: string, answer: string): Promise<void> {
+	public async getTaskInput(taskId: string): Promise<DashboardPendingInput> {
 		const controller = deadlineSignal(10_000);
 		try {
 			const task = await this.options.localTasks.getTask(
@@ -450,6 +451,23 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 			if (inputId === undefined) {
 				throw new Error('The selected task is not waiting for input.');
 			}
+			return {
+				taskId,
+				inputId,
+				question: task.snapshot.pendingInput!.prompt,
+			};
+		} finally {
+			controller.abort();
+		}
+	}
+
+	public async answerTaskInput(
+		taskId: string,
+		inputId: string,
+		answer: string,
+	): Promise<void> {
+		const controller = deadlineSignal(10_000);
+		try {
 			await this.options.localTasks.answerOwnedTask({
 				taskId,
 				inputId,
@@ -559,7 +577,7 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 		}
 	}
 
-	public async answerCollaboration(runId: string, answer: string): Promise<void> {
+	public async getCollaborationInput(runId: string): Promise<DashboardPendingInput> {
 		const controller = deadlineSignal(10_000);
 		try {
 			const { run } = await this.options.localCollaborations.getCollaboration(
@@ -570,9 +588,39 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 			if (task?.pendingInput === undefined) {
 				throw new Error('The collaboration is not waiting for input.');
 			}
-			await this.options.localTasks.answerOwnedTask({
+			return {
 				taskId: task.taskId,
 				inputId: task.pendingInput.inputId,
+				question: task.pendingInput.prompt,
+			};
+		} finally {
+			controller.abort();
+		}
+	}
+
+	public async answerCollaboration(
+		runId: string,
+		taskId: string,
+		inputId: string,
+		answer: string,
+	): Promise<void> {
+		const controller = deadlineSignal(10_000);
+		try {
+			const { run } = await this.options.localCollaborations.getCollaboration(
+				runId,
+				controller.signal,
+			);
+			const task = run.tasks.find((candidate) =>
+				candidate.taskId === taskId
+				&& candidate.status === 'needsInput'
+				&& candidate.pendingInput?.inputId === inputId,
+			);
+			if (task === undefined) {
+				throw new Error('The collaboration input changed before the answer was submitted.');
+			}
+			await this.options.localTasks.answerOwnedTask({
+				taskId,
+				inputId,
 				answerId: randomUUID(),
 				answer,
 			}, controller.signal);

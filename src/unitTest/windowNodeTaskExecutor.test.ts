@@ -523,7 +523,7 @@ test('maps one bounded string answer across structured Agent input fields', asyn
 		taskId: TASK_ID,
 		inputId: INPUT_ID,
 		answerId: ANSWER_ID,
-		answer: 'approve',
+		answer: '继续',
 	});
 	assert.deepEqual(handle.answers, [{
 		requestId: 'runtime-structured-input',
@@ -572,7 +572,7 @@ test('queues concurrent Agent inputs and publishes them one at a time', async ()
 		taskId: TASK_ID,
 		inputId: INPUT_ID,
 		answerId: ANSWER_ID,
-		answer: 'approve',
+		answer: '继续',
 	});
 	await waitFor(() =>
 		fixture.events.filter(({ event }) => event.type === 'inputRequired').length === 2,

@@ -928,7 +928,7 @@ function toAgentAnswer(request: AgentInputRequest, answer: string): AgentTaskAns
 		);
 		return {
 			requestId: request.requestId,
-			outcome: selected?.approve === true || ['yes', 'approve', 'accept'].includes(normalized)
+			outcome: selected?.approve === true || isAffirmative(normalized)
 				? 'accept'
 				: 'decline',
 			selectedOptionId: selected?.id,
@@ -937,7 +937,7 @@ function toAgentAnswer(request: AgentInputRequest, answer: string): AgentTaskAns
 	if (request.kind === 'toolAuthentication') {
 		return {
 			requestId: request.requestId,
-			outcome: ['yes', 'approve', 'accept', 'authenticate'].includes(normalized)
+			outcome: isAffirmative(normalized) || normalized === 'authenticate'
 				? 'accept'
 				: 'decline',
 		};
@@ -979,7 +979,7 @@ function parseFieldAnswer(
 			return value;
 		}
 		case 'boolean':
-			if (['true', 'yes', 'approve', 'accept'].includes(trimmed.toLowerCase())) {
+			if (isAffirmative(trimmed.toLowerCase())) {
 				return true;
 			}
 			if (['false', 'no', 'decline', 'deny'].includes(trimmed.toLowerCase())) {
@@ -1006,7 +1006,7 @@ function selectOption(
 	const selected = options?.find((option) =>
 		option.id === answer || option.label.toLowerCase() === normalized,
 	) ?? (
-		['yes', 'approve', 'accept'].includes(normalized)
+		isAffirmative(normalized)
 			? options?.find((option) => /(?:^|[\s_-])(yes|approve|accept|allow)(?:$|[\s_-])/iu.test(
 				`${option.id} ${option.label}`,
 			))
@@ -1019,6 +1019,23 @@ function selectOption(
 		);
 	}
 	return selected.id;
+}
+
+function isAffirmative(answer: string): boolean {
+	return [
+		'yes',
+		'approve',
+		'accept',
+		'continue',
+		'ok',
+		'是',
+		'可以',
+		'继续',
+		'同意',
+		'批准',
+		'确认',
+		'允许',
+	].includes(answer);
 }
 
 function boundUtf8(value: string, maxBytes: number): string {

@@ -35,6 +35,10 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
   turns, exact Artifact ID/media type/153-byte size/SHA-256 consumption, two
   passed validations, aggregate completion, no Listener/Tunnel use, released
   profile lock, and zero owned process/socket residue.
+- Fixed Dashboard input handling so the pending Agent question is shown in the
+  native Extension Host input box without crossing the webview message bus,
+  answers are bound to the exact pending input ID, and common Chinese approval
+  terms such as `继续`、`同意` and `批准` are accepted.
 - Upgraded the production AHP client from the published 0.8.0 tarball to the
   TypeScript 0.9.0 client built from pinned upstream commit
   `f19dd8b3942d029744a3bdd31d830f9428e8ea47`, which negotiates AHP 1.0.0 with

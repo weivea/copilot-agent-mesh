@@ -32,6 +32,14 @@ removal, and task cancellation. The production fallback is
 `UnavailableDashboardFacade`; it reads only the configured device metadata and
 reports services as unavailable. It never creates fake online state or fake tasks.
 
+For task and collaboration input, the webview still sends only the opaque task
+or run ID. The Facade then reads the exact pending `inputId` and question and
+shows that question in a native Extension Host input box. The question is never
+added to the Dashboard ViewModel. Submission is conditional on the same
+`inputId`, preventing an answer from being applied to a newer queued question;
+approval prompts accept `approve`, `continue`, `继续`, `同意`, `批准`, `确认`,
+and `允许`.
+
 ## Message and data boundary
 
 The webview sends only action names and bounded opaque IDs. Connection URLs,

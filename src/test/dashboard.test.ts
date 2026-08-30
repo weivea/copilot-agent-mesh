@@ -475,6 +475,32 @@ suite('Dashboard', () => {
 		assert.doesNotMatch(JSON.stringify(viewModel), /Sensitive prompt body/u);
 	});
 
+	test('shows the exact pending collaboration question in Extension Host UI and answers its exact input', async () => {
+		const services = new RecordingServiceBindings();
+		let shownPrompt: string | undefined;
+		const facade = new ServiceDashboardFacade(
+			services,
+			{ confirm: async () => true },
+			{
+				showInputBox: async (options) => {
+					shownPrompt = options.prompt;
+					return '继续';
+				},
+			},
+		);
+
+		await facade.answerCollaboration('run-1');
+
+		assert.equal(shownPrompt, 'Approve the backend tool call?');
+		assert.deepStrictEqual(services.lastCollaborationAnswer, {
+			runId: 'run-1',
+			taskId: 'task-1',
+			inputId: 'input-1',
+			answer: '继续',
+		});
+		assert.doesNotMatch(JSON.stringify(await services.getSnapshot()), /Approve the backend tool call/u);
+	});
+
 	test('dispatches all dashboard actions without sensitive values in messages', async () => {
 		const extension = getExtension();
 		const facade = new RecordingDashboardFacade();
@@ -642,6 +668,12 @@ class RecordingServiceBindings implements DashboardServiceBindings {
 		readonly title: string;
 		readonly instruction: string;
 	};
+	public lastCollaborationAnswer?: {
+		readonly runId: string;
+		readonly taskId: string;
+		readonly inputId: string;
+		readonly answer: string;
+	};
 
 	public getSnapshot(): Promise<DashboardSnapshot> {
 		return Promise.resolve(snapshot());
@@ -672,11 +704,36 @@ class RecordingServiceBindings implements DashboardServiceBindings {
 	}
 
 	public async cancelTask(_taskId: string): Promise<void> {}
-	public async answerTaskInput(_taskId: string, _answer: string): Promise<void> {}
+	public async getTaskInput(taskId: string) {
+		return {
+			taskId,
+			inputId: 'input-1',
+			question: 'Approve the task tool call?',
+		};
+	}
+	public async answerTaskInput(
+		_taskId: string,
+		_inputId: string,
+		_answer: string,
+	): Promise<void> {}
 	public async startCollaboration(_request: { readonly title: string; readonly goal: string }): Promise<void> {}
 	public async getCollaboration(_runId: string): Promise<void> {}
 	public async cancelCollaboration(_runId: string): Promise<void> {}
-	public async answerCollaboration(_runId: string, _answer: string): Promise<void> {}
+	public async getCollaborationInput(_runId: string) {
+		return {
+			taskId: 'task-1',
+			inputId: 'input-1',
+			question: 'Approve the backend tool call?',
+		};
+	}
+	public async answerCollaboration(
+		runId: string,
+		taskId: string,
+		inputId: string,
+		answer: string,
+	): Promise<void> {
+		this.lastCollaborationAnswer = { runId, taskId, inputId, answer };
+	}
 }
 
 class TestWebview implements vscode.Webview {
