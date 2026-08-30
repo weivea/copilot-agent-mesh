@@ -3,6 +3,7 @@ import { z } from 'zod';
 import {
 	ACTIVE_TASK_STATUSES,
 	LOCAL_BROKER_METHODS,
+	LOCAL_BROKER_TASK_START_TIMEOUT_MS,
 	MESH_ERROR_CODES,
 	nodeTaskAnswerParamsSchema,
 	nodeTaskCancelParamsSchema,
@@ -481,6 +482,15 @@ export class BrokerTaskService {
 		void this.trackOperation(tracked);
 	}
 
+	/**
+	 * Bounds the Node start request by the Agent start allowance, never waiting past the
+	 * task's own worker deadline.
+	 */
+	private taskStartTimeoutMs(workerDeadline: string): number {
+		const remainingMs = Date.parse(workerDeadline) - this.clock.now().valueOf();
+		return Math.max(1, Math.min(LOCAL_BROKER_TASK_START_TIMEOUT_MS, remainingMs));
+	}
+
 	private async dispatchStart(
 		ownerId: string,
 		params: RoutedTaskStartParams,
@@ -496,6 +506,7 @@ export class BrokerTaskService {
 					authenticatedOwnerId: ownerId,
 					sourceLabel: sourceLabel ?? params.sourceNodeId ?? ownerId,
 				}),
+				this.taskStartTimeoutMs(params.workerDeadline),
 			);
 			result = nodeTaskStartedResultSchema.parse(rawResult);
 			if (

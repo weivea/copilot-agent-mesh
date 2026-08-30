@@ -25,9 +25,10 @@ The application creates:
 
 Worker Preview platform eligibility is deliberately limited to **macOS arm64**. That is the
 only platform with both the exact-gated Dev Tunnel build and reliable owned Agent
-Host process control validated together. Authenticated end-to-end AHP execution
-remains behind compatibility Gate G0 and is not claimed complete. Windows, Linux, macOS x64, and other
-architectures are Coordinator-only when peer-client networking is available.
+Host process control validated together. Authenticated end-to-end AHP
+start/output/cancel has passed compatibility Gate G0 on that scope. Windows,
+Linux, macOS x64, and other architectures are Coordinator-only when peer-client
+networking is available.
 
 On a Coordinator-only platform, Listener start fails before spawning with stable
 `CLI_UNSUPPORTED`, and Agent Host probe/start returns stable

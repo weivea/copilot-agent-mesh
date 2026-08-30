@@ -638,6 +638,34 @@ test('start failure cleans the task, AHP connection, and owned host without losi
 	assert.equal(transport.shutdownCalls, 2);
 });
 
+test('provisional Session dispatches its first turn before session/ready', async () => {
+	const transport = new FakeAhpTransport();
+	transport.sessionStartsProvisional = true;
+	const launcher = new FakeLauncher();
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+
+	const handle = await runtime.start(taskRequest());
+	assert.equal(transport.dispatched[0]?.action.type, 'chat/turnStarted');
+	assert.equal(transport.dispatched[0]?.channel, transport.sessionDefaultChat);
+	await handle.dispose();
+});
+
+test('AHP 0.8 creationFailed Session snapshots fail with the reported error', async () => {
+	const transport = new FakeAhpTransport();
+	transport.sessionCreationFailed = true;
+	const launcher = new FakeLauncher();
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+
+	await assert.rejects(
+		runtime.start(taskRequest()),
+		(error: unknown) =>
+			error instanceof AgentRuntimeError
+			&& error.code === 'TASK_EXECUTION_FAILED'
+			&& error.message === 'Legacy Session creation failed.',
+	);
+	assert.equal(launcher.host.disposed, true);
+});
+
 test('connection failure cleans the detached owned host before surfacing startup failure', async () => {
 	const launcher = new FakeLauncher();
 	const runtime = new AhpAgentRuntime({
@@ -749,7 +777,7 @@ test('startup observes terminal actions delivered immediately after turn dispatc
 	assert.equal(launcher.host.disposed, true);
 });
 
-test('disposing runtime rejects pending Session readiness without waiting for timeout', async () => {
+test('disposing runtime rejects a pending default Chat without waiting for timeout', async () => {
 	const transport = new FakeAhpTransport();
 	transport.sessionStartsPending = true;
 	const launcher = new FakeLauncher();
@@ -1390,6 +1418,80 @@ test('snapshot recovery fails when the active chat snapshot is missing', async (
 	await handle.dispose();
 });
 
+test('snapshot recovery reports the durable AHP 1.0 error response part', async () => {
+	const first = new FakeAhpTransport();
+	const recovered = new FakeAhpTransport();
+	const runtime = createRuntime(new FakeLauncher(), new FakeConnectionFactory([first, recovered]));
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+	const turnId = first.dispatched[0]?.action.turnId;
+	assert.equal(typeof turnId, 'string');
+	recovered.created = first.created;
+	recovered.reconnectResult = {
+		type: 'snapshot',
+		snapshots: [
+			{
+				resource: 'ahp-root://',
+				fromSeq: 10,
+				state: {
+					agents: [{
+						provider: 'dynamic-provider',
+						displayName: 'Dynamic Provider',
+						description: 'Test provider',
+						models: [],
+						protectedResources: [protectedResource],
+					}],
+					terminals: [],
+				},
+			} as Snapshot,
+			{
+				resource: first.created!.sessionUri,
+				fromSeq: 10,
+				state: {
+					resource: first.created!.sessionUri,
+					provider: 'dynamic-provider',
+					title: 'Task',
+					status: 2,
+					lifecycle: 'ready',
+					activeClients: [],
+					chats: [],
+					defaultChat: 'ahp-chat:/default',
+				},
+			} as Snapshot,
+			{
+				resource: 'ahp-chat:/default',
+				fromSeq: 10,
+				state: {
+					resource: 'ahp-chat:/default',
+					title: 'Recovered',
+					status: 2,
+					modifiedAt: new Date(0).toISOString(),
+					activeTurn: undefined,
+					turns: [{
+						id: turnId,
+						message: { text: 'safe', origin: { kind: 'user' } },
+						responseParts: [{
+							kind: 'error',
+							error: { message: 'Durable AHP 1.0 failure.' },
+						}],
+						usage: undefined,
+						state: 'error',
+					}],
+				},
+			} as Snapshot,
+		],
+	};
+
+	first.failChat();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	const failed = await nextEvent(handle.events);
+	assert.equal(failed.type, 'failed');
+	if (failed.type === 'failed') {
+		assert.equal(failed.error.message, 'Durable AHP 1.0 failure.');
+	}
+	await handle.dispose();
+});
+
 test('VS Code auth broker is silent-first, requires explicit interaction, and only succeeds after AHP accepts', async () => {
 	const calls: unknown[] = [];
 	const authentication: AuthenticationApi = {
@@ -1479,6 +1581,31 @@ test('event mapper reports authoritative turn completion and bounded terminal su
 		type: 'terminal/data',
 		data: '\u001B[31mhello\u001B[0m',
 	}, 11)), [{ type: 'terminal', summary: 'hello' }]);
+});
+
+test('event mapper accepts AHP 1.0 and 0.8 turn error shapes', () => {
+	const mapper = new AhpEventMapper();
+	const actions = [
+		{
+			type: 'chat/error',
+			turnId: 'turn-1',
+			duration: 1,
+			part: { kind: 'error', error: { message: 'AHP 1.0 failure.' } },
+		},
+		{
+			type: 'chat/error',
+			turnId: 'turn-2',
+			duration: 1,
+			error: { message: 'AHP 0.8 failure.' },
+		},
+	];
+	for (const [index, action] of actions.entries()) {
+		const [mapped] = mapper.map(envelope('ahp-chat:/default', action, 12 + index));
+		assert.equal(mapped?.type, 'failed');
+		if (mapped?.type === 'failed') {
+			assert.equal(mapped.error.message, index === 0 ? 'AHP 1.0 failure.' : 'AHP 0.8 failure.');
+		}
+	}
 });
 
 test('event mapper routes MCP authentication through a protected-resource challenge', () => {
@@ -1893,6 +2020,8 @@ class FakeAhpTransport implements AhpConnection {
 	completeAfterTurnDispatch = false;
 	ignoreSubscribeAbort = false;
 	sessionStartsPending = false;
+	sessionStartsProvisional = false;
+	sessionCreationFailed = false;
 	sessionDefaultChat = 'ahp-chat:/default';
 	blockSessionSubscriptions = false;
 	notificationDuringInitialize: readonly ProtectedResource[] = [];
@@ -2031,7 +2160,14 @@ class FakeAhpTransport implements AhpConnection {
 						provider: 'dynamic-provider',
 						title: 'Task',
 						status: 1,
-						lifecycle: this.sessionStartsPending ? 'creating' : 'ready',
+						lifecycle: this.sessionCreationFailed
+							? 'creationFailed'
+							: this.sessionStartsPending || this.sessionStartsProvisional
+								? 'creating'
+								: 'ready',
+						...(this.sessionCreationFailed
+							? { creationError: { message: 'Legacy Session creation failed.' } }
+							: {}),
 						activeClients: [],
 						chats: [],
 						defaultChat: this.sessionStartsPending ? undefined : this.sessionDefaultChat,

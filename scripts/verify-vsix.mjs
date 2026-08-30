@@ -19,7 +19,7 @@ const expected = [
 	'extension/media/dashboard.js',
 	'extension/package.json',
 	'extension/readme.md',
-	'extension/vendor/microsoft-agent-host-protocol-LICENSE.txt',
+	'extension/third_party/agent-host-protocol/LICENSE',
 ].sort();
 
 const prohibited = [

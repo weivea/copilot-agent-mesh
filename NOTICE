@@ -4,12 +4,13 @@ Copyright (c) 2026 Copilot Agent Mesh contributors
 This Preview bundles code from the following runtime dependencies in
 dist/extension.js. Development-only packages are not distributed in the VSIX.
 
-@microsoft/agent-host-protocol 0.8.0
+@microsoft/agent-host-protocol 0.9.0
 Copyright (c) Microsoft Corporation
 License: MIT
 Source: https://github.com/microsoft/agent-host-protocol
+Pinned commit: f19dd8b3942d029744a3bdd31d830f9428e8ea47
 The complete license is distributed as
-vendor/microsoft-agent-host-protocol-LICENSE.txt.
+third_party/agent-host-protocol/LICENSE.
 
 zod 4.1.11
 Copyright (c) 2025 Colin McDonnell

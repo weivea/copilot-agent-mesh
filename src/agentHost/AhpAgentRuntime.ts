@@ -32,7 +32,7 @@ import type { AgentHostLauncherLike, LaunchedAgentHost } from './AgentHostLaunch
 import type { AuthBroker, ProtectedResource } from './AuthBroker';
 
 const rootUri = 'ahp-root://';
-const sessionReadyTimeoutMs = 60_000;
+const sessionDefaultChatTimeoutMs = 60_000;
 const cancellationTimeoutMs = 15_000;
 
 interface AuthenticationInFlight {
@@ -448,7 +448,6 @@ class AhpTask implements AgentTaskHandle {
 	private chatUri: string | undefined;
 	private turnId: string | undefined;
 	private provider: AgentInfo | undefined;
-	private sessionReady = false;
 	private sessionDefaultChat: string | undefined;
 	private sessionDefaultChatState: 'unknown' | 'available' | 'cleared' = 'unknown';
 	private sessionDefaultChatRevision = 0;
@@ -457,8 +456,6 @@ class AhpTask implements AgentTaskHandle {
 	private terminal = false;
 	private disposed = false;
 	private recovering = false;
-	private readyResolve: (() => void) | undefined;
-	private readyReject: ((error: Error) => void) | undefined;
 	private defaultChatResolve: ((uri: string) => void) | undefined;
 	private defaultChatReject: ((error: Error) => void) | undefined;
 	private cancellationTimer: NodeJS.Timeout | undefined;
@@ -562,10 +559,11 @@ class AhpTask implements AgentTaskHandle {
 		this.throwIfTerminalError();
 
 		await this.ensureStartupSubscription(this.sessionUri);
-		await Promise.all([
-			this.waitForReady(),
-			this.waitForDefaultChat(),
-		]);
+		// AHP 1.0 providers may create a provisional Session whose lifecycle stays
+		// `creating` until its first turn materializes it. The default Chat is the
+		// readiness boundary for that first dispatch; waiting for `session/ready`
+		// here would deadlock with such providers.
+		await this.waitForDefaultChat();
 		this.throwIfTerminalError();
 		await this.waitForStartupRecovery();
 		while (true) {
@@ -666,7 +664,6 @@ class AhpTask implements AgentTaskHandle {
 			'TASK_EXECUTION_FAILED',
 			'The Agent Host task was disposed during startup.',
 		);
-		this.readyReject?.(startupStopped);
 		this.defaultChatReject?.(startupStopped);
 		if (this.cancellationTimer !== undefined) {
 			clearTimeout(this.cancellationTimer);
@@ -1100,12 +1097,8 @@ class AhpTask implements AgentTaskHandle {
 			}
 		}
 		if (envelope.channel === this.sessionUri) {
-			if (action.type === 'session/ready') {
-				this.sessionReady = true;
-				this.readyResolve?.();
-			} else if (action.type === 'session/creationFailed') {
+			if (action.type === 'session/creationFailed') {
 				const error = new AgentRuntimeError('TASK_EXECUTION_FAILED', safeMessage(action.error.message));
-				this.readyReject?.(error);
 				this.defaultChatReject?.(error);
 				this.fail(error);
 			} else if (action.type === 'session/defaultChatChanged') {
@@ -1194,19 +1187,16 @@ class AhpTask implements AgentTaskHandle {
 		this.lastSeenServerSeq = Math.max(this.lastSeenServerSeq, snapshot.fromSeq);
 		if (snapshot.resource === this.sessionUri) {
 			const state = snapshot.state as SessionState;
-			if (state.lifecycle === 'creationFailed') {
+			const lifecycle = String(state.lifecycle);
+			if (lifecycle === 'failed' || lifecycle === 'creationFailed') {
 				throw new AgentRuntimeError(
 					'TASK_EXECUTION_FAILED',
 					safeMessage(state.creationError?.message ?? 'Agent session creation failed.'),
 				);
 			}
-			if (state.lifecycle === 'ready') {
-				this.sessionReady = true;
-				this.readyResolve?.();
-			}
 			if (state.defaultChat !== undefined) {
 				this.updateSessionDefaultChat(state.defaultChat);
-			} else if (state.lifecycle === 'ready') {
+			} else if (lifecycle === 'ready') {
 				this.updateSessionDefaultChat(undefined);
 			}
 			return;
@@ -1255,12 +1245,12 @@ class AhpTask implements AgentTaskHandle {
 		} else if (turn.state === 'cancelled') {
 			await this.emitMappedEvents([{ type: 'cancelled' }]);
 		} else if (turn.state === 'error') {
-			const message = isRecord(turn.error) && typeof turn.error.message === 'string'
-				? turn.error.message
-				: 'The recovered Agent Host turn failed.';
 			await this.emitMappedEvents([{
 				type: 'failed',
-				error: new AgentRuntimeError('TASK_EXECUTION_FAILED', safeMessage(message)),
+				error: new AgentRuntimeError(
+					'TASK_EXECUTION_FAILED',
+					safeMessage(recoveredTurnErrorMessage(turn)),
+				),
 			}]);
 		}
 	}
@@ -1397,16 +1387,6 @@ class AhpTask implements AgentTaskHandle {
 		}
 	}
 
-	private waitForReady(): Promise<void> {
-		if (this.sessionReady) {
-			return Promise.resolve();
-		}
-		return withTimeout(new Promise<void>((resolvePromise, reject) => {
-			this.readyResolve = resolvePromise;
-			this.readyReject = reject;
-		}), sessionReadyTimeoutMs, 'The Agent Host session did not become ready.');
-	}
-
 	private waitForDefaultChat(): Promise<string> {
 		if (this.sessionDefaultChatState === 'available' && this.sessionDefaultChat !== undefined) {
 			return Promise.resolve(this.sessionDefaultChat);
@@ -1420,7 +1400,7 @@ class AhpTask implements AgentTaskHandle {
 		return withTimeout(new Promise<string>((resolvePromise, reject) => {
 			this.defaultChatResolve = resolvePromise;
 			this.defaultChatReject = reject;
-		}), sessionReadyTimeoutMs, 'The Agent Host session did not publish a default chat.');
+		}), sessionDefaultChatTimeoutMs, 'The Agent Host session did not publish a default chat.');
 	}
 
 	private updateSessionDefaultChat(defaultChat: string | undefined): void {
@@ -1827,7 +1807,6 @@ class AhpTask implements AgentTaskHandle {
 			return;
 		}
 		this.terminalError = error;
-		this.readyReject?.(error);
 		this.defaultChatReject?.(error);
 		this.terminal = true;
 		void this.events.pushAndClose({ type: 'failed', error }).then(() => this.finishTerminal());
@@ -2066,6 +2045,26 @@ function combineRuntimeErrors(primary: AgentRuntimeError, cleanup: AgentRuntimeE
 		], 'The Agent Host operation and its resource cleanup both failed.'),
 		true,
 	);
+}
+
+function recoveredTurnErrorMessage(turn: Record<string, unknown>): string {
+	if (Array.isArray(turn.responseParts)) {
+		for (let index = turn.responseParts.length - 1; index >= 0; index -= 1) {
+			const part = turn.responseParts[index];
+			if (
+				isRecord(part)
+				&& part.kind === 'error'
+				&& isRecord(part.error)
+				&& typeof part.error.message === 'string'
+			) {
+				return part.error.message;
+			}
+		}
+	}
+	if (isRecord(turn.error) && typeof turn.error.message === 'string') {
+		return turn.error.message;
+	}
+	return 'The recovered Agent Host turn failed.';
 }
 
 function safeCleanupResource(uri: string): string {

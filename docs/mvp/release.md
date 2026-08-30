@@ -1,7 +1,7 @@
 # Preview release engineering
 
 > Version: `0.2.0` Preview
-> Gate status: G0 **No-Go**
+> Gate status: G0 **Go for validated macOS arm64 scope**
 
 This document describes a reproducible evaluation package. It does not authorize
 Marketplace publication, GitHub release creation, or promotion to general
@@ -45,6 +45,7 @@ downloads, installs, or upgrades the CLI.
 Use Node.js 22 or newer:
 
 ```sh
+git submodule update --init --recursive
 npm ci
 npm audit --audit-level=high
 npm run verify
@@ -68,8 +69,8 @@ npm run package:vsix
 `vsce ls`, and verifies the ZIP central directory against an exact allowlist.
 Only the production bundle, media, extension manifest, release documents,
 project notices, and the AHP license are permitted. AHP runtime code is already
-in the esbuild output, so its source tarball and every other nested archive are
-rejected alongside source, tests, shared TypeScript, build output, test
+in the esbuild output, so the AHP source submodule and every nested archive are
+excluded alongside source, tests, shared TypeScript, build output, test
 downloads, source maps, credentials, and external CLIs.
 
 Inspect and hash the result independently:
@@ -99,17 +100,27 @@ must observe multiple Window Nodes, exactly one generation-fenced Broker,
 workspace claim/reclaim and conflicts, takeover, and complete process/socket
 cleanup while the local task route leaves Dev Tunnel untouched.
 
-The real AHP task path is a separate opt-in and may consume quota:
+The real AHP task path is a separate opt-in and may consume quota. Its persistent
+profile must be a dedicated absolute directory and must first be signed into
+GitHub interactively; the harness rejects overlap with real VS Code profiles and
+aborts non-destructively if the dedicated profile is already locked or in use:
 
 ```sh
+MESH_MULTI_WINDOW_E2E=1 \
+MESH_MULTI_WINDOW_E2E_TASKS=1 \
+MESH_MULTI_WINDOW_E2E_PROFILE_DIR=$HOME/.mw-profile \
+MESH_MULTI_WINDOW_E2E_AUTH_RESOURCE='https://api.github.com' \
+MESH_MULTI_WINDOW_E2E_AUTH_PROVIDER='github' \
+MESH_MULTI_WINDOW_E2E_AUTH_SCOPES_JSON='["read:user","user:email"]' \
 MESH_MULTI_WINDOW_E2E_RUNTIME_DIR=$HOME/.mw \
-MESH_MULTI_WINDOW_E2E_TASKS=1 npm run test:multi-window-real
+npm run test:multi-window-real
 ```
 
-The recorded opted-in run passed infrastructure/lifecycle assertions but stopped
-correctly at `AGENT_AUTH_REQUIRED` because the fresh shared profile had no
-authentication mapping/session. It did not prove authoritative AHP
-start/get/cancel/output, so G0 remains No-Go.
+Evidence `2ab62a03-51ba-45ef-a01a-0e3829f7ae7c` passed with an accepted
+authentication session, `agentStarted`, five output events,
+`AgentTaskHandle.cancel()`, authoritative `cancelled`, and zero owned process,
+socket, or Tunnel residue. G0 is Go only for this validated macOS arm64 Preview
+scope.
 
 ## Isolated activation smoke
 
@@ -153,4 +164,4 @@ an ordinary unit/component gate. Its AHP branch must never run unless
 5. Record the commit SHA, VSIX SHA-256, verified archive listing, and sanitized
    multi-window evidence.
 6. Transfer the VSIX only as an explicitly labeled Preview evaluation artifact.
-7. Do not publish, push, create a release, or claim G0 completion from this procedure.
+7. Do not publish, push, or create a release without explicit authorization.

@@ -1,8 +1,8 @@
 # MVP real VS Code E2E
 
-> Evidence date: 2026-08-25
-> Baseline: local `mvp-e2e-base` at `06775c7e2e8a18f7771507e4a739fad0b865d9a0`
-> Platform: macOS arm64, VS Code `1.134.0`
+> Evidence date: 2026-08-30
+> Development baseline: `d5555172b5b6d37200f24f351678adc9ab201593`
+> Final platform: macOS arm64, VS Code `1.135.0`
 
 ## Opt-in boundary
 
@@ -43,10 +43,30 @@ Optional authentication mapping uses
 silent session is unavailable; the harness then records no authoritative
 start/get/cancel/output evidence.
 
+`MESH_MULTI_WINDOW_E2E_PROFILE_DIR` is an explicit opt-in persistent profile
+base. It must be an absolute, dedicated path outside the per-run runtime and must
+not overlap known real VS Code user-data or extension directories. The harness
+retains its `user-data` child across runs, resets only Copilot Agent Mesh global
+storage for deterministic Device/Node assertions, acquires an exclusive profile
+lock, refuses to terminate a pre-existing profile user, and never defaults to
+the developer's profile. The final authenticated command was:
+
+```sh
+MESH_MULTI_WINDOW_E2E=1 \
+MESH_MULTI_WINDOW_E2E_TASKS=1 \
+MESH_MULTI_WINDOW_E2E_PROFILE_DIR=$HOME/.mw-profile \
+MESH_MULTI_WINDOW_E2E_AUTH_RESOURCE='https://api.github.com' \
+MESH_MULTI_WINDOW_E2E_AUTH_PROVIDER='github' \
+MESH_MULTI_WINDOW_E2E_AUTH_SCOPES_JSON='["read:user","user:email"]' \
+MESH_MULTI_WINDOW_E2E_RUNTIME_DIR=$HOME/.mw \
+npm run test:multi-window-real
+```
+
 ## Same-profile multi-window flow
 
-The multi-window harness uses exactly one temporary `--user-data-dir` and one
-`--extensions-dir` for every ordinary VS Code window. Each Extension Host creates
+The multi-window harness uses exactly one `--user-data-dir` and one temporary
+`--extensions-dir` for every ordinary VS Code window. User Data is temporary by
+default and persistent only through the explicit opt-in above. Each Extension Host creates
 a Window Node with process-lifetime random `nodeId`/`nodeInstanceId`, heartbeats,
 workspace claims, and its own real AHP runtime/handles. A nonce-authenticated test
 controller selects a mailbox by workspace basename plus node instance ID.
@@ -93,9 +113,28 @@ assertions:
 - takeover in 1683 ms with the same `workspaceId`; and
 - zero Tunnel/socket/process residue.
 
-That run correctly stopped at `AGENT_AUTH_REQUIRED` because the fresh shared
-profile had no authentication mapping/session. It did **not** prove authoritative
-AHP start/get/cancel/output. Gate G0 therefore remains **No-Go**.
+That historical run correctly stopped at `AGENT_AUTH_REQUIRED` because the fresh
+shared profile had no authentication mapping/session. It did not count as task
+success.
+
+The final authenticated run passed on VS Code `1.135.0`, macOS arm64:
+
+- `.vscode-test/multi-window-evidence/2ab62a03-51ba-45ef-a01a-0e3829f7ae7c.json`
+- one authenticated session was available and the task emitted
+  `agentStartRequested → agentStarted → output` (five output events);
+- source-side start/get/cancel and terminal observations were authoritative;
+- `AgentTaskHandle.cancel()` was invoked, followed by `cancelRequested` and
+  `cancelConfirmed`, and the task reached `cancelled`;
+- two nodes were visible in 133 ms, repo-b was offline in 210 ms, the same
+  `workspaceId` was reclaimed, and Broker takeover completed in 1878 ms;
+- the duplicate workspace conflict and no-Tunnel sentinel assertions passed; and
+- cleanup recorded zero Agent Host, VS Code, and Dev Tunnel processes, removed
+  the local IPC socket and per-run runtime, released the profile lock, and left
+  no owned residue.
+
+The evidence stores event kinds and booleans only; it contains no token, account,
+path, raw prompt, or raw output. Gate G0 is therefore **Go for the validated
+macOS arm64 Preview scope**.
 
 The real two-device v2 run also passed one-Tunnel pairing, explicit remote
 Device → Node → Workspace discovery, and durable task acceptance. The Worker
@@ -207,14 +246,15 @@ only `MESH_TWO_INSTANCE_E2E_OK` and forbids file changes and commands.
 | 5 | Display/copy connection URL | Pass | Production invitation creation returned a valid HTTPS URL to in-memory IPC; the secret was not persisted as evidence. |
 | 6 | Add, save, and delete a connection | Partial | Real add/pair/save passed. Peer deletion is covered offline but was not exercised in this real run. |
 | 7 | Connection state, heartbeat, and workspace list UI | Pass | Production dashboard/directory observed the peer online and its workspace over the real Tunnel. |
-| 8 | Five mesh language-model tools | Partial | Offline extension/tool suites cover all five tools; real delegation/polling used the same `TaskCoordinator`, but an authenticated Copilot did not invoke the LM tools. |
-| 9 | macOS arm64 Worker invokes built-in Copilot over AHP | Blocked | Real production AHP launched and probed, but the isolated profile had no explicit VS Code authentication mapping/session; task failed correctly with `AGENT_AUTH_REQUIRED` before `agentStarted`, runtime-handle cancellation, Session completion, or `turnComplete`. |
-| 10 | Coordinator UI shows task state/output summary | Partial | The real auth failure was observable through production snapshots; cancellation was blocked before `agentStarted`, and no authenticated text output or visual UI assertion was available. |
-| 11 | `mesh_get_task` returns completion result to Copilot | Partial | Real result polling traversed Coordinator/Gateway/Worker; authenticated Copilot tool invocation and a completed AHP result remain blocked by item 9. |
+| 8 | Five mesh language-model tools | Partial | Offline extension/tool suites cover all five tools; authenticated real delegation/polling used the same production services, but Copilot itself did not invoke the LM tools. |
+| 9 | macOS arm64 Worker invokes built-in Copilot over AHP | Pass | VS Code 1.135.0 authenticated through the explicit GitHub mapping. The real production AHP task emitted `agentStarted` and five output events, invoked `AgentTaskHandle.cancel()`, and reached authoritative `cancelled`. |
+| 10 | Coordinator UI shows task state/output summary | Partial | Production source-side snapshots exposed authenticated output and cancellation state, but the harness did not make a visual Dashboard assertion. |
+| 11 | `mesh_get_task` returns completion result to Copilot | Partial | Real source-side polling traversed the production Broker/Node route and returned output/cancellation events; Copilot LM-tool invocation and a completed (rather than cancelled) task result remain unverified. |
 | 12 | Multiple workspaces, one writer per workspace | Partial | Lease/concurrency behavior passes offline; this real run registered one temporary workspace. |
 | 13 | No Git/worktree management or injected Git prompt | Pass | Production request forwards the supplied prompt/criteria only; the real prompts contained no Git operation and the harness performed no repository mutation in the Worker workspace. |
 
-This earlier two-instance matrix remains historical evidence. The current hard
-runtime blocker is explicit authentication for a disposable Worker profile;
-OS/UI/multi-workspace coverage and an authenticated authoritative turn remain
-required before G0 can change.
+This earlier two-instance matrix remains historical evidence. G0 is closed by the
+authenticated same-user-data multi-window turn above. Cross-platform Worker
+hosting, visual UI coverage, multi-workspace real coverage, authenticated
+two-device execution, and Copilot-driven LM-tool invocation remain outside the
+validated scope.

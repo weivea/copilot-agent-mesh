@@ -1,0 +1,4 @@
+[submodule "third_party/agent-host-protocol"]
+	path = third_party/agent-host-protocol
+	url = https://github.com/microsoft/agent-host-protocol
+	branch = main

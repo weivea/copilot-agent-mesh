@@ -338,6 +338,15 @@ export const LOCAL_BROKER_METHODS = {
 	remoteTaskAnswer: 'broker.remote.task.answer',
 } as const;
 
+/**
+ * Upper bound for the Broker → Window Node `node.task.start` request.
+ *
+ * Starting a real Agent turn spawns and authenticates an Agent Host before the Node can
+ * answer, which routinely exceeds the transport's ordinary request timeout. The bound stays
+ * finite so a wedged Node still fails the request instead of pinning the session forever.
+ */
+export const LOCAL_BROKER_TASK_START_TIMEOUT_MS = 180_000;
+
 export const localBrokerMethodParamsSchemas = {
 	[LOCAL_BROKER_METHODS.register]: nodeRegisterParamsSchema,
 	[LOCAL_BROKER_METHODS.heartbeat]: nodeHeartbeatParamsSchema,

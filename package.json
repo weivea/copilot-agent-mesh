@@ -42,7 +42,7 @@
     "LICENSE",
     "NOTICE",
     "docs/mvp/release.md",
-    "vendor/microsoft-agent-host-protocol-LICENSE.txt"
+    "third_party/agent-host-protocol/LICENSE"
   ],
   "capabilities": {
     "untrustedWorkspaces": {
@@ -490,6 +490,10 @@
     }
   },
   "scripts": {
+    "ahp:build": "node scripts/build-agent-host-protocol.mjs",
+    "prepare": "node scripts/build-agent-host-protocol.mjs",
+    "precheck-types": "npm run ahp:build",
+    "precompile-tests": "npm run ahp:build",
     "vscode:prepublish": "npm run bundle",
     "compile": "npm run check-types && npm run lint && node esbuild.js",
     "bundle": "npm run check-types && npm run lint && node esbuild.js --production",
@@ -528,6 +532,8 @@
     "esbuild": "^0.28.1",
     "eslint": "^10.5.0",
     "npm-run-all": "^4.1.5",
+    "ts-morph": "^28.0.0",
+    "tsx": "^4.19.0",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.61.1"
   },
@@ -536,7 +542,7 @@
     "serialize-javascript": "^7.0.6"
   },
   "dependencies": {
-    "@microsoft/agent-host-protocol": "file:vendor/microsoft-agent-host-protocol-0.8.0.tgz",
+    "@microsoft/agent-host-protocol": "file:third_party/agent-host-protocol/clients/typescript",
     "ws": "8.21.3",
     "zod": "4.1.11"
   }

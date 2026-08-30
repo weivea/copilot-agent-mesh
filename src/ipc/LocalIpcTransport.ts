@@ -306,8 +306,12 @@ export class LocalIpcSession {
 		this.peer.attachSession(this);
 	}
 
-	public request<T extends JsonValue = JsonValue>(method: string, params: JsonValue): Promise<T> {
-		return this.peer.request(method, params) as Promise<T>;
+	public request<T extends JsonValue = JsonValue>(
+		method: string,
+		params: JsonValue,
+		timeoutMs?: number,
+	): Promise<T> {
+		return this.peer.request(method, params, timeoutMs) as Promise<T>;
 	}
 
 	public notify(method: string, params: JsonValue): Promise<void> {
@@ -751,12 +755,20 @@ class IpcPeer {
 		});
 	}
 
-	public request(method: string, params: JsonValue): Promise<JsonValue> {
+	public request(method: string, params: JsonValue, timeoutMs?: number): Promise<JsonValue> {
 		if (this.state !== 'authenticated') {
 			return Promise.reject(new Error('Local IPC session is not authenticated.'));
 		}
 		if (this.pendingRequests.size >= this.maxPendingRequests) {
 			return Promise.reject(new Error('Local IPC pending request limit exceeded.'));
+		}
+		let effectiveTimeoutMs: number;
+		try {
+			effectiveTimeoutMs = timeoutMs === undefined
+				? this.requestTimeoutMs
+				: boundedPositiveInteger(timeoutMs, 'request timeout', MAX_CONFIGURED_TIMEOUT_MS);
+		} catch (error: unknown) {
+			return Promise.reject(safeError(error, 'Invalid local IPC request timeout.'));
 		}
 		const id = randomBytes(16).toString('base64url');
 		return new Promise<JsonValue>((resolve, reject) => {
@@ -764,7 +776,7 @@ class IpcPeer {
 				if (this.pendingRequests.has(id)) {
 					this.fail(new Error('Local IPC request timed out.'));
 				}
-			}, this.requestTimeoutMs);
+			}, effectiveTimeoutMs);
 			this.pendingRequests.set(id, { resolve, reject, timer });
 			void this.send({
 				kind: 'request',

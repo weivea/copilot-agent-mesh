@@ -19,8 +19,8 @@ import {
 } from './ownedProcess';
 
 const optInEnvironmentVariable = 'MESH_AGENT_HOST_E2E';
-const expectedAhpPackageVersion = '0.8.0';
-const expectedAhpDependency = 'file:vendor/microsoft-agent-host-protocol-0.8.0.tgz';
+const expectedAhpPackageVersion = '0.9.0';
+const expectedAhpDependency = 'file:third_party/agent-host-protocol/clients/typescript';
 const startupTimeoutMs = 30_000;
 const commandTimeoutMs = 10_000;
 const webSocketTimeoutMs = 10_000;

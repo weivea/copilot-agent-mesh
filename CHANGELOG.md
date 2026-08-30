@@ -6,6 +6,25 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [Unreleased]
 
+- Upgraded the production AHP client from the published 0.8.0 tarball to the
+  TypeScript 0.9.0 client built from pinned upstream commit
+  `f19dd8b3942d029744a3bdd31d830f9428e8ea47`, which negotiates AHP 1.0.0 with
+  VS Code 1.135.0. The upstream source is an explicit Git submodule because this
+  client revision is not yet tagged or published to npm. This is the newest
+  upstream commit before `60706330` changed the offer to AHP 0.9.0, which is
+  incompatible with the tested VS Code Host's `^1.0.0` requirement.
+- Added an opt-in persistent real-E2E profile, guarded against overlap with real
+  VS Code user-data directories, so an interactive GitHub session can be reused
+  without changing the default disposable-profile behavior.
+- Fixed AHP 1.0 provisional Session startup: the first turn is dispatched once
+  the default Chat is available rather than deadlocking while waiting for
+  `session/ready`. Extended only the bounded Broker-to-Node task-start request
+  timeout so real Agent startup does not close the local IPC transport.
+- Passed Gate G0 for the macOS arm64 Preview scope on VS Code 1.135.0. Evidence
+  `2ab62a03-51ba-45ef-a01a-0e3829f7ae7c` records an authenticated real turn with
+  `agentStarted`, five output events, `AgentTaskHandle.cancel()`, authoritative
+  `cancelled`, and zero owned Tunnel/socket/Agent Host/VS Code process residue.
+
 ## [0.2.0 Preview] - 2026-08-25
 
 - Added protocol v2; v1 peers are explicitly incompatible.
