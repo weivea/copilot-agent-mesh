@@ -1,6 +1,7 @@
 const maximumCanonicalLength = 16 * 1024;
 const maximumDecodeRounds = 4;
 const maximumUriInspectionDepth = 4;
+const credentialObfuscationPattern = /[\u0000-\u001f\u007f-\u009f\p{Cf}]/gu;
 const sensitiveCredentialKeySuffixes = [
 	'apikey',
 	'authorization',
@@ -29,11 +30,10 @@ export function containsUnsafeDashboardText(value: string): boolean {
 }
 
 export function containsCredentialText(value: string): boolean {
-	if (containsCredentialTextRaw(value)) {
-		return true;
-	}
 	const canonicalForms = canonicalizePercentEncoding(value);
-	return canonicalForms === undefined || canonicalForms.some(containsCredentialTextRaw);
+	return canonicalForms === undefined || canonicalForms.some((form) =>
+		containsCredentialTextRaw(form)
+		|| containsCredentialTextRaw(form.replace(credentialObfuscationPattern, '')));
 }
 
 function containsUnsafeDashboardTextAtDepth(value: string, depth: number): boolean {

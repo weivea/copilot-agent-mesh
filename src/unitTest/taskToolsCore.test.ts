@@ -38,6 +38,47 @@ const NODE_ID = '00000000-0000-4000-8000-000000000009';
 const NODE_INSTANCE_ID = '00000000-0000-4000-8000-00000000000a';
 const SOURCE_NODE_ID = '00000000-0000-4000-8000-00000000000b';
 const SOURCE_WORKSPACE_IDENTITY = `sha256:${'A'.repeat(43)}`;
+const ENCODED_CONTROL_CREDENTIAL_FIELDS = encodedControlCredentialFields();
+
+function encodedControlCredentialFields(): string[] {
+	const controls = [
+		{ name: 'c0', value: '\u0001' },
+		{ name: 'c1', value: '\u0080' },
+		{ name: 'format', value: '\u200c' },
+	];
+	const positions = ['start', 'middle', 'end'] as const;
+	const fields: string[] = [];
+	let index = 0;
+	for (const control of controls) {
+		for (let rounds = 1; rounds <= 3; rounds += 1) {
+			let encoded = control.value;
+			for (let round = 0; round < rounds; round += 1) {
+				encoded = encodeURIComponent(encoded);
+			}
+			for (const position of positions) {
+				index += 1;
+				const key = position === 'start'
+					? `${encoded}token`
+					: position === 'middle'
+						? `to${encoded}ken`
+						: `token${encoded}`;
+				fields.push(
+					`${key} = hunter2 unique-tail-control-${index} `
+					+ `${control.name}-${rounds}-${position} prose`,
+				);
+			}
+		}
+	}
+	return [
+		...fields,
+		'token%3D%01hunter2 unique-tail-control-boundary separator prose',
+		'password%253A%2520%25C2%2580hunter2 unique-tail-control-password-boundary prose',
+		'api_key%25253D%2525E2%252580%25258Chunter2 unique-tail-control-api-boundary prose',
+		'Authorization%3A%20%E2%80%8Ctoken unique-tail-control-authorization prose',
+		'to%01ken=\r\nhunter2 unique-tail-control-continuation prose',
+		'to\u200b%01ken: hunter2 unique-tail-control-mixed prose',
+	];
+}
 
 suite('TaskToolsCore', () => {
 	test('lists only bounded opaque Device -> Node -> Workspace metadata', async () => {
@@ -164,6 +205,7 @@ suite('TaskToolsCore', () => {
 			'A%zzuthorization: token first second malformed-auth prose',
 			'api_%zzkey = hunter2 malformed-api-key prose',
 			'api%255Fkey%3A%20hunter2%zz mixed-valid-invalid prose',
+			...ENCODED_CONTROL_CREDENTIAL_FIELDS,
 		]) {
 			const result = sanitizeDelegationText(`Safe before. ${credential} Safe after.`, 2_048);
 			assert.equal(result, '[redacted sensitive details]', credential);
@@ -207,6 +249,7 @@ suite('TaskToolsCore', () => {
 			'api_%zzkey = hunter2 unique-tail-17 malformed-api-key prose',
 			'api%255Fkey%3A%20hunter2%zz unique-tail-18 mixed-valid-invalid prose',
 			'pa%zzssword\r\nhunter2 unique-tail-19 continuation prose',
+			...ENCODED_CONTROL_CREDENTIAL_FIELDS,
 		];
 		for (const field of credentialFields) {
 			const facade = new RecordingFacade();

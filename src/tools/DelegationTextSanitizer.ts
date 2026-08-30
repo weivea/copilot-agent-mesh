@@ -8,7 +8,6 @@ const redactionSentinel = '__MESH_REDACTED__';
 const benignWhitespacePattern = /[\t\r\n]+/gu;
 const remainingControlPattern = /[\u0000-\u001f\u007f-\u009f]/gu;
 const formatControlPattern = /\p{Cf}/gu;
-const credentialObfuscationPattern = /[\u0000-\u001f\u007f-\u009f\p{Cf}]/gu;
 
 /**
  * Preserves useful remote task prose while removing unsafe spans. Dashboard
@@ -21,10 +20,7 @@ export function sanitizeDelegationText(value: string, maxBytes: number): string 
 	}
 	// Inspect the original field before whitespace normalization can erase the
 	// boundary between an assignment value and a continuation line.
-	if (
-		containsCredentialText(value)
-		|| containsCredentialText(value.replace(credentialObfuscationPattern, ''))
-	) {
+	if (containsCredentialText(value)) {
 		return boundedUtf8(redaction, maxBytes);
 	}
 	let sanitized = value

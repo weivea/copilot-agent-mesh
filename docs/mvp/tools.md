@@ -107,8 +107,10 @@ text cannot escape the credential boundary; otherwise safe surrounding content
 is retained. Valid percent-encoded credential-free prose remains available for
 inspection. Malformed, undecodable, or excessively nested percent encoding fails
 closed by redacting the full field, because it can otherwise split a credential
-key from its value. Canonical inspection is bounded to a fixed number of linear
-decode passes. Byte-budget
+key from its value. Every decoded form also removes C0, C1, and Unicode format
+controls for credential-key inspection, preventing encoded controls from splitting
+a key while preserving ordinary valid percent-encoded prose. Canonical inspection
+is bounded to a fixed number of linear decode passes. Byte-budget
 contraction always preserves `t` and `d`; if a completed or needs-input payload
 cannot fit, it becomes exact compact failure
 `{s:2,t,d,e:"OUTPUT_TOO_LARGE"}` rather than an identity-free generic result.
