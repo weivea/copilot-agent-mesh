@@ -158,10 +158,24 @@ suite('TaskToolsCore', () => {
 			'secret = secret = topsecretvalue',
 			'password:\u0001hunter2',
 			'password: \u202ehunter2',
+			'%zzpassword = hunter2 malformed-key-start prose',
+			'pa%zzssword: hunter2 malformed-key-middle prose',
+			'password%zz\t hunter2 malformed-key-end prose',
+			'A%zzuthorization: token first second malformed-auth prose',
+			'api_%zzkey = hunter2 malformed-api-key prose',
+			'api%255Fkey%3A%20hunter2%zz mixed-valid-invalid prose',
 		]) {
 			const result = sanitizeDelegationText(`Safe before. ${credential} Safe after.`, 2_048);
 			assert.equal(result, '[redacted sensitive details]', credential);
 		}
+		assert.equal(
+			sanitizeDelegationText('Encoded credential-free status ready%20now.', 2_048),
+			'Encoded credential-free status ready%20now.',
+		);
+		assert.equal(
+			sanitizeDelegationText('Malformed credential-free progress is 100% complete.', 2_048),
+			'[redacted sensitive details]',
+		);
 		assert.equal(
 			sanitizeDelegationText('MIME text/plain is safe.', 2_048),
 			'MIME text/plain is safe.',
@@ -186,6 +200,13 @@ suite('TaskToolsCore', () => {
 			'to\u0001ken=abc unique-tail-10 control-obfuscated prose',
 			'token=abc%\r\nunique-tail-11 malformed-percent prose',
 			'to\u200cken=abc unique-tail-12 format-obfuscated prose',
+			'%zzpassword = hunter2 unique-tail-13 malformed-key-start prose',
+			'pa%zzssword: hunter2 unique-tail-14 malformed-key-middle prose',
+			'password%zz\t hunter2 unique-tail-15 malformed-key-end prose',
+			'A%zzuthorization: token first second unique-tail-16 malformed-auth prose',
+			'api_%zzkey = hunter2 unique-tail-17 malformed-api-key prose',
+			'api%255Fkey%3A%20hunter2%zz unique-tail-18 mixed-valid-invalid prose',
+			'pa%zzssword\r\nhunter2 unique-tail-19 continuation prose',
 		];
 		for (const field of credentialFields) {
 			const facade = new RecordingFacade();

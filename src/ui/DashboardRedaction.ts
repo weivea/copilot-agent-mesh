@@ -33,7 +33,7 @@ export function containsCredentialText(value: string): boolean {
 		return true;
 	}
 	const canonicalForms = canonicalizePercentEncoding(value);
-	return canonicalForms !== undefined && canonicalForms.some(containsCredentialTextRaw);
+	return canonicalForms === undefined || canonicalForms.some(containsCredentialTextRaw);
 }
 
 function containsUnsafeDashboardTextAtDepth(value: string, depth: number): boolean {

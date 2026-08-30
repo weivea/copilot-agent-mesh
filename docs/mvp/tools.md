@@ -104,7 +104,11 @@ whitespace, redact unsafe path/control spans, and remain bounded before token
 contraction. A field containing a recognized credential assignment or bearer
 credential is redacted in full before whitespace normalization, so continuation
 text cannot escape the credential boundary; otherwise safe surrounding content
-is retained. Byte-budget
+is retained. Valid percent-encoded credential-free prose remains available for
+inspection. Malformed, undecodable, or excessively nested percent encoding fails
+closed by redacting the full field, because it can otherwise split a credential
+key from its value. Canonical inspection is bounded to a fixed number of linear
+decode passes. Byte-budget
 contraction always preserves `t` and `d`; if a completed or needs-input payload
 cannot fit, it becomes exact compact failure
 `{s:2,t,d,e:"OUTPUT_TOO_LARGE"}` rather than an identity-free generic result.
