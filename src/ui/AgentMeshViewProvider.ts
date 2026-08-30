@@ -266,18 +266,32 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 	}
 
 	private scopeActions(instance: ViewInstance, model: DashboardViewModel): DashboardViewModel {
+		const stableTaskAliases = new Map<string, string>();
+		for (const [uiHandle, action] of instance.actions) {
+			if (
+				action.action === 'cancelOutgoingTask'
+				|| action.action === 'cancelIncomingTask'
+			) {
+				stableTaskAliases.set(`${action.action}:${action.brokerHandle}`, uiHandle);
+			}
+		}
 		instance.actions.clear();
 		const scope = (
 			action: DashboardAction,
 			brokerHandle: string | undefined,
+			stable = false,
 		): string | undefined => {
 			if (brokerHandle === undefined) {
 				return undefined;
 			}
-			let handle: string;
-			do {
-				handle = randomBytes(24).toString('base64url');
-			} while (instance.actions.has(handle));
+			let handle = stable
+				? stableTaskAliases.get(`${action}:${brokerHandle}`)
+				: undefined;
+			if (handle === undefined) {
+				do {
+					handle = randomBytes(24).toString('base64url');
+				} while (instance.actions.has(handle));
+			}
 			instance.actions.set(handle, { action, brokerHandle });
 			return handle;
 		};
@@ -296,11 +310,11 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 			})),
 			outgoingTasks: model.outgoingTasks.map((task) => ({
 				...task,
-				actionHandle: scope('cancelOutgoingTask', task.actionHandle),
+				actionHandle: scope('cancelOutgoingTask', task.actionHandle, true),
 			})),
 			incomingTasks: model.incomingTasks.map((task) => ({
 				...task,
-				actionHandle: scope('cancelIncomingTask', task.actionHandle),
+				actionHandle: scope('cancelIncomingTask', task.actionHandle, true),
 			})),
 		};
 	}

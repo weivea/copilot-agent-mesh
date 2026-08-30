@@ -88,6 +88,7 @@ interface RegisteredSession {
 }
 
 interface DashboardTaskBinding {
+	readonly ownerId: string;
 	readonly taskId: string;
 	readonly direction: DashboardTaskDirection;
 }
@@ -95,6 +96,7 @@ interface DashboardTaskBinding {
 interface DashboardActionRegistry {
 	readonly candidates: Map<string, PeerPolicyCandidateBinding>;
 	readonly tasks: Map<string, DashboardTaskBinding>;
+	readonly taskHandlesByKey: Map<string, string>;
 	readonly taskReservations: Map<string, DashboardTaskBinding>;
 }
 
@@ -121,6 +123,9 @@ export class DeviceBroker {
 	private readonly dashboardActions = new WeakMap<LocalIpcSession, DashboardActionRegistry>();
 	private readonly sessions = new Set<LocalIpcSession>();
 	private readonly activeHandlers = new Set<Promise<JsonValue>>();
+	private readonly dashboardNotificationImmediates = new Map<LocalIpcSession, NodeJS.Immediate>();
+	private readonly dashboardTaskStates = new Map<string, string>();
+	private dashboardNotificationsSent = 0;
 	private readonly policySubscription: { dispose(): void };
 	private started = false;
 	private disposed = false;
@@ -160,6 +165,11 @@ export class DeviceBroker {
 			onSession: (session) => {
 				this.sessions.add(session);
 				session.onClose(() => {
+					const immediate = this.dashboardNotificationImmediates.get(session);
+					if (immediate !== undefined) {
+						clearImmediate(immediate);
+						this.dashboardNotificationImmediates.delete(session);
+					}
 					this.registrations.delete(session);
 					this.dashboardActions.delete(session);
 					this.sessions.delete(session);
@@ -172,6 +182,16 @@ export class DeviceBroker {
 
 	public get endpoint() {
 		return this.server.endpoint;
+	}
+
+	public dashboardMetrics(): {
+		readonly notificationsSent: number;
+		readonly pendingNotifications: number;
+	} {
+		return {
+			notificationsSent: this.dashboardNotificationsSent,
+			pendingNotifications: this.dashboardNotificationImmediates.size,
+		};
 	}
 
 	public async start(): Promise<void> {
@@ -299,7 +319,10 @@ export class DeviceBroker {
 		}
 	}
 
-	private notifyDashboardChanged(excluded?: LocalIpcSession): void {
+	private notifyDashboardChanged(
+		excluded?: LocalIpcSession,
+		invalidateTaskActions = true,
+	): void {
 		if (this.disposeRequested || this.disposed) {
 			return;
 		}
@@ -311,19 +334,49 @@ export class DeviceBroker {
 			) {
 				continue;
 			}
-			this.dashboardActions.get(session)?.tasks.clear();
-			void session.notify(LOCAL_BROKER_NOTIFICATIONS.dashboardChanged, {}).catch(
-				(error: unknown) => this.options.onError?.(
-					error instanceof Error
-						? error
-						: new Error('A dashboard notification failed.'),
-				),
-			);
+			if (invalidateTaskActions) {
+				this.invalidateDashboardTaskActions(session);
+			}
+			if (this.dashboardNotificationImmediates.has(session)) {
+				continue;
+			}
+			const immediate = setImmediate(() => {
+				this.dashboardNotificationImmediates.delete(session);
+				if (
+					this.disposeRequested
+					|| this.disposed
+					|| session.closed
+					|| this.registrations.get(session) === undefined
+				) {
+					return;
+				}
+				this.dashboardNotificationsSent += 1;
+				void session.notify(LOCAL_BROKER_NOTIFICATIONS.dashboardChanged, {}).catch(
+					(error: unknown) => this.options.onError?.(
+						error instanceof Error
+							? error
+							: new Error('A dashboard notification failed.'),
+					),
+				);
+			});
+			this.dashboardNotificationImmediates.set(session, immediate);
 		}
 	}
 
 	public publishTaskSnapshot(snapshot: TaskSnapshot, sourceNodeId?: string): void {
-		this.notifyDashboardChanged();
+		const previousState = this.dashboardTaskStates.get(snapshot.taskId);
+		this.dashboardTaskStates.delete(snapshot.taskId);
+		this.dashboardTaskStates.set(snapshot.taskId, snapshot.state);
+		while (this.dashboardTaskStates.size > 1_000) {
+			const oldest = this.dashboardTaskStates.keys().next().value;
+			if (oldest === undefined) {
+				break;
+			}
+			this.dashboardTaskStates.delete(oldest);
+		}
+		if (previousState !== snapshot.state) {
+			this.notifyDashboardChanged(undefined, false);
+		}
 		const source = sourceNodeId;
 		if (source === undefined) {
 			return;
@@ -566,6 +619,17 @@ export class DeviceBroker {
 				if (task === undefined || task.direction !== input.direction) {
 					throw new MeshDomainError('TASK_NOT_FOUND', 'The dashboard task action is stale.');
 				}
+				this.options.taskService.assertDashboardTaskCancellable(
+					binding.nodeId,
+					binding.nodeInstanceId,
+					task.ownerId,
+					task.taskId,
+					task.direction,
+				);
+				if (task.direction === 'outgoing') {
+					this.taskRoutes.requireForNode(task.taskId, binding.nodeId);
+				}
+				actions.taskHandlesByKey.delete(dashboardTaskBindingKey(task));
 				const reservationHandle = this.issueDashboardHandle(
 					actions.taskReservations,
 					task,
@@ -583,11 +647,22 @@ export class DeviceBroker {
 				if (task === undefined || task.direction !== input.direction) {
 					throw new MeshDomainError('TASK_NOT_FOUND', 'The dashboard task action is stale.');
 				}
+				this.options.taskService.assertDashboardTaskCancellable(
+					binding.nodeId,
+					binding.nodeInstanceId,
+					task.ownerId,
+					task.taskId,
+					task.direction,
+				);
+				if (task.direction === 'outgoing') {
+					this.taskRoutes.requireForNode(task.taskId, binding.nodeId);
+				}
 				const snapshot = task.direction === 'outgoing'
 					? await this.cancelRoutedTask(binding, task.taskId)
 					: await this.options.taskService.cancelForTarget(
 						binding.nodeId,
 						binding.nodeInstanceId,
+						task.ownerId,
 						task.taskId,
 					);
 				return toJsonValue(taskSnapshotSchema.parse(snapshot));
@@ -958,7 +1033,7 @@ export class DeviceBroker {
 		session: LocalIpcSession,
 		binding: RegisteredSession,
 	): Promise<ReturnType<typeof dashboardTaskListResultSchema.parse>> {
-		const actions = this.resetTaskActions(session);
+		const actions = this.dashboardActionRegistry(session);
 		const records = await this.options.taskService.listDashboardRecords();
 		const activeStates = new Set<string>(ACTIVE_TASK_STATUSES);
 		const projected = records
@@ -968,27 +1043,49 @@ export class DeviceBroker {
 					return [];
 				}
 				const counterpart = this.dashboardTaskCounterpart(record, direction);
-				const canCancel = activeStates.has(record.state);
-				const actionHandle = canCancel
-					? this.issueDashboardHandle(actions, { taskId: record.taskId, direction })
-					: undefined;
 				return [{
-					...(actionHandle === undefined ? {} : { actionHandle }),
-					direction,
-					counterpartLabel: counterpart.label,
-					workspaceName: counterpart.workspaceName,
-					title: safeDashboardLabel(record.title, 'Delegated task'),
-					state: record.state,
-					startedAt: record.createdAt,
-					shortId: record.taskId.slice(0, 8),
-					canCancel,
+					binding: {
+						ownerId: record.peerId,
+						taskId: record.taskId,
+						direction,
+					},
+					task: {
+						direction,
+						counterpartLabel: counterpart.label,
+						workspaceName: counterpart.workspaceName,
+						title: safeDashboardLabel(record.title, 'Delegated task'),
+						state: record.state,
+						startedAt: record.createdAt,
+						shortId: record.taskId.slice(0, 8),
+						canCancel: activeStates.has(record.state),
+					},
 				}];
 			})
-			.sort((left, right) => right.startedAt.localeCompare(left.startedAt));
-		const tasks = projected.slice(0, 500);
+			.sort((left, right) =>
+				compareDashboardTimestampsDescending(
+					left.task.startedAt,
+					right.task.startedAt,
+				)
+			);
+		const visible = projected.slice(0, 500);
+		const retainedTaskKeys = new Set(
+			visible
+				.filter(({ task }) => task.canCancel)
+				.map(({ binding: taskBinding }) => dashboardTaskBindingKey(taskBinding)),
+		);
+		this.pruneDashboardTaskActions(actions, retainedTaskKeys);
+		const tasks = visible.map(({ binding: taskBinding, task }) => {
+			if (!task.canCancel) {
+				return task;
+			}
+			return {
+				...task,
+				actionHandle: this.stableDashboardTaskHandle(actions, taskBinding),
+			};
+		});
 		return dashboardTaskListResultSchema.parse({
 			tasks,
-			truncated: projected.length > tasks.length,
+			truncated: projected.length > visible.length,
 			totalTasks: projected.length,
 		});
 	}
@@ -1035,23 +1132,56 @@ export class DeviceBroker {
 		return registry.candidates;
 	}
 
-	private resetTaskActions(session: LocalIpcSession): Map<string, DashboardTaskBinding> {
-		const registry = this.dashboardActionRegistry(session);
-		registry.tasks.clear();
-		return registry.tasks;
-	}
-
 	private dashboardActionRegistry(session: LocalIpcSession): DashboardActionRegistry {
 		let registry = this.dashboardActions.get(session);
 		if (registry === undefined) {
 			registry = {
 				candidates: new Map(),
 				tasks: new Map(),
+				taskHandlesByKey: new Map(),
 				taskReservations: new Map(),
 			};
 			this.dashboardActions.set(session, registry);
 		}
 		return registry;
+	}
+
+	private stableDashboardTaskHandle(
+		actions: DashboardActionRegistry,
+		binding: DashboardTaskBinding,
+	): string {
+		const key = dashboardTaskBindingKey(binding);
+		const existingHandle = actions.taskHandlesByKey.get(key);
+		if (existingHandle !== undefined) {
+			const existing = actions.tasks.get(existingHandle);
+			if (existing !== undefined && dashboardTaskBindingKey(existing) === key) {
+				return existingHandle;
+			}
+			actions.taskHandlesByKey.delete(key);
+		}
+		const handle = this.issueDashboardHandle(actions.tasks, binding);
+		actions.taskHandlesByKey.set(key, handle);
+		return handle;
+	}
+
+	private pruneDashboardTaskActions(
+		actions: DashboardActionRegistry,
+		retainedKeys: ReadonlySet<string>,
+	): void {
+		for (const [key, handle] of actions.taskHandlesByKey) {
+			if (retainedKeys.has(key)) {
+				continue;
+			}
+			actions.taskHandlesByKey.delete(key);
+			actions.tasks.delete(handle);
+		}
+	}
+
+	private invalidateDashboardTaskActions(session: LocalIpcSession): void {
+		const actions = this.dashboardActions.get(session);
+		actions?.tasks.clear();
+		actions?.taskHandlesByKey.clear();
+		actions?.taskReservations.clear();
 	}
 
 	private issueDashboardHandle<T>(actions: Map<string, T>, binding: T): string {
@@ -1074,6 +1204,11 @@ export class DeviceBroker {
 
 	private async disposeOnce(): Promise<void> {
 		this.policySubscription.dispose();
+		for (const immediate of this.dashboardNotificationImmediates.values()) {
+			clearImmediate(immediate);
+		}
+		this.dashboardNotificationImmediates.clear();
+		this.dashboardTaskStates.clear();
 		const failures: unknown[] = [];
 		if (!this.serverDisposed) {
 			try {
@@ -1227,8 +1362,21 @@ function dashboardTaskDirection(
 	return undefined;
 }
 
+function dashboardTaskBindingKey(binding: DashboardTaskBinding): string {
+	return `${binding.ownerId}:${binding.taskId}:${binding.direction}`;
+}
+
 function safeDashboardLabel(value: string, fallback: string): string {
 	return containsUnsafeDashboardText(value) ? fallback : value;
+}
+
+function compareDashboardTimestampsDescending(left: string, right: string): number {
+	const leftTime = Date.parse(left);
+	const rightTime = Date.parse(right);
+	if (Number.isFinite(leftTime) && Number.isFinite(rightTime)) {
+		return rightTime - leftTime;
+	}
+	return right.localeCompare(left);
 }
 
 function requireRoutedSnapshot<T extends TaskSnapshot | TaskSnapshotAfterEventSeq>(

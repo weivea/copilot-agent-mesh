@@ -292,20 +292,50 @@ test('two windows and one Broker deliver authoritative delegation outcomes witho
 	const incomingTask = incoming.tasks.find(({ shortId }) => shortId === cancelledTaskId.slice(0, 8));
 	assert.equal(outgoingTask?.direction, 'outgoing');
 	assert.equal(incomingTask?.direction, 'incoming');
+	assert.ok(outgoingTask?.actionHandle);
+	assert.ok(incomingTask?.actionHandle);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	const beforeBurst = fixture.dashboardMetrics();
+	await Promise.all(Array.from({ length: 12 }, (_, index) =>
+		fixture.nodeB.publishTaskEvent(taskEvent(cancelledTaskId, {
+			type: index % 3 === 0 ? 'progress' : index % 3 === 1 ? 'output' : 'tool',
+			summary: `Burst event ${index}`,
+		}))
+	));
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	const afterBurst = fixture.dashboardMetrics();
+	const refreshedOutgoing = (await fixture.nodeA.listDashboardTasks()).tasks.find(
+		({ shortId }) => shortId === cancelledTaskId.slice(0, 8),
+	);
+	const refreshedIncoming = (await fixture.nodeB.listDashboardTasks()).tasks.find(
+		({ shortId }) => shortId === cancelledTaskId.slice(0, 8),
+	);
+	assert.equal(refreshedOutgoing?.actionHandle, outgoingTask.actionHandle);
+	assert.equal(refreshedIncoming?.actionHandle, incomingTask.actionHandle);
+	assert.equal(afterBurst.tasks.startupScans, 1);
+	assert.equal(afterBurst.tasks.startupScans, beforeBurst.tasks.startupScans);
+	assert.equal(afterBurst.tasks.storeListScans, beforeBurst.tasks.storeListScans);
+	assert.equal(afterBurst.broker.notificationsSent, beforeBurst.broker.notificationsSent);
 	assert.equal((await fixture.nodeA.listDashboardTasks()).tasks.some(
 		({ direction }) => direction === 'incoming',
 	), false);
-	const wrongDirectionHandle = incomingTask?.actionHandle;
+	const wrongDirectionHandle = outgoingTask?.actionHandle;
 	assert.ok(wrongDirectionHandle);
 	await assert.rejects(
-		fixture.nodeB.reserveDashboardTask(wrongDirectionHandle, 'outgoing'),
+		fixture.nodeA.reserveDashboardTask(wrongDirectionHandle, 'incoming'),
 		(error: unknown) =>
 			error instanceof LocalIpcRemoteError
 			&& errorReason(error) === 'TASK_NOT_FOUND',
 	);
-	const cancelHandle = (await fixture.nodeB.listDashboardTasks()).tasks.find(
+	const terminalProbeHandle = (await fixture.nodeA.listDashboardTasks()).tasks.find(
 		({ shortId }) => shortId === cancelledTaskId.slice(0, 8),
 	)?.actionHandle;
+	assert.ok(terminalProbeHandle);
+	const terminalReservation = await fixture.nodeA.reserveDashboardTask(
+		terminalProbeHandle,
+		'outgoing',
+	);
+	const cancelHandle = refreshedIncoming?.actionHandle;
 	assert.ok(cancelHandle);
 	const reservation = await fixture.nodeB.reserveDashboardTask(cancelHandle, 'incoming');
 	await fixture.nodeB.listDashboardTasks();
@@ -324,6 +354,21 @@ test('two windows and one Broker deliver authoritative delegation outcomes witho
 		type: 'cancelled',
 		summary: 'The peer cancelled the component task.',
 	}));
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	const terminalOutgoing = (await fixture.nodeA.listDashboardTasks()).tasks.find(
+		({ shortId }) => shortId === cancelledTaskId.slice(0, 8),
+	);
+	assert.equal(terminalOutgoing?.state, 'cancelled');
+	assert.equal(terminalOutgoing?.actionHandle, undefined);
+	await assert.rejects(
+		fixture.nodeA.cancelDashboardTask(
+			terminalReservation.reservationHandle,
+			'outgoing',
+		),
+		(error: unknown) =>
+			error instanceof LocalIpcRemoteError
+			&& errorReason(error) === 'TASK_NOT_FOUND',
+	);
 	assert.deepEqual(await cancelled, {
 		s: 3,
 		t: cancelledTaskId,
@@ -493,6 +538,10 @@ interface Fixture {
 	readonly nodeC?: WindowNodeClient;
 	readonly executorB: RecordingExecutor;
 	readonly executorC?: RecordingExecutor;
+	dashboardMetrics(): {
+		readonly broker: ReturnType<DeviceBroker['dashboardMetrics']>;
+		readonly tasks: ReturnType<BrokerTaskService['dashboardMetrics']>;
+	};
 	restartBroker(): Promise<void>;
 	dispose(): Promise<void>;
 }
@@ -616,6 +665,15 @@ async function createFixture(options: {
 		},
 		executorB,
 		executorC,
+		dashboardMetrics: () => {
+			if (broker === undefined) {
+				throw new Error('The test Broker is unavailable.');
+			}
+			return {
+				broker: broker.dashboardMetrics(),
+				tasks: taskService.dashboardMetrics(),
+			};
+		},
 		restartBroker: async () => {
 			await nodeA.dispose();
 			await nodeB.dispose();

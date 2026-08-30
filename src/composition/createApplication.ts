@@ -476,14 +476,12 @@ function registerCommands(
 		}
 	});
 	const selectTarget = async (
-		kind: 'workspace' | 'peer' | 'task',
+		kind: 'workspace' | 'peer',
 	): Promise<string | undefined> => {
 		const snapshot = await facade.getSnapshot();
 		const values = kind === 'workspace'
 			? snapshot.workspaces.map((item) => ({ label: item.name, id: item.workspaceId }))
-			: kind === 'peer'
-				? snapshot.peers.map((item) => ({ label: item.name, id: item.peerId }))
-				: snapshot.tasks.map((item) => ({ label: item.title, id: item.taskId }));
+			: snapshot.peers.map((item) => ({ label: item.name, id: item.peerId }));
 		return (await vscode.window.showQuickPick(values, {
 			title: `Select ${kind}`,
 			ignoreFocusOut: true,
@@ -526,9 +524,36 @@ function registerCommands(
 		register(APPLICATION_COMMANDS.runTask, false, (value) =>
 			facade.runTask(dashboardTarget(value))),
 		register(APPLICATION_COMMANDS.cancelTask, false, async (value) => {
-			const id = opaqueId(value) ?? await selectTarget('task');
+			const id = opaqueId(value);
 			if (id !== undefined) {
 				await facade.cancelTask(id);
+				return;
+			}
+			const snapshot = await facade.getSnapshot();
+			const candidates = [
+				...(snapshot.outgoingTasks ?? []).flatMap((task) =>
+					task.actionHandle === undefined ? [] : [{
+						label: task.title,
+						description: `Outgoing · ${task.counterpartLabel}`,
+						actionHandle: task.actionHandle,
+						direction: 'outgoing' as const,
+					}]
+				),
+				...(snapshot.incomingTasks ?? []).flatMap((task) =>
+					task.actionHandle === undefined ? [] : [{
+						label: task.title,
+						description: `Incoming · ${task.counterpartLabel}`,
+						actionHandle: task.actionHandle,
+						direction: 'incoming' as const,
+					}]
+				),
+			];
+			const selected = await vscode.window.showQuickPick(candidates, {
+				title: 'Select task',
+				ignoreFocusOut: true,
+			});
+			if (selected !== undefined) {
+				await facade.cancelDashboardTask(selected.actionHandle, selected.direction);
 			}
 		}),
 	];

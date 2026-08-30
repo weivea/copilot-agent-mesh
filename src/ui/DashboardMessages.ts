@@ -318,7 +318,10 @@ function assertDashboardTasks(value: unknown): void {
 		if (!/^[0-9a-f]{8}$/u.test(shortId)) {
 			throw new Error('Dashboard task short ID is invalid.');
 		}
-		if (!Number.isFinite(Date.parse(startedAt))) {
+		if (
+			startedAt !== 'Unknown'
+			&& !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(startedAt)
+		) {
 			throw new Error('Dashboard task start time is invalid.');
 		}
 		if (task.canCancel) {

@@ -54,8 +54,17 @@ Offline saved targets can only be unchecked.
 Task cancellation redeems the visible action handle into a separate bounded
 in-flight reservation before the Extension Host opens its confirmation modal.
 That reservation survives ordinary snapshot refreshes, is consumed by cancel,
-and is explicitly released when the user declines, so status notifications
-cannot retarget or invalidate an already displayed confirmation.
+and is explicitly released when the user declines. Commit revalidates active
+state, exact owner/target route, and Broker lifecycle generation, so status or
+takeover changes cannot retarget an already displayed confirmation.
+
+Active task handles are stable for the same exact owner, task, direction, route,
+and UI instance across manual refreshes and non-identity output/progress/tool
+events. Terminal state or topology/ownership changes invalidate them. The
+Broker rebuilds a bounded generation-scoped Dashboard task index from one
+startup scan, then updates it only from durable task transitions. Dashboard
+reads do not scan task files. State notifications are coalesced per session and
+event loop; non-state event bursts do not trigger Dashboard publication.
 
 Outgoing tasks are selected by exact source Node ownership; incoming tasks are
 selected by exact target Node instance. Their Webview records contain only a
@@ -67,6 +76,11 @@ authorization. Remote outgoing snapshots are refreshed by the same authoritative
 task notifications and retained in a bounded per-window cache; merged task
 collections are sorted and truncated to the strict 500-item UI limit with an
 explicit warning. Dashboard has no answer-input path.
+
+Task timestamps are normalized from every protocol-valid offset/fraction form
+to canonical UTC ISO with three millisecond digits before outbound safety
+inspection. Malformed or out-of-display-range values become the explicit
+`Unknown` field value instead of rejecting the rest of the Dashboard.
 
 P6 exposes an Agent Host source status provider with typed `editor | standalone`
 source, a bounded degradation enum/message, and change notifications wired into the

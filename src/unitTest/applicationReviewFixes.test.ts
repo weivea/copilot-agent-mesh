@@ -377,8 +377,7 @@ test('production dashboard uses the safe unfiltered directory for self, conflict
 	assert.equal(snapshot.localNodes?.find(({ thisWindow }) => thisWindow)?.workspaces[0]?.name, 'Source Workspace');
 	assert.ok(snapshot.errors.some(({ code }) => code === 'NODE_DIRECTORY_TRUNCATED'));
 	assert.ok(snapshot.errors.some(({ code }) => code === 'WORKSPACE_CLAIM_CONFLICT'));
-	assert.equal(snapshot.tasks[0]?.workspaceName, 'Source Workspace');
-	assert.equal(snapshot.tasks[0]?.phase, 'Window Node: This Window');
+	assert.deepEqual(snapshot.tasks, []);
 	assert.equal(snapshot.outgoingTasks?.length, 1);
 	const outgoingTask = snapshot.outgoingTasks?.[0];
 	assert.ok(outgoingTask);

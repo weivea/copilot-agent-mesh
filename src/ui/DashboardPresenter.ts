@@ -1,5 +1,6 @@
 import { DashboardSnapshot } from './DashboardFacade';
 import { redactRemoteText } from './DashboardRedaction';
+import { timestampSchema } from '../../shared/protocol';
 
 const dashboardStringBytes = 2 * 1_024;
 
@@ -80,7 +81,20 @@ function redactDashboardTask(
 		counterpartLabel: redactRemoteText(task.counterpartLabel),
 		workspaceName: redactRemoteText(task.workspaceName),
 		title: redactAndTruncate(task.title).value ?? 'Delegated task',
+		startedAt: normalizeDashboardTimestamp(task.startedAt),
 	};
+}
+
+function normalizeDashboardTimestamp(value: string): string {
+	if (!timestampSchema.safeParse(value).success) {
+		return 'Unknown';
+	}
+	const timestamp = Date.parse(value);
+	if (!Number.isFinite(timestamp)) {
+		return 'Unknown';
+	}
+	const canonical = new Date(timestamp).toISOString();
+	return /^\d{4}-\d{2}-\d{2}T/u.test(canonical) ? canonical : 'Unknown';
 }
 
 function redactComponent(component: DashboardSnapshot['listener']['gateway']): DashboardSnapshot['listener']['gateway'] {

@@ -44,6 +44,11 @@ import type { ProductionBrokerRuntime } from './ProductionBrokerRuntime';
 
 const activeTaskStates = new Set<string>(ACTIVE_TASK_STATUSES);
 
+interface RemoteTaskActionBinding {
+	readonly taskId: string;
+	readonly lifecycleGeneration: string;
+}
+
 export interface ProductionDashboardBindingsOptions {
 	readonly vscodeApi: typeof vscode;
 	readonly changed: vscode.EventEmitter<void>;
@@ -64,12 +69,17 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 		readonly workspaceIdentity: string;
 		readonly workspaceId: string;
 	}>();
-	private readonly remoteTaskActions = new Map<string, string>();
+	private readonly remoteTaskActions = new Map<string, RemoteTaskActionBinding>();
+	private readonly remoteTaskHandlesById = new Map<string, string>();
+	private remoteHandleGeneration = 'uninitialized';
 
 	public constructor(private readonly options: ProductionDashboardBindingsOptions) {
 		this.subscriptions.push(
 			options.node.onDidChange(() => options.changed.fire()),
-			options.lifecycle.onDidChange(() => options.changed.fire()),
+			options.lifecycle.onDidChange(() => {
+				this.refreshRemoteHandleGeneration();
+				options.changed.fire();
+			}),
 		);
 		const onDidChangeActiveTextEditor = options.vscodeApi.window.onDidChangeActiveTextEditor;
 		if (typeof onDidChangeActiveTextEditor === 'function') {
@@ -82,7 +92,7 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 
 	public async getSnapshot(): Promise<DashboardSnapshot> {
 		this.acceptActions.clear();
-		this.remoteTaskActions.clear();
+		this.refreshRemoteHandleGeneration();
 		this.options.guard.assertAllowed({ requireWorkspace: false });
 		const profile = this.options.profile();
 		const owner = this.options.ownerRuntime();
@@ -278,60 +288,14 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 			});
 		}
 
-		const records = owner === undefined
-			? []
-			: await owner.tasks.list().catch(() => {
-				errors.push({
-					code: 'TASK_RECOVERY_READ_FAILED',
-					message: 'Persisted task recovery state could not be read.',
-					action: 'Refresh after Broker takeover completes.',
-				});
-				return [];
-			});
 		const allNodes = [...localNodes, ...remoteDevices.flatMap(({ nodes }) => nodes)];
-		const nodeNames = new Map(allNodes.map((node) => [node.nodeId, node.label]));
 		const workspaceNames = new Map(
 			allNodes.flatMap((node) =>
 				node.workspaces.map((workspace) => [workspace.workspaceId, workspace.name] as const),
 			),
 		);
 		const remoteNames = new Map(remoteDevices.map((device) => [device.deviceId, device.name]));
-		const localTasks: DashboardSnapshot['tasks'] = records.map((record) => {
-			const target = record.schemaVersion === 2 ? record.target : undefined;
-			const ownedByThisNode = record.schemaVersion === 2
-				&& record.peerId === profile.deviceId
-				&& record.sourceNodeId === this.options.node.nodeId;
-			const safeFailure = record.failure === undefined ? undefined : {
-				code: record.failure.code,
-				message: 'The task failed. Open its owning Window Node for diagnostic details.',
-				action: record.failure.retryable ? 'Retry with a new delegation request.' : undefined,
-			};
-			if (record.failure?.code === 'TASK_RECOVERY_UNAVAILABLE') {
-				errors.push({
-					code: 'TASK_RECOVERY_UNAVAILABLE',
-					message: 'A task could not recover after its Window Node disconnected.',
-					action: 'Retry the task on an online Window Node.',
-				});
-			}
-			return {
-				taskId: record.taskId,
-				title: record.title,
-				peerName: target?.deviceId === profile.deviceId
-					? 'This Device'
-					: remoteNames.get(target?.deviceId ?? '') ?? 'Connected coordinator',
-				workspaceName: workspaceNames.get(record.workspaceId) ?? 'Registered workspace',
-				state: record.state,
-				phase: target?.nodeId === undefined
-					? undefined
-					: `Window Node: ${nodeNames.get(target.nodeId) ?? 'Unavailable'}`,
-				canCancel: ownedByThisNode && activeTaskStates.has(record.state),
-				needsInput: ownedByThisNode && record.state === 'needsInput',
-				error: safeFailure,
-			};
-		});
-		const localTaskIds = new Set(localTasks.map(({ taskId }) => taskId));
-		const knownRemoteTasks = this.options.remoteTasks.listKnownTasks()
-			.filter((snapshot) => !localTaskIds.has(snapshot.taskId));
+		const knownRemoteTasks = this.options.remoteTasks.listKnownTasks();
 		const remoteTasks: DashboardSnapshot['tasks'] = knownRemoteTasks
 			.map((snapshot) => ({
 				taskId: snapshot.taskId,
@@ -352,15 +316,17 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 			[...outgoingTasks, ...incomingTasks]
 				.flatMap(({ actionHandle }) => actionHandle === undefined ? [] : [actionHandle]),
 		);
+		const retainedRemoteTaskIds = new Set(
+			knownRemoteTasks
+				.filter(({ state }) => activeTaskStates.has(state))
+				.map(({ taskId }) => taskId),
+		);
+		this.pruneRemoteTaskActions(retainedRemoteTaskIds);
 		const remoteDashboardTasks: DashboardTaskSummarySnapshot[] = knownRemoteTasks.map((snapshot) => {
 			const canCancel = activeTaskStates.has(snapshot.state);
 			return {
 				...(canCancel ? {
-					actionHandle: this.issueBindingHandle(
-						this.remoteTaskActions,
-						snapshot.taskId,
-						reservedTaskHandles,
-					),
+					actionHandle: this.stableRemoteTaskHandle(snapshot.taskId, reservedTaskHandles),
 				} : {}),
 				counterpartLabel: remoteNames.get(snapshot.deviceId) ?? 'Remote Device',
 				workspaceName: workspaceNames.get(snapshot.workspaceId) ?? 'Remote Workspace',
@@ -372,7 +338,9 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 			};
 		});
 		const combinedOutgoingTasks = [...outgoingTasks, ...remoteDashboardTasks]
-			.sort((left, right) => right.startedAt.localeCompare(left.startedAt));
+			.sort((left, right) =>
+				compareDashboardTimestampsDescending(left.startedAt, right.startedAt)
+			);
 		if (combinedOutgoingTasks.length > 500) {
 			errors.push({
 				code: 'DASHBOARD_TASKS_TRUNCATED',
@@ -381,7 +349,7 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 			});
 		}
 		outgoingTasks = combinedOutgoingTasks.slice(0, 500);
-		const tasks: DashboardSnapshot['tasks'] = [...localTasks, ...remoteTasks];
+		const tasks: DashboardSnapshot['tasks'] = remoteTasks;
 		const legacyWorkspaces = uniqueWorkspaces(localNodes);
 		const broker = brokerSnapshot(lifecycle);
 		return {
@@ -560,17 +528,42 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 		cancel(): Promise<void>;
 		release(): Promise<void>;
 	}> {
-		const remoteTaskId = this.remoteTaskActions.get(actionHandle);
+		const remoteBinding = this.remoteTaskActions.get(actionHandle);
 		this.remoteTaskActions.delete(actionHandle);
-		if (remoteTaskId !== undefined) {
+		if (remoteBinding !== undefined) {
+			this.remoteTaskHandlesById.delete(remoteBinding.taskId);
+		}
+		if (remoteBinding !== undefined) {
 			if (direction !== 'outgoing') {
 				throw new DashboardActionError(
 					'STALE_ACTION',
 					'The task action does not match its Dashboard direction.',
 				);
 			}
+			if (remoteBinding.lifecycleGeneration !== this.currentRemoteHandleGeneration()) {
+				throw new DashboardActionError(
+					'STALE_ACTION',
+					'The Broker ownership generation changed. Refresh the Dashboard and try again.',
+				);
+			}
+			const remoteTaskId = remoteBinding.taskId;
 			return {
 				cancel: async () => {
+					if (remoteBinding.lifecycleGeneration !== this.currentRemoteHandleGeneration()) {
+						throw new DashboardActionError(
+							'STALE_ACTION',
+							'The Broker ownership generation changed while confirming cancellation.',
+						);
+					}
+					const current = this.options.remoteTasks.listKnownTasks().find(
+						({ taskId }) => taskId === remoteTaskId,
+					);
+					if (current === undefined || !activeTaskStates.has(current.state)) {
+						throw new DashboardActionError(
+							'STALE_ACTION',
+							'The remote task is no longer cancellable.',
+						);
+					}
 					const controller = deadlineSignal(10_000);
 					try {
 						const snapshot = await this.options.remoteTasks.cancelTask(
@@ -712,6 +705,7 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 	public dispose(): void {
 		this.acceptActions.clear();
 		this.remoteTaskActions.clear();
+		this.remoteTaskHandlesById.clear();
 		for (const subscription of this.subscriptions.splice(0)) {
 			subscription.dispose();
 		}
@@ -834,6 +828,54 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 		} while (actions.has(handle) || forbidden.has(handle));
 		actions.set(handle, value);
 		return handle;
+	}
+
+	private stableRemoteTaskHandle(
+		taskId: string,
+		forbidden: ReadonlySet<string>,
+	): string {
+		const existing = this.remoteTaskHandlesById.get(taskId);
+		const existingBinding = existing === undefined
+			? undefined
+			: this.remoteTaskActions.get(existing);
+		if (
+			existing !== undefined
+			&& existingBinding?.taskId === taskId
+			&& existingBinding.lifecycleGeneration === this.remoteHandleGeneration
+		) {
+			return existing;
+		}
+		const handle = this.issueBindingHandle(this.remoteTaskActions, {
+			taskId,
+			lifecycleGeneration: this.remoteHandleGeneration,
+		}, forbidden);
+		this.remoteTaskHandlesById.set(taskId, handle);
+		return handle;
+	}
+
+	private pruneRemoteTaskActions(retainedTaskIds: ReadonlySet<string>): void {
+		for (const [taskId, handle] of this.remoteTaskHandlesById) {
+			if (retainedTaskIds.has(taskId)) {
+				continue;
+			}
+			this.remoteTaskHandlesById.delete(taskId);
+			this.remoteTaskActions.delete(handle);
+		}
+	}
+
+	private currentRemoteHandleGeneration(): string {
+		const snapshot = this.options.lifecycle.snapshot();
+		return `${snapshot.generation ?? 'none'}:${snapshot.ownership?.generation ?? 'none'}:${snapshot.state}`;
+	}
+
+	private refreshRemoteHandleGeneration(): void {
+		const generation = this.currentRemoteHandleGeneration();
+		if (generation === this.remoteHandleGeneration) {
+			return;
+		}
+		this.remoteHandleGeneration = generation;
+		this.remoteTaskActions.clear();
+		this.remoteTaskHandlesById.clear();
 	}
 
 	private requireOwner(): ProductionBrokerRuntime {
@@ -1181,6 +1223,15 @@ function platformLabel(platform: NodeJS.Platform): string {
 	return platform === 'darwin'
 		? 'macOS'
 		: platform === 'win32' ? 'Windows' : platform === 'linux' ? 'Linux' : platform;
+}
+
+function compareDashboardTimestampsDescending(left: string, right: string): number {
+	const leftTime = Date.parse(left);
+	const rightTime = Date.parse(right);
+	if (Number.isFinite(leftTime) && Number.isFinite(rightTime)) {
+		return rightTime - leftTime;
+	}
+	return right.localeCompare(left);
 }
 
 

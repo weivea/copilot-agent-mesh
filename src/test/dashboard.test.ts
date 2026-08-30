@@ -3,6 +3,7 @@ import { readFile } from 'fs/promises';
 
 import * as vscode from 'vscode';
 
+import { timestampSchema } from '../../shared/protocol';
 import {
 	ProductionDashboardBindings,
 	ProductionDashboardBindingsOptions,
@@ -356,6 +357,45 @@ suite('Dashboard', () => {
 		assert.equal(degraded.thisWindow.agentHost.reason, 'EDITOR_DISCOVERY_FAILED');
 	});
 
+	test('canonicalizes every protocol-valid timestamp shape and safely marks malformed values', () => {
+		const variants = [
+			'2026-08-31T00:00:00+00:00',
+			'2026-08-31T08:00:00+08:00',
+			'2026-08-31T00:00:00.1Z',
+			'2026-08-31T00:00:00.123Z',
+			'2026-08-31T00:00:00.123456Z',
+			'2026-08-31T00:00:00.123456789Z',
+		];
+		for (const value of variants) {
+			assert.equal(timestampSchema.safeParse(value).success, true);
+		}
+		const extendedYearAfterNormalization = '9999-12-31T23:59:59-23:59';
+		assert.equal(timestampSchema.safeParse(extendedYearAfterNormalization).success, true);
+		const source = snapshot();
+		const task = source.outgoingTasks?.[0];
+		assert.ok(task);
+		const model = new DashboardPresenter().present({
+			...source,
+			outgoingTasks: variants.slice(0, 3).map((startedAt) => ({ ...task, startedAt })),
+			incomingTasks: [
+				...variants.slice(3).map((startedAt) => ({ ...task, startedAt })),
+				{ ...task, startedAt: extendedYearAfterNormalization },
+				{ ...task, startedAt: 'malformed timestamp' },
+			],
+		});
+		for (const projected of [...model.outgoingTasks, ...model.incomingTasks.slice(0, 3)]) {
+			assert.match(projected.startedAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u);
+		}
+		assert.equal(model.incomingTasks[3]?.startedAt, 'Unknown');
+		assert.equal(model.incomingTasks[4]?.startedAt, 'Unknown');
+		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: 'instance-1',
+			type: 'dashboard.snapshot',
+			model,
+		}));
+	});
+
 	test('isolates repeated resolves of the same view and makes repeated disposal safe', async () => {
 		const extension = getExtension();
 		const facade = new RecordingDashboardFacade();
@@ -466,6 +506,52 @@ suite('Dashboard', () => {
 			enabled: false,
 		});
 		assert.equal(first.webview.sent.some(({ code }) => code === 'STALE_ACTION'), true);
+		provider.dispose();
+	});
+
+	test('keeps active task UI handles stable across refresh and removes them at terminal state', async () => {
+		const extension = getExtension();
+		const facade = new RecordingDashboardFacade();
+		const provider = new AgentMeshViewProvider(facade, extension.extensionUri);
+		const view = new TestWebviewView();
+		provider.resolveWebviewView(view);
+		const uiInstanceId = getUiInstanceId(view.webview.html);
+		await view.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'ready' });
+		const handle = getCollectionActionHandle(view.webview.sent[0], 'outgoingTasks');
+		assert.ok(handle);
+
+		facade.fireChanged();
+		await settle();
+		const refreshedHandle = getCollectionActionHandle(
+			view.webview.sent[view.webview.sent.length - 1],
+			'outgoingTasks',
+		);
+		assert.equal(refreshedHandle, handle);
+
+		const current = facade.snapshotValue;
+		facade.snapshotValue = {
+			...current,
+			outgoingTasks: current.outgoingTasks?.map((task) => ({
+				...task,
+				state: 'completed',
+				canCancel: false,
+				actionHandle: undefined,
+			})),
+		};
+		facade.fireChanged();
+		await settle();
+		assert.equal(getCollectionActionHandle(
+			view.webview.sent[view.webview.sent.length - 1],
+			'outgoingTasks',
+		), undefined);
+		await view.webview.receive({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId,
+			type: 'action',
+			action: 'cancelOutgoingTask',
+			actionHandle: handle,
+		});
+		assert.equal(view.webview.sent.some(({ code }) => code === 'STALE_ACTION'), true);
 		provider.dispose();
 	});
 
@@ -732,10 +818,11 @@ class RecordingDashboardFacade implements DashboardFacade {
 	private readonly changed = new vscode.EventEmitter<void>();
 	public readonly calls: string[] = [];
 	public readonly onDidChange = this.changed.event;
+	public snapshotValue = snapshot();
 	public renameError?: DashboardActionError;
 
 	public getSnapshot(): Promise<DashboardSnapshot> {
-		return Promise.resolve(snapshot());
+		return Promise.resolve(this.snapshotValue);
 	}
 
 	public fireChanged(): void {
