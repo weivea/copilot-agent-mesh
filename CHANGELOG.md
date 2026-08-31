@@ -68,6 +68,12 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
   plus `testMode: true` in a separately typed test diagnostic, and is rejected
   by both normal and `--require-pass` release validation. Unsupported release
   platforms fail before touching existing evidence.
+- Isolated peer-delegation E2E Mesh metadata and Broker files from persistent
+  authenticated profiles. Fixed-key run-nonce envelopes prevent a full production
+  Workspace Catalog or stale routes from blocking temporary claims, while the
+  run-owned Broker root preserves authentication without deleting, editing, or
+  evicting persistent state. Safe startup diagnostics now distinguish bounded
+  Broker/workspace failures from a bare controller timeout.
 - Bumped the Preview extension and VSIX artifact to `0.4.0` while retaining AHP
   commit `f19dd8b3942d029744a3bdd31d830f9428e8ea47`, TypeScript client `0.9.0`,
   and protocol offer `1.0.0`.

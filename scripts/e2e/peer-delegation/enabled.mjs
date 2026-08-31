@@ -1198,7 +1198,7 @@ async function recordCompletionScenario({
 		evidence.blocker = {
 			code,
 			message: code === 'AGENT_AUTH_REQUIRED'
-				? 'The fresh real E2E profile has no usable Copilot authentication session.'
+				? 'The selected real E2E profile has no usable Agent Host authentication session.'
 				: 'The real Agent task did not reach authoritative completion.',
 		};
 		return false;

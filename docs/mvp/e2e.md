@@ -128,8 +128,9 @@ Copilot edits, and O5 remains unsupported/unverified outside macOS arm64.
 
 ### Recorded P8 objective result
 
-The 2026-08-31 diagnostics-only run on VS Code 1.135.0/macOS arm64 produced a
-valid **Unverified** artifact rather than a false Pass:
+The 2026-08-31 diagnostics-only run on VS Code 1.135.0/macOS arm64 using the
+existing dedicated profile with a full 32-entry production Workspace Catalog
+produced a valid **Unverified** artifact rather than a false Pass:
 
 - AC-5 1-4 passed: two ordinary windows, exactly one Broker, two distinct claim
   hashes, target absent before authorization, exact `PEER_NOT_ALLOWED` and
@@ -138,8 +139,10 @@ valid **Unverified** artifact rather than a false Pass:
 - AC-5 8 and 10-12 passed: the target had an Incoming record, Listener/Tunnel
   attempt deltas stayed zero, the Workspace lease and Profile Lock were released,
   and final harness-owned VS Code/Agent Host/Tunnel/socket/timer counts were zero.
-- The fresh profile selected explicit `standalone` degradation and returned
-  `AGENT_AUTH_REQUIRED` with the exact task ID after 2.489 seconds. AC-5 5-7 and
+- The run-scoped Mesh state reached both windows without reading or evicting that
+  production Catalog. The selected profile then used explicit `standalone`
+  degradation and returned `AGENT_AUTH_REQUIRED` with the exact task ID after
+  5.825 seconds. AC-5 5-7 and
   9, O1, needs-input, cancellation, timeout, and O2 therefore remain Unverified.
 - No user attestation was created. The full UI rerun still requires the exact
   enabled command, a signed-in dedicated profile, one visible Agent-mode Tool

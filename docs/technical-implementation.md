@@ -1295,10 +1295,12 @@ macOS arm64 已记录以下真实运行：
   Run completed，Listener/Tunnel Stopped，Takeover 993 ms，Profile Lock 释放且
   Process/Socket/Timer 零残留。
 - `artifacts/peer-delegation-e2e/evidence.json`：
-  P8 VS Code 1.135.0/macOS arm64 objective run 通过两个普通 Window Node、一个 Broker、
+  P8 使用已有满 32 项生产 Workspace Catalog 的专用 Profile，在 VS Code
+  1.135.0/macOS arm64 objective run 通过两个普通 Window Node、一个 Broker、
   两个不同 Claim、`PEER_NOT_ALLOWED` / `PEER_NOT_ACCEPTING`、单向可见、Incoming、
   Listener/Tunnel 零 attempt delta、Lease/Profile Lock 释放与 Harness-owned 资源归零。
-  Fresh Profile 显式 standalone 降级并停在 `AGENT_AUTH_REQUIRED`，所以不声明
+  Run-scoped metadata/file root 未读取、删除或逐出生产 Catalog；所选 Profile 显式
+  standalone 降级并停在 `AGENT_AUTH_REQUIRED`，所以不声明
   `agentStarted`/output/completed、父 Chat confirmation、O1/O2 或真实 input/cancel/timeout。
 
 实施期间 Unit、Component、Extension Host 和完整 npm Test 均通过；最终发布
