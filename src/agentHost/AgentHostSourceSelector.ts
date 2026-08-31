@@ -40,6 +40,7 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 	private readonly listeners = new Set<(status: AgentHostSourceStatus) => void>();
 	private status: AgentHostSourceStatus = { source: 'standalone', degraded: false };
 	private sourceSelected = false;
+	private editorProbeOperation: Promise<AgentRuntimeProbe> | undefined;
 	private readonly inFlightStarts = new Set<{
 		readonly controller: AbortController;
 		readonly operation: Promise<AgentTaskHandle>;
@@ -57,14 +58,28 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 			this.setStatus({ source: 'standalone', degraded: false });
 			return { ...probe, source: 'standalone', degradation: undefined };
 		}
+		if (this.inFlightStarts.size > 0) {
+			return {
+				available: false,
+				featureEnabled: true,
+				reason: 'AGENT_UNAVAILABLE',
+				source: 'editor',
+			};
+		}
 		if (this.sourceSelected) {
 			const selected = this.status.source === 'editor'
-				? await this.options.editor.probe()
+				? {
+					available: this.status.failure === undefined,
+					featureEnabled: true,
+					...(this.status.failure === undefined
+						? {}
+						: { reason: this.status.failure.code }),
+				}
 				: await this.options.standalone.probe();
 			return probeWithStatus(selected, this.status);
 		}
 
-		const editor = await this.options.editor.probe();
+		const editor = await this.probeEditor();
 		if (editor.available) {
 			this.setStatus({ source: 'editor', degraded: false });
 			return probeWithStatus(editor, this.status);
@@ -111,6 +126,7 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 		}
 
 		let editorFailure: AgentHostSourceFailure | undefined;
+		await this.editorProbeOperation?.catch(() => undefined);
 		for (let attempt = 0; attempt < 2; attempt += 1) {
 			try {
 				const handle = await this.options.editor.start(request);
@@ -145,6 +161,20 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 			this.setStatus(failed);
 			throw normalizeFallbackFailure(error);
 		}
+	}
+
+	private probeEditor(): Promise<AgentRuntimeProbe> {
+		if (this.editorProbeOperation !== undefined) {
+			return this.editorProbeOperation;
+		}
+		let operation!: Promise<AgentRuntimeProbe>;
+		operation = this.options.editor.probe().finally(() => {
+			if (this.editorProbeOperation === operation) {
+				this.editorProbeOperation = undefined;
+			}
+		});
+		this.editorProbeOperation = operation;
+		return operation;
 	}
 
 	private async approve(request: AgentTaskRequest, signal: AbortSignal): Promise<AgentTaskRequest> {

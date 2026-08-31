@@ -32,6 +32,10 @@ launcher exactly once and exposes `standalone` plus a bounded degradation reason
 One connection-only failure may re-locate and reconnect the editor once under the
 same approval capability before that fallback; no Session or Turn exists at that
 boundary.
+The selector also serializes the final pre-start endpoint probe with launch and
+does not rediscover the endpoint while an editor start is in flight or selected.
+This prevents Dashboard refreshes from rotating the registry token between
+locate and WebSocket upgrade.
 Fallback is forbidden when cleanup of the failed editor attempt is unconfirmed;
 starting standalone in that state could overlap resources or execution. Selector
 disposal retains failed cleanup for an explicit retry.
