@@ -8,8 +8,7 @@
 > 用户实例的 `editor` endpoint。Broker、Window Node、Workspace Lease、本地 IPC、
 > Task 生命周期与脱敏边界等章节**仍然有效**。
 
-> 状态：0.3.0 Preview Same-device Multi-project Collaboration；Gate G0 在 macOS
-> arm64 验证范围内 Go<br>
+> 状态：0.4.0 Preview Peer Window Delegation 已实现；真实 UI/editor Gate 待显式运行<br>
 > 日期：2026-08-30<br>
 > 依据：[产品需求文档 v0.3](../copilot-agent-mesh-prd.md)<br>
 > 首版范围：本机桌面 Workspace；不支持 SSH、WSL、Dev Containers、Codespaces 或 vscode.dev
@@ -147,7 +146,7 @@ flowchart LR
 | 进程 | 所有者 | 职责 | 禁止暴露 |
 | --- | --- | --- | --- |
 | Broker-owner Extension Host | VS Code | Device Broker、Gateway、一个 Dev Tunnel、Peer Manager、全局 Store、远端路由、Node Registry | Secret、Agent Host token |
-| 其他普通 Extension Host | VS Code | 活跃 Window Node、UI、八个工具、Workspace Claim、自有真实 AHP Runtime/Handle | Broker key、Agent Host token |
+| 其他普通 Extension Host | VS Code | 活跃 Window Node、UI、五个工具、Workspace Claim、自有真实 AHP Runtime/Handle | Broker key、Agent Host token |
 | `devtunnel host` | Mesh 启动 | Relay host 长连接 | 配对密钥、任务内容 |
 | `code agent host` | Mesh 启动或发现 | AHP Server、Copilot Agent Session | AHP connection token |
 | VS Code Webview | Extension | 只显示 ViewModel、发送受限 UI 命令 | Secret、原始本地路径、未脱敏日志 |
@@ -1247,6 +1246,11 @@ zod
 4. **Multi-window E2E：** 相同 User Data 的普通 VS Code Windows，验证一个
    Broker、多 Node、IPC、Claim/Reclaim/Conflict、Takeover 与精确清理。默认不
    启动 AHP Task。
+5. **Peer Delegation E2E：** 两个普通窗口、两个一次性项目、同一专用 User Data，
+   通过 Dashboard 一次性句柄配置双重门，并通过真实注册的五个 LM Tool 验证
+   Tool → Broker → Window Node → editor AHP → Broker → Tool Result。稳定
+   `vscode.lm.invokeTool` 不触发 `prepareInvocation`，所以父 Copilot 确认只能由可见
+   Agent-mode 阶段证明，缺失时明确 `unverified`。
 
 环境变量：
 
@@ -1256,6 +1260,7 @@ MESH_AGENT_HOST_E2E=1
 MESH_TWO_DEVICE_E2E=1
 npm run test:multi-window-real
 MESH_MULTI_WINDOW_E2E_TASKS=1 npm run test:multi-window-real
+MESH_PEER_DELEGATION_E2E=1 npm run test:peer-delegation-real
 ```
 
 macOS Unix Socket 路径过长时使用短目录：
@@ -1319,8 +1324,9 @@ Linux Extension Host Test 使用 `xvfb-run -a`。[VS Code CI](https://code.visua
 
 ## 21. Release Gate
 
-以下全部通过才可把 0.3.0 Preview Evaluation Package 提升为通过 G0 的发布候选。
-macOS arm64 验证范围现为 Go；这不表示已 Push/Release/Publish：
+以下全部通过才可把 0.4.0 Preview Evaluation Package 提升为 Peer Window
+Delegation 发布候选。历史 G0 的 macOS arm64 验证范围仍为 Go；新的同设备委派必须
+另外通过 12 项真实证据，且这不表示已 Merge/Release/Publish：
 
 1. Gateway 只监听 `127.0.0.1`，只公开 `/healthz` 和认证 RPC Upgrade。
 2. 未认证 Peer 无法读取设备、Workspace 或 Task 信息。
@@ -1349,6 +1355,12 @@ macOS arm64 验证范围现为 Go；这不表示已 Push/Release/Publish：
 21. Authenticated Authoritative AHP start/get/cancel/output/handle-cancel 已通过。
 22. Dashboard/Tool 不暴露 Artifact 内容、绝对路径、Secret、原始
     Prompt/Output；同设备路径始终不触碰 Dev Tunnel。
+23. `MESH_PEER_DELEGATION_E2E=1` 真实运行证明两个普通 Window Node、一个 Broker、
+    两个不同 Claim、双重门两种错误、一次父确认、真实 AHP completed、同次 Tool
+    `taskId`、Incoming、editor source、零 Listener/Tunnel delta、Lease/Profile Lock
+    释放，以及零 Harness-owned Process/Socket/Timer residual。
+24. P8 evidence Validator 拒绝路径、Token、完整 Workspace identity、原始
+    Prompt/Output、无效引用、降级 editor 冒充和全局进程零断言。
 
 ## 22. 参考资料
 

@@ -80,6 +80,13 @@ Editor connection tokens, socket/user-data/executable paths, and endpoint instan
 are registered in a reference-counted in-memory redaction set for raw and
 percent-encoded forms and are removed after the final borrowing task disposes.
 
+The P8 real harness may install a non-throwing, E2E-capability-only lifecycle
+observer. It records only the task UUID and one of
+`chat/turnComplete`/`chat/turnCancelled`/`chat/error`, allowing evidence to
+distinguish the authoritative AHP action from the persisted Mesh terminal state.
+It never records an envelope, prompt, output, URI, endpoint, or token, and no
+observer exists in production extension mode.
+
 Required Session configuration is rendered from the provider schema. Boolean values use explicit choices, strings remain strings, and numbers, arrays, and objects are parsed and recursively validated as JSON. Invalid, read-only, or unsupported properties fail with `AGENT_CONFIG_REQUIRED` instead of sending a coerced value to the provider.
 
 ## Authentication
@@ -143,6 +150,11 @@ The 2026-08-31 P6 editor-source experiment ran on macOS arm64. The Stable regist
 command succeeded but returned zero endpoints; Insiders user-data was absent. Editor
 initialize and O1 Session visibility therefore remain unverified in that environment,
 with no Session created and no sensitive evidence persisted.
+
+P8 adds editor `listSessions` catalog comparison before and after a real task.
+Only domain-separated 16-hex fingerprints and counts leave the Extension Host.
+A standalone fallback can demonstrate degraded execution but can never satisfy
+the editor Session visibility claim.
 
 ## Verified result
 

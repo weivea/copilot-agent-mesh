@@ -22,6 +22,10 @@ import {
 	type WindowNodeClientSnapshot,
 } from '../node';
 import { deriveLocalIpcEndpoint } from '../ipc';
+import {
+	PeerDelegationE2eRecorder,
+	PeerDelegationE2eToolClock,
+} from '../e2e/PeerDelegationE2eRecorder';
 import { BrokerOwnerLock } from '../storage/BrokerOwnerLock';
 import {
 	DeviceProfileStore,
@@ -60,8 +64,10 @@ import {
 	createTwoDeviceE2eApi,
 	type TwoDeviceE2eApi,
 } from './TwoDeviceE2eApi';
+import { createPeerDelegationE2eApi } from './PeerDelegationE2eApi';
 import {
 	E2eCapability,
+	isE2eCapabilityEnabled,
 	type ExtensionRuntimeMode,
 } from './E2eCapability';
 import {
@@ -99,6 +105,7 @@ export interface AgentMeshExtensionApi {
 	readonly listener?: ProductionBrokerRuntime['listener'];
 	readonly twoDeviceE2e?: TwoDeviceE2eApi;
 	readonly multiWindowE2e?: TwoDeviceE2eApi;
+	readonly peerDelegationE2e?: TwoDeviceE2eApi;
 }
 
 export interface Application {
@@ -129,23 +136,34 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		const configuration = vscode.workspace.getConfiguration('copilotAgentMesh');
 		const twoDeviceE2eRequested = process.env.MESH_TWO_DEVICE_E2E === '1';
 		const multiWindowE2eRequested = process.env.MESH_MULTI_WINDOW_E2E === '1';
-		const requestedE2eScenarios = [
-			twoDeviceE2eRequested,
-			multiWindowE2eRequested,
-		].filter(Boolean).length;
-		const oneE2eScenarioRequested = requestedE2eScenarios === 1;
+		const peerDelegationE2eRequested = process.env.MESH_PEER_DELEGATION_E2E === '1';
+		const requestedE2eScenario = selectE2eScenario({
+			twoDevice: twoDeviceE2eRequested,
+			multiWindow: multiWindowE2eRequested,
+			peerDelegation: peerDelegationE2eRequested,
+		});
 		const e2eCapability = E2eCapability.create({
 			mode: extensionRuntimeMode(context.extensionMode),
-			environmentEnabled: oneE2eScenarioRequested,
-			environmentNonce: multiWindowE2eRequested
+			environmentEnabled: requestedE2eScenario !== undefined,
+			environmentNonce: requestedE2eScenario === 'peerDelegation'
+				? process.env.MESH_PEER_DELEGATION_E2E_NONCE
+				: requestedE2eScenario === 'multiWindow'
 					? process.env.MESH_MULTI_WINDOW_E2E_NONCE
 					: process.env.MESH_TWO_DEVICE_E2E_NONCE,
-			environmentRole: multiWindowE2eRequested
+			environmentRole: requestedE2eScenario === 'peerDelegation'
+				|| requestedE2eScenario === 'multiWindow'
 				? 'coordinator'
 				: process.env.MESH_TWO_DEVICE_E2E_ROLE,
 			profileNonce: configuration.get<string>('e2e.nonce'),
 			profileRole: configuration.get<string>('e2e.role'),
 		});
+		const peerDelegationRecorder = requestedE2eScenario === 'peerDelegation'
+			&& isE2eCapabilityEnabled(e2eCapability)
+			? new PeerDelegationE2eRecorder()
+			: undefined;
+		const peerDelegationToolClock = peerDelegationRecorder === undefined
+			? undefined
+			: new PeerDelegationE2eToolClock(peerDelegationBudgetMs());
 		const environment: DeviceEnvironment = {
 			defaultName: configuration.get<string>('deviceName', '').trim() || hostname(),
 			platform: supportedPlatform(process.platform),
@@ -236,6 +254,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 					workerPlatform,
 					delegatedToolInvocations,
 					runtimeApprovalCapabilities,
+					peerDelegationRecorder,
 				);
 				sourceStatusSubscription = runtime.onDidSourceStatusChange(() => changeEvents.fire());
 				return new WindowNodeTaskExecutor({
@@ -331,18 +350,42 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			capability: e2eCapability,
 			localIpcEndpoint: deriveLocalIpcEndpoint(nodeIdentity),
 		});
-		const twoDeviceE2e = twoDeviceE2eRequested && requestedE2eScenarios === 1
+		const twoDeviceE2e = requestedE2eScenario === 'twoDevice'
 			? gatedE2e
 			: undefined;
-		const multiWindowE2e = multiWindowE2eRequested && requestedE2eScenarios === 1
+		const multiWindowE2e = requestedE2eScenario === 'multiWindow'
 			? gatedE2e
+			: undefined;
+		const peerDelegationE2e = requestedE2eScenario === 'peerDelegation'
+			&& peerDelegationRecorder !== undefined
+			&& peerDelegationToolClock !== undefined
+			? createPeerDelegationE2eApi({
+				vscodeApi: vscode,
+				bindings,
+				node,
+				localTasks,
+				remoteTasks,
+				runtime,
+				lifecycle,
+				ownerRuntime: () => currentOwnerRuntime,
+				capability: e2eCapability,
+				localIpcEndpoint: deriveLocalIpcEndpoint(nodeIdentity),
+				recorder: peerDelegationRecorder,
+				toolClock: peerDelegationToolClock,
+			})
 			: undefined;
 		let meshTools: vscode.Disposable | undefined;
 		const syncMeshTools = (): void => {
 			const enabled = vscode.workspace.getConfiguration('copilotAgentMesh')
 				.get<boolean>('experimental.peerDelegation', false);
 			if (enabled && meshTools === undefined) {
-				meshTools = registerMeshTaskTools(localTasks, { delegatedToolInvocations });
+				meshTools = peerDelegationRecorder === undefined
+					? registerMeshTaskTools(localTasks, { delegatedToolInvocations })
+					: registerMeshTaskTools(localTasks, {
+						delegatedToolInvocations,
+						clock: peerDelegationToolClock,
+						observer: peerDelegationRecorder,
+					});
 			} else if (!enabled && meshTools !== undefined) {
 				meshTools.dispose();
 				meshTools = undefined;
@@ -419,6 +462,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			},
 			...(twoDeviceE2e === undefined ? {} : { twoDeviceE2e }),
 			...(multiWindowE2e === undefined ? {} : { multiWindowE2e }),
+			...(peerDelegationE2e === undefined ? {} : { peerDelegationE2e }),
 		};
 		return {
 			api,
@@ -627,6 +671,27 @@ function supportedPlatform(platform: NodeJS.Platform): 'win32' | 'darwin' | 'lin
 		return platform;
 	}
 	throw new Error(`Copilot Agent Mesh does not support platform ${platform}.`);
+}
+
+type E2eScenario = 'twoDevice' | 'multiWindow' | 'peerDelegation';
+
+function selectE2eScenario(requested: Readonly<Record<E2eScenario, boolean>>): E2eScenario | undefined {
+	const selected = (Object.entries(requested) as Array<[E2eScenario, boolean]>)
+		.filter(([, enabled]) => enabled)
+		.map(([scenario]) => scenario);
+	return selected.length === 1 ? selected[0] : undefined;
+}
+
+function peerDelegationBudgetMs(): number {
+	const raw = process.env.MESH_PEER_DELEGATION_E2E_BUDGET_MS ?? '10000';
+	if (!/^[0-9]{3,5}$/u.test(raw)) {
+		throw new Error('MESH_PEER_DELEGATION_E2E_BUDGET_MS must be an integer from 500 to 30000.');
+	}
+	const value = Number(raw);
+	if (!Number.isSafeInteger(value) || value < 500 || value > 30_000) {
+		throw new Error('MESH_PEER_DELEGATION_E2E_BUDGET_MS must be an integer from 500 to 30000.');
+	}
+	return value;
 }
 
 function extensionRuntimeMode(mode: vscode.ExtensionMode): ExtensionRuntimeMode {

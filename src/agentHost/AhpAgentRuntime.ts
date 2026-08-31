@@ -22,6 +22,7 @@ import {
 	type AgentRuntime,
 	type AgentRuntimeEvent,
 	type AgentRuntimeProbe,
+	type AgentRuntimeLifecycleObserver,
 	type AgentTaskAnswer,
 	type AgentTaskHandle,
 	type AgentTaskRequest,
@@ -140,6 +141,7 @@ export interface AhpAgentRuntimeOptions {
 	readonly configResolver?: SessionConfigurationResolver;
 	readonly cancellationTimeoutMs?: number;
 	readonly delegatedToolInvocations?: DelegatedToolInvocationRegistry;
+	readonly lifecycleObserver?: AgentRuntimeLifecycleObserver;
 }
 
 export class AhpAgentRuntime implements AgentRuntime {
@@ -229,6 +231,7 @@ export class AhpAgentRuntime implements AgentRuntime {
 				this.options.configResolver ?? new DefaultSessionConfigurationResolver(),
 				this.options.cancellationTimeoutMs ?? cancellationTimeoutMs,
 				this.options.delegatedToolInvocations,
+				this.options.lifecycleObserver,
 				() => this.tasks.delete(createdTask),
 			);
 			task = createdTask;
@@ -562,6 +565,7 @@ class AhpTask implements AgentTaskHandle {
 		private readonly configResolver: SessionConfigurationResolver,
 		private readonly cancelTimeoutMs: number,
 		private readonly delegatedToolInvocations: DelegatedToolInvocationRegistry | undefined,
+		private readonly lifecycleObserver: AgentRuntimeLifecycleObserver | undefined,
 		private readonly didDispose: () => void,
 	) {
 		this.taskId = request.taskId;
@@ -1242,6 +1246,23 @@ class AhpTask implements AgentTaskHandle {
 			}
 		}
 		this.trackDeliveredResponseAction(action);
+		if (
+			envelope.channel === this.chatUri
+			&& (
+				action.type === 'chat/turnComplete'
+				|| action.type === 'chat/turnCancelled'
+				|| action.type === 'chat/error'
+			)
+		) {
+			try {
+				this.lifecycleObserver?.observeLifecycle({
+					taskId: this.taskId,
+					eventType: action.type,
+				});
+			} catch {
+				// Optional lifecycle observation must not affect Agent execution.
+			}
+		}
 		await this.emitMappedEvents(
 			this.mapper.map(envelope),
 			envelope.channel === this.chatUri

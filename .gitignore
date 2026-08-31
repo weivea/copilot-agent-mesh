@@ -4,3 +4,4 @@ node_modules
 .vscode-test/
 .mw/
 *.vsix
+artifacts/peer-delegation-e2e/

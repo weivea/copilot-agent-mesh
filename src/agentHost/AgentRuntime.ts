@@ -40,6 +40,15 @@ export interface AgentHostSourceStatusProvider {
 	};
 }
 
+export interface AgentRuntimeLifecycleObservation {
+	readonly taskId: string;
+	readonly eventType: 'chat/turnComplete' | 'chat/turnCancelled' | 'chat/error';
+}
+
+export interface AgentRuntimeLifecycleObserver {
+	observeLifecycle(observation: AgentRuntimeLifecycleObservation): void;
+}
+
 export class AgentRuntimeError extends Error {
 	constructor(
 		readonly code: AgentRuntimeErrorCode,

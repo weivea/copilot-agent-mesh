@@ -285,3 +285,16 @@ Stable user-data 存在且命令成功，但 endpoint/editor 计数均为 0；In
 **unverified**，未创建 Session、未消费模型配额，也未留下 token、socket 或 Workspace
 路径证据。该环境结果不推翻本 Spike 的已证明结果，只说明 P8 必须在一个正在运行并注册
 editor endpoint 的普通 VS Code 实例内完成 O1。
+
+### P8 自动化边界（2026-08-31）
+
+P8 已实现可重复的两个普通窗口 Harness。它在窗口启动后用相同的严格 Locator 连接本次
+专用 User Data 的唯一 live `editor` endpoint，并在真实任务前后调用 `listSessions`；只
+保存数量与 domain-separated 截断 Hash，不保存 resource URI、socket 路径或 token。任务
+自己的 recovery Session Hash 只有与 editor catalog 匹配时才算 Host catalog 证据。
+
+稳定 Extension API 不提供读取 Chat Sessions UI 或向内置 Copilot Agent 自动发送并确认
+消息的接口；`vscode.lm.invokeTool` 还会绕过 `prepareInvocation`。因此自动结果不能证明
+Q4' 的可见 UI，也不能证明用户点过 Continue。P8 的可选人工阶段保留两个真实窗口并给出
+精确 Agent-mode 操作；若没有人工可见观察，Q4' 继续记为 **unverified**，不从
+`listSessions` 推断为 Pass。

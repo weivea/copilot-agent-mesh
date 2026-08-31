@@ -5,9 +5,9 @@ import {
 } from './WindowE2eHost';
 
 const options = {
-	environmentPrefix: 'MESH_MULTI_WINDOW_E2E',
-	controller: (api: AgentMeshExtensionApi) => api.multiWindowE2e,
-	label: 'multi-window E2E',
+	environmentPrefix: 'MESH_PEER_DELEGATION_E2E',
+	controller: (api: AgentMeshExtensionApi) => api.peerDelegationE2e,
+	label: 'peer-delegation E2E',
 } as const;
 
 export function run(): Promise<void> {

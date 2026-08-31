@@ -1,10 +1,11 @@
 # Copilot Agent Mesh
 
-Copilot Agent Mesh 0.3.0 Preview coordinates GitHub Copilot coding tasks across
-trusted devices, VS Code windows, and local workspaces. It uses Mesh protocol v2;
-v1 peers are explicitly incompatible. Gate G0 has passed for the validated
-macOS arm64 Preview scope; this remains an evaluation build, not a cross-platform
-Worker or general-availability claim.
+Copilot Agent Mesh 0.4.0 Preview adds default-off **Peer Window Delegation** for
+ordinary VS Code windows on one macOS arm64 device. In Agent mode, Copilot can use
+five Mesh tools to discover an explicitly authorized peer window, delegate one
+task, wait for its authoritative result, answer input, or cancel it. Mesh protocol
+v2 remains in use; v1 peers are explicitly incompatible. This is an evaluation
+build, not a cross-device, cross-platform Worker, or general-availability claim.
 
 One stable **Device Broker** owns pairing, peer roots, the Gateway, one Dev Tunnel,
 the peer manager, global task/delegation persistence, reducer/event log, remote
@@ -23,6 +24,12 @@ Preview. Other platforms fail closed with `CLI_UNSUPPORTED` or
 - VS Code 1.103 or newer is required.
 - Real Worker execution is experimental, disabled by default, and may consume Copilot quota.
 - Enable `copilotAgentMesh.experimental.agentHost` only after reviewing the first-task confirmation and process ownership behavior.
+- Enable `copilotAgentMesh.experimental.peerDelegation` in every participating
+  window. The directional source allowlist and the target's **Accept Incoming
+  Tasks** switch are both default-off.
+- Use Copilot Chat in Agent mode with tools enabled. Copilot tool choice is not
+  guaranteed; use `#meshListWorkers` and `#meshDelegateTask` when explicit
+  selection is needed.
 - AHP authentication is not inferred. Every advertised protected-resource or authorization-server URL must be mapped explicitly in `copilotAgentMesh.experimental.authenticationProviders` to an installed VS Code authentication provider and its exact scopes. Missing mappings fail with `AGENT_AUTH_REQUIRED`.
 - Tunnel hosting requires a user-supplied `copilotAgentMesh.devTunnelPath` pointing to the exact validated macOS arm64 CLI build `1.0.2030+fc9273aa0f`. The extension does not search `PATH`, download, install, or upgrade Dev Tunnel.
 - A fresh shared profile has no authentication session by default. Real AHP E2E
@@ -46,6 +53,10 @@ See [Preview release and installation](./docs/mvp/release.md) for packaging, ins
 - Run the production Agent Host/AHP adapter with explicit VS Code authentication.
 - Use the five Copilot task tools to discover workers, delegate, recover, cancel,
   or answer tasks.
+- Configure a safe per-Workspace window name, receive switch, and directional
+  peer allowlist from the Dashboard. Display names never authorize or route.
+- Prefer the running VS Code instance's AHP `editor` endpoint for delegated
+  sessions, with a visibly degraded standalone fallback.
 - Operate the Broker, owner/takeover state, local nodes, workspace conflicts,
   remote nodes, listener, peers, and tasks from the Activity Bar Dashboard.
 - Persist shared task/delegation state and bounded reducer events behind
@@ -70,7 +81,7 @@ disposable Worker profile stopped at `AGENT_AUTH_REQUIRED`. See
 git submodule update --init --recursive
 npm ci
 npm run package:vsix
-code --install-extension artifacts/copilot-agent-mesh-0.3.0-preview.vsix
+code --install-extension artifacts/copilot-agent-mesh-0.4.0-preview.vsix
 ```
 
 Project documents:
@@ -113,6 +124,7 @@ npm test
 npm run verify
 npm run package:vsix
 npm run test:multi-window-real
+npm run test:peer-delegation-real
 ```
 
 To opt into the real AHP path (which may consume quota):
@@ -124,8 +136,25 @@ MESH_MULTI_WINDOW_E2E_TASKS=1 npm run test:multi-window-real
 
 The short runtime path avoids the macOS Unix-domain socket path limit.
 
-Cross-device task execution is not fully verified. Windows, Linux, and
-macOS x64 remain unable to host Worker/AHP execution in this Preview.
+The real Peer Window Delegation gate is additionally protected by an exact
+environment value. Without it the command exits safely before compiling or
+launching VS Code:
+
+```bash
+MESH_PEER_DELEGATION_E2E=1 npm run test:peer-delegation-real
+```
+
+The harness uses two ordinary windows, two temporary non-sensitive projects, one
+shared dedicated profile, real registered LM tools, and the pinned AHP client.
+Real Copilot sidebar confirmation and Chat Sessions visibility require an
+operator-visible run; programmatic `vscode.lm.invokeTool` evidence is never
+misreported as UI confirmation. Sanitized evidence is written to
+`artifacts/peer-delegation-e2e/evidence.json`.
+
+Cross-device delegation remains unverified. Windows, Linux, and macOS x64 remain
+unable to host Worker/AHP execution in this Preview. Stable APIs also cannot
+detect concurrent edits made by the target window's separate user Copilot session;
+the Incoming Task record and target-side cancel action are the mitigation.
 
 ## Project layout
 

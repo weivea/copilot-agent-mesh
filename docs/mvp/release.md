@@ -1,7 +1,7 @@
 # Preview release engineering
 
-> Version: `0.3.0` Preview
-> Gate status: G0 **Go for validated macOS arm64 scope**
+> Version: `0.4.0` Preview
+> Gate status: historical G0 Go; Peer Window Delegation requires its own real evidence gate
 
 This document describes a reproducible evaluation package. It does not authorize
 Marketplace publication, GitHub release creation, or promotion to general
@@ -55,7 +55,7 @@ npm run verify
 The package command creates:
 
 ```text
-artifacts/copilot-agent-mesh-0.3.0-preview.vsix
+artifacts/copilot-agent-mesh-0.4.0-preview.vsix
 ```
 
 The production bundle is separate from VSIX creation:
@@ -77,11 +77,30 @@ Inspect and hash the result independently:
 
 ```sh
 npx vsce ls --no-dependencies
-unzip -Z1 artifacts/copilot-agent-mesh-0.3.0-preview.vsix
-shasum -a 256 artifacts/copilot-agent-mesh-0.3.0-preview.vsix
+unzip -Z1 artifacts/copilot-agent-mesh-0.4.0-preview.vsix
+shasum -a 256 artifacts/copilot-agent-mesh-0.4.0-preview.vsix
 ```
 
 ## Real multi-window verification
+
+Run the 0.4.0 Peer Window Delegation release gate separately:
+
+```sh
+MESH_PEER_DELEGATION_E2E=1 npm run test:peer-delegation-real
+npm run validate:peer-delegation-evidence
+```
+
+The exact opt-in is required because this starts two ordinary VS Code windows and
+may consume Copilot quota. A fully passing artifact requires the optional visible
+Copilot Agent-mode phase documented in [the E2E guide](e2e.md); programmatic Tool
+invocation cannot stand in for the one parent confirmation. A short E2E-only
+budget is armed for one test task and does not change the manifest/runtime
+default or maximum of 60 minutes.
+
+The generated evidence remains local at
+`artifacts/peer-delegation-e2e/evidence.json`. Do not package it into the VSIX or
+publish it as a release asset without a separate review. Its validator rejects
+sensitive content and any claimed Pass with residual harness-owned resources.
 
 Run the ordinary-window transport/lifecycle test explicitly:
 
@@ -158,10 +177,12 @@ an ordinary unit/component gate. Its AHP branch must never run unless
 
 1. Confirm the worktree is clean and record the current commit SHA.
 2. Run `npm ci`, `npm audit --audit-level=high`, and `npm run verify`.
-3. Run `npm run smoke:vsix` without enabling Worker settings.
-4. Run `npm run test:multi-window-real`; on macOS use
+3. Run the explicit Peer Window Delegation E2E and require valid, passing AC-5
+   evidence; do not convert an authentication/UI block into Pass.
+4. Run `npm run smoke:vsix` without enabling Worker settings.
+5. Run `npm run test:multi-window-real`; on macOS use
    `MESH_MULTI_WINDOW_E2E_RUNTIME_DIR=$HOME/.mw` if needed.
-5. Record the commit SHA, VSIX SHA-256, verified archive listing, and sanitized
+6. Record the commit SHA, VSIX SHA-256, verified archive listing, and sanitized
    multi-window evidence.
-6. Transfer the VSIX only as an explicitly labeled Preview evaluation artifact.
-7. Do not publish, push, or create a release without explicit authorization.
+7. Transfer the VSIX only as an explicitly labeled Preview evaluation artifact.
+8. Do not publish or create a GitHub Release without explicit authorization.

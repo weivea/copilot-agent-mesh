@@ -27,6 +27,7 @@ import type {
 	AgentHostSourceStatus,
 	AgentHostSourceStatusProvider,
 	AgentRuntime,
+	AgentRuntimeLifecycleObserver,
 	AgentRuntimeProbe,
 	AgentTaskHandle,
 	AgentTaskRequest,
@@ -194,6 +195,7 @@ export function createVscodeAgentRuntime(
 	workerPlatform: WorkerPlatformSupport,
 	delegatedToolInvocations?: DelegatedToolInvocationRegistry,
 	approvalCapabilities = new AgentRuntimeApprovalCapabilityIssuer(),
+	lifecycleObserver?: AgentRuntimeLifecycleObserver,
 ): AgentRuntime & AgentHostSourceStatusProvider {
 	const configuration = vscodeApi.workspace.getConfiguration(configurationSection);
 	const launcher = new AgentHostLauncher({
@@ -211,6 +213,7 @@ export function createVscodeAgentRuntime(
 		workspaceResolver,
 		configResolver: new VscodeSessionConfigurationResolver(vscodeApi),
 		delegatedToolInvocations,
+		lifecycleObserver,
 	};
 	const standalone = new AhpAgentRuntime({
 		...common,

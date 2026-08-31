@@ -17,10 +17,12 @@ The application creates:
   structured artifacts, and event journals.
 - `DeviceService`, `WorkspaceService`, `WorkerTaskService`, `TaskCoordinator`, and
   `ListenerService`.
+- Broker-owned `PeerPolicyStore` / `PeerPolicyService`, the directional double
+  gate, and one active Window Node client per ordinary window.
 - `PairingService`, `GatewayServer`, `PeerConnectionManager`,
   `DevTunnelCliProvider`, and the feature-gated `AhpAgentRuntime`.
-- `ProductionDashboardBindings`, `ServiceDashboardFacade`, the Dashboard view, and
-  five production Language Model Tools.
+- `ProductionDashboardBindings`, `ServiceDashboardFacade`, the P7 peer/task
+  Dashboard, and exactly five production Language Model Tools.
 
 ## Preview platform scope
 
@@ -52,11 +54,11 @@ them, so readers never observe a partially initialized record. Every non-crash m
 only its own on-disk token. Takeover also requires both an expired heartbeat and a dead owner
 process.
 
-Later Extension Hosts are read-only Coordinator dashboards. They do not restore or mutate peer
-connections, delegation intents, workspace registrations or leases, Worker tasks, Listener,
-tunnel, or pairing resources. Mutating commands and task tools return stable `WORKER_DRAINING`
-guidance pointing to the owner window. Shutdown removes the owner lock only when its on-disk
-token still belongs to that instance. Dynamic Agent Host configuration search debounces queries,
+Later Extension Hosts are active Window Nodes and authenticated Broker clients. They do not own
+or restore the singleton Gateway/Tunnel/Peer Manager, but their tools and Dashboard may mutate
+their own peer policy or route tasks through Broker IPC. Shared persistence remains exclusive to
+the generation-fenced owner. Shutdown removes the owner lock only when its on-disk token still
+belongs to that instance. Dynamic Agent Host configuration search debounces queries,
 keeps at most two bounded AHP completion requests in flight, and displays only the latest
 revision even when an older request has not resolved.
 
@@ -72,9 +74,11 @@ Worker start verifies ownership, resolves only an opaque registered workspace ID
 Agent Host feature/probe, acquires the workspace lease, and atomically persists `accepted`
 before launching `AgentRuntime.start`.
 
-The first task for a peer/workspace pair requires local confirmation. “Always allow” stores
-only the non-sensitive pair grant; each accepted task is still explicitly pre-authorized for
-the runtime confirmation boundary. Runtime events use a byte-and-count-bounded queue:
+Same-device delegation uses one parent Tool confirmation. Its in-memory grant is bound to the
+exact task/target and can auto-approve only structured, non-control-plane file URIs proven inside
+the target Workspace; terminal, authentication, uncertain, cross-Workspace, secret, and publish
+operations return `needsInput`. There is no persistent “Always allow” task grant. Runtime events
+use a byte-and-count-bounded queue:
 progress coalesces, nonterminal output truncates or drops with one explicit truncation event
 per pressure episode, and tool/control/terminal events apply backpressure instead of being
 discarded. The serial consumer persists every retained input, cancellation, and terminal
@@ -113,3 +117,11 @@ Disposal first unregisters commands, tools, and the view, then closes the listen
 worker handles, disconnects coordinator peers, disposes the Agent runtime and owned child
 processes, and finally closes the structured redacted log. Cleanup is idempotent and
 aggregate failures are returned to asynchronous deactivation.
+
+## P8 real harness composition
+
+`MESH_PEER_DELEGATION_E2E=1` enables a third mutually exclusive, non-production
+capability. It exposes only nonce-bound high-level policy, registered Tool, safe
+catalog, and resource-observation actions. The short test budget is armed for one
+delegation timer only; production Tool limits remain 60 minutes. Without the exact
+environment value no E2E API is created and no VS Code window is launched.

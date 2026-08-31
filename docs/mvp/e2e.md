@@ -1,10 +1,86 @@
 # MVP real VS Code E2E
 
-> Evidence date: 2026-08-30
+> Evidence date: 2026-08-31
 > Development baseline: `d5555172b5b6d37200f24f351678adc9ab201593`
 > Final platform: macOS arm64, VS Code `1.135.0`
 
 ## Opt-in boundary
+
+### 0.4.0 Peer Window Delegation
+
+The release gate is exact and default-off:
+
+```sh
+MESH_PEER_DELEGATION_E2E=1 npm run test:peer-delegation-real
+```
+
+Without the exact value `1`, the wrapper exits before compiling or launching VS
+Code. An enabled run requires macOS arm64, creates two ordinary windows with one
+dedicated User Data directory and two different temporary non-sensitive projects,
+and removes only resources identified by its own root PIDs, descendants, and
+unique runtime markers. A persistent authenticated profile is optional and must
+be an explicit dedicated path outside real VS Code profiles:
+
+```sh
+MESH_PEER_DELEGATION_E2E=1 \
+MESH_PEER_DELEGATION_E2E_PROFILE_DIR=$HOME/.mw-profile \
+MESH_PEER_DELEGATION_E2E_AUTH_RESOURCE='https://api.github.com' \
+MESH_PEER_DELEGATION_E2E_AUTH_PROVIDER='github' \
+MESH_PEER_DELEGATION_E2E_AUTH_SCOPES_JSON='["read:user","user:email"]' \
+npm run test:peer-delegation-real
+```
+
+The automated phase uses the real Dashboard handle paths for policy and the real
+registered LM Tools for list, direct rejection, completion, needs-input/answer,
+CancellationToken cancellation, and a one-shot short budget. The budget override
+is armed only for the next minute-scale delegation timer; ordinary Tool deadlines
+and the production default/maximum of 60 minutes are unchanged. No mock AHP,
+Fake Agent, direct Broker task substitute, synthetic terminal state, or
+blocked/cancelled-as-completed result can pass.
+
+`vscode.lm.invokeTool` does not invoke `prepareInvocation`, so automated evidence
+cannot claim the parent Copilot confirmation. To run the visible Agent-mode phase:
+
+```sh
+MESH_PEER_DELEGATION_E2E=1 \
+MESH_PEER_DELEGATION_E2E_MANUAL_UI=1 \
+MESH_PEER_DELEGATION_E2E_PROFILE_DIR=$HOME/.mw-profile \
+MESH_PEER_DELEGATION_E2E_AUTH_RESOURCE='https://api.github.com' \
+MESH_PEER_DELEGATION_E2E_AUTH_PROVIDER='github' \
+MESH_PEER_DELEGATION_E2E_AUTH_SCOPES_JSON='["read:user","user:email"]' \
+npm run test:peer-delegation-real
+```
+
+The harness prints one exact `#meshListWorkers` / `#meshDelegateTask` prompt. In
+the named source window, submit it in Copilot Agent mode and click **Continue**
+exactly once. After checking the target Chat Sessions list, record only the two
+boolean observations with the printed command:
+
+```sh
+node scripts/e2e/peer-delegation/attest.mjs <run-id> confirmation-once session-visible
+```
+
+Use `session-not-visible` when that is the observed result. Without this phase,
+AC-5 item 5 and UI visibility remain `unverified`, and the command exits nonzero.
+
+Sanitized JSON and a short summary are written to:
+
+- `artifacts/peer-delegation-e2e/evidence.json`
+- `artifacts/peer-delegation-e2e/summary.md`
+
+These generated artifacts are ignored rather than committed, matching the prior
+real-E2E convention. `npm run validate:peer-delegation-evidence` rejects paths,
+tokens, socket/User Data locations, full Workspace identities, raw prompts or
+output, invalid evidence references, inconsistent Pass states, and any nonzero
+harness-owned final resource count. Baseline, peak, and final counts all use the
+harness ownership scope; unrelated global processes are neither counted nor a
+global-zero assertion.
+
+O1 is Pass only when the task Session hash appears in the editor `listSessions`
+catalog and the target UI is visibly observed. O2 is Pass only after a genuine
+60-minute Copilot Tool call; shorter runs are recorded as shorter-duration-only.
+O3 remains non-guaranteed Tool choice, O4 remains undetectable concurrent user
+Copilot edits, and O5 remains unsupported/unverified outside macOS arm64.
 
 The default `npm test` remains offline. The real test is explicit because it creates a
 public Dev Tunnel and may consume Copilot quota:

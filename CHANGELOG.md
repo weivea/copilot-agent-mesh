@@ -6,6 +6,8 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [Unreleased]
 
+## [0.4.0 Preview] - 2026-08-31
+
 - Documented the 0.4.0 Peer Window Delegation redesign. Same-device multi-project
   collaboration moves from the Dashboard-driven fixed frontend/backend DAG to
   Copilot Chat driven peer window delegation: each window is its own primary node,
@@ -28,8 +30,26 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 - Recorded that the stable VS Code tool confirmation surface offers only
   Continue/Cancel, so delegation authorization is a binary confirmation whose scope
   is stated in the confirmation body rather than a third button.
-- Marked the collaboration sections of the PRD and the technical implementation
-  plan as superseded. No code has changed yet; 0.3.0 behaviour is unaffected.
+- Removed the 0.3.0 Collaboration service, fixed DAG, three collaboration tools,
+  and Dashboard collaboration entry points while retaining the bounded Artifact
+  Store and all Device Broker, Window Node, task, lease, IPC, and recovery
+  foundations.
+- Implemented the Broker-owned directional peer policy, default-off receive gate,
+  safe window naming, double-gated Tool directory, distinguishable peer errors,
+  long-running delegation result, one-task grant, recursion defense, editor AHP
+  source preference, and P7 Dashboard configuration/task views.
+- Added `MESH_PEER_DELEGATION_E2E=1 npm run test:peer-delegation-real`.
+  The command launches two ordinary same-profile windows only after the exact
+  opt-in, invokes the five registered LM Tools rather than replacing them with
+  Broker calls, records real AHP and cleanup observations, and fails rather than
+  treating missing Copilot UI/authentication evidence as Pass.
+- Added a strict 0.4.0 evidence schema and release validator. Evidence rejects
+  paths, tokens, raw prompts/output, full Workspace identities, malformed
+  references, success-shaped incomplete results, and global-process-zero claims;
+  it records only harness-owned baseline/delta/final resources.
+- Bumped the Preview extension and VSIX artifact to `0.4.0` while retaining AHP
+  commit `f19dd8b3942d029744a3bdd31d830f9428e8ea47`, TypeScript client `0.9.0`,
+  and protocol offer `1.0.0`.
 
 ## [0.3.0 Preview] - 2026-08-30
 

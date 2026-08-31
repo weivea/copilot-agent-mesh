@@ -32,6 +32,10 @@ export interface ListenerSnapshot {
 	readonly error?: { readonly code: string; readonly message: string };
 }
 
+export interface ListenerLifecycleMetrics {
+	readonly startAttempts: number;
+}
+
 export interface ListenerServiceOptions {
 	readonly accessDuration?: `${number}h` | `${number}d`;
 	readonly tunnelExpiration?: `${number}h` | `${number}d`;
@@ -69,6 +73,7 @@ export class ListenerService {
 	private tunnelDisposed = false;
 	private pairingDisposed = false;
 	private tunnelSubscription: { dispose(): void } | undefined;
+	private startAttempts = 0;
 
 	public constructor(
 		private readonly deviceId: string,
@@ -142,6 +147,10 @@ export class ListenerService {
 		};
 	}
 
+	public lifecycleMetrics(): ListenerLifecycleMetrics {
+		return { startAttempts: this.startAttempts };
+	}
+
 	public publish(
 		peerId: string,
 		method: string,
@@ -179,6 +188,7 @@ export class ListenerService {
 	}
 
 	private async startCore(): Promise<void> {
+		this.startAttempts += 1;
 		if (this.disposeRequested || this.disposed) {
 			throw new Error('Listener service is disposed.');
 		}

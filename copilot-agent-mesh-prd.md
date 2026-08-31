@@ -16,15 +16,17 @@
 
 > 工作名称：Copilot Agent Mesh  
 > 文档版本：v0.4<br>
-> 状态：0.2.0 Preview Multi-window Mesh Nodes 已实现；G0 仍为 No-Go<br>
-> 日期：2026-08-25<br>
+> 状态：0.4.0 Preview Peer Window Delegation 已实现；真实 Copilot UI/editor 证据待显式运行<br>
+> 日期：2026-08-31<br>
 > 产品形态：个人使用的 VS Code Desktop 扩展  
 > Preview 支持平台：普通桌面 Window Node 跨平台；Worker Host 仅 macOS arm64
 
-> 实施快照：Mesh protocol v2 已实现，v1 Peer 明确不兼容。真实普通窗口 E2E
-> 已覆盖 Broker/Node、IPC、Claim/Conflict/Takeover 和精确清理。第二次 opted-in
-> AHP 运行因 Fresh Shared Profile 没有 Authentication Mapping/Session 正确返回
-> `AGENT_AUTH_REQUIRED`，未证明 authoritative start/get/cancel/output。
+> 实施快照：Mesh protocol v2 已实现，v1 Peer 明确不兼容。历史 G0 已在
+> macOS arm64 证明 authenticated AHP start/output/cancel。0.4.0 用默认关闭的
+> Peer Window Delegation 取代固定 Collaboration DAG；P8 增加两个普通窗口、
+> 真实注册 LM Tool、严格证据与 ownership cleanup Harness。自动
+> `vscode.lm.invokeTool` 不能证明 Copilot UI 确认，缺失人工观察时必须保持
+> `unverified`。
 
 ## 1. 产品摘要
 
@@ -806,6 +808,21 @@ MESH_MULTI_WINDOW_E2E_TASKS=1 npm run test:multi-window-real
 
 macOS 使用 `$HOME/.mw` 这类短路径以避开 Unix-domain socket path limit。实施
 期间 Unit/Component/Extension Host/完整 npm Test 已通过；最终验证前不固定数量。
+
+### AC-6：0.4.0 Peer Window Delegation
+
+- 两个普通窗口共享一个专用 User Data，但 claim 两个不同的一次性项目；Device Broker
+  owner 恰好一个。
+- Source allowlist 与 Target Accept Incoming 同时满足前，目标不进入 Tool 目录；直接
+  地址分别返回 `PEER_NOT_ALLOWED` 与 `PEER_NOT_ACCEPTING`，反向仍默认不可见。
+- 委派必须经过真实注册的 `mesh_delegate_task` 和真实 AHP Agent。父调用同次得到含
+  `taskId` 的 compact result，目标 Dashboard 有 Incoming，权威序列包含
+  `agentStarted`、非空 output、AHP `chat/turnComplete` 与 Task `completed`。
+- 父 Copilot 的一次确认只能由可见 Agent-mode 调用证明；程序化 `lm.invokeTool` 不算。
+- 本地路线不启动 Listener/Tunnel；Workspace Lease、Profile Lock、Harness-owned
+  VS Code/Agent Host/Tunnel/Socket/Timer 全部释放。
+- 稳定证据路径为 `artifacts/peer-delegation-e2e/evidence.json`。只有真实观察可标
+  Pass；认证、UI、60 分钟或 editor endpoint 未观察时明确 `unverified`。
 
 ## 17. 开发阶段
 
