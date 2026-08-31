@@ -1114,6 +1114,9 @@ async function recordCompletionScenario({
 				&& sourceFailure.statusCode <= 599
 				? { statusCode: sourceFailure.statusCode }
 				: {}),
+			...(['EACCES', 'ECONNREFUSED', 'ENOENT'].includes(sourceFailure.socketCode)
+				? { socketCode: sourceFailure.socketCode }
+				: {}),
 		}
 		: undefined;
 	const catalogAfter = await request(target, 'peer.session.catalog', {}, 60_000);

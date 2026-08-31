@@ -464,6 +464,9 @@ function safeEditorFailure(error: unknown): AgentHostSourceFailure {
 				...(error.cause.statusCode === undefined
 					? {}
 					: { statusCode: error.cause.statusCode }),
+				...(error.cause.socketCode === undefined
+					? {}
+					: { socketCode: error.cause.socketCode }),
 			}
 			: {}),
 		message: 'The selected editor Agent Host attempt failed safely.',

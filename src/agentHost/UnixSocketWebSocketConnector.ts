@@ -22,6 +22,7 @@ export class UnixSocketWebSocketError extends Error {
 		readonly code: UnixSocketWebSocketErrorCode,
 		message: string,
 		readonly statusCode?: number,
+		readonly socketCode?: 'EACCES' | 'ECONNREFUSED' | 'ENOENT',
 	) {
 		super(message);
 		this.name = 'UnixSocketWebSocketError';
@@ -253,9 +254,12 @@ function webSocketFailure(error: Error & { code?: unknown }): UnixSocketWebSocke
 		return unexpectedResponse(Number(unexpected[1]));
 	}
 	if (['EACCES', 'ECONNREFUSED', 'ENOENT'].includes(String(error.code))) {
+		const socketCode = error.code as 'EACCES' | 'ECONNREFUSED' | 'ENOENT';
 		return new UnixSocketWebSocketError(
 			'CONNECT_FAILED',
 			'The editor Agent Host socket connection failed.',
+			undefined,
+			socketCode,
 		);
 	}
 	if (error.code === 'ETIMEDOUT') {
