@@ -33,6 +33,10 @@ Fallback is forbidden when cleanup of the failed editor attempt is unconfirmed;
 starting standalone in that state could overlap resources or execution. Selector
 disposal retains failed cleanup for an explicit retry.
 With Peer Delegation disabled, the historical standalone behavior is unchanged.
+After an editor connection has initialized, authentication, configuration, title,
+or task-start failures do not fall back. Source status records the editor as the
+selected source plus a bounded failure code/message, rather than retaining an
+older standalone probe result or reporting the editor as healthy.
 
 Source fallback sits below one runtime approval boundary. An exact local
 `DelegationGrant` validated by the target Window Node produces an in-memory,
@@ -54,7 +58,10 @@ socket, and user-data paths never enter the ViewModel.
 2. Create an owned instance directory, owner-only token file, dedicated user/server data directories, and an isolated process group.
 3. Diff strict `code agent endpoints` JSON and require exactly one new standalone endpoint matching both an owned PID and the generated token. Stdout/stderr are drained but never interpreted as readiness.
 4. Connect to the loopback endpoint, initialize AHP, apply the root snapshot, and dynamically select an advertised provider.
-5. Authenticate advertised required resources, resolve Session configuration (including dynamic completions), create the Session with the registered workspace URI, and apply the Session snapshot before processing actions.
+5. For standalone, authenticate advertised required resources through the explicit
+   VS Code mapping. For editor, reuse the host's existing identity without an
+   initial `authenticate` request. Then resolve Session configuration, create the
+   Session with the registered workspace URI, and apply its snapshot.
 6. Wait for `defaultChat`, subscribe to the Chat, then dispatch only the supplied
    prompt plus acceptance criteria. AHP 1.0 providers may keep a provisional
    Session in `creating` until that first turn materializes it, so startup must
@@ -94,7 +101,19 @@ Required Session configuration is rendered from the provider schema. Boolean val
 
 ## Authentication
 
-`VscodeAuthBroker` is silent-first. A modal `createIfNone` request is allowed only when the invocation explicitly permits interactive authentication. The adapter does not infer an authentication provider, GitHub scopes, or a Copilot resource.
+The editor and standalone paths use different authentication policies. A borrowed
+editor endpoint already owns the signed-in Copilot identity: its initial protected
+resource list is informational, so `EditorExistingIdentityAuthBroker` performs no
+VS Code session lookup and sends no root `authenticate` action. If
+`resolveSessionConfig`, `createSession`, a tool, recovery, or a token-invalid
+notification produces a real authentication challenge, the editor path fails
+`AGENT_AUTH_REQUIRED` with a safe instruction to authenticate in that editor
+profile. It never overrides or restarts editor credentials.
+
+The standalone-only `VscodeAuthBroker` is silent-first. A modal `createIfNone`
+request is allowed only when the invocation explicitly permits interactive
+authentication. It does not infer an authentication provider, GitHub scopes, or
+a Copilot resource.
 
 Map each AHP protected-resource URL or advertised authorization-server URL to an existing VS Code authentication provider:
 
@@ -109,7 +128,12 @@ Map each AHP protected-resource URL or advertised authorization-server URL to an
 }
 ```
 
-An authentication attempt is successful only after the Agent Host accepts `authenticate`. Missing mappings, unavailable silent credentials, or interaction-disabled contexts return `AGENT_AUTH_REQUIRED`; rejected tokens return `AGENT_AUTH_FAILED`. Since tokens are not cached, account/session changes are observed on the next initial, challenge, or invalid-token authentication attempt.
+A standalone authentication attempt is successful only after the Agent Host
+accepts `authenticate`. Missing mappings, unavailable silent credentials, or
+interaction-disabled contexts return `AGENT_AUTH_REQUIRED`; rejected tokens
+return `AGENT_AUTH_FAILED`. Since tokens are not cached, account/session changes
+are observed on the next initial, challenge, or invalid-token authentication
+attempt.
 
 ## Errors and ownership
 

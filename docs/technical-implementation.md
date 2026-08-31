@@ -739,7 +739,11 @@ sequenceDiagram
     H-->>M: negotiated version + root snapshot
     M->>M: apply root snapshot
     M->>M: discover Agent provider and capabilities
-    M->>H: authenticate(resource token) when required
+    alt borrowed editor
+        M->>M: reuse editor Host identity; no initial token injection
+    else owned standalone
+        M->>H: authenticate(mapped resource token) when required
+    end
     M->>H: resolve session config when required
     M->>H: createSession(sessionUri, provider, workingDirectories)
     M->>H: subscribe(sessionUri)
@@ -758,7 +762,12 @@ sequenceDiagram
 - `createSession` 使用 `workingDirectories: [registeredFileUri]`；只有 Provider Capability 允许时才传多个目录。
 - 必须处理 `resolveSessionConfig` / `sessionConfigCompletions`，不能假定 Provider 接受空配置。
 - 根据 Provider 动态 Resource Metadata 和 `AuthRequired` Error 重新发现认证要求；`scopes_supported` 只是候选能力，不是可直接照抄的确定请求 Scope。
-- `vscode.authentication.getSession` 只能作为 `AuthBroker` 的候选 Token 来源；不硬编码 Authentication Provider、GitHub Scope 或 Copilot Resource，只有 AHP `authenticate` 成功后才认为 Token 可用。
+- Borrowed editor 初始 protected-resource 列表只描述 Host 自有身份，Mesh 不调用
+  `vscode.authentication.getSession`、不发送 Root `authenticate`。后续真实 challenge/
+  token-invalid 直接安全失败 `AGENT_AUTH_REQUIRED`，要求用户在该 editor Profile 认证。
+- 只有 owned standalone 的 `VscodeAuthBroker` 可把
+  `vscode.authentication.getSession` 作为候选 Token 来源；不硬编码 Authentication
+  Provider、GitHub Scope 或 Copilot Resource，只有 AHP `authenticate` 成功后才认为 Token 可用。
 - 首先 silent lookup；仅在明确用户操作或已确认 Tool Invocation 中触发交互登录。
 - 处理 `AuthRequired`、Token 无效、无 Copilot 权限、配额不足和 Provider 消失。
 - 每次 `initialize` / `subscribe` 返回的 Snapshot 必须先应用，再消费后续 Action。

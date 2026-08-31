@@ -28,9 +28,11 @@ test('extension entry point delegates activation and awaited deactivation to com
 test('composition uses global metadata, SecretStorage, and globalStorageUri without sync keys', () => {
 	const source = readSource('src/composition/createApplication.ts');
 	const runtime = readSource('src/composition/ProductionBrokerRuntime.ts');
+	const agentRuntime = readSource('src/composition/VscodeAgentRuntime.ts');
 	const allProductionSource = [
 		source,
 		runtime,
+		agentRuntime,
 		readSource('src/storage/VscodeStorageAdapters.ts'),
 	].join('\n');
 	assert.match(source, /context\.globalState/);
@@ -51,6 +53,10 @@ test('composition uses global metadata, SecretStorage, and globalStorageUri with
 	assert.match(runtime, /options\.storageRootUri,\s*'mesh-state'/u);
 	assert.doesNotMatch(source, /new PeerDelegationE2eStateStore\([^,]+,\s*process\.env/u);
 	assert.doesNotMatch(allProductionSource, /setKeysForSync/);
+	assert.match(
+		agentRuntime,
+		/const standalone = new AhpAgentRuntime\(\{[\s\S]*?authBroker: new VscodeAuthBroker[\s\S]*?const editor = new AhpAgentRuntime\(\{[\s\S]*?authBroker: new EditorExistingIdentityAuthBroker\(\)/u,
+	);
 });
 
 test('production manifest contributes only the five registered task tools', () => {

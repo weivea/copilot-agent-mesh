@@ -107,6 +107,11 @@ The recorded P8 objective run is valid but **Unverified**: AC-5 1-4, 8, and
 `AGENT_AUTH_REQUIRED`. Do not publish or relabel this as a full Peer Delegation
 Pass; rerun with a signed-in dedicated profile and the visible Agent-mode steps.
 
+Editor endpoints reuse the editor Host's established identity and never receive
+tokens from `copilotAgentMesh.experimental.authenticationProviders`; those
+mappings apply only to an owned standalone fallback. AC-5 item 9 additionally
+requires a catalog-observed task Session, not only a reported editor source.
+
 Run the ordinary-window transport/lifecycle test explicitly:
 
 ```sh

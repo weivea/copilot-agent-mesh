@@ -74,6 +74,12 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
   run-owned Broker root preserves authentication without deleting, editing, or
   evicting persistent state. Safe startup diagnostics now distinguish bounded
   Broker/workspace failures from a bare controller timeout.
+- Split editor and standalone authentication. Borrowed editor Agent Hosts now
+  retain their established profile identity without proactive OAuth injection;
+  later editor challenges fail safely and never trigger credential replacement,
+  while owned standalone hosts retain explicit VS Code authentication mappings.
+  Source status and AC-5 evidence now require the actual editor attempt and a
+  catalog-observed task Session rather than a stale probe result.
 - Bumped the Preview extension and VSIX artifact to `0.4.0` while retaining AHP
   commit `f19dd8b3942d029744a3bdd31d830f9428e8ea47`, TypeScript client `0.9.0`,
   and protocol offer `1.0.0`.

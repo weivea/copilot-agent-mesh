@@ -49,6 +49,7 @@ import type { StateStore } from '../domain/ports';
 import { DelegatedToolInvocationRegistry } from '../tools/DelegatedToolInvocationRegistry';
 import { MESH_TOOL_NAMES } from '../tools/toolManifest';
 import {
+	EditorExistingIdentityAuthBroker,
 	VscodeAuthBroker,
 	type AuthenticationApi,
 	type AuthenticationRequest,
@@ -1972,6 +1973,102 @@ test('VS Code auth broker is silent-first, requires explicit interaction, and on
 	);
 });
 
+test('editor identity broker skips initial token injection and runs with the host identity', async () => {
+	const transport = new FakeAhpTransport();
+	transport.completeAfterTurnDispatch = true;
+	const runtime = new AhpAgentRuntime({
+		enabled: () => true,
+		launcher: new FakeLauncher(),
+		connections: new FakeConnectionFactory([transport]),
+		authBroker: new EditorExistingIdentityAuthBroker(),
+		confirmation: { confirm: async () => 'once' },
+		workspaceResolver: trustedWorkspaceResolver(),
+		configResolver: { resolve: async () => ({ model: 'test-model' }) },
+	});
+
+	const handle = await runtime.start(taskRequest());
+	const events = [];
+	for await (const event of handle.events) {
+		events.push(event);
+	}
+	assert.equal(transport.initialized, true);
+	assert.ok(transport.created);
+	assert.deepEqual(transport.authenticated, []);
+	assert.equal(events.at(-1)?.type, 'completed');
+	await handle.dispose();
+});
+
+test('editor identity broker fails closed on challenges without pushing credentials', async () => {
+	const broker = new EditorExistingIdentityAuthBroker();
+	let pushes = 0;
+	await broker.authenticate(
+		{ resources: [protectedResource], interactive: true, reason: 'initial' },
+		async () => {
+			pushes += 1;
+		},
+	);
+	assert.equal(pushes, 0);
+
+	for (const reason of ['challenge', 'tokenInvalid'] as const) {
+		await assert.rejects(
+			broker.authenticate(
+				{ resources: [protectedResource], interactive: true, reason },
+				async () => {
+					pushes += 1;
+				},
+			),
+			(error: unknown) => error instanceof AgentRuntimeError
+				&& error.code === 'AGENT_AUTH_REQUIRED'
+				&& error.message === 'Authenticate the Agent Host in the selected editor profile before retrying.'
+				&& !error.message.includes(protectedResource.resource),
+		);
+	}
+	assert.equal(pushes, 0);
+
+	const abort = new AbortController();
+	abort.abort();
+	await assert.rejects(
+		broker.authenticate(
+			{
+				resources: [protectedResource],
+				interactive: false,
+				reason: 'initial',
+				signal: abort.signal,
+			},
+			async () => {
+				pushes += 1;
+			},
+		),
+		(error: unknown) => error instanceof DOMException && error.name === 'AbortError',
+	);
+	assert.equal(pushes, 0);
+});
+
+test('editor runtime reports createSession authentication challenges without token injection', async () => {
+	const transport = new FakeAhpTransport();
+	transport.createSessionAuthRequired = true;
+	const runtime = new AhpAgentRuntime({
+		enabled: () => true,
+		launcher: new FakeLauncher(),
+		connections: new FakeConnectionFactory([transport]),
+		authBroker: new EditorExistingIdentityAuthBroker(),
+		confirmation: { confirm: async () => 'once' },
+		workspaceResolver: trustedWorkspaceResolver(),
+		configResolver: { resolve: async () => ({ model: 'test-model' }) },
+	});
+
+	await assert.rejects(
+		runtime.start(taskRequest()),
+		(error: unknown) => error instanceof AgentRuntimeError
+			&& error.code === 'AGENT_AUTH_REQUIRED'
+			&& error.message === 'Authenticate the Agent Host in the selected editor profile before retrying.',
+	);
+	assert.equal(transport.initialized, true);
+	assert.deepEqual(transport.authenticated, []);
+	assert.equal(transport.createSessionCalls, 1);
+	await runtime.dispose();
+});
+
 test('VS Code auth broker aborts an in-flight authentication prompt without submitting a token', async () => {
 	const abort = new AbortController();
 	let submitted = false;
@@ -2550,6 +2647,8 @@ class FakeAhpTransport implements AhpConnection {
 	sessionStartsPending = false;
 	sessionStartsProvisional = false;
 	sessionCreationFailed = false;
+	createSessionAuthRequired = false;
+	createSessionCalls = 0;
 	sessionDefaultChat = 'ahp-chat:/default';
 	blockSessionSubscriptions = false;
 	notificationDuringInitialize: readonly ProtectedResource[] = [];
@@ -2792,6 +2891,13 @@ class FakeAhpTransport implements AhpConnection {
 
 	async createSession(params: NonNullable<FakeAhpTransport['created']>): Promise<void> {
 		this.assertOpen();
+		this.createSessionCalls += 1;
+		if (this.createSessionAuthRequired) {
+			throw Object.assign(new Error('Authentication required.'), {
+				code: -32007,
+				data: { resources: [protectedResource] },
+			});
+		}
 		this.created = params;
 	}
 

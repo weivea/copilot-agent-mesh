@@ -115,6 +115,8 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 		} catch (error: unknown) {
 			this.assertActive();
 			if (!isFallbackEligible(error)) {
+				this.sourceSelected = true;
+				this.setStatus(editorFailureStatus(error));
 				throw error;
 			}
 		}
@@ -347,6 +349,26 @@ function degradedStatus(
 	};
 }
 
+function editorFailureStatus(
+	error: unknown,
+): Extract<AgentHostSourceStatus, { source: 'editor' }> {
+	const code = error instanceof AgentRuntimeError
+		? error.code
+		: 'TASK_EXECUTION_FAILED';
+	const message = code === 'AGENT_AUTH_REQUIRED'
+		? 'The selected editor Agent Host requires authentication in its editor profile.'
+		: code === 'AGENT_AUTH_FAILED'
+			? 'The selected editor Agent Host could not authenticate with its existing identity.'
+			: code === 'AGENT_CONFIG_REQUIRED'
+				? 'The selected editor Agent Host requires Session configuration.'
+				: 'The selected editor Agent Host could not start the task.';
+	return {
+		source: 'editor',
+		degraded: false,
+		failure: { code, message },
+	};
+}
+
 function isFallbackEligible(error: unknown): boolean {
 	return error instanceof AgentRuntimeError
 		&& error.code === 'AGENT_UNAVAILABLE'
@@ -382,6 +404,15 @@ function probeWithStatus(
 	probe: AgentRuntimeProbe,
 	status: AgentHostSourceStatus,
 ): AgentRuntimeProbe {
+	if (status.source === 'editor' && status.failure !== undefined) {
+		return {
+			...probe,
+			available: false,
+			reason: status.failure.code,
+			source: 'editor',
+			degradation: undefined,
+		};
+	}
 	return {
 		...probe,
 		source: status.source,

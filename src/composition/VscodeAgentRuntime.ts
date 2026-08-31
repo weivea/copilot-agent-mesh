@@ -35,7 +35,11 @@ import type {
 	ResolvedAgentTaskRequest,
 	WorkspaceResolver,
 } from '../agentHost/AgentRuntime';
-import { VscodeAuthBroker, type AuthenticationMapping } from '../agentHost/AuthBroker';
+import {
+	EditorExistingIdentityAuthBroker,
+	VscodeAuthBroker,
+	type AuthenticationMapping,
+} from '../agentHost/AuthBroker';
 import type { StateStore } from '../domain/ports';
 import type { LocalDesktopWorkspaceGuard } from '../application/LocalDesktopWorkspaceGuard';
 import type { LocalTaskConfirmation } from '../application/RemoteTaskRunner';
@@ -208,8 +212,6 @@ export function createVscodeAgentRuntime(
 		enabled: () => vscodeApi.workspace
 			.getConfiguration(configurationSection)
 			.get<boolean>('experimental.agentHost', false),
-		authBroker: new VscodeAuthBroker(vscodeApi.authentication, (resource) =>
-			resolveAuthenticationProvider(vscodeApi, resource)),
 		confirmation: approval,
 		approvalCapabilities,
 		workspaceResolver,
@@ -219,11 +221,14 @@ export function createVscodeAgentRuntime(
 	};
 	const standalone = new AhpAgentRuntime({
 		...common,
+		authBroker: new VscodeAuthBroker(vscodeApi.authentication, (resource) =>
+			resolveAuthenticationProvider(vscodeApi, resource)),
 		launcher,
 		connections: new SdkAhpConnectionFactory(),
 	});
 	const editor = new AhpAgentRuntime({
 		...common,
+		authBroker: new EditorExistingIdentityAuthBroker(),
 		launcher: new EditorAgentHostLauncher(
 			new EditorAgentHostLocator({
 				configuredCodeCli: configuration.get<string>('codePath') || undefined,

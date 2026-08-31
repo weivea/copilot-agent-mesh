@@ -21,6 +21,10 @@ export type AgentHostSourceStatus =
 	| {
 		readonly source: 'editor';
 		readonly degraded: false;
+		readonly failure?: {
+			readonly code: AgentRuntimeErrorCode;
+			readonly message: string;
+		};
 	}
 	| {
 		readonly source: 'standalone';

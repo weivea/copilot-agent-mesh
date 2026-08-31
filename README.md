@@ -30,7 +30,14 @@ Preview. Other platforms fail closed with `CLI_UNSUPPORTED` or
 - Use Copilot Chat in Agent mode with tools enabled. Copilot tool choice is not
   guaranteed; use `#meshListWorkers` and `#meshDelegateTask` when explicit
   selection is needed.
-- AHP authentication is not inferred. Every advertised protected-resource or authorization-server URL must be mapped explicitly in `copilotAgentMesh.experimental.authenticationProviders` to an installed VS Code authentication provider and its exact scopes. Missing mappings fail with `AGENT_AUTH_REQUIRED`.
+- A borrowed editor Agent Host reuses that editor profile's established identity;
+  Mesh never pushes a separate OAuth token into it. If the editor later reports an
+  authentication challenge, authenticate in that editor profile and retry.
+  `copilotAgentMesh.experimental.authenticationProviders` applies only to the
+  owned standalone Agent Host path, where every protected-resource or
+  authorization-server URL must map to an installed VS Code authentication
+  provider and exact scopes. Missing standalone mappings fail with
+  `AGENT_AUTH_REQUIRED`.
 - Tunnel hosting requires a user-supplied `copilotAgentMesh.devTunnelPath` pointing to the exact validated macOS arm64 CLI build `1.0.2030+fc9273aa0f`. The extension does not search `PATH`, download, install, or upgrade Dev Tunnel.
 - A fresh shared profile has no authentication session by default. Real AHP E2E
   uses an explicitly configured, dedicated persistent test profile; it never

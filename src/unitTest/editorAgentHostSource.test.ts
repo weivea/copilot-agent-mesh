@@ -444,7 +444,49 @@ test('source selector reports standalone failure explicitly and does not fallbac
 	standalone.startError = undefined;
 	await assert.rejects(selector.start(taskRequest()), { code: 'AGENT_AUTH_REQUIRED' });
 	assert.equal(standalone.starts, 1);
+	assert.deepEqual(selector.sourceStatus(), {
+		source: 'editor',
+		degraded: false,
+		failure: {
+			code: 'AGENT_AUTH_REQUIRED',
+			message: 'The selected editor Agent Host requires authentication in its editor profile.',
+		},
+	});
+	const probe = await selector.probe();
+	assert.equal(probe.source, 'editor');
+	assert.equal(probe.available, false);
+	assert.equal(probe.reason, 'AGENT_AUTH_REQUIRED');
 	await selector.dispose();
+	await selector.dispose();
+});
+
+test('nonfallback editor errors replace stale standalone probe status without leaking details', async () => {
+	const editor = new FakeRuntime();
+	const standalone = new FakeRuntime();
+	const selector = new AgentHostSourceSelector(selectorOptions({
+		preferEditor: () => true,
+		editor,
+		standalone,
+	}));
+	editor.probeResult = { available: false, featureEnabled: true };
+	await selector.probe();
+	assert.equal(selector.sourceStatus().source, 'standalone');
+	editor.startError = new AgentRuntimeError(
+		'AGENT_CONFIG_REQUIRED',
+		'/private/editor.sock?tkn=secret requires configuration',
+	);
+
+	await assert.rejects(selector.start(taskRequest()), { code: 'AGENT_CONFIG_REQUIRED' });
+	assert.equal(standalone.starts, 0);
+	assert.deepEqual(selector.sourceStatus(), {
+		source: 'editor',
+		degraded: false,
+		failure: {
+			code: 'AGENT_CONFIG_REQUIRED',
+			message: 'The selected editor Agent Host requires Session configuration.',
+		},
+	});
+	assert.doesNotMatch(JSON.stringify(selector.sourceStatus()), /private|secret|tkn/iu);
 	await selector.dispose();
 });
 

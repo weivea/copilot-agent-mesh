@@ -123,6 +123,16 @@ test('peer-delegation passing evidence requires all real AC-5 conditions', () =>
 	assert.throws(
 		() => parsePeerDelegationEvidence({
 			...evidence,
+			sessionVisibility: {
+				...evidence.sessionVisibility,
+				sessionHashMatched: false,
+			},
+		}),
+		/editor Tool-to-Agent route|AC-5 item 9 must match/u,
+	);
+	assert.throws(
+		() => parsePeerDelegationEvidence({
+			...evidence,
 			cleanup: {
 				...evidence.cleanup,
 				status: 'unverified',
@@ -459,7 +469,7 @@ function passingEvidence(): PeerDelegationEvidence {
 		'#/completion/eventTypes',
 		'#/completion/parentSameInvocation',
 		'#/completion/incomingRecord',
-		'#/completion/source',
+		'#/sessionVisibility/sessionHashMatched',
 		'#/transport',
 		'#/cleanup/workspaceLeaseReleased',
 		'#/resources',
@@ -559,6 +569,14 @@ function passingEvidence(): PeerDelegationEvidence {
 			eventTypes: ['agentStarted', 'output', 'cancelRequested', 'cancelConfirmed'],
 			terminalState: 'cancelled',
 			leaseReleased: true,
+		},
+		sessionVisibility: {
+			status: 'unverified',
+			source: 'editor',
+			catalogBefore: 0,
+			catalogAfter: 1,
+			sessionHashMatched: true,
+			uiObserved: false,
 		},
 		transport: {
 			status: 'pass',

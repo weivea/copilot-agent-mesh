@@ -1098,6 +1098,15 @@ async function recordCompletionScenario({
 			? 'standalone'
 			: 'unavailable';
 	const degraded = runtimeStatus.status?.degraded === true;
+	const sourceFailure = runtimeStatus.status?.failure;
+	const catalogAfter = await request(target, 'peer.session.catalog', {}, 60_000);
+	const sessionHashMatched = catalogAfter.available === true
+		&& typeof completionTask.recoverySessionHash === 'string'
+		&& catalogAfter.sessionHashes.includes(completionTask.recoverySessionHash);
+	const editorSessionObserved = sourceKind === 'editor'
+		&& !degraded
+		&& sourceFailure === undefined
+		&& sessionHashMatched;
 	const completed = completionResult.s === 0;
 	const completionPass = completed
 		&& authoritativeOrder
@@ -1108,8 +1117,7 @@ async function recordCompletionScenario({
 		&& typeof completionTask.outputHash === 'string'
 		&& incomingRecord
 		&& completionTask.leaseReleased
-		&& sourceKind === 'editor'
-		&& !degraded;
+		&& editorSessionObserved;
 	evidence.confirmation = completionRun.confirmation;
 	evidence.completion = {
 		status: completionPass ? 'pass' : 'unverified',
@@ -1162,13 +1170,10 @@ async function recordCompletionScenario({
 		incomingRecord ? 'pass' : 'unverified',
 		incomingRecord ? ['#/completion/incomingRecord'] : [],
 	);
-	setAc5(9, sourceKind === 'editor' && !degraded ? 'pass' : 'unverified',
-		sourceKind === 'editor' && !degraded ? ['#/completion/source'] : []);
+	setAc5(9, editorSessionObserved ? 'pass' : 'unverified', editorSessionObserved
+		? ['#/completion/source', '#/sessionVisibility/sessionHashMatched']
+		: []);
 
-	const catalogAfter = await request(target, 'peer.session.catalog', {}, 60_000);
-	const sessionHashMatched = catalogAfter.available === true
-		&& typeof completionTask.recoverySessionHash === 'string'
-		&& catalogAfter.sessionHashes.includes(completionTask.recoverySessionHash);
 	const uiObserved = completionRun.uiAttestation?.targetSessionVisible === true;
 	evidence.sessionVisibility = {
 		status: sourceKind === 'editor' && sessionHashMatched && uiObserved
@@ -1198,7 +1203,9 @@ async function recordCompletionScenario({
 		evidence.blocker = {
 			code,
 			message: code === 'AGENT_AUTH_REQUIRED'
-				? 'The selected real E2E profile has no usable Agent Host authentication session.'
+				? sourceKind === 'editor'
+					? 'Authenticate the Agent Host in the selected editor profile before retrying.'
+					: 'The selected real E2E profile has no usable standalone Agent Host authentication session.'
 				: 'The real Agent task did not reach authoritative completion.',
 		};
 		return false;

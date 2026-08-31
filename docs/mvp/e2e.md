@@ -30,6 +30,12 @@ MESH_PEER_DELEGATION_E2E_AUTH_SCOPES_JSON='["read:user","user:email"]' \
 npm run test:peer-delegation-real
 ```
 
+The `AUTH_*` mapping above is retained for an owned standalone fallback only.
+When the editor endpoint is selected, it reuses that editor Host's existing
+identity and receives no proactive OAuth token injection. A later editor
+authentication challenge fails explicitly and must be resolved in the editor
+profile.
+
 The persistent User Data remains the source of VS Code/Copilot authentication, but
 it is not the Mesh state root for a peer-delegation run. After the development-only
 E2E capability validates the environment/profile nonce and role, every Mesh
@@ -125,6 +131,9 @@ catalog and the target UI is visibly observed. O2 is Pass only after a genuine
 60-minute Copilot Tool call; shorter runs are recorded as shorter-duration-only.
 O3 remains non-guaranteed Tool choice, O4 remains undetectable concurrent user
 Copilot edits, and O5 remains unsupported/unverified outside macOS arm64.
+AC-5 item 9 is narrower than O1 but still cannot rely on source status alone:
+it requires the task recovery Session hash to appear in a separately opened
+editor `listSessions` catalog. UI observation is not required for item 9.
 
 ### Recorded P8 objective result
 

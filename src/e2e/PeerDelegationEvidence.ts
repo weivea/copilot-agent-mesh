@@ -329,6 +329,9 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 			|| !evidence.completion.incomingRecord
 			|| evidence.completion.source !== 'editor'
 			|| evidence.completion.degraded
+			|| evidence.sessionVisibility.source !== 'editor'
+			|| !evidence.sessionVisibility.sessionHashMatched
+			|| evidence.sessionVisibility.catalogAfter < 1
 			|| !evidence.completion.leaseReleased
 		)
 	) {
@@ -634,10 +637,18 @@ function validateAc5Correspondence(
 			referencePrefixes: ['#/completion/incomingRecord'],
 		},
 		{
-			status: evidence.completion.source === 'editor' && !evidence.completion.degraded
+			status: evidence.completion.source === 'editor'
+				&& !evidence.completion.degraded
+				&& evidence.sessionVisibility.source === 'editor'
+				&& evidence.sessionVisibility.sessionHashMatched
+				&& evidence.sessionVisibility.catalogAfter > 0
 				? 'pass'
 				: evidence.completion.status === 'fail' ? 'fail' : 'unverified',
-			referencePrefixes: ['#/completion/source', '#/sessionVisibility/source'],
+			referencePrefixes: [
+				'#/completion/source',
+				'#/sessionVisibility/source',
+				'#/sessionVisibility/sessionHashMatched',
+			],
 		},
 		{
 			status: evidence.transport.status,
