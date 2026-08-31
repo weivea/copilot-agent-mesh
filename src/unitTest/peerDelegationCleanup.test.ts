@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import {
 	access,
+	copyFile,
 	link,
 	mkdir,
 	mkdtemp,
@@ -291,6 +292,110 @@ test('release snapshot validator rejects dirty trees and commit drift', () => {
 		{ cwd: resolve('.'), encoding: 'utf8', shell: false },
 	);
 	assert.equal(result.status, 0, result.stderr);
+});
+
+for (const aliasKind of ['symlink', 'hardlink'] as const) {
+	test(
+		`release wrapper rejects an evidence ${aliasKind} before compile without modifying artifacts`,
+		{
+			skip: aliasKind === 'symlink' && process.platform === 'win32'
+				? 'Windows CI does not grant symbolic-link creation.'
+				: false,
+		},
+		async () => {
+			await withStableArtifactSentinels(async () => {
+				const parent = resolve('.vscode-test', 'peer-process-ownership');
+				await mkdir(parent, { recursive: true });
+				const root = await mkdtemp(join(parent, `wrapper-${aliasKind}-`));
+				const evidenceRoot = join(root, 'evidence');
+				const runtimeRoot = join(root, 'runtime');
+				const profileRoot = join(root, 'profile');
+				const externalSentinel = join(root, 'external-sentinel.json');
+				const evidencePath = join(evidenceRoot, 'evidence.json');
+				const summaryPath = join(evidenceRoot, 'summary.md');
+				const externalBytes = Buffer.from('external evidence sentinel\n', 'utf8');
+				const priorSummaryBytes = Buffer.from('prior evidence summary\n', 'utf8');
+				await mkdir(evidenceRoot);
+				await writeFile(externalSentinel, externalBytes);
+				await writeFile(summaryPath, priorSummaryBytes);
+				try {
+					if (aliasKind === 'symlink') {
+						await symlink(externalSentinel, evidencePath);
+					} else {
+						await link(externalSentinel, evidencePath);
+					}
+					const result = await runReleaseWrapper({
+						scriptPath: resolve('scripts/e2e/peer-delegation/run.mjs'),
+						repositoryRoot: resolve('.'),
+						evidenceRoot,
+						runtimeRoot,
+						profileRoot,
+					});
+					assert.notEqual(result.exitCode, 0);
+					assert.equal(result.stdout, '', 'The wrapper reached npm compile output.');
+					assert.match(result.stderr, /evidence file is aliased or unsafe/u);
+					assert.deepEqual(await readFile(externalSentinel), externalBytes);
+					assert.deepEqual(await readFile(summaryPath), priorSummaryBytes);
+					await access(evidencePath);
+					await assert.rejects(access(runtimeRoot), { code: 'ENOENT' });
+					await assert.rejects(access(profileRoot), { code: 'ENOENT' });
+				} finally {
+					await rm(root, { recursive: true, force: true });
+				}
+			});
+		},
+	);
+}
+
+test('release wrapper rejects a dirty tree before compile and preserves prior evidence', async () => {
+	const parent = resolve('.vscode-test', 'peer-process-ownership');
+	await mkdir(parent, { recursive: true });
+	const root = await mkdtemp(join(parent, 'wrapper-dirty-'));
+	const repositoryRoot = join(root, 'repository');
+	const scriptDirectory = join(repositoryRoot, 'scripts', 'e2e', 'peer-delegation');
+	const evidenceRoot = join(repositoryRoot, 'artifacts', 'peer-delegation-e2e');
+	const runtimeRoot = join(root, 'runtime');
+	const profileRoot = join(root, 'profile');
+	const evidencePath = join(evidenceRoot, 'evidence.json');
+	const summaryPath = join(evidenceRoot, 'summary.md');
+	const evidenceBytes = Buffer.from('prior release evidence\n', 'utf8');
+	const summaryBytes = Buffer.from('prior release summary\n', 'utf8');
+	try {
+		await mkdir(scriptDirectory, { recursive: true });
+		await Promise.all([
+			copyFile(
+				resolve('scripts/e2e/peer-delegation/run.mjs'),
+				join(scriptDirectory, 'run.mjs'),
+			),
+			copyFile(
+				resolve('scripts/e2e/peer-delegation/evidence-path.mjs'),
+				join(scriptDirectory, 'evidence-path.mjs'),
+			),
+			writeFile(join(repositoryRoot, '.gitignore'), 'artifacts/\n'),
+		]);
+		initializeGitFixture(repositoryRoot);
+		await mkdir(evidenceRoot, { recursive: true });
+		await writeFile(evidencePath, evidenceBytes);
+		await writeFile(summaryPath, summaryBytes);
+		await writeFile(join(repositoryRoot, 'dirty.txt'), 'dirty\n');
+
+		const result = await runReleaseWrapper({
+			scriptPath: join(scriptDirectory, 'run.mjs'),
+			repositoryRoot,
+			evidenceRoot,
+			runtimeRoot,
+			profileRoot,
+		});
+		assert.notEqual(result.exitCode, 0);
+		assert.equal(result.stdout, '', 'The dirty-tree wrapper reached npm compile output.');
+		assert.match(result.stderr, /clean committed tree/u);
+		assert.deepEqual(await readFile(evidencePath), evidenceBytes);
+		assert.deepEqual(await readFile(summaryPath), summaryBytes);
+		await assert.rejects(access(runtimeRoot), { code: 'ENOENT' });
+		await assert.rejects(access(profileRoot), { code: 'ENOENT' });
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
 });
 
 test(
@@ -715,6 +820,75 @@ async function runReleasePreflightWithEvidenceRoot(
 		child.once('error', reject);
 		child.once('exit', (exitCode) => resolveExit({ exitCode, stderr }));
 	});
+}
+
+async function runReleaseWrapper(options: {
+	readonly scriptPath: string;
+	readonly repositoryRoot: string;
+	readonly evidenceRoot: string;
+	readonly runtimeRoot: string;
+	readonly profileRoot: string;
+}): Promise<{
+	readonly exitCode: number | null;
+	readonly stdout: string;
+	readonly stderr: string;
+}> {
+	const environment = { ...process.env };
+	delete environment.MESH_PEER_DELEGATION_E2E_TEST_MODE;
+	const child = spawn(
+		process.execPath,
+		[options.scriptPath],
+		{
+			cwd: options.repositoryRoot,
+			env: {
+				...environment,
+				MESH_PEER_DELEGATION_E2E: '1',
+				MESH_PEER_DELEGATION_E2E_EVIDENCE_DIR: options.evidenceRoot,
+				MESH_PEER_DELEGATION_E2E_RUNTIME_DIR: options.runtimeRoot,
+				MESH_PEER_DELEGATION_E2E_PROFILE_DIR: options.profileRoot,
+			},
+			shell: false,
+			stdio: ['ignore', 'pipe', 'pipe'],
+		},
+	);
+	let stdout = '';
+	let stderr = '';
+	child.stdout?.setEncoding('utf8');
+	child.stderr?.setEncoding('utf8');
+	child.stdout?.on('data', (chunk: string) => {
+		stdout = appendBounded(stdout, chunk);
+	});
+	child.stderr?.on('data', (chunk: string) => {
+		stderr = appendBounded(stderr, chunk);
+	});
+	return new Promise((resolveExit, reject) => {
+		child.once('error', reject);
+		child.once('close', (exitCode) => resolveExit({ exitCode, stdout, stderr }));
+	});
+}
+
+function initializeGitFixture(repositoryRoot: string): void {
+	for (const args of [
+		['init', '--quiet'],
+		['config', 'user.name', 'Peer E2E Fixture'],
+		['config', 'user.email', 'peer-e2e-fixture@example.invalid'],
+		['config', 'commit.gpgSign', 'false'],
+		['add', '.'],
+		['commit', '--quiet', '-m', 'fixture'],
+	]) {
+		const result = spawnSync('git', args, {
+			cwd: repositoryRoot,
+			encoding: 'utf8',
+			shell: false,
+		});
+		assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+	}
+}
+
+function appendBounded(current: string, chunk: string): string {
+	return current.length >= 16_384
+		? current
+		: `${current}${chunk}`.slice(0, 16_384);
 }
 
 function releaseEvidencePath(): string {

@@ -242,9 +242,14 @@ test('0.4.0 release metadata keeps the real peer gate default-off and five-tool 
 			< wrapper.indexOf('const result = spawnSync'),
 		'The exact environment gate must run before any compile or launch command.',
 	);
-	assert.match(
-		wrapper,
-		/assertCleanCommittedReleaseSnapshot[\s\S]*resolvePeerDelegationEvidenceDestination[\s\S]*rmSync\(evidence\.evidencePath[\s\S]*resolvePeerDelegationEvidenceDestination[\s\S]*rmSync\(evidence\.summaryPath/u,
+	const cleanSnapshotCall = wrapper.indexOf('assertCleanCommittedReleaseSnapshot({');
+	const evidenceRemoval = wrapper.indexOf('rmSync(evidence.evidencePath');
+	const summaryRemoval = wrapper.indexOf('rmSync(evidence.summaryPath');
+	assert.ok(
+		cleanSnapshotCall >= 0
+			&& cleanSnapshotCall < evidenceRemoval
+			&& evidenceRemoval < summaryRemoval,
+		'The clean-snapshot call must execute before the actual stable artifact removals.',
 	);
 	assert.match(
 		harness,
