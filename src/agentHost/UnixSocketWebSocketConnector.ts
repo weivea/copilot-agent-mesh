@@ -252,6 +252,18 @@ function webSocketFailure(error: Error & { code?: unknown }): UnixSocketWebSocke
 	if (unexpected !== null) {
 		return unexpectedResponse(Number(unexpected[1]));
 	}
+	if (['EACCES', 'ECONNREFUSED', 'ENOENT'].includes(String(error.code))) {
+		return new UnixSocketWebSocketError(
+			'CONNECT_FAILED',
+			'The editor Agent Host socket connection failed.',
+		);
+	}
+	if (error.code === 'ETIMEDOUT') {
+		return new UnixSocketWebSocketError(
+			'UPGRADE_TIMEOUT',
+			'The editor Agent Host connection timed out.',
+		);
+	}
 	if (/Sec-WebSocket-Accept|upgrade header|connection header/iu.test(error.message)) {
 		return new UnixSocketWebSocketError(
 			'INVALID_RESPONSE',
