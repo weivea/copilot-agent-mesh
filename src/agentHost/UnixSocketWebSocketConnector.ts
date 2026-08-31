@@ -131,10 +131,8 @@ export class UnixSocketWebSocketConnector {
 				_request: import('node:http').ClientRequest,
 				response: import('node:http').IncomingMessage,
 			): void => settleFailure(unexpectedResponse(response.statusCode));
-			const handleWebSocketError = (): void => settleFailure(new UnixSocketWebSocketError(
-				'UPGRADE_FAILED',
-				'The editor Agent Host WebSocket upgrade failed.',
-			));
+			const handleWebSocketError = (error: Error & { code?: unknown }): void =>
+				settleFailure(webSocketFailure(error));
 			const handleWebSocketClose = (): void => settleFailure(new UnixSocketWebSocketError(
 				'EARLY_CLOSE',
 				'The editor Agent Host WebSocket closed before opening.',
@@ -246,5 +244,32 @@ function unexpectedResponse(statusCode: number | undefined): UnixSocketWebSocket
 		'UPGRADE_FAILED',
 		'The editor Agent Host rejected the WebSocket upgrade.',
 		statusCode,
+	);
+}
+
+function webSocketFailure(error: Error & { code?: unknown }): UnixSocketWebSocketError {
+	const unexpected = /^Unexpected server response: (\d{3})$/u.exec(error.message);
+	if (unexpected !== null) {
+		return unexpectedResponse(Number(unexpected[1]));
+	}
+	if (/Sec-WebSocket-Accept|upgrade header|connection header/iu.test(error.message)) {
+		return new UnixSocketWebSocketError(
+			'INVALID_RESPONSE',
+			'The editor Agent Host returned an invalid WebSocket upgrade response.',
+		);
+	}
+	if (
+		error.code === 'ECONNRESET'
+		|| error.code === 'EPIPE'
+		|| /socket hang up|closed before/iu.test(error.message)
+	) {
+		return new UnixSocketWebSocketError(
+			'EARLY_CLOSE',
+			'The editor Agent Host connection closed during the WebSocket upgrade.',
+		);
+	}
+	return new UnixSocketWebSocketError(
+		'UPGRADE_FAILED',
+		'The editor Agent Host WebSocket upgrade failed.',
 	);
 }
