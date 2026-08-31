@@ -487,6 +487,78 @@ test('source selector retries one cleanup-safe editor connection before standalo
 	await selector.dispose();
 });
 
+test('source selector does not retry explicit editor upgrade authentication rejection', async () => {
+	const editor = new FakeRuntime();
+	const standalone = new FakeRuntime();
+	editor.startError = new AgentRuntimeError(
+		'AGENT_UNAVAILABLE',
+		'The Agent Host connection could not be established.',
+		false,
+		new UnixSocketWebSocketError(
+			'UPGRADE_AUTH_REJECTED',
+			'The editor Agent Host rejected WebSocket authentication.',
+			401,
+		),
+	);
+	const selector = new AgentHostSourceSelector(selectorOptions({
+		preferEditor: () => true,
+		editor,
+		standalone,
+	}));
+
+	await selector.start(taskRequest());
+	assert.equal(editor.starts, 1);
+	assert.equal(standalone.starts, 1);
+	await selector.dispose();
+});
+
+test('source selector cancellation interrupts editor readiness backoff without fallback', async () => {
+	let waiting!: () => void;
+	const waitingPromise = new Promise<void>((resolve) => {
+		waiting = resolve;
+	});
+	const editor = new FakeRuntime();
+	editor.startError = new AgentRuntimeError(
+		'AGENT_UNAVAILABLE',
+		'The Agent Host connection could not be established.',
+		false,
+		new UnixSocketWebSocketError(
+			'CONNECT_FAILED',
+			'The editor Agent Host socket connection failed.',
+			undefined,
+			'ECONNREFUSED',
+		),
+	);
+	const standalone = new FakeRuntime();
+	const selector = new AgentHostSourceSelector({
+		...selectorOptions({
+			preferEditor: () => true,
+			editor,
+			standalone,
+		}),
+		editorConnectionRetryDelaysMs: [1_000],
+		waitForEditorRetry: (_delayMs, signal) => new Promise((_resolve, reject) => {
+			waiting();
+			const abort = () => {
+				signal.removeEventListener('abort', abort);
+				reject(new DOMException('cancelled', 'AbortError'));
+			};
+			signal.addEventListener('abort', abort, { once: true });
+		}),
+	});
+
+	const start = selector.start(taskRequest());
+	void start.catch(() => undefined);
+	await waitingPromise;
+	await selector.dispose();
+	await assert.rejects(
+		start,
+		(error: unknown) => error instanceof DOMException && error.name === 'AbortError',
+	);
+	assert.equal(editor.starts, 1);
+	assert.equal(standalone.starts, 0);
+});
+
 test('source selector prevents editor endpoint probes from racing token use', async () => {
 	let releaseProbe!: () => void;
 	let probeStarted!: () => void;

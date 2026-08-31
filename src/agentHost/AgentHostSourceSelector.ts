@@ -26,7 +26,7 @@ import {
 } from './UnixSocketWebSocketConnector';
 
 const borrowedEditorEndpoint = new URL('ws://editor-agent-host.invalid/');
-const defaultEditorConnectionRetryDelaysMs = [3_000, 4_000] as const;
+const defaultEditorConnectionRetryDelaysMs = [3_000, 4_000, 8_000, 15_000] as const;
 
 export interface AgentHostSourceSelectorOptions {
 	readonly preferEditor: () => boolean;
@@ -59,7 +59,7 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 		if (
 			this.editorConnectionRetryDelaysMs.length > 4
 			|| this.editorConnectionRetryDelaysMs.some(
-				(delayMs) => !Number.isSafeInteger(delayMs) || delayMs < 0 || delayMs > 10_000,
+				(delayMs) => !Number.isSafeInteger(delayMs) || delayMs < 0 || delayMs > 30_000,
 			)
 		) {
 			throw new RangeError('Editor connection retry delays are invalid.');
@@ -163,7 +163,7 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 					throw error;
 				}
 				if (
-					editorFailure.stage === 'connection'
+					isRetryableEditorConnectionFailure(editorFailure)
 					&& attempt < this.editorConnectionRetryDelaysMs.length
 				) {
 					await this.waitForEditorRetry(
@@ -471,6 +471,13 @@ function safeEditorFailure(error: unknown): AgentHostSourceFailure {
 			: {}),
 		message: 'The selected editor Agent Host attempt failed safely.',
 	};
+}
+
+function isRetryableEditorConnectionFailure(failure: AgentHostSourceFailure): boolean {
+	return failure.stage === 'connection'
+		&& !['INVALID_RESPONSE', 'TOKEN_INVALID', 'UPGRADE_AUTH_REJECTED'].includes(
+			failure.detail ?? '',
+		);
 }
 
 function isFallbackEligible(error: unknown): boolean {
