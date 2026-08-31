@@ -38,7 +38,7 @@ test('composition uses global metadata, SecretStorage, and globalStorageUri with
 	assert.match(source, /context\.globalStorageUri/);
 	assert.match(
 		source,
-		/requestedE2eScenario === 'peerDelegation'\s*&& isE2eCapabilityEnabled\(e2eCapability\)\s*\?\s*peerDelegationRunContext/u,
+		/runtimeMode === 'development'\s*&& requestedE2eScenario === 'peerDelegation'\s*&& isE2eCapabilityEnabled\(e2eCapability\)\s*\?\s*peerDelegationRunContext/u,
 	);
 	assert.match(
 		source,

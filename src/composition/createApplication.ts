@@ -148,8 +148,9 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			multiWindow: multiWindowE2eRequested,
 			peerDelegation: peerDelegationE2eRequested,
 		});
+		const runtimeMode = extensionRuntimeMode(context.extensionMode);
 		const e2eCapability = E2eCapability.create({
-			mode: extensionRuntimeMode(context.extensionMode),
+			mode: runtimeMode,
 			environmentEnabled: requestedE2eScenario !== undefined,
 			environmentNonce: requestedE2eScenario === 'peerDelegation'
 				? process.env.MESH_PEER_DELEGATION_E2E_NONCE
@@ -163,7 +164,8 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			profileNonce: configuration.get<string>('e2e.nonce'),
 			profileRole: configuration.get<string>('e2e.role'),
 		});
-		const peerDelegationRun = requestedE2eScenario === 'peerDelegation'
+		const peerDelegationRun = runtimeMode === 'development'
+			&& requestedE2eScenario === 'peerDelegation'
 			&& isE2eCapabilityEnabled(e2eCapability)
 			? peerDelegationRunContext(process.env.MESH_PEER_DELEGATION_E2E_NONCE)
 			: undefined;
