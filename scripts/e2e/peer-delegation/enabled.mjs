@@ -1105,7 +1105,7 @@ async function recordCompletionScenario({
 		? {
 			code: sourceFailure.code,
 			stage: sourceFailure.stage,
-			...(['CANCELLED', 'CONNECT_FAILED', 'EARLY_CLOSE', 'INVALID_RESPONSE', 'TOKEN_INVALID', 'UPGRADE_FAILED', 'UPGRADE_TIMEOUT']
+			...(['CANCELLED', 'CONNECT_FAILED', 'EARLY_CLOSE', 'INVALID_RESPONSE', 'TOKEN_INVALID', 'UPGRADE_AUTH_REJECTED', 'UPGRADE_BUSY', 'UPGRADE_FAILED', 'UPGRADE_TIMEOUT']
 				.includes(sourceFailure.detail)
 				? { detail: sourceFailure.detail }
 				: {}),

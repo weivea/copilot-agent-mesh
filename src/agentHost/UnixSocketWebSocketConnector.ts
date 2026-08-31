@@ -12,6 +12,8 @@ export type UnixSocketWebSocketErrorCode =
 	| 'EARLY_CLOSE'
 	| 'INVALID_RESPONSE'
 	| 'TOKEN_INVALID'
+	| 'UPGRADE_AUTH_REJECTED'
+	| 'UPGRADE_BUSY'
 	| 'UPGRADE_FAILED'
 	| 'UPGRADE_TIMEOUT';
 
@@ -121,10 +123,10 @@ export class UnixSocketWebSocketConnector {
 				'EARLY_CLOSE',
 				'The editor Agent Host socket closed before the WebSocket upgrade completed.',
 			));
-			const handleUnexpectedResponse = (): void => settleFailure(new UnixSocketWebSocketError(
-				'UPGRADE_FAILED',
-				'The editor Agent Host rejected the WebSocket upgrade.',
-			));
+			const handleUnexpectedResponse = (
+				_request: import('node:http').ClientRequest,
+				response: import('node:http').IncomingMessage,
+			): void => settleFailure(unexpectedResponse(response.statusCode));
 			const handleWebSocketError = (): void => settleFailure(new UnixSocketWebSocketError(
 				'UPGRADE_FAILED',
 				'The editor Agent Host WebSocket upgrade failed.',
@@ -218,5 +220,24 @@ function cancelled(): UnixSocketWebSocketError {
 	return new UnixSocketWebSocketError(
 		'CANCELLED',
 		'The editor Agent Host connection was cancelled.',
+	);
+}
+
+function unexpectedResponse(statusCode: number | undefined): UnixSocketWebSocketError {
+	if (statusCode === 401 || statusCode === 403) {
+		return new UnixSocketWebSocketError(
+			'UPGRADE_AUTH_REJECTED',
+			'The editor Agent Host rejected WebSocket authentication.',
+		);
+	}
+	if ([409, 423, 429, 503].includes(statusCode ?? 0)) {
+		return new UnixSocketWebSocketError(
+			'UPGRADE_BUSY',
+			'The editor Agent Host is not ready for another WebSocket client.',
+		);
+	}
+	return new UnixSocketWebSocketError(
+		'UPGRADE_FAILED',
+		'The editor Agent Host rejected the WebSocket upgrade.',
 	);
 }

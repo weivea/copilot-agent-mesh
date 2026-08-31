@@ -304,7 +304,7 @@ test('Unix socket connector rejects token/status/header failures, timeout, cance
 		try {
 			await assertConnectorFailure(
 				new UnixSocketWebSocketConnector({ timeoutMs: 500 }).connect(socketPath, 'wrong-token'),
-				'UPGRADE_FAILED',
+				'UPGRADE_AUTH_REJECTED',
 				socketPath,
 				'wrong-token',
 			);

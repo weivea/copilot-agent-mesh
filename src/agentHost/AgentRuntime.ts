@@ -26,6 +26,8 @@ export interface AgentHostSourceFailure {
 		| 'EARLY_CLOSE'
 		| 'INVALID_RESPONSE'
 		| 'TOKEN_INVALID'
+		| 'UPGRADE_AUTH_REJECTED'
+		| 'UPGRADE_BUSY'
 		| 'UPGRADE_FAILED'
 		| 'UPGRADE_TIMEOUT';
 	readonly message: string;
