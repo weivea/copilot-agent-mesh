@@ -1,6 +1,6 @@
 # Compatibility Matrix
 
-> Status: 0.4.0 Preview implemented; Peer Window Delegation real gate pending operator evidence<br>
+> Status: 0.4.0 Preview implemented; Peer Window Delegation objective gate 8/12, full gate Unverified<br>
 > Evidence date: 2026-08-31<br>
 > Mesh protocol: v2; v1 peers incompatible
 
@@ -31,7 +31,7 @@ extend Worker support beyond macOS arm64 or authorize publication.
 | AHP package | TypeScript package `0.9.0` from pinned upstream commit `f19dd8b3942d029744a3bdd31d830f9428e8ea47`; negotiates AHP `1.0.0` | Current VS Code 1.135.0 Agent Host handshake and real turn passed | Pass; upstream revision is not yet tagged or npm-published |
 | AHP authentication | `https://api.github.com` → provider `github`, scopes `read:user`, `user:email` | Dedicated profile exposed a silent session accepted by Agent Host | Pass on tested profile |
 | Editor Agent Host source (0.4.0 P6) | schema-v2 editor endpoint, Unix socket WebSocket, AHP offer `1.0.0`; standalone fallback | Offline strict parser/socket/selector/lifecycle coverage. The 2026-08-31 macOS arm64 local registry had zero editor endpoints, so live initialize/O1 were not runnable there | Implemented; live connectivity and Chat Sessions visibility remain unverified for P8 |
-| Peer Window Delegation (0.4.0) | Five registered LM Tools, directional allowlist plus target receive gate, one Broker/two ordinary windows, editor-first AHP | Default-off real harness and strict sanitized evidence validator are implemented. Programmatic Tool invocation cannot prove Copilot sidebar confirmation; only an operator-visible run may promote AC-5 | Unverified until `artifacts/peer-delegation-e2e/evidence.json` passes all 12 items |
+| Peer Window Delegation (0.4.0) | Five registered LM Tools, directional allowlist plus target receive gate, one Broker/two ordinary windows, editor-first AHP | Real VS Code 1.135.0/macOS arm64 objective run passed AC-5 1-4, 8, 10-12. Fresh profile then used explicit standalone degradation and stopped at `AGENT_AUTH_REQUIRED`; cleanup passed | 8/12 objective items Pass; completion/UI/editor items Unverified |
 | Dev Tunnel CLI | Exact macOS arm64 build `1.0.2030+fc9273aa0f` | Existing exact-build lifecycle evidence; multi-window local route kept Listener/Tunnel stopped | Pass on macOS arm64 only |
 | Remote v2 route | One device Gateway/Tunnel → Broker → explicit Window Node | Historical two-device pairing/discovery and durable acceptance passed; its disposable Worker profile then stopped at `AGENT_AUTH_REQUIRED` | Transport/routing pass; authenticated two-device execution not yet run |
 | Artifact Store | Immutable bounded JSON with producer/consumer ownership, length, SHA-256, and revision | Size/count/media/hash/ownership/corruption/path/secret tests plus exact 153-byte contract handoff passed | Same-device Broker scope only; not arbitrary file transfer |
@@ -43,6 +43,7 @@ extend Worker support beyond macOS arm64 or authorize publication.
 | `.vscode-test/multi-window-evidence/6c119d7b-8596-4757-a129-7e31b412db5d.json` | Two nodes in 129 ms; exactly one Broker; Listener/Tunnel stopped and sentinel untouched; repo-b offline in 268 ms, then same `workspaceId` reclaimed; takeover changed generation; duplicate repo conflict; complete socket/process cleanup. |
 | `.vscode-test/multi-window-evidence/7886dc25-37ef-4909-ac2b-6af2a506078c.json` | Opted-in real AHP run: two nodes in 278 ms; repo-b offline in 214 ms; takeover in 1683 ms; same `workspaceId`; zero tunnel/socket/process residue. Infrastructure/lifecycle passed, but AHP stopped at `AGENT_AUTH_REQUIRED`; no authoritative start/get/cancel/output evidence. |
 | `.vscode-test/multi-window-evidence/2ab62a03-51ba-45ef-a01a-0e3829f7ae7c.json` | Final authenticated run on VS Code 1.135.0: two nodes in 133 ms; `agentStarted`; five output events; authoritative start/get/cancel; `AgentTaskHandle.cancel()` invoked; `cancelled`; repo-b offline in 210 ms; takeover in 1878 ms; workspace reclaim/conflict; profile lock released; zero Tunnel/socket/Agent Host/VS Code residue. |
+| `artifacts/peer-delegation-e2e/evidence.json` | P8 objective run: two ordinary nodes, one Broker, two distinct claims, `PEER_NOT_ALLOWED`, `PEER_NOT_ACCEPTING`, one-way visibility, Incoming record, zero Listener/Tunnel attempts, lease/profile release, and zero harness-owned residue. Fresh profile stopped at `AGENT_AUTH_REQUIRED`; artifact status is Unverified, not Pass. |
 
 ## Preview platform support
 

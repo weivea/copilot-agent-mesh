@@ -824,6 +824,10 @@ macOS 使用 `$HOME/.mw` 这类短路径以避开 Unix-domain socket path limit�
 - 稳定证据路径为 `artifacts/peer-delegation-e2e/evidence.json`。只有真实观察可标
   Pass；认证、UI、60 分钟或 editor endpoint 未观察时明确 `unverified`。
 
+2026-08-31 objective run 已通过上述拓扑、双重门、Incoming、本地路由和清理项；Fresh
+Profile 在 standalone degradation 下返回 `AGENT_AUTH_REQUIRED`。因此该 Artifact 总状态为
+Unverified（8/12），不是完整 Peer Delegation Pass。
+
 ## 17. 开发阶段
 
 ### Phase 0：技术 Spike

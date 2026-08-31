@@ -30,12 +30,13 @@ MESH_PEER_DELEGATION_E2E_AUTH_SCOPES_JSON='["read:user","user:email"]' \
 npm run test:peer-delegation-real
 ```
 
-The automated phase uses the real Dashboard handle paths for policy and the real
-registered LM Tools for list, direct rejection, completion, needs-input/answer,
-CancellationToken cancellation, and a one-shot short budget. The budget override
-is armed only for the next minute-scale delegation timer; ordinary Tool deadlines
-and the production default/maximum of 60 minutes are unchanged. No mock AHP,
-Fake Agent, direct Broker task substitute, synthetic terminal state, or
+The default visible phase uses the real Dashboard handle paths for policy and the
+registered LM Tools for the passing Tool+Agent route. Diagnostics-only mode uses
+the same production `TaskToolsCore`/Broker/Window Node/AHP path to collect
+objective runtime evidence without pretending it had a parent Chat or
+confirmation. The short budget override is armed only for the next minute-scale
+delegation timer; ordinary Tool deadlines and the production default/maximum of
+60 minutes are unchanged. No mock AHP, Fake Agent, synthetic terminal state, or
 blocked/cancelled-as-completed result can pass.
 
 Programmatic `vscode.lm.invokeTool` has no parent Chat identity and cannot prove
@@ -74,6 +75,25 @@ catalog and the target UI is visibly observed. O2 is Pass only after a genuine
 60-minute Copilot Tool call; shorter runs are recorded as shorter-duration-only.
 O3 remains non-guaranteed Tool choice, O4 remains undetectable concurrent user
 Copilot edits, and O5 remains unsupported/unverified outside macOS arm64.
+
+### Recorded P8 objective result
+
+The 2026-08-31 diagnostics-only run on VS Code 1.135.0/macOS arm64 produced a
+valid **Unverified** artifact rather than a false Pass:
+
+- AC-5 1-4 passed: two ordinary windows, exactly one Broker, two distinct claim
+  hashes, target absent before authorization, exact `PEER_NOT_ALLOWED` and
+  `PEER_NOT_ACCEPTING`, target visible after both gates, and reverse direction
+  absent; both Dashboard configuration lists contained both windows.
+- AC-5 8 and 10-12 passed: the target had an Incoming record, Listener/Tunnel
+  attempt deltas stayed zero, the Workspace lease and Profile Lock were released,
+  and final harness-owned VS Code/Agent Host/Tunnel/socket/timer counts were zero.
+- The fresh profile selected explicit `standalone` degradation and returned
+  `AGENT_AUTH_REQUIRED` with the exact task ID after 2.489 seconds. AC-5 5-7 and
+  9, O1, needs-input, cancellation, timeout, and O2 therefore remain Unverified.
+- No user attestation was created. The full UI rerun still requires the exact
+  enabled command, a signed-in dedicated profile, one visible Agent-mode Tool
+  confirmation, and an honest `session-visible`/`session-not-visible` attestation.
 
 The default `npm test` remains offline. The real test is explicit because it creates a
 public Dev Tunnel and may consume Copilot quota:

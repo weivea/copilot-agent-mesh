@@ -1290,6 +1290,12 @@ macOS arm64 已记录以下真实运行：
   schema Artifact 由 frontend 精确消费，两边 Validation 与独立检查通过，
   Run completed，Listener/Tunnel Stopped，Takeover 993 ms，Profile Lock 释放且
   Process/Socket/Timer 零残留。
+- `artifacts/peer-delegation-e2e/evidence.json`：
+  P8 VS Code 1.135.0/macOS arm64 objective run 通过两个普通 Window Node、一个 Broker、
+  两个不同 Claim、`PEER_NOT_ALLOWED` / `PEER_NOT_ACCEPTING`、单向可见、Incoming、
+  Listener/Tunnel 零 attempt delta、Lease/Profile Lock 释放与 Harness-owned 资源归零。
+  Fresh Profile 显式 standalone 降级并停在 `AGENT_AUTH_REQUIRED`，所以不声明
+  `agentStarted`/output/completed、父 Chat confirmation、O1/O2 或真实 input/cancel/timeout。
 
 实施期间 Unit、Component、Extension Host 和完整 npm Test 均通过；最终发布
 验证完成前不在文档中固定数量。

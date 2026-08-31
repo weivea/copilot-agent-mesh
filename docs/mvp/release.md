@@ -102,6 +102,11 @@ The generated evidence remains local at
 publish it as a release asset without a separate review. Its validator rejects
 sensitive content and any claimed Pass with residual harness-owned resources.
 
+The recorded P8 objective run is valid but **Unverified**: AC-5 1-4, 8, and
+10-12 passed, while the fresh profile degraded to standalone and stopped at
+`AGENT_AUTH_REQUIRED`. Do not publish or relabel this as a full Peer Delegation
+Pass; rerun with a signed-in dedicated profile and the visible Agent-mode steps.
+
 Run the ordinary-window transport/lifecycle test explicitly:
 
 ```sh

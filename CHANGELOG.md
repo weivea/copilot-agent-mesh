@@ -47,6 +47,12 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
   paths, tokens, raw prompts/output, full Workspace identities, malformed
   references, success-shaped incomplete results, and global-process-zero claims;
   it records only harness-owned baseline/delta/final resources.
+- Recorded an honest real P8 objective run on VS Code 1.135.0/macOS arm64:
+  AC-5 items 1-4, 8, and 10-12 were observed, including both peer rejection
+  codes, directionality, Incoming, no Listener/Tunnel access, and complete
+  cleanup. The disposable profile degraded to standalone and stopped at
+  `AGENT_AUTH_REQUIRED`; UI/editor completion and the remaining items stay
+  Unverified rather than being converted to Pass.
 - Bumped the Preview extension and VSIX artifact to `0.4.0` while retaining AHP
   commit `f19dd8b3942d029744a3bdd31d830f9428e8ea47`, TypeScript client `0.9.0`,
   and protocol offer `1.0.0`.
