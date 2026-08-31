@@ -68,6 +68,7 @@ import type { Clock } from '../domain/ports';
 import {
 	LocalIpcClient,
 	LocalIpcHandlerError,
+	LocalIpcRemoteError,
 	type JsonValue,
 	type LocalIpcIdentity,
 	type LocalIpcSession,
@@ -853,13 +854,16 @@ export class WindowNodeClient implements WorkspaceResolver {
 			this.resolveFirstConnection?.();
 			this.resolveFirstConnection = undefined;
 			this.rejectFirstConnection = undefined;
-		} catch {
+		} catch (error) {
 			if (this.client === client && this.session !== undefined) {
 				this.session.close();
 			} else {
 				client.dispose();
 			}
-			this.reportSafeError('The Window Node could not connect to the local Device Broker.');
+			this.reportSafeError(
+				'The Window Node could not connect to the local Device Broker.',
+				localIpcMeshReason(error),
+			);
 			this.transition('reconnecting');
 			if (
 				this.executorTransitionOperation === undefined
@@ -1331,9 +1335,12 @@ export class WindowNodeClient implements WorkspaceResolver {
 		}
 	}
 
-	private reportSafeError(message: string): void {
+	private reportSafeError(message: string, code?: MeshErrorReason): void {
 		try {
-			this.options.onError?.(new Error(message));
+			this.options.onError?.(Object.assign(
+				new Error(message),
+				code === undefined ? {} : { code },
+			));
 		} catch {
 			process.emitWarning('A Window Node error listener failed.', {
 				code: 'WINDOW_NODE_ERROR_LISTENER_FAILED',
@@ -1475,6 +1482,21 @@ export class WindowNodeClient implements WorkspaceResolver {
 			throw new AggregateError(failures, 'Window Node client cleanup failed.');
 		}
 	}
+}
+
+function localIpcMeshReason(error: unknown): MeshErrorReason | undefined {
+	if (
+		!(error instanceof LocalIpcRemoteError)
+		|| typeof error.data !== 'object'
+		|| error.data === null
+		|| Array.isArray(error.data)
+		|| !('reason' in error.data)
+		|| typeof error.data.reason !== 'string'
+		|| !Object.hasOwn(MESH_ERROR_CODES, error.data.reason)
+	) {
+		return undefined;
+	}
+	return error.data.reason as MeshErrorReason;
 }
 
 export function toWindowNodeHandlerError(error: unknown): LocalIpcHandlerError {

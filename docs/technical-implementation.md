@@ -1251,6 +1251,10 @@ zod
    Tool → Broker → Window Node → editor AHP → Broker → Tool Result。VS Code 1.135.0
    的无 Chat context `vscode.lm.invokeTool` 仍执行 prepare 并显示独立 modal，但无法证明
    父 Copilot Chat 身份；确认只能由可见 Agent-mode 阶段证明，缺失时明确 `unverified`。
+   持久 User Data 仅复用 Copilot authentication；通过 `E2eCapability` 校验后，全部 Mesh
+   `StateStore` metadata 使用 fixed-key/run-nonce envelope，Broker lock、IPC identity root
+   与 `mesh-state` 使用唯一 `controlRoot/broker`。新 run 不读取旧 run 或生产
+   Workspace/Route state，也不删除持久 global storage、修改 SQLite、提高 limit 或 eviction。
 
 环境变量：
 

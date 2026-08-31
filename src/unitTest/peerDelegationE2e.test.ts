@@ -223,6 +223,14 @@ test('0.4.0 release metadata keeps the real peer gate default-off and five-tool 
 		resolve(root, 'scripts/e2e/peer-delegation/enabled.mjs'),
 		'utf8',
 	);
+	const application = readFileSync(
+		resolve(root, 'src/composition/createApplication.ts'),
+		'utf8',
+	);
+	const brokerRuntime = readFileSync(
+		resolve(root, 'src/composition/ProductionBrokerRuntime.ts'),
+		'utf8',
+	);
 	assert.equal(manifest.version, '0.4.0');
 	assert.equal(
 		manifest.scripts['test:peer-delegation-real'],
@@ -255,6 +263,17 @@ test('0.4.0 release metadata keeps the real peer gate default-off and five-tool 
 		harness,
 		/async function installEvidenceTemporary[\s\S]*revalidateEvidenceDestination[\s\S]*await rename/u,
 	);
+	assert.doesNotMatch(harness, /rm\(meshGlobalStorageDirectory/u);
+	assert.match(
+		application,
+		/BrokerOwnerLock\.acquire\(brokerStorageUri\.fsPath[\s\S]*storageRootUri: brokerStorageUri/u,
+	);
+	assert.match(
+		application,
+		/createLocalBrokerIdentity\(brokerStorageUri, deviceId\)[\s\S]*createLocalBrokerIdentity\(\s*brokerStorageUri/u,
+	);
+	assert.match(brokerRuntime, /options\.storageRootUri,\s*'mesh-state'/u);
+	assert.match(harness, /readMultiWindowStartupDiagnostic/u);
 	assert.match(validator, /evidence\.gitCommit !== head/u);
 	assert.match(validator, /status\.length !== 0/u);
 });

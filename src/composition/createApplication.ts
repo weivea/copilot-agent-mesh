@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
-import { isAbsolute, join } from 'node:path';
+import { basename, isAbsolute, join } from 'node:path';
 
 import * as vscode from 'vscode';
 
@@ -37,6 +37,11 @@ import {
 	VscodeGlobalStateStore,
 	VscodeSecretStore,
 } from '../storage/VscodeStorageAdapters';
+import { PeerDelegationE2eStateStore } from '../storage/PeerDelegationE2eStateStore';
+import {
+	writeMultiWindowStartupDiagnostic,
+	type MultiWindowStartupDiagnosticCode,
+} from '../e2e/MultiWindowE2eSupport';
 import { DelegatedToolInvocationRegistry } from '../tools/DelegatedToolInvocationRegistry';
 import { LocalBrokerTaskFacade } from '../tools/LocalBrokerTaskFacade';
 import { registerMeshTaskTools } from '../tools/taskTools';
@@ -121,7 +126,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 	const cleanup: ApplicationCleanupStep[] = [];
 	const cleanupState = createApplicationCleanupState<vscode.Disposable>();
 	try {
-		const rawState = new VscodeGlobalStateStore(context.globalState);
+		const persistentState = new VscodeGlobalStateStore(context.globalState);
 		const secrets = new VscodeSecretStore(context.secrets);
 		const guard = new LocalDesktopWorkspaceGuard(() => ({
 			remoteName: vscode.env.remoteName,
@@ -158,8 +163,17 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			profileNonce: configuration.get<string>('e2e.nonce'),
 			profileRole: configuration.get<string>('e2e.role'),
 		});
-		const peerDelegationRecorder = requestedE2eScenario === 'peerDelegation'
+		const peerDelegationRun = requestedE2eScenario === 'peerDelegation'
 			&& isE2eCapabilityEnabled(e2eCapability)
+			? peerDelegationRunContext(process.env.MESH_PEER_DELEGATION_E2E_NONCE)
+			: undefined;
+		const rawState = peerDelegationRun === undefined
+			? persistentState
+			: new PeerDelegationE2eStateStore(persistentState, peerDelegationRun.nonce);
+		const brokerStorageUri = peerDelegationRun === undefined
+			? context.globalStorageUri
+			: vscode.Uri.file(join(peerDelegationRun.controlRoot, 'broker'));
+		const peerDelegationRecorder = peerDelegationRun !== undefined
 			? new PeerDelegationE2eRecorder()
 			: undefined;
 		const peerDelegationToolClock = peerDelegationRecorder === undefined
@@ -173,7 +187,12 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			extensionVersion: String(context.extension?.packageJSON.version ?? '0.0.0'),
 		};
 		const windowInstanceId = randomUUID();
-		const ownership = await BrokerOwnerLock.acquire(context.globalStorageUri.fsPath, {
+		const nodeId = randomUUID();
+		const nodeInstanceId = randomUUID();
+		const reportPeerStartup = peerDelegationRun === undefined
+			? undefined
+			: peerDelegationStartupReporter(peerDelegationRun.controlRoot, nodeInstanceId);
+		const ownership = await BrokerOwnerLock.acquire(brokerStorageUri.fsPath, {
 			instanceId: windowInstanceId,
 		});
 		const ownershipCleanup = addApplicationCleanup(cleanup, () => ownership.dispose(), true);
@@ -188,12 +207,13 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 				const ownerRuntime = await ProductionBrokerRuntime.create({
 					vscodeApi: vscode,
 					context,
+					storageRootUri: brokerStorageUri,
 					rawState,
 					secrets,
 					ownership,
 					generation,
 					identityFor: (deviceId) =>
-						createLocalBrokerIdentity(context.globalStorageUri, deviceId),
+						createLocalBrokerIdentity(brokerStorageUri, deviceId),
 					guard,
 					workerPlatform,
 					logger,
@@ -218,6 +238,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 				'Initial Broker ownership startup failed; bounded lifecycle retry remains active.',
 				error,
 			);
+			void reportPeerStartup?.('BROKER_RUNTIME_START_FAILED');
 		});
 
 		const [sharedProfile, brokerKey] = await Promise.all([
@@ -225,8 +246,6 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			waitForBrokerKey(secrets),
 		]);
 		profile = sharedProfile;
-		const nodeId = randomUUID();
-		const nodeInstanceId = randomUUID();
 		const nodeLabel = windowNodeLabel(nodeId);
 		const runtimeApproval = new VscodeLocalTaskApproval(vscode, rawState, e2eCapability);
 		const runtimeApprovalCapabilities = new AgentRuntimeApprovalCapabilityIssuer();
@@ -234,9 +253,10 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		let runtime!: ReturnType<typeof createVscodeAgentRuntime>;
 		let sourceStatusSubscription: { dispose(): void } | undefined;
 		const nodeIdentity = createLocalBrokerIdentity(
-			context.globalStorageUri,
+			brokerStorageUri,
 			sharedProfile.deviceId,
 		);
+		let nodeStartupComplete = false;
 		const node = new WindowNodeClient({
 			nodeId,
 			nodeInstanceId,
@@ -256,9 +276,9 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 					delegatedToolInvocations,
 					runtimeApprovalCapabilities,
 					peerDelegationRecorder,
-					peerDelegationRecorder === undefined
+					peerDelegationRun === undefined
 						? undefined
-						: peerDelegationAgentHostStorageRoot(),
+						: join(peerDelegationRun.controlRoot, 'agent-host'),
 				);
 				sourceStatusSubscription = runtime.onDidSourceStatusChange(() => changeEvents.fire());
 				return new WindowNodeTaskExecutor({
@@ -289,16 +309,22 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 							.filter((tag) => tag.length > 0),
 					}));
 			},
-			onError: (error) => logger.error(
-				'window-node',
-				'The Window Node is reconnecting to the local Device Broker.',
-				error,
-			),
+			onError: (error) => {
+				logger.error(
+					'window-node',
+					'The Window Node is reconnecting to the local Device Broker.',
+					error,
+				);
+				if (!nodeStartupComplete) {
+					void reportPeerStartup?.(peerStartupCode(error));
+				}
+			},
 		});
 		addApplicationCleanup(cleanup, () => node.dispose(), true);
 		addApplicationCleanup(cleanup, () => changeEvents.dispose());
 		addApplicationCleanup(cleanup, () => sourceStatusSubscription?.dispose());
 		await node.start();
+		nodeStartupComplete = true;
 		const remoteTasks = new LocalIpcRemoteTaskAdapter(node);
 		addApplicationCleanup(cleanup, () => remoteTasks.dispose());
 		const localTasks = new LocalBrokerTaskFacade(node, {
@@ -698,12 +724,51 @@ function peerDelegationBudgetMs(): number {
 	return value;
 }
 
-function peerDelegationAgentHostStorageRoot(): string {
+function peerDelegationRunContext(nonce: string | undefined): {
+	readonly nonce: string;
+	readonly controlRoot: string;
+} {
+	if (nonce === undefined) {
+		throw new Error('The peer-delegation E2E nonce is unavailable after capability validation.');
+	}
 	const controlRoot = process.env.MESH_PEER_DELEGATION_E2E_CONTROL_DIR;
 	if (controlRoot === undefined || !isAbsolute(controlRoot)) {
 		throw new Error('The peer-delegation E2E control directory must be absolute.');
 	}
-	return join(controlRoot, 'agent-host');
+	return { nonce, controlRoot };
+}
+
+function peerDelegationStartupReporter(
+	controlRoot: string,
+	windowId: string,
+): ((code: MultiWindowStartupDiagnosticCode) => Promise<void>) | undefined {
+	const folders = vscode.workspace.workspaceFolders;
+	if (folders?.length !== 1 || folders[0].uri.scheme !== 'file') {
+		return undefined;
+	}
+	const workspaceBasename = basename(folders[0].uri.fsPath);
+	return async (code) => {
+		try {
+			await writeMultiWindowStartupDiagnostic({
+				controlRoot,
+				workspaceBasename,
+				windowId,
+				code,
+			});
+		} catch {
+			process.emitWarning(
+				'The peer-delegation E2E startup diagnostic could not be recorded.',
+				{ code: 'MESH_PEER_DELEGATION_E2E_DIAGNOSTIC_FAILED' },
+			);
+		}
+	};
+}
+
+function peerStartupCode(error: Error): MultiWindowStartupDiagnosticCode {
+	if ('code' in error && (error.code === 'WORKSPACE_BUSY' || error.code === 'WORKSPACE_NOT_FOUND')) {
+		return error.code;
+	}
+	return 'WINDOW_NODE_CONNECT_FAILED';
 }
 
 function extensionRuntimeMode(mode: vscode.ExtensionMode): ExtensionRuntimeMode {

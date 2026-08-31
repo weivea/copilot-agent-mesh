@@ -30,6 +30,22 @@ MESH_PEER_DELEGATION_E2E_AUTH_SCOPES_JSON='["read:user","user:email"]' \
 npm run test:peer-delegation-real
 ```
 
+The persistent User Data remains the source of VS Code/Copilot authentication, but
+it is not the Mesh state root for a peer-delegation run. After the development-only
+E2E capability validates the environment/profile nonce and role, every Mesh
+`globalState` key is projected through a fixed physical-key envelope containing
+that run nonce. Both windows in one run share those envelopes; a later run treats
+older envelopes as absent and overwrites the same bounded physical keys. Production
+device, workspace catalog, route, delegation, pairing, peer, listener, and Tunnel
+metadata remain untouched.
+
+The Broker owner lock, local IPC identity root, tasks, artifacts, and peer policy
+files live below the unique `<controlRoot>/broker` directory. Standalone Agent Host
+state remains below `<controlRoot>/agent-host`. Cleanup removes the encompassing
+owned run root. The harness never deletes the persistent extension global-storage
+directory, edits its SQLite state directly, raises the 32-workspace limit, or evicts
+production catalog entries.
+
 The default visible phase uses the real Dashboard handle paths for policy and the
 registered LM Tools for the passing Tool+Agent route. Diagnostics-only mode uses
 the same production `TaskToolsCore`/Broker/Window Node/AHP path to collect
@@ -85,6 +101,12 @@ The E2E-only standalone Agent Host stores its owned instance below the unique
 per-run control directory, which puts a run marker in the detached process
 arguments. Cleanup therefore continues to recognize an immediately reparented
 Host without retaining historical PIDs or matching the shared profile.
+
+Before controller readiness, the Extension Host may write only an allowlisted,
+path-free startup code under the owned window control directory. The harness
+validates its schema and freshness and includes the fixed safe diagnosis in a
+controller timeout. Raw errors, profile paths, workspace names, and secrets are
+never written to this diagnostic.
 
 Before validating the complete evidence schema, the harness atomically writes a
 separately validated minimal diagnostic envelope. If full schema or safety

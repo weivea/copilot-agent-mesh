@@ -20,6 +20,7 @@ import {
 	type NodeTaskBinding,
 	type RegistryScheduler,
 } from '../broker';
+import { PeerDelegationE2eStateStore } from '../storage/PeerDelegationE2eStateStore';
 
 const DEVICE_ID = '00000000-0000-4000-8000-000000000001';
 const NODE_A = '00000000-0000-4000-8000-000000000002';
@@ -177,6 +178,49 @@ test('registers and lists deterministic Window Node descriptors', async (t) => {
 	assert.equal(directory.deviceId, DEVICE_ID);
 	assert.deepEqual(directory.nodes.map((node) => node.nodeId), [NODE_A, NODE_B]);
 	assert.equal(directory.nodes[0].status, 'online');
+});
+
+test('run-scoped state claims a workspace despite a full persistent catalog', async (t) => {
+	const persistentCatalog = {
+		schemaVersion: 2,
+		workspaces: Array.from(
+			{ length: PROTOCOL_LIMITS.workspaceListCount },
+			(_, index) => ({
+				workspaceId: uuidFromIndex(40_000 + index),
+				workspaceIdentity: createOpaqueWorkspaceIdentity(`persistent-${index}`),
+				name: `Persistent ${index}`,
+				capabilityTags: [],
+				enabled: true,
+				createdAt: STARTED_AT,
+				updatedAt: STARTED_AT,
+			}),
+		),
+	};
+	const persistent = new MemoryState({
+		[WORKSPACE_CATALOG_STATE_KEY]: persistentCatalog,
+	});
+	const scoped = new PeerDelegationE2eStateStore(
+		persistent,
+		'00000000-0000-4000-8000-000000000010',
+	);
+	const time = new ManualTime();
+	const registry = await NodeRegistry.create({
+		deviceId: DEVICE_ID,
+		state: scoped,
+		ids: { next: () => WORKSPACE_ID },
+		clock: { now: () => time.now },
+		workspaceLeases: new WorkspaceLeaseManager(),
+		scheduler: time,
+	});
+	t.after(() => registry.dispose());
+	registry.register(registration(), new FakeSession().asRoute());
+
+	assert.equal((await registry.claimWorkspace(claim())).status, 'claimed');
+	assert.equal(registry.catalogSnapshot().workspaces.length, 1);
+	assert.deepEqual(
+		persistent.values.get(WORKSPACE_CATALOG_STATE_KEY),
+		persistentCatalog,
+	);
 });
 
 test('binds mandatory delegation principals to exact window and child sessions', async (t) => {

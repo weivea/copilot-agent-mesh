@@ -10,14 +10,20 @@ import {
 	NodeRegistry,
 	PeerPolicyService,
 	PeerPolicyStore,
+	TASK_ROUTE_CATALOG_STATE_KEY,
 	TaskRouteCatalog,
+	WORKSPACE_CATALOG_STATE_KEY,
 	type RegistryScheduler,
 } from '../broker';
-import type { NodeTaskStartParams } from '../../shared/protocol';
+import {
+	PROTOCOL_LIMITS,
+	type NodeTaskStartParams,
+} from '../../shared/protocol';
 import type { StateStore } from '../domain/ports';
 import { LocalIpcRemoteError, type LocalIpcIdentity } from '../ipc';
 import { WindowNodeClient, type WindowNodeExecutor } from '../node';
 import { AtomicFileStore } from '../storage/AtomicFileStore';
+import { PeerDelegationE2eStateStore } from '../storage/PeerDelegationE2eStateStore';
 import type { BrokerOwnership } from '../storage/WorkerOwnerLock';
 import { FileTaskStore } from '../tasks/FileTaskStore';
 import { WorkspaceLeaseManager } from '../tasks/WorkspaceLeaseManager';
@@ -47,6 +53,58 @@ const IDENTITY_A = createOpaqueWorkspaceIdentity('component-workspace-a');
 const IDENTITY_B = createOpaqueWorkspaceIdentity('component-workspace-b');
 const IDENTITY_C = createOpaqueWorkspaceIdentity('component-workspace-c');
 const IDENTITY_D = createOpaqueWorkspaceIdentity('component-workspace-d');
+
+test('run-scoped metadata boots two windows despite full persistent state', async (t) => {
+	const persistent = new MemoryState({
+		[WORKSPACE_CATALOG_STATE_KEY]: {
+			schemaVersion: 2,
+			workspaces: Array.from(
+				{ length: PROTOCOL_LIMITS.workspaceListCount },
+				(_, index) => ({
+					workspaceId: uuid(1_000 + index),
+					workspaceIdentity: createOpaqueWorkspaceIdentity(`persistent-${index}`),
+					name: `Persistent ${index}`,
+					capabilityTags: [],
+					enabled: true,
+					createdAt: '2026-08-30T12:00:00.000Z',
+					updatedAt: '2026-08-30T12:00:00.000Z',
+				}),
+			),
+		},
+		[TASK_ROUTE_CATALOG_STATE_KEY]: staleRouteCatalog('production'),
+	});
+	const oldRun = new PeerDelegationE2eStateStore(
+		persistent,
+		'00000000-0000-4000-8000-000000000010',
+	);
+	await oldRun.update(TASK_ROUTE_CATALOG_STATE_KEY, staleRouteCatalog('old-run'));
+	const currentRun = new PeerDelegationE2eStateStore(
+		persistent,
+		'00000000-0000-4000-8000-000000000011',
+	);
+	const fixture = await createFixture({ state: currentRun });
+	t.after(() => fixture.dispose());
+
+	const dashboard = await fixture.nodeA.listDashboardNodes();
+	assert.equal(fixture.brokerStartCount(), 1);
+	assert.equal(dashboard.nodes.length, 2);
+	assert.equal(
+		dashboard.nodes.reduce((count, node) => count + node.workspaces.length, 0),
+		2,
+	);
+	assert.equal(
+		(persistent.get<{ readonly workspaces: readonly unknown[] }>(
+			WORKSPACE_CATALOG_STATE_KEY,
+		))?.workspaces.length,
+		PROTOCOL_LIMITS.workspaceListCount,
+	);
+	assert.equal(
+		currentRun.get<{ readonly routes: readonly unknown[] }>(
+			TASK_ROUTE_CATALOG_STATE_KEY,
+		)?.routes.length ?? 0,
+		0,
+	);
+});
 
 test('authenticated broker RPC keeps Tool and configuration directories separate', async (t) => {
 	const fixture = await createFixture();
@@ -539,6 +597,7 @@ interface Fixture {
 	readonly nodeC?: WindowNodeClient;
 	readonly executorB: RecordingExecutor;
 	readonly executorC?: RecordingExecutor;
+	brokerStartCount(): number;
 	dashboardMetrics(): {
 		readonly broker: ReturnType<DeviceBroker['dashboardMetrics']>;
 		readonly tasks: ReturnType<BrokerTaskService['dashboardMetrics']>;
@@ -551,6 +610,7 @@ async function createFixture(options: {
 	readonly enabled?: boolean;
 	readonly sourceWorkspaceIdentities?: readonly string[];
 	readonly includeNodeC?: boolean;
+	readonly state?: StateStore;
 } = {}): Promise<Fixture> {
 	const tempDirectory = await mkdtemp(
 		process.platform === 'win32' ? join(tmpdir(), 'mesh-pp-') : '/tmp/mesh-pp-',
@@ -571,8 +631,8 @@ async function createFixture(options: {
 		clock,
 	});
 	await peerStore.initialize();
-	const registryState = new MemoryState();
-	const routeState = new MemoryState();
+	const registryState = options.state ?? new MemoryState();
+	const routeState = options.state ?? new MemoryState();
 	const workspaceIds = [
 		WORKSPACE_A,
 		...(options.sourceWorkspaceIdentities?.length === 2 ? [WORKSPACE_C] : []),
@@ -583,7 +643,9 @@ async function createFixture(options: {
 	let policies: PeerPolicyService;
 	let taskService: BrokerTaskService;
 	let broker: DeviceBroker | undefined;
+	let brokerStarts = 0;
 	const startBroker = async (): Promise<void> => {
+		brokerStarts += 1;
 		registry = await NodeRegistry.create({
 			deviceId: DEVICE,
 			state: registryState,
@@ -666,6 +728,7 @@ async function createFixture(options: {
 		},
 		executorB,
 		executorC,
+		brokerStartCount: () => brokerStarts,
 		dashboardMetrics: () => {
 			if (broker === undefined) {
 				throw new Error('The test Broker is unavailable.');
@@ -855,7 +918,13 @@ async function startedTaskId(
 }
 
 class MemoryState implements StateStore {
-	private readonly values = new Map<string, unknown>();
+	public readonly values = new Map<string, unknown>();
+
+	public constructor(initial: Readonly<Record<string, unknown>> = {}) {
+		for (const [key, value] of Object.entries(initial)) {
+			this.values.set(key, structuredClone(value));
+		}
+	}
 
 	public get<T>(key: string): T | undefined {
 		return this.values.get(key) as T | undefined;
@@ -864,6 +933,27 @@ class MemoryState implements StateStore {
 	public async update(key: string, value: unknown): Promise<void> {
 		this.values.set(key, structuredClone(value));
 	}
+}
+
+function staleRouteCatalog(label: string): unknown {
+	return {
+		schemaVersion: 1,
+		routes: [{
+			taskId: uuid(label === 'production' ? 1_100 : 1_101),
+			delegationRequestId: uuid(label === 'production' ? 1_102 : 1_103),
+			requestHash: 'a'.repeat(64),
+			target: {
+				deviceId: DEVICE,
+				nodeId: NODE_B,
+				nodeInstanceId: INSTANCE_B,
+				workspaceId: WORKSPACE_B,
+			},
+			routeKind: 'local',
+			sourceNodeId: NODE_A,
+			createdAt: '2026-08-30T12:00:00.000Z',
+			state: 'running',
+		}],
+	};
 }
 
 class NoopScheduler implements RegistryScheduler {

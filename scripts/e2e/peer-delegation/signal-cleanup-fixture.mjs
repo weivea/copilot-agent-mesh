@@ -14,9 +14,14 @@ const {
 const runRoot = join(root, 'run');
 const lockRoot = join(root, 'lock');
 await Promise.all([
-	mkdir(runRoot, { recursive: true }),
+	mkdir(join(runRoot, 'control', 'broker', 'mesh-state', 'tasks'), { recursive: true }),
 	mkdir(lockRoot, { recursive: true }),
 ]);
+await writeFile(
+	join(runRoot, 'control', 'broker', 'mesh-state', 'tasks', 'owned.json'),
+	'{}\n',
+	{ encoding: 'utf8', mode: 0o600 },
+);
 const child = spawn(process.execPath, ['-e', 'setInterval(() => undefined, 1000)'], {
 	shell: false,
 	stdio: 'ignore',

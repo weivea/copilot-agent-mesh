@@ -126,6 +126,7 @@ suite('Copilot Agent Mesh', () => {
 		assert.strictEqual(api.nodeState().registered, true);
 		assert.strictEqual(api.brokerState().state, 'running');
 		assert.strictEqual(api.brokerState().owner, true);
+		assert.strictEqual(api.peerDelegationE2e, undefined);
 		assert.deepEqual((await api.node.listNodes()).nodes, []);
 		const dashboard = await api.node.listDashboardNodes();
 		const thisWindow = dashboard.nodes.find((node) =>

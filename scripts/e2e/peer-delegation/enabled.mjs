@@ -44,6 +44,7 @@ const require = createRequire(import.meta.url);
 const {
 	multiWindowWorkspaceKey,
 	parseProcessTable,
+	readMultiWindowStartupDiagnostic,
 } = require(join(repositoryRoot, 'out/src/e2e/MultiWindowE2eSupport.js'));
 const {
 	createPeerDelegationDiagnosticEvidence,
@@ -99,12 +100,6 @@ const profileBase = persistentProfile
 const userDataDirectory = join(profileBase, 'user-data');
 const profileLockDirectory = join(profileBase, '.copilot-agent-mesh-peer-e2e-lock');
 const profileLockOwnerPath = join(profileLockDirectory, 'owner');
-const meshGlobalStorageDirectory = join(
-	userDataDirectory,
-	'User',
-	'globalStorage',
-	'weivea.copilot-agent-mesh',
-);
 const extensionsDirectory = join(runRoot, 'extensions');
 const controlRoot = join(runRoot, 'control');
 const logsDirectory = join(runRoot, 'logs');
@@ -787,9 +782,6 @@ async function releaseProfileLock() {
 
 async function prepareRun() {
 	await revalidateEvidenceDestination([basename(attestationPath)]);
-	if (persistentProfile) {
-		await rm(meshGlobalStorageDirectory, { recursive: true, force: true });
-	}
 	await mkdir(evidenceRoot, { recursive: true });
 	await revalidateEvidenceDestination([basename(attestationPath)]);
 	await Promise.all([
@@ -929,6 +921,7 @@ async function waitForController(workspacePath, launchedAt, timeoutMs) {
 	const workspaceControlRoot = join(controlRoot, 'windows', workspaceKey);
 	const deadline = Date.now() + timeoutMs;
 	let lastFailure;
+	let lastDiagnostic;
 	while (Date.now() < deadline) {
 		for (const windowId of await readdir(workspaceControlRoot).catch(() => [])) {
 			const controlDirectory = join(workspaceControlRoot, windowId);
@@ -950,7 +943,19 @@ async function waitForController(workspacePath, launchedAt, timeoutMs) {
 				await request(controller, 'controller.state', {}, 2_000);
 				return controller;
 			} catch (error) {
-				lastFailure = error;
+				if (error?.code !== 'ENOENT') {
+					lastFailure = error;
+				}
+			}
+			try {
+				lastDiagnostic = await readMultiWindowStartupDiagnostic(
+					join(controlDirectory, 'startup-failure.json'),
+					{ workspaceKey, windowId, launchedAt },
+				);
+			} catch (error) {
+				if (error?.code !== 'ENOENT' && !(error instanceof SyntaxError)) {
+					lastFailure = new Error('A peer E2E startup diagnostic was invalid.');
+				}
 			}
 		}
 		const launch = launchRecords.at(-1);
@@ -961,6 +966,9 @@ async function waitForController(workspacePath, launchedAt, timeoutMs) {
 	}
 	throw new Error(
 		`Timed out waiting for ${workspaceBasename}.`
+		+ (lastDiagnostic === undefined
+			? ''
+			: ` Startup diagnostic: ${lastDiagnostic.code}: ${lastDiagnostic.message}`)
 		+ (lastFailure instanceof Error ? ` Last error: ${lastFailure.message}` : ''),
 	);
 }
@@ -2066,7 +2074,6 @@ async function assertProfileMutationSafe() {
 		join(userDataDirectory, 'User'),
 		join(userDataDirectory, 'User', 'settings.json'),
 		join(userDataDirectory, 'User', 'globalStorage'),
-		meshGlobalStorageDirectory,
 	];
 	for (const path of paths) {
 		await assertNoSymlinkAlias(path, 'profile mutation path');

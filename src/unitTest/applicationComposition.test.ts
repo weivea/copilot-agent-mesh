@@ -27,13 +27,29 @@ test('extension entry point delegates activation and awaited deactivation to com
 
 test('composition uses global metadata, SecretStorage, and globalStorageUri without sync keys', () => {
 	const source = readSource('src/composition/createApplication.ts');
+	const runtime = readSource('src/composition/ProductionBrokerRuntime.ts');
 	const allProductionSource = [
 		source,
+		runtime,
 		readSource('src/storage/VscodeStorageAdapters.ts'),
 	].join('\n');
 	assert.match(source, /context\.globalState/);
 	assert.match(source, /context\.secrets/);
 	assert.match(source, /context\.globalStorageUri/);
+	assert.match(
+		source,
+		/requestedE2eScenario === 'peerDelegation'\s*&& isE2eCapabilityEnabled\(e2eCapability\)\s*\?\s*peerDelegationRunContext/u,
+	);
+	assert.match(
+		source,
+		/new PeerDelegationE2eStateStore\(persistentState, peerDelegationRun\.nonce\)/u,
+	);
+	assert.match(
+		source,
+		/vscode\.Uri\.file\(join\(peerDelegationRun\.controlRoot, 'broker'\)\)/u,
+	);
+	assert.match(runtime, /options\.storageRootUri,\s*'mesh-state'/u);
+	assert.doesNotMatch(source, /new PeerDelegationE2eStateStore\([^,]+,\s*process\.env/u);
 	assert.doesNotMatch(allProductionSource, /setKeysForSync/);
 });
 

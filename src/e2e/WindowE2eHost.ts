@@ -6,6 +6,7 @@ import * as vscode from 'vscode';
 import type { AgentMeshExtensionApi } from '../composition/createApplication';
 import type { TwoDeviceE2eApi } from '../composition/TwoDeviceE2eApi';
 import {
+	clearMultiWindowStartupDiagnostic,
 	multiWindowControlDirectory,
 	multiWindowWorkspaceKey,
 	parseMultiWindowRequest,
@@ -74,6 +75,7 @@ export async function runWindowE2eHostWithApi(
 		mkdir(requests, { recursive: true }),
 		mkdir(responses, { recursive: true }),
 	]);
+	await clearMultiWindowStartupDiagnostic(controlRoot, workspaceBasename, windowId);
 
 	const identity = {
 		schemaVersion: 1,
