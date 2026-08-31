@@ -26,7 +26,7 @@ import {
 } from './UnixSocketWebSocketConnector';
 
 const borrowedEditorEndpoint = new URL('ws://editor-agent-host.invalid/');
-const defaultEditorConnectionRetryDelaysMs = [3_000, 4_000, 8_000, 15_000] as const;
+const defaultEditorConnectionRetryDelaysMs = [5_000, 10_000, 15_000, 30_000] as const;
 
 export interface AgentHostSourceSelectorOptions {
 	readonly preferEditor: () => boolean;
