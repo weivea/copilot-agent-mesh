@@ -70,6 +70,7 @@ export class DelegationWaiter {
 	private cancelReason: Exclude<DelegationCancellationReason, 'peer'> | undefined;
 	private cancellationAccepted = false;
 	private cancelOperation: Promise<void> | undefined;
+	private pendingOutcome: DelegationOutcome | undefined;
 
 	public constructor(private readonly options: DelegationWaiterOptions) {}
 
@@ -93,13 +94,16 @@ export class DelegationWaiter {
 						try {
 							const value = this.toOutcome(snapshot);
 							if (value !== undefined) {
-								settle(value);
+								this.receiveOutcome(value, settle);
 							}
 						} catch {
-							settle(this.failed('OUTPUT_INVALID', 'The authoritative task event was invalid.'));
+							this.receiveOutcome(
+								this.failed('OUTPUT_INVALID', 'The authoritative task event was invalid.'),
+								settle,
+							);
 						}
 					},
-					(error) => settle(this.failureFromUnknown(error)),
+					(error) => this.receiveOutcome(this.failureFromUnknown(error), settle),
 				);
 				this.cancellationRegistration = this.options.cancellation.onCancellationRequested(
 					() => this.requestCancellation('token', settle),
@@ -194,9 +198,25 @@ export class DelegationWaiter {
 
 	private markTaskAvailable(settle: (outcome: DelegationOutcome) => void): void {
 		this.startReconciled = true;
+		const pending = this.pendingOutcome;
+		this.pendingOutcome = undefined;
+		if (pending !== undefined) {
+			settle(pending);
+		}
 		if (this.cancelReason !== undefined) {
 			this.beginCancellation(settle);
 		}
+	}
+
+	private receiveOutcome(
+		outcome: DelegationOutcome,
+		settle: (outcome: DelegationOutcome) => void,
+	): void {
+		if (!this.startReconciled) {
+			this.pendingOutcome ??= outcome;
+			return;
+		}
+		settle(outcome);
 	}
 
 	private toOutcome(snapshot: TaskToolSnapshot): DelegationOutcome | undefined {

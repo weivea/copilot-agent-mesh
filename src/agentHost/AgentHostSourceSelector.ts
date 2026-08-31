@@ -179,12 +179,18 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 	public dispose(): Promise<void> {
 		this.disposed = true;
 		this.listeners.clear();
-		this.disposal ??= this.disposeRuntimes().finally(() => {
-			if (!this.disposed) {
+		if (this.disposal !== undefined) {
+			return this.disposal;
+		}
+		let operation!: Promise<void>;
+		operation = this.disposeRuntimes().catch((error: unknown) => {
+			if (this.disposal === operation) {
 				this.disposal = undefined;
 			}
+			throw error;
 		});
-		return this.disposal;
+		this.disposal = operation;
+		return operation;
 	}
 
 	private async disposeRuntimes(): Promise<void> {
@@ -342,7 +348,9 @@ function degradedStatus(
 }
 
 function isFallbackEligible(error: unknown): boolean {
-	return error instanceof AgentRuntimeError && error.code === 'AGENT_UNAVAILABLE';
+	return error instanceof AgentRuntimeError
+		&& error.code === 'AGENT_UNAVAILABLE'
+		&& !error.cleanupFailed;
 }
 
 function normalizeFallbackFailure(error: unknown): AgentRuntimeError {

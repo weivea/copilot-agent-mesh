@@ -70,6 +70,11 @@ harness-owned final resource count. Baseline, peak, and final counts all use the
 harness ownership scope; unrelated global processes are neither counted nor a
 global-zero assertion.
 
+Cleanup runs as independent best-effort phases: process observation/termination,
+log/sentinel diagnostics, profile-lock release, and exact run-root removal cannot
+short-circuit one another. SIGINT/SIGTERM uses the same idempotent cleanup and
+never performs a name-based or global process kill.
+
 O1 is Pass only when the task Session hash appears in the editor `listSessions`
 catalog and the target UI is visibly observed. O2 is Pass only after a genuine
 60-minute Copilot Tool call; shorter runs are recorded as shorter-duration-only.

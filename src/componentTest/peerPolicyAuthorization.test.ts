@@ -218,6 +218,7 @@ test('two windows and one Broker deliver authoritative delegation outcomes witho
 		title: completedInput.title,
 		prompt: completedInput.prompt,
 		acceptanceCriteria: completedInput.acceptanceCriteria,
+		timeoutMinutes: completedInput.timeoutMinutes,
 		workerDeadline: '2026-08-30T13:00:00.000Z',
 	});
 	const completed = core.delegateTask(completedInput);

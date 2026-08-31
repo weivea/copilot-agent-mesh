@@ -45,6 +45,9 @@ const {
 const {
 	parsePeerDelegationEvidence,
 } = require(join(repositoryRoot, 'out/src/e2e/PeerDelegationEvidence.js'));
+const {
+	runPeerDelegationCleanupPhases,
+} = require(join(repositoryRoot, 'out/src/e2e/PeerDelegationCleanup.js'));
 
 class E2eRequestError extends Error {
 	constructor(action, code, message) {
@@ -130,6 +133,7 @@ let cleanupLeaseReleased = false;
 let evidence = initialEvidence();
 let canonicalUserDataDirectory = userDataDirectory;
 let signalCleanupStarted = false;
+let cleanupOperation;
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
 	process.once(signal, () => {
@@ -370,70 +374,16 @@ try {
 } catch (error) {
 	primaryFailure = error;
 } finally {
-	try {
-		await closeControllers();
-		await waitForNoOwnedProcesses(15_000).catch(async () => {
-			await terminateOwnedProcesses();
-			await waitForNoOwnedProcesses(5_000);
-		});
-		await closeLogStreams();
-		if (primaryFailure !== undefined) {
-			await saveSanitizedLogs();
-		}
-		const finalOwned = currentOwnedProcesses();
-		const localIpcRemoved = localIpcEndpoint === undefined
-			|| localIpcEndpoint.platform === 'win32'
-			|| await isAbsent(localIpcEndpoint.address);
-		const editorEndpointReleased = codeCliPath === undefined
-			|| await safeEditorEndpointCount(codeCliPath, userDataDirectory) === 0;
-		const sentinelInvoked = !await isAbsent(sentinelInvocationPath);
-		const sentinelUnchanged = sentinelDigest === undefined
-			|| createHash('sha256').update(await readFile(sentinelPath)).digest('hex') === sentinelDigest;
-		const profileLockReleased = await releaseProfileLock();
-		await rm(runRoot, { recursive: true, force: true });
-		const runtimeRemoved = await isAbsent(runRoot);
-		const ownedProcessesReleased = finalOwned.length === 0;
-		const ownedSocketsReleased = localIpcRemoved && editorEndpointReleased;
-		const ownedTimersReleased = (latestResourceMetrics?.toolTimers.activeTimers ?? 0) === 0;
-		const complete = profileLockReleased
-			&& cleanupLeaseReleased
-			&& localIpcRemoved
-			&& editorEndpointReleased
-			&& runtimeRemoved
-			&& ownedProcessesReleased
-			&& ownedSocketsReleased
-			&& ownedTimersReleased
-			&& sentinelUnchanged
-			&& !sentinelInvoked;
-		evidence.resources.vscode.ownedPeak = ownedPeaks.vscode;
-		evidence.resources.agentHost.ownedPeak = ownedPeaks.agentHost;
-		evidence.resources.tunnel.ownedPeak = ownedPeaks.tunnel;
-		evidence.resources.socket.ownedPeak = localIpcEndpoint === undefined
-			? 0
-			: 1 + (evidence.completion.source === 'editor' ? 1 : 0);
-		evidence.resources.timer.ownedPeak = latestResourceMetrics?.toolTimers.timersCreated ?? 0;
-		evidence.resources.vscode.finalOwned = finalOwned.filter(isVscodeProcess).length;
-		evidence.resources.agentHost.finalOwned = finalOwned.filter(isAgentHostProcess).length;
-		evidence.resources.tunnel.finalOwned = finalOwned.filter(isDevTunnelProcess).length;
-		evidence.resources.socket.finalOwned = Number(!localIpcRemoved) + Number(!editorEndpointReleased);
-		evidence.resources.timer.finalOwned = latestResourceMetrics?.toolTimers.activeTimers ?? 0;
-		evidence.cleanup = {
-			status: complete ? 'pass' : 'fail',
-			profileLockReleased,
-			workspaceLeaseReleased: cleanupLeaseReleased,
-			localIpcRemoved,
-			editorEndpointReleased,
-			runtimeRemoved,
-			ownedProcessesReleased,
-			ownedSocketsReleased,
-			ownedTimersReleased,
-			complete,
-		};
-		setAc5(11, complete ? 'pass' : 'fail', complete ? ['#/cleanup'] : []);
-		setAc5(12, complete ? 'pass' : 'fail', complete ? ['#/resources'] : []);
-	} catch (error) {
-		cleanupFailure = error;
-		await closeLogStreams().catch(() => undefined);
+	const cleanupFailures = await performCleanup();
+	if (cleanupFailures.length > 0) {
+		cleanupFailure = new AggregateError(
+			cleanupFailures.map(({ error }) => error),
+			'One or more peer-delegation E2E cleanup phases failed.',
+		);
+		evidence.cleanupFailures = cleanupFailures.map(({ phase, error }) => ({
+			phase,
+			...safeFailure(error),
+		}));
 	}
 }
 
@@ -1381,23 +1331,176 @@ async function closeControllers() {
 		await request(controller, 'host.close', {}, 5_000).catch(() => undefined);
 		activeControllers.delete(controller.windowId);
 	}
+}
 
-	async function cleanupAfterSignal(signal) {
-		const exitCode = signal === 'SIGINT' ? 130 : 143;
-		try {
-			await closeControllers().catch(() => undefined);
-			await waitForNoOwnedProcesses(10_000).catch(async () => {
-				await terminateOwnedProcesses();
-				await waitForNoOwnedProcesses(5_000).catch(() => undefined);
-			});
-			await closeLogStreams().catch(() => undefined);
-			if (profileLockOwned) {
-				await releaseProfileLock().catch(() => false);
-			}
-			await rm(runRoot, { recursive: true, force: true });
-		} finally {
-			process.exit(exitCode);
+function performCleanup() {
+	cleanupOperation ??= performCleanupOnce();
+	return cleanupOperation;
+}
+
+async function performCleanupOnce() {
+	let finalOwned;
+	let localIpcRemoved = localIpcEndpoint === undefined
+		|| localIpcEndpoint.platform === 'win32';
+	let editorEndpointReleased = codeCliPath === undefined;
+	let sentinelInvoked = false;
+	let sentinelUnchanged = sentinelDigest === undefined;
+	let profileLockReleased = false;
+	let runtimeRemoved = false;
+	const cleanupFailures = await runPeerDelegationCleanupPhases([
+		{ name: 'close-controllers', run: closeControllers },
+		{
+			name: 'owned-processes',
+			run: async () => {
+				await waitForNoOwnedProcesses(15_000).catch(async () => {
+					await terminateOwnedProcesses();
+					await waitForNoOwnedProcesses(5_000);
+				});
+			},
+		},
+		{ name: 'close-logs', run: closeLogStreams },
+		{
+			name: 'save-logs',
+			run: async () => {
+				if (primaryFailure !== undefined) {
+					await saveSanitizedLogs();
+				}
+			},
+		},
+		{
+			name: 'observe-processes',
+			run: async () => {
+				finalOwned = currentOwnedProcesses();
+			},
+		},
+		{
+			name: 'observe-local-ipc',
+			run: async () => {
+				localIpcRemoved = localIpcEndpoint === undefined
+					|| localIpcEndpoint.platform === 'win32'
+					|| await isAbsent(localIpcEndpoint.address);
+			},
+		},
+		{
+			name: 'observe-editor-endpoint',
+			run: async () => {
+				editorEndpointReleased = codeCliPath === undefined
+					|| await safeEditorEndpointCount(codeCliPath, userDataDirectory) === 0;
+			},
+		},
+		{
+			name: 'observe-sentinel',
+			run: async () => {
+				sentinelInvoked = !await isAbsent(sentinelInvocationPath);
+				sentinelUnchanged = sentinelDigest === undefined
+					|| createHash('sha256').update(await readFile(sentinelPath)).digest('hex') === sentinelDigest;
+			},
+		},
+		{
+			name: 'release-profile-lock',
+			run: async () => {
+				profileLockReleased = profileLockOwned
+					? await releaseProfileLock()
+					: await isAbsent(profileLockDirectory);
+			},
+		},
+		{
+			name: 'remove-run-root',
+			run: () => rm(runRoot, { recursive: true, force: true }),
+		},
+		{
+			name: 'verify-run-root',
+			run: async () => {
+				runtimeRemoved = await isAbsent(runRoot);
+				if (!runtimeRemoved) {
+					throw new Error('The exact peer-delegation E2E run root remains.');
+				}
+			},
+		},
+	]);
+	const ownedProcessesReleased = finalOwned !== undefined && finalOwned.length === 0;
+	const ownedSocketsReleased = localIpcRemoved && editorEndpointReleased;
+	const ownedTimersReleased = (latestResourceMetrics?.toolTimers.activeTimers ?? 0) === 0;
+	const complete = cleanupFailures.length === 0
+		&& profileLockReleased
+		&& cleanupLeaseReleased
+		&& localIpcRemoved
+		&& editorEndpointReleased
+		&& runtimeRemoved
+		&& ownedProcessesReleased
+		&& ownedSocketsReleased
+		&& ownedTimersReleased
+		&& sentinelUnchanged
+		&& !sentinelInvoked;
+	evidence.resources.vscode.ownedPeak = ownedPeaks.vscode;
+	evidence.resources.agentHost.ownedPeak = ownedPeaks.agentHost;
+	evidence.resources.tunnel.ownedPeak = ownedPeaks.tunnel;
+	evidence.resources.socket.ownedPeak = localIpcEndpoint === undefined
+		? 0
+		: 1 + (evidence.completion.source === 'editor' ? 1 : 0);
+	evidence.resources.timer.ownedPeak = latestResourceMetrics?.toolTimers.timersCreated ?? 0;
+	evidence.resources.vscode.finalOwned = finalOwned?.filter(isVscodeProcess).length ?? 1;
+	evidence.resources.agentHost.finalOwned = finalOwned?.filter(isAgentHostProcess).length ?? 1;
+	evidence.resources.tunnel.finalOwned = finalOwned?.filter(isDevTunnelProcess).length ?? 1;
+	evidence.resources.socket.finalOwned = Number(!localIpcRemoved) + Number(!editorEndpointReleased);
+	evidence.resources.timer.finalOwned = latestResourceMetrics?.toolTimers.activeTimers ?? 0;
+	evidence.cleanup = {
+		status: complete ? 'pass' : 'fail',
+		profileLockReleased,
+		workspaceLeaseReleased: cleanupLeaseReleased,
+		localIpcRemoved,
+		editorEndpointReleased,
+		runtimeRemoved,
+		ownedProcessesReleased,
+		ownedSocketsReleased,
+		ownedTimersReleased,
+		complete,
+	};
+	setAc5(11, complete ? 'pass' : 'fail', complete ? ['#/cleanup'] : []);
+	setAc5(12, complete ? 'pass' : 'fail', complete ? ['#/resources'] : []);
+	return cleanupFailures;
+}
+
+async function cleanupAfterSignal(signal) {
+	const exitCode = signal === 'SIGINT' ? 130 : 143;
+	let cleanupFailures = [];
+	try {
+		cleanupFailures = await performCleanup();
+	} catch {
+		cleanupFailures = [{ phase: 'signal-primary-cleanup', error: new Error('Primary signal cleanup failed.') }];
+	}
+	try {
+		if (cleanupFailures.length > 0) {
+			await runPeerDelegationCleanupPhases([
+			{ name: 'signal-owned-processes', run: terminateOwnedProcesses },
+			{
+				name: 'signal-verify-processes',
+				run: () => waitForNoOwnedProcesses(5_000),
+			},
+			{
+				name: 'signal-profile-lock',
+				run: async () => {
+					if (profileLockOwned) {
+						await releaseProfileLock();
+					}
+				},
+			},
+			{
+				name: 'signal-run-root',
+				run: () => rm(runRoot, { recursive: true, force: true }),
+			},
+			{
+				name: 'signal-verify-run-root',
+				run: async () => {
+					if (!await isAbsent(runRoot)) {
+						throw new Error('The exact signal-cleanup run root remains.');
+					}
+				},
+			},
+			]);
 		}
+	} finally {
+		process.exit(exitCode);
 	}
 }
 

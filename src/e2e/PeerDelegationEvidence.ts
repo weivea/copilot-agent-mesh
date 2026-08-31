@@ -227,6 +227,11 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 		code: stableCode,
 		message: z.string().min(1).max(512),
 	}).optional(),
+	cleanupFailures: z.array(z.strictObject({
+		phase: z.string().regex(/^[a-z][a-z0-9-]{0,63}$/u),
+		code: stableCode,
+		message: z.string().min(1).max(512),
+	})).max(16).optional(),
 	failure: z.strictObject({
 		code: stableCode,
 		message: z.string().min(1).max(512),
@@ -265,6 +270,16 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 			path: ['outcome'],
 			message: `Outcome must be ${expectedOutcome} for the recorded statuses.`,
 		});
+	}
+	if (
+		(evidence.cleanupFailures?.length ?? 0) > 0
+		&& evidence.cleanup.status !== 'fail'
+	) {
+		addInvariantIssue(
+			context,
+			['cleanup'],
+			'Recorded cleanup failures require failed cleanup status.',
+		);
 	}
 	validateAc5Correspondence(evidence, context);
 	if (
@@ -653,9 +668,10 @@ function deriveOutcome(evidence: {
 	readonly transport: { readonly status: 'pass' | 'fail' | 'unverified' };
 	readonly cleanup: { readonly status: 'pass' | 'fail' | 'unverified' };
 	readonly resources: Readonly<Record<string, { readonly finalOwned: number }>>;
+	readonly cleanupFailures?: readonly unknown[];
 	readonly failure?: unknown;
 }): 'pass' | 'fail' | 'unverified' {
-	if (evidence.failure !== undefined) {
+	if (evidence.failure !== undefined || (evidence.cleanupFailures?.length ?? 0) > 0) {
 		return 'fail';
 	}
 	const required = [

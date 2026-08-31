@@ -111,6 +111,17 @@ test('peer-delegation passing evidence requires all real AC-5 conditions', () =>
 		}),
 		/Outcome must be fail|every harness-owned resource/u,
 	);
+	assert.throws(
+		() => parsePeerDelegationEvidence({
+			...evidence,
+			cleanupFailures: [{
+				phase: 'process-table',
+				code: 'PEER_E2E_FAILED',
+				message: 'Process observation failed.',
+			}],
+		}),
+		/Outcome must be fail|require failed cleanup status/u,
+	);
 });
 
 test('peer-delegation recorder stores identities and hashes without prompt or output text', () => {

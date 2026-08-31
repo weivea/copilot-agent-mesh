@@ -29,6 +29,9 @@ live schema-v2 `editor` Unix-socket endpoint at AHP `1.0.0`. Each delegated task
 uses its own `net.connect` + authenticated WebSocket Upgrade + AHP client. Discovery,
 connection, initialize, or protocol failure falls back to the existing standalone
 launcher exactly once and exposes `standalone` plus a bounded degradation reason.
+Fallback is forbidden when cleanup of the failed editor attempt is unconfirmed;
+starting standalone in that state could overlap resources or execution. Selector
+disposal retains failed cleanup for an explicit retry.
 With Peer Delegation disabled, the historical standalone behavior is unchanged.
 
 Source fallback sits below one runtime approval boundary. An exact local

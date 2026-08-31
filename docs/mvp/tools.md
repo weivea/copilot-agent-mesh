@@ -180,6 +180,11 @@ not snapshot polling loops. `mesh_get_task` remains available for abnormal Tool
 host interruption and explicit tracking of another task, but normal delegation
 does not poll it.
 
+Terminal notifications received during start reconciliation are buffered until
+the persisted idempotency mapping is validated. A conflicting retry therefore
+returns `IDEMPOTENCY_CONFLICT`; it cannot reuse the prior task's fast completed
+event as a success-shaped result.
+
 ## Facade integration
 
 `TaskToolFacade` is the production seam for the future `TaskCoordinator` and

@@ -448,6 +448,47 @@ test('source selector reports standalone failure explicitly and does not fallbac
 	await selector.dispose();
 });
 
+test('source selector does not fallback while editor cleanup remains failed', async () => {
+	const editor = new FakeRuntime();
+	const standalone = new FakeRuntime();
+	editor.startError = new AgentRuntimeError(
+		'AGENT_UNAVAILABLE',
+		'editor cleanup failed',
+		false,
+		undefined,
+		true,
+	);
+	const selector = new AgentHostSourceSelector(selectorOptions({
+		preferEditor: () => true,
+		editor,
+		standalone,
+	}));
+
+	await assert.rejects(
+		selector.start(taskRequest()),
+		(error: unknown) => error instanceof AgentRuntimeError
+			&& error.cleanupFailed,
+	);
+	assert.equal(standalone.starts, 0);
+	await selector.dispose();
+});
+
+test('source selector retries failed runtime disposal', async () => {
+	const editor = new FakeRuntime();
+	const standalone = new FakeRuntime();
+	editor.disposeErrors.push(new Error('first cleanup failed'));
+	const selector = new AgentHostSourceSelector(selectorOptions({
+		preferEditor: () => true,
+		editor,
+		standalone,
+	}));
+
+	await assert.rejects(selector.dispose(), { code: 'AGENT_UNAVAILABLE' });
+	await selector.dispose();
+	assert.equal(editor.disposals, 2);
+	assert.equal(standalone.disposals, 2);
+});
+
 test('source selector preserves the safe standalone fallback failure category', async () => {
 	const editor = new FakeRuntime();
 	const standalone = new FakeRuntime();
@@ -692,6 +733,7 @@ class FakeRuntime implements AgentRuntime {
 	probes = 0;
 	disposals = 0;
 	startError: unknown;
+	readonly disposeErrors: unknown[] = [];
 	probeResult: AgentRuntimeProbe = { available: true, featureEnabled: true };
 
 	public async probe(): Promise<AgentRuntimeProbe> {
@@ -723,6 +765,10 @@ class FakeRuntime implements AgentRuntime {
 
 	public async dispose(): Promise<void> {
 		this.disposals += 1;
+		const error = this.disposeErrors.shift();
+		if (error !== undefined) {
+			throw error;
+		}
 	}
 }
 

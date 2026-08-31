@@ -53,6 +53,10 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
   cleanup. The disposable profile degraded to standalone and stopped at
   `AGENT_AUTH_REQUIRED`; UI/editor completion and the remaining items stay
   Unverified rather than being converted to Pass.
+- Hardened final-stack lifecycle edges: an editor attempt with failed cleanup no
+  longer starts a concurrent standalone fallback, selector disposal can retry,
+  and a fast historical terminal notification cannot mask a retry's
+  `IDEMPOTENCY_CONFLICT`.
 - Bumped the Preview extension and VSIX artifact to `0.4.0` while retaining AHP
   commit `f19dd8b3942d029744a3bdd31d830f9428e8ea47`, TypeScript client `0.9.0`,
   and protocol offer `1.0.0`.
