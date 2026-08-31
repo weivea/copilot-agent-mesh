@@ -309,147 +309,16 @@ try {
 	};
 	setAc5(4, 'pass', ['#/doubleGate']);
 
-	const completionStarted = Date.now();
-	const completionRun = manualUi
-		? await waitForManualCompletion(source, targetInputBase)
-		: await runProgrammaticCoreCompletion(source, targetInputBase);
-	const completionResult = completionRun.result;
-	assert.equal(completionResult.s, 0, 'The real completion did not return compact completed status.');
-	const completionTaskId = requiredUuid(completionResult.t, 'completion taskId');
-	const parentResultFields = completionRun.parentResultObservation?.resultFields
-		?? Object.keys(completionResult).sort();
-	const serializedParentResult = JSON.stringify(completionResult);
-	const parentResultBytes = completionRun.parentResultObservation?.resultBytes
-		?? Buffer.byteLength(serializedParentResult, 'utf8');
-	const parentResultHash = completionRun.parentResultObservation?.resultHash?.slice(0, 16)
-		?? shortHash('parent-result', serializedParentResult);
-	const parentResultValid = parentResultFields.join(',') === 'd,r,s,t'
-		&& parentResultBytes > 0
-		&& parentResultHash.length === 16;
-	const completionTask = await request(source, 'peer.task.evidence', {
-		taskId: completionTaskId,
-	});
-	const completionObservations = await request(target, 'peer.observations');
-	const turnCompleteObserved = completionObservations.ahp.some(
-		(observation) =>
-			observation.taskId === completionTaskId
-			&& observation.eventType === 'chat/turnComplete',
-	);
-	const authoritativeOrder = ordered(
-		completionTask.eventTypes,
-		['agentStarted', 'output', 'completed'],
-	);
-	const incoming = await waitForDashboard(
+	const completionAvailable = await recordCompletionScenario({
+		source,
 		target,
-		(snapshot) => snapshot.incomingTasks?.some(
-			(task) => task.shortId === completionTaskId.slice(0, 8),
-		),
-		5_000,
-		'the target Incoming Task record was absent',
-	);
-	const incomingRecord = incoming.incomingTasks.some(
-		(task) => task.shortId === completionTaskId.slice(0, 8),
-	);
-	const runtimeStatus = await request(target, 'peer.runtime.status', {}, 60_000);
-	const sourceKind = runtimeStatus.status?.source === 'editor'
-		? 'editor'
-		: runtimeStatus.status?.source === 'standalone'
-			? 'standalone'
-			: 'unavailable';
-	const degraded = runtimeStatus.status?.degraded === true;
-	const completionPass = authoritativeOrder
-		&& turnCompleteObserved
-		&& parentResultValid
-		&& completionTask.outputCount > 0
-		&& completionTask.outputBytes > 0
-		&& typeof completionTask.outputHash === 'string'
-		&& incomingRecord
-		&& completionTask.leaseReleased
-		&& sourceKind === 'editor'
-		&& !degraded;
-	evidence.confirmation = completionRun.confirmation;
-	evidence.completion = {
-		status: completionPass ? 'pass' : 'unverified',
-		taskId: completionTaskId,
-		parentResultTaskId: completionTaskId,
-		parentSameInvocation: true,
-		parentResultFields,
-		parentResultBytes,
-		parentResultHash,
-		invocationSource: completionRun.invocationSource,
-		compactStatus: completionResult.s,
-		eventTypes: completionTask.eventTypes,
-		eventSequences: completionTask.eventSequences,
-		authoritativeOrder,
-		ahpTurnCompleteObserved: turnCompleteObserved,
-		output: {
-			count: completionTask.outputCount,
-			bytes: completionTask.outputBytes,
-			...(completionTask.outputHash === undefined ? {} : { hash: completionTask.outputHash }),
-		},
-		incomingRecord,
-		source: sourceKind,
-		degraded,
-		leaseReleased: completionTask.leaseReleased,
-		durationMs: Date.now() - completionStarted,
-	};
-	evidence.experiments[1] = {
-		id: 'O2',
-		status: 'unverified',
-		conclusion: 'shorter-duration-only',
-		observedDurationMs: evidence.completion.durationMs,
-	};
-	setAc5(
-		5,
-		evidence.confirmation.status,
-		evidence.confirmation.status === 'pass' ? ['#/confirmation'] : [],
-	);
-	setAc5(6, completionPass ? 'pass' : 'unverified', completionPass
-		? ['#/completion/eventTypes', '#/completion/ahpTurnCompleteObserved']
-		: []);
-	const parentChatResultVerified = parentResultValid
-		&& completionRun.invocationSource === 'copilot-ui';
-	setAc5(7, parentChatResultVerified ? 'pass' : 'unverified', parentChatResultVerified
-		? ['#/completion/parentSameInvocation', '#/completion/parentResultTaskId']
-		: []);
-	setAc5(8, incomingRecord ? 'pass' : 'fail', incomingRecord ? ['#/completion/incomingRecord'] : []);
-	setAc5(9, sourceKind === 'editor' && !degraded ? 'pass' : 'unverified',
-		sourceKind === 'editor' && !degraded ? ['#/completion/source'] : []);
-
-	const catalogAfter = await request(target, 'peer.session.catalog', {}, 60_000);
-	const sessionHashMatched = catalogAfter.available === true
-		&& typeof completionTask.recoverySessionHash === 'string'
-		&& catalogAfter.sessionHashes.includes(completionTask.recoverySessionHash);
-	const uiObserved = completionRun.uiAttestation?.targetSessionVisible === true;
-	evidence.sessionVisibility = {
-		status: sourceKind === 'editor' && sessionHashMatched && uiObserved
-			? 'pass'
-			: 'unverified',
-		source: sourceKind,
-		catalogBefore: catalogBeforeCount,
-		catalogAfter: catalogAfter.available ? catalogAfter.sessionCount : 0,
-		sessionHashMatched,
-		uiObserved,
-	};
-	evidence.experiments[0] = {
-		id: 'O1',
-		status: evidence.sessionVisibility.status,
-		conclusion: evidence.sessionVisibility.status === 'pass'
-			? 'editor-session-visible'
-			: 'unverified',
-	};
-	if (evidence.sessionVisibility.status === 'pass') {
-		removeLimitation('TARGET_CHAT_SESSIONS_UI_UNVERIFIED');
-	}
-
-	await runNeedsInputScenario(source, targetInputBase);
-	await runCancellationScenario(source, targetInputBase);
-	await runTimeoutScenario(source, targetInputBase);
-	if (!manualUi) {
-		evidence.blocker = {
-			code: 'COPILOT_UI_REQUIRED',
-			message: 'A visible Copilot Agent-mode Tool invocation and one user confirmation are required.',
-		};
+		targetInputBase,
+		catalogBeforeCount,
+	});
+	if (completionAvailable) {
+		await runNeedsInputScenario(source, targetInputBase);
+		await runCancellationScenario(source, targetInputBase);
+		await runTimeoutScenario(source, targetInputBase);
 	}
 
 	latestResourceMetrics = await request(source, 'peer.resources');
@@ -486,12 +355,14 @@ try {
 		localRouteOnly: transportPass,
 	};
 	setAc5(10, transportPass ? 'pass' : 'fail', transportPass ? ['#/transport'] : []);
-	cleanupLeaseReleased = [
-		evidence.completion.leaseReleased,
-		evidence.needsInput.leaseReleased,
-		evidence.cancellation.leaseReleased,
-		evidence.timeout.leaseReleased,
-	].every(Boolean);
+	cleanupLeaseReleased = completionAvailable
+		? [
+			evidence.completion.leaseReleased,
+			evidence.needsInput.leaseReleased,
+			evidence.cancellation.leaseReleased,
+			evidence.timeout.leaseReleased,
+		].every(Boolean)
+		: evidence.completion.leaseReleased;
 	assert.equal(latestResourceMetrics.toolTimers.activeTimers, 0);
 	assert.equal(latestResourceMetrics.toolTimers.armedBudgetTimers, 0);
 	await assertProjectUnchanged(sourceWorkspacePath);
@@ -919,6 +790,166 @@ async function waitForDashboard(controller, predicate, timeoutMs, message) {
 		await delay(50);
 	} while (Date.now() < deadline);
 	throw new Error(`${message}; last dashboard was unavailable or did not match.`);
+}
+
+async function recordCompletionScenario({
+	source,
+	target,
+	targetInputBase,
+	catalogBeforeCount,
+}) {
+	const completionStarted = Date.now();
+	const completionRun = manualUi
+		? await waitForManualCompletion(source, targetInputBase)
+		: await runProgrammaticCoreCompletion(source, targetInputBase);
+	const completionResult = completionRun.result;
+	const completionTaskId = requiredUuid(completionResult.t, 'completion taskId');
+	const parentResultFields = completionRun.parentResultObservation?.resultFields
+		?? Object.keys(completionResult).sort();
+	const serializedParentResult = JSON.stringify(completionResult);
+	const parentResultBytes = completionRun.parentResultObservation?.resultBytes
+		?? Buffer.byteLength(serializedParentResult, 'utf8');
+	const parentResultHash = completionRun.parentResultObservation?.resultHash?.slice(0, 16)
+		?? shortHash('parent-result', serializedParentResult);
+	const parentResultValid = parentResultFields.join(',') === 'd,r,s,t'
+		&& parentResultBytes > 0
+		&& parentResultHash.length === 16;
+	const completionTask = await request(source, 'peer.task.evidence', {
+		taskId: completionTaskId,
+	});
+	const completionObservations = await request(target, 'peer.observations');
+	const turnCompleteObserved = completionObservations.ahp.some(
+		(observation) =>
+			observation.taskId === completionTaskId
+			&& observation.eventType === 'chat/turnComplete',
+	);
+	const authoritativeOrder = ordered(
+		completionTask.eventTypes,
+		['agentStarted', 'output', 'completed'],
+	);
+	const incoming = await request(target, 'peer.dashboard.snapshot');
+	const incomingRecord = incoming.incomingTasks?.some(
+		(task) => task.shortId === completionTaskId.slice(0, 8),
+	) === true;
+	const runtimeStatus = await request(target, 'peer.runtime.status', {}, 60_000);
+	const sourceKind = runtimeStatus.status?.source === 'editor'
+		? 'editor'
+		: runtimeStatus.status?.source === 'standalone'
+			? 'standalone'
+			: 'unavailable';
+	const degraded = runtimeStatus.status?.degraded === true;
+	const completed = completionResult.s === 0;
+	const completionPass = completed
+		&& authoritativeOrder
+		&& turnCompleteObserved
+		&& parentResultValid
+		&& completionTask.outputCount > 0
+		&& completionTask.outputBytes > 0
+		&& typeof completionTask.outputHash === 'string'
+		&& incomingRecord
+		&& completionTask.leaseReleased
+		&& sourceKind === 'editor'
+		&& !degraded;
+	evidence.confirmation = completionRun.confirmation;
+	evidence.completion = {
+		status: completionPass ? 'pass' : 'unverified',
+		taskId: completionTaskId,
+		parentResultTaskId: completionTaskId,
+		parentSameInvocation: true,
+		parentResultFields,
+		parentResultBytes,
+		parentResultHash,
+		invocationSource: completionRun.invocationSource,
+		...(Number.isSafeInteger(completionResult.s)
+			? { compactStatus: completionResult.s }
+			: {}),
+		eventTypes: completionTask.eventTypes,
+		eventSequences: completionTask.eventSequences,
+		authoritativeOrder,
+		ahpTurnCompleteObserved: turnCompleteObserved,
+		output: {
+			count: completionTask.outputCount,
+			bytes: completionTask.outputBytes,
+			...(completionTask.outputHash === undefined ? {} : { hash: completionTask.outputHash }),
+		},
+		incomingRecord,
+		source: sourceKind,
+		degraded,
+		leaseReleased: completionTask.leaseReleased,
+		durationMs: Date.now() - completionStarted,
+	};
+	evidence.experiments[1] = {
+		id: 'O2',
+		status: 'unverified',
+		conclusion: 'shorter-duration-only',
+		observedDurationMs: evidence.completion.durationMs,
+	};
+	setAc5(
+		5,
+		evidence.confirmation.status,
+		evidence.confirmation.status === 'pass' ? ['#/confirmation'] : [],
+	);
+	setAc5(6, completionPass ? 'pass' : 'unverified', completionPass
+		? ['#/completion/eventTypes', '#/completion/ahpTurnCompleteObserved']
+		: []);
+	const parentChatResultVerified = parentResultValid
+		&& completionRun.invocationSource === 'copilot-ui';
+	setAc5(7, parentChatResultVerified ? 'pass' : 'unverified', parentChatResultVerified
+		? ['#/completion/parentSameInvocation', '#/completion/parentResultTaskId']
+		: []);
+	setAc5(
+		8,
+		incomingRecord ? 'pass' : 'unverified',
+		incomingRecord ? ['#/completion/incomingRecord'] : [],
+	);
+	setAc5(9, sourceKind === 'editor' && !degraded ? 'pass' : 'unverified',
+		sourceKind === 'editor' && !degraded ? ['#/completion/source'] : []);
+
+	const catalogAfter = await request(target, 'peer.session.catalog', {}, 60_000);
+	const sessionHashMatched = catalogAfter.available === true
+		&& typeof completionTask.recoverySessionHash === 'string'
+		&& catalogAfter.sessionHashes.includes(completionTask.recoverySessionHash);
+	const uiObserved = completionRun.uiAttestation?.targetSessionVisible === true;
+	evidence.sessionVisibility = {
+		status: sourceKind === 'editor' && sessionHashMatched && uiObserved
+			? 'pass'
+			: 'unverified',
+		source: sourceKind,
+		catalogBefore: catalogBeforeCount,
+		catalogAfter: catalogAfter.available ? catalogAfter.sessionCount : 0,
+		sessionHashMatched,
+		uiObserved,
+	};
+	evidence.experiments[0] = {
+		id: 'O1',
+		status: evidence.sessionVisibility.status,
+		conclusion: evidence.sessionVisibility.status === 'pass'
+			? 'editor-session-visible'
+			: 'unverified',
+	};
+	if (evidence.sessionVisibility.status === 'pass') {
+		removeLimitation('TARGET_CHAT_SESSIONS_UI_UNVERIFIED');
+	}
+	if (!completed) {
+		const code = typeof completionResult.e === 'string'
+			&& /^[A-Z][A-Z0-9_]{0,127}$/u.test(completionResult.e)
+			? completionResult.e
+			: 'REAL_AGENT_COMPLETION_REQUIRED';
+		evidence.blocker = {
+			code,
+			message: code === 'AGENT_AUTH_REQUIRED'
+				? 'The fresh real E2E profile has no usable Copilot authentication session.'
+				: 'The real Agent task did not reach authoritative completion.',
+		};
+		return false;
+	}
+	if (!manualUi) {
+		evidence.blocker = {
+			code: 'COPILOT_UI_REQUIRED',
+			message: 'A visible Copilot Agent-mode Tool invocation and one user confirmation are required.',
+		};
+	}
+	return true;
 }
 
 async function runProgrammaticCoreCompletion(source, targetInputBase) {
