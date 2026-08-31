@@ -26,6 +26,7 @@ import {
 } from './UnixSocketWebSocketConnector';
 
 const borrowedEditorEndpoint = new URL('ws://editor-agent-host.invalid/');
+const defaultEditorConnectionRetryDelaysMs = [3_000, 4_000] as const;
 
 export interface AgentHostSourceSelectorOptions {
 	readonly preferEditor: () => boolean;
@@ -34,6 +35,8 @@ export interface AgentHostSourceSelectorOptions {
 	readonly confirmation: FirstTaskConfirmation;
 	readonly workspaceResolver: WorkspaceResolver;
 	readonly approvalCapabilities: AgentRuntimeApprovalCapabilityIssuer;
+	readonly editorConnectionRetryDelaysMs?: readonly number[];
+	readonly waitForEditorRetry?: (delayMs: number, signal: AbortSignal) => Promise<void>;
 }
 
 export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceStatusProvider {
@@ -47,8 +50,22 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 	}>();
 	private disposed = false;
 	private disposal: Promise<void> | undefined;
+	private readonly editorConnectionRetryDelaysMs: readonly number[];
+	private readonly waitForEditorRetry: (delayMs: number, signal: AbortSignal) => Promise<void>;
 
-	public constructor(private readonly options: AgentHostSourceSelectorOptions) {}
+	public constructor(private readonly options: AgentHostSourceSelectorOptions) {
+		this.editorConnectionRetryDelaysMs = options.editorConnectionRetryDelaysMs
+			?? defaultEditorConnectionRetryDelaysMs;
+		if (
+			this.editorConnectionRetryDelaysMs.length > 4
+			|| this.editorConnectionRetryDelaysMs.some(
+				(delayMs) => !Number.isSafeInteger(delayMs) || delayMs < 0 || delayMs > 10_000,
+			)
+		) {
+			throw new RangeError('Editor connection retry delays are invalid.');
+		}
+		this.waitForEditorRetry = options.waitForEditorRetry ?? waitForEditorRetry;
+	}
 
 	public async probe(): Promise<AgentRuntimeProbe> {
 		this.assertActive();
@@ -111,13 +128,16 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 		const approvedRequest = await this.approve(request, signal);
 		try {
 			throwIfSelectorAborted(signal);
-			return await this.startApproved(approvedRequest);
+			return await this.startApproved(approvedRequest, signal);
 		} finally {
 			this.options.approvalCapabilities.revoke(approvedRequest.approvalCapability);
 		}
 	}
 
-	private async startApproved(request: AgentTaskRequest): Promise<AgentTaskHandle> {
+	private async startApproved(
+		request: AgentTaskRequest,
+		signal: AbortSignal,
+	): Promise<AgentTaskHandle> {
 		if (!this.options.preferEditor()) {
 			const handle = await this.options.standalone.start(request);
 			this.sourceSelected = true;
@@ -127,7 +147,7 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 
 		let editorFailure: AgentHostSourceFailure | undefined;
 		await this.editorProbeOperation?.catch(() => undefined);
-		for (let attempt = 0; attempt < 2; attempt += 1) {
+		for (let attempt = 0; attempt <= this.editorConnectionRetryDelaysMs.length; attempt += 1) {
 			try {
 				const handle = await this.options.editor.start(request);
 				this.assertActive();
@@ -142,7 +162,14 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 					this.setStatus(editorFailureStatus(editorFailure));
 					throw error;
 				}
-				if (editorFailure.stage === 'connection' && attempt === 0) {
+				if (
+					editorFailure.stage === 'connection'
+					&& attempt < this.editorConnectionRetryDelaysMs.length
+				) {
+					await this.waitForEditorRetry(
+						this.editorConnectionRetryDelaysMs[attempt]!,
+						signal,
+					);
 					continue;
 				}
 				break;
@@ -501,6 +528,22 @@ function throwIfSelectorAborted(signal: AbortSignal): void {
 			'The Agent Host source selection was cancelled during shutdown.',
 		);
 	}
+}
+
+function waitForEditorRetry(delayMs: number, signal: AbortSignal): Promise<void> {
+	throwIfSelectorAborted(signal);
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(() => {
+			signal.removeEventListener('abort', abort);
+			resolve();
+		}, delayMs);
+		const abort = () => {
+			clearTimeout(timer);
+			signal.removeEventListener('abort', abort);
+			reject(new DOMException('Agent Host source selection was cancelled.', 'AbortError'));
+		};
+		signal.addEventListener('abort', abort, { once: true });
+	});
 }
 
 function abortableSelectorOperation<T>(

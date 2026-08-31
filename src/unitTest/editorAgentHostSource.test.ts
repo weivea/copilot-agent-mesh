@@ -915,5 +915,7 @@ function selectorOptions(options: {
 			}),
 		},
 		approvalCapabilities: new AgentRuntimeApprovalCapabilityIssuer(),
+		editorConnectionRetryDelaysMs: [0, 0],
+		waitForEditorRetry: async () => undefined,
 	};
 }
