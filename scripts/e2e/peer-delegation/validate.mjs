@@ -18,7 +18,7 @@ const requirePass = process.argv.includes('--require-pass');
 const require = createRequire(import.meta.url);
 const {
 	assertPassingPeerDelegationEvidence,
-	parsePeerDelegationEvidence,
+	parsePeerDelegationEvidenceArtifact,
 } = require(resolve(repositoryRoot, 'out/src/e2e/PeerDelegationEvidence.js'));
 
 const serialized = await readFile(evidencePath, 'utf8');
@@ -28,7 +28,7 @@ if (Buffer.byteLength(serialized, 'utf8') > 1024 * 1024) {
 const value = JSON.parse(serialized);
 const evidence = requirePass
 	? assertPassingPeerDelegationEvidence(value)
-	: parsePeerDelegationEvidence(value);
+	: parsePeerDelegationEvidenceArtifact(value);
 const head = git(['rev-parse', 'HEAD']);
 const status = git(['status', '--porcelain=v1', '--untracked-files=all']);
 if (status.length !== 0) {
@@ -40,9 +40,12 @@ if (evidence.gitCommit !== head) {
 console.log(JSON.stringify({
 	valid: true,
 	passing: evidence.outcome === 'pass',
+	kind: evidence.kind ?? 'evidence',
 	runId: evidence.runId,
 	outcome: evidence.outcome,
-	ac5PassCount: evidence.ac5.filter(({ status }) => status === 'pass').length,
+	ac5PassCount: 'ac5' in evidence
+		? evidence.ac5.filter(({ status }) => status === 'pass').length
+		: 0,
 }));
 
 function git(args) {

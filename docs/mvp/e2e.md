@@ -75,6 +75,23 @@ log/sentinel diagnostics, profile-lock release, and exact run-root removal canno
 short-circuit one another. SIGINT/SIGTERM uses the same idempotent cleanup and
 never performs a name-based or global process kill.
 
+For a persistent profile, its User Data and extension global-storage paths are
+observation-only and never appear in process ownership markers. A lock loser or
+idle-check failure before child launch makes zero termination attempts and cannot
+kill the winner/foreign profile user. Subprocess tests exercise both conflicts
+with a live foreign sentinel.
+
+The E2E-only standalone Agent Host stores its owned instance below the unique
+per-run control directory, which puts a run marker in the detached process
+arguments. Cleanup therefore continues to recognize an immediately reparented
+Host without retaining historical PIDs or matching the shared profile.
+
+Before validating the complete evidence schema, the harness atomically writes a
+separately validated minimal diagnostic envelope. If full schema or safety
+validation fails, the diagnostic remains at the stable evidence path with the
+original stable error code and `outcome: fail`. Active Broker task states are
+normalized to `not-observed` rather than copied into terminal-only fields.
+
 O1 is Pass only when the task Session hash appears in the editor `listSessions`
 catalog and the target UI is visibly observed. O2 is Pass only after a genuine
 60-minute Copilot Tool call; shorter runs are recorded as shorter-duration-only.

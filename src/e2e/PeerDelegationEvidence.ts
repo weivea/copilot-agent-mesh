@@ -9,6 +9,14 @@ const fingerprint = z.string().regex(/^[a-f0-9]{16}$/u);
 const sha256 = z.string().regex(/^[a-f0-9]{64}$/u);
 const stableCode = z.string().regex(/^[A-Z][A-Z0-9_]{0,127}$/u);
 const evidenceReference = z.string().regex(/^#(?:\/(?:[A-Za-z0-9_-]|~[01])+)+$/u);
+const terminalStateValues = [
+	'completed',
+	'failed',
+	'cancelled',
+	'timedOut',
+	'not-observed',
+] as const;
+const terminalState = z.enum(terminalStateValues);
 
 const statusCount = z.strictObject({
 	status,
@@ -126,7 +134,7 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 		answerTaskIdMatched: z.boolean(),
 		answerInputIdMatched: z.boolean(),
 		resumed: z.boolean(),
-		terminalState: z.enum(['completed', 'failed', 'cancelled', 'timedOut', 'not-observed']),
+		terminalState,
 		leaseReleased: z.boolean(),
 	}),
 	cancellation: z.strictObject({
@@ -135,7 +143,7 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 		compactStatus: z.number().int().min(0).max(3).optional(),
 		reason: z.enum(['token', 'budget', 'peer', 'not-observed']),
 		eventTypes: z.array(z.string().min(1).max(64)).max(256),
-		terminalState: z.enum(['cancelled', 'failed', 'completed', 'timedOut', 'not-observed']),
+		terminalState,
 		leaseReleased: z.boolean(),
 	}),
 	timeout: z.strictObject({
@@ -147,7 +155,7 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 		productionDefaultMinutes: z.literal(60),
 		productionMaximumMinutes: z.literal(60),
 		eventTypes: z.array(z.string().min(1).max(64)).max(256),
-		terminalState: z.enum(['cancelled', 'failed', 'completed', 'timedOut', 'not-observed']),
+		terminalState,
 		leaseReleased: z.boolean(),
 	}),
 	sessionVisibility: z.strictObject({
@@ -404,10 +412,82 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 });
 
 export type PeerDelegationEvidence = z.infer<typeof peerDelegationEvidenceSchema>;
+export type PeerDelegationEvidenceTerminalState = typeof terminalStateValues[number];
+
+export const peerDelegationDiagnosticEvidenceSchema = z.strictObject({
+	schemaVersion: z.literal(1),
+	kind: z.literal('diagnostic'),
+	release: z.literal('0.4.0-preview'),
+	runId: uuid,
+	outcome: z.literal('fail'),
+	gitCommit: z.string().regex(/^[a-f0-9]{40}$/u),
+	startedAt: timestamp,
+	finishedAt: timestamp,
+	durationMs: nonNegativeInteger,
+	failure: z.strictObject({
+		code: stableCode,
+		message: z.string().min(1).max(512),
+	}),
+	validation: z.strictObject({
+		code: z.literal('EVIDENCE_VALIDATION_FAILED'),
+	}),
+});
+export type PeerDelegationDiagnosticEvidence = z.infer<
+	typeof peerDelegationDiagnosticEvidenceSchema
+>;
+export type PeerDelegationEvidenceArtifact =
+	| PeerDelegationEvidence
+	| PeerDelegationDiagnosticEvidence;
+
+export function normalizePeerDelegationEvidenceTerminalState(
+	status: unknown,
+): PeerDelegationEvidenceTerminalState {
+	return terminalStateValues.includes(status as PeerDelegationEvidenceTerminalState)
+		? status as PeerDelegationEvidenceTerminalState
+		: 'not-observed';
+}
 
 export function parsePeerDelegationEvidence(value: unknown): PeerDelegationEvidence {
 	assertEvidenceContentSafe(value);
 	return peerDelegationEvidenceSchema.parse(value);
+}
+
+export function parsePeerDelegationEvidenceArtifact(
+	value: unknown,
+): PeerDelegationEvidenceArtifact {
+	assertEvidenceContentSafe(value);
+	const evidence = peerDelegationEvidenceSchema.safeParse(value);
+	return evidence.success
+		? evidence.data
+		: peerDelegationDiagnosticEvidenceSchema.parse(value);
+}
+
+export function createPeerDelegationDiagnosticEvidence(input: {
+	readonly runId: string;
+	readonly gitCommit: string;
+	readonly startedAt: string;
+	readonly finishedAt: string;
+	readonly durationMs: number;
+	readonly failureCode: string;
+}): PeerDelegationDiagnosticEvidence {
+	return peerDelegationDiagnosticEvidenceSchema.parse({
+		schemaVersion: 1,
+		kind: 'diagnostic',
+		release: '0.4.0-preview',
+		runId: input.runId,
+		outcome: 'fail',
+		gitCommit: input.gitCommit,
+		startedAt: input.startedAt,
+		finishedAt: input.finishedAt,
+		durationMs: input.durationMs,
+		failure: {
+			code: input.failureCode,
+			message: 'Strict peer-delegation evidence validation failed; unsafe details were discarded.',
+		},
+		validation: {
+			code: 'EVIDENCE_VALIDATION_FAILED',
+		},
+	});
 }
 
 export function assertPassingPeerDelegationEvidence(value: unknown): PeerDelegationEvidence {

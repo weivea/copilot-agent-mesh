@@ -57,6 +57,12 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
   longer starts a concurrent standalone fallback, selector disposal can retry,
   and a fast historical terminal notification cannot mask a retry's
   `IDEMPOTENCY_CONFLICT`.
+- Hardened P8 evidence failure handling and persistent-profile ownership:
+  nonterminal Broker states normalize to `not-observed`, strict schema/safety
+  failures retain a separately validated diagnostic artifact, and shared
+  persistent User Data/global-storage paths never confer process kill ownership.
+  Lock/idle conflicts leave foreign profile users alive and perform zero
+  termination attempts.
 - Bumped the Preview extension and VSIX artifact to `0.4.0` while retaining AHP
   commit `f19dd8b3942d029744a3bdd31d830f9428e8ea47`, TypeScript client `0.9.0`,
   and protocol offer `1.0.0`.

@@ -196,10 +196,12 @@ export function createVscodeAgentRuntime(
 	delegatedToolInvocations?: DelegatedToolInvocationRegistry,
 	approvalCapabilities = new AgentRuntimeApprovalCapabilityIssuer(),
 	lifecycleObserver?: AgentRuntimeLifecycleObserver,
+	standaloneStorageRoot?: string,
 ): AgentRuntime & AgentHostSourceStatusProvider {
 	const configuration = vscodeApi.workspace.getConfiguration(configurationSection);
 	const launcher = new AgentHostLauncher({
-		storageRoot: vscodeApi.Uri.joinPath(context.globalStorageUri, 'agent-host').fsPath,
+		storageRoot: standaloneStorageRoot
+			?? vscodeApi.Uri.joinPath(context.globalStorageUri, 'agent-host').fsPath,
 		configuredCodeCli: configuration.get<string>('codePath') || undefined,
 	});
 	const common = {

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { createWriteStream } from 'node:fs';
+import { appendFileSync, createWriteStream } from 'node:fs';
 import {
 	access,
 	chmod,
@@ -40,14 +40,18 @@ const require = createRequire(import.meta.url);
 const {
 	multiWindowWorkspaceKey,
 	parseProcessTable,
-	selectOwnedProcesses,
 } = require(join(repositoryRoot, 'out/src/e2e/MultiWindowE2eSupport.js'));
 const {
+	createPeerDelegationDiagnosticEvidence,
+	normalizePeerDelegationEvidenceTerminalState,
 	parsePeerDelegationEvidence,
 } = require(join(repositoryRoot, 'out/src/e2e/PeerDelegationEvidence.js'));
 const {
 	runPeerDelegationCleanupPhases,
 } = require(join(repositoryRoot, 'out/src/e2e/PeerDelegationCleanup.js'));
+const {
+	PeerDelegationProcessTracker,
+} = require(join(repositoryRoot, 'out/src/e2e/PeerDelegationProcessTracker.js'));
 
 class E2eRequestError extends Error {
 	constructor(action, code, message) {
@@ -58,7 +62,11 @@ class E2eRequestError extends Error {
 	}
 }
 
-if (process.platform !== 'darwin' || process.arch !== 'arm64') {
+const testMode = process.env[`${environmentPrefix}_TEST_MODE`] === '1';
+if (
+	!testMode
+	&& (process.platform !== 'darwin' || process.arch !== 'arm64')
+) {
 	throw new Error('The real peer-delegation E2E requires supported macOS arm64 Worker hardware.');
 }
 
@@ -92,26 +100,33 @@ const sourceWorkspacePath = join(workspacesDirectory, `source-${runLabel}`);
 const targetWorkspacePath = join(workspacesDirectory, `target-${runLabel}`);
 const sentinelPath = join(runRoot, 'devtunnel-sentinel');
 const sentinelInvocationPath = join(runRoot, 'devtunnel-invoked.json');
-const evidenceRoot = join(repositoryRoot, 'artifacts', 'peer-delegation-e2e');
+const configuredEvidenceRoot = process.env[`${environmentPrefix}_EVIDENCE_DIR`];
+const evidenceRoot = configuredEvidenceRoot === undefined
+	? join(repositoryRoot, 'artifacts', 'peer-delegation-e2e')
+	: resolve(configuredEvidenceRoot);
 const evidencePath = join(evidenceRoot, 'evidence.json');
 const summaryPath = join(evidenceRoot, 'summary.md');
 const attestationPath = join(evidenceRoot, `attestation-${runId}.json`);
 const manualUi = process.env[`${environmentPrefix}_MANUAL_UI`] !== '0';
+const testTerminationLogPath = testMode
+	&& process.env[`${environmentPrefix}_TEST_TERMINATION_LOG`] !== undefined
+	? resolve(process.env[`${environmentPrefix}_TEST_TERMINATION_LOG`])
+	: undefined;
 const budgetMs = parseBudgetMs(process.env[`${environmentPrefix}_BUDGET_MS`] ?? '10000');
 const nonce = randomUUID();
 const sourceWindowLabel = `P8 Source ${runLabel}`;
 const targetWindowLabel = `P8 Target ${runLabel}`;
 const ownedMarkers = [
 	runRoot,
-	userDataDirectory,
 	extensionsDirectory,
 	controlRoot,
 	sentinelPath,
 ];
-if (persistentProfile) {
-	ownedMarkers.push(meshGlobalStorageDirectory);
-}
-const rootPids = new Set();
+const processTracker = new PeerDelegationProcessTracker({
+	rootPids: new Set(),
+	markers: ownedMarkers,
+	selfPid: process.pid,
+});
 const launchRecords = [];
 const windowOpenRecords = [];
 const activeControllers = new Map();
@@ -134,6 +149,9 @@ let evidence = initialEvidence();
 let canonicalUserDataDirectory = userDataDirectory;
 let signalCleanupStarted = false;
 let cleanupOperation;
+let ownershipSampler;
+let ownershipSamplerStarted = false;
+let ownershipSamplerFailure;
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
 	process.once(signal, () => {
@@ -393,16 +411,22 @@ if (primaryFailure !== undefined || cleanupFailure !== undefined) {
 evidence.finishedAt = new Date().toISOString();
 evidence.durationMs = Date.now() - startedAtMs;
 evidence.outcome = deriveOutcome(evidence);
-await mkdir(evidenceRoot, { recursive: true });
-const validated = parsePeerDelegationEvidence(evidence);
-await writeFile(evidencePath, `${JSON.stringify(validated, null, 2)}\n`, {
-	encoding: 'utf8',
-	mode: 0o600,
-});
-await writeFile(summaryPath, renderSummary(validated), {
-	encoding: 'utf8',
-	mode: 0o600,
-});
+injectInvalidEvidenceForTest(evidence);
+const persisted = await persistEvidenceArtifact(evidence);
+const validated = persisted.artifact;
+
+if (persisted.validationError !== undefined) {
+	throw new AggregateError(
+		[
+			primaryFailure,
+			cleanupFailure,
+			persisted.validationError,
+		].filter((error) => error !== undefined),
+		`Real peer-delegation E2E evidence validation failed safely; diagnostic: ${
+			relative(repositoryRoot, evidencePath)
+		}`,
+	);
+}
 
 if (primaryFailure !== undefined || cleanupFailure !== undefined) {
 	throw new AggregateError(
@@ -410,7 +434,7 @@ if (primaryFailure !== undefined || cleanupFailure !== undefined) {
 		`Real peer-delegation E2E failed; sanitized evidence: ${relative(repositoryRoot, evidencePath)}`,
 	);
 }
-if (validated.outcome !== 'pass') {
+if (validated.kind === 'diagnostic' || validated.outcome !== 'pass') {
 	throw new Error(
 		`Real peer-delegation E2E remains unverified; sanitized evidence: ${relative(repositoryRoot, evidencePath)}`,
 	);
@@ -419,15 +443,102 @@ console.log(JSON.stringify({
 	outcome: validated.outcome,
 	evidence: relative(repositoryRoot, evidencePath),
 	summary: relative(repositoryRoot, summaryPath),
-	ac5PassCount: validated.ac5.filter(({ status }) => status === 'pass').length,
-	cleanup: validated.cleanup.status,
+	ac5PassCount: 'ac5' in validated
+		? validated.ac5.filter(({ status }) => status === 'pass').length
+		: 0,
+	cleanup: 'cleanup' in validated ? validated.cleanup.status : 'failed',
 }));
+
+async function persistEvidenceArtifact(rawEvidence) {
+	await mkdir(evidenceRoot, { recursive: true });
+	const diagnostic = createPeerDelegationDiagnosticEvidence({
+		runId,
+		gitCommit: /^[a-f0-9]{40}$/u.test(rawEvidence.gitCommit)
+			? rawEvidence.gitCommit
+			: '0000000000000000000000000000000000000000',
+		startedAt: rawEvidence.startedAt,
+		finishedAt: rawEvidence.finishedAt,
+		durationMs: Number.isSafeInteger(rawEvidence.durationMs)
+			&& rawEvidence.durationMs >= 0
+			? rawEvidence.durationMs
+			: 0,
+		failureCode: diagnosticFailureCode(rawEvidence),
+	});
+	await writeJsonAtomic(evidencePath, diagnostic);
+	await writeFile(summaryPath, renderDiagnosticSummary(diagnostic), {
+		encoding: 'utf8',
+		mode: 0o600,
+	});
+	try {
+		const parsed = parsePeerDelegationEvidence(rawEvidence);
+		await writeJsonAtomic(evidencePath, parsed);
+		await writeFile(summaryPath, renderSummary(parsed), {
+			encoding: 'utf8',
+			mode: 0o600,
+		});
+		return { artifact: parsed, validationError: undefined };
+	} catch (validationError) {
+		return { artifact: diagnostic, validationError };
+	}
+}
+
+async function writeJsonAtomic(path, value) {
+	const temporary = `${path}.${process.pid}.${runLabel}.tmp`;
+	await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, {
+		encoding: 'utf8',
+		mode: 0o600,
+	});
+	await rename(temporary, path);
+}
+
+function diagnosticFailureCode(rawEvidence) {
+	for (const code of [
+		rawEvidence.failure?.code,
+		rawEvidence.blocker?.code,
+	]) {
+		if (typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,127}$/u.test(code)) {
+			return code;
+		}
+	}
+	return 'EVIDENCE_INVALID';
+}
+
+function renderDiagnosticSummary(diagnostic) {
+	return [
+		'# Peer Delegation E2E diagnostic',
+		'',
+		'- Outcome: **fail**',
+		`- Run: \`${diagnostic.runId}\``,
+		`- Commit: \`${diagnostic.gitCommit}\``,
+		`- Code: \`${diagnostic.failure.code}\``,
+		'- Strict evidence validation failed; unsafe details were discarded.',
+		'',
+	].join('\n');
+}
+
+function injectInvalidEvidenceForTest(rawEvidence) {
+	if (!testMode) {
+		return;
+	}
+	const injection = process.env[`${environmentPrefix}_TEST_INVALID_EVIDENCE`];
+	if (injection === 'schema') {
+		rawEvidence.needsInput.terminalState = 'running';
+		return;
+	}
+	if (injection === 'safety') {
+		rawEvidence.failure ??= {
+			code: 'EVIDENCE_INVALID',
+			message: 'Injected evidence safety failure.',
+		};
+		rawEvidence.failure.message = '/Users/injected/private-evidence';
+	}
+}
 
 async function preflight() {
 	await assertUsablePaths();
 	const head = runGit(['rev-parse', 'HEAD']);
 	const status = runGit(['status', '--porcelain=v1', '--untracked-files=all']);
-	if (status.length !== 0) {
+	if (!testMode && status.length !== 0) {
 		throw new Error('The peer-delegation E2E requires a clean committed tree.');
 	}
 	const submodule = runGit(['-C', 'third_party/agent-host-protocol', 'rev-parse', 'HEAD']);
@@ -452,7 +563,10 @@ async function acquireProfileLock() {
 			profileLockOwned = false;
 		}
 		if (error?.code === 'EEXIST') {
-			throw new Error('The dedicated peer-delegation E2E profile is already locked.');
+			throw Object.assign(
+				new Error('The dedicated peer-delegation E2E profile is already locked.'),
+				{ code: 'PROFILE_LOCKED' },
+			);
 		}
 		throw error;
 	}
@@ -468,7 +582,10 @@ function assertProfileIdle() {
 		),
 	);
 	if (users.length > 0) {
-		throw new Error('The dedicated peer-delegation E2E profile is already in use.');
+		throw Object.assign(
+			new Error('The dedicated peer-delegation E2E profile is already in use.'),
+			{ code: 'PROFILE_IN_USE' },
+		);
 	}
 }
 
@@ -606,7 +723,7 @@ function launchWindow(workspacePath) {
 	if (child.pid === undefined) {
 		throw new Error('VS Code did not expose a child PID for the peer E2E.');
 	}
-	rootPids.add(child.pid);
+	startOwnershipSampler();
 	child.stdout.pipe(output, { end: false });
 	child.stderr.pipe(output, { end: false });
 	const record = { child, output, logPath, exit: undefined };
@@ -615,7 +732,6 @@ function launchWindow(workspacePath) {
 	});
 	child.once('exit', (code, signal) => {
 		record.exit = { code, signal };
-		rootPids.delete(child.pid);
 	});
 	launchRecords.push(record);
 	refreshOwnedProcesses();
@@ -1025,7 +1141,7 @@ async function runNeedsInputScenario(source, targetInputBase) {
 			answerTaskIdMatched: false,
 			answerInputIdMatched: false,
 			resumed: false,
-			terminalState: task?.state ?? 'not-observed',
+			terminalState: normalizePeerDelegationEvidenceTerminalState(task?.state),
 			leaseReleased: task?.leaseReleased === true,
 		};
 		return;
@@ -1052,7 +1168,7 @@ async function runNeedsInputScenario(source, targetInputBase) {
 		answerTaskIdMatched: answer.taskId === result.t,
 		answerInputIdMatched: true,
 		resumed,
-		terminalState: terminal.state,
+		terminalState: normalizePeerDelegationEvidenceTerminalState(terminal.state),
 		leaseReleased: terminal.leaseReleased,
 	};
 	if (passed) {
@@ -1095,7 +1211,7 @@ async function runCancellationScenario(source, targetInputBase) {
 			: undefined,
 		reason: invocation.cancellationReason === 'token' ? 'token' : 'not-observed',
 		eventTypes: task.eventTypes,
-		terminalState: task.state,
+		terminalState: normalizePeerDelegationEvidenceTerminalState(task.state),
 		leaseReleased: task.leaseReleased,
 	};
 }
@@ -1128,7 +1244,7 @@ async function runTimeoutScenario(source, targetInputBase) {
 		productionDefaultMinutes: 60,
 		productionMaximumMinutes: 60,
 		eventTypes: task.eventTypes,
-		terminalState: task.state,
+		terminalState: normalizePeerDelegationEvidenceTerminalState(task.state),
 		leaseReleased: task.leaseReleased,
 	};
 }
@@ -1241,11 +1357,7 @@ function readProcessTable() {
 }
 
 function currentOwnedProcesses() {
-	const owned = selectOwnedProcesses(readProcessTable(), {
-		rootPids,
-		markers: ownedMarkers,
-		selfPid: process.pid,
-	});
+	const owned = processTracker.select(readProcessTable());
 	maximumOwnedProcessCount = Math.max(maximumOwnedProcessCount, owned.length);
 	ownedPeaks.vscode = Math.max(
 		ownedPeaks.vscode,
@@ -1264,6 +1376,31 @@ function currentOwnedProcesses() {
 
 function refreshOwnedProcesses() {
 	currentOwnedProcesses();
+}
+
+function startOwnershipSampler() {
+	if (ownershipSampler !== undefined) {
+		return;
+	}
+	ownershipSamplerStarted = true;
+	ownershipSampler = setInterval(() => {
+		try {
+			currentOwnedProcesses();
+		} catch (error) {
+			ownershipSamplerFailure ??= error;
+		}
+	}, 100);
+	ownershipSampler.unref?.();
+}
+
+function stopOwnershipSampler() {
+	if (ownershipSampler !== undefined) {
+		clearInterval(ownershipSampler);
+		ownershipSampler = undefined;
+	}
+	if (ownershipSamplerFailure !== undefined) {
+		throw ownershipSamplerFailure;
+	}
 }
 
 function isVscodeProcess(processInfo) {
@@ -1309,6 +1446,12 @@ async function terminateOwnedProcesses() {
 }
 
 function killExactProcess(pid, signal) {
+	if (testTerminationLogPath !== undefined) {
+		appendFileSync(testTerminationLogPath, `${pid}:${signal}\n`, {
+			encoding: 'utf8',
+			mode: 0o600,
+		});
+	}
 	try {
 		process.kill(pid, signal);
 	} catch (error) {
@@ -1348,6 +1491,13 @@ async function performCleanupOnce() {
 	let profileLockReleased = false;
 	let runtimeRemoved = false;
 	const cleanupFailures = await runPeerDelegationCleanupPhases([
+		{
+			name: 'snapshot-owned-processes',
+			run: async () => {
+				currentOwnedProcesses();
+			},
+		},
+		{ name: 'stop-ownership-sampler', run: async () => stopOwnershipSampler() },
 		{ name: 'close-controllers', run: closeControllers },
 		{
 			name: 'owned-processes',
@@ -1420,7 +1570,9 @@ async function performCleanupOnce() {
 	]);
 	const ownedProcessesReleased = finalOwned !== undefined && finalOwned.length === 0;
 	const ownedSocketsReleased = localIpcRemoved && editorEndpointReleased;
-	const ownedTimersReleased = (latestResourceMetrics?.toolTimers.activeTimers ?? 0) === 0;
+	const ownedTimersReleased =
+		(latestResourceMetrics?.toolTimers.activeTimers ?? 0) === 0
+		&& ownershipSampler === undefined;
 	const complete = cleanupFailures.length === 0
 		&& profileLockReleased
 		&& cleanupLeaseReleased
@@ -1438,12 +1590,16 @@ async function performCleanupOnce() {
 	evidence.resources.socket.ownedPeak = localIpcEndpoint === undefined
 		? 0
 		: 1 + (evidence.completion.source === 'editor' ? 1 : 0);
-	evidence.resources.timer.ownedPeak = latestResourceMetrics?.toolTimers.timersCreated ?? 0;
+	evidence.resources.timer.ownedPeak =
+		(latestResourceMetrics?.toolTimers.timersCreated ?? 0)
+		+ Number(ownershipSamplerStarted);
 	evidence.resources.vscode.finalOwned = finalOwned?.filter(isVscodeProcess).length ?? 1;
 	evidence.resources.agentHost.finalOwned = finalOwned?.filter(isAgentHostProcess).length ?? 1;
 	evidence.resources.tunnel.finalOwned = finalOwned?.filter(isDevTunnelProcess).length ?? 1;
 	evidence.resources.socket.finalOwned = Number(!localIpcRemoved) + Number(!editorEndpointReleased);
-	evidence.resources.timer.finalOwned = latestResourceMetrics?.toolTimers.activeTimers ?? 0;
+	evidence.resources.timer.finalOwned =
+		(latestResourceMetrics?.toolTimers.activeTimers ?? 0)
+		+ Number(ownershipSampler !== undefined);
 	evidence.cleanup = {
 		status: complete ? 'pass' : 'fail',
 		profileLockReleased,
@@ -1632,7 +1788,7 @@ async function assertUsablePaths() {
 	}
 	await assertNoSymlinkAlias(evidenceRoot, 'evidence directory');
 	const mainIpcPath = join(userDataDirectory, '1.13-main.sock');
-	if (Buffer.byteLength(mainIpcPath, 'utf8') > 103) {
+	if (!testMode && Buffer.byteLength(mainIpcPath, 'utf8') > 103) {
 		throw new Error('The selected peer E2E profile path exceeds the macOS socket limit.');
 	}
 }
@@ -1775,8 +1931,15 @@ function removeLimitation(value) {
 }
 
 function safeFailure(error) {
-	const code = error instanceof E2eRequestError && typeof error.code === 'string'
-		? stableCode(error.code)
+	const candidateCode = error instanceof E2eRequestError
+		? error.code
+		: error !== null
+			&& typeof error === 'object'
+			&& 'code' in error
+			? error.code
+			: undefined;
+	const code = typeof candidateCode === 'string'
+		? stableCode(candidateCode)
 		: 'PEER_E2E_FAILED';
 	return {
 		code,

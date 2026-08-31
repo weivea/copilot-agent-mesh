@@ -5,6 +5,7 @@ import { resolve } from 'node:path';
 
 import {
 	assertPassingPeerDelegationEvidence,
+	normalizePeerDelegationEvidenceTerminalState,
 	parsePeerDelegationEvidence,
 	type PeerDelegationEvidence,
 } from '../e2e/PeerDelegationEvidence';
@@ -62,6 +63,37 @@ test('peer-delegation evidence requires resolvable AC-5 references and honest ou
 		() => parsePeerDelegationEvidence({ ...base, outcome: 'pass' }),
 		/Outcome must be unverified/u,
 	);
+});
+
+test('peer evidence maps every active task state to not-observed', () => {
+	for (const status of [
+		'accepted',
+		'startingAgent',
+		'running',
+		'needsInput',
+		'recovering',
+		'cancelling',
+	]) {
+		assert.equal(
+			normalizePeerDelegationEvidenceTerminalState(status),
+			'not-observed',
+			status,
+		);
+		const evidence = unverifiedEvidence();
+		evidence.needsInput.terminalState =
+			normalizePeerDelegationEvidenceTerminalState(status);
+		evidence.timeout.terminalState =
+			normalizePeerDelegationEvidenceTerminalState(status);
+		assert.doesNotThrow(() => parsePeerDelegationEvidence(evidence), status);
+	}
+	for (const status of ['completed', 'failed', 'cancelled', 'timedOut']) {
+		assert.equal(
+			normalizePeerDelegationEvidenceTerminalState(status),
+			status,
+		);
+	}
+	assert.equal(normalizePeerDelegationEvidenceTerminalState('not-found'), 'not-observed');
+	assert.equal(normalizePeerDelegationEvidenceTerminalState(undefined), 'not-observed');
 });
 
 test('peer-delegation passing evidence requires all real AC-5 conditions', () => {

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
+import { isAbsolute, join } from 'node:path';
 
 import * as vscode from 'vscode';
 
@@ -255,6 +256,9 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 					delegatedToolInvocations,
 					runtimeApprovalCapabilities,
 					peerDelegationRecorder,
+					peerDelegationRecorder === undefined
+						? undefined
+						: peerDelegationAgentHostStorageRoot(),
 				);
 				sourceStatusSubscription = runtime.onDidSourceStatusChange(() => changeEvents.fire());
 				return new WindowNodeTaskExecutor({
@@ -692,6 +696,14 @@ function peerDelegationBudgetMs(): number {
 		throw new Error('MESH_PEER_DELEGATION_E2E_BUDGET_MS must be an integer from 500 to 30000.');
 	}
 	return value;
+}
+
+function peerDelegationAgentHostStorageRoot(): string {
+	const controlRoot = process.env.MESH_PEER_DELEGATION_E2E_CONTROL_DIR;
+	if (controlRoot === undefined || !isAbsolute(controlRoot)) {
+		throw new Error('The peer-delegation E2E control directory must be absolute.');
+	}
+	return join(controlRoot, 'agent-host');
 }
 
 function extensionRuntimeMode(mode: vscode.ExtensionMode): ExtensionRuntimeMode {
