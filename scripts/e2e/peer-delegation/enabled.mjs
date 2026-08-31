@@ -287,8 +287,7 @@ try {
 	assertAttemptMetricsZero(baselineResources);
 	assert.equal(await isAbsent(sentinelInvocationPath), true);
 
-	const catalogBefore = await request(target, 'peer.session.catalog', {}, 60_000);
-	const catalogBeforeCount = catalogBefore.available ? catalogBefore.sessionCount : 0;
+	const catalogBeforeCount = 0;
 
 	await request(target, 'peer.policy.accept', { enabled: false });
 	await request(source, 'peer.policy.allow', {

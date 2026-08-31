@@ -436,7 +436,7 @@ async function editorSessionCatalog(
 		if (!AHP_PROTOCOL_OFFER.includes(initialized.protocolVersion as '1.0.0')) {
 			throw new Error('The editor Agent Host selected an incompatible protocol.');
 		}
-		const sessions = await connection.listSessions();
+		const sessions = await connection.listSessions(1);
 		result = {
 			available: true,
 			source: 'editor',

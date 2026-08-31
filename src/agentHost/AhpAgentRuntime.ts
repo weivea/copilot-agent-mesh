@@ -102,7 +102,7 @@ export interface AhpConnection {
 		readonly config: Readonly<Record<string, unknown>>;
 		readonly clientId: string;
 	}): Promise<void>;
-	listSessions(): Promise<readonly { readonly resource: string }[]>;
+	listSessions(limit?: number): Promise<readonly { readonly resource: string }[]>;
 	dispatch(channel: string, action: unknown, clientSeq?: number): number;
 	unsubscribe(uri: string): Promise<void>;
 	disposeSession(uri: string): Promise<void>;
@@ -437,8 +437,11 @@ class SdkAhpConnection implements AhpConnection {
 		});
 	}
 
-	async listSessions(): Promise<readonly { readonly resource: string }[]> {
-		const result = await this.client.request('listSessions', { channel: rootUri, limit: 200 });
+	async listSessions(limit = 200): Promise<readonly { readonly resource: string }[]> {
+		if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+			throw new TypeError('The Agent Host Session list limit is invalid.');
+		}
+		const result = await this.client.request('listSessions', { channel: rootUri, limit });
 		return result.items.map(({ resource }) => ({ resource }));
 	}
 

@@ -2901,7 +2901,7 @@ class FakeAhpTransport implements AhpConnection {
 		this.created = params;
 	}
 
-	async listSessions(): Promise<readonly { readonly resource: string }[]> {
+	async listSessions(_limit?: number): Promise<readonly { readonly resource: string }[]> {
 		this.assertOpen();
 		return this.created === undefined ? [] : [{ resource: this.created.sessionUri }];
 	}

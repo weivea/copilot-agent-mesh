@@ -178,10 +178,12 @@ command succeeded but returned zero endpoints; Insiders user-data was absent. Ed
 initialize and O1 Session visibility therefore remain unverified in that environment,
 with no Session created and no sensitive evidence persisted.
 
-P8 adds editor `listSessions` catalog comparison before and after a real task.
-Only domain-separated 16-hex fingerprints and counts leave the Extension Host.
-A standalone fallback can demonstrate degraded execution but can never satisfy
-the editor Session visibility claim.
+P8 performs a bounded post-task editor `listSessions` observation and compares
+the newest Session's domain-separated 16-hex fingerprint with the task recovery
+Session. It does not open and close a separate pre-task AHP catalog client,
+because that borrowed-client lifecycle can perturb editor identity readiness.
+Only fingerprints and counts leave the Extension Host. A standalone fallback can
+demonstrate degraded execution but can never satisfy the editor Session claim.
 
 ## Verified result
 
