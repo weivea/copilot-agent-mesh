@@ -37,44 +37,48 @@ for (const [signal, expectedExitCode] of [
 	['SIGINT', 130],
 	['SIGTERM', 143],
 ] as const) {
-	test(`signal cleanup removes only owned fixtures for ${signal}`, async () => {
-		const root = await mkdtemp(join(tmpdir(), 'mesh-peer-signal-'));
-		const fixture = spawn(
-			process.execPath,
-			[
-				resolve('scripts/e2e/peer-delegation/signal-cleanup-fixture.mjs'),
-				root,
-			],
-			{ cwd: resolve('.'), shell: false, stdio: 'ignore' },
-		);
-		let childPid: number | undefined;
-		try {
-			const ready = await waitForReady(join(root, 'ready.json'));
-			childPid = ready.childPid;
-			fixture.kill(signal);
-			const exit = await new Promise<number | null>((resolveExit, reject) => {
-				fixture.once('error', reject);
-				fixture.once('exit', resolveExit);
-			});
-			assert.equal(exit, expectedExitCode);
-			await assert.rejects(access(join(root, 'run')), { code: 'ENOENT' });
-			await assert.rejects(access(join(root, 'lock')), { code: 'ENOENT' });
-			assert.equal(processAlive(childPid), false);
-		} finally {
-			if (fixture.exitCode === null && fixture.signalCode === null) {
-				fixture.kill('SIGTERM');
-				await waitForExit(fixture, 2_000);
-			}
-			if (childPid !== undefined && processAlive(childPid)) {
-				process.kill(childPid, 'SIGTERM');
-				await waitForProcessExit(childPid, 2_000);
-				if (processAlive(childPid)) {
-					process.kill(childPid, 'SIGKILL');
+	test(
+		`signal cleanup removes only owned fixtures for ${signal}`,
+		{ skip: process.platform === 'win32' ? 'POSIX signal cleanup is a macOS/Linux harness boundary.' : false },
+		async () => {
+			const root = await mkdtemp(join(tmpdir(), 'mesh-peer-signal-'));
+			const fixture = spawn(
+				process.execPath,
+				[
+					resolve('scripts/e2e/peer-delegation/signal-cleanup-fixture.mjs'),
+					root,
+				],
+				{ cwd: resolve('.'), shell: false, stdio: 'ignore' },
+			);
+			let childPid: number | undefined;
+			try {
+				const ready = await waitForReady(join(root, 'ready.json'));
+				childPid = ready.childPid;
+				fixture.kill(signal);
+				const exit = await new Promise<number | null>((resolveExit, reject) => {
+					fixture.once('error', reject);
+					fixture.once('exit', resolveExit);
+				});
+				assert.equal(exit, expectedExitCode);
+				await assert.rejects(access(join(root, 'run')), { code: 'ENOENT' });
+				await assert.rejects(access(join(root, 'lock')), { code: 'ENOENT' });
+				assert.equal(processAlive(childPid), false);
+			} finally {
+				if (fixture.exitCode === null && fixture.signalCode === null) {
+					fixture.kill('SIGTERM');
+					await waitForExit(fixture, 2_000);
 				}
+				if (childPid !== undefined && processAlive(childPid)) {
+					process.kill(childPid, 'SIGTERM');
+					await waitForProcessExit(childPid, 2_000);
+					if (processAlive(childPid)) {
+						process.kill(childPid, 'SIGKILL');
+					}
+				}
+				await rm(root, { recursive: true, force: true });
 			}
-			await rm(root, { recursive: true, force: true });
-		}
-	});
+		},
+	);
 }
 
 function failing(name: string, attempted: string[]) {
