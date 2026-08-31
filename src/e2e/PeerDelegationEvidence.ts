@@ -103,6 +103,7 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 		parentResultFields: z.array(z.string().regex(/^[a-z][A-Za-z0-9]{0,31}$/u)).max(16),
 		parentResultBytes: nonNegativeInteger,
 		parentResultHash: fingerprint.optional(),
+		invocationSource: z.enum(['copilot-ui', 'programmatic-core', 'none']),
 		compactStatus: z.number().int().min(0).max(3).optional(),
 		eventTypes: z.array(z.string().min(1).max(64)).max(256),
 		eventSequences: z.array(z.number().int().positive()).max(256),
@@ -222,6 +223,10 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 		'TARGET_CHAT_SESSIONS_UI_UNVERIFIED',
 		'REAL_NEEDS_INPUT_UNVERIFIED',
 	])).max(7),
+	blocker: z.strictObject({
+		code: stableCode,
+		message: z.string().min(1).max(512),
+	}).optional(),
 	failure: z.strictObject({
 		code: stableCode,
 		message: z.string().min(1).max(512),
@@ -434,6 +439,7 @@ function validateAc5Correspondence(
 			status: evidence.completion.taskId !== undefined
 				&& evidence.completion.parentResultTaskId === evidence.completion.taskId
 				&& evidence.completion.parentSameInvocation
+				&& evidence.completion.invocationSource === 'copilot-ui'
 				&& evidence.completion.parentResultFields.join(',') === 'd,r,s,t'
 				&& evidence.completion.parentResultBytes > 0
 				&& evidence.completion.parentResultHash !== undefined

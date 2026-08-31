@@ -312,7 +312,7 @@ try {
 	const completionStarted = Date.now();
 	const completionRun = manualUi
 		? await waitForManualCompletion(source, targetInputBase)
-		: await runProgrammaticCompletion(source, targetInputBase);
+		: await runProgrammaticCoreCompletion(source, targetInputBase);
 	const completionResult = completionRun.result;
 	assert.equal(completionResult.s, 0, 'The real completion did not return compact completed status.');
 	const completionTaskId = requiredUuid(completionResult.t, 'completion taskId');
@@ -376,6 +376,7 @@ try {
 		parentResultFields,
 		parentResultBytes,
 		parentResultHash,
+		invocationSource: completionRun.invocationSource,
 		compactStatus: completionResult.s,
 		eventTypes: completionTask.eventTypes,
 		eventSequences: completionTask.eventSequences,
@@ -406,7 +407,9 @@ try {
 	setAc5(6, completionPass ? 'pass' : 'unverified', completionPass
 		? ['#/completion/eventTypes', '#/completion/ahpTurnCompleteObserved']
 		: []);
-	setAc5(7, parentResultValid ? 'pass' : 'fail', parentResultValid
+	const parentChatResultVerified = parentResultValid
+		&& completionRun.invocationSource === 'copilot-ui';
+	setAc5(7, parentChatResultVerified ? 'pass' : 'unverified', parentChatResultVerified
 		? ['#/completion/parentSameInvocation', '#/completion/parentResultTaskId']
 		: []);
 	setAc5(8, incomingRecord ? 'pass' : 'fail', incomingRecord ? ['#/completion/incomingRecord'] : []);
@@ -442,6 +445,12 @@ try {
 	await runNeedsInputScenario(source, targetInputBase);
 	await runCancellationScenario(source, targetInputBase);
 	await runTimeoutScenario(source, targetInputBase);
+	if (!manualUi) {
+		evidence.blocker = {
+			code: 'COPILOT_UI_REQUIRED',
+			message: 'A visible Copilot Agent-mode Tool invocation and one user confirmation are required.',
+		};
+	}
 
 	latestResourceMetrics = await request(source, 'peer.resources');
 	const listenerDelta = delta(
@@ -874,6 +883,10 @@ async function invokeMeshTool(controller, toolName, input, timeoutMs = 15 * 60_0
 	return request(controller, 'peer.tool.invoke', { toolName, input }, timeoutMs);
 }
 
+async function invokeCoreTool(controller, toolName, input, timeoutMs = 15 * 60_000) {
+	return request(controller, 'peer.core.invoke', { toolName, input }, timeoutMs);
+}
+
 async function waitForControllerState(controller, predicate, timeoutMs, message) {
 	const deadline = Date.now() + timeoutMs;
 	let latest;
@@ -908,9 +921,9 @@ async function waitForDashboard(controller, predicate, timeoutMs, message) {
 	throw new Error(`${message}; last dashboard was unavailable or did not match.`);
 }
 
-async function runProgrammaticCompletion(source, targetInputBase) {
+async function runProgrammaticCoreCompletion(source, targetInputBase) {
 	const delegationRequestId = randomUUID();
-	const result = await invokeMeshTool(source, 'mesh_delegate_task', {
+	const result = await invokeCoreTool(source, 'mesh_delegate_task', {
 		...targetInputBase,
 		delegationRequestId,
 		title: `P8 E2E completion ${runLabel}`,
@@ -921,6 +934,7 @@ async function runProgrammaticCompletion(source, targetInputBase) {
 	return {
 		result,
 		parentResultObservation: undefined,
+		invocationSource: 'programmatic-core',
 		confirmation: {
 			status: 'unverified',
 			preparedCount: 0,
@@ -983,6 +997,7 @@ async function waitForManualCompletion(source, targetInputBase) {
 					resultBytes: completed.resultBytes,
 					resultHash: completed.resultHash,
 				},
+				invocationSource: 'copilot-ui',
 				confirmation: {
 					status: uiAttestation.confirmationAcceptedOnce ? 'pass' : 'unverified',
 					preparedCount,
@@ -999,7 +1014,7 @@ async function waitForManualCompletion(source, targetInputBase) {
 }
 
 async function runNeedsInputScenario(source, targetInputBase) {
-	const result = await invokeMeshTool(source, 'mesh_delegate_task', {
+	const result = await invokeCoreTool(source, 'mesh_delegate_task', {
 		...targetInputBase,
 		delegationRequestId: randomUUID(),
 		title: `P8 E2E needs input ${runLabel}`,
@@ -1034,7 +1049,7 @@ async function runNeedsInputScenario(source, targetInputBase) {
 		};
 		return;
 	}
-	const answer = await invokeMeshTool(source, 'mesh_answer_task', {
+	const answer = await invokeCoreTool(source, 'mesh_answer_task', {
 		taskId: result.t,
 		inputId: result.i,
 		answerId: randomUUID(),
@@ -1078,13 +1093,13 @@ async function runCancellationScenario(source, targetInputBase) {
 	};
 	const invocation = await request(
 		source,
-		'peer.tool.cancel.after.events',
+		'peer.core.cancel.after.events',
 		{ input },
 		10 * 60_000,
 	);
 	const taskId = requiredUuid(invocation.taskId, 'cancellation taskId');
 	const task = await request(source, 'peer.task.evidence', { taskId });
-	const passed = invocation.hostInvocationCancelled === true
+	const passed = invocation.cancellationTokenTriggered === true
 		&& invocation.compactStatus === 3
 		&& invocation.cancellationReason === 'token'
 		&& task.state === 'cancelled'
@@ -1106,7 +1121,7 @@ async function runCancellationScenario(source, targetInputBase) {
 
 async function runTimeoutScenario(source, targetInputBase) {
 	await request(source, 'peer.budget.arm');
-	const result = await invokeMeshTool(source, 'mesh_delegate_task', {
+	const result = await invokeCoreTool(source, 'mesh_delegate_task', {
 		...targetInputBase,
 		delegationRequestId: randomUUID(),
 		title: `P8 E2E short budget ${runLabel}`,
@@ -1729,6 +1744,7 @@ function initialEvidence() {
 			parentSameInvocation: false,
 			parentResultFields: [],
 			parentResultBytes: 0,
+			invocationSource: 'none',
 			eventTypes: [],
 			eventSequences: [],
 			authoritativeOrder: false,

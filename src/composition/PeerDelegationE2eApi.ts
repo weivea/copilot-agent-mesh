@@ -21,6 +21,7 @@ import type { LocalIpcRemoteTaskAdapter } from '../node/LocalIpcRemoteTaskAdapte
 import type { LocalIpcEndpoint } from '../ipc';
 import {
 	parseDelegateTaskInput,
+	TaskToolsCore,
 	type DelegateTaskInput,
 } from '../tools/taskToolsCore';
 import type { LocalBrokerTaskFacade } from '../tools/LocalBrokerTaskFacade';
@@ -92,10 +93,16 @@ export function createPeerDelegationE2eApi(
 						requiredToolName(params, 'toolName'),
 						requiredRecord(params, 'input'),
 					);
+				case 'peer.core.invoke':
+					return invokeCoreTool(
+						options,
+						requiredToolName(params, 'toolName'),
+						requiredRecord(params, 'input'),
+					);
 				case 'peer.direct.start.error':
 					return directStartError(options, requiredRecord(params, 'input'));
-				case 'peer.tool.cancel.after.events':
-					return invokeDelegateAndCancelAfterEvents(options, requiredRecord(params, 'input'));
+				case 'peer.core.cancel.after.events':
+					return invokeCoreDelegateAndCancelAfterEvents(options, requiredRecord(params, 'input'));
 				case 'peer.observations':
 					return options.recorder.snapshot();
 				case 'peer.budget.arm':
@@ -114,6 +121,28 @@ export function createPeerDelegationE2eApi(
 					return resourceMetrics(options);
 				default:
 					return base.execute(request, action, params);
+			}
+
+			function invokeCoreTool(
+				options: PeerDelegationE2eApiOptions,
+				toolName: string,
+				input: Record<string, unknown>,
+			): Promise<Record<string, unknown>> {
+				const core = new TaskToolsCore(options.localTasks, { clock: options.toolClock });
+				switch (toolName) {
+					case MESH_TOOL_NAMES.listWorkers:
+						return core.listWorkers(input);
+					case MESH_TOOL_NAMES.delegateTask:
+						return core.delegateTask(input);
+					case MESH_TOOL_NAMES.getTask:
+						return core.getTask(input);
+					case MESH_TOOL_NAMES.cancelTask:
+						return core.cancelTask(input);
+					case MESH_TOOL_NAMES.answerTask:
+						return core.answerTask(input);
+					default:
+						throw new Error('The requested core Tool is unsupported.');
+				}
 			}
 
 			async function directStartError(
@@ -231,12 +260,12 @@ async function invokeTool(
 	}
 }
 
-async function invokeDelegateAndCancelAfterEvents(
+async function invokeCoreDelegateAndCancelAfterEvents(
 	options: PeerDelegationE2eApiOptions,
 	rawInput: Record<string, unknown>,
 ): Promise<{
 	readonly taskId: string;
-	readonly hostInvocationCancelled: boolean;
+	readonly cancellationTokenTriggered: boolean;
 	readonly compactStatus?: number;
 	readonly cancellationReason?: string;
 	readonly observedEventTypes: readonly string[];
@@ -254,15 +283,10 @@ async function invokeDelegateAndCancelAfterEvents(
 		acceptanceCriteria: input.acceptanceCriteria ?? [],
 	});
 	const cancellation = new options.vscodeApi.CancellationTokenSource();
-	let invocationSettled = false;
-	const invocation = invokeTool(
-		options.vscodeApi,
-		MESH_TOOL_NAMES.delegateTask,
-		input as unknown as Record<string, unknown>,
-		cancellation.token,
-	).finally(() => {
-		invocationSettled = true;
-	});
+	const invocation = new TaskToolsCore(
+		options.localTasks,
+		{ clock: options.toolClock },
+	).delegateTask(input, cancellation.token);
 	let observedEventTypes: readonly string[] = [];
 	try {
 		const deadline = Date.now() + 120_000;
@@ -274,33 +298,22 @@ async function invokeDelegateAndCancelAfterEvents(
 				&& observedEventTypes.includes('output')
 			) {
 				cancellation.cancel();
-				const hostInvocationCancelled = await invocation.then(
-					() => false,
-					() => true,
-				);
+				const result = await invocation;
 				const terminal = await waitForTaskEvidenceTerminal(options, identity.taskId, 60_000);
-				const toolCompletion = await waitForToolCompletion(
-					options,
-					identity.taskId,
-					60_000,
-				);
 				return {
 					taskId: identity.taskId,
-					hostInvocationCancelled,
-					...(toolCompletion?.compactStatus === undefined
+					cancellationTokenTriggered: true,
+					...(typeof result.s !== 'number'
 						? {}
-						: { compactStatus: toolCompletion.compactStatus }),
-					...(toolCompletion?.cancellationReason === undefined
+						: { compactStatus: result.s }),
+					...(typeof result.x !== 'string'
 						? {}
-						: { cancellationReason: toolCompletion.cancellationReason }),
+						: { cancellationReason: result.x }),
 					observedEventTypes: terminal.eventTypes,
 				};
 			}
 			if (taskTerminalStates.has(evidence.state)) {
 				throw new Error(`The cancellation task became ${evidence.state} before cancellation.`);
-			}
-			if (invocationSettled) {
-				throw new Error('The delegate Tool invocation settled before cancellation evidence was observed.');
 			}
 			await delay(50);
 		}
@@ -329,26 +342,6 @@ async function waitForTaskEvidenceTerminal(
 	throw new Error(`The cancellation task did not become terminal; last state was ${latest?.state ?? 'unknown'}.`);
 }
 
-async function waitForToolCompletion(
-	options: PeerDelegationE2eApiOptions,
-	taskId: string,
-	timeoutMs: number,
-): Promise<ReturnType<PeerDelegationE2eRecorder['snapshot']>['tools'][number] | undefined> {
-	const deadline = Date.now() + timeoutMs;
-	do {
-		const completion = options.recorder.snapshot().tools.find(
-			(observation) =>
-				observation.toolName === MESH_TOOL_NAMES.delegateTask
-				&& observation.phase === 'invokeCompleted'
-				&& observation.taskId === taskId,
-		);
-		if (completion !== undefined) {
-			return completion;
-		}
-		await delay(50);
-	} while (Date.now() < deadline);
-	return undefined;
-}
 
 async function taskEvidence(
 	options: PeerDelegationE2eApiOptions,
