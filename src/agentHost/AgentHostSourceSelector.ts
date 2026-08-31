@@ -20,7 +20,10 @@ import {
 	EditorAgentHostLocator,
 	type LocatedEditorAgentHost,
 } from './EditorAgentHostLocator';
-import { UnixSocketWebSocketConnector } from './UnixSocketWebSocketConnector';
+import {
+	UnixSocketWebSocketConnector,
+	UnixSocketWebSocketError,
+} from './UnixSocketWebSocketConnector';
 
 const borrowedEditorEndpoint = new URL('ws://editor-agent-host.invalid/');
 
@@ -397,6 +400,10 @@ function safeEditorFailure(error: unknown): AgentHostSourceFailure {
 	return {
 		code,
 		stage,
+		...(error instanceof AgentRuntimeError
+			&& error.cause instanceof UnixSocketWebSocketError
+			? { detail: error.cause.code }
+			: {}),
 		message: 'The selected editor Agent Host attempt failed safely.',
 	};
 }

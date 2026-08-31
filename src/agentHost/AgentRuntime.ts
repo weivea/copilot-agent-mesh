@@ -21,6 +21,13 @@ export type AgentHostSourceFailureStage =
 export interface AgentHostSourceFailure {
 	readonly code: AgentRuntimeErrorCode;
 	readonly stage: AgentHostSourceFailureStage;
+	readonly detail?: 'CANCELLED'
+		| 'CONNECT_FAILED'
+		| 'EARLY_CLOSE'
+		| 'INVALID_RESPONSE'
+		| 'TOKEN_INVALID'
+		| 'UPGRADE_FAILED'
+		| 'UPGRADE_TIMEOUT';
 	readonly message: string;
 }
 

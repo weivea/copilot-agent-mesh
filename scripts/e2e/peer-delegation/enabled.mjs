@@ -1102,7 +1102,14 @@ async function recordCompletionScenario({
 		&& typeof sourceFailure.code === 'string'
 		&& /^[A-Z][A-Z0-9_]{0,127}$/u.test(sourceFailure.code)
 		&& ['discovery', 'connection', 'initialize', 'session', 'task'].includes(sourceFailure.stage)
-		? { code: sourceFailure.code, stage: sourceFailure.stage }
+		? {
+			code: sourceFailure.code,
+			stage: sourceFailure.stage,
+			...(['CANCELLED', 'CONNECT_FAILED', 'EARLY_CLOSE', 'INVALID_RESPONSE', 'TOKEN_INVALID', 'UPGRADE_FAILED', 'UPGRADE_TIMEOUT']
+				.includes(sourceFailure.detail)
+				? { detail: sourceFailure.detail }
+				: {}),
+		}
 		: undefined;
 	const catalogAfter = await request(target, 'peer.session.catalog', {}, 60_000);
 	const sessionHashMatched = catalogAfter.available === true

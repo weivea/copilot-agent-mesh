@@ -33,6 +33,7 @@ import {
 import type { DelegatedToolInvocationRegistry } from '../tools/DelegatedToolInvocationRegistry';
 import { sanitizeDelegationText } from '../tools/DelegationTextSanitizer';
 import { redactRegisteredSensitiveValues } from '../security/SensitiveValueRedaction';
+import { UnixSocketWebSocketError } from './UnixSocketWebSocketConnector';
 import type { AgentHostLauncherLike, LaunchedAgentHost } from './AgentHostLauncher';
 import type { AuthBroker, ProtectedResource } from './AuthBroker';
 
@@ -215,10 +216,12 @@ export class AhpAgentRuntime implements AgentRuntime {
 		try {
 			try {
 				connection = await this.options.connections.connect(host, signal);
-			} catch {
+			} catch (error) {
 				throw new AgentRuntimeError(
 					'AGENT_UNAVAILABLE',
 					'The Agent Host connection could not be established.',
+					false,
+					error instanceof UnixSocketWebSocketError ? error : undefined,
 				);
 			}
 			this.throwIfDisposed();
