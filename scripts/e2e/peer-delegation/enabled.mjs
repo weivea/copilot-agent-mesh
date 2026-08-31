@@ -1098,6 +1098,12 @@ async function recordCompletionScenario({
 			: 'unavailable';
 	const degraded = runtimeStatus.status?.degraded === true;
 	const sourceFailure = runtimeStatus.status?.failure;
+	const recordedSourceFailure = sourceFailure !== undefined
+		&& typeof sourceFailure.code === 'string'
+		&& /^[A-Z][A-Z0-9_]{0,127}$/u.test(sourceFailure.code)
+		&& ['discovery', 'connection', 'initialize', 'session', 'task'].includes(sourceFailure.stage)
+		? { code: sourceFailure.code, stage: sourceFailure.stage }
+		: undefined;
 	const catalogAfter = await request(target, 'peer.session.catalog', {}, 60_000);
 	const sessionHashMatched = catalogAfter.available === true
 		&& typeof completionTask.recoverySessionHash === 'string'
@@ -1142,6 +1148,7 @@ async function recordCompletionScenario({
 		incomingRecord,
 		source: sourceKind,
 		degraded,
+		...(recordedSourceFailure === undefined ? {} : { sourceFailure: recordedSourceFailure }),
 		leaseReleased: completionTask.leaseReleased,
 		durationMs: Date.now() - completionStarted,
 	};

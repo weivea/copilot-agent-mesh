@@ -414,6 +414,11 @@ test('source selector uses editor first, falls back exactly once, publishes safe
 		degraded: true,
 		reason: 'EDITOR_START_FAILED',
 		message: 'Editor Agent Host startup failed; standalone mode is in use.',
+		failure: {
+			code: 'AGENT_UNAVAILABLE',
+			stage: 'task',
+			message: 'The selected editor Agent Host attempt failed safely.',
+		},
 	});
 	assert.doesNotMatch(JSON.stringify(changes), /private|sensitive|tkn/iu);
 	await selector.dispose();
@@ -449,6 +454,7 @@ test('source selector reports standalone failure explicitly and does not fallbac
 		degraded: false,
 		failure: {
 			code: 'AGENT_AUTH_REQUIRED',
+			stage: 'session',
 			message: 'The selected editor Agent Host requires authentication in its editor profile.',
 		},
 	});
@@ -483,6 +489,7 @@ test('nonfallback editor errors replace stale standalone probe status without le
 		degraded: false,
 		failure: {
 			code: 'AGENT_CONFIG_REQUIRED',
+			stage: 'session',
 			message: 'The selected editor Agent Host requires Session configuration.',
 		},
 	});
@@ -581,6 +588,11 @@ test('source selector retains the actual degraded execution source across availa
 		degraded: true,
 		reason: 'EDITOR_START_FAILED',
 		message: 'Editor Agent Host startup failed; standalone mode is in use.',
+		failure: {
+			code: 'AGENT_UNAVAILABLE',
+			stage: 'task',
+			message: 'The selected editor Agent Host attempt failed safely.',
+		},
 	});
 	await selector.dispose();
 });

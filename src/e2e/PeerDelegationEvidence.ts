@@ -121,6 +121,10 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 		incomingRecord: z.boolean(),
 		source: z.enum(['editor', 'standalone', 'unavailable']),
 		degraded: z.boolean(),
+		sourceFailure: z.strictObject({
+			code: stableCode,
+			stage: z.enum(['discovery', 'connection', 'initialize', 'session', 'task']),
+		}).optional(),
 		leaseReleased: z.boolean(),
 		durationMs: nonNegativeInteger,
 	}),

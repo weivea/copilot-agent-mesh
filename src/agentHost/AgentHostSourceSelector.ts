@@ -1,6 +1,7 @@
 import {
 	AgentRuntimeError,
 	type AgentHostSourceStatus,
+	type AgentHostSourceFailure,
 	type AgentHostSourceStatusProvider,
 	type AgentRuntimeApprovalCapabilityIssuer,
 	type AgentRuntime,
@@ -106,6 +107,7 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 			return handle;
 		}
 
+		let editorFailure: AgentHostSourceFailure | undefined;
 		try {
 			const handle = await this.options.editor.start(request);
 			this.assertActive();
@@ -114,14 +116,15 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 			return handle;
 		} catch (error: unknown) {
 			this.assertActive();
+			editorFailure = safeEditorFailure(error);
 			if (!isFallbackEligible(error)) {
 				this.sourceSelected = true;
-				this.setStatus(editorFailureStatus(error));
+				this.setStatus(editorFailureStatus(editorFailure));
 				throw error;
 			}
 		}
 
-		const status = degradedStatus('EDITOR_START_FAILED');
+		const status = degradedStatus('EDITOR_START_FAILED', editorFailure);
 		this.sourceSelected = true;
 		this.setStatus(status);
 		try {
@@ -335,6 +338,7 @@ class BorrowedEditorAgentHost implements LaunchedAgentHost {
 
 function degradedStatus(
 	reason: Extract<AgentHostSourceStatus, { degraded: true }>['reason'],
+	failure?: AgentHostSourceFailure,
 ): Extract<AgentHostSourceStatus, { degraded: true }> {
 	const message = reason === 'EDITOR_DISCOVERY_FAILED'
 		? 'Editor Agent Host discovery failed; standalone mode is in use.'
@@ -346,15 +350,14 @@ function degradedStatus(
 		degraded: true,
 		reason,
 		message,
+		...(failure === undefined ? {} : { failure }),
 	};
 }
 
 function editorFailureStatus(
-	error: unknown,
+	failure: AgentHostSourceFailure,
 ): Extract<AgentHostSourceStatus, { source: 'editor' }> {
-	const code = error instanceof AgentRuntimeError
-		? error.code
-		: 'TASK_EXECUTION_FAILED';
+	const { code } = failure;
 	const message = code === 'AGENT_AUTH_REQUIRED'
 		? 'The selected editor Agent Host requires authentication in its editor profile.'
 		: code === 'AGENT_AUTH_FAILED'
@@ -365,7 +368,30 @@ function editorFailureStatus(
 	return {
 		source: 'editor',
 		degraded: false,
-		failure: { code, message },
+		failure: { ...failure, message },
+	};
+}
+
+function safeEditorFailure(error: unknown): AgentHostSourceFailure {
+	const code = error instanceof AgentRuntimeError
+		? error.code
+		: 'TASK_EXECUTION_FAILED';
+	const message = error instanceof AgentRuntimeError ? error.message : '';
+	const stage = ['AGENT_AUTH_REQUIRED', 'AGENT_AUTH_FAILED', 'AGENT_CONFIG_REQUIRED'].includes(code)
+		? 'session'
+		: /endpoint is unavailable/u.test(message)
+		? 'discovery'
+		: /connection could not be established|WebSocket/u.test(message)
+			? 'connection'
+			: /protocol|initialize|root snapshot|root snapshot did not contain|provider/u.test(message)
+				? 'initialize'
+				: /Session|session|connection closed while the task was starting/u.test(message)
+					? 'session'
+					: 'task';
+	return {
+		code,
+		stage,
+		message: 'The selected editor Agent Host attempt failed safely.',
 	};
 }
 

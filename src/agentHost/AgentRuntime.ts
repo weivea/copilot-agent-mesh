@@ -11,6 +11,18 @@ export const AGENT_RUNTIME_ERROR_CODES = [
 export type AgentRuntimeErrorCode = typeof AGENT_RUNTIME_ERROR_CODES[number];
 
 export type AgentHostSource = 'editor' | 'standalone';
+export type AgentHostSourceFailureStage =
+	| 'discovery'
+	| 'connection'
+	| 'initialize'
+	| 'session'
+	| 'task';
+
+export interface AgentHostSourceFailure {
+	readonly code: AgentRuntimeErrorCode;
+	readonly stage: AgentHostSourceFailureStage;
+	readonly message: string;
+}
 
 export type AgentHostDegradationReason =
 	| 'EDITOR_DISCOVERY_FAILED'
@@ -21,10 +33,7 @@ export type AgentHostSourceStatus =
 	| {
 		readonly source: 'editor';
 		readonly degraded: false;
-		readonly failure?: {
-			readonly code: AgentRuntimeErrorCode;
-			readonly message: string;
-		};
+		readonly failure?: AgentHostSourceFailure;
 	}
 	| {
 		readonly source: 'standalone';
@@ -35,6 +44,7 @@ export type AgentHostSourceStatus =
 		readonly degraded: true;
 		readonly reason: AgentHostDegradationReason;
 		readonly message: string;
+		readonly failure?: AgentHostSourceFailure;
 	};
 
 export interface AgentHostSourceStatusProvider {
