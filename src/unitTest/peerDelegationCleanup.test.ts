@@ -15,6 +15,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
+import { pathToFileURL } from 'node:url';
 
 import { runPeerDelegationCleanupPhases } from '../e2e/PeerDelegationCleanup';
 import {
@@ -261,8 +262,39 @@ test(
 	},
 );
 
+test('release snapshot validator rejects dirty trees and commit drift', () => {
+	const helperUrl = pathToFileURL(
+		resolve('scripts/e2e/peer-delegation/evidence-path.mjs'),
+	).href;
+	const result = spawnSync(
+		process.execPath,
+		[
+			'--input-type=module',
+			'--eval',
+			`
+				import { assertCleanCommittedReleaseSnapshot as check } from ${JSON.stringify(helperUrl)};
+				const head = '0123456789012345678901234567890123456789';
+				const cases = [
+					[{ expectedCommit: head, headBefore: head, headAfter: head, statusBefore: ' M file', statusAfter: '' }, 'WORKTREE_DIRTY'],
+					[{ expectedCommit: head, headBefore: head, headAfter: '1123456789012345678901234567890123456789', statusBefore: '', statusAfter: '' }, 'EVIDENCE_COMMIT_MISMATCH'],
+				];
+				for (const [input, expectedCode] of cases) {
+					let actualCode;
+					try { check(input); } catch (error) { actualCode = error.code; }
+					if (actualCode !== expectedCode) {
+						throw new Error('Unexpected release snapshot result: ' + String(actualCode));
+					}
+				}
+				check({ expectedCommit: head, headBefore: head, headAfter: head, statusBefore: '', statusAfter: '' });
+			`,
+		],
+		{ cwd: resolve('.'), encoding: 'utf8', shell: false },
+	);
+	assert.equal(result.status, 0, result.stderr);
+});
+
 test(
-	'test-mode case alias cannot replace stable release evidence',
+	'release-mode case alias cannot replace stable release evidence',
 	{ skip: process.platform !== 'darwin' ? 'macOS case-alias boundary.' : false },
 	async () => {
 		const stableRoot = resolve('artifacts', 'peer-delegation-e2e');
@@ -280,41 +312,17 @@ test(
 			return;
 		}
 		await withStableEvidencePreserved(async () => {
-			const root = await mkdtemp(join(resolve('.vscode-test'), 'case-alias-'));
-			try {
-				const child = spawn(
-					process.execPath,
-					[resolve('scripts/e2e/peer-delegation/enabled.mjs')],
-					{
-						cwd: resolve('.'),
-						env: {
-							...process.env,
-							MESH_PEER_DELEGATION_E2E: '1',
-							MESH_PEER_DELEGATION_E2E_TEST_MODE: '1',
-							MESH_PEER_DELEGATION_E2E_RUNTIME_DIR: join(root, 'runtime'),
-							MESH_PEER_DELEGATION_E2E_PROFILE_DIR: join(root, 'profile'),
-							MESH_PEER_DELEGATION_E2E_EVIDENCE_DIR: aliasRoot,
-						},
-						shell: false,
-						stdio: 'ignore',
-					},
-				);
-
-				const exitCode = await new Promise<number | null>((resolveExit, reject) => {
-					child.once('error', reject);
-					child.once('exit', resolveExit);
-				});
-				assert.notEqual(exitCode, 0);
-			} finally {
-				await rm(root, { recursive: true, force: true });
-			}
+			const result = await runReleasePreflightWithEvidenceRoot(aliasRoot);
+			assert.notEqual(result.exitCode, 0);
+			assert.match(result.stderr, /case alias|aliases the stable release directory/u);
 		});
 	},
 );
 
-for (const aliasKind of ['symlink', 'hardlink'] as const) {
-	test(
-		`test-mode ${aliasKind} cannot replace a stable release artifact`,
+for (const fileName of ['evidence.json', 'summary.md'] as const) {
+	for (const aliasKind of ['symlink', 'hardlink'] as const) {
+		test(
+		`release-mode ${fileName} ${aliasKind} cannot replace an external artifact`,
 		{ skip: process.platform === 'win32' ? 'POSIX link fixture.' : false },
 		async () => {
 			await withStableArtifactSentinels(async () => {
@@ -323,81 +331,86 @@ for (const aliasKind of ['symlink', 'hardlink'] as const) {
 				const root = await mkdtemp(join(parent, `${aliasKind}-alias-`));
 				const evidenceRoot = join(root, 'evidence');
 				await mkdir(evidenceRoot);
-				const aliasedSummary = join(evidenceRoot, 'summary.md');
+				const aliasedFile = join(evidenceRoot, fileName);
+				const target = fileName === 'evidence.json'
+					? releaseEvidencePath()
+					: releaseSummaryPath();
 				try {
 					if (aliasKind === 'symlink') {
-						await symlink(releaseSummaryPath(), aliasedSummary);
+						await symlink(target, aliasedFile);
 					} else {
-						await link(releaseSummaryPath(), aliasedSummary);
+						await link(target, aliasedFile);
 					}
-					const child = spawn(
-						process.execPath,
-						[resolve('scripts/e2e/peer-delegation/enabled.mjs')],
-						{
-							cwd: resolve('.'),
-							env: {
-								...process.env,
-								MESH_PEER_DELEGATION_E2E: '1',
-								MESH_PEER_DELEGATION_E2E_TEST_MODE: '1',
-								MESH_PEER_DELEGATION_E2E_RUNTIME_DIR: join(root, 'runtime'),
-								MESH_PEER_DELEGATION_E2E_PROFILE_DIR: join(root, 'profile'),
-								MESH_PEER_DELEGATION_E2E_EVIDENCE_DIR: evidenceRoot,
-							},
-							shell: false,
-							stdio: 'ignore',
-						},
+					const result = await runReleasePreflightWithEvidenceRoot(evidenceRoot);
+					assert.notEqual(result.exitCode, 0);
+					assert.match(
+						result.stderr,
+						/evidence file is aliased or unsafe/u,
 					);
-					const exitCode = await new Promise<number | null>((resolveExit, reject) => {
-						child.once('error', reject);
-						child.once('exit', resolveExit);
-					});
-					assert.notEqual(exitCode, 0);
-					await assert.rejects(
-						access(join(evidenceRoot, 'evidence.json')),
-						{ code: 'ENOENT' },
-					);
+					await access(aliasedFile);
 				} finally {
 					await rm(root, { recursive: true, force: true });
 				}
 			});
 		},
-	);
+		);
+	}
 }
 
 test(
-	'test-mode ancestor symlink cannot create or replace stable release evidence',
+	'release-mode ancestor symlink cannot create or replace stable release evidence',
 	{ skip: process.platform === 'win32' ? 'POSIX symlink fixture.' : false },
 	async () => {
 		await withStableArtifactSentinels(async () => {
 			const parent = resolve('.vscode-test', 'peer-process-ownership');
 			await mkdir(parent, { recursive: true });
 			const root = await mkdtemp(join(parent, 'ancestor-alias-'));
+			const externalRoot = join(root, 'external');
+			const externalEvidenceRoot = join(externalRoot, 'peer-delegation-e2e');
 			const artifactsAlias = join(root, 'artifacts-alias');
-			await symlink(resolve('artifacts'), artifactsAlias);
+			await mkdir(externalEvidenceRoot, { recursive: true });
+			const externalEvidence = join(externalEvidenceRoot, 'evidence.json');
+			const externalSummary = join(externalEvidenceRoot, 'summary.md');
+			await writeFile(externalEvidence, 'external evidence sentinel\n');
+			await writeFile(externalSummary, 'external summary sentinel\n');
+			await symlink(externalRoot, artifactsAlias);
 			try {
-				const child = spawn(
-					process.execPath,
-					[resolve('scripts/e2e/peer-delegation/enabled.mjs')],
-					{
-						cwd: resolve('.'),
-						env: {
-							...process.env,
-							MESH_PEER_DELEGATION_E2E: '1',
-							MESH_PEER_DELEGATION_E2E_TEST_MODE: '1',
-							MESH_PEER_DELEGATION_E2E_RUNTIME_DIR: join(root, 'runtime'),
-							MESH_PEER_DELEGATION_E2E_PROFILE_DIR: join(root, 'profile'),
-							MESH_PEER_DELEGATION_E2E_EVIDENCE_DIR:
-								join(artifactsAlias, 'peer-delegation-e2e'),
-						},
-						shell: false,
-						stdio: 'ignore',
-					},
+				const result = await runReleasePreflightWithEvidenceRoot(
+					join(artifactsAlias, 'peer-delegation-e2e'),
 				);
-				const exitCode = await new Promise<number | null>((resolveExit, reject) => {
-					child.once('error', reject);
-					child.once('exit', resolveExit);
-				});
-				assert.notEqual(exitCode, 0);
+				assert.notEqual(result.exitCode, 0);
+				assert.match(result.stderr, /must not contain symbolic links/u);
+				assert.equal(await readFile(externalEvidence, 'utf8'), 'external evidence sentinel\n');
+				assert.equal(await readFile(externalSummary, 'utf8'), 'external summary sentinel\n');
+			} finally {
+				await rm(root, { recursive: true, force: true });
+			}
+		});
+	},
+);
+
+test(
+	'release-mode evidence-root symlink cannot modify its external target',
+	{ skip: process.platform === 'win32' ? 'POSIX symlink fixture.' : false },
+	async () => {
+		await withStableEvidencePreserved(async () => {
+			const parent = resolve('.vscode-test', 'peer-process-ownership');
+			await mkdir(parent, { recursive: true });
+			const root = await mkdtemp(join(parent, 'root-alias-'));
+			const target = join(root, 'external-target');
+			const alias = join(root, 'evidence-alias');
+			await mkdir(target);
+			const targetEvidence = join(target, 'evidence.json');
+			const targetSummary = join(target, 'summary.md');
+			await writeFile(targetEvidence, 'external evidence sentinel\n');
+			await writeFile(targetSummary, 'external summary sentinel\n');
+			await symlink(target, alias);
+			try {
+				const result = await runReleasePreflightWithEvidenceRoot(alias);
+				assert.notEqual(result.exitCode, 0);
+				assert.match(result.stderr, /must not contain symbolic links/u);
+				assert.equal(await readFile(targetEvidence, 'utf8'), 'external evidence sentinel\n');
+				assert.equal(await readFile(targetSummary, 'utf8'), 'external summary sentinel\n');
 			} finally {
 				await rm(root, { recursive: true, force: true });
 			}
@@ -665,6 +678,43 @@ async function assertReleaseValidatorRejects(path: string): Promise<void> {
 		);
 		assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
 	}
+}
+
+async function runReleasePreflightWithEvidenceRoot(
+	evidenceRoot: string,
+): Promise<{ readonly exitCode: number | null; readonly stderr: string }> {
+	const helperUrl = pathToFileURL(
+		resolve('scripts/e2e/peer-delegation/evidence-path.mjs'),
+	).href;
+	const child = spawn(
+		process.execPath,
+		[
+			'--input-type=module',
+			'--eval',
+			`
+				import { resolvePeerDelegationEvidenceDestination as preflight } from ${JSON.stringify(helperUrl)};
+				await preflight({
+					repositoryRoot: ${JSON.stringify(resolve('.'))},
+					configuredRoot: ${JSON.stringify(evidenceRoot)},
+				});
+			`,
+		],
+		{
+			cwd: resolve('.'),
+			env: process.env,
+			shell: false,
+			stdio: ['ignore', 'ignore', 'pipe'],
+		},
+	);
+	let stderr = '';
+	child.stderr?.setEncoding('utf8');
+	child.stderr?.on('data', (chunk: string) => {
+		stderr += chunk;
+	});
+	return new Promise((resolveExit, reject) => {
+		child.once('error', reject);
+		child.once('exit', (exitCode) => resolveExit({ exitCode, stderr }));
+	});
 }
 
 function releaseEvidencePath(): string {

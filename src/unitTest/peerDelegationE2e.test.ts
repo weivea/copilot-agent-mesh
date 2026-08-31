@@ -219,6 +219,10 @@ test('0.4.0 release metadata keeps the real peer gate default-off and five-tool 
 		resolve(root, 'scripts/e2e/peer-delegation/validate.mjs'),
 		'utf8',
 	);
+	const harness = readFileSync(
+		resolve(root, 'scripts/e2e/peer-delegation/enabled.mjs'),
+		'utf8',
+	);
 	assert.equal(manifest.version, '0.4.0');
 	assert.equal(
 		manifest.scripts['test:peer-delegation-real'],
@@ -238,7 +242,14 @@ test('0.4.0 release metadata keeps the real peer gate default-off and five-tool 
 			< wrapper.indexOf('const result = spawnSync'),
 		'The exact environment gate must run before any compile or launch command.',
 	);
-	assert.match(wrapper, /rmSync[\s\S]*evidence\.json/u);
+	assert.match(
+		wrapper,
+		/assertCleanCommittedReleaseSnapshot[\s\S]*resolvePeerDelegationEvidenceDestination[\s\S]*rmSync\(evidence\.evidencePath[\s\S]*resolvePeerDelegationEvidenceDestination[\s\S]*rmSync\(evidence\.summaryPath/u,
+	);
+	assert.match(
+		harness,
+		/async function installEvidenceTemporary[\s\S]*revalidateEvidenceDestination[\s\S]*await rename/u,
+	);
 	assert.match(validator, /evidence\.gitCommit !== head/u);
 	assert.match(validator, /status\.length !== 0/u);
 });

@@ -1,6 +1,9 @@
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+	resolvePeerDelegationEvidenceDestination,
+} from './evidence-path.mjs';
 
 const runId = process.argv[2];
 const confirmation = process.argv[3];
@@ -19,16 +22,44 @@ if (observation !== 'session-visible' && observation !== 'session-not-visible') 
 }
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptDirectory, '../../..');
-const evidenceRoot = join(repositoryRoot, 'artifacts', 'peer-delegation-e2e');
+const fileName = `attestation-${runId}.json`;
+const destination = await resolvePeerDelegationEvidenceDestination({
+	repositoryRoot,
+	configuredRoot: process.env.MESH_PEER_DELEGATION_E2E_EVIDENCE_DIR,
+	additionalFileNames: [fileName],
+});
+const evidenceRoot = destination.root;
 await mkdir(evidenceRoot, { recursive: true });
-await writeFile(
-	join(evidenceRoot, `attestation-${runId}.json`),
-	`${JSON.stringify({
-		schemaVersion: 1,
-		runId,
-		confirmationAcceptedOnce: true,
-		targetSessionVisible: observation === 'session-visible',
-	})}\n`,
-	{ encoding: 'utf8', mode: 0o600 },
-);
+await resolvePeerDelegationEvidenceDestination({
+	repositoryRoot,
+	configuredRoot: evidenceRoot,
+	additionalFileNames: [fileName],
+});
+const attestationPath = join(evidenceRoot, fileName);
+const temporaryPath = `${attestationPath}.${process.pid}.tmp`;
+try {
+	await resolvePeerDelegationEvidenceDestination({
+		repositoryRoot,
+		configuredRoot: evidenceRoot,
+		additionalFileNames: [fileName, `${fileName}.${process.pid}.tmp`],
+	});
+	await writeFile(
+		temporaryPath,
+		`${JSON.stringify({
+			schemaVersion: 1,
+			runId,
+			confirmationAcceptedOnce: true,
+			targetSessionVisible: observation === 'session-visible',
+		})}\n`,
+		{ encoding: 'utf8', mode: 0o600, flag: 'wx' },
+	);
+	await resolvePeerDelegationEvidenceDestination({
+		repositoryRoot,
+		configuredRoot: evidenceRoot,
+		additionalFileNames: [fileName, `${fileName}.${process.pid}.tmp`],
+	});
+	await rename(temporaryPath, attestationPath);
+} finally {
+	await rm(temporaryPath, { force: true });
+}
 console.log(JSON.stringify({ recorded: true, runId, observation }));

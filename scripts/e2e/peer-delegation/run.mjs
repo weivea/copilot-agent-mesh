@@ -2,6 +2,10 @@ import { spawnSync } from 'node:child_process';
 import { rmSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+	assertCleanCommittedReleaseSnapshot,
+	resolvePeerDelegationEvidenceDestination,
+} from './evidence-path.mjs';
 
 const environmentVariable = 'MESH_PEER_DELEGATION_E2E';
 if (process.env[environmentVariable] !== '1') {
@@ -21,10 +25,31 @@ if (process.platform !== 'darwin' || process.arch !== 'arm64') {
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptDirectory, '../../..');
-const evidenceRoot = resolve(repositoryRoot, 'artifacts', 'peer-delegation-e2e');
-for (const name of ['evidence.json', 'summary.md']) {
-	rmSync(resolve(evidenceRoot, name), { force: true });
-}
+const evidence = await resolvePeerDelegationEvidenceDestination({
+	repositoryRoot,
+	configuredRoot: process.env.MESH_PEER_DELEGATION_E2E_EVIDENCE_DIR,
+});
+const headBefore = runGit(['rev-parse', 'HEAD']);
+const statusBefore = runGit(['status', '--porcelain=v1', '--untracked-files=all']);
+const statusAfter = runGit(['status', '--porcelain=v1', '--untracked-files=all']);
+const headAfter = runGit(['rev-parse', 'HEAD']);
+assertCleanCommittedReleaseSnapshot({
+	expectedCommit: headBefore,
+	headBefore,
+	headAfter,
+	statusBefore,
+	statusAfter,
+});
+await resolvePeerDelegationEvidenceDestination({
+	repositoryRoot,
+	configuredRoot: evidence.root,
+});
+rmSync(evidence.evidencePath, { force: true });
+await resolvePeerDelegationEvidenceDestination({
+	repositoryRoot,
+	configuredRoot: evidence.root,
+});
+rmSync(evidence.summaryPath, { force: true });
 for (const script of ['compile-tests', 'compile']) {
 	const result = spawnSync(npmCommand(), ['run', script], {
 		cwd: repositoryRoot,
@@ -40,6 +65,22 @@ for (const script of ['compile-tests', 'compile']) {
 	}
 }
 await import('./enabled.mjs');
+
+function runGit(args) {
+	const result = spawnSync('git', args, {
+		cwd: repositoryRoot,
+		encoding: 'utf8',
+		maxBuffer: 1024 * 1024,
+		shell: false,
+	});
+	if (result.error !== undefined) {
+		throw result.error;
+	}
+	if (result.status !== 0) {
+		throw new Error(`git ${args.join(' ')} failed with exit code ${result.status ?? 'unknown'}.`);
+	}
+	return result.stdout.trim();
+}
 
 function npmCommand() {
 	return process.platform === 'win32' ? 'npm.cmd' : 'npm';

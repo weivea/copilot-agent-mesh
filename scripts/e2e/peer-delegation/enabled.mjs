@@ -32,6 +32,10 @@ import {
 	downloadAndUnzipVSCode,
 	resolveCliPathFromVSCodeExecutablePath,
 } from '@vscode/test-electron';
+import {
+	assertCleanCommittedReleaseSnapshot,
+	resolvePeerDelegationEvidenceDestination,
+} from './evidence-path.mjs';
 
 const environmentPrefix = 'MESH_PEER_DELEGATION_E2E';
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
@@ -61,6 +65,14 @@ class E2eRequestError extends Error {
 		this.action = action;
 		this.code = code;
 	}
+}
+
+function revalidateEvidenceDestination(additionalFileNames = []) {
+	return resolvePeerDelegationEvidenceDestination({
+		repositoryRoot,
+		configuredRoot: evidenceRoot,
+		additionalFileNames,
+	});
 }
 
 const testMode = process.env[`${environmentPrefix}_TEST_MODE`] === '1';
@@ -103,11 +115,13 @@ const sentinelPath = join(runRoot, 'devtunnel-sentinel');
 const sentinelInvocationPath = join(runRoot, 'devtunnel-invoked.json');
 const configuredEvidenceRoot = process.env[`${environmentPrefix}_EVIDENCE_DIR`];
 const releaseEvidenceRoot = join(repositoryRoot, 'artifacts', 'peer-delegation-e2e');
-const evidenceRoot = configuredEvidenceRoot === undefined
-	? releaseEvidenceRoot
-	: resolve(configuredEvidenceRoot);
-const evidencePath = join(evidenceRoot, 'evidence.json');
-const summaryPath = join(evidenceRoot, 'summary.md');
+const evidenceDestination = await resolvePeerDelegationEvidenceDestination({
+	repositoryRoot,
+	configuredRoot: configuredEvidenceRoot,
+});
+const evidenceRoot = evidenceDestination.root;
+const evidencePath = evidenceDestination.evidencePath;
+const summaryPath = evidenceDestination.summaryPath;
 const attestationPath = join(evidenceRoot, `attestation-${runId}.json`);
 const manualUi = process.env[`${environmentPrefix}_MANUAL_UI`] !== '0';
 const testTerminationLogPath = testMode
@@ -469,6 +483,8 @@ async function persistEvidenceArtifact(rawEvidence) {
 	}
 	if (testMode) {
 		await assertSafeTestEvidenceDestination();
+	} else {
+		await revalidateEvidenceDestination();
 	}
 	await mkdir(evidenceRoot, { recursive: true });
 	if (testMode) {
@@ -534,21 +550,25 @@ async function persistEvidenceArtifact(rawEvidence) {
 	}
 	try {
 		const parsed = parsePeerDelegationEvidence(rawEvidence);
-		const evidenceTemporary = await writeJsonTemporary(evidencePath, parsed);
-		const summaryTemporary = await writeTextTemporary(
-			summaryPath,
-			renderSummary(parsed),
-		);
+		let evidenceTemporary;
+		let summaryTemporary;
 		try {
+			evidenceTemporary = await writeJsonTemporary(evidencePath, parsed);
+			summaryTemporary = await writeTextTemporary(
+				summaryPath,
+				renderSummary(parsed),
+			);
 			assertReleaseEvidenceTree(parsed.gitCommit);
-			await rename(summaryTemporary, summaryPath);
+			await installEvidenceTemporary(summaryTemporary, summaryPath);
+			summaryTemporary = undefined;
 			assertReleaseEvidenceTree(parsed.gitCommit);
-			await rename(evidenceTemporary, evidencePath);
+			await installEvidenceTemporary(evidenceTemporary, evidencePath);
+			evidenceTemporary = undefined;
 			assertReleaseEvidenceTree(parsed.gitCommit);
 		} catch (error) {
 			await Promise.all([
-				rm(evidenceTemporary, { force: true }),
-				rm(summaryTemporary, { force: true }),
+				removeOptionalTemporary(evidenceTemporary),
+				removeOptionalTemporary(summaryTemporary),
 			]);
 			await writeJsonAtomic(evidencePath, diagnostic);
 			await writeTextAtomic(summaryPath, renderDiagnosticSummary(diagnostic));
@@ -569,30 +589,67 @@ async function persistEvidenceArtifact(rawEvidence) {
 
 async function writeJsonAtomic(path, value) {
 	const temporary = await writeJsonTemporary(path, value);
-	await rename(temporary, path);
+	try {
+		await installEvidenceTemporary(temporary, path);
+	} finally {
+		await rm(temporary, { force: true });
+	}
 }
 
 async function writeTextAtomic(path, value) {
 	const temporary = await writeTextTemporary(path, value);
-	await rename(temporary, path);
+	try {
+		await installEvidenceTemporary(temporary, path);
+	} finally {
+		await rm(temporary, { force: true });
+	}
 }
 
 async function writeTextTemporary(path, value) {
-	const temporary = `${path}.${process.pid}.${runLabel}.tmp`;
+	await assertEvidenceWritePath(path);
+	const temporary = `${path}.${process.pid}.${runLabel}.${randomUUID()}.tmp`;
+	await revalidateEvidenceDestination([basename(path), basename(temporary)]);
 	await writeFile(temporary, value, {
 		encoding: 'utf8',
 		mode: 0o600,
+		flag: 'wx',
 	});
 	return temporary;
 }
 
 async function writeJsonTemporary(path, value) {
-	const temporary = `${path}.${process.pid}.${runLabel}.tmp`;
+	await assertEvidenceWritePath(path);
+	const temporary = `${path}.${process.pid}.${runLabel}.${randomUUID()}.tmp`;
+	await revalidateEvidenceDestination([basename(path), basename(temporary)]);
 	await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, {
 		encoding: 'utf8',
 		mode: 0o600,
+		flag: 'wx',
 	});
 	return temporary;
+}
+
+async function installEvidenceTemporary(temporary, destination) {
+	await assertEvidenceWritePath(destination);
+	if (dirname(temporary) !== evidenceRoot) {
+		throw new Error('The peer-delegation evidence temporary escaped its directory.');
+	}
+	await revalidateEvidenceDestination([
+		basename(destination),
+		basename(temporary),
+	]);
+	await rename(temporary, destination);
+}
+
+async function assertEvidenceWritePath(path) {
+	if (dirname(path) !== evidenceRoot) {
+		throw new Error('The peer-delegation evidence write escaped its directory.');
+	}
+	await revalidateEvidenceDestination([basename(path)]);
+}
+
+function removeOptionalTemporary(path) {
+	return path === undefined ? Promise.resolve() : rm(path, { force: true });
 }
 
 function assertReleaseEvidenceTree(expectedCommit) {
@@ -600,18 +657,13 @@ function assertReleaseEvidenceTree(expectedCommit) {
 	const headBefore = runGit(['rev-parse', 'HEAD']);
 	const statusAfter = runGit(['status', '--porcelain=v1', '--untracked-files=all']);
 	const headAfter = runGit(['rev-parse', 'HEAD']);
-	if (statusBefore.length !== 0 || statusAfter.length !== 0) {
-		throw Object.assign(
-			new Error('Full release evidence requires a clean committed tree.'),
-			{ code: 'WORKTREE_DIRTY' },
-		);
-	}
-	if (headBefore !== expectedCommit || headAfter !== expectedCommit) {
-		throw Object.assign(
-			new Error('Full release evidence must match the current committed HEAD.'),
-			{ code: 'EVIDENCE_COMMIT_MISMATCH' },
-		);
-	}
+	assertCleanCommittedReleaseSnapshot({
+		expectedCommit,
+		headBefore,
+		headAfter,
+		statusBefore,
+		statusAfter,
+	});
 }
 
 function diagnosticFailureCode(rawEvidence) {
@@ -734,9 +786,12 @@ async function releaseProfileLock() {
 }
 
 async function prepareRun() {
+	await revalidateEvidenceDestination([basename(attestationPath)]);
 	if (persistentProfile) {
 		await rm(meshGlobalStorageDirectory, { recursive: true, force: true });
 	}
+	await mkdir(evidenceRoot, { recursive: true });
+	await revalidateEvidenceDestination([basename(attestationPath)]);
 	await Promise.all([
 		mkdir(join(userDataDirectory, 'User'), { recursive: true }),
 		mkdir(extensionsDirectory, { recursive: true }),
@@ -744,7 +799,6 @@ async function prepareRun() {
 		mkdir(logsDirectory, { recursive: true }),
 		mkdir(sourceWorkspacePath, { recursive: true }),
 		mkdir(targetWorkspacePath, { recursive: true }),
-		mkdir(evidenceRoot, { recursive: true }),
 	]);
 	await Promise.all([
 		writeFile(
@@ -767,6 +821,7 @@ async function prepareRun() {
 	await writeFile(sentinelPath, sentinel, { encoding: 'utf8', mode: 0o700 });
 	await chmod(sentinelPath, 0o700);
 	sentinelDigest = createHash('sha256').update(sentinel).digest('hex');
+	await revalidateEvidenceDestination([basename(attestationPath)]);
 	await rm(attestationPath, { force: true });
 }
 
@@ -1397,6 +1452,7 @@ async function readUiAttestation() {
 	const deadline = Date.now() + 5 * 60_000;
 	while (Date.now() < deadline) {
 		try {
+			await revalidateEvidenceDestination([basename(attestationPath)]);
 			const value = JSON.parse(await readFile(attestationPath, 'utf8'));
 			if (
 				value.schemaVersion === 1
@@ -1806,10 +1862,11 @@ async function closeLogStreams() {
 async function saveSanitizedLogs() {
 	for (const record of launchRecords) {
 		const raw = await readFile(record.logPath, 'utf8').catch(() => '');
-		await writeFile(
-			join(evidenceRoot, `${runId}-${basename(record.logPath)}`),
+		const name = `${runId}-${basename(record.logPath)}`;
+		await revalidateEvidenceDestination([name]);
+		await writeTextAtomic(
+			join(evidenceRoot, name),
 			sanitize(raw),
-			{ encoding: 'utf8', mode: 0o600 },
 		);
 	}
 }
@@ -1929,6 +1986,7 @@ async function assertSafeTestEvidenceDestination() {
 		return;
 	}
 	try {
+		await revalidateEvidenceDestination();
 		await assertTestEvidenceIsolation();
 		await assertNoSymlinkAlias(evidenceRoot, 'evidence directory');
 	} catch (error) {
