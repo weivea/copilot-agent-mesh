@@ -92,6 +92,12 @@ validation fails, the diagnostic remains at the stable evidence path with the
 original stable error code and `outcome: fail`. Active Broker task states are
 normalized to `not-observed` rather than copied into terminal-only fields.
 
+`MESH_PEER_DELEGATION_E2E_TEST_MODE` is internal to subprocess tests. It cannot be
+used through `npm run test:peer-delegation-real`, requires an isolated evidence
+directory, records the actual process OS/architecture with `testMode: true`, and
+emits only a `test-diagnostic` artifact. Both release validator modes reject that
+artifact, and test mode cannot replace the stable release evidence file.
+
 O1 is Pass only when the task Session hash appears in the editor `listSessions`
 catalog and the target UI is visibly observed. O2 is Pass only after a genuine
 60-minute Copilot Tool call; shorter runs are recorded as shorter-duration-only.

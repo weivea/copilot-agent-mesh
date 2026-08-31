@@ -435,6 +435,41 @@ export const peerDelegationDiagnosticEvidenceSchema = z.strictObject({
 export type PeerDelegationDiagnosticEvidence = z.infer<
 	typeof peerDelegationDiagnosticEvidenceSchema
 >;
+
+export const peerDelegationTestDiagnosticEvidenceSchema = z.strictObject({
+	schemaVersion: z.literal(1),
+	kind: z.literal('test-diagnostic'),
+	testMode: z.literal(true),
+	release: z.literal('0.4.0-preview'),
+	runId: uuid,
+	outcome: z.literal('fail'),
+	gitCommit: z.string().regex(/^[a-f0-9]{40}$/u),
+	startedAt: timestamp,
+	finishedAt: timestamp,
+	durationMs: nonNegativeInteger,
+	platform: z.strictObject({
+		os: z.string().min(1).max(32),
+		architecture: z.string().min(1).max(32),
+	}),
+	simulation: z.strictObject({
+		os: z.string().min(1).max(32).optional(),
+		architecture: z.string().min(1).max(32).optional(),
+		dirtyTree: z.boolean(),
+	}),
+	failure: z.strictObject({
+		code: stableCode,
+		message: z.string().min(1).max(512),
+	}),
+	validation: z.strictObject({
+		code: z.enum([
+			'EVIDENCE_VALIDATION_FAILED',
+			'TEST_MODE_NOT_RELEASE_EVIDENCE',
+		]),
+	}),
+});
+export type PeerDelegationTestDiagnosticEvidence = z.infer<
+	typeof peerDelegationTestDiagnosticEvidenceSchema
+>;
 export type PeerDelegationEvidenceArtifact =
 	| PeerDelegationEvidence
 	| PeerDelegationDiagnosticEvidence;
@@ -488,6 +523,56 @@ export function createPeerDelegationDiagnosticEvidence(input: {
 			code: 'EVIDENCE_VALIDATION_FAILED',
 		},
 	});
+}
+
+export function createPeerDelegationTestDiagnosticEvidence(input: {
+	readonly runId: string;
+	readonly gitCommit: string;
+	readonly startedAt: string;
+	readonly finishedAt: string;
+	readonly durationMs: number;
+	readonly platform: {
+		readonly os: string;
+		readonly architecture: string;
+	};
+	readonly simulation: {
+		readonly os?: string;
+		readonly architecture?: string;
+		readonly dirtyTree: boolean;
+	};
+	readonly failureCode: string;
+	readonly validationFailed: boolean;
+}): PeerDelegationTestDiagnosticEvidence {
+	return peerDelegationTestDiagnosticEvidenceSchema.parse({
+		schemaVersion: 1,
+		kind: 'test-diagnostic',
+		testMode: true,
+		release: '0.4.0-preview',
+		runId: input.runId,
+		outcome: 'fail',
+		gitCommit: input.gitCommit,
+		startedAt: input.startedAt,
+		finishedAt: input.finishedAt,
+		durationMs: input.durationMs,
+		platform: input.platform,
+		simulation: input.simulation,
+		failure: {
+			code: input.failureCode,
+			message: 'Internal peer-delegation fixture diagnostic; not release evidence.',
+		},
+		validation: {
+			code: input.validationFailed
+				? 'EVIDENCE_VALIDATION_FAILED'
+				: 'TEST_MODE_NOT_RELEASE_EVIDENCE',
+		},
+	});
+}
+
+export function parsePeerDelegationTestDiagnosticEvidence(
+	value: unknown,
+): PeerDelegationTestDiagnosticEvidence {
+	assertEvidenceContentSafe(value);
+	return peerDelegationTestDiagnosticEvidenceSchema.parse(value);
 }
 
 export function assertPassingPeerDelegationEvidence(value: unknown): PeerDelegationEvidence {

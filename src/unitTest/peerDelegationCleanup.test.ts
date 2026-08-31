@@ -2,11 +2,14 @@ import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import {
 	access,
+	link,
 	mkdir,
 	mkdtemp,
 	readFile,
 	readdir,
 	rm,
+	stat,
+	symlink,
 	writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -15,7 +18,7 @@ import { test } from 'node:test';
 
 import { runPeerDelegationCleanupPhases } from '../e2e/PeerDelegationCleanup';
 import {
-	parsePeerDelegationEvidenceArtifact,
+	parsePeerDelegationTestDiagnosticEvidence,
 } from '../e2e/PeerDelegationEvidence';
 import {
 	PeerDelegationProcessTracker,
@@ -105,16 +108,18 @@ for (const scenario of ['lock-conflict', 'idle-conflict'] as const) {
 		async () => {
 			const fixture = await persistentProfileFixture(scenario);
 			try {
+				const releaseBefore = await readOptionalFile(releaseEvidencePath());
 				const result = await fixture.run();
 				assert.notEqual(result.exitCode, 0);
 				assert.equal(processAlive(fixture.foreignPid), true);
 				await assert.rejects(access(fixture.terminationLog), { code: 'ENOENT' });
 				assert.deepEqual(await peerRunDirectories(fixture.runtimeRoot), []);
-				const artifact = parsePeerDelegationEvidenceArtifact(
+				const artifact = parsePeerDelegationTestDiagnosticEvidence(
 					JSON.parse(await readFile(fixture.evidencePath, 'utf8')),
 				);
+				assert.equal(artifact.kind, 'test-diagnostic');
+				assert.equal(artifact.testMode, true);
 				assert.equal(artifact.outcome, 'fail');
-				assert.ok(artifact.failure);
 				assert.equal(
 					artifact.failure.code,
 					scenario === 'lock-conflict' ? 'PROFILE_LOCKED' : 'PROFILE_IN_USE',
@@ -125,6 +130,8 @@ for (const scenario of ['lock-conflict', 'idle-conflict'] as const) {
 				} else {
 					await assert.rejects(access(fixture.lockRoot), { code: 'ENOENT' });
 				}
+				assert.deepEqual(await readOptionalFile(releaseEvidencePath()), releaseBefore);
+				await assertReleaseValidatorRejects(fixture.evidencePath);
 			} finally {
 				await fixture.dispose();
 			}
@@ -139,25 +146,264 @@ for (const injection of ['schema', 'safety'] as const) {
 		async () => {
 			const fixture = await persistentProfileFixture('idle-conflict', injection);
 			try {
+				const releaseBefore = await readOptionalFile(releaseEvidencePath());
 				const result = await fixture.run();
 				assert.notEqual(result.exitCode, 0);
 				assert.equal(processAlive(fixture.foreignPid), true);
 				await assert.rejects(access(fixture.terminationLog), { code: 'ENOENT' });
 				assert.deepEqual(await peerRunDirectories(fixture.runtimeRoot), []);
-				const artifact = parsePeerDelegationEvidenceArtifact(
+				const artifact = parsePeerDelegationTestDiagnosticEvidence(
 					JSON.parse(await readFile(fixture.evidencePath, 'utf8')),
 				);
-				assert.ok('kind' in artifact);
-				assert.equal(artifact.kind, 'diagnostic');
+				assert.equal(artifact.kind, 'test-diagnostic');
+				assert.equal(artifact.testMode, true);
 				assert.equal(artifact.outcome, 'fail');
 				assert.equal(artifact.failure.code, 'PROFILE_IN_USE');
 				assert.equal(artifact.validation.code, 'EVIDENCE_VALIDATION_FAILED');
+				assert.deepEqual(await readOptionalFile(releaseEvidencePath()), releaseBefore);
+				await assertReleaseValidatorRejects(fixture.evidencePath);
 			} finally {
 				await fixture.dispose();
 			}
 		},
 	);
 }
+
+test(
+	'test mode records actual platform and dirty/unsupported simulation without release evidence',
+	{ skip: process.platform === 'win32' ? 'POSIX process ownership is the supported real harness boundary.' : false },
+	async () => {
+		const fixture = await persistentProfileFixture(
+			'lock-conflict',
+			undefined,
+			{
+				os: 'linux',
+				architecture: 'x64',
+				dirtyTree: true,
+			},
+		);
+		try {
+			const releaseBefore = await readOptionalFile(releaseEvidencePath());
+			const result = await fixture.run();
+			assert.notEqual(result.exitCode, 0);
+			const artifact = parsePeerDelegationTestDiagnosticEvidence(
+				JSON.parse(await readFile(fixture.evidencePath, 'utf8')),
+			);
+			assert.deepEqual(artifact.platform, {
+				os: process.platform,
+				architecture: process.arch,
+			});
+			assert.deepEqual(artifact.simulation, {
+				os: 'linux',
+				architecture: 'x64',
+				dirtyTree: true,
+			});
+			assert.deepEqual(await readOptionalFile(releaseEvidencePath()), releaseBefore);
+			await assertReleaseValidatorRejects(fixture.evidencePath);
+		} finally {
+			await fixture.dispose();
+		}
+	},
+);
+
+test('release wrapper rejects test mode before touching stable evidence', async () => {
+	await withStableEvidencePreserved(async () => {
+		const child = spawn(
+			process.execPath,
+			[resolve('scripts/e2e/peer-delegation/run.mjs')],
+			{
+				cwd: resolve('.'),
+				env: {
+					...process.env,
+					MESH_PEER_DELEGATION_E2E: '1',
+					MESH_PEER_DELEGATION_E2E_TEST_MODE: '1',
+				},
+				shell: false,
+				stdio: 'ignore',
+			},
+		);
+		const exitCode = await new Promise<number | null>((resolveExit, reject) => {
+			child.once('error', reject);
+			child.once('exit', resolveExit);
+		});
+		assert.notEqual(exitCode, 0);
+	});
+});
+
+test(
+	'unsupported actual platform rejects before touching stable evidence',
+	{
+		skip: process.platform === 'darwin' && process.arch === 'arm64'
+			? 'This runner is the supported release platform.'
+			: false,
+	},
+	async () => {
+		await withStableEvidencePreserved(async () => {
+			const child = spawn(
+				process.execPath,
+				[resolve('scripts/e2e/peer-delegation/run.mjs')],
+				{
+					cwd: resolve('.'),
+					env: {
+						...process.env,
+						MESH_PEER_DELEGATION_E2E: '1',
+					},
+					shell: false,
+					stdio: 'ignore',
+				},
+			);
+			const exitCode = await new Promise<number | null>((resolveExit, reject) => {
+				child.once('error', reject);
+				child.once('exit', resolveExit);
+			});
+			assert.notEqual(exitCode, 0);
+		});
+	},
+);
+
+test(
+	'test-mode case alias cannot replace stable release evidence',
+	{ skip: process.platform !== 'darwin' ? 'macOS case-alias boundary.' : false },
+	async () => {
+		const stableRoot = resolve('artifacts', 'peer-delegation-e2e');
+		const aliasRoot = resolve('ARTIFACTS', 'PEER-DELEGATION-E2E');
+		await mkdir(stableRoot, { recursive: true });
+		const [stableStat, aliasStat] = await Promise.all([
+			access(stableRoot).then(() => stat(stableRoot)),
+			access(aliasRoot).then(() => stat(aliasRoot)).catch(() => undefined),
+		]);
+		if (
+			aliasStat === undefined
+			|| stableStat.dev !== aliasStat.dev
+			|| stableStat.ino !== aliasStat.ino
+		) {
+			return;
+		}
+		await withStableEvidencePreserved(async () => {
+			const root = await mkdtemp(join(resolve('.vscode-test'), 'case-alias-'));
+			try {
+				const child = spawn(
+					process.execPath,
+					[resolve('scripts/e2e/peer-delegation/enabled.mjs')],
+					{
+						cwd: resolve('.'),
+						env: {
+							...process.env,
+							MESH_PEER_DELEGATION_E2E: '1',
+							MESH_PEER_DELEGATION_E2E_TEST_MODE: '1',
+							MESH_PEER_DELEGATION_E2E_RUNTIME_DIR: join(root, 'runtime'),
+							MESH_PEER_DELEGATION_E2E_PROFILE_DIR: join(root, 'profile'),
+							MESH_PEER_DELEGATION_E2E_EVIDENCE_DIR: aliasRoot,
+						},
+						shell: false,
+						stdio: 'ignore',
+					},
+				);
+
+				const exitCode = await new Promise<number | null>((resolveExit, reject) => {
+					child.once('error', reject);
+					child.once('exit', resolveExit);
+				});
+				assert.notEqual(exitCode, 0);
+			} finally {
+				await rm(root, { recursive: true, force: true });
+			}
+		});
+	},
+);
+
+for (const aliasKind of ['symlink', 'hardlink'] as const) {
+	test(
+		`test-mode ${aliasKind} cannot replace a stable release artifact`,
+		{ skip: process.platform === 'win32' ? 'POSIX link fixture.' : false },
+		async () => {
+			await withStableArtifactSentinels(async () => {
+				const parent = resolve('.vscode-test', 'peer-process-ownership');
+				await mkdir(parent, { recursive: true });
+				const root = await mkdtemp(join(parent, `${aliasKind}-alias-`));
+				const evidenceRoot = join(root, 'evidence');
+				await mkdir(evidenceRoot);
+				const aliasedSummary = join(evidenceRoot, 'summary.md');
+				try {
+					if (aliasKind === 'symlink') {
+						await symlink(releaseSummaryPath(), aliasedSummary);
+					} else {
+						await link(releaseSummaryPath(), aliasedSummary);
+					}
+					const child = spawn(
+						process.execPath,
+						[resolve('scripts/e2e/peer-delegation/enabled.mjs')],
+						{
+							cwd: resolve('.'),
+							env: {
+								...process.env,
+								MESH_PEER_DELEGATION_E2E: '1',
+								MESH_PEER_DELEGATION_E2E_TEST_MODE: '1',
+								MESH_PEER_DELEGATION_E2E_RUNTIME_DIR: join(root, 'runtime'),
+								MESH_PEER_DELEGATION_E2E_PROFILE_DIR: join(root, 'profile'),
+								MESH_PEER_DELEGATION_E2E_EVIDENCE_DIR: evidenceRoot,
+							},
+							shell: false,
+							stdio: 'ignore',
+						},
+					);
+					const exitCode = await new Promise<number | null>((resolveExit, reject) => {
+						child.once('error', reject);
+						child.once('exit', resolveExit);
+					});
+					assert.notEqual(exitCode, 0);
+					await assert.rejects(
+						access(join(evidenceRoot, 'evidence.json')),
+						{ code: 'ENOENT' },
+					);
+				} finally {
+					await rm(root, { recursive: true, force: true });
+				}
+			});
+		},
+	);
+}
+
+test(
+	'test-mode ancestor symlink cannot create or replace stable release evidence',
+	{ skip: process.platform === 'win32' ? 'POSIX symlink fixture.' : false },
+	async () => {
+		await withStableArtifactSentinels(async () => {
+			const parent = resolve('.vscode-test', 'peer-process-ownership');
+			await mkdir(parent, { recursive: true });
+			const root = await mkdtemp(join(parent, 'ancestor-alias-'));
+			const artifactsAlias = join(root, 'artifacts-alias');
+			await symlink(resolve('artifacts'), artifactsAlias);
+			try {
+				const child = spawn(
+					process.execPath,
+					[resolve('scripts/e2e/peer-delegation/enabled.mjs')],
+					{
+						cwd: resolve('.'),
+						env: {
+							...process.env,
+							MESH_PEER_DELEGATION_E2E: '1',
+							MESH_PEER_DELEGATION_E2E_TEST_MODE: '1',
+							MESH_PEER_DELEGATION_E2E_RUNTIME_DIR: join(root, 'runtime'),
+							MESH_PEER_DELEGATION_E2E_PROFILE_DIR: join(root, 'profile'),
+							MESH_PEER_DELEGATION_E2E_EVIDENCE_DIR:
+								join(artifactsAlias, 'peer-delegation-e2e'),
+						},
+						shell: false,
+						stdio: 'ignore',
+					},
+				);
+				const exitCode = await new Promise<number | null>((resolveExit, reject) => {
+					child.once('error', reject);
+					child.once('exit', resolveExit);
+				});
+				assert.notEqual(exitCode, 0);
+			} finally {
+				await rm(root, { recursive: true, force: true });
+			}
+		});
+	},
+);
 
 test(
 	'run-scoped marker captures a detached child after its parent exits before sampling',
@@ -281,6 +527,11 @@ function processAlive(pid: number): boolean {
 async function persistentProfileFixture(
 	scenario: 'lock-conflict' | 'idle-conflict',
 	injection?: 'schema' | 'safety',
+	simulation?: {
+		readonly os: string;
+		readonly architecture: string;
+		readonly dirtyTree: boolean;
+	},
 ) {
 	const parent = resolve('.vscode-test', 'peer-process-ownership');
 	await mkdir(parent, { recursive: true });
@@ -333,6 +584,7 @@ async function persistentProfileFixture(
 			evidenceRoot,
 			terminationLog,
 			injection,
+			simulation,
 		}),
 		dispose: async () => {
 			if (processAlive(foreign.pid!)) {
@@ -353,6 +605,11 @@ async function runHarnessGuard(options: {
 	readonly evidenceRoot: string;
 	readonly terminationLog: string;
 	readonly injection?: 'schema' | 'safety';
+	readonly simulation?: {
+		readonly os: string;
+		readonly architecture: string;
+		readonly dirtyTree: boolean;
+	};
 }): Promise<{ readonly exitCode: number | null; readonly stderr: string }> {
 	const child = spawn(
 		process.execPath,
@@ -371,6 +628,12 @@ async function runHarnessGuard(options: {
 				...(options.injection === undefined
 					? {}
 					: { MESH_PEER_DELEGATION_E2E_TEST_INVALID_EVIDENCE: options.injection }),
+				...(options.simulation === undefined ? {} : {
+					MESH_PEER_DELEGATION_E2E_TEST_PLATFORM: options.simulation.os,
+					MESH_PEER_DELEGATION_E2E_TEST_ARCHITECTURE: options.simulation.architecture,
+					MESH_PEER_DELEGATION_E2E_TEST_DIRTY_TREE:
+						options.simulation.dirtyTree ? '1' : '0',
+				}),
 			},
 			shell: false,
 			stdio: ['ignore', 'ignore', 'pipe'],
@@ -387,6 +650,99 @@ async function runHarnessGuard(options: {
 		child.once('exit', resolveExit);
 	});
 	return { exitCode, stderr };
+}
+
+async function assertReleaseValidatorRejects(path: string): Promise<void> {
+	for (const flags of [[], ['--require-pass']]) {
+		const result = spawnSync(
+			process.execPath,
+			[
+				resolve('scripts/e2e/peer-delegation/validate.mjs'),
+				path,
+				...flags,
+			],
+			{ cwd: resolve('.'), encoding: 'utf8', shell: false },
+		);
+		assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+	}
+}
+
+function releaseEvidencePath(): string {
+	return resolve('artifacts', 'peer-delegation-e2e', 'evidence.json');
+}
+
+function releaseSummaryPath(): string {
+	return resolve('artifacts', 'peer-delegation-e2e', 'summary.md');
+}
+
+async function withStableEvidencePreserved(run: () => Promise<void>): Promise<void> {
+	const snapshots = await Promise.all(
+		[releaseEvidencePath(), releaseSummaryPath()].map(async (path) => ({
+			path,
+			content: await readOptionalFile(path),
+		})),
+	);
+	try {
+		await run();
+		for (const snapshot of snapshots) {
+			assert.deepEqual(await readOptionalFile(snapshot.path), snapshot.content);
+		}
+	} finally {
+		for (const snapshot of snapshots) {
+			if (snapshot.content === undefined) {
+				await rm(snapshot.path, { force: true });
+			} else {
+				await mkdir(resolve(snapshot.path, '..'), { recursive: true });
+				await writeFile(snapshot.path, snapshot.content, { mode: 0o600 });
+			}
+		}
+	}
+}
+
+async function withStableArtifactSentinels(run: () => Promise<void>): Promise<void> {
+	const paths = [releaseEvidencePath(), releaseSummaryPath()];
+	const snapshots = await Promise.all(paths.map(async (path) => ({
+		path,
+		content: await readOptionalFile(path),
+	})));
+	const sentinels = new Map([
+		[releaseEvidencePath(), Buffer.from('stable release evidence sentinel\n', 'utf8')],
+		[releaseSummaryPath(), Buffer.from('stable release summary sentinel\n', 'utf8')],
+	]);
+	try {
+		await mkdir(resolve(releaseEvidencePath(), '..'), { recursive: true });
+		for (const [path, content] of sentinels) {
+			await writeFile(path, content, { mode: 0o600 });
+		}
+		await run();
+		for (const [path, content] of sentinels) {
+			assert.deepEqual(await readFile(path), content);
+		}
+	} finally {
+		for (const snapshot of snapshots) {
+			if (snapshot.content === undefined) {
+				await rm(snapshot.path, { force: true });
+			} else {
+				await writeFile(snapshot.path, snapshot.content, { mode: 0o600 });
+			}
+		}
+	}
+}
+
+async function readOptionalFile(path: string): Promise<Buffer | undefined> {
+	try {
+		return await readFile(path);
+	} catch (error: unknown) {
+		if (
+			typeof error === 'object'
+			&& error !== null
+			&& 'code' in error
+			&& error.code === 'ENOENT'
+		) {
+			return undefined;
+		}
+		throw error;
+	}
 }
 
 async function peerRunDirectories(runtimeRoot: string): Promise<readonly string[]> {

@@ -12,6 +12,12 @@ if (process.env[environmentVariable] !== '1') {
 	}));
 	process.exit(0);
 }
+if (process.env.MESH_PEER_DELEGATION_E2E_TEST_MODE === '1') {
+	throw new Error('Internal peer-delegation test mode cannot run through the release command.');
+}
+if (process.platform !== 'darwin' || process.arch !== 'arm64') {
+	throw new Error('The real peer-delegation E2E requires supported macOS arm64 Worker hardware.');
+}
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptDirectory, '../../..');

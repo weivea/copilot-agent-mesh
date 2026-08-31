@@ -63,6 +63,11 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
   persistent User Data/global-storage paths never confer process kill ownership.
   Lock/idle conflicts leave foreign profile users alive and perform zero
   termination attempts.
+- Made internal E2E fixture mode permanently ineligible for release evidence:
+  it requires an isolated artifact directory, records actual process platform
+  plus `testMode: true` in a separately typed test diagnostic, and is rejected
+  by both normal and `--require-pass` release validation. Unsupported release
+  platforms fail before touching existing evidence.
 - Bumped the Preview extension and VSIX artifact to `0.4.0` while retaining AHP
   commit `f19dd8b3942d029744a3bdd31d830f9428e8ea47`, TypeScript client `0.9.0`,
   and protocol offer `1.0.0`.

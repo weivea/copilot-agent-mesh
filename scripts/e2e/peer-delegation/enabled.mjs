@@ -43,6 +43,7 @@ const {
 } = require(join(repositoryRoot, 'out/src/e2e/MultiWindowE2eSupport.js'));
 const {
 	createPeerDelegationDiagnosticEvidence,
+	createPeerDelegationTestDiagnosticEvidence,
 	normalizePeerDelegationEvidenceTerminalState,
 	parsePeerDelegationEvidence,
 } = require(join(repositoryRoot, 'out/src/e2e/PeerDelegationEvidence.js'));
@@ -101,8 +102,9 @@ const targetWorkspacePath = join(workspacesDirectory, `target-${runLabel}`);
 const sentinelPath = join(runRoot, 'devtunnel-sentinel');
 const sentinelInvocationPath = join(runRoot, 'devtunnel-invoked.json');
 const configuredEvidenceRoot = process.env[`${environmentPrefix}_EVIDENCE_DIR`];
+const releaseEvidenceRoot = join(repositoryRoot, 'artifacts', 'peer-delegation-e2e');
 const evidenceRoot = configuredEvidenceRoot === undefined
-	? join(repositoryRoot, 'artifacts', 'peer-delegation-e2e')
+	? releaseEvidenceRoot
 	: resolve(configuredEvidenceRoot);
 const evidencePath = join(evidenceRoot, 'evidence.json');
 const summaryPath = join(evidenceRoot, 'summary.md');
@@ -152,6 +154,18 @@ let cleanupOperation;
 let ownershipSampler;
 let ownershipSamplerStarted = false;
 let ownershipSamplerFailure;
+let testDirtyTree = false;
+let testEvidencePersistenceAllowed = true;
+
+if (
+	testMode
+	&& (
+		configuredEvidenceRoot === undefined
+		|| filesystemPathsOverlap(evidenceRoot, releaseEvidenceRoot)
+	)
+) {
+	throw new Error('Internal peer-delegation test mode requires an isolated evidence directory.');
+}
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
 	process.once(signal, () => {
@@ -450,45 +464,154 @@ console.log(JSON.stringify({
 }));
 
 async function persistEvidenceArtifact(rawEvidence) {
+	if (testMode && !testEvidencePersistenceAllowed) {
+		throw new Error('Internal test evidence isolation failed; no artifact was written.');
+	}
+	if (testMode) {
+		await assertSafeTestEvidenceDestination();
+	}
 	await mkdir(evidenceRoot, { recursive: true });
+	if (testMode) {
+		let validationError;
+		try {
+			parsePeerDelegationEvidence(rawEvidence);
+		} catch (error) {
+			validationError = error;
+		}
+		const diagnostic = createPeerDelegationTestDiagnosticEvidence({
+			runId,
+			gitCommit: /^[a-f0-9]{40}$/u.test(rawEvidence.gitCommit)
+				? rawEvidence.gitCommit
+				: '0000000000000000000000000000000000000000',
+			startedAt: new Date(startedAtMs).toISOString(),
+			finishedAt: new Date().toISOString(),
+			durationMs: Math.max(0, Date.now() - startedAtMs),
+			platform: {
+				os: process.platform,
+				architecture: process.arch,
+			},
+			simulation: {
+				...optionalTestSimulationString('TEST_PLATFORM', 'os'),
+				...optionalTestSimulationString('TEST_ARCHITECTURE', 'architecture'),
+				dirtyTree: testDirtyTree,
+			},
+			failureCode: diagnosticFailureCode(rawEvidence),
+			validationFailed: validationError !== undefined,
+		});
+		await writeJsonAtomic(evidencePath, diagnostic);
+		await writeTextAtomic(summaryPath, renderDiagnosticSummary(diagnostic));
+		return {
+			artifact: diagnostic,
+			validationError: validationError
+				?? Object.assign(
+					new Error('Internal test-mode diagnostics are not release evidence.'),
+					{ code: 'TEST_MODE_NOT_RELEASE_EVIDENCE' },
+				),
+		};
+	}
+	let releaseEligibilityError;
+	try {
+		assertReleaseEvidenceTree(rawEvidence.gitCommit);
+	} catch (error) {
+		releaseEligibilityError = error;
+	}
 	const diagnostic = createPeerDelegationDiagnosticEvidence({
 		runId,
 		gitCommit: /^[a-f0-9]{40}$/u.test(rawEvidence.gitCommit)
 			? rawEvidence.gitCommit
 			: '0000000000000000000000000000000000000000',
-		startedAt: rawEvidence.startedAt,
-		finishedAt: rawEvidence.finishedAt,
-		durationMs: Number.isSafeInteger(rawEvidence.durationMs)
-			&& rawEvidence.durationMs >= 0
-			? rawEvidence.durationMs
-			: 0,
-		failureCode: diagnosticFailureCode(rawEvidence),
+		startedAt: new Date(startedAtMs).toISOString(),
+		finishedAt: new Date().toISOString(),
+		durationMs: Math.max(0, Date.now() - startedAtMs),
+		failureCode: releaseEligibilityError === undefined
+			? diagnosticFailureCode(rawEvidence)
+			: safeFailure(releaseEligibilityError).code,
 	});
 	await writeJsonAtomic(evidencePath, diagnostic);
-	await writeFile(summaryPath, renderDiagnosticSummary(diagnostic), {
-		encoding: 'utf8',
-		mode: 0o600,
-	});
+	await writeTextAtomic(summaryPath, renderDiagnosticSummary(diagnostic));
+	if (releaseEligibilityError !== undefined) {
+		return { artifact: diagnostic, validationError: releaseEligibilityError };
+	}
 	try {
 		const parsed = parsePeerDelegationEvidence(rawEvidence);
-		await writeJsonAtomic(evidencePath, parsed);
-		await writeFile(summaryPath, renderSummary(parsed), {
-			encoding: 'utf8',
-			mode: 0o600,
-		});
+		const evidenceTemporary = await writeJsonTemporary(evidencePath, parsed);
+		const summaryTemporary = await writeTextTemporary(
+			summaryPath,
+			renderSummary(parsed),
+		);
+		try {
+			assertReleaseEvidenceTree(parsed.gitCommit);
+			await rename(summaryTemporary, summaryPath);
+			assertReleaseEvidenceTree(parsed.gitCommit);
+			await rename(evidenceTemporary, evidencePath);
+			assertReleaseEvidenceTree(parsed.gitCommit);
+		} catch (error) {
+			await Promise.all([
+				rm(evidenceTemporary, { force: true }),
+				rm(summaryTemporary, { force: true }),
+			]);
+			await writeJsonAtomic(evidencePath, diagnostic);
+			await writeTextAtomic(summaryPath, renderDiagnosticSummary(diagnostic));
+			return { artifact: diagnostic, validationError: error };
+		}
 		return { artifact: parsed, validationError: undefined };
 	} catch (validationError) {
 		return { artifact: diagnostic, validationError };
 	}
+
+	function optionalTestSimulationString(environmentSuffix, field) {
+		const value = process.env[`${environmentPrefix}_${environmentSuffix}`];
+		return typeof value === 'string' && value.length > 0 && value.length <= 32
+			? { [field]: value }
+			: {};
+	}
 }
 
 async function writeJsonAtomic(path, value) {
+	const temporary = await writeJsonTemporary(path, value);
+	await rename(temporary, path);
+}
+
+async function writeTextAtomic(path, value) {
+	const temporary = await writeTextTemporary(path, value);
+	await rename(temporary, path);
+}
+
+async function writeTextTemporary(path, value) {
+	const temporary = `${path}.${process.pid}.${runLabel}.tmp`;
+	await writeFile(temporary, value, {
+		encoding: 'utf8',
+		mode: 0o600,
+	});
+	return temporary;
+}
+
+async function writeJsonTemporary(path, value) {
 	const temporary = `${path}.${process.pid}.${runLabel}.tmp`;
 	await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, {
 		encoding: 'utf8',
 		mode: 0o600,
 	});
-	await rename(temporary, path);
+	return temporary;
+}
+
+function assertReleaseEvidenceTree(expectedCommit) {
+	const statusBefore = runGit(['status', '--porcelain=v1', '--untracked-files=all']);
+	const headBefore = runGit(['rev-parse', 'HEAD']);
+	const statusAfter = runGit(['status', '--porcelain=v1', '--untracked-files=all']);
+	const headAfter = runGit(['rev-parse', 'HEAD']);
+	if (statusBefore.length !== 0 || statusAfter.length !== 0) {
+		throw Object.assign(
+			new Error('Full release evidence requires a clean committed tree.'),
+			{ code: 'WORKTREE_DIRTY' },
+		);
+	}
+	if (headBefore !== expectedCommit || headAfter !== expectedCommit) {
+		throw Object.assign(
+			new Error('Full release evidence must match the current committed HEAD.'),
+			{ code: 'EVIDENCE_COMMIT_MISMATCH' },
+		);
+	}
 }
 
 function diagnosticFailureCode(rawEvidence) {
@@ -504,6 +627,9 @@ function diagnosticFailureCode(rawEvidence) {
 }
 
 function renderDiagnosticSummary(diagnostic) {
+	const detail = diagnostic.kind === 'test-diagnostic'
+		? 'Internal fixture diagnostic; release validators reject this artifact.'
+		: 'Strict evidence validation failed; unsafe details were discarded.';
 	return [
 		'# Peer Delegation E2E diagnostic',
 		'',
@@ -511,7 +637,7 @@ function renderDiagnosticSummary(diagnostic) {
 		`- Run: \`${diagnostic.runId}\``,
 		`- Commit: \`${diagnostic.gitCommit}\``,
 		`- Code: \`${diagnostic.failure.code}\``,
-		'- Strict evidence validation failed; unsafe details were discarded.',
+		`- ${detail}`,
 		'',
 	].join('\n');
 }
@@ -538,8 +664,13 @@ async function preflight() {
 	await assertUsablePaths();
 	const head = runGit(['rev-parse', 'HEAD']);
 	const status = runGit(['status', '--porcelain=v1', '--untracked-files=all']);
+	testDirtyTree = status.length !== 0
+		|| process.env[`${environmentPrefix}_TEST_DIRTY_TREE`] === '1';
 	if (!testMode && status.length !== 0) {
-		throw new Error('The peer-delegation E2E requires a clean committed tree.');
+		throw Object.assign(
+			new Error('The peer-delegation E2E requires a clean committed tree.'),
+			{ code: 'WORKTREE_DIRTY' },
+		);
 	}
 	const submodule = runGit(['-C', 'third_party/agent-host-protocol', 'rev-parse', 'HEAD']);
 	assert.equal(submodule, 'f19dd8b3942d029744a3bdd31d830f9428e8ea47');
@@ -1786,11 +1917,88 @@ async function assertUsablePaths() {
 			throw new Error('The canonical peer E2E profile must not overlap a real VS Code profile.');
 		}
 	}
-	await assertNoSymlinkAlias(evidenceRoot, 'evidence directory');
+	await assertSafeTestEvidenceDestination();
 	const mainIpcPath = join(userDataDirectory, '1.13-main.sock');
 	if (!testMode && Buffer.byteLength(mainIpcPath, 'utf8') > 103) {
 		throw new Error('The selected peer E2E profile path exceeds the macOS socket limit.');
 	}
+}
+
+async function assertSafeTestEvidenceDestination() {
+	if (!testMode) {
+		return;
+	}
+	try {
+		await assertTestEvidenceIsolation();
+		await assertNoSymlinkAlias(evidenceRoot, 'evidence directory');
+	} catch (error) {
+		testEvidencePersistenceAllowed = false;
+		throw error;
+	}
+}
+
+async function assertTestEvidenceIsolation() {
+	if (!testMode) {
+		return;
+	}
+	if (
+		filesystemPathsOverlap(evidenceRoot, releaseEvidenceRoot)
+		|| await pathsAliasSameEntry(evidenceRoot, releaseEvidenceRoot)
+		|| await anyPathsAlias([
+			evidencePath,
+			summaryPath,
+		], [
+			join(releaseEvidenceRoot, 'evidence.json'),
+			join(releaseEvidenceRoot, 'summary.md'),
+		])
+	) {
+		testEvidencePersistenceAllowed = false;
+		throw new Error('Internal test diagnostics must not alias the stable release evidence directory.');
+	}
+}
+
+async function anyPathsAlias(leftPaths, rightPaths) {
+	for (const left of leftPaths) {
+		for (const right of rightPaths) {
+			if (
+				filesystemPathKey(left) === filesystemPathKey(right)
+				|| await pathsAliasSameEntry(left, right)
+			) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+async function pathsAliasSameEntry(left, right) {
+	if (filesystemPathKey(left) === filesystemPathKey(right)) {
+		return true;
+	}
+	try {
+		const [leftStat, rightStat] = await Promise.all([stat(left), stat(right)]);
+		return leftStat.dev === rightStat.dev && leftStat.ino === rightStat.ino;
+	} catch (error) {
+		if (error?.code === 'ENOENT') {
+			return false;
+		}
+		throw error;
+	}
+}
+
+function filesystemPathKey(value) {
+	const absolute = resolve(value);
+	return process.platform === 'darwin' || process.platform === 'win32'
+		? absolute.toLocaleLowerCase('en-US')
+		: absolute;
+}
+
+function filesystemPathsOverlap(left, right) {
+	const leftKey = filesystemPathKey(left);
+	const rightKey = filesystemPathKey(right);
+	return leftKey === rightKey
+		|| leftKey.startsWith(`${rightKey}${sep}`)
+		|| rightKey.startsWith(`${leftKey}${sep}`);
 }
 
 async function assertProfileMutationSafe() {
@@ -2003,7 +2211,7 @@ function initialEvidence() {
 		startedAt: new Date(startedAtMs).toISOString(),
 		finishedAt: new Date(startedAtMs).toISOString(),
 		durationMs: 0,
-		platform: { os: 'darwin', architecture: 'arm64' },
+		platform: { os: process.platform, architecture: process.arch },
 		topology: {
 			ordinaryWindows: {
 				status: 'unverified',
