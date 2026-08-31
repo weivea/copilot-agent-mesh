@@ -108,19 +108,25 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 		}
 
 		let editorFailure: AgentHostSourceFailure | undefined;
-		try {
-			const handle = await this.options.editor.start(request);
-			this.assertActive();
-			this.sourceSelected = true;
-			this.setStatus({ source: 'editor', degraded: false });
-			return handle;
-		} catch (error: unknown) {
-			this.assertActive();
-			editorFailure = safeEditorFailure(error);
-			if (!isFallbackEligible(error)) {
+		for (let attempt = 0; attempt < 2; attempt += 1) {
+			try {
+				const handle = await this.options.editor.start(request);
+				this.assertActive();
 				this.sourceSelected = true;
-				this.setStatus(editorFailureStatus(editorFailure));
-				throw error;
+				this.setStatus({ source: 'editor', degraded: false });
+				return handle;
+			} catch (error: unknown) {
+				this.assertActive();
+				editorFailure = safeEditorFailure(error);
+				if (!isFallbackEligible(error)) {
+					this.sourceSelected = true;
+					this.setStatus(editorFailureStatus(editorFailure));
+					throw error;
+				}
+				if (editorFailure.stage === 'connection' && attempt === 0) {
+					continue;
+				}
+				break;
 			}
 		}
 

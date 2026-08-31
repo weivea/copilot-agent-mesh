@@ -466,6 +466,26 @@ test('source selector reports standalone failure explicitly and does not fallbac
 	await selector.dispose();
 });
 
+test('source selector retries one cleanup-safe editor connection before standalone fallback', async () => {
+	const editor = new FakeRuntime();
+	const standalone = new FakeRuntime();
+	editor.startErrors.push(new AgentRuntimeError(
+		'AGENT_UNAVAILABLE',
+		'The Agent Host connection could not be established.',
+	));
+	const selector = new AgentHostSourceSelector(selectorOptions({
+		preferEditor: () => true,
+		editor,
+		standalone,
+	}));
+
+	await selector.start(taskRequest());
+	assert.equal(editor.starts, 2);
+	assert.equal(standalone.starts, 0);
+	assert.deepEqual(selector.sourceStatus(), { source: 'editor', degraded: false });
+	await selector.dispose();
+});
+
 test('nonfallback editor errors replace stale standalone probe status without leaking details', async () => {
 	const editor = new FakeRuntime();
 	const standalone = new FakeRuntime();
@@ -787,6 +807,7 @@ class FakeRuntime implements AgentRuntime {
 	probes = 0;
 	disposals = 0;
 	startError: unknown;
+	readonly startErrors: unknown[] = [];
 	readonly disposeErrors: unknown[] = [];
 	probeResult: AgentRuntimeProbe = { available: true, featureEnabled: true };
 
@@ -797,8 +818,9 @@ class FakeRuntime implements AgentRuntime {
 
 	public async start(request: AgentTaskRequest): Promise<AgentTaskHandle> {
 		this.starts += 1;
-		if (this.startError !== undefined) {
-			throw this.startError;
+		const error = this.startErrors.shift() ?? this.startError;
+		if (error !== undefined) {
+			throw error;
 		}
 		return {
 			taskId: request.taskId,
