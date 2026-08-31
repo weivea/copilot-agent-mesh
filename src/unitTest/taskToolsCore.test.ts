@@ -1672,7 +1672,7 @@ suite('TaskToolsCore', () => {
 });
 
 suite('Mesh tool manifest contract', () => {
-	test('exports eight manifest descriptors with runtime name parity', () => {
+	test('exports five manifest descriptors with runtime name parity', () => {
 		const manifestNames = MESH_TOOL_MANIFEST_DESCRIPTORS.map(({ name }) => name);
 
 		assert.equal(manifestNames.length, 5);

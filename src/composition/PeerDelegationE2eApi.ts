@@ -24,6 +24,7 @@ import {
 	type DelegateTaskInput,
 } from '../tools/taskToolsCore';
 import type { LocalBrokerTaskFacade } from '../tools/LocalBrokerTaskFacade';
+import { TaskToolFacadeError } from '../tools/taskToolFacade';
 import {
 	MESH_RUNTIME_TOOL_NAMES,
 	MESH_TOOL_NAMES,
@@ -91,6 +92,8 @@ export function createPeerDelegationE2eApi(
 						requiredToolName(params, 'toolName'),
 						requiredRecord(params, 'input'),
 					);
+				case 'peer.direct.start.error':
+					return directStartError(options, requiredRecord(params, 'input'));
 				case 'peer.tool.cancel.after.events':
 					return invokeDelegateAndCancelAfterEvents(options, requiredRecord(params, 'input'));
 				case 'peer.observations':
@@ -111,6 +114,26 @@ export function createPeerDelegationE2eApi(
 					return resourceMetrics(options);
 				default:
 					return base.execute(request, action, params);
+			}
+
+			async function directStartError(
+				options: PeerDelegationE2eApiOptions,
+				rawInput: Record<string, unknown>,
+			): Promise<{ readonly rejected: true; readonly code: string }> {
+				const parsed = parseDelegateTaskInput(rawInput);
+				try {
+					await options.localTasks.persistDelegationIntent({
+						...parsed,
+						delegationRequestId: parsed.delegationRequestId ?? randomUUID(),
+						acceptanceCriteria: parsed.acceptanceCriteria ?? [],
+					});
+				} catch (error: unknown) {
+					if (error instanceof TaskToolFacadeError) {
+						return { rejected: true, code: error.code };
+					}
+					throw error;
+				}
+				throw new Error('The direct peer authorization probe unexpectedly started a task.');
 			}
 		},
 	};

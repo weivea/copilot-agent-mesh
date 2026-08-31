@@ -93,7 +93,7 @@ const evidenceRoot = join(repositoryRoot, 'artifacts', 'peer-delegation-e2e');
 const evidencePath = join(evidenceRoot, 'evidence.json');
 const summaryPath = join(evidenceRoot, 'summary.md');
 const attestationPath = join(evidenceRoot, `attestation-${runId}.json`);
-const manualUi = process.env[`${environmentPrefix}_MANUAL_UI`] === '1';
+const manualUi = process.env[`${environmentPrefix}_MANUAL_UI`] !== '0';
 const budgetMs = parseBudgetMs(process.env[`${environmentPrefix}_BUDGET_MS`] ?? '10000');
 const nonce = randomUUID();
 const sourceWindowLabel = `P8 Source ${runLabel}`;
@@ -252,13 +252,15 @@ try {
 	});
 	const beforeList = await invokeMeshTool(source, 'mesh_list_workers', {});
 	const beforeTargetVisible = toolDirectoryContains(beforeList, targetNode);
-	const notAllowed = await invokeMeshTool(source, 'mesh_delegate_task', {
-		...targetInputBase,
-		delegationRequestId: randomUUID(),
-		title: 'P8 denied allowlist probe',
-		prompt: 'Return a short safe acknowledgement without tools or file changes.',
-		acceptanceCriteria: [],
-		timeoutMinutes: 1,
+	const notAllowed = await request(source, 'peer.direct.start.error', {
+		input: {
+			...targetInputBase,
+			delegationRequestId: randomUUID(),
+			title: 'P8 denied allowlist probe',
+			prompt: 'Return a short safe acknowledgement without tools or file changes.',
+			acceptanceCriteria: [],
+			timeoutMinutes: 1,
+		},
 	});
 	await request(source, 'peer.policy.allow', {
 		windowLabel: targetWindowLabel,
@@ -266,13 +268,15 @@ try {
 	});
 	const allowOnlyList = await invokeMeshTool(source, 'mesh_list_workers', {});
 	const allowOnlyTargetVisible = toolDirectoryContains(allowOnlyList, targetNode);
-	const notAccepting = await invokeMeshTool(source, 'mesh_delegate_task', {
-		...targetInputBase,
-		delegationRequestId: randomUUID(),
-		title: 'P8 denied receive-gate probe',
-		prompt: 'Return a short safe acknowledgement without tools or file changes.',
-		acceptanceCriteria: [],
-		timeoutMinutes: 1,
+	const notAccepting = await request(source, 'peer.direct.start.error', {
+		input: {
+			...targetInputBase,
+			delegationRequestId: randomUUID(),
+			title: 'P8 denied receive-gate probe',
+			prompt: 'Return a short safe acknowledgement without tools or file changes.',
+			acceptanceCriteria: [],
+			timeoutMinutes: 1,
+		},
 	});
 	await request(target, 'peer.policy.accept', { enabled: true });
 	const afterList = await invokeMeshTool(source, 'mesh_list_workers', {});
@@ -285,18 +289,18 @@ try {
 	const targetCandidateCount = targetDashboard.policyCandidates?.length ?? 0;
 	const dashboardAlwaysListedBoth = sourceCandidateCount === 2 && targetCandidateCount === 2;
 	assert.equal(beforeTargetVisible, false);
-	assert.equal(notAllowed.e, 'PEER_NOT_ALLOWED');
+	assert.equal(notAllowed.code, 'PEER_NOT_ALLOWED');
 	assert.equal(allowOnlyTargetVisible, false);
-	assert.equal(notAccepting.e, 'PEER_NOT_ACCEPTING');
+	assert.equal(notAccepting.code, 'PEER_NOT_ACCEPTING');
 	assert.equal(afterTargetVisible, true);
 	assert.equal(reverseTargetVisible, false);
 	assert.equal(dashboardAlwaysListedBoth, true);
 	evidence.doubleGate = {
 		status: 'pass',
 		beforeTargetVisible,
-		notAllowedCode: notAllowed.e,
+		notAllowedCode: notAllowed.code,
 		allowOnlyTargetVisible,
-		notAcceptingCode: notAccepting.e,
+		notAcceptingCode: notAccepting.code,
 		afterTargetVisible,
 		reverseTargetVisible,
 		dashboardSourceCandidateCount: sourceCandidateCount,

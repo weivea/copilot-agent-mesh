@@ -146,9 +146,10 @@ MESH_PEER_DELEGATION_E2E=1 npm run test:peer-delegation-real
 
 The harness uses two ordinary windows, two temporary non-sensitive projects, one
 shared dedicated profile, real registered LM tools, and the pinned AHP client.
-Real Copilot sidebar confirmation and Chat Sessions visibility require an
-operator-visible run; programmatic `vscode.lm.invokeTool` evidence is never
-misreported as UI confirmation. Sanitized evidence is written to
+Real Copilot sidebar confirmation and Chat Sessions visibility use an
+operator-visible phase in the exact enabled command; programmatic
+`vscode.lm.invokeTool` evidence is never misreported as UI confirmation.
+Sanitized evidence is written to
 `artifacts/peer-delegation-e2e/evidence.json`.
 
 Cross-device delegation remains unverified. Windows, Linux, and macOS x64 remain

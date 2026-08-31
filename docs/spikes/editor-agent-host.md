@@ -294,7 +294,8 @@ P8 已实现可重复的两个普通窗口 Harness。它在窗口启动后用相
 自己的 recovery Session Hash 只有与 editor catalog 匹配时才算 Host catalog 证据。
 
 稳定 Extension API 不提供读取 Chat Sessions UI 或向内置 Copilot Agent 自动发送并确认
-消息的接口；`vscode.lm.invokeTool` 还会绕过 `prepareInvocation`。因此自动结果不能证明
-Q4' 的可见 UI，也不能证明用户点过 Continue。P8 的可选人工阶段保留两个真实窗口并给出
-精确 Agent-mode 操作；若没有人工可见观察，Q4' 继续记为 **unverified**，不从
-`listSessions` 推断为 Pass。
+消息的接口。P8 在 VS Code 1.135.0 观察到无 Chat context 的
+`vscode.lm.invokeTool` 会执行 `prepareInvocation` 并显示独立 modal，但这个 modal 没有
+父 Chat 身份，不能证明用户在 Copilot 侧边栏接受委派。P8 的人工阶段保留两个真实窗口并
+给出精确 Agent-mode 操作；若没有人工可见观察，Q4' 继续记为 **unverified**，不从
+`listSessions` 或独立 modal 推断为 Pass。

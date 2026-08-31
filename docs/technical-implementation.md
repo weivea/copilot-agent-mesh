@@ -1248,9 +1248,9 @@ zod
    启动 AHP Task。
 5. **Peer Delegation E2E：** 两个普通窗口、两个一次性项目、同一专用 User Data，
    通过 Dashboard 一次性句柄配置双重门，并通过真实注册的五个 LM Tool 验证
-   Tool → Broker → Window Node → editor AHP → Broker → Tool Result。稳定
-   `vscode.lm.invokeTool` 不触发 `prepareInvocation`，所以父 Copilot 确认只能由可见
-   Agent-mode 阶段证明，缺失时明确 `unverified`。
+   Tool → Broker → Window Node → editor AHP → Broker → Tool Result。VS Code 1.135.0
+   的无 Chat context `vscode.lm.invokeTool` 仍执行 prepare 并显示独立 modal，但无法证明
+   父 Copilot Chat 身份；确认只能由可见 Agent-mode 阶段证明，缺失时明确 `unverified`。
 
 环境变量：
 

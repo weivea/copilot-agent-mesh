@@ -38,18 +38,11 @@ and the production default/maximum of 60 minutes are unchanged. No mock AHP,
 Fake Agent, direct Broker task substitute, synthetic terminal state, or
 blocked/cancelled-as-completed result can pass.
 
-`vscode.lm.invokeTool` does not invoke `prepareInvocation`, so automated evidence
-cannot claim the parent Copilot confirmation. To run the visible Agent-mode phase:
-
-```sh
-MESH_PEER_DELEGATION_E2E=1 \
-MESH_PEER_DELEGATION_E2E_MANUAL_UI=1 \
-MESH_PEER_DELEGATION_E2E_PROFILE_DIR=$HOME/.mw-profile \
-MESH_PEER_DELEGATION_E2E_AUTH_RESOURCE='https://api.github.com' \
-MESH_PEER_DELEGATION_E2E_AUTH_PROVIDER='github' \
-MESH_PEER_DELEGATION_E2E_AUTH_SCOPES_JSON='["read:user","user:email"]' \
-npm run test:peer-delegation-real
-```
+Programmatic `vscode.lm.invokeTool` has no parent Chat identity and cannot prove
+the required Copilot sidebar route. The exact enabled command therefore waits for
+the visible Agent-mode phase by default. Setting
+`MESH_PEER_DELEGATION_E2E_MANUAL_UI=0` is diagnostics-only and can never produce
+passing confirmation evidence.
 
 The harness prints one exact `#meshListWorkers` / `#meshDelegateTask` prompt. In
 the named source window, submit it in Copilot Agent mode and click **Continue**
