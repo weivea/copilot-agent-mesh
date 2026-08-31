@@ -1109,6 +1109,11 @@ async function recordCompletionScenario({
 				.includes(sourceFailure.detail)
 				? { detail: sourceFailure.detail }
 				: {}),
+			...(Number.isSafeInteger(sourceFailure.statusCode)
+				&& sourceFailure.statusCode >= 100
+				&& sourceFailure.statusCode <= 599
+				? { statusCode: sourceFailure.statusCode }
+				: {}),
 		}
 		: undefined;
 	const catalogAfter = await request(target, 'peer.session.catalog', {}, 60_000);

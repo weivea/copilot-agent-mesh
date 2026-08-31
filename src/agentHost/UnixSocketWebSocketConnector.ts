@@ -18,7 +18,11 @@ export type UnixSocketWebSocketErrorCode =
 	| 'UPGRADE_TIMEOUT';
 
 export class UnixSocketWebSocketError extends Error {
-	public constructor(readonly code: UnixSocketWebSocketErrorCode, message: string) {
+	public constructor(
+		readonly code: UnixSocketWebSocketErrorCode,
+		message: string,
+		readonly statusCode?: number,
+	) {
 		super(message);
 		this.name = 'UnixSocketWebSocketError';
 	}
@@ -228,16 +232,19 @@ function unexpectedResponse(statusCode: number | undefined): UnixSocketWebSocket
 		return new UnixSocketWebSocketError(
 			'UPGRADE_AUTH_REJECTED',
 			'The editor Agent Host rejected WebSocket authentication.',
+			statusCode,
 		);
 	}
 	if ([409, 423, 429, 503].includes(statusCode ?? 0)) {
 		return new UnixSocketWebSocketError(
 			'UPGRADE_BUSY',
 			'The editor Agent Host is not ready for another WebSocket client.',
+			statusCode,
 		);
 	}
 	return new UnixSocketWebSocketError(
 		'UPGRADE_FAILED',
 		'The editor Agent Host rejected the WebSocket upgrade.',
+		statusCode,
 	);
 }

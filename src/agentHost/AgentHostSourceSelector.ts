@@ -459,7 +459,12 @@ function safeEditorFailure(error: unknown): AgentHostSourceFailure {
 		stage,
 		...(error instanceof AgentRuntimeError
 			&& error.cause instanceof UnixSocketWebSocketError
-			? { detail: error.cause.code }
+			? {
+				detail: error.cause.code,
+				...(error.cause.statusCode === undefined
+					? {}
+					: { statusCode: error.cause.statusCode }),
+			}
 			: {}),
 		message: 'The selected editor Agent Host attempt failed safely.',
 	};

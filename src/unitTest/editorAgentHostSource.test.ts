@@ -307,6 +307,7 @@ test('Unix socket connector rejects token/status/header failures, timeout, cance
 				'UPGRADE_AUTH_REJECTED',
 				socketPath,
 				'wrong-token',
+				401,
 			);
 		} finally {
 			await closeWebSocketServer(server, webSockets);
@@ -830,11 +831,13 @@ async function assertConnectorFailure(
 	code: UnixSocketWebSocketError['code'],
 	socketPath: string,
 	token: string,
+	statusCode?: number,
 ): Promise<void> {
 	await assert.rejects(
 		connection,
 		(error: unknown) => error instanceof UnixSocketWebSocketError
 			&& error.code === code
+			&& error.statusCode === statusCode
 			&& !error.message.includes(socketPath)
 			&& !error.message.includes(token),
 	);

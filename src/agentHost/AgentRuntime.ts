@@ -30,6 +30,7 @@ export interface AgentHostSourceFailure {
 		| 'UPGRADE_BUSY'
 		| 'UPGRADE_FAILED'
 		| 'UPGRADE_TIMEOUT';
+	readonly statusCode?: number;
 	readonly message: string;
 }
 

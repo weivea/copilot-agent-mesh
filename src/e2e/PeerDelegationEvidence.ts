@@ -135,6 +135,7 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 				'UPGRADE_FAILED',
 				'UPGRADE_TIMEOUT',
 			]).optional(),
+			statusCode: z.number().int().min(100).max(599).optional(),
 		}).optional(),
 		leaseReleased: z.boolean(),
 		durationMs: nonNegativeInteger,
