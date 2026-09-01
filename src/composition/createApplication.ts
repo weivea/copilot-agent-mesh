@@ -284,6 +284,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 					peerDelegationRun === undefined
 						? undefined
 						: join(peerDelegationRun.controlRoot, 'editor-proxy'),
+					peerDelegationRun?.nodeExecutable,
 				);
 				sourceStatusSubscription = runtime.onDidSourceStatusChange(() => changeEvents.fire());
 				return new WindowNodeTaskExecutor({
@@ -409,6 +410,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 				recorder: peerDelegationRecorder,
 				toolClock: peerDelegationToolClock,
 				editorProxyRoot: join(peerDelegationRun.controlRoot, 'editor-proxy'),
+				editorProxyNodeExecutable: peerDelegationRun.nodeExecutable,
 			})
 			: undefined;
 		let meshTools: vscode.Disposable | undefined;
@@ -734,6 +736,7 @@ function peerDelegationBudgetMs(): number {
 function peerDelegationRunContext(nonce: string | undefined): {
 	readonly nonce: string;
 	readonly controlRoot: string;
+	readonly nodeExecutable: string;
 } {
 	if (nonce === undefined) {
 		throw new Error('The peer-delegation E2E nonce is unavailable after capability validation.');
@@ -742,7 +745,11 @@ function peerDelegationRunContext(nonce: string | undefined): {
 	if (controlRoot === undefined || !isAbsolute(controlRoot)) {
 		throw new Error('The peer-delegation E2E control directory must be absolute.');
 	}
-	return { nonce, controlRoot };
+	const nodeExecutable = process.env.MESH_PEER_DELEGATION_E2E_NODE_EXECUTABLE;
+	if (nodeExecutable === undefined || !isAbsolute(nodeExecutable)) {
+		throw new Error('The peer-delegation E2E Node executable must be absolute.');
+	}
+	return { nonce, controlRoot, nodeExecutable };
 }
 
 function peerDelegationStartupReporter(

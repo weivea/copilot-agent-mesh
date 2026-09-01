@@ -40,17 +40,20 @@ export class UnixSocketWebSocketError extends Error {
 export interface UnixSocketWebSocketConnectorOptions {
 	readonly timeoutMs?: number;
 	readonly proxyRoot?: string;
+	readonly proxyNodeExecutable?: string;
 	readonly connectionMode?: 'directThenProxy' | 'directOnly' | 'proxyOnly';
 }
 
 export class UnixSocketWebSocketConnector {
 	private readonly timeoutMs: number;
 	private readonly proxyRoot: string | undefined;
+	private readonly proxyNodeExecutable: string | undefined;
 	private readonly connectionMode: 'directThenProxy' | 'directOnly' | 'proxyOnly';
 
 	public constructor(options: UnixSocketWebSocketConnectorOptions = {}) {
 		this.timeoutMs = options.timeoutMs ?? defaultTimeoutMs;
 		this.proxyRoot = options.proxyRoot;
+		this.proxyNodeExecutable = options.proxyNodeExecutable;
 		this.connectionMode = options.connectionMode ?? 'directThenProxy';
 		if (!Number.isSafeInteger(this.timeoutMs) || this.timeoutMs <= 0) {
 			throw new RangeError('Unix socket WebSocket timeout must be a positive safe integer.');
@@ -272,6 +275,9 @@ export class UnixSocketWebSocketConnector {
 			proxy = await EditorSocketProxy.open({
 				targetPath,
 				root: this.proxyRoot,
+				...(this.proxyNodeExecutable === undefined
+					? {}
+					: { nodeExecutable: this.proxyNodeExecutable }),
 				timeoutMs: this.timeoutMs,
 				signal,
 			});

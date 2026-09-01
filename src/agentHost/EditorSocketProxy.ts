@@ -77,6 +77,7 @@ process.on('message', (message) => {
 export interface EditorSocketProxyOptions {
 	readonly targetPath: string;
 	readonly root: string;
+	readonly nodeExecutable?: string;
 	readonly timeoutMs: number;
 	readonly signal?: AbortSignal;
 }
@@ -102,7 +103,11 @@ export class EditorSocketProxy {
 	) {}
 
 	public static async open(options: EditorSocketProxyOptions): Promise<EditorSocketProxy> {
-		if (!isAbsolute(options.targetPath) || !isAbsolute(options.root)) {
+		if (
+			!isAbsolute(options.targetPath)
+			|| !isAbsolute(options.root)
+			|| (options.nodeExecutable !== undefined && !isAbsolute(options.nodeExecutable))
+		) {
 			throw new TypeError('Editor socket proxy paths must be absolute.');
 		}
 		if (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs <= 0) {
@@ -119,7 +124,7 @@ export class EditorSocketProxy {
 		await chmod(connectionRoot, 0o700);
 		const socketPath = join(connectionRoot, 'proxy.sock');
 		const child = spawn(
-			process.execPath,
+			options.nodeExecutable ?? process.execPath,
 			['-e', helperSource, '--', connectionRoot, options.root],
 			{
 				env: helperEnvironment(),

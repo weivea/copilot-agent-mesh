@@ -900,6 +900,7 @@ function launchWindow(workspacePath) {
 	environment[`${environmentPrefix}_CONTROL_DIR`] = controlRoot;
 	environment[`${environmentPrefix}_NONCE`] = nonce;
 	environment[`${environmentPrefix}_BUDGET_MS`] = String(budgetMs);
+	environment[`${environmentPrefix}_NODE_EXECUTABLE`] = process.execPath;
 	const child = spawn(vscodeExecutablePath, args, {
 		env: environment,
 		shell: false,

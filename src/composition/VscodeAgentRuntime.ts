@@ -202,6 +202,7 @@ export function createVscodeAgentRuntime(
 	lifecycleObserver?: AgentRuntimeLifecycleObserver,
 	standaloneStorageRoot?: string,
 	editorProxyRoot?: string,
+	editorProxyNodeExecutable?: string,
 ): AgentRuntime & AgentHostSourceStatusProvider {
 	const configuration = vscodeApi.workspace.getConfiguration(configurationSection);
 	const launcher = new AgentHostLauncher({
@@ -239,6 +240,9 @@ export function createVscodeAgentRuntime(
 			new UnixSocketWebSocketConnector({
 				proxyRoot: editorProxyRoot
 					?? vscodeApi.Uri.joinPath(context.globalStorageUri, 'editor-proxy').fsPath,
+				...(editorProxyNodeExecutable === undefined
+					? {}
+					: { proxyNodeExecutable: editorProxyNodeExecutable }),
 			}),
 		),
 		connections: new SdkAhpConnectionFactory(),

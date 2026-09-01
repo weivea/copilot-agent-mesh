@@ -45,7 +45,9 @@ only as local authenticated WebSocket handshake bytes. The short proxy socket
 uses a mode-0700 `/tmp/cam-ep-*` directory to stay below the macOS Unix path limit,
 while its command line carries the owning storage-root marker. Close, cancellation,
 parent IPC loss, and startup failure terminate the exact child and remove only
-that exact directory.
+that exact directory. The real P8 harness supplies its already-running absolute
+Node executable only after E2E capability validation; the extension does not
+search `PATH` or download a runtime.
 Before any task selects a source, Dashboard probes are passive and report editor
 health as unavailable/pending with an internal `canStart` capability rather than
 executing `code agent endpoints`. The task executor may attempt such a source,

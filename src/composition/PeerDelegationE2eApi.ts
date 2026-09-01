@@ -63,6 +63,7 @@ export interface PeerDelegationE2eApiOptions {
 	readonly recorder: PeerDelegationE2eRecorder;
 	readonly toolClock: PeerDelegationE2eToolClock;
 	readonly editorProxyRoot?: string;
+	readonly editorProxyNodeExecutable?: string;
 }
 
 export function createPeerDelegationE2eApi(
@@ -193,6 +194,9 @@ async function editorInitializeProbe(
 			...(options.editorProxyRoot === undefined
 				? {}
 				: { proxyRoot: options.editorProxyRoot }),
+			...(options.editorProxyNodeExecutable === undefined
+				? {}
+				: { proxyNodeExecutable: options.editorProxyNodeExecutable }),
 		}),
 	);
 	let host: LaunchedAgentHost | undefined;
@@ -478,6 +482,9 @@ async function editorSessionCatalog(
 			...(options.editorProxyRoot === undefined
 				? {}
 				: { proxyRoot: options.editorProxyRoot }),
+			...(options.editorProxyNodeExecutable === undefined
+				? {}
+				: { proxyNodeExecutable: options.editorProxyNodeExecutable }),
 		}),
 	);
 	let host: LaunchedAgentHost | undefined;
