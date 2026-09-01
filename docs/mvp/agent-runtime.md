@@ -30,12 +30,13 @@ uses its own `net.connect` + authenticated WebSocket Upgrade + AHP client. Disco
 connection, initialize, or protocol failure falls back to the existing standalone
 launcher exactly once and exposes `standalone` plus a bounded degradation reason.
 Retryable connection-only failures may re-locate and reconnect after
-cancellation-aware 5, 10, 15, and 30 second delays under the same approval
+cancellation-aware 5, 10, 15, 30, 30, and 30 second delays under the same approval
 capability before fallback; no Session or Turn exists at that boundary. Invalid
 protocol responses, malformed tokens, and explicit upgrade authentication
 rejection do not use this retry. A controlled run identified the live-startup
-boundary as a stale-registry `ECONNREFUSED`, while the same production connector succeeded after
-the editor listener became ready.
+boundary as a stale-registry `ECONNREFUSED`; an independent production connector
+first succeeded about 82 seconds after the two-window startup. The bounded
+readiness window is therefore 120 seconds.
 The selector also serializes the final pre-start endpoint probe with launch and
 does not rediscover the endpoint while an editor start is in flight or selected.
 This prevents Dashboard refreshes from rotating the registry token between
