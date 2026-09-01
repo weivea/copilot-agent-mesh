@@ -85,11 +85,12 @@ disposable Worker profile stopped at `AGENT_AUTH_REQUIRED`. See
 The 0.4.0 Peer Delegation objective run on the same VS Code/platform verified
 two ordinary windows, exactly one Broker, two distinct claims, both double-gate
 errors and directionality, the target Incoming record, zero Listener/Tunnel
-attempt delta, released lease/profile lock, and zero harness-owned residue.
-The disposable profile then stopped honestly at `AGENT_AUTH_REQUIRED` after an
-explicit standalone degradation; no `agentStarted`/output/completed, Copilot
-sidebar confirmation, target Chat Sessions UI, needs-input, cancellation, or
-60-minute stability is claimed.
+attempt delta, a real editor-backed `agentStarted`/output/`turnComplete`/
+`completed` sequence, exact needs-input resume, token cancellation, short-budget
+cancellation, released leases/profile lock, and zero harness-owned residue.
+The actual editor Session and task recovery hashes matched. Copilot-sidebar
+confirmation, target Chat Sessions UI visibility, and 60-minute UI stability
+remain explicitly Unverified.
 
 ## Install the local Preview
 

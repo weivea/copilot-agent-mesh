@@ -102,15 +102,18 @@ The generated evidence remains local at
 publish it as a release asset without a separate review. Its validator rejects
 sensitive content and any claimed Pass with residual harness-owned resources.
 
-The recorded P8 objective run is valid but **Unverified**: AC-5 1-4, 8, and
-10-12 passed, while the fresh profile degraded to standalone and stopped at
-`AGENT_AUTH_REQUIRED`. Do not publish or relabel this as a full Peer Delegation
-Pass; rerun with a signed-in dedicated profile and the visible Agent-mode steps.
+The recorded P8 objective run is valid but **Unverified**: AC-5 1-4, 6, and
+8-12 passed against the existing full-Catalog authenticated profile, including
+real editor completion, matched createSession/recovery fingerprints,
+needs-input resume, cancellation, and complete cleanup. Do not publish or
+relabel this as a full Peer Delegation Pass: AC-5 5 and 7 plus O1/O2 still
+require the visible Agent-mode/UI observations.
 
 Editor endpoints reuse the editor Host's established identity and never receive
 tokens from `copilotAgentMesh.experimental.authenticationProviders`; those
 mappings apply only to an owned standalone fallback. AC-5 item 9 additionally
-requires a catalog-observed task Session, not only a reported editor source.
+requires matching editor createSession/task-recovery fingerprints and an editor
+endpoint fingerprint, not only a reported source.
 
 Run the ordinary-window transport/lifecycle test explicitly:
 

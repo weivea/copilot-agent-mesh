@@ -48,11 +48,13 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
   references, success-shaped incomplete results, and global-process-zero claims;
   it records only harness-owned baseline/delta/final resources.
 - Recorded an honest real P8 objective run on VS Code 1.135.0/macOS arm64:
-  AC-5 items 1-4, 8, and 10-12 were observed, including both peer rejection
-  codes, directionality, Incoming, no Listener/Tunnel access, and complete
-  cleanup. The disposable profile degraded to standalone and stopped at
-  `AGENT_AUTH_REQUIRED`; UI/editor completion and the remaining items stay
-  Unverified rather than being converted to Pass.
+  AC-5 items 1-4, 6, and 8-12 were observed against the existing authenticated
+  full-Catalog profile, including both peer rejection codes, directionality,
+  real editor output/completion, matching runtime/recovery Session hashes,
+  Incoming, needs-input resume, token and short-budget cancellation, no
+  Listener/Tunnel access, and complete cleanup. Copilot UI confirmation,
+  same-Chat return, target Chat Sessions UI visibility, and 60-minute UI
+  stability stay Unverified rather than being converted to Pass.
 - Hardened final-stack lifecycle edges: an editor attempt with failed cleanup no
   longer starts a concurrent standalone fallback, selector disposal can retry,
   and a fast historical terminal notification cannot mask a retry's
@@ -79,7 +81,9 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
   later editor challenges fail safely and never trigger credential replacement,
   while owned standalone hosts retain explicit VS Code authentication mappings.
   Source status and AC-5 evidence now require the actual editor attempt and a
-  catalog-observed task Session rather than a stale probe result.
+  createSession-to-task recovery hash match rather than a stale probe result.
+  The E2E editor transport uses an owned one-client authenticated loopback TCP
+  bridge when its Extension Host cannot directly reach the live Unix socket.
 - Bumped the Preview extension and VSIX artifact to `0.4.0` while retaining AHP
   commit `f19dd8b3942d029744a3bdd31d830f9428e8ea47`, TypeScript client `0.9.0`,
   and protocol offer `1.0.0`.

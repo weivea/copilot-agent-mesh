@@ -139,7 +139,7 @@ required for item 9.
 
 ### Recorded P8 objective result
 
-The 2026-08-31 diagnostics-only run on VS Code 1.135.0/macOS arm64 using the
+The 2026-09-01 diagnostics-only run on VS Code 1.135.0/macOS arm64 using the
 existing dedicated profile with a full 32-entry production Workspace Catalog
 produced a valid **Unverified** artifact rather than a false Pass:
 
@@ -147,16 +147,18 @@ produced a valid **Unverified** artifact rather than a false Pass:
   hashes, target absent before authorization, exact `PEER_NOT_ALLOWED` and
   `PEER_NOT_ACCEPTING`, target visible after both gates, and reverse direction
   absent; both Dashboard configuration lists contained both windows.
-- AC-5 8 and 10-12 passed: the target had an Incoming record, Listener/Tunnel
+- AC-5 6 and 8-12 passed: the editor task emitted real
+  `agentStarted`/output/`turnComplete`/`completed`, its createSession and recovery
+  fingerprints matched, the target had an Incoming record, Listener/Tunnel
   attempt deltas stayed zero, the Workspace lease and Profile Lock were released,
   and final harness-owned VS Code/Agent Host/Tunnel/socket/timer counts were zero.
 - The run-scoped Mesh state reached both windows without reading or evicting that
-  production Catalog. A later authenticated run used the live editor source and
-  produced authoritative output/completion, a real needs-input answer/resume,
-  and authoritative token cancellation. The post-task editor catalog remained
-  empty and no user UI attestation was supplied, so O1 remains Unverified; the
-  short-budget and exact final-SHA results are recorded in the generated
-  evidence artifact.
+  production Catalog. The authenticated run used the live editor source and
+  passed real needs-input answer/resume, authoritative token cancellation, and
+  the 10-second harness-budget cancellation. The post-task editor catalog
+  remained empty and no user UI attestation was supplied, so AC-5 5 and 7 plus
+  O1 remain Unverified. O2 also remains Unverified because the observed editor
+  invocation was about 87 seconds, not a 60-minute Copilot UI call.
 - No user attestation was created. The full UI rerun still requires the exact
   enabled command, a signed-in dedicated profile, one visible Agent-mode Tool
   confirmation, and an honest `session-visible`/`session-not-visible` attestation.
