@@ -273,6 +273,7 @@ export class AgentRuntimeLifecycle {
 export interface AgentRuntimeProbe {
 	readonly available: boolean;
 	readonly featureEnabled: boolean;
+	readonly canStart?: boolean;
 	readonly version?: string;
 	readonly reason?: AgentRuntimeErrorCode;
 	readonly source?: AgentHostSource;

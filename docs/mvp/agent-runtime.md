@@ -38,10 +38,12 @@ seconds after two-window startup without intervening attempts. Invalid protocol
 responses, malformed tokens, and explicit upgrade authentication rejection do
 not retry.
 Before any task selects a source, Dashboard probes are passive and report editor
-availability as pending rather than executing `code agent endpoints`. The actual
-task start performs the first fresh locate/connect. This prevents UI refreshes
-from perturbing the registry or rotating a connection token before WebSocket
-upgrade. Only after a successful start is editor reported healthy.
+health as unavailable/pending with an internal `canStart` capability rather than
+executing `code agent endpoints`. The task executor may attempt such a source,
+but Dashboard does not report it healthy. The actual task start performs the
+first fresh locate/connect. This prevents UI refreshes from perturbing the
+registry or rotating a connection token before WebSocket upgrade. Only after a
+successful start is editor reported healthy.
 Fallback is forbidden when cleanup of the failed editor attempt is unconfirmed;
 starting standalone in that state could overlap resources or execution. Selector
 disposal retains failed cleanup for an explicit retry.

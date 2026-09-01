@@ -318,7 +318,7 @@ export class WindowNodeTaskExecutor {
 		const grant = assertDelegationGrantBinding(params, workspace);
 		this.assertRecordWithinWorkerDeadline(record, params.workerDeadline);
 		const probe = await this.options.runtime.probe();
-		if (!probe.featureEnabled || !probe.available) {
+		if (!probe.featureEnabled || (!probe.available && probe.canStart !== true)) {
 			throw new AgentRuntimeError(
 				probe.reason ?? 'AGENT_UNAVAILABLE',
 				'The production Agent runtime is unavailable or disabled.',

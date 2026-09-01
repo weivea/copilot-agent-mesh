@@ -78,6 +78,7 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 			return {
 				available: false,
 				featureEnabled: true,
+				canStart: true,
 				reason: 'AGENT_UNAVAILABLE',
 				source: 'editor',
 			};
@@ -99,6 +100,7 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 		return {
 			available: false,
 			featureEnabled: true,
+			canStart: true,
 			reason: 'AGENT_UNAVAILABLE',
 			source: 'editor',
 		};

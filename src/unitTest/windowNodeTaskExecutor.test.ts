@@ -348,6 +348,19 @@ test('validates exact routes, local workspaces, and production runtime availabil
 		(error: unknown) => error instanceof AgentRuntimeError && error.code === 'AGENT_UNAVAILABLE',
 	);
 	await unavailable.executor.dispose();
+
+	const attemptableRuntime = new TestRuntime();
+	attemptableRuntime.probeResult = {
+		available: false,
+		featureEnabled: true,
+		canStart: true,
+		reason: 'AGENT_UNAVAILABLE',
+		source: 'editor',
+	};
+	const attemptable = createFixture({ runtime: attemptableRuntime });
+	await attemptable.executor.start(startParams());
+	assert.equal(attemptableRuntime.requests.length, 1);
+	await attemptable.executor.dispose();
 });
 
 test('rejects a task start whose absolute worker deadline has expired', async () => {

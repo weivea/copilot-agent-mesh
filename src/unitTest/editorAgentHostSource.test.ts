@@ -579,6 +579,7 @@ test('source selector keeps editor availability passive until a real task select
 	assert.deepEqual(pending, {
 		available: false,
 		featureEnabled: true,
+		canStart: true,
 		reason: 'AGENT_UNAVAILABLE',
 		source: 'editor',
 	});
