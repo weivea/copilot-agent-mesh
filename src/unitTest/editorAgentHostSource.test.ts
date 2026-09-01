@@ -473,6 +473,13 @@ test('source selector retries one cleanup-safe editor connection before standalo
 	editor.startErrors.push(new AgentRuntimeError(
 		'AGENT_UNAVAILABLE',
 		'The Agent Host connection could not be established.',
+		false,
+		new UnixSocketWebSocketError(
+			'CONNECT_FAILED',
+			'The editor Agent Host socket connection failed.',
+			undefined,
+			'ECONNREFUSED',
+		),
 	));
 	const selector = new AgentHostSourceSelector(selectorOptions({
 		preferEditor: () => true,

@@ -29,14 +29,14 @@ live schema-v2 `editor` Unix-socket endpoint at AHP `1.0.0`. Each delegated task
 uses its own `net.connect` + authenticated WebSocket Upgrade + AHP client. Discovery,
 connection, initialize, or protocol failure falls back to the existing standalone
 launcher exactly once and exposes `standalone` plus a bounded degradation reason.
-Retryable connection-only failures may re-locate and reconnect after
-cancellation-aware 5, 10, 15, 30, 30, and 30 second delays under the same approval
-capability before fallback; no Session or Turn exists at that boundary. Invalid
-protocol responses, malformed tokens, and explicit upgrade authentication
-rejection do not use this retry. A controlled run identified the live-startup
-boundary as a stale-registry `ECONNREFUSED`; an independent production connector
-first succeeded about 82 seconds after the two-window startup. The bounded
-readiness window is therefore 120 seconds.
+A retryable `ECONNREFUSED` connection failure waits once for a cancellation-aware
+90-second quiet readiness window, then re-locates and reconnects under the same
+approval capability before fallback; no Session or Turn exists at that boundary.
+Repeated short connection attempts were observed to keep the shared editor Host
+unstable, while an independent production connector first succeeded about 82
+seconds after two-window startup without intervening attempts. Invalid protocol
+responses, malformed tokens, and explicit upgrade authentication rejection do
+not retry.
 The selector also serializes the final pre-start endpoint probe with launch and
 does not rediscover the endpoint while an editor start is in flight or selected.
 This prevents Dashboard refreshes from rotating the registry token between
