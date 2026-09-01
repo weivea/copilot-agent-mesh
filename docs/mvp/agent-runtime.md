@@ -78,9 +78,12 @@ Source fallback sits below one runtime approval boundary. An exact local
 WeakMap-backed capability bound to the complete request; same-device peer tasks
 therefore show no target Node/runtime modal because the parent's native
 Continue/Cancel was the sole consent. Legacy, direct, and cross-device tasks without
-that local-source proof retain exactly one target confirmation, whose capability
-covers both source attempts. The capability is not a wire/model boolean and carries
-no serializable grant, path, or identity data.
+that local-source proof retain exactly one owned target confirmation panel with
+a scrollable full prompt, whose capability covers both source attempts. Worker
+deadline or disposal closes the panel, and no unanswered prompt holds the
+runtime startup gate. The
+capability is not a wire/model boolean and carries no serializable grant, path,
+or identity data.
 
 The Dashboard does not infer a healthy source before selection. With Peer
 Delegation off it reports the source as unavailable for delegation. With the
@@ -132,7 +135,7 @@ distinguish the authoritative AHP action from the persisted Mesh terminal state.
 It never records an envelope, prompt, output, URI, endpoint, or token, and no
 observer exists in production extension mode.
 
-Required Session configuration is rendered from the provider schema. Boolean values use explicit choices, strings remain strings, and numbers, arrays, and objects are parsed and recursively validated as JSON. Invalid, read-only, or unsupported properties fail with `AGENT_CONFIG_REQUIRED` instead of sending a coerced value to the provider.
+Required Session configuration is rendered from the provider schema. Boolean values use explicit choices, strings remain strings, and numbers, arrays, and objects are parsed and recursively validated as JSON. Dynamic, static, and freeform controls are owned by the runtime and close on task disposal. Invalid, read-only, or unsupported properties fail with `AGENT_CONFIG_REQUIRED` instead of sending a coerced value to the provider.
 
 ## Authentication
 
@@ -144,9 +147,10 @@ VS Code session lookup and sends no root `authenticate` action. If
 notification produces a real authentication challenge, the editor path fails
 `AGENT_AUTH_REQUIRED` with a safe instruction to authenticate in that editor
 profile. It never overrides or restarts editor credentials. The failed source
-stays visibly unhealthy, but a later task may retry after the user fixes
-authentication or configuration; the stale probe result does not permanently
-disable the editor runtime.
+stays visibly unhealthy, but every later task may re-attempt it; any retained
+failed-start resources are retried to completion before another Host launch.
+The stale probe result therefore does not permanently disable the runtime, and
+cleanup failure never permits standalone fallback or concurrent reuse.
 
 The standalone-only `VscodeAuthBroker` is silent-first. A modal `createIfNone`
 request is allowed only when the invocation explicitly permits interactive
@@ -216,16 +220,18 @@ command succeeded but returned zero endpoints; Insiders user-data was absent. Ed
 initialize and O1 Session visibility therefore remain unverified in that environment,
 with no Session created and no sensitive evidence persisted.
 
-P8 records the actual editor `createSession` boundary through its E2E-only
-lifecycle observer, then compares that Session's domain-separated 16-hex
-fingerprint with the task recovery Session and requires a fingerprinted editor
-endpoint. This objective match satisfies the runtime portion of AC-5.9 without
-trusting a stale source status. A separate bounded post-task `listSessions`
+After `createSession` is acknowledged, P8 records the Session resource returned
+by the Host's subscribed Session snapshot (or a later Host Session-channel
+action) through its E2E-only lifecycle observer. It compares that
+domain-separated 16-hex fingerprint with the task recovery Session and requires
+a fingerprinted editor endpoint. A locally generated Session URI alone is not
+evidence. If the Host never echoes the Session, AC-5.9 remains Unverified even
+when the task otherwise completes. A separate bounded post-task `listSessions`
 observation remains O1 catalog evidence; it does not open and close a pre-task
-catalog client because that borrowed-client lifecycle can perturb editor identity
-readiness. Only fingerprints and counts leave the Extension Host. A standalone
-fallback can demonstrate degraded execution but can never satisfy the editor
-Session claim.
+catalog client because that borrowed-client lifecycle can perturb editor
+identity readiness. Only fingerprints and counts leave the Extension Host. A
+standalone fallback can demonstrate degraded execution but can never satisfy
+the editor Session claim.
 
 ## Verified result
 

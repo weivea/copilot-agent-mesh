@@ -186,11 +186,11 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 		source: z.enum(['editor', 'standalone', 'unavailable']),
 		catalogBefore: nonNegativeInteger,
 		catalogAfter: nonNegativeInteger,
-		runtimeSessionHash: fingerprint.optional(),
+		hostSessionHash: fingerprint.optional(),
 		recoverySessionHash: fingerprint.optional(),
 		editorEndpointFingerprint: fingerprint.optional(),
-		runtimeSessionHashMatched: z.boolean(),
-		sessionHashMatched: z.boolean(),
+		hostSessionHashMatched: z.boolean(),
+		catalogSessionHashMatched: z.boolean(),
 		uiObserved: z.boolean(),
 	}),
 	transport: z.strictObject({
@@ -364,12 +364,6 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 			|| !evidence.completion.incomingRecord
 			|| evidence.completion.source !== 'editor'
 			|| evidence.completion.degraded
-			|| evidence.sessionVisibility.source !== 'editor'
-			|| !evidence.sessionVisibility.runtimeSessionHashMatched
-			|| evidence.sessionVisibility.runtimeSessionHash === undefined
-			|| evidence.sessionVisibility.recoverySessionHash === undefined
-			|| evidence.sessionVisibility.runtimeSessionHash !== evidence.sessionVisibility.recoverySessionHash
-			|| evidence.sessionVisibility.editorEndpointFingerprint === undefined
 			|| !evidence.completion.leaseReleased
 		)
 	) {
@@ -678,17 +672,17 @@ function validateAc5Correspondence(
 			status: evidence.completion.source === 'editor'
 				&& !evidence.completion.degraded
 				&& evidence.sessionVisibility.source === 'editor'
-				&& evidence.sessionVisibility.runtimeSessionHashMatched
-				&& evidence.sessionVisibility.runtimeSessionHash !== undefined
+				&& evidence.sessionVisibility.hostSessionHashMatched
+				&& evidence.sessionVisibility.hostSessionHash !== undefined
 				&& evidence.sessionVisibility.recoverySessionHash !== undefined
-				&& evidence.sessionVisibility.runtimeSessionHash === evidence.sessionVisibility.recoverySessionHash
+				&& evidence.sessionVisibility.hostSessionHash === evidence.sessionVisibility.recoverySessionHash
 				&& evidence.sessionVisibility.editorEndpointFingerprint !== undefined
 				? 'pass'
 				: evidence.completion.status === 'fail' ? 'fail' : 'unverified',
 			referencePrefixes: [
 				'#/completion/source',
 				'#/sessionVisibility/source',
-				'#/sessionVisibility/runtimeSessionHashMatched',
+				'#/sessionVisibility/hostSessionHashMatched',
 			],
 		},
 		{
@@ -809,23 +803,23 @@ function validateAc5Correspondence(
 		addInvariantIssue(context, ['timeout'], 'Passing timeout evidence requires budget cancellation, authoritative terminal state, and lease release.');
 	}
 	if (
-		evidence.sessionVisibility.runtimeSessionHashMatched
+		evidence.sessionVisibility.hostSessionHashMatched
 		&& (
 			evidence.sessionVisibility.source !== 'editor'
-			|| evidence.sessionVisibility.runtimeSessionHash === undefined
+			|| evidence.sessionVisibility.hostSessionHash === undefined
 			|| evidence.sessionVisibility.recoverySessionHash === undefined
-			|| evidence.sessionVisibility.runtimeSessionHash !== evidence.sessionVisibility.recoverySessionHash
+			|| evidence.sessionVisibility.hostSessionHash !== evidence.sessionVisibility.recoverySessionHash
 			|| evidence.sessionVisibility.editorEndpointFingerprint === undefined
 		)
 	) {
-		addInvariantIssue(context, ['sessionVisibility'], 'A matched runtime Session requires an observed editor Session and endpoint fingerprint.');
+		addInvariantIssue(context, ['sessionVisibility'], 'A matched Host Session requires an echoed editor Session and endpoint fingerprint.');
 	}
 	if (
 		evidence.sessionVisibility.status === 'pass'
 		&& (
 			evidence.sessionVisibility.source !== 'editor'
-			|| !evidence.sessionVisibility.runtimeSessionHashMatched
-			|| !evidence.sessionVisibility.sessionHashMatched
+			|| !evidence.sessionVisibility.hostSessionHashMatched
+			|| !evidence.sessionVisibility.catalogSessionHashMatched
 			|| !evidence.sessionVisibility.uiObserved
 			|| evidence.sessionVisibility.catalogAfter < 1
 		)

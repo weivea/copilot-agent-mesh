@@ -109,9 +109,18 @@ class TestRuntime implements AgentRuntime {
 	public probeResult: AgentRuntimeProbe = { available: true, featureEnabled: true };
 	public readonly requests: AgentTaskRequest[] = [];
 	public readonly handles: TestHandle[] = [];
+	public prepareCalls = 0;
+	public prepareError: Error | undefined;
 
 	public probe(): Promise<AgentRuntimeProbe> {
 		return Promise.resolve(this.probeResult);
+	}
+
+	public async prepareStart(): Promise<void> {
+		this.prepareCalls += 1;
+		if (this.prepareError !== undefined) {
+			throw this.prepareError;
+		}
 	}
 
 	public start(request: AgentTaskRequest): Promise<AgentTaskHandle> {
@@ -364,6 +373,27 @@ test('validates exact routes, local workspaces, and production runtime availabil
 	await attemptable.executor.dispose();
 });
 
+test('failed runtime preparation stops before target confirmation or a new launch', async () => {
+	const runtime = new TestRuntime();
+	runtime.prepareError = new AgentRuntimeError(
+		'TASK_EXECUTION_FAILED',
+		'Prior Agent Host resources are still being released.',
+		false,
+		undefined,
+		true,
+	);
+	const fixture = createFixture({ runtime });
+
+	await assert.rejects(
+		fixture.executor.start(startParams({ sourceNodeId: undefined })),
+		(error: unknown) => error instanceof AgentRuntimeError && error.cleanupFailed,
+	);
+	assert.equal(runtime.prepareCalls, 1);
+	assert.equal(runtime.requests.length, 0);
+	assert.deepEqual(fixture.confirmations, []);
+	await fixture.executor.dispose();
+});
+
 test('rejects a task start whose absolute worker deadline has expired', async () => {
 	const fixture = createFixture();
 	assert.throws(
@@ -430,6 +460,67 @@ test('shutdown interrupts a pending runtime start before awaiting it', async () 
 	);
 	await disposal;
 	assert.equal(runtime.disposeCalls, 1);
+});
+
+test('shutdown interrupts an unanswered target confirmation and releases the start gate', async () => {
+	let confirmationEntered!: () => void;
+	const entered = new Promise<void>((resolve) => {
+		confirmationEntered = resolve;
+	});
+	const runtime = new TestRuntime();
+	const fixture = createFixture({
+		runtime,
+		clock: { now: () => new Date() },
+		confirmationHost: {
+			confirm: async () => {
+				confirmationEntered();
+				return new Promise<never>(() => undefined);
+			},
+		},
+	});
+	const start = fixture.executor.start(startParams({
+		sourceNodeId: undefined,
+		workerDeadline: new Date(Date.now() + 60_000).toISOString(),
+	}));
+	await entered;
+
+	const disposal = fixture.executor.dispose();
+	await assert.rejects(
+		start,
+		(error: unknown) => isReason(error, 'WORKER_DRAINING'),
+	);
+	await disposal;
+	assert.equal(runtime.requests.length, 0);
+});
+
+test('worker deadline interrupts an unanswered target confirmation', async () => {
+	let confirmationEntered!: () => void;
+	const entered = new Promise<void>((resolve) => {
+		confirmationEntered = resolve;
+	});
+	const runtime = new TestRuntime();
+	const fixture = createFixture({
+		runtime,
+		clock: { now: () => new Date() },
+		confirmationHost: {
+			confirm: async () => {
+				confirmationEntered();
+				return new Promise<never>(() => undefined);
+			},
+		},
+	});
+	const start = fixture.executor.start(startParams({
+		sourceNodeId: undefined,
+		workerDeadline: new Date(Date.now() + 30).toISOString(),
+	}));
+	await entered;
+
+	await assert.rejects(
+		start,
+		(error: unknown) => isReason(error, 'TASK_EXECUTION_FAILED'),
+	);
+	assert.equal(runtime.requests.length, 0);
+	await fixture.executor.dispose();
 });
 
 test('starts once for exact retries, rejects conflicts, and supplies complete confirmation details', async () => {

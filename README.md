@@ -88,9 +88,9 @@ errors and directionality, the target Incoming record, zero Listener/Tunnel
 attempt delta, a real editor-backed `agentStarted`/output/`turnComplete`/
 `completed` sequence, exact needs-input resume, token cancellation, short-budget
 cancellation, released leases/profile lock, and zero harness-owned residue.
-The actual editor Session and task recovery hashes matched. Copilot-sidebar
-confirmation, target Chat Sessions UI visibility, and 60-minute UI stability
-remain explicitly Unverified.
+The Session resource echoed by the editor Host matched the task recovery hash.
+Copilot-sidebar confirmation, target Chat Sessions UI visibility, and 60-minute
+UI stability remain explicitly Unverified.
 
 ## Install the local Preview
 

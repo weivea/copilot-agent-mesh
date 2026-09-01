@@ -846,6 +846,87 @@ test('closing dynamic configuration search aborts the active completion request'
 	assert.equal(picker.disposed, true);
 });
 
+test('runtime cancellation closes dynamic configuration and aborts completion work', async () => {
+	const picker = new TestQuickPick();
+	const resolver = new VscodeSessionConfigurationResolver(vscodeWithPicker(picker), 1);
+	const controller = new AbortController();
+	let activeSignal: AbortSignal | undefined;
+	const resolution = resolver.resolve({
+		schema: {
+			type: 'object',
+			required: ['model'],
+			properties: {
+				model: { type: 'string', title: 'Model', enumDynamic: true },
+			},
+		},
+		values: {},
+		interactive: true,
+		signal: controller.signal,
+		completions: async (_property, _values, _query, signal) => {
+			activeSignal = signal;
+			return new Promise(() => undefined);
+		},
+	});
+	await waitFor(() => activeSignal !== undefined);
+
+	controller.abort();
+
+	await assert.rejects(
+		resolution,
+		(error: unknown) => error instanceof DOMException && error.name === 'AbortError',
+	);
+	assert.equal(activeSignal?.aborted, true);
+	assert.equal(picker.disposed, true);
+});
+
+test('runtime cancellation closes static and freeform configuration controls', async () => {
+	const staticPicker = new TestQuickPick();
+	const staticResolver = new VscodeSessionConfigurationResolver(vscodeWithPicker(staticPicker));
+	const staticController = new AbortController();
+	const staticResolution = staticResolver.resolve({
+		schema: {
+			type: 'object',
+			required: ['mode'],
+			properties: {
+				mode: { type: 'string', title: 'Mode', enum: ['one', 'two'] },
+			},
+		},
+		values: {},
+		interactive: true,
+		signal: staticController.signal,
+		completions: async () => [],
+	});
+	staticController.abort();
+	await assert.rejects(
+		staticResolution,
+		(error: unknown) => error instanceof DOMException && error.name === 'AbortError',
+	);
+	assert.equal(staticPicker.disposed, true);
+
+	const input = new TestInputBox();
+	const inputResolver = new VscodeSessionConfigurationResolver(vscodeWithInput(input));
+	const inputController = new AbortController();
+	const inputResolution = inputResolver.resolve({
+		schema: {
+			type: 'object',
+			required: ['name'],
+			properties: {
+				name: { type: 'string', title: 'Name' },
+			},
+		},
+		values: {},
+		interactive: true,
+		signal: inputController.signal,
+		completions: async () => [],
+	});
+	inputController.abort();
+	await assert.rejects(
+		inputResolution,
+		(error: unknown) => error instanceof DOMException && error.name === 'AbortError',
+	);
+	assert.equal(input.disposed, true);
+});
+
 class MemoryState {
 	private readonly values = new Map<string, unknown>();
 	public updateCalls = 0;
@@ -964,6 +1045,10 @@ class TestQuickPick {
 
 	public show(): void {}
 
+	public hide(): void {
+		this.emitHide();
+	}
+
 	public dispose(): void {
 		this.disposed = true;
 	}
@@ -998,6 +1083,46 @@ function vscodeWithPicker(picker: TestQuickPick): typeof vscode {
 	return {
 		window: {
 			createQuickPick: () => picker,
+		},
+	} as unknown as typeof vscode;
+}
+
+class TestInputBox {
+	public title: string | undefined;
+	public prompt: string | undefined;
+	public value = '';
+	public ignoreFocusOut = false;
+	public disposed = false;
+	private readonly acceptListeners = new Set<() => void>();
+	private readonly hideListeners = new Set<() => void>();
+
+	public readonly onDidAccept = this.event(this.acceptListeners);
+	public readonly onDidHide = this.event(this.hideListeners);
+
+	public show(): void {}
+
+	public hide(): void {
+		for (const listener of this.hideListeners) {
+			listener();
+		}
+	}
+
+	public dispose(): void {
+		this.disposed = true;
+	}
+
+	private event(listeners: Set<() => void>) {
+		return (listener: () => void): vscode.Disposable => {
+			listeners.add(listener);
+			return { dispose: () => listeners.delete(listener) };
+		};
+	}
+}
+
+function vscodeWithInput(input: TestInputBox): typeof vscode {
+	return {
+		window: {
+			createInputBox: () => input,
 		},
 	} as unknown as typeof vscode;
 }

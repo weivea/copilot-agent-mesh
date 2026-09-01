@@ -104,7 +104,7 @@ export class PeerDelegationE2eRecorder implements
 			if (!uuidPattern.test(observation.taskId)) {
 				return;
 			}
-			const observesSession = observation.eventType === 'session/created'
+			const observesSession = observation.eventType === 'session/hostObserved'
 				|| observation.eventType === 'task/sessionBound';
 			if (
 				observesSession
@@ -124,7 +124,7 @@ export class PeerDelegationE2eRecorder implements
 					? {}
 					: {
 						sessionHash: digest('agent-session', observation.sessionUri).slice(0, 16),
-						...(observation.eventType !== 'session/created'
+						...(observation.eventType !== 'session/hostObserved'
 							? {}
 							: {
 								source: observation.source,

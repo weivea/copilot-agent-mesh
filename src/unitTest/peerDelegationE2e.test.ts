@@ -151,11 +151,39 @@ test('peer-delegation passing evidence requires all real AC-5 conditions', () =>
 			...evidence,
 			sessionVisibility: {
 				...evidence.sessionVisibility,
-				runtimeSessionHashMatched: false,
+				hostSessionHashMatched: false,
 			},
 		}),
 		/editor Tool-to-Agent route|AC-5 item 9 must match/u,
 	);
+	assert.throws(
+		() => parsePeerDelegationEvidence({
+			...evidence,
+			sessionVisibility: {
+				...evidence.sessionVisibility,
+				recoverySessionHash: '1111111111111111',
+			},
+		}),
+		/matched Host Session|AC-5 item 9 must match/u,
+	);
+	const {
+		hostSessionHash: _hostSessionHash,
+		recoverySessionHash: _recoverySessionHash,
+		editorEndpointFingerprint: _editorEndpointFingerprint,
+		...sessionWithoutHostEcho
+	} = evidence.sessionVisibility;
+	assert.doesNotThrow(() => parsePeerDelegationEvidence({
+		...evidence,
+		outcome: 'unverified',
+		sessionVisibility: {
+			...sessionWithoutHostEcho,
+			hostSessionHashMatched: false,
+			catalogSessionHashMatched: false,
+		},
+		ac5: evidence.ac5.map((item) => item.item === 9
+			? { ...item, status: 'unverified' as const, evidenceRefs: [] }
+			: item),
+	}));
 	assert.throws(
 		() => parsePeerDelegationEvidence({
 			...evidence,
@@ -210,7 +238,7 @@ test('peer-delegation recorder stores identities and hashes without prompt or ou
 	});
 	recorder.observeLifecycle({
 		taskId,
-		eventType: 'session/created',
+		eventType: 'session/hostObserved',
 		sessionUri: 'session:do-not-persist-this-identifier',
 		source: 'editor',
 		endpointFingerprint: '0123456789abcdef',
@@ -234,7 +262,7 @@ test('peer-delegation recorder stores identities and hashes without prompt or ou
 			sequence: 2,
 			at: snapshot.ahp[0]?.at,
 			taskId,
-			eventType: 'session/created',
+			eventType: 'session/hostObserved',
 			source: 'editor',
 			sessionHash: snapshot.ahp[0]?.sessionHash,
 			endpointFingerprint: '0123456789abcdef',
@@ -485,8 +513,8 @@ function unverifiedEvidence(): PeerDelegationEvidence {
 			source: 'unavailable',
 			catalogBefore: 0,
 			catalogAfter: 0,
-			runtimeSessionHashMatched: false,
-			sessionHashMatched: false,
+			hostSessionHashMatched: false,
+			catalogSessionHashMatched: false,
 			uiObserved: false,
 		},
 		transport: {
@@ -568,7 +596,7 @@ function passingEvidence(): PeerDelegationEvidence {
 		'#/completion/eventTypes',
 		'#/completion/parentSameInvocation',
 		'#/completion/incomingRecord',
-		'#/sessionVisibility/runtimeSessionHashMatched',
+		'#/sessionVisibility/hostSessionHashMatched',
 		'#/transport',
 		'#/cleanup/workspaceLeaseReleased',
 		'#/resources',
@@ -678,11 +706,11 @@ function passingEvidence(): PeerDelegationEvidence {
 			source: 'editor',
 			catalogBefore: 0,
 			catalogAfter: 1,
-			runtimeSessionHash: '0123456789abcdef',
+			hostSessionHash: '0123456789abcdef',
 			recoverySessionHash: '0123456789abcdef',
 			editorEndpointFingerprint: 'fedcba9876543210',
-			runtimeSessionHashMatched: true,
-			sessionHashMatched: true,
+			hostSessionHashMatched: true,
+			catalogSessionHashMatched: true,
 			uiObserved: false,
 		},
 		transport: {

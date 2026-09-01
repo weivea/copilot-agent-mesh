@@ -571,6 +571,92 @@ test('source selector preserves the Agent Host feature gate before probing or co
 	await selector.dispose();
 });
 
+test('source selector prepares both editor and standalone cleanup before task confirmation', async () => {
+	const editor = new FakeRuntime();
+	const standalone = new FakeRuntime();
+	standalone.prepareErrors.push(new AgentRuntimeError(
+		'TASK_EXECUTION_FAILED',
+		'Standalone cleanup is incomplete.',
+		false,
+		undefined,
+		true,
+	));
+	const selector = new AgentHostSourceSelector(selectorOptions({
+		preferEditor: () => true,
+		editor,
+		standalone,
+	}));
+
+	await assert.rejects(
+		selector.prepareStart(),
+		(error: unknown) => error instanceof AgentRuntimeError && error.cleanupFailed,
+	);
+	assert.equal(editor.prepareCalls, 1);
+	assert.equal(standalone.prepareCalls, 1);
+	assert.equal(editor.starts, 0);
+	assert.equal(standalone.starts, 0);
+
+	await selector.prepareStart();
+	assert.equal(editor.prepareCalls, 2);
+	assert.equal(standalone.prepareCalls, 2);
+	await selector.dispose();
+});
+
+for (const scenario of [
+	{
+		name: 'recovery failure',
+		error: new AgentRuntimeError(
+			'TASK_RECOVERY_UNAVAILABLE',
+			'The prior editor task could not recover.',
+		),
+	},
+	{
+		name: 'unconfirmed cancellation',
+		error: new AgentRuntimeError(
+			'TASK_CANCELLATION_UNCONFIRMED',
+			'The prior editor task could not confirm cancellation.',
+		),
+	},
+	{
+		name: 'cleanup failure',
+		error: new AgentRuntimeError(
+			'AGENT_UNAVAILABLE',
+			'The prior editor start did not release its resources.',
+			false,
+			undefined,
+			true,
+		),
+	},
+]) {
+	test(`source selector re-attempts editor after a prior ${scenario.name}`, async () => {
+		const editor = new FakeRuntime();
+		editor.startErrors.push(scenario.error);
+		const standalone = new FakeRuntime();
+		const selector = new AgentHostSourceSelector(selectorOptions({
+			preferEditor: () => true,
+			editor,
+			standalone,
+		}));
+
+		await assert.rejects(selector.start(taskRequest()), { code: scenario.error.code });
+		for (let probeIndex = 0; probeIndex < 2; probeIndex += 1) {
+			const probe = await selector.probe();
+			assert.equal(probe.available, false);
+			assert.equal(probe.canStart, true);
+			assert.equal(probe.reason, scenario.error.code);
+			assert.equal(probe.source, 'editor');
+		}
+
+		await selector.start(taskRequest());
+		assert.equal(editor.starts, 2);
+		assert.equal(standalone.starts, 0);
+		assert.deepEqual(selector.sourceStatus(), { source: 'editor', degraded: false });
+		await selector.dispose();
+		assert.equal(editor.disposals, 1);
+		assert.equal(standalone.disposals, 1);
+	});
+}
+
 test('source selector retries one cleanup-safe editor connection before standalone fallback', async () => {
 	const editor = new FakeRuntime();
 	const standalone = new FakeRuntime();
@@ -1117,12 +1203,22 @@ class FakeRuntime implements AgentRuntime {
 	disposals = 0;
 	startError: unknown;
 	readonly startErrors: unknown[] = [];
+	prepareCalls = 0;
+	readonly prepareErrors: unknown[] = [];
 	readonly disposeErrors: unknown[] = [];
 	probeResult: AgentRuntimeProbe = { available: true, featureEnabled: true };
 
 	public async probe(): Promise<AgentRuntimeProbe> {
 		this.probes += 1;
 		return this.probeResult;
+	}
+
+	public async prepareStart(): Promise<void> {
+		this.prepareCalls += 1;
+		const error = this.prepareErrors.shift();
+		if (error !== undefined) {
+			throw error;
+		}
 	}
 
 	public async start(request: AgentTaskRequest): Promise<AgentTaskHandle> {

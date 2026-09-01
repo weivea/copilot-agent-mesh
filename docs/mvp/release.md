@@ -104,7 +104,7 @@ sensitive content and any claimed Pass with residual harness-owned resources.
 
 The recorded P8 objective run is valid but **Unverified**: AC-5 1-4, 6, and
 8-12 passed against the existing full-Catalog authenticated profile, including
-real editor completion, matched createSession/recovery fingerprints,
+real editor completion, matched Host-echoed/recovery Session fingerprints,
 needs-input resume, cancellation, and complete cleanup. Do not publish or
 relabel this as a full Peer Delegation Pass: AC-5 5 and 7 plus O1/O2 still
 require the visible Agent-mode/UI observations.
@@ -112,8 +112,9 @@ require the visible Agent-mode/UI observations.
 Editor endpoints reuse the editor Host's established identity and never receive
 tokens from `copilotAgentMesh.experimental.authenticationProviders`; those
 mappings apply only to an owned standalone fallback. AC-5 item 9 additionally
-requires matching editor createSession/task-recovery fingerprints and an editor
-endpoint fingerprint, not only a reported source.
+requires a Host-echoed editor Session fingerprint to match the task recovery
+fingerprint, plus an editor endpoint fingerprint; two locally derived values or
+a reported source cannot satisfy it.
 
 Run the ordinary-window transport/lifecycle test explicitly:
 

@@ -51,7 +51,10 @@ export interface WindowNodeTaskConfirmationRequest {
 export type WindowNodeTaskConfirmationResult = 'once' | 'deny';
 
 export interface WindowNodeTaskConfirmationHost {
-	confirm(request: WindowNodeTaskConfirmationRequest): Promise<WindowNodeTaskConfirmationResult>;
+	confirm(
+		request: WindowNodeTaskConfirmationRequest,
+		signal?: AbortSignal,
+	): Promise<WindowNodeTaskConfirmationResult>;
 }
 
 export interface WindowNodeTaskEventSink {
@@ -111,6 +114,7 @@ interface StartRecord {
 	terminal: boolean;
 	deadlineExpired: boolean;
 	runtimeStartPending: boolean;
+	readonly preStartAbort: AbortController;
 	deadlineTimer?: NodeJS.Timeout;
 }
 
@@ -146,6 +150,7 @@ export class WindowNodeTaskExecutor {
 	private disposeComplete = false;
 	private disposal: Promise<void> | undefined;
 	private runtimeDisposal: Promise<void> | undefined;
+	private runtimeStartTail: Promise<void> = Promise.resolve();
 
 	public constructor(private readonly options: WindowNodeTaskExecutorOptions) {
 		this.nodeId = uuidSchema.parse(options.nodeId);
@@ -181,6 +186,7 @@ export class WindowNodeTaskExecutor {
 			terminal: false,
 			deadlineExpired: false,
 			runtimeStartPending: false,
+			preStartAbort: new AbortController(),
 		};
 		this.scheduleWorkerDeadline(record, params.workerDeadline);
 		const operation = this.startCore(params, record);
@@ -316,10 +322,17 @@ export class WindowNodeTaskExecutor {
 		record: StartRecord,
 	): Promise<NodeTaskStartedResult> {
 		this.assertRecordWithinWorkerDeadline(record, params.workerDeadline);
-		const workspace = await this.resolveWorkspace(params.target.workspaceId);
+		this.assertActive();
+		const workspace = await abortablePreStartOperation(
+			this.resolveWorkspace(params.target.workspaceId),
+			record.preStartAbort.signal,
+		);
 		const grant = assertDelegationGrantBinding(params, workspace);
 		this.assertRecordWithinWorkerDeadline(record, params.workerDeadline);
-		const probe = await this.options.runtime.probe();
+		const probe = await abortablePreStartOperation(
+			this.options.runtime.probe(),
+			record.preStartAbort.signal,
+		);
 		if (!probe.featureEnabled || (!probe.available && probe.canStart !== true)) {
 			throw new AgentRuntimeError(
 				probe.reason ?? 'AGENT_UNAVAILABLE',
@@ -327,6 +340,10 @@ export class WindowNodeTaskExecutor {
 				true,
 			);
 		}
+		await abortablePreStartOperation(
+			this.options.runtime.prepareStart?.() ?? Promise.resolve(),
+			record.preStartAbort.signal,
+		);
 		this.assertRecordWithinWorkerDeadline(record, params.workerDeadline);
 		this.assertActive();
 		const baseRuntimeRequest = {
@@ -345,13 +362,16 @@ export class WindowNodeTaskExecutor {
 			},
 		} satisfies AgentTaskRequest;
 		if (params.sourceNodeId === undefined) {
-			const confirmation = await this.options.confirmationHost.confirm({
-				sourceWindowLabel: params.sourceLabel,
-				targetWindowLabel: this.nodeLabel,
-				workspaceDisplayName: workspace.displayName,
-				taskTitle: params.title,
-				prompt: params.prompt,
-			});
+			const confirmation = await abortablePreStartOperation(
+				this.options.confirmationHost.confirm({
+					sourceWindowLabel: params.sourceLabel,
+					targetWindowLabel: this.nodeLabel,
+					workspaceDisplayName: workspace.displayName,
+					taskTitle: params.title,
+					prompt: params.prompt,
+				}, record.preStartAbort.signal),
+				record.preStartAbort.signal,
+			);
 			if (confirmation !== 'once') {
 				throw new MeshDomainError(
 					'TASK_EXECUTION_FAILED',
@@ -362,28 +382,35 @@ export class WindowNodeTaskExecutor {
 		this.assertRecordWithinWorkerDeadline(record, params.workerDeadline);
 		this.assertActive();
 
-		let handle: AgentTaskHandle;
-		record.runtimeStartPending = true;
-		try {
-			const approvalCapability = this.options.approvalCapabilities?.issue(baseRuntimeRequest);
-			handle = await this.options.runtime.start({
-				...baseRuntimeRequest,
-				...(approvalCapability === undefined ? {} : { approvalCapability }),
-			});
-		} catch (error: unknown) {
-			if (record.deadlineExpired) {
-				throw new MeshDomainError(
-					'TASK_EXECUTION_FAILED',
-					'The task worker deadline expired before the Agent runtime start completed.',
-				);
+		const handle = await this.withRuntimeStartGate(record, async () => {
+			await abortablePreStartOperation(
+				this.options.runtime.prepareStart?.() ?? Promise.resolve(),
+				record.preStartAbort.signal,
+			);
+			this.assertRecordWithinWorkerDeadline(record, params.workerDeadline);
+			this.assertActive();
+			record.runtimeStartPending = true;
+			try {
+				const approvalCapability = this.options.approvalCapabilities?.issue(baseRuntimeRequest);
+				return await this.options.runtime.start({
+					...baseRuntimeRequest,
+					...(approvalCapability === undefined ? {} : { approvalCapability }),
+				});
+			} catch (error: unknown) {
+				if (record.deadlineExpired) {
+					throw new MeshDomainError(
+						'TASK_EXECUTION_FAILED',
+						'The task worker deadline expired before the Agent runtime start completed.',
+					);
+				}
+				if (this.disposed) {
+					throw new MeshDomainError('WORKER_DRAINING', 'The Window Node is shutting down.');
+				}
+				throw error;
+			} finally {
+				record.runtimeStartPending = false;
 			}
-			if (this.disposed) {
-				throw new MeshDomainError('WORKER_DRAINING', 'The Window Node is shutting down.');
-			}
-			throw error;
-		} finally {
-			record.runtimeStartPending = false;
-		}
+		});
 		const active: ActiveTask = {
 			handle,
 			workspace,
@@ -474,6 +501,24 @@ export class WindowNodeTaskExecutor {
 		active.pump = pump;
 		this.trackPump(pump);
 		return result;
+	}
+
+	private withRuntimeStartGate<T>(
+		record: StartRecord,
+		operation: () => Promise<T>,
+	): Promise<T> {
+		const predecessor = this.runtimeStartTail;
+		let releaseTurn!: () => void;
+		const turn = new Promise<void>((resolve) => {
+			releaseTurn = resolve;
+		});
+		this.runtimeStartTail = predecessor.then(() => turn, () => turn);
+		return abortablePreStartOperation(
+			predecessor.catch(() => undefined),
+			record.preStartAbort.signal,
+		)
+			.then(operation)
+			.finally(releaseTurn);
 	}
 
 	private async pump(record: StartRecord, active: ActiveTask): Promise<void> {
@@ -816,6 +861,10 @@ export class WindowNodeTaskExecutor {
 				return;
 			}
 			record.deadlineExpired = true;
+			record.preStartAbort.abort(new MeshDomainError(
+				'TASK_EXECUTION_FAILED',
+				'The task worker deadline expired before execution could start.',
+			));
 			const active = record.active;
 			if (active !== undefined) {
 				this.trackDeadlineOperation(this.stopActiveTask(record, active));
@@ -922,6 +971,12 @@ export class WindowNodeTaskExecutor {
 	}
 
 	private async disposeCore(): Promise<void> {
+		for (const record of this.starts.values()) {
+			record.preStartAbort.abort(new MeshDomainError(
+				'WORKER_DRAINING',
+				'The Window Node is shutting down.',
+			));
+		}
 		const runtimeOperation = this.disposeRuntime();
 		const startOperations = [...this.starts.values()].map(({ operation }) => operation);
 		await Promise.allSettled(startOperations);
@@ -987,6 +1042,42 @@ export class WindowNodeTaskExecutor {
 		active.grant = undefined;
 		active.delegatedExecutionContext = undefined;
 	}
+}
+
+function abortablePreStartOperation<T>(
+	operation: Promise<T>,
+	signal: AbortSignal,
+): Promise<T> {
+	if (signal.aborted) {
+		return Promise.reject(preStartAbortReason(signal));
+	}
+	return new Promise<T>((resolve, reject) => {
+		const abort = () => {
+			signal.removeEventListener('abort', abort);
+			reject(preStartAbortReason(signal));
+		};
+		signal.addEventListener('abort', abort, { once: true });
+		void operation.then(
+			(value) => {
+				signal.removeEventListener('abort', abort);
+				if (!signal.aborted) {
+					resolve(value);
+				}
+			},
+			(error: unknown) => {
+				signal.removeEventListener('abort', abort);
+				if (!signal.aborted) {
+					reject(error);
+				}
+			},
+		);
+	});
+}
+
+function preStartAbortReason(signal: AbortSignal): Error {
+	return signal.reason instanceof Error
+		? signal.reason
+		: new MeshDomainError('WORKER_DRAINING', 'The Window Node task start was interrupted.');
 }
 
 function startFingerprint(params: NodeTaskStartParams): string {

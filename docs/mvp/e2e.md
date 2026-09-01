@@ -139,10 +139,11 @@ catalog and the target UI is visibly observed. O2 is Pass only after a genuine
 O3 remains non-guaranteed Tool choice, O4 remains undetectable concurrent user
 Copilot edits, and O5 remains unsupported/unverified outside macOS arm64.
 AC-5 item 9 is narrower than O1 but still cannot rely on source status alone:
-it requires the E2E-only lifecycle observer's actual editor `createSession`
-fingerprint to match the task recovery Session fingerprint and records the
-editor endpoint fingerprint. UI and post-task catalog observation are not
-required for item 9.
+it requires a Session resource echoed by the editor Host's subscription snapshot
+or Session-channel action to match the task recovery Session fingerprint, and
+records the editor endpoint fingerprint. A locally generated `createSession`
+URI cannot satisfy the item. If no Host echo is available, item 9 remains
+Unverified. UI and post-task catalog observation are not required for item 9.
 
 ### Recorded P8 objective result
 
@@ -155,10 +156,11 @@ produced a valid **Unverified** artifact rather than a false Pass:
   `PEER_NOT_ACCEPTING`, target visible after both gates, and reverse direction
   absent; both Dashboard configuration lists contained both windows.
 - AC-5 6 and 8-12 passed: the editor task emitted real
-  `agentStarted`/output/`turnComplete`/`completed`, its createSession and recovery
-  fingerprints matched, the target had an Incoming record, Listener/Tunnel
-  attempt deltas stayed zero, the Workspace lease and Profile Lock were released,
-  and final harness-owned VS Code/Agent Host/Tunnel/socket/timer counts were zero.
+  `agentStarted`/output/`turnComplete`/`completed`, its Host-echoed Session and
+  recovery fingerprints matched, the target had an Incoming record,
+  Listener/Tunnel attempt deltas stayed zero, the Workspace lease and Profile
+  Lock were released, and final harness-owned VS Code/Agent
+  Host/Tunnel/socket/timer counts were zero.
 - The run-scoped Mesh state reached both windows without reading or evicting that
   production Catalog. The authenticated run used the live editor source and
   passed real needs-input answer/resume, authoritative token cancellation, and

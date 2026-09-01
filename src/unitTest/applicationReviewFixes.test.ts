@@ -458,25 +458,24 @@ test('local approval shows the full prompt and preapproval cannot be reused by t
 });
 
 test('Window Node confirmation names both windows, workspace, title, and full prompt', async () => {
-	const calls: unknown[][] = [];
+	const panel = new TestConfirmationPanel();
 	const vscodeApi = {
+		ViewColumn: { Active: -1 },
 		window: {
-			showWarningMessage: async (...args: unknown[]) => {
-				calls.push(args);
-				return 'Run Once';
-			},
+			createWebviewPanel: () => panel,
 		},
 	} as unknown as typeof vscode;
 	const confirmation = new VscodeWindowNodeTaskConfirmation(vscodeApi);
-	const result = await confirmation.confirm({
+	const result = confirmation.confirm({
 		sourceWindowLabel: 'Source Window',
 		targetWindowLabel: 'Target Window',
 		workspaceDisplayName: 'Workspace',
 		taskTitle: 'Review changes',
-		prompt: 'Full prompt text.',
+		prompt: 'Full prompt text.\n<script>alert("unsafe")</script>',
 	});
-	assert.equal(result, 'once');
-	const detail = String((calls[0]?.[1] as { detail?: string }).detail);
+	panel.emitMessage({ decision: 'once' });
+	assert.equal(await result, 'once');
+	const detail = panel.webview.html;
 	for (const expected of [
 		'Source Window',
 		'Target Window',
@@ -486,6 +485,36 @@ test('Window Node confirmation names both windows, workspace, title, and full pr
 	]) {
 		assert.ok(detail.includes(expected));
 	}
+	assert.ok(detail.includes('&lt;script&gt;alert(&quot;unsafe&quot;)&lt;/script&gt;'));
+	assert.equal(detail.includes('<script>alert("unsafe")</script>'), false);
+	assert.match(detail, /default-src 'none'/u);
+	assert.equal(panel.disposed, true);
+});
+
+test('Window Node confirmation closes when its task start is aborted', async () => {
+	const panel = new TestConfirmationPanel();
+	const confirmation = new VscodeWindowNodeTaskConfirmation({
+		ViewColumn: { Active: -1 },
+		window: {
+			createWebviewPanel: () => panel,
+		},
+	} as unknown as typeof vscode);
+	const controller = new AbortController();
+	const result = confirmation.confirm({
+		sourceWindowLabel: 'Source Window',
+		targetWindowLabel: 'Target Window',
+		workspaceDisplayName: 'Workspace',
+		taskTitle: 'Review changes',
+		prompt: 'Full prompt text.',
+	}, controller.signal);
+
+	controller.abort();
+
+	await assert.rejects(
+		result,
+		(error: unknown) => error instanceof DOMException && error.name === 'AbortError',
+	);
+	assert.equal(panel.disposed, true);
 });
 
 test('real GatewayServer retries HTTP close after a transient stop failure', async () => {
@@ -683,6 +712,41 @@ test('ListenerService never replaces retained Gateway ownership after failed sta
 	assert.equal(created, 2);
 	await listener.dispose();
 });
+
+class TestConfirmationPanel {
+	public disposed = false;
+	private readonly messageListeners = new Set<(message: unknown) => void>();
+	private readonly disposeListeners = new Set<() => void>();
+	public readonly webview = {
+		cspSource: 'vscode-webview://confirmation-test',
+		html: '',
+		onDidReceiveMessage: this.event(this.messageListeners),
+	};
+	public readonly onDidDispose = this.event(this.disposeListeners);
+
+	public dispose(): void {
+		if (this.disposed) {
+			return;
+		}
+		this.disposed = true;
+		for (const listener of this.disposeListeners) {
+			listener();
+		}
+	}
+
+	public emitMessage(message: unknown): void {
+		for (const listener of this.messageListeners) {
+			listener(message);
+		}
+	}
+
+	private event<T>(listeners: Set<(value: T) => void>) {
+		return (listener: (value: T) => void): vscode.Disposable => {
+			listeners.add(listener);
+			return { dispose: () => listeners.delete(listener) };
+		};
+	}
+}
 
 function createListener(
 	tunnel: RecordingTunnel,

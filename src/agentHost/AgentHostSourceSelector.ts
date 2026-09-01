@@ -110,9 +110,7 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 						? {}
 						: {
 							reason: this.status.failure.code,
-							...(isRemediableEditorFailure(this.status.failure.code)
-								? { canStart: true }
-								: {}),
+							canStart: true,
 						}),
 				}
 				: await this.options.standalone.probe();
@@ -127,6 +125,31 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 			reason: 'AGENT_UNAVAILABLE',
 			source: 'editor',
 		};
+	}
+
+	public async prepareStart(): Promise<void> {
+		this.assertActive();
+		if (this.options.enabled?.() === false) {
+			throw new AgentRuntimeError(
+				'AGENT_UNAVAILABLE',
+				'The experimental Agent Host runtime is disabled.',
+			);
+		}
+		const runtimes = this.options.preferEditor()
+			? [this.options.editor, this.options.standalone]
+			: [this.options.standalone, this.options.editor];
+		for (const runtime of runtimes) {
+			try {
+				await runtime.prepareStart?.();
+			} catch (error) {
+				if (runtime === this.options.editor) {
+					this.sourceSelected = true;
+					this.setStatus(editorFailureStatus(safeEditorFailure(error)));
+				}
+				throw error;
+			}
+		}
+		this.assertActive();
 	}
 
 	public start(request: AgentTaskRequest): Promise<AgentTaskHandle> {
@@ -564,13 +587,6 @@ function probeWithStatus(
 			}
 			: undefined,
 	};
-}
-
-function isRemediableEditorFailure(code: AgentRuntimeError['code']): boolean {
-	return code === 'AGENT_AUTH_REQUIRED'
-		|| code === 'AGENT_AUTH_FAILED'
-		|| code === 'AGENT_CONFIG_REQUIRED'
-		|| code === 'TASK_EXECUTION_FAILED';
 }
 
 function throwIfSelectorAborted(signal: AbortSignal): void {

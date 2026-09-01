@@ -70,7 +70,7 @@ export interface AgentHostSourceStatusProvider {
 export type AgentRuntimeLifecycleObservation =
 	| {
 		readonly taskId: string;
-		readonly eventType: 'session/created';
+		readonly eventType: 'session/hostObserved';
 		readonly sessionUri: string;
 		readonly source: AgentHostSource;
 		readonly endpointFingerprint?: string;
@@ -246,6 +246,7 @@ export interface AgentTaskHandle {
 
 export interface AgentRuntime {
 	probe(): Promise<AgentRuntimeProbe>;
+	prepareStart?(): Promise<void>;
 	start(request: AgentTaskRequest): Promise<AgentTaskHandle>;
 	dispose(): Promise<void>;
 }

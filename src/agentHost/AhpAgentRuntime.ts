@@ -119,6 +119,7 @@ export interface SessionConfigurationResolver {
 		readonly schema: SessionConfigSchema;
 		readonly values: Readonly<Record<string, unknown>>;
 		readonly interactive: boolean;
+		readonly signal?: AbortSignal;
 		readonly completions: (
 			property: string,
 			currentValues: Readonly<Record<string, unknown>>,
@@ -147,12 +148,15 @@ export interface AhpAgentRuntimeOptions {
 
 export class AhpAgentRuntime implements AgentRuntime {
 	private readonly tasks = new Set<AhpTask>();
+	private readonly failedStartCleanups = new Set<{ dispose(): Promise<void> }>();
 	private readonly inFlightStarts = new Set<{
 		readonly controller: AbortController;
 		readonly operation: Promise<AgentTaskHandle>;
 	}>();
 	private disposed = false;
 	private disposePromise: Promise<void> | undefined;
+	private failedStartCleanupRetry: Promise<void> | undefined;
+	private startQueueTail: Promise<void> = Promise.resolve();
 
 	constructor(private readonly options: AhpAgentRuntimeOptions) {}
 
@@ -171,15 +175,50 @@ export class AhpAgentRuntime implements AgentRuntime {
 
 	start(request: AgentTaskRequest): Promise<AgentTaskHandle> {
 		const controller = new AbortController();
+		const predecessor = this.startQueueTail;
+		let releaseTurn!: () => void;
+		const turn = new Promise<void>((resolve) => {
+			releaseTurn = resolve;
+		});
+		this.startQueueTail = predecessor.then(() => turn, () => turn);
 		let tracked!: {
 			readonly controller: AbortController;
 			readonly operation: Promise<AgentTaskHandle>;
 		};
-		const operation = this.startTracked(request, controller.signal)
+		const operation = this.startQueued(
+			request,
+			controller.signal,
+			predecessor,
+			releaseTurn,
+		)
 			.finally(() => this.inFlightStarts.delete(tracked));
 		tracked = { controller, operation };
 		this.inFlightStarts.add(tracked);
 		return operation;
+	}
+
+	public async prepareStart(): Promise<void> {
+		if (this.disposed || !this.options.enabled()) {
+			throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'The production Agent Host runtime is disabled.');
+		}
+		await this.startQueueTail;
+		this.throwIfDisposed();
+		await this.retryFailedStartCleanup();
+		this.throwIfDisposed();
+	}
+
+	private async startQueued(
+		request: AgentTaskRequest,
+		signal: AbortSignal,
+		predecessor: Promise<void>,
+		releaseTurn: () => void,
+	): Promise<AgentTaskHandle> {
+		await predecessor.catch(() => undefined);
+		try {
+			return await this.startTracked(request, signal);
+		} finally {
+			releaseTurn();
+		}
 	}
 
 	private async startTracked(
@@ -189,6 +228,8 @@ export class AhpAgentRuntime implements AgentRuntime {
 		if (this.disposed || !this.options.enabled()) {
 			throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'The production Agent Host runtime is disabled.');
 		}
+		await this.retryFailedStartCleanup();
+		this.throwIfDisposed();
 		validateRequest(request);
 		const workspace = await this.options.workspaceResolver.resolve(request.workspaceId);
 		this.throwIfDisposed();
@@ -207,7 +248,14 @@ export class AhpAgentRuntime implements AgentRuntime {
 
 		const host = await this.options.launcher.launch(signal);
 		if (this.disposed) {
-			const cleanup = await cleanupDetachedResources(host, undefined);
+			const cleanupOwner = new DetachedAgentHostCleanup(host, undefined);
+			let cleanup: AgentRuntimeError | undefined;
+			try {
+				await cleanupOwner.dispose();
+			} catch (error) {
+				this.failedStartCleanups.add(cleanupOwner);
+				cleanup = normalizeRuntimeError(error);
+			}
 			const error = new AgentRuntimeError('AGENT_UNAVAILABLE', 'The production Agent Host runtime was disposed during startup.');
 			throw cleanup === undefined ? error : combineRuntimeErrors(error, cleanup);
 		}
@@ -245,16 +293,48 @@ export class AhpAgentRuntime implements AgentRuntime {
 		} catch (error) {
 			const primary = normalizeRuntimeError(error);
 			let cleanupError: AgentRuntimeError | undefined;
+			const cleanupOwner = task ?? new DetachedAgentHostCleanup(host, connection);
 			try {
-				if (task !== undefined) {
-					await task.dispose();
-				} else {
-					cleanupError = await cleanupDetachedResources(host, connection);
-				}
+				await cleanupOwner.dispose();
 			} catch (cleanup) {
+				this.failedStartCleanups.add(cleanupOwner);
 				cleanupError = normalizeRuntimeError(cleanup);
 			}
 			throw cleanupError === undefined ? primary : combineRuntimeErrors(primary, cleanupError);
+		}
+	}
+
+	private retryFailedStartCleanup(): Promise<void> {
+		if (this.failedStartCleanupRetry !== undefined) {
+			return this.failedStartCleanupRetry;
+		}
+		if (this.failedStartCleanups.size === 0) {
+			return Promise.resolve();
+		}
+		let operation!: Promise<void>;
+		operation = this.retryFailedStartCleanupOwners().finally(() => {
+			if (this.failedStartCleanupRetry === operation) {
+				this.failedStartCleanupRetry = undefined;
+			}
+		});
+		this.failedStartCleanupRetry = operation;
+		return operation;
+	}
+
+	private async retryFailedStartCleanupOwners(): Promise<void> {
+		const failures: string[] = [];
+		await collectCleanupFailures(
+			[...this.failedStartCleanups].map((owner) => ({
+				label: 'retry failed Agent Host start cleanup',
+				run: async () => {
+					await owner.dispose();
+					this.failedStartCleanups.delete(owner);
+				},
+			})),
+			failures,
+		);
+		if (failures.length > 0) {
+			throw cleanupFailure(failures);
 		}
 	}
 
@@ -276,20 +356,27 @@ export class AhpAgentRuntime implements AgentRuntime {
 		for (const start of this.inFlightStarts) {
 			start.controller.abort();
 		}
+		if (this.inFlightStarts.size > 0) {
+			await Promise.all(
+				[...this.tasks].map((task) => task.dispose().catch(() => undefined)),
+			);
+		}
+		await Promise.all(
+			[...this.inFlightStarts].map(({ operation }) => operation.catch(() => undefined)),
+		);
 		const failures: string[] = [];
+		const cleanupOwners = new Set([
+			...this.tasks,
+			...this.failedStartCleanups,
+		]);
 		await collectCleanupFailures(
-			[
-				...[...this.inFlightStarts].map(({ operation }) => ({
-					label: 'stop in-flight Agent Host start',
-					run: async () => {
-						await operation.catch(() => undefined);
-					},
-				})),
-				...[...this.tasks].map((task) => ({
-					label: 'dispose active Agent Host task',
-					run: () => task.dispose(),
-				})),
-			],
+			[...cleanupOwners].map((owner) => ({
+				label: 'dispose active Agent Host task',
+				run: async () => {
+					await owner.dispose();
+					this.failedStartCleanups.delete(owner);
+				},
+			})),
 			failures,
 		);
 		await collectCleanupFailures([
@@ -469,8 +556,10 @@ class DefaultSessionConfigurationResolver implements SessionConfigurationResolve
 	async resolve(
 		request: Parameters<SessionConfigurationResolver['resolve']>[0],
 	): Promise<Readonly<Record<string, unknown>>> {
+		throwIfAborted(request.signal);
 		const values: Record<string, unknown> = { ...request.values };
 		for (const [id, property] of Object.entries(request.schema.properties)) {
+			throwIfAborted(request.signal);
 			if (values[id] !== undefined) {
 				continue;
 			}
@@ -485,7 +574,7 @@ class DefaultSessionConfigurationResolver implements SessionConfigurationResolve
 						`Agent session configuration requires an interactive value for: ${id}.`,
 					);
 				}
-				const options = await request.completions(id, values, '');
+				const options = await request.completions(id, values, '', request.signal);
 				if (options.length === 1) {
 					values[id] = options[0]?.value;
 				}
@@ -518,6 +607,7 @@ class AhpTask implements AgentTaskHandle {
 	private sessionDefaultChatState: 'unknown' | 'available' | 'cleared' = 'unknown';
 	private sessionDefaultChatRevision = 0;
 	private sessionCreated = false;
+	private hostSessionObserved = false;
 	private lastSeenServerSeq = 0;
 	private terminal = false;
 	private authoritativeTurnTerminal = false;
@@ -642,19 +732,6 @@ class AhpTask implements AgentTaskHandle {
 			'challenge',
 		);
 		this.sessionCreated = true;
-		try {
-			this.lifecycleObserver?.observeLifecycle({
-				taskId: this.taskId,
-				eventType: 'session/created',
-				sessionUri: this.sessionUri,
-				source: this.host.source ?? 'standalone',
-				...(this.host.endpointFingerprint === undefined
-					? {}
-					: { endpointFingerprint: this.host.endpointFingerprint }),
-			});
-		} catch {
-			// Optional lifecycle observation must not affect Agent execution.
-		}
 		this.throwIfTerminalError();
 
 		await this.ensureStartupSubscription(this.sessionUri);
@@ -897,23 +974,28 @@ class AhpTask implements AgentTaskHandle {
 			if (missing.length === 0) {
 				return resolved.values;
 			}
-			const next = await this.configResolver.resolve({
-				schema: resolved.schema,
-				values: resolved.values,
-				interactive: this.request.allowInteractiveAuthentication === true,
-				completions: async (property, currentValues, query, signal) => {
-					throwIfAborted(signal);
-					const completions = await this.connection.sessionConfigCompletions(
-						provider.provider,
-						this.request.workspace.uri,
-						currentValues,
-						property,
-						query,
-					);
-					throwIfAborted(signal);
-					return completions;
-				},
-			});
+			const signal = this.generation.abort.signal;
+			const next = await abortableConfigurationResolution(
+				this.configResolver.resolve({
+					schema: resolved.schema,
+					values: resolved.values,
+					interactive: this.request.allowInteractiveAuthentication === true,
+					signal,
+					completions: async (property, currentValues, query, completionSignal) => {
+						throwIfAborted(completionSignal);
+						const completions = await this.connection.sessionConfigCompletions(
+							provider.provider,
+							this.request.workspace.uri,
+							currentValues,
+							property,
+							query,
+						);
+						throwIfAborted(completionSignal);
+						return completions;
+					},
+				}),
+				signal,
+			);
 			if (stableJson(next) === stableJson(config)) {
 				throw new AgentRuntimeError(
 					'AGENT_CONFIG_REQUIRED',
@@ -1110,6 +1192,26 @@ class AhpTask implements AgentTaskHandle {
 				continue;
 			}
 			if (result.snapshot !== undefined) {
+				if (result.snapshot.resource !== uri) {
+					const failures: string[] = [];
+					await collectCleanupFailures([
+						{
+							label: 'close mismatched Agent Host subscription',
+							run: () => result.subscription.close(),
+						},
+						{
+							label: 'unsubscribe mismatched Agent Host resource',
+							run: () => generation.connection.unsubscribe(uri),
+						},
+					], failures);
+					const mismatch = new AgentRuntimeError(
+						'TASK_EXECUTION_FAILED',
+						'The Agent Host subscription returned a mismatched resource.',
+					);
+					throw failures.length === 0
+						? mismatch
+						: combineRuntimeErrors(mismatch, cleanupFailure(failures));
+				}
 				await this.applySnapshot(result.snapshot);
 			}
 			this.throwIfTerminalError();
@@ -1260,8 +1362,11 @@ class AhpTask implements AgentTaskHandle {
 				const error = new AgentRuntimeError('TASK_EXECUTION_FAILED', safeMessage(action.error.message));
 				this.defaultChatReject?.(error);
 				this.fail(error);
-			} else if (action.type === 'session/defaultChatChanged') {
-				this.updateSessionDefaultChat(action.defaultChat);
+			} else {
+				this.observeHostSession(envelope.channel);
+				if (action.type === 'session/defaultChatChanged') {
+					this.updateSessionDefaultChat(action.defaultChat);
+				}
 			}
 		}
 		this.trackDeliveredResponseAction(action);
@@ -1371,6 +1476,26 @@ class AhpTask implements AgentTaskHandle {
 		}
 	}
 
+	private observeHostSession(sessionUri: string): void {
+		if (this.hostSessionObserved) {
+			return;
+		}
+		this.hostSessionObserved = true;
+		try {
+			this.lifecycleObserver?.observeLifecycle({
+				taskId: this.taskId,
+				eventType: 'session/hostObserved',
+				sessionUri,
+				source: this.host.source ?? 'standalone',
+				...(this.host.endpointFingerprint === undefined
+					? {}
+					: { endpointFingerprint: this.host.endpointFingerprint }),
+			});
+		} catch {
+			// Optional lifecycle observation must not affect Agent execution.
+		}
+	}
+
 	private async applySnapshot(snapshot: Snapshot, subscribeRootTerminals = true): Promise<void> {
 		this.lastSeenServerSeq = Math.max(this.lastSeenServerSeq, snapshot.fromSeq);
 		if (snapshot.resource === this.sessionUri) {
@@ -1382,6 +1507,7 @@ class AhpTask implements AgentTaskHandle {
 					safeMessage(state.creationError?.message ?? 'Agent session creation failed.'),
 				);
 			}
+			this.observeHostSession(snapshot.resource);
 			if (state.defaultChat !== undefined) {
 				this.updateSessionDefaultChat(state.defaultChat);
 			} else if (lifecycle === 'ready') {
@@ -2187,20 +2313,59 @@ interface CleanupOperation {
 	readonly run: () => Promise<void>;
 }
 
-async function cleanupDetachedResources(
-	host: LaunchedAgentHost,
-	connection: AhpConnection | undefined,
-): Promise<AgentRuntimeError | undefined> {
-	const failures: string[] = [];
-	if (connection !== undefined) {
-		await collectCleanupFailures([
-			{ label: 'shutdown detached AHP connection', run: () => connection.shutdown() },
-		], failures);
+class DetachedAgentHostCleanup {
+	private connectionShutdown: boolean;
+	private hostDisposed = false;
+	private disposal: Promise<void> | undefined;
+
+	constructor(
+		private readonly host: LaunchedAgentHost,
+		private readonly connection: AhpConnection | undefined,
+	) {
+		this.connectionShutdown = connection === undefined;
 	}
-	await collectCleanupFailures([
-		{ label: 'dispose detached owned Agent Host', run: () => host.dispose() },
-	], failures);
-	return failures.length === 0 ? undefined : cleanupFailure(failures);
+
+	dispose(): Promise<void> {
+		if (this.connectionShutdown && this.hostDisposed) {
+			return Promise.resolve();
+		}
+		this.disposal ??= this.disposeOwned().finally(() => {
+			if (!this.connectionShutdown || !this.hostDisposed) {
+				this.disposal = undefined;
+			}
+		});
+		return this.disposal;
+	}
+
+	private async disposeOwned(): Promise<void> {
+		const failures: string[] = [];
+		const connection = this.connection;
+		await collectCleanupFailures([
+			...(
+				this.connectionShutdown || connection === undefined
+					? []
+					: [{
+						label: 'shutdown detached AHP connection',
+						run: async () => {
+							await connection.shutdown();
+							this.connectionShutdown = true;
+						},
+					}]
+			),
+			...(this.hostDisposed
+				? []
+				: [{
+					label: 'dispose detached owned Agent Host',
+					run: async () => {
+						await this.host.dispose();
+						this.hostDisposed = true;
+					},
+				}]),
+		], failures);
+		if (failures.length > 0) {
+			throw cleanupFailure(failures);
+		}
+	}
 }
 
 class RecoveryCandidateCleanup {
@@ -2439,6 +2604,34 @@ function throwIfAborted(signal?: AbortSignal): void {
 	if (signal?.aborted === true) {
 		throw new RecoveryStoppedCause();
 	}
+}
+
+function abortableConfigurationResolution<T>(
+	operation: Promise<T>,
+	signal: AbortSignal,
+): Promise<T> {
+	throwIfAborted(signal);
+	return new Promise<T>((resolve, reject) => {
+		const abort = () => {
+			signal.removeEventListener('abort', abort);
+			reject(new RecoveryStoppedCause());
+		};
+		signal.addEventListener('abort', abort, { once: true });
+		void operation.then(
+			(value) => {
+				signal.removeEventListener('abort', abort);
+				if (!signal.aborted) {
+					resolve(value);
+				}
+			},
+			(error: unknown) => {
+				signal.removeEventListener('abort', abort);
+				if (!signal.aborted) {
+					reject(error);
+				}
+			},
+		);
+	});
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {

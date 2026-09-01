@@ -458,7 +458,7 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 	assert.deepEqual(transport.created?.workingDirectories, [workspaceUri]);
 	assert.deepEqual(lifecycle, [{
 		taskId: 'task-1',
-		eventType: 'session/created',
+		eventType: 'session/hostObserved',
 		sessionUri: handle.recovery.sessionUri,
 		source: 'standalone',
 	}]);
@@ -929,6 +929,43 @@ test('non-interactive dynamic Session config fails with a stable configuration b
 	);
 });
 
+test('runtime disposal aborts and awaits interactive Session configuration', async () => {
+	const transport = new FakeAhpTransport();
+	const launcher = new FakeLauncher();
+	let configEntered!: () => void;
+	const entered = new Promise<void>((resolve) => {
+		configEntered = resolve;
+	});
+	let configSignal: AbortSignal | undefined;
+	const runtime = new AhpAgentRuntime({
+		enabled: () => true,
+		launcher,
+		connections: new FakeConnectionFactory([transport]),
+		authBroker: new RecordingAuthBroker(),
+		confirmation: { confirm: async () => 'once' },
+		workspaceResolver: trustedWorkspaceResolver(),
+		configResolver: {
+			resolve: async (request) => {
+				configSignal = request.signal;
+				configEntered();
+				return new Promise(() => undefined);
+			},
+		},
+	});
+
+	const start = runtime.start({
+		...taskRequest(),
+		allowInteractiveAuthentication: true,
+	});
+	await entered;
+	const disposal = runtime.dispose();
+
+	await assert.rejects(start, AgentRuntimeError);
+	await disposal;
+	assert.equal(configSignal?.aborted, true);
+	assert.equal(launcher.host.disposed, true);
+});
+
 test('start failure cleans the task, AHP connection, and owned host without losing the auth error', async () => {
 	const transport = new FakeAhpTransport();
 	transport.shutdownFails = true;
@@ -960,6 +997,63 @@ test('start failure cleans the task, AHP connection, and owned host without losi
 	assert.equal(transport.shutdownCalls, 2);
 });
 
+test('a later start retries failed startup cleanup before launching another Agent task', async () => {
+	const firstTransport = new FakeAhpTransport();
+	firstTransport.shutdownFails = true;
+	const secondTransport = new FakeAhpTransport();
+	const launcher = new FakeLauncher();
+	const connections = new FakeConnectionFactory([firstTransport, secondTransport]);
+	let authenticationAttempts = 0;
+	const authBroker: AuthBroker = {
+		authenticate: async (request, pushToken) => {
+			authenticationAttempts += 1;
+			if (authenticationAttempts === 1) {
+				throw new AgentRuntimeError('AGENT_AUTH_REQUIRED', 'Authentication is not ready.');
+			}
+			for (const resource of request.resources.filter(({ required }) => required !== false)) {
+				await pushToken(resource.resource, 'test-token', resource.scopes_supported ?? []);
+			}
+		},
+	};
+	const runtime = new AhpAgentRuntime({
+		enabled: () => true,
+		launcher,
+		connections,
+		authBroker,
+		confirmation: { confirm: async () => 'once' },
+		workspaceResolver: trustedWorkspaceResolver(),
+		configResolver: { resolve: async () => ({ model: 'test-model' }) },
+	});
+
+	const first = runtime.start(taskRequest());
+	const queued = runtime.start({ ...taskRequest(), taskId: 'task-2' });
+	await assert.rejects(
+		first,
+		(error: unknown) => error instanceof AgentRuntimeError
+			&& error.code === 'AGENT_AUTH_REQUIRED'
+			&& error.cleanupFailed,
+	);
+	assert.equal(connections.connectCalls, 1);
+	assert.equal(launcher.launchCalls, 1);
+
+	await assert.rejects(
+		queued,
+		(error: unknown) => error instanceof AgentRuntimeError
+			&& error.cleanupFailed,
+	);
+	assert.equal(firstTransport.shutdownCalls, 2);
+	assert.equal(connections.connectCalls, 1);
+	assert.equal(launcher.launchCalls, 1);
+	firstTransport.shutdownFails = false;
+	const handle = await runtime.start({ ...taskRequest(), taskId: 'task-3' });
+	assert.equal(firstTransport.shutdownCalls, 3);
+	assert.equal(connections.connectCalls, 2);
+	assert.equal(launcher.launchCalls, 2);
+	assert.equal(secondTransport.initialized, true);
+	await handle.dispose();
+	await runtime.dispose();
+});
+
 test('provisional Session dispatches its first turn before session/ready', async () => {
 	const transport = new FakeAhpTransport();
 	transport.sessionStartsProvisional = true;
@@ -985,6 +1079,35 @@ test('AHP 0.8 creationFailed Session snapshots fail with the reported error', as
 			&& error.code === 'TASK_EXECUTION_FAILED'
 			&& error.message === 'Legacy Session creation failed.',
 	);
+	assert.equal(launcher.host.disposed, true);
+});
+
+test('runtime rejects a mismatched Host-echoed Session without recording local identity', async () => {
+	const transport = new FakeAhpTransport();
+	transport.sessionSnapshotResource = 'ahp-session:/foreign';
+	const launcher = new FakeLauncher();
+	const lifecycle: AgentRuntimeLifecycleObservation[] = [];
+	const runtime = new AhpAgentRuntime({
+		enabled: () => true,
+		launcher,
+		connections: new FakeConnectionFactory([transport]),
+		authBroker: new RecordingAuthBroker(),
+		confirmation: { confirm: async () => 'once' },
+		workspaceResolver: trustedWorkspaceResolver(),
+		configResolver: { resolve: async () => ({ model: 'test-model' }) },
+		lifecycleObserver: {
+			observeLifecycle: (observation) => lifecycle.push(observation),
+		},
+	});
+
+	await assert.rejects(
+		runtime.start(taskRequest()),
+		(error: unknown) => error instanceof AgentRuntimeError
+			&& error.code === 'TASK_EXECUTION_FAILED'
+			&& /mismatched resource/u.test(error.message),
+	);
+	assert.deepEqual(lifecycle, []);
+	assert.equal(transport.unsubscribedUris.includes(transport.created?.sessionUri ?? ''), true);
 	assert.equal(launcher.host.disposed, true);
 });
 
@@ -1035,6 +1158,50 @@ test('runtime disposal aborts and awaits an in-flight editor connection start', 
 	await runtime.dispose();
 	await assert.rejects(start, AgentRuntimeError);
 	assert.equal(launcher.host.disposed, true);
+});
+
+test('runtime disposal drains cleanup ownership recorded by an in-flight start', async () => {
+	const host = new FakeHost();
+	host.disposeFailuresRemaining = 1;
+	let launchEntered!: () => void;
+	let releaseLaunch!: () => void;
+	const entered = new Promise<void>((resolve) => {
+		launchEntered = resolve;
+	});
+	const launchGate = new Promise<void>((resolve) => {
+		releaseLaunch = resolve;
+	});
+	const launcher: AgentHostLauncherLike = {
+		probe: async () => ({ available: true, executable: '/safe/code', version: '1.134.0' }),
+		launch: async () => {
+			launchEntered();
+			await launchGate;
+			return host;
+		},
+		dispose: () => host.dispose(),
+	};
+	const runtime = new AhpAgentRuntime({
+		enabled: () => true,
+		launcher,
+		connections: new FakeConnectionFactory([new FakeAhpTransport()]),
+		authBroker: new RecordingAuthBroker(),
+		confirmation: { confirm: async () => 'once' },
+		workspaceResolver: trustedWorkspaceResolver(),
+		configResolver: { resolve: async () => ({ model: 'test-model' }) },
+	});
+
+	const start = runtime.start(taskRequest());
+	await entered;
+	const disposal = runtime.dispose();
+	releaseLaunch();
+
+	await assert.rejects(
+		start,
+		(error: unknown) => error instanceof AgentRuntimeError && error.cleanupFailed,
+	);
+	await disposal;
+	assert.equal(host.disposeFailuresRemaining, 0);
+	assert.equal(host.disposed, true);
 });
 
 test('root connection loss before Session creation fails startup instead of entering Session recovery', async () => {
@@ -2659,6 +2826,7 @@ class FakeAhpTransport implements AhpConnection {
 	sessionStartsPending = false;
 	sessionStartsProvisional = false;
 	sessionCreationFailed = false;
+	sessionSnapshotResource: string | undefined;
 	createSessionAuthRequired = false;
 	createSessionCalls = 0;
 	sessionDefaultChat = 'ahp-chat:/default';
@@ -2790,12 +2958,13 @@ class FakeAhpTransport implements AhpConnection {
 		}
 		this.subscribedUris.push(uri);
 		if (uri.startsWith('ahp-session:')) {
+			const resource = this.sessionSnapshotResource ?? uri;
 			return {
 				snapshot: {
-					resource: uri,
+					resource,
 					fromSeq: 2,
 					state: {
-						resource: uri,
+						resource,
 						provider: 'dynamic-provider',
 						title: 'Task',
 						status: 1,

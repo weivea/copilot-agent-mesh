@@ -289,10 +289,12 @@ editor endpoint 的普通 VS Code 实例内完成 O1。
 ### P8 自动化边界（2026-08-31）
 
 P8 已实现可重复的两个普通窗口 Harness。它在窗口启动后用相同的严格 Locator 连接本次
-唯一 live `editor` endpoint；E2E-only lifecycle observer 在实际 `createSession` 边界记录
-Session/source/endpoint 的 domain-separated 截断 Hash，并与任务 recovery Session Hash
-匹配，作为 AC-5.9 的客观 runtime 证据。另有 bounded post-task `listSessions` 只服务 O1
-catalog/UI 可见性判断。任何路径都不保存 resource URI、socket 路径或 token。
+唯一 live `editor` endpoint；`createSession` acknowledgement 后，E2E-only lifecycle
+observer 只记录 Host 在 subscribed Session snapshot 或 Session-channel action 中回显的
+Session/source/endpoint domain-separated 截断 Hash，并与任务 recovery Session Hash
+匹配，作为 AC-5.9 的客观 runtime 证据。本地请求 URI 不算 Host 证据。另有 bounded
+post-task `listSessions` 只服务 O1 catalog/UI 可见性判断。任何路径都不保存 resource URI、
+socket 路径或 token。
 
 稳定 Extension API 不提供读取 Chat Sessions UI 或向内置 Copilot Agent 自动发送并确认
 消息的接口。P8 在 VS Code 1.135.0 观察到无 Chat context 的
