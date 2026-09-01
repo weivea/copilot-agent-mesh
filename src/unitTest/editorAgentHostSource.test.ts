@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readdir, rm } from 'node:fs/promises';
-import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
+import { mkdtemp, rm } from 'node:fs/promises';
 import {
+	createServer as createHttpServer,
+	request as httpRequest,
+	type Server as HttpServer,
+} from 'node:http';
+import {
+	connect as connectNet,
 	createServer as createNetServer,
 	type Server as NetServer,
 	type Socket,
@@ -11,11 +16,12 @@ import { join } from 'node:path';
 import { once } from 'node:events';
 import { test } from 'node:test';
 
-import { WebSocketServer } from 'ws';
+import WebSocket, { WebSocketServer } from 'ws';
 
 import {
 	AgentHostSourceSelector,
 } from '../agentHost/AgentHostSourceSelector';
+import { EditorSocketProxy } from '../agentHost/EditorSocketProxy';
 import {
 	deriveEditorAgentHostUserDataDir,
 	EditorAgentHostLocator,
@@ -295,13 +301,61 @@ test('Unix socket connector performs authenticated upgrade, scrubs inspectable U
 			assert.equal(proxied.readyState, proxied.OPEN);
 			proxied.close();
 			await once(proxied, 'close');
-			await waitForDirectoryEmpty(proxyRoot);
 			await rm(proxyRoot, { recursive: true, force: true });
 			second.close();
 			second.close();
 			await once(second, 'close');
 			assert.equal(webSockets.clients.size, 0);
 		} finally {
+			await closeWebSocketServer(server, webSockets);
+		}
+	});
+});
+
+test('editor proxy rejects unauthorized loopback clients without consuming the one-shot bridge', {
+	skip: process.platform === 'win32',
+}, async () => {
+	await withSocketPath(async (socketPath) => {
+		const {
+			server,
+			webSockets,
+			receivedProxyHeaders,
+		} = await startWebSocketServer(socketPath, 'connection-token');
+		const ownershipMarker = await mkdtemp(join(tmpdir(), 'mesh-editor-proxy-auth-test-'));
+		const proxy = await EditorSocketProxy.open({
+			targetPath: socketPath,
+			ownershipMarker,
+			nodeExecutable: process.execPath,
+			timeoutMs: 1_000,
+		});
+		try {
+			await resetProxyClient(proxy.port);
+			assert.equal(await requestProxyWithoutUpgrade(proxy.port), 403);
+			assert.equal(await requestProxyWithoutUpgrade(proxy.port, 'wrong-proxy-token'), 403);
+			assert.equal(await requestProxyWithoutUpgrade(proxy.port, 'x'.repeat(17_000)), 431);
+			assert.equal(webSockets.clients.size, 0);
+			const serializedProxy = JSON.stringify(proxy);
+			assert.equal(serializedProxy.includes('connection-token'), false);
+			assert.equal(serializedProxy.includes(socketPath), false);
+			assert.equal(serializedProxy.includes(proxy.authenticationToken), false);
+
+			const client = new WebSocket(
+				`ws://127.0.0.1:${proxy.port}/?tkn=connection-token`,
+				{
+					headers: {
+						'X-Mesh-Editor-Proxy': proxy.authenticationToken,
+					},
+				},
+			);
+			proxy.bind(client);
+			await once(client, 'open');
+			assert.deepEqual(receivedProxyHeaders, ['']);
+			client.close();
+			await once(client, 'close');
+			await proxy.dispose();
+		} finally {
+			await proxy.dispose();
+			await rm(ownershipMarker, { recursive: true, force: true });
 			await closeWebSocketServer(server, webSockets);
 		}
 	});
@@ -857,20 +911,73 @@ async function withSocketPath(run: (socketPath: string) => Promise<void>): Promi
 async function startWebSocketServer(
 	socketPath: string,
 	expectedToken: string,
-): Promise<{ readonly server: HttpServer; readonly webSockets: WebSocketServer }> {
+): Promise<{
+	readonly server: HttpServer;
+	readonly webSockets: WebSocketServer;
+	readonly receivedProxyHeaders: string[];
+}> {
 	const server = createHttpServer();
 	const webSockets = new WebSocketServer({ noServer: true });
+	const receivedProxyHeaders: string[] = [];
 	server.on('upgrade', (request, socket, head) => {
 		if (request.url !== `/?tkn=${expectedToken}`) {
 			socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
 			return;
 		}
+		receivedProxyHeaders.push(
+			typeof request.headers['x-mesh-editor-proxy'] === 'string'
+				? request.headers['x-mesh-editor-proxy']
+				: '',
+		);
 		webSockets.handleUpgrade(request, socket, head, (client) => {
 			webSockets.emit('connection', client, request);
 		});
 	});
 	await listen(server, socketPath);
-	return { server, webSockets };
+	return { server, webSockets, receivedProxyHeaders };
+}
+
+async function requestProxyWithoutUpgrade(
+	port: number,
+	authenticationToken?: string,
+): Promise<number | undefined> {
+	return new Promise((resolve, reject) => {
+		const request = httpRequest({
+			host: '127.0.0.1',
+			port,
+			path: '/?tkn=connection-token',
+			headers: {
+				Connection: 'Upgrade',
+				Upgrade: 'websocket',
+				'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
+				'Sec-WebSocket-Version': '13',
+				...(authenticationToken === undefined
+					? {}
+					: { 'X-Mesh-Editor-Proxy': authenticationToken }),
+			},
+		}, (response) => {
+			response.resume();
+			resolve(response.statusCode);
+		});
+		request.once('error', reject);
+		request.once('upgrade', (_response, socket) => {
+			socket.destroy();
+			reject(new Error('Unauthorized proxy request was upgraded.'));
+		});
+		request.end();
+	});
+}
+
+async function resetProxyClient(port: number): Promise<void> {
+	await new Promise<void>((resolve, reject) => {
+		const socket = connectNet({ host: '127.0.0.1', port });
+		socket.once('connect', () => {
+			socket.resetAndDestroy();
+			resolve();
+		});
+		socket.once('error', reject);
+	});
+	await new Promise((resolve) => setTimeout(resolve, 10));
 }
 
 async function listen(server: HttpServer | NetServer, socketPath: string): Promise<void> {
@@ -922,16 +1029,6 @@ async function assertConnectorFailure(
 			&& !error.message.includes(socketPath)
 			&& !error.message.includes(token),
 	);
-}
-
-async function waitForDirectoryEmpty(path: string): Promise<void> {
-	for (let attempt = 0; attempt < 100; attempt += 1) {
-		if ((await readdir(path).catch(() => [])).length === 0) {
-			return;
-		}
-		await new Promise((resolve) => setTimeout(resolve, 10));
-	}
-	assert.fail('Timed out waiting for the editor socket proxy to clean up.');
 }
 
 class FakeRuntime implements AgentRuntime {

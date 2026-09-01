@@ -41,11 +41,13 @@ If an Extension Host receives `ECONNREFUSED` while an ordinary Node process can
 reach the exact fingerprinted endpoint, the connector uses one owned short-lived
 Node byte proxy. The target socket path crosses only the private IPC channel;
 the connection token remains in the Extension Host and passes through the proxy
-only as local authenticated WebSocket handshake bytes. The short proxy socket
-uses a mode-0700 `/tmp/cam-ep-*` directory to stay below the macOS Unix path limit,
-while its command line carries the owning storage-root marker. Close, cancellation,
-parent IPC loss, and startup failure terminate the exact child and remove only
-that exact directory. The real P8 harness supplies its already-running absolute
+only as local authenticated WebSocket handshake bytes. The helper exposes a
+one-client loopback TCP listener authenticated by a separate 256-bit token sent
+only over private IPC. It validates and strips the `X-Mesh-Editor-Proxy` header
+before forwarding the editor handshake, so neither secret reaches the wrong
+endpoint. Its command line carries the owning storage-root marker. Close,
+cancellation, parent IPC loss, and startup failure terminate the exact child and
+listener. The real P8 harness supplies its already-running absolute
 Node executable only after E2E capability validation; the extension does not
 search `PATH` or download a runtime. That validated E2E path uses proxy-only
 connection so a known-refused Code Helper attempt cannot immediately poison the

@@ -275,7 +275,7 @@ export class UnixSocketWebSocketConnector {
 		try {
 			proxy = await EditorSocketProxy.open({
 				targetPath,
-				root: this.proxyRoot,
+				ownershipMarker: this.proxyRoot,
 				...(this.proxyNodeExecutable === undefined
 					? {}
 					: { nodeExecutable: this.proxyNodeExecutable }),
@@ -294,8 +294,8 @@ export class UnixSocketWebSocketConnector {
 				: fingerprintError(connectionFailed(), endpointFingerprint);
 		}
 		try {
-			const webSocket = await this.connectAtPath(
-				proxy.socketPath,
+			const webSocket = await this.connectAtProxy(
+				proxy,
 				connectionToken,
 				endpointFingerprint,
 				signal,
@@ -314,6 +314,119 @@ export class UnixSocketWebSocketConnector {
 			}
 			throw error;
 		}
+	}
+
+	private connectAtProxy(
+		proxy: EditorSocketProxy,
+		connectionToken: string,
+		endpointFingerprint: string,
+		signal?: AbortSignal,
+	): Promise<WebSocket> {
+		if (signal?.aborted === true) {
+			return Promise.reject(fingerprintError(cancelled(), endpointFingerprint));
+		}
+		return new Promise((resolve, reject) => {
+			let settled = false;
+			let upgradeValidated = false;
+			let webSocket: WebSocket | undefined;
+			const timer = setTimeout(() => {
+				settleFailure(new UnixSocketWebSocketError(
+					'UPGRADE_TIMEOUT',
+					'The editor Agent Host proxy WebSocket timed out.',
+				));
+			}, this.timeoutMs);
+			const cleanup = (): void => {
+				clearTimeout(timer);
+				signal?.removeEventListener('abort', handleAbort);
+				if (webSocket !== undefined) {
+					webSocket.removeListener('open', handleOpen);
+					webSocket.removeListener('error', handleError);
+					webSocket.removeListener('close', handleClose);
+					webSocket.removeListener('unexpected-response', handleUnexpectedResponse);
+					webSocket.removeListener('upgrade', handleUpgrade);
+				}
+			};
+			const scrub = (): void => {
+				if (webSocket !== undefined) {
+					Object.defineProperty(webSocket, '_url', {
+						configurable: true,
+						value: 'ws://localhost/',
+						writable: true,
+					});
+				}
+			};
+			const settleFailure = (error: UnixSocketWebSocketError): void => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				cleanup();
+				scrub();
+				webSocket?.once('error', () => undefined);
+				webSocket?.terminate();
+				reject(fingerprintError(error, endpointFingerprint));
+			};
+			const handleAbort = (): void => settleFailure(cancelled());
+			const handleError = (error: Error & { code?: unknown }): void =>
+				settleFailure(webSocketFailure(error));
+			const handleClose = (): void => settleFailure(new UnixSocketWebSocketError(
+				'EARLY_CLOSE',
+				'The editor Agent Host proxy WebSocket closed before opening.',
+			));
+			const handleUnexpectedResponse = (
+				_request: import('node:http').ClientRequest,
+				response: import('node:http').IncomingMessage,
+			): void => settleFailure(unexpectedResponse(response.statusCode));
+			const handleUpgrade = (response: import('node:http').IncomingMessage): void => {
+				if (!validateUpgradeResponse(response)) {
+					settleFailure(new UnixSocketWebSocketError(
+						'INVALID_RESPONSE',
+						'The editor Agent Host proxy returned an invalid WebSocket response.',
+					));
+					return;
+				}
+				upgradeValidated = true;
+			};
+			const handleOpen = (): void => {
+				if (!upgradeValidated || webSocket === undefined) {
+					settleFailure(new UnixSocketWebSocketError(
+						'INVALID_RESPONSE',
+						'The editor Agent Host proxy opened without a validated response.',
+					));
+					return;
+				}
+				settled = true;
+				cleanup();
+				scrub();
+				resolve(webSocket);
+			};
+			try {
+				webSocket = new WebSocket(
+					`ws://127.0.0.1:${proxy.port}/?tkn=${encodeURIComponent(connectionToken)}`,
+					{
+						headers: {
+							'X-Mesh-Editor-Proxy': proxy.authenticationToken,
+						},
+						followRedirects: false,
+						handshakeTimeout: this.timeoutMs,
+						maxPayload: maximumPayloadBytes,
+						perMessageDeflate: false,
+					},
+				);
+			} catch {
+				settleFailure(new UnixSocketWebSocketError(
+					'UPGRADE_FAILED',
+					'The editor Agent Host proxy WebSocket could not be started.',
+				));
+				return;
+			}
+			webSocket.once('open', handleOpen);
+			webSocket.once('error', handleError);
+			webSocket.once('close', handleClose);
+			webSocket.once('unexpected-response', handleUnexpectedResponse);
+			webSocket.once('upgrade', handleUpgrade);
+			signal?.addEventListener('abort', handleAbort, { once: true });
+		});
 	}
 }
 

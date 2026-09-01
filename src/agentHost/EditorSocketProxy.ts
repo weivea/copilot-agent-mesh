@@ -1,17 +1,14 @@
+import { randomBytes } from 'node:crypto';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { chmod, mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { isAbsolute, join } from 'node:path';
+import { isAbsolute } from 'node:path';
 
 import type WebSocket from 'ws';
 
 const helperSource = String.raw`
-const fs = require('node:fs');
+const crypto = require('node:crypto');
 const net = require('node:net');
-const path = require('node:path');
-const root = path.resolve(process.argv.at(-2));
 let client;
-let proxyPath;
+const pendingClients = new Set();
 let server;
 let stopping = false;
 let target;
@@ -19,13 +16,17 @@ process.umask(0o077);
 function stop(code) {
 	if (stopping) return;
 	stopping = true;
+	for (const pending of pendingClients) pending.destroy();
+	pendingClients.clear();
 	client?.destroy();
 	target?.destroy();
 	server?.close();
-	if (proxyPath) {
-		try { fs.rmSync(proxyPath, { force: true }); } catch {}
-	}
 	setTimeout(() => process.exit(code), 0);
+}
+function equal(left, right) {
+	const a = Buffer.from(left, 'utf8');
+	const b = Buffer.from(right, 'utf8');
+	return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 process.once('disconnect', () => stop(0));
 process.once('SIGTERM', () => stop(0));
@@ -37,14 +38,13 @@ process.on('message', (message) => {
 	if (
 		message?.schemaVersion !== 1
 		|| typeof message.targetPath !== 'string'
-		|| !path.isAbsolute(message.targetPath)
-		|| typeof message.proxyPath !== 'string'
-		|| path.dirname(path.resolve(message.proxyPath)) !== root
+		|| !require('node:path').isAbsolute(message.targetPath)
+		|| typeof message.authenticationToken !== 'string'
+		|| !/^[A-Za-z0-9_-]{43}$/.test(message.authenticationToken)
 	) {
 		stop(2);
 		return;
 	}
-	proxyPath = path.resolve(message.proxyPath);
 	target = net.connect({ path: message.targetPath });
 	target.once('error', (error) => {
 		const code = ['EACCES', 'ECONNREFUSED', 'ENOENT'].includes(error?.code)
@@ -55,20 +55,76 @@ process.on('message', (message) => {
 	target.once('connect', () => {
 		server = net.createServer((incoming) => {
 			if (client) {
-				incoming.destroy();
+				incoming.once('error', () => undefined);
+				incoming.end('HTTP/1.1 409 Conflict\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
 				return;
 			}
-			client = incoming;
-			server.close();
-			client.pipe(target);
-			target.pipe(client);
-			client.once('close', () => stop(0));
-			target.once('close', () => client?.destroy());
+			pendingClients.add(incoming);
+			let buffered = Buffer.alloc(0);
+			let finished = false;
+			incoming.setTimeout(2000, () => incoming.destroy());
+			const rejectRequest = (status) => {
+				if (finished) return;
+				finished = true;
+				incoming.removeListener('data', authenticate);
+				pendingClients.delete(incoming);
+				incoming.end('HTTP/1.1 ' + status + '\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+			};
+			const authenticate = (chunk) => {
+				buffered = Buffer.concat([buffered, chunk]);
+				if (buffered.byteLength > 16 * 1024) {
+					rejectRequest('431 Request Header Fields Too Large');
+					return;
+				}
+				const end = buffered.indexOf('\r\n\r\n');
+				if (end < 0) return;
+				const lines = buffered.subarray(0, end).toString('latin1').split('\r\n');
+				const headers = lines.filter((line) => /^x-mesh-editor-proxy:/i.test(line));
+				const supplied = headers.length === 1 ? headers[0].slice(headers[0].indexOf(':') + 1).trim() : '';
+				if (!equal(supplied, message.authenticationToken)) {
+					rejectRequest('403 Forbidden');
+					return;
+				}
+				if (client) {
+					rejectRequest('409 Conflict');
+					return;
+				}
+				finished = true;
+				incoming.removeListener('data', authenticate);
+				pendingClients.delete(incoming);
+				client = incoming;
+				incoming.setTimeout(0);
+				server.close();
+				for (const pending of pendingClients) pending.destroy();
+				pendingClients.clear();
+				const forwarded = lines
+					.filter((line) => !/^x-mesh-editor-proxy:/i.test(line))
+					.join('\r\n') + '\r\n\r\n';
+				target.write(forwarded, 'latin1');
+				target.write(buffered.subarray(end + 4));
+				incoming.pipe(target);
+				target.pipe(incoming);
+				incoming.once('close', () => stop(0));
+			};
+			incoming.on('data', authenticate);
+			incoming.once('error', () => {
+				incoming.removeListener('data', authenticate);
+				pendingClients.delete(incoming);
+				if (incoming === client) stop(1);
+			});
+			incoming.once('close', () => {
+				pendingClients.delete(incoming);
+			});
 		});
+		target.once('close', () => stop(0));
 		server.once('error', () => stop(2));
-		try { fs.rmSync(proxyPath, { force: true }); } catch {}
-		server.listen(proxyPath, () => {
-			process.send?.({ schemaVersion: 1, ready: true });
+		server.listen({ host: '127.0.0.1', port: 0, exclusive: true }, () => {
+			const address = server.address();
+			if (!address || typeof address === 'string') {
+				stop(2);
+				return;
+			}
+			process.send?.({ schemaVersion: 1, ready: true, port: address.port });
 		});
 	});
 });
@@ -76,7 +132,7 @@ process.on('message', (message) => {
 
 export interface EditorSocketProxyOptions {
 	readonly targetPath: string;
-	readonly root: string;
+	readonly ownershipMarker: string;
 	readonly nodeExecutable?: string;
 	readonly timeoutMs: number;
 	readonly signal?: AbortSignal;
@@ -94,18 +150,32 @@ export class EditorSocketProxyError extends Error {
 }
 
 export class EditorSocketProxy {
-	private disposed = false;
+	private disposal: Promise<void> | undefined;
 
 	private constructor(
-		readonly socketPath: string,
-		private readonly root: string,
+		readonly port: number,
+		readonly authenticationToken: string,
 		private readonly child: ChildProcess,
-	) {}
+	) {
+		Object.defineProperty(this, 'authenticationToken', {
+			configurable: false,
+			enumerable: false,
+			value: authenticationToken,
+			writable: false,
+		});
+	}
+
+	toJSON(): Readonly<{ kind: 'editorSocketProxy'; port: number }> {
+		return {
+			kind: 'editorSocketProxy',
+			port: this.port,
+		};
+	}
 
 	public static async open(options: EditorSocketProxyOptions): Promise<EditorSocketProxy> {
 		if (
 			!isAbsolute(options.targetPath)
-			|| !isAbsolute(options.root)
+			|| !isAbsolute(options.ownershipMarker)
 			|| (options.nodeExecutable !== undefined && !isAbsolute(options.nodeExecutable))
 		) {
 			throw new TypeError('Editor socket proxy paths must be absolute.');
@@ -116,33 +186,27 @@ export class EditorSocketProxy {
 		if (options.signal?.aborted === true) {
 			throw cancelled();
 		}
-		const connectionRoot = await mkdtemp(
-			process.platform === 'darwin'
-				? '/tmp/cam-ep-'
-				: join(tmpdir(), 'cam-ep-'),
-		);
-		await chmod(connectionRoot, 0o700);
-		const socketPath = join(connectionRoot, 'proxy.sock');
+		const authenticationToken = randomBytes(32).toString('base64url');
 		const child = spawn(
 			options.nodeExecutable ?? process.execPath,
-			['-e', helperSource, '--', connectionRoot, options.root],
+			['-e', helperSource, '--', options.ownershipMarker],
 			{
 				env: helperEnvironment(),
 				shell: false,
 				stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
 			},
 		);
+		child.on('error', () => undefined);
 		try {
-			await waitUntilReady(child, {
+			const port = await waitUntilReady(child, {
 				targetPath: options.targetPath,
-				proxyPath: socketPath,
+				authenticationToken,
 				timeoutMs: options.timeoutMs,
 				signal: options.signal,
 			});
-			return new EditorSocketProxy(socketPath, connectionRoot, child);
+			return new EditorSocketProxy(port, authenticationToken, child);
 		} catch (error) {
 			await stopChild(child);
-			await rm(connectionRoot, { recursive: true, force: true });
 			throw error;
 		}
 	}
@@ -152,7 +216,6 @@ export class EditorSocketProxy {
 			void this.dispose();
 		});
 		this.child.once('exit', () => {
-			void rm(this.root, { recursive: true, force: true });
 			if (webSocket.readyState === webSocket.OPEN) {
 				webSocket.terminate();
 			}
@@ -160,12 +223,8 @@ export class EditorSocketProxy {
 	}
 
 	public async dispose(): Promise<void> {
-		if (this.disposed) {
-			return;
-		}
-		this.disposed = true;
-		await stopChild(this.child);
-		await rm(this.root, { recursive: true, force: true });
+		this.disposal ??= stopChild(this.child);
+		await this.disposal;
 	}
 }
 
@@ -173,12 +232,12 @@ async function waitUntilReady(
 	child: ChildProcess,
 	options: {
 		readonly targetPath: string;
-		readonly proxyPath: string;
+		readonly authenticationToken: string;
 		readonly timeoutMs: number;
 		readonly signal?: AbortSignal;
 	},
-): Promise<void> {
-	await new Promise<void>((resolve, reject) => {
+): Promise<number> {
+	return new Promise<number>((resolve, reject) => {
 		let settled = false;
 		const finish = (operation: () => void) => {
 			if (settled) {
@@ -205,9 +264,14 @@ async function waitUntilReady(
 				finish(() => reject(connectionFailed()));
 				return;
 			}
-			const response = value as { ready?: unknown; code?: unknown };
-			if (response.ready === true) {
-				finish(resolve);
+			const response = value as { ready?: unknown; code?: unknown; port?: unknown };
+			if (
+				response.ready === true
+				&& Number.isSafeInteger(response.port)
+				&& Number(response.port) >= 1
+				&& Number(response.port) <= 65_535
+			) {
+				finish(() => resolve(Number(response.port)));
 				return;
 			}
 			const socketCode = ['EACCES', 'ECONNREFUSED', 'ENOENT'].includes(String(response.code))
@@ -227,7 +291,7 @@ async function waitUntilReady(
 		child.send({
 			schemaVersion: 1,
 			targetPath: options.targetPath,
-			proxyPath: options.proxyPath,
+			authenticationToken: options.authenticationToken,
 		}, (error) => {
 			if (error !== null && error !== undefined) {
 				failed();
