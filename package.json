@@ -432,6 +432,12 @@
           "scope": "machine",
           "markdownDescription": "Enable Preview same-device peer window discovery, policy configuration, and incoming task routing. Authorization remains default-deny."
         },
+        "copilotAgentMesh.agentHost.userDataDir": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "markdownDescription": "Override the current VS Code instance user-data directory for editor Agent Host discovery. Leave empty for platform/product derivation. The 0.4.0 Worker Host support claim remains macOS arm64 only."
+        },
         "copilotAgentMesh.experimental.authenticationProviders": {
           "type": "object",
           "default": {},

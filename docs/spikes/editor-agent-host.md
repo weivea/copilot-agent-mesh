@@ -276,3 +276,12 @@ Sessions 是同一份数据。因此**在该 endpoint 上创建的 Session 有�
 | Q4' 新建 Session 出现在目标窗口 Sessions 列表 | ⛔ 未验证，须 0.4.0 真实 E2E |
 | Tool 长时调用在真实 Copilot UI 下的表现 | ⛔ 未验证，须 0.4.0 真实 E2E |
 | 非 macOS / Insiders / 便携模式的 endpoint 发现 | ⛔ 未验证，超出当前支持范围 |
+
+### P6 后续实验（2026-08-31）
+
+P6 使用实现中的严格 locator 在另一台 macOS arm64 开发环境执行了相同只读发现边界。
+Stable user-data 存在且命令成功，但 endpoint/editor 计数均为 0；Insiders user-data
+不存在。因此 Unix-socket AHP initialize 与写入 Session 实验没有可连接对象，均记录为
+**unverified**，未创建 Session、未消费模型配额，也未留下 token、socket 或 Workspace
+路径证据。该环境结果不推翻本 Spike 的已证明结果，只说明 P8 必须在一个正在运行并注册
+editor endpoint 的普通 VS Code 实例内完成 O1。

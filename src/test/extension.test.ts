@@ -85,6 +85,11 @@ suite('Copilot Agent Mesh', () => {
 
 		assert.strictEqual(properties['copilotAgentMesh.experimental.agentHost']?.default, false);
 		assert.strictEqual(properties['copilotAgentMesh.experimental.peerDelegation']?.default, false);
+		assert.strictEqual(properties['copilotAgentMesh.agentHost.userDataDir']?.default, '');
+		assert.strictEqual(
+			(properties['copilotAgentMesh.agentHost.userDataDir'] as { scope?: unknown } | undefined)?.scope,
+			'machine',
+		);
 		assert.strictEqual(properties['copilotAgentMesh.experimental.sameDeviceCollaboration'], undefined);
 	});
 

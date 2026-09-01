@@ -32,6 +32,12 @@ execution URI so symlinked roots retain stable active-Workspace provenance.
 Successful writes broadcast `node.policy.changed`, so all open dashboards
 re-render without reload.
 
+P6 exposes an Agent Host source status provider with typed `editor | standalone`
+source, a bounded degradation enum/message, and change notifications wired into the
+existing Dashboard refresh event. The existing Agent Host component projects
+`Editor`, `Standalone`, or `Standalone (degraded)` without exposing an endpoint
+document or sensitive fields; P7 owns the broader Dashboard rework.
+
 ## Facade contract
 
 `src/ui/DashboardFacade.ts` exports `DashboardFacade`, `DashboardSnapshot`,

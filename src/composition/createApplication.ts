@@ -3,7 +3,10 @@ import { hostname } from 'node:os';
 
 import * as vscode from 'vscode';
 
-import type { AgentRuntime } from '../agentHost/AgentRuntime';
+import {
+	AgentRuntimeApprovalCapabilityIssuer,
+	type AgentRuntime,
+} from '../agentHost/AgentRuntime';
 import { LocalDesktopWorkspaceGuard } from '../application/LocalDesktopWorkspaceGuard';
 import { getWorkerPlatformSupport } from '../application/WorkerPlatformSupport';
 import {
@@ -207,8 +210,10 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		const nodeInstanceId = randomUUID();
 		const nodeLabel = windowNodeLabel(nodeId);
 		const runtimeApproval = new VscodeLocalTaskApproval(vscode, rawState, e2eCapability);
+		const runtimeApprovalCapabilities = new AgentRuntimeApprovalCapabilityIssuer();
 		const nodeConfirmation = new VscodeWindowNodeTaskConfirmation(vscode, e2eCapability);
-		let runtime!: AgentRuntime;
+		let runtime!: ReturnType<typeof createVscodeAgentRuntime>;
+		let sourceStatusSubscription: { dispose(): void } | undefined;
 		const nodeIdentity = createLocalBrokerIdentity(
 			context.globalStorageUri,
 			sharedProfile.deviceId,
@@ -221,6 +226,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			identity: nodeIdentity,
 			brokerKey,
 			executor: ({ workspaceResolver, eventSink }) => {
+				sourceStatusSubscription?.dispose();
 				runtime = createVscodeAgentRuntime(
 					vscode,
 					context,
@@ -229,7 +235,9 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 					runtimeApproval,
 					workerPlatform,
 					delegatedToolInvocations,
+					runtimeApprovalCapabilities,
 				);
+				sourceStatusSubscription = runtime.onDidSourceStatusChange(() => changeEvents.fire());
 				return new WindowNodeTaskExecutor({
 					nodeId,
 					nodeInstanceId,
@@ -237,6 +245,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 					runtime,
 					workspaceResolver,
 					confirmationHost: nodeConfirmation,
+					approvalCapabilities: runtimeApprovalCapabilities,
 					eventSink,
 					ids: { next: randomUUID },
 					clock: { now: () => new Date() },
@@ -265,6 +274,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		});
 		addApplicationCleanup(cleanup, () => node.dispose(), true);
 		addApplicationCleanup(cleanup, () => changeEvents.dispose());
+		addApplicationCleanup(cleanup, () => sourceStatusSubscription?.dispose());
 		await node.start();
 		const remoteTasks = new LocalIpcRemoteTaskAdapter(node);
 		const localTasks = new LocalBrokerTaskFacade(node, {

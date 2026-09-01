@@ -12,6 +12,7 @@ import type {
 } from '../../shared/protocol';
 import { LOCAL_BROKER_METHODS, MESH_ERROR_CODES } from '../../shared/protocol';
 import {
+	AgentRuntimeApprovalCapabilityIssuer,
 	createAgentRuntimeEventQueue,
 	type AgentRuntime,
 	type AgentRuntimeEvent,
@@ -251,6 +252,7 @@ interface ClientFixture {
 	readonly client: WindowNodeClient;
 	readonly runtime: TestRuntime;
 	readonly confirmations: WindowNodeTaskConfirmationRequest[];
+	readonly approvalCapabilities: AgentRuntimeApprovalCapabilityIssuer;
 	readonly executorCreations: () => number;
 	readonly previousGenerationWasDrained: () => boolean;
 	readonly executionContext: (
@@ -266,6 +268,7 @@ function createClient(
 ): ClientFixture {
 	const runtime = new TestRuntime();
 	const confirmations: WindowNodeTaskConfirmationRequest[] = [];
+	const approvalCapabilities = new AgentRuntimeApprovalCapabilityIssuer();
 	let executorCreations = 0;
 	let previousGenerationWasDrained = true;
 	let executor: WindowNodeTaskExecutor | undefined;
@@ -296,6 +299,7 @@ function createClient(
 						return 'once';
 					},
 				},
+				approvalCapabilities,
 				ids: { next: () => INPUT_ID },
 				clock: { now: () => new Date() },
 			});
@@ -320,6 +324,7 @@ function createClient(
 		client,
 		runtime,
 		confirmations,
+		approvalCapabilities,
 		executorCreations: () => executorCreations,
 		previousGenerationWasDrained: () => previousGenerationWasDrained,
 		executionContext: (taskId) => executor?.delegatedExecutionContext(taskId),
@@ -629,7 +634,11 @@ test('routes authenticated local RPC across two nodes and fences workspace execu
 			workspaceId: nodeA.workspaces[0].workspaceId,
 		}));
 		assert.equal(windowA.runtime.requests.length, 1);
-		assert.equal(windowA.confirmations[0].sourceWindowLabel, 'Window B');
+		assert.equal(windowA.confirmations.length, 0);
+		assert.equal(
+			windowA.approvalCapabilities.accepts(windowA.runtime.requests[0]!),
+			true,
+		);
 
 		await emit(windowA.runtime.handles[0], {
 			type: 'progress',

@@ -671,7 +671,8 @@ Coordinator 可以有本地 `created` 状态；Worker 的第一个持久状态�
 VS Code 1.135.0 Agent Host 要求 AHP 1.0.0，而 npm 最新发布仍是 0.8.0。当前实现
 因此用 Git Submodule 精确锁定上游 commit
 `f19dd8b3942d029744a3bdd31d830f9428e8ea47`，从源码生成并构建 TypeScript
-0.9.0 Client；其 `SUPPORTED_PROTOCOL_VERSIONS` 包含 1.0.0。该 revision 尚未
+0.9.0 Client；Mesh initialize 明确只 offer `["1.0.0"]`，不使用该包的 legacy
+`SUPPORTED_PROTOCOL_VERSIONS` 全集。该 revision 尚未
 Tag 或发布到 npm，属于明确记录的 Preview 供应链限制。Phase 0 必须继续证明实际
 VS Code Build 的 Host 版本与 SDK Offer 有交集，不能靠 Feature Flag 绕过。
 当前 pin 是上游在 `60706330` 将首选 Offer 改为 0.9.0 之前的最新提交；不能直接
@@ -681,6 +682,21 @@ VS Code Build 的 Host 版本与 SDK Offer 有交集，不能靠 Feature Flag �
 当前 `engines.vscode = ^1.103.0` 只足以覆盖 Language Model Tool API，不能自动证明对应版本的 `code agent host` 与目标 AHP 行为可用。Phase 0 完成后，将最低 VS Code 版本提高到验证通过的最低版本，并在启动时做 Capability Probe。
 
 ### 10.2 启动与发现
+
+0.4.0 Peer Delegation 打开时，`AgentHostSourceSelector` 先按 VS Code product/platform
+推导当前 user-data（可由 machine-scope `copilotAgentMesh.agentHost.userDataDir` 绝对路径
+覆盖），执行有界 `code agent endpoints --user-data-dir <dir>`，并要求 registry 的
+canonical `userDataPath` 精确匹配。只接受唯一 live、schema-v2、`type: editor`、
+Unix socket、protocol `1.0.0` 的 endpoint。使用 `net.connect(path)` 后由 `ws@8.21.3`
+在该 socket 上发起唯一 `/?tkn=` Upgrade；连接、响应头、超时和取消均 fail closed。
+Editor 发现/连接/initialize/协议失败只回退 standalone 一次，并公开有界 source/degraded
+状态。Preview 关闭时继续使用以下既有 standalone 路径。
+
+Source selector 先完成唯一 runtime approval，再用绑定完整 request 的 WeakMap capability
+覆盖 editor 与 standalone attempt。same-device task 只有在 Broker grant 精确校验且存在
+认证本地 `sourceNodeId` 后才直接获得该 capability，因此目标窗口不再重复确认；无该证明
+的 legacy/cross-device/direct task 在目标确认一次后获得 capability。该对象不进入 wire、
+日志或 Webview，模型字段与布尔值均不能伪造。
 
 推荐启动方式：
 
@@ -728,6 +744,7 @@ sequenceDiagram
     M->>H: resolve session config when required
     M->>H: createSession(sessionUri, provider, workingDirectories)
     M->>H: subscribe(sessionUri)
+    M->>H: session/titleChanged (acknowledged)
     H-->>M: session snapshot / ready / creationFailed
     M->>M: read defaultChat from session state
     M->>H: subscribe(chatUri)
@@ -747,6 +764,12 @@ sequenceDiagram
 - 处理 `AuthRequired`、Token 无效、无 Copilot 权限、配额不足和 Provider 消失。
 - 每次 `initialize` / `subscribe` 返回的 Snapshot 必须先应用，再消费后续 Action。
 - AHP 原始对象不穿过 Adapter 边界。
+- editor endpoint 的 token、socket/user-data/executable 路径和 instance ID 进入引用计数的
+  内存脱敏集合；raw、percent-encoded、JSON/cause 文本在日志、事件、错误和 Webview 前均
+  清除。
+- editor Turn 达到权威终态后关闭 AHP Client/socket，但不调用会触发
+  `root/sessionRemoved` 的 `disposeSession`；启动/标题失败仍删除 provisional Session，
+  standalone 生命周期保持不变。
 
 ### 10.4 Event 映射
 

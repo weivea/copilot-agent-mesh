@@ -727,11 +727,32 @@ function listenerSnapshot(
 		readonly available: boolean;
 		readonly featureEnabled: boolean;
 		readonly reason?: string;
+		readonly source?: 'editor' | 'standalone';
+		readonly degradation?: {
+			readonly reason: string;
+			readonly message: string;
+		};
 	},
 	workerPlatform: WorkerPlatformSupport,
 ): DashboardSnapshot['listener'] {
 	const agentHost = runtimeProbe.available
-		? { state: 'ready' as const, label: 'Available', detail: 'This Window owns a real AgentRuntime.' }
+		? runtimeProbe.source === 'editor'
+			? {
+				state: 'ready' as const,
+				label: 'Editor',
+				detail: 'Tasks use the current VS Code instance Agent Host.',
+			}
+			: runtimeProbe.degradation === undefined
+				? {
+					state: 'ready' as const,
+					label: 'Standalone',
+					detail: 'Tasks use the owned standalone Agent Host.',
+				}
+				: {
+					state: 'ready' as const,
+					label: 'Standalone (degraded)',
+					detail: runtimeProbe.degradation.message,
+				}
 		: {
 			state: 'unavailable' as const,
 			label: runtimeProbe.featureEnabled ? 'Unavailable' : 'Disabled',

@@ -2,7 +2,8 @@
 
 The MVP runtime is a production adapter over the TypeScript 0.9.0 client built
 from pinned `microsoft-agent-host-protocol` commit
-`f19dd8b3942d029744a3bdd31d830f9428e8ea47`; it negotiates AHP 1.0.0 with
+`f19dd8b3942d029744a3bdd31d830f9428e8ea47`; it offers exactly `["1.0.0"]`
+and negotiates AHP 1.0.0 with
 VS Code 1.135.0 and does not use the Fake Agent. Fake AHP connections are limited
 to deterministic tests.
 
@@ -22,6 +23,23 @@ The first-task safety decision is an injected `FirstTaskConfirmation`. The VS Co
 
 ## Lifecycle
 
+When the default-off Peer Delegation Preview is enabled, the target Window Node
+first derives the current product's user-data directory and strictly discovers one
+live schema-v2 `editor` Unix-socket endpoint at AHP `1.0.0`. Each delegated task
+uses its own `net.connect` + authenticated WebSocket Upgrade + AHP client. Discovery,
+connection, initialize, or protocol failure falls back to the existing standalone
+launcher exactly once and exposes `standalone` plus a bounded degradation reason.
+With Peer Delegation disabled, the historical standalone behavior is unchanged.
+
+Source fallback sits below one runtime approval boundary. An exact local
+`DelegationGrant` validated by the target Window Node produces an in-memory,
+WeakMap-backed capability bound to the complete request; same-device peer tasks
+therefore show no target Node/runtime modal because the parent's native
+Continue/Cancel was the sole consent. Legacy, direct, and cross-device tasks without
+that local-source proof retain exactly one target confirmation, whose capability
+covers both source attempts. The capability is not a wire/model boolean and carries
+no serializable grant, path, or identity data.
+
 1. Probe a configured or known VS Code CLI candidate with `code --version`.
 2. Create an owned instance directory, owner-only token file, dedicated user/server data directories, and an isolated process group.
 3. Diff strict `code agent endpoints` JSON and require exactly one new standalone endpoint matching both an owned PID and the generated token. Stdout/stderr are drained but never interpreted as readiness.
@@ -33,6 +51,14 @@ The first-task safety decision is an injected `FirstTaskConfirmation`. The VS Co
    not wait for `session/ready` before dispatch.
 7. Map bounded Chat output/reasoning, tool lifecycle and confirmation, elicited input, MCP authentication, Terminal summaries, and authoritative completion/cancellation/error actions to Mesh-neutral events.
 
+Delegated Sessions use the exact target Workspace URI, publish no child Mesh tools,
+and receive the acknowledged title
+`Mesh · <safe source window name> → <safe bounded task summary>`. A rejected title
+removes the provisional Session. After an authoritative editor-host turn terminal,
+cleanup closes subscriptions, client connection, socket, and timers but does not call
+`disposeSession`, because that command removes the user-visible history. Standalone
+cleanup continues to dispose the Session and owned Host.
+
 Mapped events enter a queue bounded by both serialized UTF-8 bytes and event
 count. Progress coalesces to its latest queued value. Nonterminal output is
 truncated or dropped under pressure and produces at most one
@@ -43,6 +69,9 @@ consumer remains serial so each retained event finishes task-store persistence
 and fsync before the next event is consumed.
 
 Connection recovery retains only `clientId`, Session/Chat URIs, subscriptions, and `lastSeenServerSeq`. It attempts AHP replay/snapshot recovery, re-lists Sessions, and rechecks authentication. Outbound Turn, input, and cancellation actions use persistent `clientSeq` values; actions without an accepted matching `origin` acknowledgement are resent with the same sequence after candidate takeover. Snapshot recovery reconciles accumulated response parts by stable IDs and stream ordinals, emits only undelivered content before authoritative completion, and preserves repeated id-less parts. Writes remain blocked during takeover, and Terminal subscriptions and authentication work are isolated by explicit connection generations. Recovery invalidates and aborts the old generation before shutdown; task disposal aborts and awaits recovery plus Terminal subscription work, then records successful subscription, Session, connection, and Host cleanup phases so a retry repeats only failed work. Missing Hosts or Sessions map to `TASK_RECOVERY_UNAVAILABLE`; authentication failures retain `AGENT_AUTH_REQUIRED` or `AGENT_AUTH_FAILED`. Endpoint tokens are never included in recovery descriptors, events, errors, or logs.
+Editor connection tokens, socket/user-data/executable paths, and endpoint instance IDs
+are registered in a reference-counted in-memory redaction set for raw and
+percent-encoded forms and are removed after the final borrowing task disposes.
 
 Required Session configuration is rendered from the provider schema. Boolean values use explicit choices, strings remain strings, and numbers, arrays, and objects are parsed and recursively validated as JSON. Invalid, read-only, or unsupported properties fail with `AGENT_CONFIG_REQUIRED` instead of sending a coerced value to the provider.
 
@@ -102,6 +131,11 @@ npm run test:agent-host-success-e2e
 ```
 
 Both request a no-file-change response. The success-turn command exits successfully only when an authoritative `turnComplete` accompanies accumulated output equal to `MESH_AGENT_HOST_E2E_OK`; every blocked, partial, or mismatched result is nonzero. Neither command runs in ordinary CI because a successful turn may consume Copilot quota.
+
+The 2026-08-31 P6 editor-source experiment ran on macOS arm64. The Stable registry
+command succeeded but returned zero endpoints; Insiders user-data was absent. Editor
+initialize and O1 Session visibility therefore remain unverified in that environment,
+with no Session created and no sensitive evidence persisted.
 
 ## Verified result
 

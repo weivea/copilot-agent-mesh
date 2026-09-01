@@ -17,6 +17,8 @@ import {
 	type RunOwnedCommandOptions,
 } from '../spikes/ownedProcess';
 import { AgentRuntimeError } from './AgentRuntime';
+import type { AgentHostSource } from './AgentRuntime';
+import type WebSocket from 'ws';
 
 const commandTimeoutMs = 10_000;
 const startupTimeoutMs = 30_000;
@@ -34,6 +36,9 @@ export interface LaunchedAgentHost {
 	readonly endpoint: URL;
 	readonly version: string;
 	readonly registryProtocolVersion: string;
+	readonly source?: AgentHostSource;
+	readonly preserveTerminalSession?: boolean;
+	openWebSocket?(signal?: AbortSignal): Promise<WebSocket>;
 	onExit(listener: (error: AgentRuntimeError) => void): { dispose(): void };
 	dispose(): Promise<void>;
 }
@@ -57,7 +62,7 @@ export interface AgentHostLauncherDependencies {
 
 export interface AgentHostLauncherLike {
 	probe(): Promise<AgentHostProbe>;
-	launch(): Promise<LaunchedAgentHost>;
+	launch(signal?: AbortSignal): Promise<LaunchedAgentHost>;
 	dispose(): Promise<void>;
 }
 
@@ -104,13 +109,21 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 		}
 	}
 
-	launch(): Promise<LaunchedAgentHost> {
+	launch(signal?: AbortSignal): Promise<LaunchedAgentHost> {
 		if (this.disposed) {
 			return Promise.reject(new AgentRuntimeError('AGENT_UNAVAILABLE', 'The Agent Host launcher has been disposed.'));
 		}
+		if (signal?.aborted === true) {
+			return Promise.reject(new AgentRuntimeError('AGENT_UNAVAILABLE', 'The Agent Host launch was cancelled.'));
+		}
 		const controller = new AbortController();
 		let operation: InFlightLaunch;
-		const promise = this.launchOwned(controller.signal).finally(() => this.inFlight.delete(operation));
+		const abort = () => controller.abort();
+		signal?.addEventListener('abort', abort, { once: true });
+		const promise = this.launchOwned(controller.signal).finally(() => {
+			signal?.removeEventListener('abort', abort);
+			this.inFlight.delete(operation);
+		});
 		operation = { controller, promise };
 		this.inFlight.add(operation);
 		return promise;
@@ -504,7 +517,7 @@ class RetainedProcessGroupCleanup implements OwnedResource {
 
 type OwnedCommandRunner = AgentHostLauncherDependencies['runCommand'];
 
-async function discoverCodeCli(
+export async function discoverCodeCli(
 	configuredCodeCli?: string,
 	signal?: AbortSignal,
 	runCommand: OwnedCommandRunner = runOwnedCommand,

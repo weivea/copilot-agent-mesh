@@ -19,15 +19,18 @@ import {
 import {
 	AgentRuntimeError,
 	type AgentInputRequest,
+	type AgentRuntimeApprovalCapabilityIssuer,
 	type AgentRuntime,
 	type AgentRuntimeEvent,
 	type AgentTaskAnswer,
 	type AgentTaskHandle,
+	type AgentTaskRequest,
 	type RegisteredLocalWorkspace,
 	type WorkspaceResolver,
 } from '../agentHost/AgentRuntime';
 import { MeshDomainError } from '../domain/errors';
 import type { Clock, IdGenerator } from '../domain/ports';
+import { sanitizeDelegationText } from '../tools/DelegationTextSanitizer';
 import {
 	assertDelegationGrantBinding,
 	canAutoApproveToolConfirmation,
@@ -61,6 +64,7 @@ export interface WindowNodeTaskExecutorOptions {
 	readonly runtime: AgentRuntime;
 	readonly workspaceResolver: WorkspaceResolver;
 	readonly confirmationHost: WindowNodeTaskConfirmationHost;
+	readonly approvalCapabilities?: AgentRuntimeApprovalCapabilityIssuer;
 	readonly eventSink: WindowNodeTaskEventSink;
 	readonly ids: IdGenerator | (() => string);
 	readonly clock: Clock | (() => Date);
@@ -323,18 +327,35 @@ export class WindowNodeTaskExecutor {
 		}
 		this.assertRecordWithinWorkerDeadline(record, params.workerDeadline);
 		this.assertActive();
-		const confirmation = await this.options.confirmationHost.confirm({
-			sourceWindowLabel: params.sourceLabel,
-			targetWindowLabel: this.nodeLabel,
-			workspaceDisplayName: workspace.displayName,
-			taskTitle: params.title,
+		const baseRuntimeRequest = {
+			taskId: params.taskId,
+			title: params.title,
 			prompt: params.prompt,
-		});
-		if (confirmation !== 'once') {
-			throw new MeshDomainError(
-				'TASK_EXECUTION_FAILED',
-				'The local user denied this remote task.',
-			);
+			acceptanceCriteria: [...params.acceptanceCriteria],
+			workspaceId: workspace.workspaceId,
+			sourceWindowName: params.sourceLabel,
+			allowInteractiveAuthentication: true,
+			delegatedExecutionContext: { ...params.delegatedExecutionContext },
+			approvalContext: {
+				peerId: params.authenticatedOwnerId,
+				workspaceId: workspace.workspaceId,
+				requestHash: record.fingerprint,
+			},
+		} satisfies AgentTaskRequest;
+		if (params.sourceNodeId === undefined) {
+			const confirmation = await this.options.confirmationHost.confirm({
+				sourceWindowLabel: params.sourceLabel,
+				targetWindowLabel: this.nodeLabel,
+				workspaceDisplayName: workspace.displayName,
+				taskTitle: params.title,
+				prompt: params.prompt,
+			});
+			if (confirmation !== 'once') {
+				throw new MeshDomainError(
+					'TASK_EXECUTION_FAILED',
+					'The local user denied this remote task.',
+				);
+			}
 		}
 		this.assertRecordWithinWorkerDeadline(record, params.workerDeadline);
 		this.assertActive();
@@ -342,19 +363,10 @@ export class WindowNodeTaskExecutor {
 		let handle: AgentTaskHandle;
 		record.runtimeStartPending = true;
 		try {
+			const approvalCapability = this.options.approvalCapabilities?.issue(baseRuntimeRequest);
 			handle = await this.options.runtime.start({
-				taskId: params.taskId,
-				title: params.title,
-				prompt: params.prompt,
-				acceptanceCriteria: [...params.acceptanceCriteria],
-				workspaceId: workspace.workspaceId,
-				allowInteractiveAuthentication: true,
-				delegatedExecutionContext: { ...params.delegatedExecutionContext },
-				approvalContext: {
-					peerId: params.authenticatedOwnerId,
-					workspaceId: workspace.workspaceId,
-					requestHash: record.fingerprint,
-				},
+				...baseRuntimeRequest,
+				...(approvalCapability === undefined ? {} : { approvalCapability }),
 			});
 		} catch (error: unknown) {
 			if (record.deadlineExpired) {
@@ -497,7 +509,7 @@ export class WindowNodeTaskExecutor {
 						type: 'failed',
 						failure: {
 							code: boundUtf8(failure.code, 128),
-							message: boundUtf8(failure.message, PROTOCOL_LIMITS.errorMessageBytes),
+							message: safeTaskText(failure.message, PROTOCOL_LIMITS.errorMessageBytes),
 							retryable: failure.retryable,
 						},
 					});
@@ -540,33 +552,35 @@ export class WindowNodeTaskExecutor {
 			case 'progress':
 				await this.publish(record, {
 					type: 'progress',
-					summary: boundUtf8(event.message, PROTOCOL_LIMITS.outputEventBytes),
+					summary: safeTaskText(event.message, PROTOCOL_LIMITS.outputEventBytes),
 				});
 				return false;
-			case 'output':
+			case 'output': {
+				const safeOutput = safeTaskText(event.text, PROTOCOL_LIMITS.outputEventBytes);
 				active.outputSummary = boundUtf8(
-					active.outputSummary + event.text,
+					active.outputSummary + safeOutput,
 					PROTOCOL_LIMITS.terminalSummaryBytes,
 				);
 				active.outputTail = boundUtf8Tail(
-					active.outputTail + event.text,
+					active.outputTail + safeOutput,
 					PROTOCOL_LIMITS.terminalSummaryBytes,
 				);
 				await this.publish(record, {
 					type: 'output',
-					summary: boundUtf8(event.text, PROTOCOL_LIMITS.outputEventBytes),
+					summary: safeOutput,
 				});
 				return false;
+			}
 			case 'outputTruncated':
 				await this.publish(record, {
 					type: 'outputTruncated',
-					summary: boundUtf8(event.message, PROTOCOL_LIMITS.outputEventBytes),
+					summary: safeTaskText(event.message, PROTOCOL_LIMITS.outputEventBytes),
 				});
 				return false;
 			case 'tool':
 				await this.publish(record, {
 					type: 'tool',
-					summary: boundUtf8(
+					summary: safeTaskText(
 						`${event.name}: ${event.status}${event.summary === undefined ? '' : ` — ${event.summary}`}`,
 						PROTOCOL_LIMITS.outputEventBytes,
 					),
@@ -575,7 +589,7 @@ export class WindowNodeTaskExecutor {
 			case 'terminal':
 				await this.publish(record, {
 					type: 'terminal',
-					summary: boundUtf8(event.summary, PROTOCOL_LIMITS.outputEventBytes),
+					summary: safeTaskText(event.summary, PROTOCOL_LIMITS.outputEventBytes),
 				});
 				return false;
 			case 'inputRequired':
@@ -610,7 +624,7 @@ export class WindowNodeTaskExecutor {
 					type: 'failed',
 					failure: {
 						code: boundUtf8(event.error.code, 128),
-						message: boundUtf8(event.error.message, PROTOCOL_LIMITS.errorMessageBytes),
+						message: safeTaskText(event.error.message, PROTOCOL_LIMITS.errorMessageBytes),
 						retryable: event.error.retryable,
 					},
 				});
@@ -688,7 +702,7 @@ export class WindowNodeTaskExecutor {
 			await this.publish(record, {
 				type: 'inputRequired',
 				inputId: publicInputId,
-				prompt: boundUtf8(request.prompt, PROTOCOL_LIMITS.taskAnswerBytes),
+				prompt: safeTaskText(request.prompt, PROTOCOL_LIMITS.taskAnswerBytes),
 			});
 		} catch (error: unknown) {
 			active.pendingInputs.delete(publicInputId);
@@ -966,6 +980,10 @@ export class WindowNodeTaskExecutor {
 
 function startFingerprint(params: NodeTaskStartParams): string {
 	return createHash('sha256').update(JSON.stringify(params)).digest('hex');
+}
+
+function safeTaskText(value: string, maxBytes: number): string {
+	return sanitizeDelegationText(value, maxBytes);
 }
 
 function normalizeAgentFailure(error: unknown): AgentRuntimeError {

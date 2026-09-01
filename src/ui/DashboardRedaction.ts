@@ -25,7 +25,8 @@ const githubTokenPrefixes = [
 ] as const;
 
 export function redactRemoteText(value: string): string {
-	return containsUnsafeDashboardText(value) ? '[redacted sensitive details]' : value;
+	const dynamicRedacted = redactRegisteredSensitiveValues(value);
+	return containsUnsafeDashboardText(dynamicRedacted) ? '[redacted sensitive details]' : dynamicRedacted;
 }
 
 export function containsUnsafeDashboardText(value: string): boolean {
@@ -457,3 +458,4 @@ function containsC0(value: string): boolean {
 	}
 	return false;
 }
+import { redactRegisteredSensitiveValues } from '../security/SensitiveValueRedaction';
