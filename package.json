@@ -279,190 +279,6 @@
           ],
           "additionalProperties": false
         }
-      },
-      {
-        "name": "mesh_start_collaboration",
-        "displayName": "Start Local Multi-project Collaboration",
-        "toolReferenceName": "meshStartCollaboration",
-        "canBeReferencedInPrompt": true,
-        "modelDescription": "Starts one durable Preview collaboration run across exactly two different claimed workspaces on the same local device. Call mesh_list_workers first and pass explicit frontend and backend Device -> Node -> Workspace targets. Omit collaborationRequestId for a fresh run; reuse the returned ID only for an exact retry. The Broker schedules backend implementation and structured contract production, frontend implementation using that exact authorized artifact, then one validation task per workspace. This path never starts a Listener or Dev Tunnel. Use mesh_get_collaboration to poll, mesh_cancel_collaboration to cancel the active task and pending dependencies, and mesh_answer_task with the active task/input IDs when input is required. Do not use this tool for Git, branch, worktree, commit, push, or pull request management.",
-        "userDescription": "Start a durable same-device frontend/backend collaboration across two explicitly selected workspaces.",
-        "tags": [
-          "copilot-agent-mesh"
-        ],
-        "inputSchema": {
-          "type": "object",
-          "properties": {
-            "collaborationRequestId": {
-              "type": "string",
-              "minLength": 36,
-              "maxLength": 36,
-              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-              "description": "Optional exact-retry identity. Omit for a fresh collaboration."
-            },
-            "title": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 256,
-              "description": "Non-sensitive collaboration title."
-            },
-            "goal": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 65536,
-              "description": "Complete implementation goal, limited to 64 KiB UTF-8."
-            },
-            "frontend": {
-              "type": "object",
-              "properties": {
-                "deviceId": {
-                  "type": "string",
-                  "minLength": 36,
-                  "maxLength": 36,
-                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-                  "description": "The local Device ID returned by mesh_list_workers."
-                },
-                "nodeId": {
-                  "type": "string",
-                  "minLength": 36,
-                  "maxLength": 36,
-                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-                  "description": "An explicit local Window Node ID returned by mesh_list_workers."
-                },
-                "nodeInstanceId": {
-                  "type": "string",
-                  "minLength": 36,
-                  "maxLength": 36,
-                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-                  "description": "The exact local Window Node instance ID."
-                },
-                "workspaceId": {
-                  "type": "string",
-                  "minLength": 36,
-                  "maxLength": 36,
-                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-                  "description": "An explicit claimed local Workspace ID."
-                }
-              },
-              "required": [
-                "deviceId",
-                "nodeId",
-                "nodeInstanceId",
-                "workspaceId"
-              ],
-              "additionalProperties": false,
-              "description": "Explicit frontend participant target."
-            },
-            "backend": {
-              "type": "object",
-              "properties": {
-                "deviceId": {
-                  "type": "string",
-                  "minLength": 36,
-                  "maxLength": 36,
-                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-                  "description": "The local Device ID returned by mesh_list_workers."
-                },
-                "nodeId": {
-                  "type": "string",
-                  "minLength": 36,
-                  "maxLength": 36,
-                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-                  "description": "An explicit local Window Node ID returned by mesh_list_workers."
-                },
-                "nodeInstanceId": {
-                  "type": "string",
-                  "minLength": 36,
-                  "maxLength": 36,
-                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-                  "description": "The exact local Window Node instance ID."
-                },
-                "workspaceId": {
-                  "type": "string",
-                  "minLength": 36,
-                  "maxLength": 36,
-                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-                  "description": "An explicit claimed local Workspace ID."
-                }
-              },
-              "required": [
-                "deviceId",
-                "nodeId",
-                "nodeInstanceId",
-                "workspaceId"
-              ],
-              "additionalProperties": false,
-              "description": "Explicit backend participant target."
-            },
-            "timeoutMinutes": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 1440,
-              "default": 60
-            }
-          },
-          "required": [
-            "title",
-            "goal",
-            "frontend",
-            "backend"
-          ],
-          "additionalProperties": false
-        }
-      },
-      {
-        "name": "mesh_get_collaboration",
-        "displayName": "Get Local Collaboration",
-        "toolReferenceName": "meshGetCollaboration",
-        "canBeReferencedInPrompt": true,
-        "modelDescription": "Returns a bounded same-device collaboration snapshot containing participant routes, dependency states, validation summaries, and immutable artifact metadata only. It never returns artifact content, raw prompts, raw output, local paths, or secrets. When a task needs input, use its taskId and inputId with mesh_answer_task.",
-        "userDescription": "Inspect a durable local multi-project collaboration run.",
-        "tags": [
-          "copilot-agent-mesh"
-        ],
-        "inputSchema": {
-          "type": "object",
-          "properties": {
-            "runId": {
-              "type": "string",
-              "minLength": 36,
-              "maxLength": 36,
-              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-              "description": "Collaboration run ID returned by mesh_start_collaboration."
-            }
-          },
-          "required": [
-            "runId"
-          ],
-          "additionalProperties": false
-        }
-      },
-      {
-        "name": "mesh_cancel_collaboration",
-        "displayName": "Cancel Local Collaboration",
-        "toolReferenceName": "meshCancelCollaboration",
-        "canBeReferencedInPrompt": true,
-        "modelDescription": "Cancels the exact active task in an owned same-device collaboration run and marks every not-yet-started dependent task cancelled. Races with authoritative task completion are reconciled without starting a duplicate task.",
-        "userDescription": "Cancel a local multi-project collaboration run.",
-        "tags": [
-          "copilot-agent-mesh"
-        ],
-        "inputSchema": {
-          "type": "object",
-          "properties": {
-            "runId": {
-              "type": "string",
-              "minLength": 36,
-              "maxLength": 36,
-              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-              "description": "Owned collaboration run ID to cancel."
-            }
-          },
-          "required": [
-            "runId"
-          ],
-          "additionalProperties": false
-        }
       }
     ],
     "viewsContainers": {
@@ -557,32 +373,6 @@
         "command": "copilotAgentMesh.cancelTask",
         "title": "Cancel Task",
         "category": "Copilot Agent Mesh"
-      },
-      {
-        "command": "copilotAgentMesh.answerTask",
-        "title": "Answer Task Input",
-        "category": "Copilot Agent Mesh"
-      },
-      {
-        "command": "copilotAgentMesh.startCollaboration",
-        "title": "Start Local Multi-project Collaboration",
-        "category": "Copilot Agent Mesh",
-        "icon": "$(group-by-ref-type)"
-      },
-      {
-        "command": "copilotAgentMesh.getCollaboration",
-        "title": "Refresh Collaboration Run",
-        "category": "Copilot Agent Mesh"
-      },
-      {
-        "command": "copilotAgentMesh.cancelCollaboration",
-        "title": "Cancel Collaboration Run",
-        "category": "Copilot Agent Mesh"
-      },
-      {
-        "command": "copilotAgentMesh.answerCollaboration",
-        "title": "Answer Collaboration Task Input",
-        "category": "Copilot Agent Mesh"
       }
     ],
     "menus": {
@@ -596,11 +386,6 @@
           "command": "copilotAgentMesh.registerWorkspace",
           "when": "view == copilotAgentMesh.dashboard",
           "group": "navigation@2"
-        },
-        {
-          "command": "copilotAgentMesh.startCollaboration",
-          "when": "view == copilotAgentMesh.dashboard",
-          "group": "navigation@3"
         },
         {
           "command": "copilotAgentMesh.startListener",
@@ -639,12 +424,6 @@
           "default": false,
           "scope": "machine",
           "markdownDescription": "Enable the real macOS arm64 Worker Preview Agent Host/AHP runtime. This may consume Copilot quota. Windows, Linux, macOS x64, and other architectures remain Coordinator-only."
-        },
-        "copilotAgentMesh.experimental.sameDeviceCollaboration": {
-          "type": "boolean",
-          "default": false,
-          "scope": "machine",
-          "markdownDescription": "Enable the 0.3.0 Preview same-device multi-project collaboration orchestrator. This uses only authenticated local IPC between ordinary VS Code Window Nodes and never starts a Listener or Dev Tunnel."
         },
         "copilotAgentMesh.experimental.authenticationProviders": {
           "type": "object",
@@ -729,7 +508,6 @@
     "test:dev-tunnel-real": "npm run compile-tests && node --test out/src/integrationTest/devTunnel.real.test.js",
     "test:two-instance-real": "npm run compile-tests && npm run compile && node scripts/e2e/two-instance/run.mjs",
     "test:multi-window-real": "npm run compile-tests && npm run compile && node scripts/e2e/multi-window/run.mjs",
-    "test:multi-project-real": "npm run compile-tests && npm run compile && node scripts/e2e/multi-window/run.mjs --multi-project",
     "test:extension": "npm run compile-tests && npm run compile && vscode-test",
     "test": "npm run test:unit && npm run test:component && npm run test:extension",
     "verify": "npm run test:unit && npm run test:component && npm run test:extension && npm run package:vsix",

@@ -1097,8 +1097,15 @@ suite('Mesh tool manifest contract', () => {
 	test('exports eight manifest descriptors with runtime name parity', () => {
 		const manifestNames = MESH_TOOL_MANIFEST_DESCRIPTORS.map(({ name }) => name);
 
-		assert.equal(manifestNames.length, 8);
+		assert.equal(manifestNames.length, 5);
 		assert.doesNotThrow(() => assertMeshToolNameParity(manifestNames, MESH_RUNTIME_TOOL_NAMES));
+		for (const removed of [
+			'mesh_start_collaboration',
+			'mesh_get_collaboration',
+			'mesh_cancel_collaboration',
+		]) {
+			assert.ok(!manifestNames.some((name) => name === removed));
+		}
 		for (const descriptor of MESH_TOOL_MANIFEST_DESCRIPTORS) {
 			assert.equal(descriptor.inputSchema.additionalProperties, false);
 		}
@@ -1128,12 +1135,6 @@ suite('Mesh tool manifest contract', () => {
 		assert.match(getDescriptor.modelDescription, /only needsInput snapshots expose mesh_answer_task/);
 		assert.match(getDescriptor.modelDescription, /Failed and timedOut snapshots include safe failure/);
 		assert.match(getDescriptor.modelDescription, /eventGap identifies every omitted leading event/);
-		const collaborationDescriptor = MESH_TOOL_MANIFEST_DESCRIPTORS.find(
-			({ name }) => name === MESH_TOOL_NAMES.startCollaboration,
-		);
-		assert.ok(collaborationDescriptor);
-		assert.match(collaborationDescriptor.modelDescription, /never starts a Listener or Dev Tunnel/);
-		assert.match(collaborationDescriptor.modelDescription, /mesh_answer_task/);
 	});
 
 	test('exports the cold implicit activation contract for every tool', () => {

@@ -10,7 +10,7 @@ import {
 	MemoryAtomicFileSystem,
 	TestOwnership,
 	uuid,
-} from './collaborationTestSupport';
+} from './artifactStoreTestSupport';
 
 const RUN_ID = uuid(1);
 const PRODUCER_TASK_ID = uuid(2);
@@ -92,7 +92,7 @@ test('Artifact Store rejects media, size, secrets, paths, and per-run count over
 		);
 	}
 
-	for (let index = 0; index < PROTOCOL_LIMITS.collaborationArtifactCount; index += 1) {
+	for (let index = 0; index < PROTOCOL_LIMITS.artifactGroupCount; index += 1) {
 		await store.create({
 			...base,
 			artifactId: uuid(100 + index),

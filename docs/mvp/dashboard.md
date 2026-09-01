@@ -1,7 +1,7 @@
 # MVP Dashboard integration
 
 The dashboard is a secure presentation and command surface. It does not own device,
-listener, tunnel, workspace, peer, task, collaboration, or artifact state.
+listener, tunnel, workspace, peer, or task state.
 
 ## Facade contract
 
@@ -20,11 +20,6 @@ composition root should adapt the real stores and application services to
 | `addPeer` / `removePeer` | Collect the URL in Extension Host UI, enroll it, or confirm and revoke by `peerId` |
 | `runTask` | Collect the full task prompt in Extension Host UI and call the coordinator with optional safe peer/workspace IDs |
 | `cancelTask` | Confirm locally and cancel by `taskId` |
-| `answerTaskInput` | Collect the answer in Extension Host UI and submit it by `taskId` |
-| `startCollaboration` | Require the Preview opt-in, collect title/goal in Extension Host UI, explicitly select two different claimed workspaces and frontend/backend roles, confirm, then start |
-| `getCollaboration` | Refresh a selected run by opaque `runId` |
-| `cancelCollaboration` | Confirm locally, cancel the active task, and prevent pending dependencies from starting |
-| `answerCollaboration` | Resolve the active `needsInput` task and reuse the existing task answer channel |
 
 Destructive confirmations are a Facade responsibility and therefore remain an
 Extension Host security boundary. This includes listener stop, workspace/peer
@@ -32,38 +27,14 @@ removal, and task cancellation. The production fallback is
 `UnavailableDashboardFacade`; it reads only the configured device metadata and
 reports services as unavailable. It never creates fake online state or fake tasks.
 
-For task and collaboration input, the webview still sends only the opaque task
-or run ID. The Facade then reads the exact pending `inputId` and question and
-shows that question in a native Extension Host input box. The question is never
-added to the Dashboard ViewModel. Submission is conditional on the same
-`inputId`, preventing an answer from being applied to a newer queued question;
-approval prompts accept `approve`, `continue`, `继续`, `同意`, `批准`, `确认`,
-and `允许`. The card and native dialog show a short opaque input-ID prefix so
-multiple identical `Run in terminal?` requests are visibly distinct. One click
-continues through inputs that are already queued; later Agent requests appear as
-a new ID and require a new explicit confirmation. Collaboration answers use a
-Broker-owned `runId + taskId + inputId` operation, so either live participant
-window can answer without bypassing run membership or current-input checks. The
-aggregate consumes the authoritative resumed task snapshot and clears the old
-`needsInput` immediately.
-
 ## Message and data boundary
 
 The webview sends only action names and bounded opaque IDs. Connection URLs,
-pairing secrets, task prompts, collaboration goals, artifact content, complete
-output, answers, credentials, and local
+pairing secrets, task prompts, complete output, answers, credentials, and local
 paths never cross the message bus. Both directions are runtime validated, and
 outbound messages are rejected when they contain forbidden fields, local path
 shapes, secret URL fragments, or oversized strings. Foundation's complete task
 state set is reused directly, including `recovering` and `cancelling`.
-
-The Collaboration Runs model contains only opaque IDs, role, safe
-Node/Workspace labels, task kind/dependency/status, validation status, stable
-block/failure code, and artifact label/media type/size/SHA-256. It excludes
-worker deadlines, request hashes, absolute paths, raw task prompts/output, and
-artifact content. The start button remains disabled until
-`copilotAgentMesh.experimental.sameDeviceCollaboration` is enabled and two
-different non-busy claimed local workspaces are visible.
 
 Each resolved view receives a new `uiInstanceId`. Messages from stale instances
 are rejected, resolve/dispose cleanup is idempotent, and snapshot reads are

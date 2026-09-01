@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { resolve, sep } from 'node:path';
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve, sep } from 'node:path';
 import { test } from 'node:test';
 
 import type { RoutedTaskStartParams } from '../../shared/protocol';
@@ -12,7 +14,10 @@ import {
 	LazyVscodeDevTunnelProvider,
 	type LazyDevTunnelDelegate,
 } from '../composition/LazyVscodeDevTunnelProvider';
-import { ProductionBrokerRuntime } from '../composition/ProductionBrokerRuntime';
+import {
+	ProductionBrokerRuntime,
+	removeLegacyCollaborationState,
+} from '../composition/ProductionBrokerRuntime';
 import {
 	ensureOwnedBrokerKey,
 	LOCAL_BROKER_KEY_SECRET,
@@ -52,16 +57,37 @@ test('production composition uses per-window runtime and local Broker tools', ()
 	assert.match(application, /new WindowNodeTaskExecutor/u);
 	assert.match(application, /createVscodeAgentRuntime/u);
 	assert.match(application, /new LocalBrokerTaskFacade/u);
-	assert.match(application, /new LocalBrokerCollaborationFacade/u);
 	assert.match(application, /new LocalIpcRemoteTaskAdapter\(node\)/u);
 	assert.match(application, /remoteAdapter: remoteTasks/u);
-	assert.match(application, /registerMeshTaskTools\(localTasks, localCollaborations\)/u);
+	assert.match(application, /registerMeshTaskTools\(localTasks\)/u);
+	assert.doesNotMatch(application, /Collaboration|collaboration/u);
+	assert.doesNotMatch(owner, /CollaborationService|FileCollaborationStore|sameDeviceCollaboration/u);
 	assert.match(owner, /new ProductionRemoteTaskAdapter\(\s*peers,\s*peerProfiles,\s*fencedState/u);
 	assert.match(owner, /remoteTaskService: remoteTasks/u);
 	assert.doesNotMatch(application, /WorkerTaskService|registerMeshTaskTools\(coordinator\)/u);
 	assert.doesNotMatch(owner, /new DevTunnelCliProvider|import\('\.\.\/tunnel\/DevTunnelCliProvider/u);
 	assert.doesNotMatch(remote, /DevTunnel|tunnel\./u);
 	assert.doesNotMatch(runtime, /WorkerOwnership|ownership\.assertOwner|ownership\.isOwner/u);
+});
+
+test('startup cleanup removes only legacy collaboration state', async () => {
+	const root = await mkdtemp(join(tmpdir(), 'mesh-p1-cleanup-'));
+	const legacyDirectory = join(root, 'collaborations');
+	const taskDirectory = join(root, 'tasks');
+	try {
+		await mkdir(legacyDirectory);
+		await mkdir(taskDirectory);
+		await writeFile(join(legacyDirectory, 'old.json'), '{}');
+		await writeFile(join(taskDirectory, 'current.json'), '{"state":"running"}');
+
+		await removeLegacyCollaborationState(root);
+		await removeLegacyCollaborationState(root);
+
+		await assert.rejects(access(legacyDirectory), /ENOENT/u);
+		assert.equal(await readFile(join(taskDirectory, 'current.json'), 'utf8'), '{"state":"running"}');
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
 });
 
 test('only the owner creates one stable 32-byte local Broker key while contenders wait', async () => {

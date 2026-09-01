@@ -158,21 +158,6 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 			case 'cancelTask':
 				await this.facade.cancelTask(requireTarget(message));
 				return;
-			case 'answerTaskInput':
-				await this.facade.answerTaskInput(requireTarget(message));
-				return;
-			case 'startCollaboration':
-				await this.facade.startCollaboration();
-				return;
-			case 'getCollaboration':
-				await this.facade.getCollaboration(requireTarget(message));
-				return;
-			case 'cancelCollaboration':
-				await this.facade.cancelCollaboration(requireTarget(message));
-				return;
-			case 'answerCollaboration':
-				await this.facade.answerCollaboration(requireTarget(message));
-				return;
 			case 'refresh':
 				return;
 		}
@@ -284,7 +269,6 @@ export function createDashboardHtml(
 		<section aria-labelledby="nodes-heading"><h2 id="nodes-heading">Local Window Nodes</h2><div id="localNodes" class="stack loading">Loading...</div><button data-action="registerWorkspace">Refresh Current Workspaces</button></section>
 		<section aria-labelledby="peers-heading"><h2 id="peers-heading">Remote Devices</h2><div id="remoteDevices" class="stack loading">Loading...</div><button data-action="addPeer">Add Connection</button></section>
 		<section aria-labelledby="tasks-heading"><h2 id="tasks-heading">Tasks</h2><div id="tasks" class="stack loading">Loading...</div><button data-action="runTask">Run Task</button></section>
-		<section aria-labelledby="collaboration-heading"><h2 id="collaboration-heading">Collaboration Runs</h2><div id="collaborationRuns" class="stack loading">Loading...</div><button id="startCollaboration" data-action="startCollaboration">Start Local Multi-project Collaboration</button></section>
 		<section aria-labelledby="errors-heading"><h2 id="errors-heading">Errors</h2><div id="errors" class="stack"></div></section>
 	</main>
 	<div id="announcement" role="status" aria-live="polite"></div>

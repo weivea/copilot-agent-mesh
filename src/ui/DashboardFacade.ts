@@ -88,45 +88,6 @@ export interface DashboardSnapshot {
 			readonly action?: string;
 		};
 	}[];
-	readonly collaborationPreview: {
-		readonly enabled: boolean;
-		readonly canStart: boolean;
-	};
-	readonly collaborationRuns: readonly {
-		readonly runId: string;
-		readonly title: string;
-		readonly status: 'pending' | 'running' | 'blocked' | 'needsInput' | 'completed' | 'failed' | 'cancelled';
-		readonly coordinatorNodeId: string;
-		readonly participants: readonly {
-			readonly role: 'frontend' | 'backend';
-			readonly nodeId: string;
-			readonly nodeLabel: string;
-			readonly workspaceId: string;
-			readonly workspaceName: string;
-		}[];
-		readonly tasks: readonly {
-			readonly taskId: string;
-			readonly title: string;
-			readonly role: 'frontend' | 'backend';
-			readonly kind: 'implementation' | 'validation';
-			readonly workspaceName: string;
-			readonly status: 'pending' | 'running' | 'blocked' | 'needsInput' | 'completed' | 'failed' | 'cancelled';
-			readonly dependsOn: readonly string[];
-			readonly validationStatus?: 'passed' | 'failed';
-			readonly blockCode?: string;
-			readonly failureCode?: string;
-			readonly pendingInputId?: string;
-		}[];
-		readonly artifacts: readonly {
-			readonly artifactId: string;
-			readonly label: string;
-			readonly mediaType: string;
-			readonly contentLength: number;
-			readonly sha256: string;
-		}[];
-		readonly canCancel: boolean;
-		readonly canAnswer: boolean;
-	}[];
 	readonly errors: readonly {
 		readonly code: string;
 		readonly message: string;
@@ -159,12 +120,6 @@ export interface DashboardTaskTarget {
 	readonly peerId?: string;
 }
 
-export interface DashboardPendingInput {
-	readonly taskId: string;
-	readonly inputId: string;
-	readonly question: string;
-}
-
 /**
  * Application-service boundary for the dashboard.
  *
@@ -185,11 +140,6 @@ export interface DashboardFacade {
 	removePeer(peerId: string): Promise<void>;
 	runTask(target?: DashboardTaskTarget): Promise<void>;
 	cancelTask(taskId: string): Promise<void>;
-	answerTaskInput(taskId: string): Promise<void>;
-	startCollaboration(): Promise<void>;
-	getCollaboration(runId: string): Promise<void>;
-	cancelCollaboration(runId: string): Promise<void>;
-	answerCollaboration(runId: string): Promise<void>;
 }
 
 export interface DashboardServiceBindings {
@@ -209,21 +159,6 @@ export interface DashboardServiceBindings {
 		readonly instruction: string;
 	}): Promise<void>;
 	cancelTask(taskId: string): Promise<void>;
-	getTaskInput(taskId: string): Promise<DashboardPendingInput | undefined>;
-	answerTaskInput(taskId: string, inputId: string, answer: string): Promise<void>;
-	startCollaboration(request: {
-		readonly title: string;
-		readonly goal: string;
-	}): Promise<void>;
-	getCollaboration(runId: string): Promise<void>;
-	cancelCollaboration(runId: string): Promise<void>;
-	getCollaborationInput(runId: string): Promise<DashboardPendingInput | undefined>;
-	answerCollaboration(
-		runId: string,
-		taskId: string,
-		inputId: string,
-		answer: string,
-	): Promise<void>;
 }
 
 export interface DashboardConfirmationHost {
@@ -345,82 +280,6 @@ export class ServiceDashboardFacade implements DashboardFacade {
 		}
 	}
 
-	public async answerTaskInput(taskId: string): Promise<void> {
-		const pending = await this.services.getTaskInput(taskId);
-		if (pending === undefined) {
-			return;
-		}
-		const answer = await this.inputs.showInputBox({
-			title: 'Answer Remote Task',
-			prompt: pendingQuestion(pending.question),
-			placeHolder: '输入回答；确认授权可输入 approve、继续、同意或批准',
-			ignoreFocusOut: true,
-			validateInput: (candidate) => candidate.trim().length > 0 ? undefined : 'An answer is required.',
-		});
-		if (answer !== undefined) {
-			await this.services.answerTaskInput(taskId, pending.inputId, answer.trim());
-		}
-	}
-
-	public async startCollaboration(): Promise<void> {
-		const title = await this.inputs.showInputBox({
-			title: 'Name Local Multi-project Collaboration',
-			prompt: 'Enter a non-sensitive title for the collaboration run.',
-			ignoreFocusOut: true,
-			validateInput: validateTaskTitle,
-		});
-		if (title === undefined) {
-			return;
-		}
-		const goal = await this.inputs.showInputBox({
-			title: 'Start Local Multi-project Collaboration',
-			prompt: 'Describe the complete frontend/backend goal. It stays in the Extension Host.',
-			ignoreFocusOut: true,
-			validateInput: validateCollaborationGoal,
-		});
-		if (goal !== undefined) {
-			await this.services.startCollaboration({
-				title: title.trim(),
-				goal: goal.trim(),
-			});
-		}
-	}
-
-	public getCollaboration(runId: string): Promise<void> {
-		return this.services.getCollaboration(runId);
-	}
-
-	public async cancelCollaboration(runId: string): Promise<void> {
-		if (await this.confirmations.confirm('Cancel this collaboration and its active task?', 'Cancel Collaboration')) {
-			await this.services.cancelCollaboration(runId);
-		}
-	}
-
-	public async answerCollaboration(runId: string): Promise<void> {
-		for (let index = 0; index < 32; index += 1) {
-			const pending = await this.services.getCollaborationInput(runId);
-			if (pending === undefined) {
-				return;
-			}
-			const answer = await this.inputs.showInputBox({
-				title: `Answer Collaboration Task · ${pending.inputId.slice(0, 8)}`,
-				prompt: pendingQuestion(pending.question),
-				placeHolder: '确认授权可输入 approve、继续、同意或批准；若有下一条会继续显示',
-				ignoreFocusOut: true,
-				validateInput: (candidate) => candidate.trim().length > 0 ? undefined : 'An answer is required.',
-			});
-			if (answer === undefined) {
-				return;
-			}
-			await this.services.answerCollaboration(
-				runId,
-				pending.taskId,
-				pending.inputId,
-				answer.trim(),
-			);
-		}
-		throw new Error('The collaboration exceeded the queued input interaction limit.');
-	}
 }
 
 export class UnavailableDashboardFacade implements DashboardFacade {
@@ -467,8 +326,6 @@ export class UnavailableDashboardFacade implements DashboardFacade {
 			workspaces: [],
 			peers: [],
 			tasks: [],
-			collaborationPreview: { enabled: false, canStart: false },
-			collaborationRuns: [],
 			errors: [{
 				code: 'DASHBOARD_SERVICES_UNAVAILABLE',
 				message: 'Dashboard services have not been connected to the UI facade.',
@@ -529,26 +386,6 @@ export class UnavailableDashboardFacade implements DashboardFacade {
 		return this.unavailable('Task service');
 	}
 
-	public answerTaskInput(_taskId: string): Promise<void> {
-		return this.unavailable('Task service');
-	}
-
-	public startCollaboration(): Promise<void> {
-		return this.unavailable('Collaboration service');
-	}
-
-	public getCollaboration(_runId: string): Promise<void> {
-		return this.unavailable('Collaboration service');
-	}
-
-	public cancelCollaboration(_runId: string): Promise<void> {
-		return this.unavailable('Collaboration service');
-	}
-
-	public answerCollaboration(_runId: string): Promise<void> {
-		return this.unavailable('Collaboration service');
-	}
-
 	private async unavailable(service: string): Promise<void> {
 		await vscode.window.showErrorMessage(`${service} is unavailable. The dashboard did not perform this action.`);
 	}
@@ -606,29 +443,4 @@ function validateTaskInstruction(candidate: string): string | undefined {
 	return utf8ByteLength(value) <= PROTOCOL_LIMITS.taskPromptBytes
 		? undefined
 		: `The task instruction must be at most ${PROTOCOL_LIMITS.taskPromptBytes} UTF-8 bytes.`;
-}
-
-function validateCollaborationGoal(candidate: string): string | undefined {
-	const value = candidate.trim();
-	if (value.length === 0) {
-		return 'A collaboration goal is required.';
-	}
-	return utf8ByteLength(value) <= PROTOCOL_LIMITS.collaborationGoalBytes
-		? undefined
-		: `The collaboration goal must be at most ${PROTOCOL_LIMITS.collaborationGoalBytes} UTF-8 bytes.`;
-}
-
-function pendingQuestion(question: string): string {
-	const maximumBytes = 2 * 1_024;
-	if (utf8ByteLength(question) <= maximumBytes) {
-		return question;
-	}
-	let result = '';
-	for (const character of question) {
-		if (utf8ByteLength(`${result}${character}…`) > maximumBytes) {
-			break;
-		}
-		result += character;
-	}
-	return `${result}…`;
 }

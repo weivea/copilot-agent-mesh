@@ -13,14 +13,14 @@ The application creates:
 - `VscodeSecretStore` for invitations, enrollment proofs, peer roots, and temporary
   coordinator pairing credentials.
 - `AtomicFileStore` rooted below `ExtensionContext.globalStorageUri`,
-  `FileTaskStore`, `FileCollaborationStore`, and `ArtifactStore` for authoritative
-  task records, run DAGs, immutable structured artifacts, and event journals.
+  `FileTaskStore`, and `ArtifactStore` for authoritative task records, immutable
+  structured artifacts, and event journals.
 - `DeviceService`, `WorkspaceService`, `WorkerTaskService`, `TaskCoordinator`, and
   `ListenerService`.
 - `PairingService`, `GatewayServer`, `PeerConnectionManager`,
   `DevTunnelCliProvider`, and the feature-gated `AhpAgentRuntime`.
 - `ProductionDashboardBindings`, `ServiceDashboardFacade`, the Dashboard view, and
-  eight production Language Model Tools.
+  five production Language Model Tools.
 
 ## Preview platform scope
 
@@ -93,23 +93,6 @@ On startup, peers reconnect, the prior listener is restored, coordinator task sn
 reconciled, and worker task leases are rebuilt. Because the current `AgentRuntime` contract
 does not expose process-independent resume, active worker records fail honestly with
 `TASK_RECOVERY_UNAVAILABLE` instead of starting a duplicate agent.
-
-## Same-device collaboration
-
-The optional `CollaborationService` is owned by the current Device Broker
-generation. It persists one canonical run ID and exact request hash, validates an
-acyclic task graph, and dispatches only tasks whose dependencies are completed.
-The fixed first-version graph is backend implementation/contract, frontend
-implementation, and one validation task per workspace. Existing task routing,
-workspace leases, AHP handles, cancellation, input, and terminal snapshots remain
-authoritative; the orchestrator never writes a participant workspace itself.
-
-Backend completion must end with one bounded structured JSON contract envelope.
-The Broker validates and stores it immutably, authorizes only the exact frontend
-task, and injects that read-only JSON into the frontend prompt. Missing,
-unauthorized, malformed, oversized, corrupt, or hash-mismatched artifacts fail
-explicitly. Broker/Extension Host restart reconciles persisted task IDs and never
-starts a second accepted task; unrecoverable AHP work fails honestly.
 
 ## Listener and compatibility
 
