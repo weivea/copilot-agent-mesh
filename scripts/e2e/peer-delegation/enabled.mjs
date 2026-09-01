@@ -140,6 +140,7 @@ const processTracker = new PeerDelegationProcessTracker({
 });
 const launchRecords = [];
 const windowOpenRecords = [];
+const observedCleanupFailures = [];
 const activeControllers = new Map();
 const ownedPeaks = {
 	vscode: 0,
@@ -1128,13 +1129,35 @@ async function recordCompletionScenario({
 		}
 		: undefined;
 	const catalogAfter = await request(target, 'peer.session.catalog', {}, 60_000);
+	if (catalogAfter.errorCode === 'EDITOR_CATALOG_CLEANUP_FAILED') {
+		const error = new Error('Editor Session catalog cleanup failed.');
+		error.code = 'EDITOR_CATALOG_CLEANUP_FAILED';
+		observedCleanupFailures.push({ phase: 'editor-session-catalog', error });
+	}
 	const sessionHashMatched = catalogAfter.available === true
 		&& typeof completionTask.recoverySessionHash === 'string'
 		&& catalogAfter.sessionHashes.includes(completionTask.recoverySessionHash);
+	const runtimeSessionObservation = [...completionObservations.ahp]
+		.reverse()
+		.find((observation) =>
+			observation.taskId === completionTaskId
+			&& observation.eventType === 'session/created');
+	const runtimeSessionHash = typeof runtimeSessionObservation?.sessionHash === 'string'
+		&& /^[a-f0-9]{16}$/u.test(runtimeSessionObservation.sessionHash)
+		? runtimeSessionObservation.sessionHash
+		: undefined;
+	const editorEndpointFingerprint = typeof runtimeSessionObservation?.endpointFingerprint === 'string'
+		&& /^[a-f0-9]{16}$/u.test(runtimeSessionObservation.endpointFingerprint)
+		? runtimeSessionObservation.endpointFingerprint
+		: undefined;
+	const runtimeSessionHashMatched = runtimeSessionHash !== undefined
+		&& editorEndpointFingerprint !== undefined
+		&& runtimeSessionObservation?.source === 'editor'
+		&& completionTask.recoverySessionHash === runtimeSessionHash;
 	const editorSessionObserved = sourceKind === 'editor'
 		&& !degraded
 		&& sourceFailure === undefined
-		&& sessionHashMatched;
+		&& runtimeSessionHashMatched;
 	const completed = completionResult.s === 0;
 	const completionPass = completed
 		&& authoritativeOrder
@@ -1200,17 +1223,20 @@ async function recordCompletionScenario({
 		incomingRecord ? ['#/completion/incomingRecord'] : [],
 	);
 	setAc5(9, editorSessionObserved ? 'pass' : 'unverified', editorSessionObserved
-		? ['#/completion/source', '#/sessionVisibility/sessionHashMatched']
+		? ['#/completion/source', '#/sessionVisibility/runtimeSessionHashMatched']
 		: []);
 
 	const uiObserved = completionRun.uiAttestation?.targetSessionVisible === true;
 	evidence.sessionVisibility = {
-		status: sourceKind === 'editor' && sessionHashMatched && uiObserved
+		status: editorSessionObserved && sessionHashMatched && uiObserved
 			? 'pass'
 			: 'unverified',
 		source: sourceKind,
 		catalogBefore: catalogBeforeCount,
 		catalogAfter: catalogAfter.available ? catalogAfter.sessionCount : 0,
+		...(runtimeSessionHash === undefined ? {} : { runtimeSessionHash }),
+		...(editorEndpointFingerprint === undefined ? {} : { editorEndpointFingerprint }),
+		runtimeSessionHashMatched,
 		sessionHashMatched,
 		uiObserved,
 	};
@@ -1415,7 +1441,7 @@ async function runCancellationScenario(source, targetInputBase) {
 			'Produce a long response with at least 500 short numbered observations.',
 			'Do not use tools and do not modify files. Continue until cancelled.',
 		].join(' '),
-		acceptanceCriteria: ['Emit non-empty output and remain active long enough to be cancelled.'],
+		acceptanceCriteria: ['Remain active until cancelled.'],
 		timeoutMinutes: 60,
 	};
 	const invocation = await request(
@@ -1799,6 +1825,7 @@ async function performCleanupOnce() {
 			},
 		},
 	]);
+	cleanupFailures.push(...observedCleanupFailures);
 	const ownedProcessesReleased = finalOwned !== undefined && finalOwned.length === 0;
 	const ownedSocketsReleased = localIpcRemoved && editorEndpointReleased;
 	const ownedTimersReleased =
@@ -2394,6 +2421,7 @@ function initialEvidence() {
 			source: 'unavailable',
 			catalogBefore: 0,
 			catalogAfter: 0,
+			runtimeSessionHashMatched: false,
 			sessionHashMatched: false,
 			uiObserved: false,
 		},

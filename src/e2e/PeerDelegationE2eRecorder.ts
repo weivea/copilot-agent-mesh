@@ -42,6 +42,9 @@ export interface SafePeerAhpObservation {
 	readonly at: string;
 	readonly taskId: string;
 	readonly eventType: AgentRuntimeLifecycleObservation['eventType'];
+	readonly source?: 'editor' | 'standalone';
+	readonly sessionHash?: string;
+	readonly endpointFingerprint?: string;
 }
 
 export interface PeerDelegationRecorderSnapshot {
@@ -101,11 +104,32 @@ export class PeerDelegationE2eRecorder implements
 			if (!uuidPattern.test(observation.taskId)) {
 				return;
 			}
+			if (
+				observation.eventType === 'session/created'
+				&& (
+					observation.sessionUri.length < 1
+					|| observation.sessionUri.length > 2_048
+				)
+			) {
+				return;
+			}
 			this.push(this.ahp, {
 				sequence: this.nextSequence(),
 				at: new Date().toISOString(),
 				taskId: observation.taskId,
 				eventType: observation.eventType,
+				...(observation.eventType !== 'session/created'
+					? {}
+					: {
+						source: observation.source,
+						sessionHash: digest('agent-session', observation.sessionUri).slice(0, 16),
+						...(
+							observation.endpointFingerprint === undefined
+							|| !/^[a-f0-9]{16}$/u.test(observation.endpointFingerprint)
+								? {}
+								: { endpointFingerprint: observation.endpointFingerprint }
+						),
+					}),
 			});
 		} catch {
 			// E2E observation must never affect the Agent runtime.

@@ -67,10 +67,18 @@ export interface AgentHostSourceStatusProvider {
 	};
 }
 
-export interface AgentRuntimeLifecycleObservation {
-	readonly taskId: string;
-	readonly eventType: 'chat/turnComplete' | 'chat/turnCancelled' | 'chat/error';
-}
+export type AgentRuntimeLifecycleObservation =
+	| {
+		readonly taskId: string;
+		readonly eventType: 'session/created';
+		readonly sessionUri: string;
+		readonly source: AgentHostSource;
+		readonly endpointFingerprint?: string;
+	}
+	| {
+		readonly taskId: string;
+		readonly eventType: 'chat/turnComplete' | 'chat/turnCancelled' | 'chat/error';
+	};
 
 export interface AgentRuntimeLifecycleObserver {
 	observeLifecycle(observation: AgentRuntimeLifecycleObservation): void;

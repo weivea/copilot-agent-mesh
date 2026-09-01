@@ -41,6 +41,7 @@ import {
 	createAgentRuntimeEventQueue,
 	type AgentRuntimeEvent,
 	type AgentRuntimeErrorCode,
+	type AgentRuntimeLifecycleObservation,
 	type AgentTaskRequest,
 	type FirstTaskConfirmation,
 } from '../agentHost/AgentRuntime';
@@ -414,6 +415,7 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 	const transport = new FakeAhpTransport();
 	const launcher = new FakeLauncher();
 	const auth = new RecordingAuthBroker();
+	const lifecycle: AgentRuntimeLifecycleObservation[] = [];
 	let confirmed = false;
 	let completedDynamicConfig = false;
 	const runtime = new AhpAgentRuntime({
@@ -436,6 +438,9 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 			},
 		},
 		cancellationTimeoutMs: 100,
+		lifecycleObserver: {
+			observeLifecycle: (observation) => lifecycle.push(observation),
+		},
 	});
 
 	const handle = await runtime.start(taskRequest());
@@ -451,6 +456,12 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 	assert.deepEqual(transport.completionQueries, ['test']);
 	assert.equal(transport.created?.provider, 'dynamic-provider');
 	assert.deepEqual(transport.created?.workingDirectories, [workspaceUri]);
+	assert.deepEqual(lifecycle, [{
+		taskId: 'task-1',
+		eventType: 'session/created',
+		sessionUri: handle.recovery.sessionUri,
+		source: 'standalone',
+	}]);
 	assert.equal(transport.dispatched[0]?.action.type, 'chat/turnStarted');
 	assert.equal(
 		((transport.dispatched[0]?.action as Record<string, unknown>).message as Record<string, unknown>).text,
@@ -501,6 +512,7 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 	await handle.cancel();
 	assert.equal((await nextEvent(handle.events)).type, 'progress');
 	assert.equal((await nextEvent(handle.events)).type, 'cancelled');
+	assert.equal(lifecycle.at(-1)?.eventType, 'chat/turnCancelled');
 	await handle.dispose();
 	assert.equal(launcher.host.disposed, true);
 });

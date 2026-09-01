@@ -631,6 +631,47 @@ test('source selector cancellation interrupts editor readiness backoff without f
 	assert.equal(standalone.starts, 0);
 });
 
+test('source selector applies its initial editor readiness wait only once', async () => {
+	const waits: number[] = [];
+	let releaseWait!: () => void;
+	let observeWait!: () => void;
+	const waitStarted = new Promise<void>((resolve) => {
+		observeWait = resolve;
+	});
+	const waitGate = new Promise<void>((resolve) => {
+		releaseWait = resolve;
+	});
+	const editor = new FakeRuntime();
+	const standalone = new FakeRuntime();
+	const selector = new AgentHostSourceSelector({
+		...selectorOptions({
+			preferEditor: () => true,
+			editor,
+			standalone,
+		}),
+		editorConnectionRetryDelaysMs: [],
+		editorInitialReadinessDelayMs: 80_000,
+		waitForEditorRetry: async (delayMs) => {
+			waits.push(delayMs);
+			observeWait();
+			await waitGate;
+		},
+	});
+
+	const first = selector.start(taskRequest());
+	await waitStarted;
+	const second = selector.start(taskRequest());
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(waits, [80_000]);
+	releaseWait();
+	await Promise.all([first, second]);
+
+	assert.deepEqual(waits, [80_000]);
+	assert.equal(editor.starts, 2);
+	assert.equal(standalone.starts, 0);
+	await selector.dispose();
+});
+
 test('source selector keeps editor availability passive until a real task selects it', async () => {
 	const editor = new FakeRuntime();
 	const standalone = new FakeRuntime();

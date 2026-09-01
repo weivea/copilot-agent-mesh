@@ -99,6 +99,13 @@ test('peer evidence maps every active task state to not-observed', () => {
 test('peer-delegation passing evidence requires all real AC-5 conditions', () => {
 	const evidence = passingEvidence();
 	assert.equal(assertPassingPeerDelegationEvidence(evidence).outcome, 'pass');
+	assert.equal(assertPassingPeerDelegationEvidence({
+		...evidence,
+		cancellation: {
+			...evidence.cancellation,
+			eventTypes: ['agentStarted', 'cancelRequested', 'cancelConfirmed'],
+		},
+	}).outcome, 'pass');
 	assert.throws(
 		() => parsePeerDelegationEvidence({
 			...evidence,
@@ -125,7 +132,7 @@ test('peer-delegation passing evidence requires all real AC-5 conditions', () =>
 			...evidence,
 			sessionVisibility: {
 				...evidence.sessionVisibility,
-				sessionHashMatched: false,
+				runtimeSessionHashMatched: false,
 			},
 		}),
 		/editor Tool-to-Agent route|AC-5 item 9 must match/u,
@@ -182,6 +189,13 @@ test('peer-delegation recorder stores identities and hashes without prompt or ou
 			r: 'do not persist this output',
 		},
 	});
+	recorder.observeLifecycle({
+		taskId,
+		eventType: 'session/created',
+		sessionUri: 'session:do-not-persist-this-identifier',
+		source: 'editor',
+		endpointFingerprint: '0123456789abcdef',
+	});
 	recorder.observeLifecycle({ taskId, eventType: 'chat/turnComplete' });
 	const snapshot = recorder.snapshot();
 	assert.equal(snapshot.tools.length, 1);
@@ -191,12 +205,25 @@ test('peer-delegation recorder stores identities and hashes without prompt or ou
 	assert.deepEqual(snapshot.tools[0]?.resultFields, ['d', 'r', 's', 't']);
 	assert.match(snapshot.tools[0]?.resultHash ?? '', /^[a-f0-9]{64}$/u);
 	assert.equal(JSON.stringify(snapshot).includes('do not persist'), false);
-	assert.deepEqual(snapshot.ahp, [{
-		sequence: 2,
-		at: snapshot.ahp[0]?.at,
-		taskId,
-		eventType: 'chat/turnComplete',
-	}]);
+	assert.deepEqual(snapshot.ahp, [
+		{
+			sequence: 2,
+			at: snapshot.ahp[0]?.at,
+			taskId,
+			eventType: 'session/created',
+			source: 'editor',
+			sessionHash: snapshot.ahp[0]?.sessionHash,
+			endpointFingerprint: '0123456789abcdef',
+		},
+		{
+			sequence: 3,
+			at: snapshot.ahp[1]?.at,
+			taskId,
+			eventType: 'chat/turnComplete',
+		},
+	]);
+	assert.match(snapshot.ahp[0]?.sessionHash ?? '', /^[a-f0-9]{16}$/u);
+	assert.equal(JSON.stringify(snapshot).includes('do-not-persist-this-identifier'), false);
 });
 
 test('peer-delegation Tool clock shortens only minute-scale budget timers', () => {
@@ -387,6 +414,7 @@ function unverifiedEvidence(): PeerDelegationEvidence {
 			source: 'unavailable',
 			catalogBefore: 0,
 			catalogAfter: 0,
+			runtimeSessionHashMatched: false,
 			sessionHashMatched: false,
 			uiObserved: false,
 		},
@@ -469,7 +497,7 @@ function passingEvidence(): PeerDelegationEvidence {
 		'#/completion/eventTypes',
 		'#/completion/parentSameInvocation',
 		'#/completion/incomingRecord',
-		'#/sessionVisibility/sessionHashMatched',
+		'#/sessionVisibility/runtimeSessionHashMatched',
 		'#/transport',
 		'#/cleanup/workspaceLeaseReleased',
 		'#/resources',
@@ -575,6 +603,9 @@ function passingEvidence(): PeerDelegationEvidence {
 			source: 'editor',
 			catalogBefore: 0,
 			catalogAfter: 1,
+			runtimeSessionHash: '0123456789abcdef',
+			editorEndpointFingerprint: 'fedcba9876543210',
+			runtimeSessionHashMatched: true,
 			sessionHashMatched: true,
 			uiObserved: false,
 		},

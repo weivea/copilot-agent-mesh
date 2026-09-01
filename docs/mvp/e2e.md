@@ -132,8 +132,10 @@ catalog and the target UI is visibly observed. O2 is Pass only after a genuine
 O3 remains non-guaranteed Tool choice, O4 remains undetectable concurrent user
 Copilot edits, and O5 remains unsupported/unverified outside macOS arm64.
 AC-5 item 9 is narrower than O1 but still cannot rely on source status alone:
-it requires the task recovery Session hash to appear in a separately opened
-editor `listSessions` catalog. UI observation is not required for item 9.
+it requires the E2E-only lifecycle observer's actual editor `createSession`
+fingerprint to match the task recovery Session fingerprint and records the
+editor endpoint fingerprint. UI and post-task catalog observation are not
+required for item 9.
 
 ### Recorded P8 objective result
 
@@ -149,10 +151,12 @@ produced a valid **Unverified** artifact rather than a false Pass:
   attempt deltas stayed zero, the Workspace lease and Profile Lock were released,
   and final harness-owned VS Code/Agent Host/Tunnel/socket/timer counts were zero.
 - The run-scoped Mesh state reached both windows without reading or evicting that
-  production Catalog. The selected profile then used explicit `standalone`
-  degradation and returned `AGENT_AUTH_REQUIRED` with the exact task ID after
-  5.825 seconds. AC-5 5-7 and
-  9, O1, needs-input, cancellation, timeout, and O2 therefore remain Unverified.
+  production Catalog. A later authenticated run used the live editor source and
+  produced authoritative output/completion, a real needs-input answer/resume,
+  and authoritative token cancellation. The post-task editor catalog remained
+  empty and no user UI attestation was supplied, so O1 remains Unverified; the
+  short-budget and exact final-SHA results are recorded in the generated
+  evidence artifact.
 - No user attestation was created. The full UI rerun still requires the exact
   enabled command, a signed-in dedicated profile, one visible Agent-mode Tool
   confirmation, and an honest `session-visible`/`session-not-visible` attestation.

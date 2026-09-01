@@ -61,8 +61,9 @@ registry or rotating a connection token before WebSocket upgrade. Only after a
 successful start is editor reported healthy.
 The real two-window P8 harness additionally leaves an 80-second quiet interval
 before its first editor connection so the shared Host can publish and bind its
-listener without any diagnostic connection attempts. This delay is E2E-only;
-ordinary production tasks do not inherit it.
+listener without any diagnostic connection attempts. The interval is consumed
+only once per harness runtime, not once per delegated task. This delay is
+E2E-only; ordinary production tasks do not inherit it.
 Fallback is forbidden when cleanup of the failed editor attempt is unconfirmed;
 starting standalone in that state could overlap resources or execution. Selector
 disposal retains failed cleanup for an explicit retry.
@@ -212,12 +213,16 @@ command succeeded but returned zero endpoints; Insiders user-data was absent. Ed
 initialize and O1 Session visibility therefore remain unverified in that environment,
 with no Session created and no sensitive evidence persisted.
 
-P8 performs a bounded post-task editor `listSessions` observation and compares
-the newest Session's domain-separated 16-hex fingerprint with the task recovery
-Session. It does not open and close a separate pre-task AHP catalog client,
-because that borrowed-client lifecycle can perturb editor identity readiness.
-Only fingerprints and counts leave the Extension Host. A standalone fallback can
-demonstrate degraded execution but can never satisfy the editor Session claim.
+P8 records the actual editor `createSession` boundary through its E2E-only
+lifecycle observer, then compares that Session's domain-separated 16-hex
+fingerprint with the task recovery Session and requires a fingerprinted editor
+endpoint. This objective match satisfies the runtime portion of AC-5.9 without
+trusting a stale source status. A separate bounded post-task `listSessions`
+observation remains O1 catalog evidence; it does not open and close a pre-task
+catalog client because that borrowed-client lifecycle can perturb editor identity
+readiness. Only fingerprints and counts leave the Extension Host. A standalone
+fallback can demonstrate degraded execution but can never satisfy the editor
+Session claim.
 
 ## Verified result
 

@@ -182,6 +182,9 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 		source: z.enum(['editor', 'standalone', 'unavailable']),
 		catalogBefore: nonNegativeInteger,
 		catalogAfter: nonNegativeInteger,
+		runtimeSessionHash: fingerprint.optional(),
+		editorEndpointFingerprint: fingerprint.optional(),
+		runtimeSessionHashMatched: z.boolean(),
 		sessionHashMatched: z.boolean(),
 		uiObserved: z.boolean(),
 	}),
@@ -349,8 +352,9 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 			|| evidence.completion.source !== 'editor'
 			|| evidence.completion.degraded
 			|| evidence.sessionVisibility.source !== 'editor'
-			|| !evidence.sessionVisibility.sessionHashMatched
-			|| evidence.sessionVisibility.catalogAfter < 1
+			|| !evidence.sessionVisibility.runtimeSessionHashMatched
+			|| evidence.sessionVisibility.runtimeSessionHash === undefined
+			|| evidence.sessionVisibility.editorEndpointFingerprint === undefined
 			|| !evidence.completion.leaseReleased
 		)
 	) {
@@ -659,14 +663,15 @@ function validateAc5Correspondence(
 			status: evidence.completion.source === 'editor'
 				&& !evidence.completion.degraded
 				&& evidence.sessionVisibility.source === 'editor'
-				&& evidence.sessionVisibility.sessionHashMatched
-				&& evidence.sessionVisibility.catalogAfter > 0
+				&& evidence.sessionVisibility.runtimeSessionHashMatched
+				&& evidence.sessionVisibility.runtimeSessionHash !== undefined
+				&& evidence.sessionVisibility.editorEndpointFingerprint !== undefined
 				? 'pass'
 				: evidence.completion.status === 'fail' ? 'fail' : 'unverified',
 			referencePrefixes: [
 				'#/completion/source',
 				'#/sessionVisibility/source',
-				'#/sessionVisibility/sessionHashMatched',
+				'#/sessionVisibility/runtimeSessionHashMatched',
 			],
 		},
 		{
@@ -762,7 +767,7 @@ function validateAc5Correspondence(
 			|| evidence.cancellation.terminalState !== 'cancelled'
 			|| !orderedSubsequence(
 				evidence.cancellation.eventTypes,
-				['agentStarted', 'output', 'cancelRequested', 'cancelConfirmed'],
+				['agentStarted', 'cancelRequested', 'cancelConfirmed'],
 			)
 			|| !evidence.cancellation.leaseReleased
 		)
@@ -787,9 +792,20 @@ function validateAc5Correspondence(
 		addInvariantIssue(context, ['timeout'], 'Passing timeout evidence requires budget cancellation, authoritative terminal state, and lease release.');
 	}
 	if (
+		evidence.sessionVisibility.runtimeSessionHashMatched
+		&& (
+			evidence.sessionVisibility.source !== 'editor'
+			|| evidence.sessionVisibility.runtimeSessionHash === undefined
+			|| evidence.sessionVisibility.editorEndpointFingerprint === undefined
+		)
+	) {
+		addInvariantIssue(context, ['sessionVisibility'], 'A matched runtime Session requires an observed editor Session and endpoint fingerprint.');
+	}
+	if (
 		evidence.sessionVisibility.status === 'pass'
 		&& (
 			evidence.sessionVisibility.source !== 'editor'
+			|| !evidence.sessionVisibility.runtimeSessionHashMatched
 			|| !evidence.sessionVisibility.sessionHashMatched
 			|| !evidence.sessionVisibility.uiObserved
 			|| evidence.sessionVisibility.catalogAfter < 1

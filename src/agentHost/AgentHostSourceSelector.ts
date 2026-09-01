@@ -53,6 +53,8 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 	private readonly editorConnectionRetryDelaysMs: readonly number[];
 	private readonly editorInitialReadinessDelayMs: number;
 	private readonly waitForEditorRetry: (delayMs: number, signal: AbortSignal) => Promise<void>;
+	private readonly editorInitialReadinessController = new AbortController();
+	private editorInitialReadinessWait: Promise<void> | undefined;
 
 	public constructor(private readonly options: AgentHostSourceSelectorOptions) {
 		this.editorConnectionRetryDelaysMs = options.editorConnectionRetryDelaysMs
@@ -152,8 +154,14 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 		}
 
 		let editorFailure: AgentHostSourceFailure | undefined;
-		if (this.editorInitialReadinessDelayMs > 0) {
-			await this.waitForEditorRetry(this.editorInitialReadinessDelayMs, signal);
+		if (
+			this.editorInitialReadinessDelayMs > 0
+		) {
+			this.editorInitialReadinessWait ??= this.waitForEditorRetry(
+				this.editorInitialReadinessDelayMs,
+				this.editorInitialReadinessController.signal,
+			);
+			await abortableSelectorOperation(this.editorInitialReadinessWait, signal);
 		}
 		for (let attempt = 0; attempt <= this.editorConnectionRetryDelaysMs.length; attempt += 1) {
 			try {
@@ -259,6 +267,7 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 	}
 
 	private async disposeRuntimes(): Promise<void> {
+		this.editorInitialReadinessController.abort();
 		for (const start of this.inFlightStarts) {
 			start.controller.abort();
 		}

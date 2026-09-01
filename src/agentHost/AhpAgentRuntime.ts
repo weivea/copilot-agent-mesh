@@ -642,6 +642,19 @@ class AhpTask implements AgentTaskHandle {
 			'challenge',
 		);
 		this.sessionCreated = true;
+		try {
+			this.lifecycleObserver?.observeLifecycle({
+				taskId: this.taskId,
+				eventType: 'session/created',
+				sessionUri: this.sessionUri,
+				source: this.host.source ?? 'standalone',
+				...(this.host.endpointFingerprint === undefined
+					? {}
+					: { endpointFingerprint: this.host.endpointFingerprint }),
+			});
+		} catch {
+			// Optional lifecycle observation must not affect Agent execution.
+		}
 		this.throwIfTerminalError();
 
 		await this.ensureStartupSubscription(this.sessionUri);

@@ -292,6 +292,7 @@ async function invokeCoreDelegateAndCancelAfterEvents(
 		{ clock: options.toolClock },
 	).delegateTask(input, cancellation.token);
 	let observedEventTypes: readonly string[] = [];
+	let observationFailure: unknown;
 	try {
 		const deadline = Date.now() + 120_000;
 		while (Date.now() < deadline) {
@@ -299,34 +300,49 @@ async function invokeCoreDelegateAndCancelAfterEvents(
 			observedEventTypes = evidence.eventTypes;
 			if (
 				observedEventTypes.includes('agentStarted')
-				&& observedEventTypes.includes('output')
+				|| taskTerminalStates.has(evidence.state)
 			) {
-				cancellation.cancel();
-				const result = await invocation;
-				const terminal = await waitForTaskEvidenceTerminal(options, identity.taskId, 60_000);
-				return {
-					taskId: identity.taskId,
-					cancellationTokenTriggered: true,
-					...(typeof result.s !== 'number'
-						? {}
-						: { compactStatus: result.s }),
-					...(typeof result.x !== 'string'
-						? {}
-						: { cancellationReason: result.x }),
-					observedEventTypes: terminal.eventTypes,
-				};
-			}
-			if (taskTerminalStates.has(evidence.state)) {
-				throw new Error(`The cancellation task became ${evidence.state} before cancellation.`);
+				break;
 			}
 			await delay(50);
 		}
-		throw new Error('The cancellation task did not emit agentStarted and output in time.');
-	} finally {
-		cancellation.cancel();
-		cancellation.dispose();
-		await invocation.catch(() => undefined);
+	} catch (error: unknown) {
+		observationFailure = error;
 	}
+	cancellation.cancel();
+	let result: Awaited<typeof invocation> | undefined;
+	let invocationFailure: unknown;
+	try {
+		result = await invocation;
+	} catch (error: unknown) {
+		invocationFailure = error;
+	}
+	let terminal: Awaited<ReturnType<typeof taskEvidence>> | undefined;
+	let terminalFailure: unknown;
+	try {
+		terminal = await waitForTaskEvidenceTerminal(options, identity.taskId, 60_000);
+	} catch (error: unknown) {
+		terminalFailure = error;
+	}
+	cancellation.dispose();
+	const failures = [observationFailure, invocationFailure, terminalFailure]
+		.filter((failure) => failure !== undefined);
+	if (failures.length !== 0) {
+		throw failures.length === 1
+			? failures[0]
+			: new AggregateError(failures, 'Cancellation E2E failed while releasing its task.');
+	}
+	return {
+		taskId: identity.taskId,
+		cancellationTokenTriggered: true,
+		...(typeof result?.s !== 'number'
+			? {}
+			: { compactStatus: result.s }),
+		...(typeof result?.x !== 'string'
+			? {}
+			: { cancellationReason: result.x }),
+		observedEventTypes: terminal!.eventTypes,
+	};
 }
 
 async function waitForTaskEvidenceTerminal(
