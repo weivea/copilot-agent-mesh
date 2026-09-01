@@ -183,6 +183,7 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 		catalogBefore: nonNegativeInteger,
 		catalogAfter: nonNegativeInteger,
 		runtimeSessionHash: fingerprint.optional(),
+		recoverySessionHash: fingerprint.optional(),
 		editorEndpointFingerprint: fingerprint.optional(),
 		runtimeSessionHashMatched: z.boolean(),
 		sessionHashMatched: z.boolean(),
@@ -354,6 +355,8 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 			|| evidence.sessionVisibility.source !== 'editor'
 			|| !evidence.sessionVisibility.runtimeSessionHashMatched
 			|| evidence.sessionVisibility.runtimeSessionHash === undefined
+			|| evidence.sessionVisibility.recoverySessionHash === undefined
+			|| evidence.sessionVisibility.runtimeSessionHash !== evidence.sessionVisibility.recoverySessionHash
 			|| evidence.sessionVisibility.editorEndpointFingerprint === undefined
 			|| !evidence.completion.leaseReleased
 		)
@@ -665,6 +668,8 @@ function validateAc5Correspondence(
 				&& evidence.sessionVisibility.source === 'editor'
 				&& evidence.sessionVisibility.runtimeSessionHashMatched
 				&& evidence.sessionVisibility.runtimeSessionHash !== undefined
+				&& evidence.sessionVisibility.recoverySessionHash !== undefined
+				&& evidence.sessionVisibility.runtimeSessionHash === evidence.sessionVisibility.recoverySessionHash
 				&& evidence.sessionVisibility.editorEndpointFingerprint !== undefined
 				? 'pass'
 				: evidence.completion.status === 'fail' ? 'fail' : 'unverified',
@@ -796,6 +801,8 @@ function validateAc5Correspondence(
 		&& (
 			evidence.sessionVisibility.source !== 'editor'
 			|| evidence.sessionVisibility.runtimeSessionHash === undefined
+			|| evidence.sessionVisibility.recoverySessionHash === undefined
+			|| evidence.sessionVisibility.runtimeSessionHash !== evidence.sessionVisibility.recoverySessionHash
 			|| evidence.sessionVisibility.editorEndpointFingerprint === undefined
 		)
 	) {

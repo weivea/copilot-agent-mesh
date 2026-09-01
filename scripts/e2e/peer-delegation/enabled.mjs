@@ -1142,18 +1142,32 @@ async function recordCompletionScenario({
 		.find((observation) =>
 			observation.taskId === completionTaskId
 			&& observation.eventType === 'session/created');
+	const recoverySessionObservation = [...completionObservations.ahp]
+		.reverse()
+		.find((observation) =>
+			observation.taskId === completionTaskId
+			&& observation.eventType === 'task/sessionBound');
 	const runtimeSessionHash = typeof runtimeSessionObservation?.sessionHash === 'string'
 		&& /^[a-f0-9]{16}$/u.test(runtimeSessionObservation.sessionHash)
 		? runtimeSessionObservation.sessionHash
+		: undefined;
+	const recoverySessionHash = typeof recoverySessionObservation?.sessionHash === 'string'
+		&& /^[a-f0-9]{16}$/u.test(recoverySessionObservation.sessionHash)
+		? recoverySessionObservation.sessionHash
 		: undefined;
 	const editorEndpointFingerprint = typeof runtimeSessionObservation?.endpointFingerprint === 'string'
 		&& /^[a-f0-9]{16}$/u.test(runtimeSessionObservation.endpointFingerprint)
 		? runtimeSessionObservation.endpointFingerprint
 		: undefined;
 	const runtimeSessionHashMatched = runtimeSessionHash !== undefined
+		&& recoverySessionHash !== undefined
 		&& editorEndpointFingerprint !== undefined
 		&& runtimeSessionObservation?.source === 'editor'
-		&& completionTask.recoverySessionHash === runtimeSessionHash;
+		&& recoverySessionHash === runtimeSessionHash
+		&& (
+			completionTask.recoverySessionHash === undefined
+			|| completionTask.recoverySessionHash === recoverySessionHash
+		);
 	const editorSessionObserved = sourceKind === 'editor'
 		&& !degraded
 		&& sourceFailure === undefined
@@ -1235,6 +1249,7 @@ async function recordCompletionScenario({
 		catalogBefore: catalogBeforeCount,
 		catalogAfter: catalogAfter.available ? catalogAfter.sessionCount : 0,
 		...(runtimeSessionHash === undefined ? {} : { runtimeSessionHash }),
+		...(recoverySessionHash === undefined ? {} : { recoverySessionHash }),
 		...(editorEndpointFingerprint === undefined ? {} : { editorEndpointFingerprint }),
 		runtimeSessionHashMatched,
 		sessionHashMatched,

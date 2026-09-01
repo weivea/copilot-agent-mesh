@@ -104,8 +104,10 @@ export class PeerDelegationE2eRecorder implements
 			if (!uuidPattern.test(observation.taskId)) {
 				return;
 			}
+			const observesSession = observation.eventType === 'session/created'
+				|| observation.eventType === 'task/sessionBound';
 			if (
-				observation.eventType === 'session/created'
+				observesSession
 				&& (
 					observation.sessionUri.length < 1
 					|| observation.sessionUri.length > 2_048
@@ -118,17 +120,21 @@ export class PeerDelegationE2eRecorder implements
 				at: new Date().toISOString(),
 				taskId: observation.taskId,
 				eventType: observation.eventType,
-				...(observation.eventType !== 'session/created'
+				...(!observesSession
 					? {}
 					: {
-						source: observation.source,
 						sessionHash: digest('agent-session', observation.sessionUri).slice(0, 16),
-						...(
-							observation.endpointFingerprint === undefined
-							|| !/^[a-f0-9]{16}$/u.test(observation.endpointFingerprint)
-								? {}
-								: { endpointFingerprint: observation.endpointFingerprint }
-						),
+						...(observation.eventType !== 'session/created'
+							? {}
+							: {
+								source: observation.source,
+								...(
+									observation.endpointFingerprint === undefined
+									|| !/^[a-f0-9]{16}$/u.test(observation.endpointFingerprint)
+										? {}
+										: { endpointFingerprint: observation.endpointFingerprint }
+								),
+							}),
 					}),
 			});
 		} catch {

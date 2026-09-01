@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 import type {
 	AgentRuntime,
 	AgentRuntimeEvent,
+	AgentRuntimeLifecycleObservation,
 	AgentRuntimeProbe,
 	AgentTaskAnswer,
 	AgentTaskHandle,
@@ -432,7 +433,12 @@ test('shutdown interrupts a pending runtime start before awaiting it', async () 
 });
 
 test('starts once for exact retries, rejects conflicts, and supplies complete confirmation details', async () => {
-	const fixture = createFixture();
+	const lifecycle: AgentRuntimeLifecycleObservation[] = [];
+	const fixture = createFixture({
+		lifecycleObserver: {
+			observeLifecycle: (observation) => lifecycle.push(observation),
+		},
+	});
 	const params = startParams();
 	const first = fixture.executor.start(params);
 	const retry = fixture.executor.start(structuredClone(params));
@@ -448,6 +454,11 @@ test('starts once for exact retries, rejects conflicts, and supplies complete co
 		},
 	});
 	assert.equal(fixture.runtime.requests.length, 1);
+	assert.deepEqual(lifecycle, [{
+		taskId: TASK_ID,
+		eventType: 'task/sessionBound',
+		sessionUri: 'session',
+	}]);
 	assert.equal(fixture.runtime.requests[0]?.sourceWindowName, 'Source Window');
 	assert.deepEqual(fixture.confirmations, []);
 	assert.equal(

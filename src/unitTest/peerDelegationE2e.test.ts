@@ -196,6 +196,11 @@ test('peer-delegation recorder stores identities and hashes without prompt or ou
 		source: 'editor',
 		endpointFingerprint: '0123456789abcdef',
 	});
+	recorder.observeLifecycle({
+		taskId,
+		eventType: 'task/sessionBound',
+		sessionUri: 'session:do-not-persist-this-identifier',
+	});
 	recorder.observeLifecycle({ taskId, eventType: 'chat/turnComplete' });
 	const snapshot = recorder.snapshot();
 	assert.equal(snapshot.tools.length, 1);
@@ -219,10 +224,18 @@ test('peer-delegation recorder stores identities and hashes without prompt or ou
 			sequence: 3,
 			at: snapshot.ahp[1]?.at,
 			taskId,
+			eventType: 'task/sessionBound',
+			sessionHash: snapshot.ahp[1]?.sessionHash,
+		},
+		{
+			sequence: 4,
+			at: snapshot.ahp[2]?.at,
+			taskId,
 			eventType: 'chat/turnComplete',
 		},
 	]);
 	assert.match(snapshot.ahp[0]?.sessionHash ?? '', /^[a-f0-9]{16}$/u);
+	assert.equal(snapshot.ahp[0]?.sessionHash, snapshot.ahp[1]?.sessionHash);
 	assert.equal(JSON.stringify(snapshot).includes('do-not-persist-this-identifier'), false);
 });
 
@@ -604,6 +617,7 @@ function passingEvidence(): PeerDelegationEvidence {
 			catalogBefore: 0,
 			catalogAfter: 1,
 			runtimeSessionHash: '0123456789abcdef',
+			recoverySessionHash: '0123456789abcdef',
 			editorEndpointFingerprint: 'fedcba9876543210',
 			runtimeSessionHashMatched: true,
 			sessionHashMatched: true,
