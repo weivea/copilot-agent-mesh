@@ -604,6 +604,29 @@ test('source selector prevents editor endpoint probes from racing token use', as
 	await selector.dispose();
 });
 
+test('source selector caches pre-selection editor discovery across dashboard probes', async () => {
+	const editor = new FakeRuntime();
+	const standalone = new FakeRuntime();
+	const selector = new AgentHostSourceSelector(selectorOptions({
+		preferEditor: () => true,
+		editor,
+		standalone,
+	}));
+
+	const [first, second, third] = await Promise.all([
+		selector.probe(),
+		selector.probe(),
+		selector.probe(),
+	]);
+	assert.deepEqual(first, second);
+	assert.deepEqual(second, third);
+	assert.equal(editor.probes, 1);
+	assert.equal(standalone.probes, 0);
+	await selector.start(taskRequest());
+	assert.equal(editor.probes, 1);
+	await selector.dispose();
+});
+
 test('nonfallback editor errors replace stale standalone probe status without leaking details', async () => {
 	const editor = new FakeRuntime();
 	const standalone = new FakeRuntime();

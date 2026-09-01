@@ -38,9 +38,11 @@ seconds after two-window startup without intervening attempts. Invalid protocol
 responses, malformed tokens, and explicit upgrade authentication rejection do
 not retry.
 The selector also serializes the final pre-start endpoint probe with launch and
-does not rediscover the endpoint while an editor start is in flight or selected.
-This prevents Dashboard refreshes from rotating the registry token between
-locate and WebSocket upgrade.
+caches that first result until a source is selected. It does not rediscover the
+endpoint for repeated Dashboard refreshes, while an editor start is in flight,
+or after editor selection. The actual start still performs a fresh locate. This
+prevents UI refreshes from continuously perturbing the registry before WebSocket
+upgrade.
 Fallback is forbidden when cleanup of the failed editor attempt is unconfirmed;
 starting standalone in that state could overlap resources or execution. Selector
 disposal retains failed cleanup for an explicit retry.

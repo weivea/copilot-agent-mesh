@@ -44,6 +44,7 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 	private status: AgentHostSourceStatus = { source: 'standalone', degraded: false };
 	private sourceSelected = false;
 	private editorProbeOperation: Promise<AgentRuntimeProbe> | undefined;
+	private editorProbeResult: AgentRuntimeProbe | undefined;
 	private readonly inFlightStarts = new Set<{
 		readonly controller: AbortController;
 		readonly operation: Promise<AgentTaskHandle>;
@@ -191,11 +192,17 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 	}
 
 	private probeEditor(): Promise<AgentRuntimeProbe> {
+		if (this.editorProbeResult !== undefined) {
+			return Promise.resolve(this.editorProbeResult);
+		}
 		if (this.editorProbeOperation !== undefined) {
 			return this.editorProbeOperation;
 		}
 		let operation!: Promise<AgentRuntimeProbe>;
-		operation = this.options.editor.probe().finally(() => {
+		operation = this.options.editor.probe().then((result) => {
+			this.editorProbeResult = result;
+			return result;
+		}).finally(() => {
 			if (this.editorProbeOperation === operation) {
 				this.editorProbeOperation = undefined;
 			}
