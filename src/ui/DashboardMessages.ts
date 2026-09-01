@@ -2,20 +2,18 @@ import { DashboardViewModel } from './DashboardPresenter';
 import { containsUnsafeDashboardText } from './DashboardRedaction';
 import { TASK_STATUSES, utf8ByteLength } from '../../shared/protocol';
 
-export const DASHBOARD_MESSAGE_VERSION = 4 as const;
+export const DASHBOARD_MESSAGE_VERSION = 5 as const;
 
 export const DASHBOARD_ACTIONS = [
 	'configureDevice',
 	'renameWindow',
-	'registerWorkspace',
-	'removeWorkspace',
 	'startListener',
 	'stopListener',
 	'copyConnectionUrl',
-	'addPeer',
-	'removePeer',
-	'runTask',
-	'cancelTask',
+	'setAcceptIncoming',
+	'setPeerAllowed',
+	'cancelOutgoingTask',
+	'cancelIncomingTask',
 	'refresh',
 ] as const;
 
@@ -29,7 +27,9 @@ export type DashboardOutboundErrorCode =
 	| 'WINDOW_NAME_INVALID'
 	| 'PEER_DELEGATION_DISABLED'
 	| 'WORKSPACE_SELECTION_AMBIGUOUS'
-	| 'POLICY_FORBIDDEN';
+	| 'POLICY_FORBIDDEN'
+	| 'STALE_ACTION'
+	| 'TASK_NOT_FOUND';
 
 export type DashboardInboundMessage =
 	| {
@@ -42,12 +42,8 @@ export type DashboardInboundMessage =
 		readonly uiInstanceId: string;
 		readonly type: 'action';
 		readonly action: DashboardAction;
-		readonly targetId?: string;
-		readonly deviceId?: string;
-		readonly nodeId?: string;
-		readonly nodeInstanceId?: string;
-		readonly peerId?: string;
-		readonly workspaceId?: string;
+		readonly actionHandle?: string;
+		readonly enabled?: boolean;
 	};
 
 export type DashboardOutboundMessage =
@@ -66,10 +62,12 @@ export type DashboardOutboundMessage =
 	};
 
 const actions = new Set<string>(DASHBOARD_ACTIONS);
-const targetActions = new Set<DashboardAction>([
-	'removeWorkspace',
-	'removePeer',
-	'cancelTask',
+const booleanActions = new Set<DashboardAction>(['setAcceptIncoming', 'setPeerAllowed']);
+const handleActions = new Set<DashboardAction>([
+	'setAcceptIncoming',
+	'setPeerAllowed',
+	'cancelOutgoingTask',
+	'cancelIncomingTask',
 ]);
 
 export function parseDashboardInboundMessage(value: unknown): DashboardInboundMessage | undefined {
@@ -83,51 +81,34 @@ export function parseDashboardInboundMessage(value: unknown): DashboardInboundMe
 		value.type !== 'action'
 		|| typeof value.action !== 'string'
 		|| !actions.has(value.action)
-		|| !optionalIdentifier(value.targetId)
-		|| !optionalIdentifier(value.deviceId)
-		|| !optionalIdentifier(value.nodeId)
-		|| !optionalIdentifier(value.nodeInstanceId)
-		|| !optionalIdentifier(value.peerId)
-		|| !optionalIdentifier(value.workspaceId)
+		|| !optionalActionHandle(value.actionHandle)
+		|| (value.enabled !== undefined && typeof value.enabled !== 'boolean')
 		|| !hasOnlyKeys(value, [
 			'version',
 			'uiInstanceId',
 			'type',
 			'action',
-			'targetId',
-			'deviceId',
-			'nodeId',
-			'nodeInstanceId',
-			'peerId',
-			'workspaceId',
+			'actionHandle',
+			'enabled',
 		])
 	) {
 		return undefined;
 	}
 	const action = value.action as DashboardAction;
-	if (targetActions.has(action) && !isIdentifier(value.targetId)) {
+	if (handleActions.has(action) !== isActionHandle(value.actionHandle)) {
 		return undefined;
 	}
-	const routingKeys = [
-		value.deviceId,
-		value.nodeId,
-		value.nodeInstanceId,
-		value.workspaceId,
+	if (booleanActions.has(action) !== (typeof value.enabled === 'boolean')) {
+		return undefined;
+	}
+	const allowedActionKeys = [
+		'version',
+		'uiInstanceId',
+		'type',
+		'action',
+		...(handleActions.has(action) ? ['actionHandle'] : []),
+		...(booleanActions.has(action) ? ['enabled'] : []),
 	];
-	const hasRouting = routingKeys.some((entry) => entry !== undefined);
-	if (
-		action === 'runTask'
-			? (hasRouting && !routingKeys.every(isIdentifier))
-				|| (!hasRouting && value.peerId !== undefined)
-			: hasRouting || value.peerId !== undefined
-	) {
-		return undefined;
-	}
-	const allowedActionKeys = action === 'runTask'
-		? ['version', 'uiInstanceId', 'type', 'action', 'deviceId', 'nodeId', 'nodeInstanceId', 'peerId', 'workspaceId']
-		: targetActions.has(action)
-			? ['version', 'uiInstanceId', 'type', 'action', 'targetId']
-			: ['version', 'uiInstanceId', 'type', 'action'];
 	if (!hasOnlyKeys(value, allowedActionKeys)) {
 		return undefined;
 	}
@@ -156,6 +137,8 @@ export function assertSafeDashboardOutboundMessage(value: DashboardOutboundMessa
 			'PEER_DELEGATION_DISABLED',
 			'WORKSPACE_SELECTION_AMBIGUOUS',
 			'POLICY_FORBIDDEN',
+			'STALE_ACTION',
+			'TASK_NOT_FOUND',
 		].includes(value.code)) {
 			throw new Error('Invalid dashboard error code.');
 		}
@@ -172,10 +155,8 @@ function assertDashboardViewModel(model: unknown): asserts model is DashboardVie
 			'broker',
 			'thisWindow',
 			'localNodes',
-			'remoteDevices',
-			'workspaces',
-			'peers',
-			'tasks',
+			'outgoingTasks',
+			'incomingTasks',
 			'errors',
 		],
 		[],
@@ -183,10 +164,9 @@ function assertDashboardViewModel(model: unknown): asserts model is DashboardVie
 	assertExactRecord(
 		model.device,
 		['name', 'platform', 'architecture', 'vscodeVersion', 'extensionVersion'],
-		['deviceId'],
+		[],
 	);
 	assertStrings(model.device, ['name', 'platform', 'architecture', 'vscodeVersion', 'extensionVersion']);
-	assertOptionalIdentifier(model.device.deviceId);
 
 	assertExactRecord(
 		model.listener,
@@ -224,8 +204,17 @@ function assertDashboardViewModel(model: unknown): asserts model is DashboardVie
 
 	assertExactRecord(
 		model.thisWindow,
-		['name', 'workspaceName', 'claimStatus', 'previewEnabled', 'canRename'],
-		['detail'],
+		[
+			'name',
+			'workspaceName',
+			'claimStatus',
+			'previewEnabled',
+			'canRename',
+			'acceptsIncoming',
+			'canSetAcceptIncoming',
+			'agentHost',
+		],
+		['acceptActionHandle', 'detail'],
 	);
 	assertStrings(model.thisWindow, ['name', 'workspaceName']);
 	assertEnum(model.thisWindow.claimStatus, [
@@ -237,106 +226,110 @@ function assertDashboardViewModel(model: unknown): asserts model is DashboardVie
 	]);
 	assertBoolean(model.thisWindow.previewEnabled);
 	assertBoolean(model.thisWindow.canRename);
+	assertBoolean(model.thisWindow.acceptsIncoming);
+	assertBoolean(model.thisWindow.canSetAcceptIncoming);
+	if (model.thisWindow.canSetAcceptIncoming) {
+		assertActionHandle(model.thisWindow.acceptActionHandle);
+	} else if (model.thisWindow.acceptActionHandle !== undefined) {
+		throw new Error('An unavailable receive policy cannot expose an action handle.');
+	}
 	assertOptionalString(model.thisWindow.detail);
+	assertExactRecord(model.thisWindow.agentHost, ['source', 'label', 'degraded'], ['reason', 'detail']);
+	assertEnum(model.thisWindow.agentHost.source, ['editor', 'standalone', 'unavailable']);
+	assertString(model.thisWindow.agentHost.label);
+	assertBoolean(model.thisWindow.agentHost.degraded);
+	if (model.thisWindow.agentHost.reason !== undefined) {
+		assertEnum(model.thisWindow.agentHost.reason, [
+			'EDITOR_DISCOVERY_FAILED',
+			'EDITOR_START_FAILED',
+			'STANDALONE_START_FAILED',
+		]);
+	}
+	assertOptionalString(model.thisWindow.agentHost.detail);
 
 	assertArray(model.localNodes, 128);
-	model.localNodes.forEach(assertNode);
-
-	assertArray(model.remoteDevices, 128);
-	for (const device of model.remoteDevices) {
-		assertExactRecord(device, ['deviceId', 'peerId', 'name', 'state', 'nodes'], []);
-		assertIdentifier(device.deviceId);
-		assertIdentifier(device.peerId);
-		assertString(device.name);
-		assertEnum(device.state, ['connecting', 'online', 'busy', 'offline', 'authFailed', 'incompatible']);
-		assertArray(device.nodes, 128);
-		device.nodes.forEach(assertNode);
-	}
-
-	assertArray(model.workspaces, 200);
-	for (const workspace of model.workspaces) {
+	for (const candidate of model.localNodes) {
 		assertExactRecord(
-			workspace,
-			['workspaceId', 'name', 'capabilityTags', 'enabled', 'busy'],
-			['activeTaskId'],
+			candidate,
+			[
+				'windowLabel',
+				'workspaceName',
+				'online',
+				'acceptsIncoming',
+				'busy',
+				'allowlisted',
+				'self',
+				'canToggle',
+				'claimState',
+				'gateState',
+			],
+			['actionHandle'],
 		);
-		assertIdentifier(workspace.workspaceId);
-		assertString(workspace.name);
-		assertBoolean(workspace.enabled);
-		assertBoolean(workspace.busy);
-		assertOptionalIdentifier(workspace.activeTaskId);
-		assertArray(workspace.capabilityTags, 50);
-		workspace.capabilityTags.forEach(assertString);
-	}
-
-	function assertNode(value: unknown): void {
-		assertExactRecord(
-			value,
-			['nodeId', 'nodeInstanceId', 'label', 'status', 'thisWindow', 'workspaces'],
-			[],
-		);
-		assertIdentifier(value.nodeId);
-		assertIdentifier(value.nodeInstanceId);
-		assertString(value.label);
-		assertEnum(value.status, ['online', 'busy', 'offline', 'conflict', 'draining']);
-		assertBoolean(value.thisWindow);
-		assertArray(value.workspaces, 32);
-		for (const workspace of value.workspaces) {
-			assertExactRecord(
-				workspace,
-				['workspaceId', 'name', 'capabilityTags', 'enabled', 'busy', 'claimStatus'],
-				['activeTaskId'],
-			);
-			assertIdentifier(workspace.workspaceId);
-			assertString(workspace.name);
-			assertArray(workspace.capabilityTags, 32);
-			workspace.capabilityTags.forEach(assertString);
-			assertBoolean(workspace.enabled);
-			assertBoolean(workspace.busy);
-			assertEnum(workspace.claimStatus, ['claimed', 'readOnly', 'conflict']);
-			assertOptionalIdentifier(workspace.activeTaskId);
+		assertStrings(candidate, ['windowLabel', 'workspaceName']);
+		for (const key of ['online', 'acceptsIncoming', 'busy', 'allowlisted', 'self', 'canToggle']) {
+			assertBoolean(candidate[key]);
+		}
+		assertEnum(candidate.claimState, ['claimed', 'multiWorkspace', 'unclaimed']);
+		assertEnum(candidate.gateState, [
+			'allowed',
+			'notAllowed',
+			'notAccepting',
+			'offline',
+			'multiWorkspace',
+			'notClaimed',
+		]);
+		if (candidate.canToggle) {
+			assertActionHandle(candidate.actionHandle);
+		} else if (candidate.actionHandle !== undefined) {
+			throw new Error('A non-actionable candidate cannot expose an action handle.');
 		}
 	}
 
-	assertArray(model.peers, 200);
-	for (const peer of model.peers) {
-		assertExactRecord(
-			peer,
-			['peerId', 'name', 'state', 'workspaceCount'],
-			['latencyMs', 'lastSeenLabel'],
-		);
-		assertIdentifier(peer.peerId);
-		assertString(peer.name);
-		assertEnum(peer.state, ['connecting', 'online', 'busy', 'offline', 'authFailed', 'incompatible']);
-		assertBoundedInteger(peer.workspaceCount, 0, 10000);
-		if (peer.latencyMs !== undefined) {
-			assertBoundedInteger(peer.latencyMs, 0, 600000);
-		}
-		assertOptionalString(peer.lastSeenLabel);
-	}
-
-	assertArray(model.tasks, 500);
-	for (const task of model.tasks) {
-		assertExactRecord(
-			task,
-			['taskId', 'title', 'peerName', 'workspaceName', 'state', 'canCancel', 'needsInput'],
-			['phase', 'summary', 'summaryTruncated', 'error'],
-		);
-		assertIdentifier(task.taskId);
-		assertStrings(task, ['title', 'peerName', 'workspaceName']);
-		assertEnum(task.state, TASK_STATUSES);
-		assertBoolean(task.canCancel);
-		assertBoolean(task.needsInput);
-		assertBoolean(task.summaryTruncated);
-		assertOptionalString(task.phase);
-		assertOptionalString(task.summary);
-		if (task.error !== undefined) {
-			assertDashboardError(task.error);
-		}
-	}
+	assertDashboardTasks(model.outgoingTasks);
+	assertDashboardTasks(model.incomingTasks);
 
 	assertArray(model.errors, 100);
 	model.errors.forEach(assertDashboardError);
+}
+
+function assertDashboardTasks(value: unknown): void {
+	assertArray(value, 500);
+	for (const task of value) {
+		assertExactRecord(
+			task,
+			[
+				'counterpartLabel',
+				'workspaceName',
+				'title',
+				'state',
+				'startedAt',
+				'shortId',
+				'canCancel',
+			],
+			['actionHandle'],
+		);
+		assertStrings(task, ['counterpartLabel', 'workspaceName', 'title', 'startedAt', 'shortId']);
+		assertEnum(task.state, TASK_STATUSES);
+		assertBoolean(task.canCancel);
+		const shortId = task.shortId;
+		const startedAt = task.startedAt;
+		assertString(shortId);
+		assertString(startedAt);
+		if (!/^[0-9a-f]{8}$/u.test(shortId)) {
+			throw new Error('Dashboard task short ID is invalid.');
+		}
+		if (
+			startedAt !== 'Unknown'
+			&& !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(startedAt)
+		) {
+			throw new Error('Dashboard task start time is invalid.');
+		}
+		if (task.canCancel) {
+			assertActionHandle(task.actionHandle);
+		} else if (task.actionHandle !== undefined) {
+			throw new Error('A terminal task cannot expose a cancel handle.');
+		}
+	}
 }
 
 function assertSafeValue(value: unknown, location: string): void {
@@ -344,8 +337,14 @@ function assertSafeValue(value: unknown, location: string): void {
 		if (utf8ByteLength(value) > 2 * 1_024) {
 			throw new Error(`Dashboard value exceeds the safe bound at ${location}.`);
 		}
+		if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/u.test(value)) {
+			return;
+		}
 		if (containsUnsafeDashboardText(value)) {
 			throw new Error(`Dashboard value contains a local path or secret at ${location}.`);
+		}
+		if (/sha256:[A-Za-z0-9_-]{43}/u.test(value)) {
+			throw new Error(`Dashboard value contains a full workspace identity at ${location}.`);
 		}
 		return;
 	}
@@ -355,7 +354,7 @@ function assertSafeValue(value: unknown, location: string): void {
 	}
 	if (isRecord(value)) {
 		for (const [key, entry] of Object.entries(value)) {
-			if (/(secret|token|credential|localPath|prompt|fullOutput)/i.test(key)) {
+			if (/(secret|token|credential|path|uri|prompt|output|transcript|grant|workspaceIdentity)/i.test(key)) {
 				throw new Error(`Dashboard field is forbidden at ${location}.${key}.`);
 			}
 			assertSafeValue(entry, `${location}.${key}`);
@@ -416,15 +415,9 @@ function assertBoolean(value: unknown): asserts value is boolean {
 	}
 }
 
-function assertIdentifier(value: unknown): asserts value is string {
-	if (!isIdentifier(value)) {
-		throw new Error('Dashboard value must be an opaque identifier.');
-	}
-}
-
-function assertOptionalIdentifier(value: unknown): void {
-	if (value !== undefined) {
-		assertIdentifier(value);
+function assertActionHandle(value: unknown): asserts value is string {
+	if (!isActionHandle(value)) {
+		throw new Error('Dashboard value must be a scoped action handle.');
 	}
 }
 
@@ -437,12 +430,6 @@ function assertEnum(value: unknown, allowed: readonly string[]): asserts value i
 function assertArray(value: unknown, maximumLength: number): asserts value is unknown[] {
 	if (!Array.isArray(value) || value.length > maximumLength) {
 		throw new Error('Dashboard collection exceeds its allowed shape.');
-	}
-}
-
-function assertBoundedInteger(value: unknown, minimum: number, maximum: number): void {
-	if (typeof value !== 'number' || !Number.isInteger(value) || value < minimum || value > maximum) {
-		throw new Error('Dashboard number is outside its allowed range.');
 	}
 }
 
@@ -459,6 +446,10 @@ function isIdentifier(value: unknown): value is string {
 	return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value);
 }
 
-function optionalIdentifier(value: unknown): boolean {
-	return value === undefined || isIdentifier(value);
+function isActionHandle(value: unknown): value is string {
+	return typeof value === 'string' && /^[A-Za-z0-9_-]{32}$/u.test(value);
+}
+
+function optionalActionHandle(value: unknown): boolean {
+	return value === undefined || isActionHandle(value);
 }

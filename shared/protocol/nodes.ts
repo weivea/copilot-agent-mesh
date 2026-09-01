@@ -7,6 +7,7 @@ import {
 	taskFailureSchema,
 	taskSnapshotAfterEventSeqSchema,
 	taskSnapshotSchema,
+	taskStatusSchema,
 	timestampSchema,
 	uuidSchema,
 } from './models';
@@ -331,24 +332,69 @@ export const peerGateStateSchema = z.enum([
 	'notClaimed',
 ]);
 
-const safeShortIdSchema = z.string().regex(/^[0-9a-f]{8}$/u);
+export const dashboardActionHandleSchema = z.string().regex(/^[A-Za-z0-9_-]{32}$/u);
+export const dashboardTaskDirectionSchema = z.enum(['outgoing', 'incoming']);
+export const peerCandidateClaimStateSchema = z.enum([
+	'claimed',
+	'multiWorkspace',
+	'unclaimed',
+]);
+
+export const peerPolicyCandidateParamsSchema = nodeIdentityParamsSchema.extend({
+	workspaceIdentity: workspaceIdentitySchema,
+});
 
 export const peerPolicyCandidateSchema = z.strictObject({
-	nodeId: safeShortIdSchema,
-	nodeInstanceId: safeShortIdSchema,
-	workspaceId: safeShortIdSchema.optional(),
-	label: utf8String(PROTOCOL_LIMITS.nameBytes, 'window label', 1),
-	workspaceName: utf8String(PROTOCOL_LIMITS.nameBytes, 'workspace name', 1).optional(),
+	actionHandle: dashboardActionHandleSchema.optional(),
+	windowLabel: utf8String(PROTOCOL_LIMITS.nameBytes, 'window label', 1),
+	workspaceName: utf8String(PROTOCOL_LIMITS.nameBytes, 'workspace name', 1),
 	online: z.boolean(),
 	acceptsIncoming: z.boolean(),
 	busy: z.boolean(),
+	allowlisted: z.boolean(),
+	self: z.boolean(),
+	canToggle: z.boolean(),
+	claimState: peerCandidateClaimStateSchema,
 	gateState: peerGateStateSchema,
 });
 
 export const peerPolicyCandidateListResultSchema = z.strictObject({
 	candidates: z.array(peerPolicyCandidateSchema).max(PROTOCOL_LIMITS.nodeListCount),
 	truncated: z.boolean(),
-	totalCandidates: z.number().int().nonnegative().max(PROTOCOL_LIMITS.nodeListCount),
+	totalCandidates: z.number().int().nonnegative().max(PROTOCOL_LIMITS.nodeListCount + 32),
+});
+
+export const peerPolicyCandidateMutationParamsSchema = nodeIdentityParamsSchema.extend({
+	workspaceIdentity: workspaceIdentitySchema,
+	actionHandle: dashboardActionHandleSchema,
+	allowed: z.boolean(),
+});
+
+export const dashboardTaskSummarySchema = z.strictObject({
+	actionHandle: dashboardActionHandleSchema.optional(),
+	direction: dashboardTaskDirectionSchema,
+	counterpartLabel: utf8String(PROTOCOL_LIMITS.nameBytes, 'task counterpart label', 1),
+	workspaceName: utf8String(PROTOCOL_LIMITS.nameBytes, 'task workspace name', 1),
+	title: utf8String(PROTOCOL_LIMITS.taskTitleBytes, 'task title', 1),
+	state: taskStatusSchema,
+	startedAt: z.union([timestampSchema, z.literal('Unknown')]),
+	shortId: z.string().regex(/^[0-9a-f]{8}$/u),
+	canCancel: z.boolean(),
+});
+
+export const dashboardTaskListResultSchema = z.strictObject({
+	tasks: z.array(dashboardTaskSummarySchema).max(500),
+	truncated: z.boolean(),
+	totalTasks: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+});
+
+export const dashboardTaskCancelParamsSchema = nodeIdentityParamsSchema.extend({
+	actionHandle: dashboardActionHandleSchema,
+	direction: dashboardTaskDirectionSchema,
+});
+
+export const dashboardTaskReservationResultSchema = z.strictObject({
+	reservationHandle: dashboardActionHandleSchema,
 });
 
 export const nodeTaskStartParamsSchema = routedTaskStartParamsSchema.extend({
@@ -466,6 +512,11 @@ export const LOCAL_BROKER_METHODS = {
 	policyGet: 'node.policy.get',
 	policySet: 'node.policy.set',
 	policyCandidates: 'node.policy.candidates',
+	policyCandidateSet: 'node.policy.candidate.set',
+	dashboardTasks: 'node.dashboard.tasks',
+	dashboardTaskReserve: 'node.dashboard.task.reserve',
+	dashboardTaskCancel: 'node.dashboard.task.cancel',
+	dashboardTaskRelease: 'node.dashboard.task.release',
 	taskStart: 'node.task.start',
 	taskCancel: 'node.task.cancel',
 	taskDispose: 'node.task.dispose',
@@ -481,6 +532,7 @@ export const LOCAL_BROKER_METHODS = {
 export const LOCAL_BROKER_NOTIFICATIONS = {
 	policyChanged: 'node.policy.changed',
 	taskSnapshot: 'node.task.snapshot',
+	dashboardChanged: 'node.dashboard.changed',
 } as const;
 
 /**
@@ -502,7 +554,12 @@ export const localBrokerMethodParamsSchemas = {
 	[LOCAL_BROKER_METHODS.releaseWorkspace]: nodeWorkspaceReleaseParamsSchema,
 	[LOCAL_BROKER_METHODS.policyGet]: nodePolicyGetParamsSchema,
 	[LOCAL_BROKER_METHODS.policySet]: nodePolicySetParamsSchema,
-	[LOCAL_BROKER_METHODS.policyCandidates]: nodeIdentityParamsSchema,
+	[LOCAL_BROKER_METHODS.policyCandidates]: peerPolicyCandidateParamsSchema,
+	[LOCAL_BROKER_METHODS.policyCandidateSet]: peerPolicyCandidateMutationParamsSchema,
+	[LOCAL_BROKER_METHODS.dashboardTasks]: nodeIdentityParamsSchema,
+	[LOCAL_BROKER_METHODS.dashboardTaskReserve]: dashboardTaskCancelParamsSchema,
+	[LOCAL_BROKER_METHODS.dashboardTaskCancel]: dashboardTaskCancelParamsSchema,
+	[LOCAL_BROKER_METHODS.dashboardTaskRelease]: dashboardTaskCancelParamsSchema,
 	[LOCAL_BROKER_METHODS.taskStart]: nodeTaskStartParamsSchema,
 	[LOCAL_BROKER_METHODS.taskCancel]: nodeTaskCancelParamsSchema,
 	[LOCAL_BROKER_METHODS.taskDispose]: nodeTaskCancelParamsSchema,
@@ -538,6 +595,13 @@ export type NodePolicyResult = z.infer<typeof nodePolicyResultSchema>;
 export type PeerGateState = z.infer<typeof peerGateStateSchema>;
 export type PeerPolicyCandidate = z.infer<typeof peerPolicyCandidateSchema>;
 export type PeerPolicyCandidateListResult = z.infer<typeof peerPolicyCandidateListResultSchema>;
+export type PeerPolicyCandidateParams = z.infer<typeof peerPolicyCandidateParamsSchema>;
+export type PeerPolicyCandidateMutationParams = z.infer<typeof peerPolicyCandidateMutationParamsSchema>;
+export type DashboardTaskDirection = z.infer<typeof dashboardTaskDirectionSchema>;
+export type DashboardTaskSummary = z.infer<typeof dashboardTaskSummarySchema>;
+export type DashboardTaskListResult = z.infer<typeof dashboardTaskListResultSchema>;
+export type DashboardTaskCancelParams = z.infer<typeof dashboardTaskCancelParamsSchema>;
+export type DashboardTaskReservationResult = z.infer<typeof dashboardTaskReservationResultSchema>;
 export type DelegationGrantProtocol = z.infer<typeof delegationGrantSchema>;
 export type DelegatedExecutionContext = z.infer<typeof delegatedExecutionContextSchema>;
 export type DelegationPrincipal = z.infer<typeof delegationPrincipalSchema>;

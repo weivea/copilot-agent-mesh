@@ -53,15 +53,37 @@ test('authenticated broker RPC keeps Tool and configuration directories separate
 	t.after(() => fixture.dispose());
 
 	assert.equal((await fixture.nodeA.listNodes()).nodes.length, 0);
-	const candidates = await fixture.nodeA.listPeerPolicyCandidates();
-	assert.equal(candidates.candidates.length, 1);
-	assert.equal(candidates.candidates[0]?.nodeId, NODE_B.slice(0, 8));
+	const candidates = await fixture.nodeA.listPeerPolicyCandidates(IDENTITY_A);
+	assert.equal(candidates.candidates.length, 2);
+	assert.equal(
+		candidates.candidates.find(({ self }) => !self)?.windowLabel,
+		'Repository B',
+	);
 	assert.doesNotMatch(JSON.stringify(candidates), /sha256:|file:|component-workspace/u);
-
-	await fixture.nodeA.setPeerPolicy({
-		workspaceIdentity: IDENTITY_A,
-		allowlist: [IDENTITY_B],
-	});
+	const staleHandle = candidates.candidates.find(({ self }) => !self)?.actionHandle;
+	assert.ok(staleHandle);
+	await assert.rejects(
+		fixture.nodeB.setPeerPolicyCandidate(IDENTITY_B, staleHandle, true),
+		(error: unknown) =>
+			error instanceof LocalIpcRemoteError
+			&& errorReason(error) === 'POLICY_FORBIDDEN',
+	);
+	const refreshed = await fixture.nodeA.listPeerPolicyCandidates(IDENTITY_A);
+	await assert.rejects(
+		fixture.nodeA.setPeerPolicyCandidate(IDENTITY_A, staleHandle, true),
+		(error: unknown) =>
+			error instanceof LocalIpcRemoteError
+			&& errorReason(error) === 'POLICY_FORBIDDEN',
+	);
+	const targetHandle = refreshed.candidates.find(({ self }) => !self)?.actionHandle;
+	assert.ok(targetHandle);
+	await fixture.nodeA.setPeerPolicyCandidate(IDENTITY_A, targetHandle, true);
+	await assert.rejects(
+		fixture.nodeA.setPeerPolicyCandidate(IDENTITY_A, targetHandle, false),
+		(error: unknown) =>
+			error instanceof LocalIpcRemoteError
+			&& errorReason(error) === 'POLICY_FORBIDDEN',
+	);
 	await assert.rejects(
 		fixture.nodeA.startTask(task(uuid(208))),
 		(error: unknown) =>
@@ -106,6 +128,28 @@ test('default-off Tool listing stays empty while the safe Dashboard directory re
 		WORKSPACE_A,
 	);
 	assert.doesNotMatch(JSON.stringify(dashboard), /sha256:|component-workspace/u);
+});
+
+test('retains an offline allowlist entry with a removable one-time handle', async (t) => {
+	const fixture = await createFixture();
+	t.after(() => fixture.dispose());
+	await fixture.nodeB.setPeerPolicy({
+		workspaceIdentity: IDENTITY_B,
+		windowName: 'Backend',
+	});
+	const candidate = (await fixture.nodeA.listPeerPolicyCandidates(IDENTITY_A))
+		.candidates.find(({ self }) => !self);
+	assert.ok(candidate?.actionHandle);
+	await fixture.nodeA.setPeerPolicyCandidate(IDENTITY_A, candidate.actionHandle, true);
+	await fixture.nodeB.dispose();
+
+	const offline = (await fixture.nodeA.listPeerPolicyCandidates(IDENTITY_A))
+		.candidates.find(({ online, allowlisted }) => !online && allowlisted);
+	assert.equal(offline?.windowLabel, 'Backend');
+	assert.equal(offline?.gateState, 'offline');
+	assert.ok(offline?.actionHandle);
+	await fixture.nodeA.setPeerPolicyCandidate(IDENTITY_A, offline.actionHandle, false);
+	assert.deepEqual((await fixture.nodeA.getPeerPolicy(IDENTITY_A)).allowlist, []);
 });
 
 test('rename updates every window immediately and rejects normalized conflicts over authenticated RPC', async (t) => {
@@ -242,10 +286,89 @@ test('two windows and one Broker deliver authoritative delegation outcomes witho
 	const cancelledInput = delegationInput(214);
 	const cancelled = core.delegateTask(cancelledInput);
 	const cancelledTaskId = await startedTaskId(fixture.executorB, cancelled);
+	const outgoing = await fixture.nodeA.listDashboardTasks();
+	const incoming = await fixture.nodeB.listDashboardTasks();
+	const outgoingTask = outgoing.tasks.find(({ shortId }) => shortId === cancelledTaskId.slice(0, 8));
+	const incomingTask = incoming.tasks.find(({ shortId }) => shortId === cancelledTaskId.slice(0, 8));
+	assert.equal(outgoingTask?.direction, 'outgoing');
+	assert.equal(incomingTask?.direction, 'incoming');
+	assert.ok(outgoingTask?.actionHandle);
+	assert.ok(incomingTask?.actionHandle);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	const beforeBurst = fixture.dashboardMetrics();
+	await Promise.all(Array.from({ length: 12 }, (_, index) =>
+		fixture.nodeB.publishTaskEvent(taskEvent(cancelledTaskId, {
+			type: index % 3 === 0 ? 'progress' : index % 3 === 1 ? 'output' : 'tool',
+			summary: `Burst event ${index}`,
+		}))
+	));
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	const afterBurst = fixture.dashboardMetrics();
+	const refreshedOutgoing = (await fixture.nodeA.listDashboardTasks()).tasks.find(
+		({ shortId }) => shortId === cancelledTaskId.slice(0, 8),
+	);
+	const refreshedIncoming = (await fixture.nodeB.listDashboardTasks()).tasks.find(
+		({ shortId }) => shortId === cancelledTaskId.slice(0, 8),
+	);
+	assert.equal(refreshedOutgoing?.actionHandle, outgoingTask.actionHandle);
+	assert.equal(refreshedIncoming?.actionHandle, incomingTask.actionHandle);
+	assert.equal(afterBurst.tasks.startupScans, 1);
+	assert.equal(afterBurst.tasks.startupScans, beforeBurst.tasks.startupScans);
+	assert.equal(afterBurst.tasks.storeListScans, beforeBurst.tasks.storeListScans);
+	assert.equal(afterBurst.broker.notificationsSent, beforeBurst.broker.notificationsSent);
+	assert.equal((await fixture.nodeA.listDashboardTasks()).tasks.some(
+		({ direction }) => direction === 'incoming',
+	), false);
+	const wrongDirectionHandle = outgoingTask?.actionHandle;
+	assert.ok(wrongDirectionHandle);
+	await assert.rejects(
+		fixture.nodeA.reserveDashboardTask(wrongDirectionHandle, 'incoming'),
+		(error: unknown) =>
+			error instanceof LocalIpcRemoteError
+			&& errorReason(error) === 'TASK_NOT_FOUND',
+	);
+	const terminalProbeHandle = (await fixture.nodeA.listDashboardTasks()).tasks.find(
+		({ shortId }) => shortId === cancelledTaskId.slice(0, 8),
+	)?.actionHandle;
+	assert.ok(terminalProbeHandle);
+	const terminalReservation = await fixture.nodeA.reserveDashboardTask(
+		terminalProbeHandle,
+		'outgoing',
+	);
+	const cancelHandle = refreshedIncoming?.actionHandle;
+	assert.ok(cancelHandle);
+	const reservation = await fixture.nodeB.reserveDashboardTask(cancelHandle, 'incoming');
+	await fixture.nodeB.listDashboardTasks();
+	const cancelling = await fixture.nodeB.cancelDashboardTask(
+		reservation.reservationHandle,
+		'incoming',
+	);
+	assert.equal(cancelling.state, 'cancelling');
+	await assert.rejects(
+		fixture.nodeB.cancelDashboardTask(reservation.reservationHandle, 'incoming'),
+		(error: unknown) =>
+			error instanceof LocalIpcRemoteError
+			&& errorReason(error) === 'TASK_NOT_FOUND',
+	);
 	await fixture.nodeB.publishTaskEvent(taskEvent(cancelledTaskId, {
 		type: 'cancelled',
 		summary: 'The peer cancelled the component task.',
 	}));
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	const terminalOutgoing = (await fixture.nodeA.listDashboardTasks()).tasks.find(
+		({ shortId }) => shortId === cancelledTaskId.slice(0, 8),
+	);
+	assert.equal(terminalOutgoing?.state, 'cancelled');
+	assert.equal(terminalOutgoing?.actionHandle, undefined);
+	await assert.rejects(
+		fixture.nodeA.cancelDashboardTask(
+			terminalReservation.reservationHandle,
+			'outgoing',
+		),
+		(error: unknown) =>
+			error instanceof LocalIpcRemoteError
+			&& errorReason(error) === 'TASK_NOT_FOUND',
+	);
 	assert.deepEqual(await cancelled, {
 		s: 3,
 		t: cancelledTaskId,
@@ -415,6 +538,10 @@ interface Fixture {
 	readonly nodeC?: WindowNodeClient;
 	readonly executorB: RecordingExecutor;
 	readonly executorC?: RecordingExecutor;
+	dashboardMetrics(): {
+		readonly broker: ReturnType<DeviceBroker['dashboardMetrics']>;
+		readonly tasks: ReturnType<BrokerTaskService['dashboardMetrics']>;
+	};
 	restartBroker(): Promise<void>;
 	dispose(): Promise<void>;
 }
@@ -538,6 +665,15 @@ async function createFixture(options: {
 		},
 		executorB,
 		executorC,
+		dashboardMetrics: () => {
+			if (broker === undefined) {
+				throw new Error('The test Broker is unavailable.');
+			}
+			return {
+				broker: broker.dashboardMetrics(),
+				tasks: taskService.dashboardMetrics(),
+			};
+		},
 		restartBroker: async () => {
 			await nodeA.dispose();
 			await nodeB.dispose();

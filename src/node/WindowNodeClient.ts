@@ -8,6 +8,9 @@ import {
 	brokerRemoteTaskGetParamsSchema,
 	brokerRemoteTaskStartParamsSchema,
 	brokerLocalTaskStartParamsSchema,
+	dashboardTaskCancelParamsSchema,
+	dashboardTaskListResultSchema,
+	dashboardTaskReservationResultSchema,
 	delegatedExecutionContextSchema,
 	nodeRegistrationResultSchema,
 	dashboardNodeDirectoryResultSchema,
@@ -20,6 +23,8 @@ import {
 	nodePolicyResultSchema,
 	nodePolicySetParamsSchema,
 	peerPolicyCandidateListResultSchema,
+	peerPolicyCandidateMutationParamsSchema,
+	peerPolicyCandidateParamsSchema,
 	nodeStatusSchema,
 	nodeTaskAnswerParamsSchema,
 	nodeTaskCancelParamsSchema,
@@ -34,6 +39,9 @@ import {
 	uuidSchema,
 	windowNodeDescriptorSchema,
 	type DashboardNodeDirectoryResult,
+	type DashboardTaskDirection,
+	type DashboardTaskListResult,
+	type DashboardTaskReservationResult,
 	type DelegatedExecutionContext,
 	type DelegationPrincipal,
 	type WindowDelegationPrincipal,
@@ -420,15 +428,98 @@ export class WindowNodeClient implements WorkspaceResolver {
 		);
 	}
 
-	public listPeerPolicyCandidates(): Promise<PeerPolicyCandidateListResult> {
+	public listPeerPolicyCandidates(workspaceIdentity: string): Promise<PeerPolicyCandidateListResult> {
+		const params = peerPolicyCandidateParamsSchema.parse({
+			nodeId: this.nodeId,
+			nodeInstanceId: this.nodeInstanceId,
+			workspaceIdentity,
+		});
 		return this.request(
 			LOCAL_BROKER_METHODS.policyCandidates,
+			toJsonValue(params),
+			peerPolicyCandidateListResultSchema,
+		);
+	}
+
+	public setPeerPolicyCandidate(
+		workspaceIdentity: string,
+		actionHandle: string,
+		allowed: boolean,
+	): Promise<NodePolicyResult> {
+		const params = peerPolicyCandidateMutationParamsSchema.parse({
+			nodeId: this.nodeId,
+			nodeInstanceId: this.nodeInstanceId,
+			workspaceIdentity,
+			actionHandle,
+			allowed,
+		});
+		return this.request(
+			LOCAL_BROKER_METHODS.policyCandidateSet,
+			toJsonValue(params),
+			nodePolicyResultSchema,
+		);
+	}
+
+	public listDashboardTasks(): Promise<DashboardTaskListResult> {
+		return this.request(
+			LOCAL_BROKER_METHODS.dashboardTasks,
 			toJsonValue({
 				nodeId: this.nodeId,
 				nodeInstanceId: this.nodeInstanceId,
 			}),
-			peerPolicyCandidateListResultSchema,
+			dashboardTaskListResultSchema,
 		);
+	}
+
+	public cancelDashboardTask(
+		actionHandle: string,
+		direction: DashboardTaskDirection,
+	): Promise<TaskSnapshot> {
+		const params = dashboardTaskCancelParamsSchema.parse({
+			nodeId: this.nodeId,
+			nodeInstanceId: this.nodeInstanceId,
+			actionHandle,
+			direction,
+		});
+		return this.request(
+			LOCAL_BROKER_METHODS.dashboardTaskCancel,
+			toJsonValue(params),
+			taskSnapshotSchema,
+		);
+	}
+
+	public reserveDashboardTask(
+		actionHandle: string,
+		direction: DashboardTaskDirection,
+	): Promise<DashboardTaskReservationResult> {
+		const params = dashboardTaskCancelParamsSchema.parse({
+			nodeId: this.nodeId,
+			nodeInstanceId: this.nodeInstanceId,
+			actionHandle,
+			direction,
+		});
+		return this.request(
+			LOCAL_BROKER_METHODS.dashboardTaskReserve,
+			toJsonValue(params),
+			dashboardTaskReservationResultSchema,
+		);
+	}
+
+	public releaseDashboardTask(
+		reservationHandle: string,
+		direction: DashboardTaskDirection,
+	): Promise<void> {
+		const params = dashboardTaskCancelParamsSchema.parse({
+			nodeId: this.nodeId,
+			nodeInstanceId: this.nodeInstanceId,
+			actionHandle: reservationHandle,
+			direction,
+		});
+		return this.request(
+			LOCAL_BROKER_METHODS.dashboardTaskRelease,
+			toJsonValue(params),
+			z.null(),
+		).then(() => undefined);
 	}
 
 	public listRemoteDevices(): Promise<MeshRemoteDirectorySnapshot> {
@@ -888,6 +979,14 @@ export class WindowNodeClient implements WorkspaceResolver {
 	): Promise<JsonValue> {
 		let requestExecutor: WindowNodeExecutor | undefined;
 		try {
+			if (this.disposed && isDashboardNotification(method)) {
+				if (method === LOCAL_BROKER_NOTIFICATIONS.taskSnapshot) {
+					taskSnapshotSchema.parse(params);
+				} else {
+					z.strictObject({}).parse(params);
+				}
+				return null;
+			}
 			this.assertCurrent(session);
 			if (!this.registered) {
 				throw new MeshDomainError('AUTH_REQUIRED', 'Window Node registration is incomplete.');
@@ -902,6 +1001,10 @@ export class WindowNodeClient implements WorkspaceResolver {
 			requestExecutor = executor;
 			switch (method) {
 				case LOCAL_BROKER_NOTIFICATIONS.policyChanged:
+					z.strictObject({}).parse(params);
+					this.changed();
+					return null;
+				case LOCAL_BROKER_NOTIFICATIONS.dashboardChanged:
 					z.strictObject({}).parse(params);
 					this.changed();
 					return null;
@@ -1514,4 +1617,10 @@ function isCleanupCompleteExecutorError(error: unknown): boolean {
 
 function toJsonValue(value: unknown): JsonValue {
 	return JSON.parse(JSON.stringify(value)) as JsonValue;
+}
+
+function isDashboardNotification(method: string): boolean {
+	return method === LOCAL_BROKER_NOTIFICATIONS.policyChanged
+		|| method === LOCAL_BROKER_NOTIFICATIONS.taskSnapshot
+		|| method === LOCAL_BROKER_NOTIFICATIONS.dashboardChanged;
 }

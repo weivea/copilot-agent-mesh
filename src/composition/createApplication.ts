@@ -277,6 +277,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		addApplicationCleanup(cleanup, () => sourceStatusSubscription?.dispose());
 		await node.start();
 		const remoteTasks = new LocalIpcRemoteTaskAdapter(node);
+		addApplicationCleanup(cleanup, () => remoteTasks.dispose());
 		const localTasks = new LocalBrokerTaskFacade(node, {
 			deviceName: () =>
 				currentOwnerRuntime?.device.current().name
@@ -308,7 +309,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			node,
 			localTasks,
 			remoteTasks,
-			runtime,
+			runtime: () => runtime,
 			guard,
 			workerPlatform,
 			lifecycle,
@@ -336,8 +337,20 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		const multiWindowE2e = multiWindowE2eRequested && requestedE2eScenarios === 1
 			? gatedE2e
 			: undefined;
+		let meshTools: vscode.Disposable | undefined;
+		const syncMeshTools = (): void => {
+			const enabled = vscode.workspace.getConfiguration('copilotAgentMesh')
+				.get<boolean>('experimental.peerDelegation', false);
+			if (enabled && meshTools === undefined) {
+				meshTools = registerMeshTaskTools(localTasks, { delegatedToolInvocations });
+			} else if (!enabled && meshTools !== undefined) {
+				meshTools.dispose();
+				meshTools = undefined;
+			}
+		};
+		syncMeshTools();
 		contributions.push(
-			registerMeshTaskTools(localTasks, { delegatedToolInvocations }),
+			{ dispose: () => meshTools?.dispose() },
 			vscode.window.registerWebviewViewProvider(AgentMeshViewProvider.viewType, dashboard),
 			...registerCommands(
 				dashboardFacade,
@@ -357,6 +370,12 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 				);
 			}),
 			vscode.workspace.onDidChangeConfiguration((event) => {
+				if (
+					event.affectsConfiguration('copilotAgentMesh.experimental.peerDelegation')
+				) {
+					syncMeshTools();
+					changeEvents.fire();
+				}
 				if (
 					event.affectsConfiguration('copilotAgentMesh.workspace.capabilityTags')
 				) {
@@ -457,14 +476,12 @@ function registerCommands(
 		}
 	});
 	const selectTarget = async (
-		kind: 'workspace' | 'peer' | 'task',
+		kind: 'workspace' | 'peer',
 	): Promise<string | undefined> => {
 		const snapshot = await facade.getSnapshot();
 		const values = kind === 'workspace'
 			? snapshot.workspaces.map((item) => ({ label: item.name, id: item.workspaceId }))
-			: kind === 'peer'
-				? snapshot.peers.map((item) => ({ label: item.name, id: item.peerId }))
-				: snapshot.tasks.map((item) => ({ label: item.title, id: item.taskId }));
+			: snapshot.peers.map((item) => ({ label: item.name, id: item.peerId }));
 		return (await vscode.window.showQuickPick(values, {
 			title: `Select ${kind}`,
 			ignoreFocusOut: true,
@@ -507,9 +524,36 @@ function registerCommands(
 		register(APPLICATION_COMMANDS.runTask, false, (value) =>
 			facade.runTask(dashboardTarget(value))),
 		register(APPLICATION_COMMANDS.cancelTask, false, async (value) => {
-			const id = opaqueId(value) ?? await selectTarget('task');
+			const id = opaqueId(value);
 			if (id !== undefined) {
 				await facade.cancelTask(id);
+				return;
+			}
+			const snapshot = await facade.getSnapshot();
+			const candidates = [
+				...(snapshot.outgoingTasks ?? []).flatMap((task) =>
+					task.actionHandle === undefined ? [] : [{
+						label: task.title,
+						description: `Outgoing · ${task.counterpartLabel}`,
+						actionHandle: task.actionHandle,
+						direction: 'outgoing' as const,
+					}]
+				),
+				...(snapshot.incomingTasks ?? []).flatMap((task) =>
+					task.actionHandle === undefined ? [] : [{
+						label: task.title,
+						description: `Incoming · ${task.counterpartLabel}`,
+						actionHandle: task.actionHandle,
+						direction: 'incoming' as const,
+					}]
+				),
+			];
+			const selected = await vscode.window.showQuickPick(candidates, {
+				title: 'Select task',
+				ignoreFocusOut: true,
+			});
+			if (selected !== undefined) {
+				await facade.cancelDashboardTask(selected.actionHandle, selected.direction);
 			}
 		}),
 	];

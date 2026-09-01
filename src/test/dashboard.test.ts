@@ -3,6 +3,7 @@ import { readFile } from 'fs/promises';
 
 import * as vscode from 'vscode';
 
+import { timestampSchema } from '../../shared/protocol';
 import {
 	ProductionDashboardBindings,
 	ProductionDashboardBindingsOptions,
@@ -59,31 +60,28 @@ suite('Dashboard', () => {
 			version: DASHBOARD_MESSAGE_VERSION,
 			uiInstanceId: 'instance-1',
 			type: 'action',
-			action: 'cancelTask',
-			targetId: 'task-1',
+			action: 'cancelOutgoingTask',
+			actionHandle: 'a'.repeat(32),
 		};
 		assert.deepStrictEqual(parseDashboardInboundMessage(valid), valid);
-		assert.strictEqual(parseDashboardInboundMessage({ ...valid, targetId: '/private/task' }), undefined);
+		assert.strictEqual(parseDashboardInboundMessage({ ...valid, actionHandle: '/private/task' }), undefined);
 		assert.strictEqual(parseDashboardInboundMessage({ ...valid, secret: 'leak' }), undefined);
-		assert.strictEqual(parseDashboardInboundMessage({ ...valid, targetId: undefined }), undefined);
+		assert.strictEqual(parseDashboardInboundMessage({ ...valid, actionHandle: undefined }), undefined);
 		assert.strictEqual(parseDashboardInboundMessage({ ...valid, action: 'unknown' }), undefined);
 		assert.strictEqual(parseDashboardInboundMessage({
 			version: DASHBOARD_MESSAGE_VERSION,
 			uiInstanceId: 'instance-1',
 			type: 'action',
-			action: 'runTask',
-			peerId: 'peer-1',
-			workspaceId: 'workspace-1',
+			action: 'setPeerAllowed',
+			actionHandle: 'b'.repeat(32),
 		}), undefined);
 		assert.ok(parseDashboardInboundMessage({
 			version: DASHBOARD_MESSAGE_VERSION,
 			uiInstanceId: 'instance-1',
 			type: 'action',
-			action: 'runTask',
-			deviceId: 'device-1',
-			nodeId: 'node-1',
-			nodeInstanceId: 'instance-1',
-			workspaceId: 'workspace-1',
+			action: 'setPeerAllowed',
+			actionHandle: 'b'.repeat(32),
+			enabled: true,
 		}));
 		assert.ok(parseDashboardInboundMessage({
 			version: DASHBOARD_MESSAGE_VERSION,
@@ -185,20 +183,20 @@ suite('Dashboard', () => {
 		]) {
 			assert.throws(() => assertSafeDashboardOutboundMessage({
 				...base,
-				model: withTaskSummary(safeModel, unsafeText),
+				model: withTaskTitle(safeModel, unsafeText),
 			}), `Expected rejection for ${JSON.stringify(unsafeText)}`);
 		}
 		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({
 			...base,
-			model: withTaskSummary(safeModel, 'https://example.test'),
+			model: withTaskTitle(safeModel, 'https://example.test'),
 		}));
 		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({
 			...base,
-			model: withTaskSummary(safeModel, 'HTTPS://EXAMPLE.TEST'),
+			model: withTaskTitle(safeModel, 'HTTPS://EXAMPLE.TEST'),
 		}));
 		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({
 			...base,
-			model: withTaskSummary(safeModel, 'tokenCount = 12'),
+			model: withTaskTitle(safeModel, 'tokenCount = 12'),
 		}));
 	});
 
@@ -211,12 +209,15 @@ suite('Dashboard', () => {
 				...source.listener,
 				gateway: { ...source.listener.gateway, detail: 'Gateway failed at C:\\mesh\\gateway.json' },
 			},
-			tasks: source.tasks.map((task) => ({ ...task, summary: 'Changed src/auth.ts' })),
+			outgoingTasks: source.outgoingTasks?.map((task) => ({
+				...task,
+				title: 'Changed src/auth.ts',
+			})),
 			errors: [{ code: 'TASK_FAILED', message: '{"credential" : "private-value"}' }],
 		});
 
 		assert.strictEqual(model.listener.gateway.detail, '[redacted sensitive details]');
-		assert.strictEqual(model.tasks[0].summary, '[redacted sensitive details]');
+		assert.strictEqual(model.outgoingTasks[0].title, '[redacted sensitive details]');
 		assert.strictEqual(model.errors[0].message, '[redacted sensitive details]');
 		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({
 			version: DASHBOARD_MESSAGE_VERSION,
@@ -230,6 +231,8 @@ suite('Dashboard', () => {
 		const source = snapshot();
 		const presenter = new DashboardPresenter();
 		const summary = '🙂'.repeat(4_096);
+		const baseTask = source.outgoingTasks?.[0];
+		assert.ok(baseTask);
 		const states: DashboardSnapshot['tasks'][number]['state'][] = [
 			'accepted',
 			'startingAgent',
@@ -244,19 +247,24 @@ suite('Dashboard', () => {
 		];
 		const model = presenter.present({
 			...source,
-			tasks: states.map((state, index) => ({
-				...source.tasks[0],
-				taskId: `task-${index + 1}`,
+			outgoingTasks: states.map((state, index) => ({
+				...baseTask,
+				actionHandle: [
+					'completed',
+					'failed',
+					'cancelled',
+					'timedOut',
+				].includes(state) ? undefined : `${index}`.padStart(32, 'a'),
 				state,
-				summary,
-				summaryTruncated: index === 0,
+				title: summary,
+				shortId: `${index}`.padStart(8, 'a'),
+				canCancel: !['completed', 'failed', 'cancelled', 'timedOut'].includes(state),
 			})),
 		});
 
-		assert.strictEqual(model.tasks.length, states.length);
-		for (const task of model.tasks) {
-			assert.strictEqual(Buffer.byteLength(task.summary ?? '', 'utf8'), 2 * 1_024);
-			assert.strictEqual(task.summaryTruncated, true);
+		assert.strictEqual(model.outgoingTasks.length, states.length);
+		for (const task of model.outgoingTasks) {
+			assert.strictEqual(Buffer.byteLength(task.title, 'utf8'), 2 * 1_024);
 		}
 		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({
 			version: DASHBOARD_MESSAGE_VERSION,
@@ -294,6 +302,14 @@ suite('Dashboard', () => {
 				claimStatus: 'claimed',
 				previewEnabled: false,
 				canRename: false,
+				acceptsIncoming: false,
+				canSetAcceptIncoming: false,
+				agentHost: {
+					source: 'standalone',
+					label: 'Standalone (degraded)',
+					degraded: true,
+					reason: 'EDITOR_DISCOVERY_FAILED',
+				},
 				detail: 'Enable Peer Delegation Preview to rename this window.',
 			},
 		});
@@ -316,6 +332,68 @@ suite('Dashboard', () => {
 				},
 			},
 		} as never));
+	});
+
+	test('renders truthful Editor and degraded Standalone source states', () => {
+		const source = snapshot();
+		const presenter = new DashboardPresenter();
+		const editor = presenter.present(source);
+		assert.equal(editor.thisWindow.agentHost.label, 'Editor');
+		assert.equal(editor.thisWindow.agentHost.degraded, false);
+		const degraded = presenter.present({
+			...source,
+			thisWindow: {
+				...source.thisWindow,
+				agentHost: {
+					source: 'standalone',
+					label: 'Standalone (degraded)',
+					degraded: true,
+					reason: 'EDITOR_DISCOVERY_FAILED',
+					detail: 'Editor discovery was unavailable.',
+				},
+			},
+		});
+		assert.equal(degraded.thisWindow.agentHost.label, 'Standalone (degraded)');
+		assert.equal(degraded.thisWindow.agentHost.reason, 'EDITOR_DISCOVERY_FAILED');
+	});
+
+	test('canonicalizes every protocol-valid timestamp shape and safely marks malformed values', () => {
+		const variants = [
+			'2026-08-31T00:00:00+00:00',
+			'2026-08-31T08:00:00+08:00',
+			'2026-08-31T00:00:00.1Z',
+			'2026-08-31T00:00:00.123Z',
+			'2026-08-31T00:00:00.123456Z',
+			'2026-08-31T00:00:00.123456789Z',
+		];
+		for (const value of variants) {
+			assert.equal(timestampSchema.safeParse(value).success, true);
+		}
+		const extendedYearAfterNormalization = '9999-12-31T23:59:59-23:59';
+		assert.equal(timestampSchema.safeParse(extendedYearAfterNormalization).success, true);
+		const source = snapshot();
+		const task = source.outgoingTasks?.[0];
+		assert.ok(task);
+		const model = new DashboardPresenter().present({
+			...source,
+			outgoingTasks: variants.slice(0, 3).map((startedAt) => ({ ...task, startedAt })),
+			incomingTasks: [
+				...variants.slice(3).map((startedAt) => ({ ...task, startedAt })),
+				{ ...task, startedAt: extendedYearAfterNormalization },
+				{ ...task, startedAt: 'malformed timestamp' },
+			],
+		});
+		for (const projected of [...model.outgoingTasks, ...model.incomingTasks.slice(0, 3)]) {
+			assert.match(projected.startedAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u);
+		}
+		assert.equal(model.incomingTasks[3]?.startedAt, 'Unknown');
+		assert.equal(model.incomingTasks[4]?.startedAt, 'Unknown');
+		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: 'instance-1',
+			type: 'dashboard.snapshot',
+			model,
+		}));
 	});
 
 	test('isolates repeated resolves of the same view and makes repeated disposal safe', async () => {
@@ -371,6 +449,112 @@ suite('Dashboard', () => {
 		provider.dispose();
 	});
 
+	test('scopes one-time action handles to one UI instance and exact action', async () => {
+		const extension = getExtension();
+		const facade = new RecordingDashboardFacade();
+		const provider = new AgentMeshViewProvider(facade, extension.extensionUri);
+		const first = new TestWebviewView();
+		const second = new TestWebviewView();
+		provider.resolveWebviewView(first);
+		provider.resolveWebviewView(second);
+		const firstId = getUiInstanceId(first.webview.html);
+		const secondId = getUiInstanceId(second.webview.html);
+		await first.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: firstId, type: 'ready' });
+		await second.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: secondId, type: 'ready' });
+		const acceptHandle = getThisWindowActionHandle(first.webview.sent[0]);
+		assert.ok(acceptHandle);
+		await first.webview.receive({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: firstId,
+			type: 'action',
+			action: 'setAcceptIncoming',
+			actionHandle: acceptHandle,
+			enabled: true,
+		});
+		assert.ok(facade.calls.includes(`setAcceptIncoming:${'c'.repeat(32)}:true`));
+		const firstHandle = getCollectionActionHandle(
+			first.webview.sent[first.webview.sent.length - 1],
+			'localNodes',
+		);
+		assert.ok(firstHandle);
+
+		await second.webview.receive({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: secondId,
+			type: 'action',
+			action: 'setPeerAllowed',
+			actionHandle: firstHandle,
+			enabled: true,
+		});
+		assert.equal(second.webview.sent.some(({ code }) => code === 'STALE_ACTION'), true);
+
+		await first.webview.receive({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: firstId,
+			type: 'action',
+			action: 'setPeerAllowed',
+			actionHandle: firstHandle,
+			enabled: true,
+		});
+		assert.ok(facade.calls.includes(`setPeerAllowed:${'a'.repeat(32)}:true`));
+		await first.webview.receive({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: firstId,
+			type: 'action',
+			action: 'setPeerAllowed',
+			actionHandle: firstHandle,
+			enabled: false,
+		});
+		assert.equal(first.webview.sent.some(({ code }) => code === 'STALE_ACTION'), true);
+		provider.dispose();
+	});
+
+	test('keeps active task UI handles stable across refresh and removes them at terminal state', async () => {
+		const extension = getExtension();
+		const facade = new RecordingDashboardFacade();
+		const provider = new AgentMeshViewProvider(facade, extension.extensionUri);
+		const view = new TestWebviewView();
+		provider.resolveWebviewView(view);
+		const uiInstanceId = getUiInstanceId(view.webview.html);
+		await view.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'ready' });
+		const handle = getCollectionActionHandle(view.webview.sent[0], 'outgoingTasks');
+		assert.ok(handle);
+
+		facade.fireChanged();
+		await settle();
+		const refreshedHandle = getCollectionActionHandle(
+			view.webview.sent[view.webview.sent.length - 1],
+			'outgoingTasks',
+		);
+		assert.equal(refreshedHandle, handle);
+
+		const current = facade.snapshotValue;
+		facade.snapshotValue = {
+			...current,
+			outgoingTasks: current.outgoingTasks?.map((task) => ({
+				...task,
+				state: 'completed',
+				canCancel: false,
+				actionHandle: undefined,
+			})),
+		};
+		facade.fireChanged();
+		await settle();
+		assert.equal(getCollectionActionHandle(
+			view.webview.sent[view.webview.sent.length - 1],
+			'outgoingTasks',
+		), undefined);
+		await view.webview.receive({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId,
+			type: 'action',
+			action: 'cancelOutgoingTask',
+			actionHandle: handle,
+		});
+		assert.equal(view.webview.sent.some(({ code }) => code === 'STALE_ACTION'), true);
+		provider.dispose();
+	});
+
 	test('coalesces async publications so an old snapshot cannot overwrite a new one', async () => {
 		const extension = getExtension();
 		const facade = new DeferredDashboardFacade();
@@ -406,6 +590,20 @@ suite('Dashboard', () => {
 		});
 		await approved.stopListener();
 		assert.strictEqual(services.stopCalls, 1);
+	});
+
+	test('reserves exact task cancellation before confirmation and releases a denial', async () => {
+		const services = new RecordingServiceBindings();
+		const order: string[] = [];
+		services.cancellationOrder = order;
+		const facade = new ServiceDashboardFacade(services, {
+			confirm: async () => {
+				order.push('confirm');
+				return false;
+			},
+		});
+		await facade.cancelDashboardTask('a'.repeat(32), 'incoming');
+		assert.deepStrictEqual(order, ['prepare', 'confirm', 'release']);
 	});
 
 	test('collects a separate safe task title without placing instructions in the view model', async () => {
@@ -590,22 +788,9 @@ suite('Dashboard', () => {
 		const actions = [
 			{ action: 'configureDevice' },
 			{ action: 'renameWindow' },
-			{ action: 'registerWorkspace' },
-			{ action: 'removeWorkspace', targetId: 'workspace-1' },
 			{ action: 'startListener' },
 			{ action: 'stopListener' },
 			{ action: 'copyConnectionUrl' },
-			{ action: 'addPeer' },
-			{ action: 'removePeer', targetId: 'peer-1' },
-			{
-				action: 'runTask',
-				deviceId: 'device-1',
-				nodeId: 'node-1',
-				nodeInstanceId: 'instance-1',
-				peerId: 'peer-1',
-				workspaceId: 'workspace-1',
-			},
-			{ action: 'cancelTask', targetId: 'task-1' },
 			{ action: 'refresh' },
 		] as const;
 
@@ -621,15 +806,9 @@ suite('Dashboard', () => {
 		assert.deepStrictEqual(facade.calls, [
 			'configureDevice',
 			'renameWindow',
-			'registerWorkspace',
-			'removeWorkspace:workspace-1',
 			'startListener',
 			'stopListener',
 			'copyConnectionUrl',
-			'addPeer',
-			'removePeer:peer-1',
-			'runTask:device-1:node-1:instance-1:workspace-1:peer-1',
-			'cancelTask:task-1',
 		]);
 		provider.dispose();
 	});
@@ -639,10 +818,11 @@ class RecordingDashboardFacade implements DashboardFacade {
 	private readonly changed = new vscode.EventEmitter<void>();
 	public readonly calls: string[] = [];
 	public readonly onDidChange = this.changed.event;
+	public snapshotValue = snapshot();
 	public renameError?: DashboardActionError;
 
 	public getSnapshot(): Promise<DashboardSnapshot> {
-		return Promise.resolve(snapshot());
+		return Promise.resolve(this.snapshotValue);
 	}
 
 	public fireChanged(): void {
@@ -658,6 +838,18 @@ class RecordingDashboardFacade implements DashboardFacade {
 			throw this.renameError;
 		}
 		this.calls.push('renameWindow');
+	}
+
+	public async setAcceptIncoming(actionHandle: string, enabled: boolean): Promise<void> {
+		this.calls.push(`setAcceptIncoming:${actionHandle}:${enabled}`);
+	}
+
+	public async setPeerAllowed(actionHandle: string, allowed: boolean): Promise<void> {
+		this.calls.push(`setPeerAllowed:${actionHandle}:${allowed}`);
+	}
+
+	public async cancelDashboardTask(actionHandle: string, direction: 'incoming' | 'outgoing'): Promise<void> {
+		this.calls.push(`cancelDashboardTask:${direction}:${actionHandle}`);
 	}
 
 	public async registerCurrentWorkspace(): Promise<void> {
@@ -722,6 +914,7 @@ class RecordingServiceBindings implements DashboardServiceBindings {
 	private readonly changed = new vscode.EventEmitter<void>();
 	public readonly onDidChange = this.changed.event;
 	public stopCalls = 0;
+	public cancellationOrder?: string[];
 	public lastWindowName?: string;
 	public lastTaskRequest?: {
 		readonly target?: DashboardTaskTarget;
@@ -738,6 +931,22 @@ class RecordingServiceBindings implements DashboardServiceBindings {
 			currentName: 'This Window',
 			rename: async (name: string) => {
 				this.lastWindowName = name;
+			},
+		};
+	}
+	public async setAcceptIncoming(_actionHandle: string, _enabled: boolean): Promise<void> {}
+	public async setPeerAllowed(_actionHandle: string, _allowed: boolean): Promise<void> {}
+	public async prepareDashboardTaskCancellation(
+		_actionHandle: string,
+		_direction: 'incoming' | 'outgoing',
+	) {
+		this.cancellationOrder?.push('prepare');
+		return {
+			cancel: async () => {
+				this.cancellationOrder?.push('cancel');
+			},
+			release: async () => {
+				this.cancellationOrder?.push('release');
 			},
 		};
 	}
@@ -842,7 +1051,39 @@ function snapshot(): DashboardSnapshot {
 			claimStatus: 'claimed',
 			previewEnabled: true,
 			canRename: true,
+			acceptsIncoming: false,
+			canSetAcceptIncoming: true,
+			acceptActionHandle: 'c'.repeat(32),
+			agentHost: {
+				source: 'editor',
+				label: 'Editor',
+				degraded: false,
+			},
 		},
+		policyCandidates: [{
+			actionHandle: 'a'.repeat(32),
+			windowLabel: 'Remote Window',
+			workspaceName: 'remote-workspace',
+			online: true,
+			acceptsIncoming: true,
+			busy: false,
+			allowlisted: true,
+			self: false,
+			canToggle: true,
+			claimState: 'claimed',
+			gateState: 'allowed',
+		}],
+		outgoingTasks: [{
+			actionHandle: 'b'.repeat(32),
+			counterpartLabel: 'Remote Window',
+			workspaceName: 'remote-workspace',
+			title: 'Implement authentication',
+			state: 'running',
+			startedAt: '2026-08-31T00:00:00.000Z',
+			shortId: '1234abcd',
+			canCancel: true,
+		}],
+		incomingTasks: [],
 		localNodes: [{
 			nodeId: 'node-1',
 			nodeInstanceId: 'instance-1',
@@ -896,13 +1137,13 @@ function snapshot(): DashboardSnapshot {
 	};
 }
 
-function withTaskSummary(
+function withTaskTitle(
 	value: ReturnType<DashboardPresenter['present']>,
-	summary: string,
+	title: string,
 ): ReturnType<DashboardPresenter['present']> {
 	return {
 		...value,
-		tasks: value.tasks.map((task) => ({ ...task, summary, summaryTruncated: false })),
+		outgoingTasks: value.outgoingTasks.map((task) => ({ ...task, title })),
 	};
 }
 
@@ -918,11 +1159,46 @@ function getSnapshotDeviceName(message: Record<string, unknown>): unknown {
 	if (typeof model !== 'object' || model === null || Array.isArray(model)) {
 		return undefined;
 	}
+
 	const device = (model as Record<string, unknown>).device;
 	if (typeof device !== 'object' || device === null || Array.isArray(device)) {
 		return undefined;
 	}
 	return (device as Record<string, unknown>).name;
+}
+
+function getCollectionActionHandle(
+	message: Record<string, unknown>,
+	collection: 'localNodes' | 'outgoingTasks' | 'incomingTasks',
+): string | undefined {
+	const model = message.model;
+	if (typeof model !== 'object' || model === null || Array.isArray(model)) {
+		return undefined;
+	}
+
+	const items = (model as Record<string, unknown>)[collection];
+	if (!Array.isArray(items)) {
+		return undefined;
+	}
+	const first = items[0];
+	if (typeof first !== 'object' || first === null || Array.isArray(first)) {
+		return undefined;
+	}
+	const handle = (first as Record<string, unknown>).actionHandle;
+	return typeof handle === 'string' ? handle : undefined;
+}
+
+function getThisWindowActionHandle(message: Record<string, unknown>): string | undefined {
+	const model = message.model;
+	if (typeof model !== 'object' || model === null || Array.isArray(model)) {
+		return undefined;
+	}
+	const thisWindow = (model as Record<string, unknown>).thisWindow;
+	if (typeof thisWindow !== 'object' || thisWindow === null || Array.isArray(thisWindow)) {
+		return undefined;
+	}
+	const handle = (thisWindow as Record<string, unknown>).acceptActionHandle;
+	return typeof handle === 'string' ? handle : undefined;
 }
 
 function getExtension(): vscode.Extension<unknown> {

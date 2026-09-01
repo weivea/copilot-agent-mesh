@@ -1,14 +1,21 @@
+import { randomBytes } from 'node:crypto';
+
 import { z } from 'zod';
 
 import {
 	MESH_ERROR_CODES,
 	GATEWAY_NOTIFICATIONS,
+	ACTIVE_TASK_STATUSES,
+	PROTOCOL_LIMITS,
 	brokerRemoteListResultSchema,
 	brokerRemoteTaskAnswerParamsSchema,
 	brokerRemoteTaskCancelParamsSchema,
 	brokerRemoteTaskGetParamsSchema,
 	brokerRemoteTaskStartParamsSchema,
 	brokerLocalTaskStartParamsSchema,
+	dashboardTaskCancelParamsSchema,
+	dashboardTaskListResultSchema,
+	dashboardTaskReservationResultSchema,
 	JSON_RPC_ERROR_CODES,
 	LOCAL_BROKER_METHODS,
 	LOCAL_BROKER_NOTIFICATIONS,
@@ -17,6 +24,9 @@ import {
 	nodeRegistrationResultSchema,
 	nodePolicyGetParamsSchema,
 	nodePolicySetParamsSchema,
+	peerPolicyCandidateListResultSchema,
+	peerPolicyCandidateMutationParamsSchema,
+	peerPolicyCandidateParamsSchema,
 	nodeRegisterParamsSchema,
 	nodeTaskAnswerParamsSchema,
 	nodeTaskCancelParamsSchema,
@@ -32,8 +42,10 @@ import {
 	type TaskSnapshot,
 	type TaskSnapshotAfterEventSeq,
 	type MeshErrorReason,
+	type DashboardTaskDirection,
 } from '../../shared/protocol';
 import { MeshDomainError } from '../domain/errors';
+import { containsUnsafeDashboardText } from '../ui/DashboardRedaction';
 import {
 	LocalIpcHandlerError,
 	LocalIpcRemoteError,
@@ -51,9 +63,13 @@ import type {
 import type {
 	BrokerTaskService,
 	BrokerTaskStartOutcome,
+	DashboardTaskIndexRecord,
 } from './BrokerTaskService';
 import type { NodeRegistry } from './NodeRegistry';
-import type { PeerPolicyService } from './PeerPolicyService';
+import type {
+	PeerPolicyCandidateBinding,
+	PeerPolicyService,
+} from './PeerPolicyService';
 import {
 	TaskRouteCatalog,
 	type TaskRouteRecord,
@@ -69,6 +85,19 @@ const localTaskGetParamsSchema = nodeIdentityParamsSchema.extend({
 interface RegisteredSession {
 	readonly nodeId: string;
 	readonly nodeInstanceId: string;
+}
+
+interface DashboardTaskBinding {
+	readonly ownerId: string;
+	readonly taskId: string;
+	readonly direction: DashboardTaskDirection;
+}
+
+interface DashboardActionRegistry {
+	readonly candidates: Map<string, PeerPolicyCandidateBinding>;
+	readonly tasks: Map<string, DashboardTaskBinding>;
+	readonly taskHandlesByKey: Map<string, string>;
+	readonly taskReservations: Map<string, DashboardTaskBinding>;
 }
 
 export interface DeviceBrokerOptions extends LocalIpcSessionOptions {
@@ -91,8 +120,12 @@ export class DeviceBroker {
 	private readonly server: LocalIpcServer;
 	public readonly taskRoutes: TaskRouteCatalog;
 	private readonly registrations = new WeakMap<LocalIpcSession, RegisteredSession>();
+	private readonly dashboardActions = new WeakMap<LocalIpcSession, DashboardActionRegistry>();
 	private readonly sessions = new Set<LocalIpcSession>();
 	private readonly activeHandlers = new Set<Promise<JsonValue>>();
+	private readonly dashboardNotificationImmediates = new Map<LocalIpcSession, NodeJS.Immediate>();
+	private readonly dashboardTaskStates = new Map<string, string>();
+	private dashboardNotificationsSent = 0;
 	private readonly policySubscription: { dispose(): void };
 	private started = false;
 	private disposed = false;
@@ -132,8 +165,15 @@ export class DeviceBroker {
 			onSession: (session) => {
 				this.sessions.add(session);
 				session.onClose(() => {
+					const immediate = this.dashboardNotificationImmediates.get(session);
+					if (immediate !== undefined) {
+						clearImmediate(immediate);
+						this.dashboardNotificationImmediates.delete(session);
+					}
 					this.registrations.delete(session);
+					this.dashboardActions.delete(session);
 					this.sessions.delete(session);
+					this.notifyDashboardChanged(session);
 				});
 			},
 			onError: options.onError,
@@ -142,6 +182,16 @@ export class DeviceBroker {
 
 	public get endpoint() {
 		return this.server.endpoint;
+	}
+
+	public dashboardMetrics(): {
+		readonly notificationsSent: number;
+		readonly pendingNotifications: number;
+	} {
+		return {
+			notificationsSent: this.dashboardNotificationsSent,
+			pendingNotifications: this.dashboardNotificationImmediates.size,
+		};
 	}
 
 	public async start(): Promise<void> {
@@ -257,6 +307,7 @@ export class DeviceBroker {
 			if (session.closed || this.registrations.get(session) === undefined) {
 				continue;
 			}
+			this.dashboardActions.get(session)?.candidates.clear();
 
 			void session.notify(LOCAL_BROKER_NOTIFICATIONS.policyChanged, {}).catch(
 				(error: unknown) => this.options.onError?.(
@@ -268,7 +319,64 @@ export class DeviceBroker {
 		}
 	}
 
+	private notifyDashboardChanged(
+		excluded?: LocalIpcSession,
+		invalidateTaskActions = true,
+	): void {
+		if (this.disposeRequested || this.disposed) {
+			return;
+		}
+		for (const session of [...this.sessions]) {
+			if (
+				session === excluded
+				|| session.closed
+				|| this.registrations.get(session) === undefined
+			) {
+				continue;
+			}
+			if (invalidateTaskActions) {
+				this.invalidateDashboardTaskActions(session);
+			}
+			if (this.dashboardNotificationImmediates.has(session)) {
+				continue;
+			}
+			const immediate = setImmediate(() => {
+				this.dashboardNotificationImmediates.delete(session);
+				if (
+					this.disposeRequested
+					|| this.disposed
+					|| session.closed
+					|| this.registrations.get(session) === undefined
+				) {
+					return;
+				}
+				this.dashboardNotificationsSent += 1;
+				void session.notify(LOCAL_BROKER_NOTIFICATIONS.dashboardChanged, {}).catch(
+					(error: unknown) => this.options.onError?.(
+						error instanceof Error
+							? error
+							: new Error('A dashboard notification failed.'),
+					),
+				);
+			});
+			this.dashboardNotificationImmediates.set(session, immediate);
+		}
+	}
+
 	public publishTaskSnapshot(snapshot: TaskSnapshot, sourceNodeId?: string): void {
+		const previousState = this.dashboardTaskStates.get(snapshot.taskId);
+		this.dashboardTaskStates.delete(snapshot.taskId);
+		this.dashboardTaskStates.set(snapshot.taskId, snapshot.state);
+		while (this.dashboardTaskStates.size > 1_000) {
+			const oldest = this.dashboardTaskStates.keys().next().value;
+			if (oldest === undefined) {
+				break;
+			}
+			this.dashboardTaskStates.delete(oldest);
+		}
+		if (previousState !== snapshot.state) {
+			this.notifyDashboardChanged(undefined, false);
+		}
 		const source = sourceNodeId;
 		if (source === undefined) {
 			return;
@@ -402,6 +510,7 @@ export class DeviceBroker {
 				nodeId: input.nodeId,
 				nodeInstanceId: input.nodeInstanceId,
 			});
+			this.notifyDashboardChanged(session);
 			return toJsonValue(nodeRegistrationResultSchema.parse({
 				node: descriptor,
 				delegationPrincipal,
@@ -421,6 +530,8 @@ export class DeviceBroker {
 				this.assertIdentity(binding, input);
 				this.options.registry.unregister(input, false);
 				this.registrations.delete(session);
+				this.dashboardActions.delete(session);
+				this.notifyDashboardChanged();
 				return null;
 			}
 			case LOCAL_BROKER_METHODS.list:
@@ -435,12 +546,14 @@ export class DeviceBroker {
 				const input = nodeWorkspaceClaimParamsSchema.parse(params);
 				this.assertIdentity(binding, input);
 				const result = await this.options.registry.claimWorkspace(input);
+				this.notifyDashboardChanged();
 				return toJsonValue(result);
 			}
 			case LOCAL_BROKER_METHODS.releaseWorkspace: {
 				const input = nodeWorkspaceReleaseParamsSchema.parse(params);
 				this.assertIdentity(binding, input);
 				this.options.registry.releaseWorkspace(input);
+				this.notifyDashboardChanged();
 				return null;
 			}
 			case LOCAL_BROKER_METHODS.policyGet: {
@@ -454,9 +567,116 @@ export class DeviceBroker {
 				return toJsonValue(await this.options.peerPolicies.setPolicy(binding, input));
 			}
 			case LOCAL_BROKER_METHODS.policyCandidates: {
+				const input = peerPolicyCandidateParamsSchema.parse(params);
+				this.assertIdentity(binding, input);
+				const actions = this.resetCandidateActions(session);
+				const bindings = this.options.peerPolicies.listCandidates(input);
+				const visibleBindings = bindings.slice(0, PROTOCOL_LIMITS.nodeListCount);
+				const candidates = visibleBindings.map((candidateBinding) => {
+					const actionHandle = candidateBinding.candidate.canToggle
+						? this.issueDashboardHandle(actions, candidateBinding)
+						: undefined;
+					return {
+						...candidateBinding.candidate,
+						...(actionHandle === undefined ? {} : { actionHandle }),
+					};
+				});
+				return toJsonValue(peerPolicyCandidateListResultSchema.parse({
+					candidates,
+					truncated: bindings.length > visibleBindings.length,
+					totalCandidates: bindings.length,
+				}));
+			}
+			case LOCAL_BROKER_METHODS.policyCandidateSet: {
+				const input = peerPolicyCandidateMutationParamsSchema.parse(params);
+				this.assertIdentity(binding, input);
+				const actions = this.dashboardActions.get(session)?.candidates;
+				const candidate = actions?.get(input.actionHandle);
+				actions?.delete(input.actionHandle);
+				if (candidate === undefined) {
+					throw new MeshDomainError('POLICY_FORBIDDEN', 'The policy candidate action is stale.');
+				}
+				if (candidate.sourceWorkspaceIdentity !== input.workspaceIdentity) {
+					throw new MeshDomainError('POLICY_FORBIDDEN', 'The policy candidate source changed.');
+				}
+				return toJsonValue(await this.options.peerPolicies.setCandidateAllowed(
+					binding,
+					candidate,
+					input.allowed,
+				));
+			}
+			case LOCAL_BROKER_METHODS.dashboardTasks: {
 				const input = nodeIdentityParamsSchema.parse(params);
 				this.assertIdentity(binding, input);
-				return toJsonValue(this.options.peerPolicies.listCandidates(input));
+				return toJsonValue(await this.listDashboardTasks(session, binding));
+			}
+			case LOCAL_BROKER_METHODS.dashboardTaskReserve: {
+				const input = dashboardTaskCancelParamsSchema.parse(params);
+				this.assertIdentity(binding, input);
+				const actions = this.dashboardActionRegistry(session);
+				const task = actions.tasks.get(input.actionHandle);
+				actions.tasks.delete(input.actionHandle);
+				if (task === undefined || task.direction !== input.direction) {
+					throw new MeshDomainError('TASK_NOT_FOUND', 'The dashboard task action is stale.');
+				}
+				await this.options.taskService.assertDashboardTaskCancellable(
+					binding.nodeId,
+					binding.nodeInstanceId,
+					task.ownerId,
+					task.taskId,
+					task.direction,
+				);
+				if (task.direction === 'outgoing') {
+					this.taskRoutes.requireForNode(task.taskId, binding.nodeId);
+				}
+				actions.taskHandlesByKey.delete(dashboardTaskBindingKey(task));
+				const reservationHandle = this.issueDashboardHandle(
+					actions.taskReservations,
+					task,
+				);
+				return toJsonValue(dashboardTaskReservationResultSchema.parse({
+					reservationHandle,
+				}));
+			}
+			case LOCAL_BROKER_METHODS.dashboardTaskCancel: {
+				const input = dashboardTaskCancelParamsSchema.parse(params);
+				this.assertIdentity(binding, input);
+				const actions = this.dashboardActions.get(session)?.taskReservations;
+				const task = actions?.get(input.actionHandle);
+				actions?.delete(input.actionHandle);
+				if (task === undefined || task.direction !== input.direction) {
+					throw new MeshDomainError('TASK_NOT_FOUND', 'The dashboard task action is stale.');
+				}
+				await this.options.taskService.assertDashboardTaskCancellable(
+					binding.nodeId,
+					binding.nodeInstanceId,
+					task.ownerId,
+					task.taskId,
+					task.direction,
+				);
+				if (task.direction === 'outgoing') {
+					this.taskRoutes.requireForNode(task.taskId, binding.nodeId);
+				}
+				const snapshot = task.direction === 'outgoing'
+					? await this.cancelRoutedTask(binding, task.taskId)
+					: await this.options.taskService.cancelForTarget(
+						binding.nodeId,
+						binding.nodeInstanceId,
+						task.ownerId,
+						task.taskId,
+					);
+				return toJsonValue(taskSnapshotSchema.parse(snapshot));
+			}
+			case LOCAL_BROKER_METHODS.dashboardTaskRelease: {
+				const input = dashboardTaskCancelParamsSchema.parse(params);
+				this.assertIdentity(binding, input);
+				const reservations = this.dashboardActions.get(session)?.taskReservations;
+				const task = reservations?.get(input.actionHandle);
+				reservations?.delete(input.actionHandle);
+				if (task === undefined || task.direction !== input.direction) {
+					throw new MeshDomainError('TASK_NOT_FOUND', 'The dashboard task reservation is stale.');
+				}
+				return null;
 			}
 			case LOCAL_BROKER_METHODS.taskStart: {
 				const input = brokerLocalTaskStartParamsSchema.parse(params);
@@ -809,6 +1029,173 @@ export class DeviceBroker {
 		return taskSnapshotSchema.parse(found);
 	}
 
+	private async listDashboardTasks(
+		session: LocalIpcSession,
+		binding: RegisteredSession,
+	): Promise<ReturnType<typeof dashboardTaskListResultSchema.parse>> {
+		const actions = this.dashboardActionRegistry(session);
+		const records = await this.options.taskService.listDashboardRecords();
+		const activeStates = new Set<string>(ACTIVE_TASK_STATUSES);
+		const projected = records
+			.flatMap((record) => {
+				const direction = dashboardTaskDirection(record, binding, this.options.identity.deviceId);
+				if (direction === undefined) {
+					return [];
+				}
+				const counterpart = this.dashboardTaskCounterpart(record, direction);
+				return [{
+					binding: {
+						ownerId: record.peerId,
+						taskId: record.taskId,
+						direction,
+					},
+					task: {
+						direction,
+						counterpartLabel: counterpart.label,
+						workspaceName: counterpart.workspaceName,
+						title: safeDashboardLabel(record.title, 'Delegated task'),
+						state: record.state,
+						startedAt: record.createdAt,
+						shortId: record.taskId.slice(0, 8),
+						canCancel: activeStates.has(record.state),
+					},
+				}];
+			})
+			.sort((left, right) =>
+				compareDashboardTimestampsDescending(
+					left.task.startedAt,
+					right.task.startedAt,
+				)
+			);
+		const visible = projected.slice(0, 500);
+		const retainedTaskKeys = new Set(
+			visible
+				.filter(({ task }) => task.canCancel)
+				.map(({ binding: taskBinding }) => dashboardTaskBindingKey(taskBinding)),
+		);
+		this.pruneDashboardTaskActions(actions, retainedTaskKeys);
+		const tasks = visible.map(({ binding: taskBinding, task }) => {
+			if (!task.canCancel) {
+				return task;
+			}
+			return {
+				...task,
+				actionHandle: this.stableDashboardTaskHandle(actions, taskBinding),
+			};
+		});
+		return dashboardTaskListResultSchema.parse({
+			tasks,
+			truncated: projected.length > visible.length,
+			totalTasks: projected.length,
+		});
+	}
+
+	private dashboardTaskCounterpart(
+		record: DashboardTaskIndexRecord,
+		direction: DashboardTaskDirection,
+	): { readonly label: string; readonly workspaceName: string } {
+		if (record.schemaVersion !== 2) {
+			return { label: 'Window', workspaceName: 'Workspace' };
+		}
+		const node = direction === 'outgoing'
+			&& record.target.nodeId !== undefined
+			&& record.target.nodeInstanceId !== undefined
+			? this.options.registry.peerNode({
+				nodeId: record.target.nodeId,
+				nodeInstanceId: record.target.nodeInstanceId,
+			})
+			: direction === 'incoming' && record.sourceNodeId !== undefined
+				? this.options.registry.peerNodes().find(({ nodeId }) =>
+					nodeId === record.sourceNodeId
+				)
+				: undefined;
+		const workspace = direction === 'outgoing'
+			? node?.workspaces.find(({ workspaceId }) => workspaceId === record.workspaceId)
+			: record.sourceWorkspaceIdentity === undefined
+				? undefined
+				: node?.workspaces.find(({ workspaceIdentity }) =>
+					workspaceIdentity === record.sourceWorkspaceIdentity
+				);
+		return {
+			label: node === undefined
+				? direction === 'outgoing' ? 'Offline peer' : 'Connected source'
+				: this.options.peerPolicies.displayLabel(node),
+			workspaceName: safeDashboardLabel(workspace?.name ?? 'Workspace', 'Workspace'),
+		};
+	}
+
+	private resetCandidateActions(
+		session: LocalIpcSession,
+	): Map<string, PeerPolicyCandidateBinding> {
+		const registry = this.dashboardActionRegistry(session);
+		registry.candidates.clear();
+		return registry.candidates;
+	}
+
+	private dashboardActionRegistry(session: LocalIpcSession): DashboardActionRegistry {
+		let registry = this.dashboardActions.get(session);
+		if (registry === undefined) {
+			registry = {
+				candidates: new Map(),
+				tasks: new Map(),
+				taskHandlesByKey: new Map(),
+				taskReservations: new Map(),
+			};
+			this.dashboardActions.set(session, registry);
+		}
+		return registry;
+	}
+
+	private stableDashboardTaskHandle(
+		actions: DashboardActionRegistry,
+		binding: DashboardTaskBinding,
+	): string {
+		const key = dashboardTaskBindingKey(binding);
+		const existingHandle = actions.taskHandlesByKey.get(key);
+		if (existingHandle !== undefined) {
+			const existing = actions.tasks.get(existingHandle);
+			if (existing !== undefined && dashboardTaskBindingKey(existing) === key) {
+				return existingHandle;
+			}
+			actions.taskHandlesByKey.delete(key);
+		}
+		const handle = this.issueDashboardHandle(actions.tasks, binding);
+		actions.taskHandlesByKey.set(key, handle);
+		return handle;
+	}
+
+	private pruneDashboardTaskActions(
+		actions: DashboardActionRegistry,
+		retainedKeys: ReadonlySet<string>,
+	): void {
+		for (const [key, handle] of actions.taskHandlesByKey) {
+			if (retainedKeys.has(key)) {
+				continue;
+			}
+			actions.taskHandlesByKey.delete(key);
+			actions.tasks.delete(handle);
+		}
+	}
+
+	private invalidateDashboardTaskActions(session: LocalIpcSession): void {
+		const actions = this.dashboardActions.get(session);
+		actions?.tasks.clear();
+		actions?.taskHandlesByKey.clear();
+		actions?.taskReservations.clear();
+	}
+
+	private issueDashboardHandle<T>(actions: Map<string, T>, binding: T): string {
+		if (actions.size >= 500) {
+			throw new MeshDomainError('RATE_LIMITED', 'The dashboard action registry is full.');
+		}
+		let handle: string;
+		do {
+			handle = randomBytes(24).toString('base64url');
+		} while (actions.has(handle));
+		actions.set(handle, binding);
+		return handle;
+	}
+
 	private assertActive(): void {
 		if (this.disposeRequested || this.disposed || !this.options.ownership.isOwner()) {
 			throw new MeshDomainError('WORKER_DRAINING', 'The Device Broker is shutting down.');
@@ -817,6 +1204,11 @@ export class DeviceBroker {
 
 	private async disposeOnce(): Promise<void> {
 		this.policySubscription.dispose();
+		for (const immediate of this.dashboardNotificationImmediates.values()) {
+			clearImmediate(immediate);
+		}
+		this.dashboardNotificationImmediates.clear();
+		this.dashboardTaskStates.clear();
 		const failures: unknown[] = [];
 		if (!this.serverDisposed) {
 			try {
@@ -943,6 +1335,48 @@ function safeErrorKind(error: unknown): string {
 
 function toJsonValue(value: unknown): JsonValue {
 	return JSON.parse(JSON.stringify(value)) as JsonValue;
+}
+
+function dashboardTaskDirection(
+	record: DashboardTaskIndexRecord,
+	binding: RegisteredSession,
+	deviceId: string,
+): DashboardTaskDirection | undefined {
+	if (record.schemaVersion !== 2) {
+		return undefined;
+	}
+	if (
+		record.peerId === deviceId
+		&& record.sourceNodeId === binding.nodeId
+		&& record.target.nodeId !== undefined
+		&& record.target.nodeInstanceId !== undefined
+	) {
+		return 'outgoing';
+	}
+	if (
+		record.target.nodeId === binding.nodeId
+		&& record.target.nodeInstanceId === binding.nodeInstanceId
+	) {
+		return 'incoming';
+	}
+	return undefined;
+}
+
+function dashboardTaskBindingKey(binding: DashboardTaskBinding): string {
+	return `${binding.ownerId}:${binding.taskId}:${binding.direction}`;
+}
+
+function safeDashboardLabel(value: string, fallback: string): string {
+	return containsUnsafeDashboardText(value) ? fallback : value;
+}
+
+function compareDashboardTimestampsDescending(left: string, right: string): number {
+	const leftTime = Date.parse(left);
+	const rightTime = Date.parse(right);
+	if (Number.isFinite(leftTime) && Number.isFinite(rightTime)) {
+		return rightTime - leftTime;
+	}
+	return right.localeCompare(left);
 }
 
 function requireRoutedSnapshot<T extends TaskSnapshot | TaskSnapshotAfterEventSeq>(

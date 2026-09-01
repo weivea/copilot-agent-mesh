@@ -36,6 +36,12 @@ checks immediately before route lease acquisition. Direct starts distinguish
 `PEER_MULTI_WORKSPACE`; the filtered list never reveals which failed gate hid a
 candidate.
 
+The five Language Model Tools are registered only while that Preview setting is
+enabled; disabling it disposes their registrations. The Dashboard remains
+available for base device/Workspace/Broker safety state, while its receive and
+allowlist controls become unavailable. Configuration uses the separate
+unfiltered candidate RPC and never weakens `mesh_list_workers` filtering.
+
 Policy configuration uses a separate authenticated RPC surface. A multi-root
 window may pass one of its own claimed `workspaceIdentity` values to
 `node.policy.get` to read and update each policy independently; the Broker

@@ -1,24 +1,17 @@
 import { DashboardSnapshot } from './DashboardFacade';
 import { redactRemoteText } from './DashboardRedaction';
+import { timestampSchema } from '../../shared/protocol';
 
 const dashboardStringBytes = 2 * 1_024;
 
-type DashboardTask = DashboardSnapshot['tasks'][number];
-type DashboardTaskViewModel = Omit<DashboardTask, 'summary' | 'summaryTruncated'> & {
-	readonly summary?: string;
-	readonly summaryTruncated: boolean;
-};
-
 export interface DashboardViewModel {
-	readonly device: DashboardSnapshot['device'];
+	readonly device: Omit<DashboardSnapshot['device'], 'deviceId'>;
 	readonly listener: DashboardSnapshot['listener'];
 	readonly broker: NonNullable<DashboardSnapshot['broker']>;
 	readonly thisWindow: DashboardSnapshot['thisWindow'];
-	readonly localNodes: readonly NonNullable<DashboardSnapshot['localNodes']>[number][];
-	readonly remoteDevices: readonly NonNullable<DashboardSnapshot['remoteDevices']>[number][];
-	readonly workspaces: DashboardSnapshot['workspaces'];
-	readonly peers: DashboardSnapshot['peers'];
-	readonly tasks: readonly DashboardTaskViewModel[];
+	readonly localNodes: readonly NonNullable<DashboardSnapshot['policyCandidates']>[number][];
+	readonly outgoingTasks: readonly NonNullable<DashboardSnapshot['outgoingTasks']>[number][];
+	readonly incomingTasks: readonly NonNullable<DashboardSnapshot['incomingTasks']>[number][];
 	readonly errors: DashboardSnapshot['errors'];
 }
 
@@ -26,8 +19,11 @@ export class DashboardPresenter {
 	public present(snapshot: DashboardSnapshot): DashboardViewModel {
 		return {
 			device: {
-				...snapshot.device,
 				name: redactRemoteText(snapshot.device.name),
+				platform: redactRemoteText(snapshot.device.platform),
+				architecture: redactRemoteText(snapshot.device.architecture),
+				vscodeVersion: redactRemoteText(snapshot.device.vscodeVersion),
+				extensionVersion: redactRemoteText(snapshot.device.extensionVersion),
 			},
 			listener: {
 				...snapshot.listener,
@@ -50,36 +46,19 @@ export class DashboardPresenter {
 				name: redactRemoteText(snapshot.thisWindow.name),
 				workspaceName: redactRemoteText(snapshot.thisWindow.workspaceName),
 				detail: optionalRedacted(snapshot.thisWindow.detail),
+				agentHost: {
+					...snapshot.thisWindow.agentHost,
+					label: redactRemoteText(snapshot.thisWindow.agentHost.label),
+					detail: optionalRedacted(snapshot.thisWindow.agentHost.detail),
+				},
 			},
-			localNodes: (snapshot.localNodes ?? []).map(redactNode),
-			remoteDevices: (snapshot.remoteDevices ?? []).map((device) => ({
-				...device,
-				name: redactRemoteText(device.name),
-				nodes: device.nodes.map(redactNode),
+			localNodes: (snapshot.policyCandidates ?? []).map((candidate) => ({
+				...candidate,
+				windowLabel: redactRemoteText(candidate.windowLabel),
+				workspaceName: redactRemoteText(candidate.workspaceName),
 			})),
-			workspaces: snapshot.workspaces.map((workspace) => ({
-				...workspace,
-				name: redactRemoteText(workspace.name),
-				capabilityTags: workspace.capabilityTags.map(redactRemoteText),
-			})),
-			peers: snapshot.peers.map((peer) => ({
-				...peer,
-				name: redactRemoteText(peer.name),
-				lastSeenLabel: optionalRedacted(peer.lastSeenLabel),
-			})),
-			tasks: snapshot.tasks.map((task) => {
-				const summary = redactAndTruncate(task.summary);
-				return {
-					...task,
-					title: redactRemoteText(task.title),
-					peerName: redactRemoteText(task.peerName),
-					workspaceName: redactRemoteText(task.workspaceName),
-					phase: optionalRedacted(task.phase),
-					summary: summary.value,
-					summaryTruncated: task.summaryTruncated === true || summary.truncated,
-					error: task.error === undefined ? undefined : redactError(task.error),
-				};
-			}),
+			outgoingTasks: (snapshot.outgoingTasks ?? []).map(redactDashboardTask),
+			incomingTasks: (snapshot.incomingTasks ?? []).map(redactDashboardTask),
 			errors: snapshot.errors.map(redactError),
 		};
 	}
@@ -94,18 +73,28 @@ function redactBroker(
 	};
 }
 
-function redactNode(
-	node: NonNullable<DashboardSnapshot['localNodes']>[number],
-): NonNullable<DashboardSnapshot['localNodes']>[number] {
+function redactDashboardTask(
+	task: NonNullable<DashboardSnapshot['outgoingTasks']>[number],
+): NonNullable<DashboardSnapshot['outgoingTasks']>[number] {
 	return {
-		...node,
-		label: redactRemoteText(node.label),
-		workspaces: node.workspaces.map((workspace) => ({
-			...workspace,
-			name: redactRemoteText(workspace.name),
-			capabilityTags: workspace.capabilityTags.map(redactRemoteText),
-		})),
+		...task,
+		counterpartLabel: redactRemoteText(task.counterpartLabel),
+		workspaceName: redactRemoteText(task.workspaceName),
+		title: redactAndTruncate(task.title).value ?? 'Delegated task',
+		startedAt: normalizeDashboardTimestamp(task.startedAt),
 	};
+}
+
+function normalizeDashboardTimestamp(value: string): string {
+	if (!timestampSchema.safeParse(value).success) {
+		return 'Unknown';
+	}
+	const timestamp = Date.parse(value);
+	if (!Number.isFinite(timestamp)) {
+		return 'Unknown';
+	}
+	const canonical = new Date(timestamp).toISOString();
+	return /^\d{4}-\d{2}-\d{2}T/u.test(canonical) ? canonical : 'Unknown';
 }
 
 function redactComponent(component: DashboardSnapshot['listener']['gateway']): DashboardSnapshot['listener']['gateway'] {

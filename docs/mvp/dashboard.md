@@ -3,9 +3,12 @@
 The dashboard is a secure presentation and command surface. It does not own device,
 listener, tunnel, workspace, peer, or task state.
 
-P3 adds a `This Window` panel with the effective window label, current Workspace
-display name, claim status, Preview status, and rename control. The control is
-disabled while the default-off Peer Delegation Preview is disabled. The strict
+P7 provides `This Window`, `Accept Incoming Tasks`, `Local Window Nodes`,
+`Outgoing Tasks`, and `Incoming Tasks`. `This Window` keeps the P3 effective
+window label, current Workspace display name, claim status, Preview status, and
+rename control. It also shows the P6 Agent Host source as `Editor`,
+`Standalone (degraded)`, or an explicit unavailable/not-yet-selected state. The
+controls are disabled while the default-off Peer Delegation Preview is disabled. The strict
 `renameWindow` Webview action carries no name, path, Workspace ID, or
 `workspaceIdentity`; the Extension Host collects the name and derives the
 caller-owned claimed Workspace through `ProductionDashboardBindings` and
@@ -17,7 +20,7 @@ revalidates that Preview remains enabled and the live claimed/active Workspace
 still matches that identity. A changed or ambiguous selection fails with
 `WORKSPACE_SELECTION_AMBIGUOUS`; it never retargets the rename.
 
-The existing Dashboard reads `node.dashboard.list`, not Tool-facing
+The base safety Dashboard reads `node.dashboard.list`, not Tool-facing
 `node.list`. This safe unfiltered projection preserves this-window identity,
 Workspace claim/conflict and busy state, active task naming, and
 directory-truncation warnings even while peer delegation is disabled or no
@@ -29,8 +32,61 @@ Otherwise the active editor's Workspace must uniquely match an own claim; an
 ambiguous selection fails explicitly rather than mutating an arbitrary policy.
 Selection matches both the original VS Code Workspace URI and its canonical
 execution URI so symlinked roots retain stable active-Workspace provenance.
-Successful writes broadcast `node.policy.changed`, so all open dashboards
-re-render without reload.
+Successful writes broadcast `node.policy.changed`, and task/topology/source
+changes use event notifications, so all open dashboards re-render without
+polling or reload.
+
+The peer configuration list is intentionally broader than `mesh_list_workers`.
+It shows every same-device candidate and its online, accept, busy, claim, and
+double-gate state, including self where useful and persisted offline allowlist
+entries. A checked box changes only the current source Workspace's `A -> B`
+allowlist. It never grants `B -> A`.
+
+Candidate and task mutations use two layers of one-time opaque handles. The
+Broker handle is scoped to the authenticated IPC Session and binds the exact
+source policy plus stable target identity/current Node instance, or exact task
+ID plus incoming/outgoing authorization path. The View provider wraps it in a
+fresh `uiInstanceId`-scoped handle on every publication. Refresh, topology or
+policy changes, successful/failed consumption, replay, cross-view use, wrong
+direction, and disposal fail closed. No label or short ID authorizes a mutation.
+Offline saved targets can only be unchecked.
+
+Task cancellation redeems the visible action handle into a separate bounded
+in-flight reservation before the Extension Host opens its confirmation modal.
+That reservation survives ordinary snapshot refreshes, is consumed by cancel,
+and is explicitly released when the user declines. Commit revalidates active
+state, exact owner/target route, and Broker lifecycle generation, so status or
+takeover changes cannot retarget an already displayed confirmation.
+
+Active task handles are stable for the same exact owner, task, direction, route,
+and UI instance across manual refreshes and non-identity output/progress/tool
+events. Terminal state or topology/ownership changes invalidate them. The
+Broker rebuilds a bounded generation-scoped Dashboard task index from one
+startup scan, then updates it only from durable task transitions. Dashboard
+reads do not scan task files. State notifications are coalesced per session and
+event loop; non-state event bursts do not trigger Dashboard publication.
+Each of the 1,000 maximum index entries is a frozen, schema-validated projection
+bounded to 1 KiB. It contains only the task/owner/source/target/workspace,
+state, safe title, and timestamps required by the Dashboard; event journals,
+output, input payloads, failures, answers, recovery data, artifacts, and grants
+are never retained or cloned. Cancellation authorization re-reads the exact
+authoritative task record and live route at reserve and commit.
+
+Outgoing tasks are selected by exact source Node ownership; incoming tasks are
+selected by exact target Node instance. Their Webview records contain only a
+safe counterpart label, Workspace display name, bounded sanitized title,
+authoritative status, start time, and eight-character display ID. Raw prompts,
+output, artifacts, paths, complete identities, and task UUIDs are absent.
+Incoming cancel uses target authorization; outgoing cancel uses owner
+authorization. Remote outgoing snapshots are refreshed by the same authoritative
+task notifications and retained in a bounded per-window cache; merged task
+collections are sorted and truncated to the strict 500-item UI limit with an
+explicit warning. Dashboard has no answer-input path.
+
+Task timestamps are normalized from every protocol-valid offset/fraction form
+to canonical UTC ISO with three millisecond digits before outbound safety
+inspection. Malformed or out-of-display-range values become the explicit
+`Unknown` field value instead of rejecting the rest of the Dashboard.
 
 P6 exposes an Agent Host source status provider with typed `editor | standalone`
 source, a bounded degradation enum/message, and change notifications wired into the
@@ -54,8 +110,9 @@ composition root should adapt the real stores and application services to
 | `startListener` / `stopListener` | Drive the real gateway and tunnel lifecycle |
 | `copyConnectionUrl` | Obtain the one-time URL and write it directly with `vscode.env.clipboard`; never return or post it to the webview |
 | `addPeer` / `removePeer` | Collect the URL in Extension Host UI, enroll it, or confirm and revoke by `peerId` |
-| `runTask` | Collect the full task prompt in Extension Host UI and call the coordinator with optional safe peer/workspace IDs |
-| `cancelTask` | Confirm locally and cancel by `taskId` |
+| `setAcceptIncoming` | Resolve the current exact owned Workspace in Extension Host and update only its receive policy |
+| `setPeerAllowed` | Redeem a one-time Broker candidate handle for one directional allow/revoke mutation |
+| `cancelDashboardTask` | Confirm locally and redeem a direction-bound one-time task handle |
 
 Destructive confirmations are a Facade responsibility and therefore remain an
 Extension Host security boundary. This includes listener stop, workspace/peer

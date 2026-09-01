@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 
 import type * as vscode from 'vscode';
 import { z } from 'zod';
@@ -8,13 +8,14 @@ import {
 	JSON_RPC_ERROR_CODES,
 	PROTOCOL_LIMITS,
 	utf8String,
+	type DashboardTaskDirection,
 } from '../../shared/protocol';
 import type {
 	MeshDeviceToolSummary,
 	MeshRemoteDirectorySnapshot,
 	MeshWorkerDirectorySnapshot,
 } from '../../shared/toolProtocol';
-import type { AgentRuntime } from '../agentHost/AgentRuntime';
+import type { AgentRuntime, AgentRuntimeProbe } from '../agentHost/AgentRuntime';
 import type { LocalDesktopWorkspaceGuard } from '../application/LocalDesktopWorkspaceGuard';
 import type { WorkerPlatformSupport } from '../application/WorkerPlatformSupport';
 import type {
@@ -27,6 +28,7 @@ import type { DeviceProfile } from '../storage/DeviceProfileStore';
 import type { LocalBrokerTaskFacade } from '../tools/LocalBrokerTaskFacade';
 import type {
 	DashboardNodeSnapshot,
+	DashboardTaskSummarySnapshot,
 	DashboardServiceBindings,
 	DashboardSnapshot,
 	DashboardTaskTarget,
@@ -42,6 +44,11 @@ import type { ProductionBrokerRuntime } from './ProductionBrokerRuntime';
 
 const activeTaskStates = new Set<string>(ACTIVE_TASK_STATUSES);
 
+interface RemoteTaskActionBinding {
+	readonly taskId: string;
+	readonly lifecycleGeneration: string;
+}
+
 export interface ProductionDashboardBindingsOptions {
 	readonly vscodeApi: typeof vscode;
 	readonly changed: vscode.EventEmitter<void>;
@@ -49,7 +56,7 @@ export interface ProductionDashboardBindingsOptions {
 	readonly node: WindowNodeClient;
 	readonly localTasks: LocalBrokerTaskFacade;
 	readonly remoteTasks: LocalIpcRemoteTaskAdapter;
-	readonly runtime: AgentRuntime;
+	readonly runtime: () => AgentRuntime;
 	readonly guard: LocalDesktopWorkspaceGuard;
 	readonly workerPlatform: WorkerPlatformSupport;
 	readonly lifecycle: BrokerLifecycle<ProductionBrokerRuntime>;
@@ -58,18 +65,34 @@ export interface ProductionDashboardBindingsOptions {
 
 export class ProductionDashboardBindings implements DashboardServiceBindings, vscode.Disposable {
 	private readonly subscriptions: Array<{ dispose(): void }> = [];
+	private readonly acceptActions = new Map<string, {
+		readonly workspaceIdentity: string;
+		readonly workspaceId: string;
+	}>();
+	private readonly remoteTaskActions = new Map<string, RemoteTaskActionBinding>();
+	private readonly remoteTaskHandlesById = new Map<string, string>();
+	private remoteHandleGeneration = 'uninitialized';
 
 	public constructor(private readonly options: ProductionDashboardBindingsOptions) {
 		this.subscriptions.push(
 			options.node.onDidChange(() => options.changed.fire()),
-			options.lifecycle.onDidChange(() => options.changed.fire()),
+			options.lifecycle.onDidChange(() => {
+				this.refreshRemoteHandleGeneration();
+				options.changed.fire();
+			}),
 		);
+		const onDidChangeActiveTextEditor = options.vscodeApi.window.onDidChangeActiveTextEditor;
+		if (typeof onDidChangeActiveTextEditor === 'function') {
+			this.subscriptions.push(onDidChangeActiveTextEditor(() => options.changed.fire()));
+		}
 	}
 
 	public readonly onDidChange = (listener: () => void): vscode.Disposable =>
 		this.options.changed.event(listener);
 
 	public async getSnapshot(): Promise<DashboardSnapshot> {
+		this.acceptActions.clear();
+		this.refreshRemoteHandleGeneration();
 		this.options.guard.assertAllowed({ requireWorkspace: false });
 		const profile = this.options.profile();
 		const owner = this.options.ownerRuntime();
@@ -109,7 +132,10 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 				});
 			}
 		}
-		const thisWindow = await this.thisWindowSnapshot(localNodes, errors);
+		const policySelection = this.options.node.selectPeerPolicyWorkspace(
+			this.activeWorkspaceUri(),
+		);
+		const thisWindowBase = await this.thisWindowSnapshot(localNodes, errors, policySelection);
 
 		let remoteDirectory: MeshRemoteDirectorySnapshot = {
 			devices: [],
@@ -162,12 +188,91 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 			}),
 		);
 
-		const runtimeProbe = await this.options.runtime.probe().catch(() => ({
-			available: false,
-			featureEnabled: false,
-			reason: 'AGENT_UNAVAILABLE' as const,
-		}));
+		const runtimeProbe: AgentRuntimeProbe = thisWindowBase.previewEnabled
+			? await this.options.runtime().probe().catch(() => ({
+				available: false,
+				featureEnabled: false,
+				reason: 'AGENT_UNAVAILABLE' as const,
+			}))
+			: {
+				available: false,
+				featureEnabled: false,
+				reason: 'AGENT_UNAVAILABLE',
+			};
 		const listener = listenerSnapshot(owner, runtimeProbe, this.options.workerPlatform);
+		const thisWindow: DashboardSnapshot['thisWindow'] = {
+			...thisWindowBase,
+			...(thisWindowBase.canSetAcceptIncoming && policySelection.kind === 'selected'
+				? {
+					acceptActionHandle: this.issueBindingHandle(this.acceptActions, {
+						workspaceIdentity: policySelection.workspaceIdentity,
+						workspaceId: policySelection.workspaceId,
+					}),
+				}
+				: {}),
+			agentHost: !thisWindowBase.previewEnabled ? {
+				source: 'unavailable',
+				label: 'Unavailable (Preview off)',
+				degraded: false,
+				detail: 'Enable Peer Delegation Preview before an Agent Host source is selected.',
+			} : {
+				source: runtimeProbe.source === 'editor'
+					? 'editor'
+					: runtimeProbe.source === 'standalone' ? 'standalone' : 'unavailable',
+				label: listener.agentHost.label,
+				degraded: runtimeProbe.degradation !== undefined,
+				...(runtimeProbe.degradation === undefined ? {} : {
+					reason: runtimeProbe.degradation.reason,
+					detail: runtimeProbe.degradation.message,
+				}),
+			},
+		};
+		let policyCandidates: NonNullable<DashboardSnapshot['policyCandidates']> = [];
+		if (thisWindow.previewEnabled && policySelection.kind === 'selected') {
+			try {
+				const candidates = await this.options.node.listPeerPolicyCandidates(
+					policySelection.workspaceIdentity,
+				);
+				policyCandidates = candidates.candidates;
+				if (candidates.truncated) {
+					errors.push({
+						code: 'PEER_CANDIDATES_TRUNCATED',
+						message: 'The local peer candidate list reached its safe display bound.',
+						action: 'Close stale Window Nodes and refresh.',
+					});
+				}
+			} catch {
+				errors.push({
+					code: 'PEER_CANDIDATES_UNAVAILABLE',
+					message: 'Local peer policy candidates could not be refreshed.',
+					action: 'Wait for Broker takeover or refresh the dashboard.',
+				});
+			}
+		}
+		let outgoingTasks: NonNullable<DashboardSnapshot['outgoingTasks']> = [];
+		let incomingTasks: NonNullable<DashboardSnapshot['incomingTasks']> = [];
+		try {
+			const dashboardTasks = await this.options.node.listDashboardTasks();
+			outgoingTasks = dashboardTasks.tasks
+				.filter(({ direction }) => direction === 'outgoing')
+				.map(({ direction: _direction, ...task }) => task);
+			incomingTasks = dashboardTasks.tasks
+				.filter(({ direction }) => direction === 'incoming')
+				.map(({ direction: _direction, ...task }) => task);
+			if (dashboardTasks.truncated) {
+				errors.push({
+					code: 'DASHBOARD_TASKS_TRUNCATED',
+					message: 'The Dashboard task list reached its safe display bound.',
+					action: 'Refresh after older tasks expire.',
+				});
+			}
+		} catch {
+			errors.push({
+				code: 'DASHBOARD_TASKS_UNAVAILABLE',
+				message: 'Incoming and outgoing task status could not be refreshed.',
+				action: 'Wait for Broker reconnection or refresh the dashboard.',
+			});
+		}
 		if (lifecycle.error !== undefined) {
 			errors.push({
 				code: lifecycle.error.code,
@@ -183,60 +288,15 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 			});
 		}
 
-		const records = owner === undefined
-			? []
-			: await owner.tasks.list().catch(() => {
-				errors.push({
-					code: 'TASK_RECOVERY_READ_FAILED',
-					message: 'Persisted task recovery state could not be read.',
-					action: 'Refresh after Broker takeover completes.',
-				});
-				return [];
-			});
 		const allNodes = [...localNodes, ...remoteDevices.flatMap(({ nodes }) => nodes)];
-		const nodeNames = new Map(allNodes.map((node) => [node.nodeId, node.label]));
 		const workspaceNames = new Map(
 			allNodes.flatMap((node) =>
 				node.workspaces.map((workspace) => [workspace.workspaceId, workspace.name] as const),
 			),
 		);
 		const remoteNames = new Map(remoteDevices.map((device) => [device.deviceId, device.name]));
-		const localTasks: DashboardSnapshot['tasks'] = records.map((record) => {
-			const target = record.schemaVersion === 2 ? record.target : undefined;
-			const ownedByThisNode = record.schemaVersion === 2
-				&& record.peerId === profile.deviceId
-				&& record.sourceNodeId === this.options.node.nodeId;
-			const safeFailure = record.failure === undefined ? undefined : {
-				code: record.failure.code,
-				message: 'The task failed. Open its owning Window Node for diagnostic details.',
-				action: record.failure.retryable ? 'Retry with a new delegation request.' : undefined,
-			};
-			if (record.failure?.code === 'TASK_RECOVERY_UNAVAILABLE') {
-				errors.push({
-					code: 'TASK_RECOVERY_UNAVAILABLE',
-					message: 'A task could not recover after its Window Node disconnected.',
-					action: 'Retry the task on an online Window Node.',
-				});
-			}
-			return {
-				taskId: record.taskId,
-				title: record.title,
-				peerName: target?.deviceId === profile.deviceId
-					? 'This Device'
-					: remoteNames.get(target?.deviceId ?? '') ?? 'Connected coordinator',
-				workspaceName: workspaceNames.get(record.workspaceId) ?? 'Registered workspace',
-				state: record.state,
-				phase: target?.nodeId === undefined
-					? undefined
-					: `Window Node: ${nodeNames.get(target.nodeId) ?? 'Unavailable'}`,
-				canCancel: ownedByThisNode && activeTaskStates.has(record.state),
-				needsInput: ownedByThisNode && record.state === 'needsInput',
-				error: safeFailure,
-			};
-		});
-		const localTaskIds = new Set(localTasks.map(({ taskId }) => taskId));
-		const remoteTasks: DashboardSnapshot['tasks'] = this.options.remoteTasks.listKnownTasks()
-			.filter((snapshot) => !localTaskIds.has(snapshot.taskId))
+		const knownRemoteTasks = this.options.remoteTasks.listKnownTasks();
+		const remoteTasks: DashboardSnapshot['tasks'] = knownRemoteTasks
 			.map((snapshot) => ({
 				taskId: snapshot.taskId,
 				title: snapshot.title,
@@ -252,7 +312,44 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 					action: snapshot.failure.retryable ? 'Retry with a new delegation request.' : undefined,
 				},
 			}));
-		const tasks: DashboardSnapshot['tasks'] = [...localTasks, ...remoteTasks];
+		const reservedTaskHandles = new Set(
+			[...outgoingTasks, ...incomingTasks]
+				.flatMap(({ actionHandle }) => actionHandle === undefined ? [] : [actionHandle]),
+		);
+		const retainedRemoteTaskIds = new Set(
+			knownRemoteTasks
+				.filter(({ state }) => activeTaskStates.has(state))
+				.map(({ taskId }) => taskId),
+		);
+		this.pruneRemoteTaskActions(retainedRemoteTaskIds);
+		const remoteDashboardTasks: DashboardTaskSummarySnapshot[] = knownRemoteTasks.map((snapshot) => {
+			const canCancel = activeTaskStates.has(snapshot.state);
+			return {
+				...(canCancel ? {
+					actionHandle: this.stableRemoteTaskHandle(snapshot.taskId, reservedTaskHandles),
+				} : {}),
+				counterpartLabel: remoteNames.get(snapshot.deviceId) ?? 'Remote Device',
+				workspaceName: workspaceNames.get(snapshot.workspaceId) ?? 'Remote Workspace',
+				title: snapshot.title,
+				state: snapshot.state,
+				startedAt: snapshot.createdAt,
+				shortId: snapshot.taskId.slice(0, 8),
+				canCancel,
+			};
+		});
+		const combinedOutgoingTasks = [...outgoingTasks, ...remoteDashboardTasks]
+			.sort((left, right) =>
+				compareDashboardTimestampsDescending(left.startedAt, right.startedAt)
+			);
+		if (combinedOutgoingTasks.length > 500) {
+			errors.push({
+				code: 'DASHBOARD_TASKS_TRUNCATED',
+				message: 'The outgoing task list reached its safe display bound.',
+				action: 'Refresh after older tasks expire.',
+			});
+		}
+		outgoingTasks = combinedOutgoingTasks.slice(0, 500);
+		const tasks: DashboardSnapshot['tasks'] = remoteTasks;
 		const legacyWorkspaces = uniqueWorkspaces(localNodes);
 		const broker = brokerSnapshot(lifecycle);
 		return {
@@ -266,6 +363,9 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 			},
 			broker,
 			thisWindow,
+			policyCandidates,
+			outgoingTasks,
+			incomingTasks,
 			listener,
 			localNodes,
 			remoteDevices,
@@ -363,6 +463,158 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 		};
 	}
 
+	public async setAcceptIncoming(actionHandle: string, enabled: boolean): Promise<void> {
+		this.options.guard.assertAllowed({ requireWorkspace: false });
+		if (!this.peerDelegationEnabled()) {
+			throw new DashboardActionError(
+				'PEER_DELEGATION_DISABLED',
+				'Enable the Peer Delegation Preview before accepting incoming tasks.',
+			);
+		}
+		const binding = this.acceptActions.get(actionHandle);
+		this.acceptActions.delete(actionHandle);
+		if (binding === undefined) {
+			throw new DashboardActionError(
+				'STALE_ACTION',
+				'This receive-policy action is stale. Refresh the Dashboard and try again.',
+			);
+		}
+		const selection = this.requirePolicySelection();
+		if (
+			selection.workspaceIdentity !== binding.workspaceIdentity
+			|| selection.workspaceId !== binding.workspaceId
+		) {
+			throw new DashboardActionError(
+				'WORKSPACE_SELECTION_AMBIGUOUS',
+				'The active Workspace changed. Refresh the Dashboard before changing its receive policy.',
+			);
+		}
+		try {
+			await this.options.node.setPeerPolicy({
+				workspaceIdentity: selection.workspaceIdentity,
+				acceptsIncoming: enabled,
+			});
+		} catch (error: unknown) {
+			throw toDashboardPolicyError(error);
+		}
+		this.options.changed.fire();
+	}
+
+	public async setPeerAllowed(actionHandle: string, allowed: boolean): Promise<void> {
+		this.options.guard.assertAllowed({ requireWorkspace: false });
+		if (!this.peerDelegationEnabled()) {
+			throw new DashboardActionError(
+				'PEER_DELEGATION_DISABLED',
+				'Enable the Peer Delegation Preview before changing peer access.',
+			);
+		}
+		const selection = this.requirePolicySelection();
+		try {
+			await this.options.node.setPeerPolicyCandidate(
+				selection.workspaceIdentity,
+				actionHandle,
+				allowed,
+			);
+		} catch (error: unknown) {
+			throw toDashboardPolicyError(error);
+		}
+		this.options.changed.fire();
+	}
+
+	public async prepareDashboardTaskCancellation(
+		actionHandle: string,
+		direction: DashboardTaskDirection,
+	): Promise<{
+		cancel(): Promise<void>;
+		release(): Promise<void>;
+	}> {
+		const remoteBinding = this.remoteTaskActions.get(actionHandle);
+		this.remoteTaskActions.delete(actionHandle);
+		if (remoteBinding !== undefined) {
+			this.remoteTaskHandlesById.delete(remoteBinding.taskId);
+		}
+		if (remoteBinding !== undefined) {
+			if (direction !== 'outgoing') {
+				throw new DashboardActionError(
+					'STALE_ACTION',
+					'The task action does not match its Dashboard direction.',
+				);
+			}
+			if (remoteBinding.lifecycleGeneration !== this.currentRemoteHandleGeneration()) {
+				throw new DashboardActionError(
+					'STALE_ACTION',
+					'The Broker ownership generation changed. Refresh the Dashboard and try again.',
+				);
+			}
+			const remoteTaskId = remoteBinding.taskId;
+			return {
+				cancel: async () => {
+					if (remoteBinding.lifecycleGeneration !== this.currentRemoteHandleGeneration()) {
+						throw new DashboardActionError(
+							'STALE_ACTION',
+							'The Broker ownership generation changed while confirming cancellation.',
+						);
+					}
+					const current = this.options.remoteTasks.listKnownTasks().find(
+						({ taskId }) => taskId === remoteTaskId,
+					);
+					if (current === undefined || !activeTaskStates.has(current.state)) {
+						throw new DashboardActionError(
+							'STALE_ACTION',
+							'The remote task is no longer cancellable.',
+						);
+					}
+					const controller = deadlineSignal(10_000);
+					try {
+						const snapshot = await this.options.remoteTasks.cancelTask(
+							remoteTaskId,
+							controller.signal,
+						);
+						if (snapshot?.taskId !== remoteTaskId) {
+							throw new DashboardActionError(
+								'TASK_NOT_FOUND',
+								'The remote task is no longer available to this window.',
+							);
+						}
+					} finally {
+						controller.abort();
+					}
+					this.options.changed.fire();
+				},
+				release: async () => undefined,
+			};
+		}
+		let reservation;
+		try {
+			reservation = await this.options.node.reserveDashboardTask(actionHandle, direction);
+		} catch (error: unknown) {
+			throw toDashboardTaskError(error);
+		}
+		return {
+			cancel: async () => {
+				try {
+					await this.options.node.cancelDashboardTask(
+						reservation.reservationHandle,
+						direction,
+					);
+				} catch (error: unknown) {
+					throw toDashboardTaskError(error);
+				}
+				this.options.changed.fire();
+			},
+			release: async () => {
+				try {
+					await this.options.node.releaseDashboardTask(
+						reservation.reservationHandle,
+						direction,
+					);
+				} catch (error: unknown) {
+					throw toDashboardTaskError(error);
+				}
+			},
+		};
+	}
+
 	public async registerCurrentWorkspace(): Promise<void> {
 		this.options.guard.assertAllowed();
 		await this.options.node.refreshWorkspaces();
@@ -451,6 +703,9 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 	}
 
 	public dispose(): void {
+		this.acceptActions.clear();
+		this.remoteTaskActions.clear();
+		this.remoteTaskHandlesById.clear();
 		for (const subscription of this.subscriptions.splice(0)) {
 			subscription.dispose();
 		}
@@ -459,11 +714,9 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 	private async thisWindowSnapshot(
 		localNodes: readonly DashboardNodeSnapshot[],
 		errors: DashboardSnapshot['errors'][number][],
+		selection: ReturnType<WindowNodeClient['selectPeerPolicyWorkspace']>,
 	): Promise<DashboardSnapshot['thisWindow']> {
 		const previewEnabled = this.peerDelegationEnabled();
-		const selection = this.options.node.selectPeerPolicyWorkspace(
-			this.activeWorkspaceUri(),
-		);
 		const node = localNodes.find(({ thisWindow }) => thisWindow);
 		if (selection.kind !== 'selected') {
 			const workspaceName = resolveWindowDisplayName(
@@ -477,6 +730,9 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 				claimStatus: selection.claimStatus,
 				previewEnabled,
 				canRename: false,
+				acceptsIncoming: false,
+				canSetAcceptIncoming: false,
+				agentHost: unavailableAgentHostSnapshot(),
 				detail: selection.claimStatus === 'ambiguous'
 					? 'Select an editor in one claimed Workspace before renaming.'
 					: 'This window does not have a mutable claimed Workspace.',
@@ -494,6 +750,8 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 			? node.label
 			: resolveWindowDisplayName(undefined, workspaceName, this.options.node.nodeId);
 		let canRename = previewEnabled;
+		let acceptsIncoming = false;
+		let canSetAcceptIncoming = previewEnabled;
 		if (previewEnabled) {
 			try {
 				const policy = await this.options.node.getPeerPolicy(selection.workspaceIdentity);
@@ -502,8 +760,10 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 					workspaceName,
 					this.options.node.nodeId,
 				);
+				acceptsIncoming = policy.acceptsIncoming;
 			} catch {
 				canRename = false;
+				canSetAcceptIncoming = false;
 				errors.push({
 					code: 'PEER_POLICY_UNAVAILABLE',
 					message: 'This window policy is reconnecting.',
@@ -517,6 +777,9 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 			claimStatus: 'claimed',
 			previewEnabled,
 			canRename,
+			acceptsIncoming,
+			canSetAcceptIncoming,
+			agentHost: unavailableAgentHostSnapshot(),
 			...(previewEnabled ? {} : {
 				detail: 'Enable copilotAgentMesh.experimental.peerDelegation to rename this window.',
 			}),
@@ -533,6 +796,86 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 	private peerDelegationEnabled(): boolean {
 		return this.options.vscodeApi.workspace.getConfiguration('copilotAgentMesh')
 			.get<boolean>('experimental.peerDelegation', false);
+	}
+
+	private requirePolicySelection(): Extract<
+		ReturnType<WindowNodeClient['selectPeerPolicyWorkspace']>,
+		{ kind: 'selected' }
+	> {
+		const selection = this.options.node.selectPeerPolicyWorkspace(
+			this.activeWorkspaceUri(),
+		);
+		if (selection.kind !== 'selected') {
+			throw renameSelectionError(selection.claimStatus);
+		}
+		return selection;
+	}
+
+	private issueBindingHandle<T>(
+		actions: Map<string, T>,
+		value: T,
+		forbidden: ReadonlySet<string> = new Set(),
+	): string {
+		if (actions.size >= 500) {
+			throw new DashboardActionError(
+				'STALE_ACTION',
+				'The Dashboard action registry reached its safe bound. Refresh and try again.',
+			);
+		}
+		let handle: string;
+		do {
+			handle = randomBytes(24).toString('base64url');
+		} while (actions.has(handle) || forbidden.has(handle));
+		actions.set(handle, value);
+		return handle;
+	}
+
+	private stableRemoteTaskHandle(
+		taskId: string,
+		forbidden: ReadonlySet<string>,
+	): string {
+		const existing = this.remoteTaskHandlesById.get(taskId);
+		const existingBinding = existing === undefined
+			? undefined
+			: this.remoteTaskActions.get(existing);
+		if (
+			existing !== undefined
+			&& existingBinding?.taskId === taskId
+			&& existingBinding.lifecycleGeneration === this.remoteHandleGeneration
+		) {
+			return existing;
+		}
+		const handle = this.issueBindingHandle(this.remoteTaskActions, {
+			taskId,
+			lifecycleGeneration: this.remoteHandleGeneration,
+		}, forbidden);
+		this.remoteTaskHandlesById.set(taskId, handle);
+		return handle;
+	}
+
+	private pruneRemoteTaskActions(retainedTaskIds: ReadonlySet<string>): void {
+		for (const [taskId, handle] of this.remoteTaskHandlesById) {
+			if (retainedTaskIds.has(taskId)) {
+				continue;
+			}
+			this.remoteTaskHandlesById.delete(taskId);
+			this.remoteTaskActions.delete(handle);
+		}
+	}
+
+	private currentRemoteHandleGeneration(): string {
+		const snapshot = this.options.lifecycle.snapshot();
+		return `${snapshot.generation ?? 'none'}:${snapshot.ownership?.generation ?? 'none'}:${snapshot.state}`;
+	}
+
+	private refreshRemoteHandleGeneration(): void {
+		const generation = this.currentRemoteHandleGeneration();
+		if (generation === this.remoteHandleGeneration) {
+			return;
+		}
+		this.remoteHandleGeneration = generation;
+		this.remoteTaskActions.clear();
+		this.remoteTaskHandlesById.clear();
 	}
 
 	private requireOwner(): ProductionBrokerRuntime {
@@ -649,9 +992,10 @@ function toDashboardPolicyError(error: unknown): Error {
 					? 'Another Workspace already uses an equivalent window name.'
 					: reason === 'WINDOW_NAME_INVALID'
 						? 'The window name contains a path, invisible character, or secret-like value.'
-						: 'Only a Workspace claimed by this window can be renamed.',
+						: 'The policy action is stale or does not belong to the current Workspace.',
 			);
 		}
+
 		if (error.code === JSON_RPC_ERROR_CODES.INVALID_PARAMS) {
 			return new DashboardActionError(
 				'WINDOW_NAME_INVALID',
@@ -662,6 +1006,21 @@ function toDashboardPolicyError(error: unknown): Error {
 	return error instanceof Error
 		? error
 		: new Error('The window rename failed without diagnostic details.');
+}
+
+function toDashboardTaskError(error: unknown): Error {
+	if (error instanceof LocalIpcRemoteError) {
+		const reason = remoteErrorReason(error);
+		if (reason === 'TASK_NOT_FOUND') {
+			return new DashboardActionError(
+				'STALE_ACTION',
+				'This task action is stale. Refresh the Dashboard and try again.',
+			);
+		}
+	}
+	return error instanceof Error
+		? error
+		: new Error('The task cancellation failed without diagnostic details.');
 }
 
 function renameSelectionError(
@@ -678,7 +1037,7 @@ function renameSelectionError(
 		);
 }
 
-function remoteErrorReason(error: LocalIpcRemoteError): DashboardActionErrorCode | undefined {
+function remoteErrorReason(error: LocalIpcRemoteError): DashboardActionErrorCode | 'TASK_NOT_FOUND' | undefined {
 	if (
 		typeof error.data !== 'object'
 		|| error.data === null
@@ -692,9 +1051,18 @@ function remoteErrorReason(error: LocalIpcRemoteError): DashboardActionErrorCode
 		'WINDOW_NAME_CONFLICT',
 		'WINDOW_NAME_INVALID',
 		'POLICY_FORBIDDEN',
+		'TASK_NOT_FOUND',
 	].includes(reason)
-		? reason as DashboardActionErrorCode
+		? reason as DashboardActionErrorCode | 'TASK_NOT_FOUND'
 		: undefined;
+}
+
+function unavailableAgentHostSnapshot(): DashboardSnapshot['thisWindow']['agentHost'] {
+	return {
+		source: 'unavailable',
+		label: 'Determining',
+		degraded: false,
+	};
 }
 
 function brokerSnapshot(
@@ -855,6 +1223,15 @@ function platformLabel(platform: NodeJS.Platform): string {
 	return platform === 'darwin'
 		? 'macOS'
 		: platform === 'win32' ? 'Windows' : platform === 'linux' ? 'Linux' : platform;
+}
+
+function compareDashboardTimestampsDescending(left: string, right: string): number {
+	const leftTime = Date.parse(left);
+	const rightTime = Date.parse(right);
+	if (Number.isFinite(leftTime) && Number.isFinite(rightTime)) {
+		return rightTime - leftTime;
+	}
+	return right.localeCompare(left);
 }
 
 

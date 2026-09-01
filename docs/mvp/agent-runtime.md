@@ -40,6 +40,13 @@ that local-source proof retain exactly one target confirmation, whose capability
 covers both source attempts. The capability is not a wire/model boolean and carries
 no serializable grant, path, or identity data.
 
+The Dashboard does not infer a healthy source before selection. With Peer
+Delegation off it reports the source as unavailable for delegation. With the
+Preview on, a successful editor probe displays `Editor`; discovery, connection,
+initialize, or protocol fallback displays `Standalone (degraded)` with only the
+bounded reason category/message. Endpoint tokens, instance IDs, executable,
+socket, and user-data paths never enter the ViewModel.
+
 1. Probe a configured or known VS Code CLI candidate with `code --version`.
 2. Create an owned instance directory, owner-only token file, dedicated user/server data directories, and an isolated process group.
 3. Diff strict `code agent endpoints` JSON and require exactly one new standalone endpoint matching both an owned PID and the generated token. Stdout/stderr are drained but never interpreted as readiness.

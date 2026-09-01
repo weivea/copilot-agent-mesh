@@ -58,6 +58,17 @@ h2 {
 	grid-column: 1 / -1;
 }
 
+.toggle {
+	display: flex;
+	align-items: flex-start;
+	gap: 8px;
+	margin-top: 8px;
+}
+
+.toggle input {
+	margin-top: 2px;
+}
+
 .nested {
 	margin-top: 6px;
 	background: var(--vscode-sideBar-background);

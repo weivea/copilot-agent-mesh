@@ -5,6 +5,7 @@ import {
 	LOCAL_BROKER_METHODS,
 	LOCAL_BROKER_TASK_START_TIMEOUT_MS,
 	MESH_ERROR_CODES,
+	PROTOCOL_LIMITS,
 	nodeTaskAnswerParamsSchema,
 	nodeTaskCancelParamsSchema,
 	nodeTaskEventParamsSchema,
@@ -13,7 +14,11 @@ import {
 	taskAnswerParamsSchema,
 	taskSnapshotAfterEventSeqSchema,
 	taskSnapshotSchema,
+	taskStatusSchema,
+	timestampSchema,
+	utf8String,
 	uuidSchema,
+	workspaceIdentitySchema,
 	type MeshErrorReason,
 	type NodeTaskEventParams,
 	type RoutedTaskStartParams,
@@ -21,6 +26,7 @@ import {
 	type TaskSnapshotAfterEventSeq,
 } from '../../shared/protocol';
 import { MeshDomainError } from '../domain/errors';
+import { redactRemoteText } from '../ui/DashboardRedaction';
 import {
 	createAcceptedRoutedTask,
 	canonicalRoutedTaskRequestHash,
@@ -47,7 +53,48 @@ const activeStates = new Set<string>(ACTIVE_TASK_STATUSES);
 const terminalStates = new Set(['completed', 'failed', 'cancelled', 'timedOut']);
 const defaultCancellationDeadlineMs = 15_000;
 const maximumTimerDelayMs = 2_147_483_647;
+export const DASHBOARD_TASK_INDEX_LIMIT = 1_000;
+export const DASHBOARD_TASK_INDEX_ENTRY_BYTES = 1_024;
 const nodeActionResultSchema = z.null();
+
+const dashboardTaskIndexTargetSchema = z.strictObject({
+	deviceId: uuidSchema,
+	workspaceId: uuidSchema,
+	nodeId: uuidSchema.optional(),
+	nodeInstanceId: uuidSchema.optional(),
+});
+const dashboardTaskIndexTimestampSchema = z.union([
+	timestampSchema,
+	z.literal('Unknown'),
+]);
+
+const dashboardTaskIndexRecordSchema = z.discriminatedUnion('schemaVersion', [
+	z.strictObject({
+		schemaVersion: z.literal(1),
+		taskId: uuidSchema,
+		peerId: uuidSchema,
+		workspaceId: uuidSchema,
+		title: utf8String(PROTOCOL_LIMITS.taskTitleBytes, 'dashboard task title', 1),
+		state: taskStatusSchema,
+		createdAt: dashboardTaskIndexTimestampSchema,
+		updatedAt: dashboardTaskIndexTimestampSchema,
+	}),
+	z.strictObject({
+		schemaVersion: z.literal(2),
+		taskId: uuidSchema,
+		peerId: uuidSchema,
+		workspaceId: uuidSchema,
+		title: utf8String(PROTOCOL_LIMITS.taskTitleBytes, 'dashboard task title', 1),
+		state: taskStatusSchema,
+		createdAt: dashboardTaskIndexTimestampSchema,
+		updatedAt: dashboardTaskIndexTimestampSchema,
+		target: dashboardTaskIndexTargetSchema,
+		sourceNodeId: uuidSchema.optional(),
+		sourceWorkspaceIdentity: utf8String(1_024, 'dashboard source workspace identity', 1).optional(),
+	}),
+]);
+
+export type DashboardTaskIndexRecord = Readonly<z.infer<typeof dashboardTaskIndexRecordSchema>>;
 
 const ownedTaskReadSchema = z.strictObject({
 	ownerId: uuidSchema,
@@ -99,6 +146,11 @@ export class BrokerTaskService {
 	private readonly cancellationTimers = new Map<string, NodeJS.Timeout>();
 	private readonly workerDeadlineTimers = new Map<string, NodeJS.Timeout>();
 	private readonly backgroundFailures: Error[] = [];
+	private readonly dashboardTaskIndex = new Map<string, DashboardTaskIndexRecord>();
+	private dashboardStartupScans = 0;
+	private dashboardReads = 0;
+	private storeListScans = 0;
+	private changeImmediate: NodeJS.Immediate | undefined;
 	private startQueue: Promise<void> = Promise.resolve();
 	private disposed = false;
 	private disposeComplete = false;
@@ -229,6 +281,26 @@ export class BrokerTaskService {
 		return this.get(this.deviceId, taskId, afterEventSeq);
 	}
 
+	public async listDashboardRecords(): Promise<readonly DashboardTaskIndexRecord[]> {
+		this.assertActive();
+		this.dashboardReads += 1;
+		return [...this.dashboardTaskIndex.values()].map(cloneDashboardTaskIndexRecord);
+	}
+
+	public dashboardMetrics(): {
+		readonly startupScans: number;
+		readonly storeListScans: number;
+		readonly reads: number;
+		readonly indexSize: number;
+	} {
+		return {
+			startupScans: this.dashboardStartupScans,
+			storeListScans: this.storeListScans,
+			reads: this.dashboardReads,
+			indexSize: this.dashboardTaskIndex.size,
+		};
+	}
+
 	public cancel(ownerId: string, taskId: string): Promise<TaskSnapshot> {
 		this.assertActive();
 		const input = ownedTaskReadSchema.parse({ ownerId, taskId });
@@ -239,6 +311,59 @@ export class BrokerTaskService {
 		this.assertActive();
 		await this.assertLocalTaskSource(sourceNodeId, taskId);
 		return this.cancel(this.deviceId, taskId);
+	}
+
+	public async cancelForTarget(
+		nodeId: string,
+		nodeInstanceId: string,
+		ownerId: string,
+		taskId: string,
+	): Promise<TaskSnapshot> {
+		this.assertActive();
+		const owner = uuidSchema.parse(ownerId);
+		const task = uuidSchema.parse(taskId);
+		const record = await this.requireOwned(owner, task);
+		if (
+			record === undefined
+			|| record.schemaVersion !== 2
+			|| record.target.nodeId !== uuidSchema.parse(nodeId)
+			|| record.target.nodeInstanceId !== uuidSchema.parse(nodeInstanceId)
+		) {
+			throw new MeshDomainError('TASK_NOT_FOUND', 'The task is not owned by this target Window Node.');
+		}
+		return this.cancel(record.peerId, record.taskId);
+	}
+
+	public async assertDashboardTaskCancellable(
+		nodeId: string,
+		nodeInstanceId: string,
+		ownerId: string,
+		taskId: string,
+		direction: 'outgoing' | 'incoming',
+	): Promise<void> {
+		const node = uuidSchema.parse(nodeId);
+		const instance = uuidSchema.parse(nodeInstanceId);
+		const owner = uuidSchema.parse(ownerId);
+		const task = uuidSchema.parse(taskId);
+		const record = await this.requireOwned(owner, task);
+		if (record === undefined || record.schemaVersion !== 2 || !activeStates.has(record.state)) {
+			throw new MeshDomainError('TASK_NOT_FOUND', 'The dashboard task action is stale.');
+		}
+		const valid = direction === 'outgoing'
+			? record.peerId === this.deviceId && record.sourceNodeId === node
+			: record.target.nodeId === node && record.target.nodeInstanceId === instance;
+		if (!valid) {
+			throw new MeshDomainError('TASK_NOT_FOUND', 'The dashboard task ownership changed.');
+		}
+		const route = this.registry.lookupTaskRoute(record.peerId, record.taskId);
+		if (
+			route === undefined
+			|| route.nodeId !== record.target.nodeId
+			|| route.nodeInstanceId !== record.target.nodeInstanceId
+			|| route.workspaceId !== record.target.workspaceId
+		) {
+			throw new MeshDomainError('TASK_NOT_FOUND', 'The dashboard task route is no longer live.');
+		}
 	}
 
 	public answer(
@@ -309,6 +434,10 @@ export class BrokerTaskService {
 			return Promise.resolve();
 		}
 		this.disposed = true;
+		if (this.changeImmediate !== undefined) {
+			clearImmediate(this.changeImmediate);
+			this.changeImmediate = undefined;
+		}
 		for (const timer of this.cancellationTimers.values()) {
 			clearTimeout(timer);
 		}
@@ -330,7 +459,12 @@ export class BrokerTaskService {
 	}
 
 	private async initializeCore(): Promise<void> {
-		const active = await this.store.listForRecovery();
+		const records = await this.scanTaskStore();
+		this.dashboardStartupScans += 1;
+		for (const record of [...records].sort(compareTaskRecordUpdatedAt)) {
+			this.rememberDashboardRecord(record);
+		}
+		const active = records.filter((record) => activeStates.has(record.state));
 		for (const record of active) {
 			await this.enqueueTask(record.taskId, async () => {
 				let migrated = await this.requireOwned(record.peerId, record.taskId);
@@ -396,7 +530,7 @@ export class BrokerTaskService {
 		sourceNode?: { readonly nodeId: string; readonly nodeInstanceId: string },
 	): Promise<PreparedStart | TaskSnapshot> {
 		this.assertActive();
-		const records = await this.store.list();
+		const records = await this.scanTaskStore();
 		const existing = this.findExistingStart(records, ownerId, params);
 		if (existing !== undefined) {
 			let migrated = await this.requireOwned(ownerId, existing.taskId);
@@ -441,10 +575,11 @@ export class BrokerTaskService {
 				startRequested,
 			);
 			const result = await this.store.createRoutedIdempotent(request, record);
+			persisted = result.created;
+			this.rememberDashboardRecord(result.record);
 			if (!result.created) {
 				return this.snapshot(result.record);
 			}
-			persisted = true;
 			this.scheduleWorkerDeadline(ownerId, params.taskId, params.workerDeadline);
 			await this.publishAcceptedStart(record, startRequested);
 			return {
@@ -619,7 +754,7 @@ export class BrokerTaskService {
 		sourceNode?: { readonly nodeId: string; readonly nodeInstanceId: string },
 	): Promise<void> {
 		this.assertTargetDevice(params);
-		const records = await this.store.list();
+		const records = await this.scanTaskStore();
 		if (this.findExistingStart(records, ownerId, params) !== undefined) {
 			return;
 		}
@@ -704,10 +839,7 @@ export class BrokerTaskService {
 				await this.requireOwned(ownerId, taskId),
 			);
 			if (!activeStates.has(record.state)) {
-				throw new MeshDomainError(
-					'TASK_NOT_CANCELLABLE',
-					'The task is no longer cancellable.',
-				);
+				return { record, route: undefined };
 			}
 			if (record.state === 'cancelling') {
 				this.scheduleCancellationDeadline(
@@ -952,6 +1084,7 @@ export class BrokerTaskService {
 	): Promise<TaskRecord> {
 		const before = await this.store.getOwned(ownerId, taskId);
 		const record = await this.store.transitionOwned(ownerId, taskId, event);
+		this.rememberDashboardRecord(record);
 		if (before?.eventSeq === record.eventSeq) {
 			if (terminalStates.has(record.state)) {
 				this.clearCancellationDeadline(ownerId, taskId);
@@ -973,7 +1106,9 @@ export class BrokerTaskService {
 			record.schemaVersion === 2 ? record.sourceNodeId : undefined,
 		);
 		await this.options.notificationSink?.publish(record, event);
-		this.changed();
+		if (before?.state !== record.state) {
+			this.changed();
+		}
 		return record;
 	}
 
@@ -983,8 +1118,11 @@ export class BrokerTaskService {
 			throw new MeshDomainError('TASK_NOT_FOUND', 'Task not found.');
 		}
 		if (record.schemaVersion === 1) {
-			return this.store.migrateOwnedV1(ownerId, taskId, this.deviceId);
+			const migrated = await this.store.migrateOwnedV1(ownerId, taskId, this.deviceId);
+			this.rememberDashboardRecord(migrated);
+			return migrated;
 		}
+		this.rememberDashboardRecord(record);
 		return record;
 	}
 
@@ -1380,7 +1518,37 @@ export class BrokerTaskService {
 	}
 
 	private changed(): void {
-		this.options.onDidChange?.();
+		if (this.changeImmediate !== undefined || this.disposed) {
+			return;
+		}
+		this.changeImmediate = setImmediate(() => {
+			this.changeImmediate = undefined;
+			if (!this.disposed) {
+				this.options.onDidChange?.();
+			}
+		});
+	}
+
+	private rememberDashboardRecord(record: TaskRecord): void {
+		const projected = projectDashboardTaskIndexRecord(record);
+		const key = taskKey(projected.peerId, projected.taskId);
+		this.dashboardTaskIndex.delete(key);
+		this.dashboardTaskIndex.set(key, projected);
+		while (this.dashboardTaskIndex.size > DASHBOARD_TASK_INDEX_LIMIT) {
+			const terminal = [...this.dashboardTaskIndex].find(([, candidate]) =>
+				terminalStates.has(candidate.state)
+			);
+			const oldest = terminal?.[0] ?? this.dashboardTaskIndex.keys().next().value;
+			if (oldest === undefined) {
+				return;
+			}
+			this.dashboardTaskIndex.delete(oldest);
+		}
+	}
+
+	private scanTaskStore(): Promise<readonly TaskRecord[]> {
+		this.storeListScans += 1;
+		return this.store.list();
 	}
 
 	private assertActive(): void {
@@ -1388,6 +1556,90 @@ export class BrokerTaskService {
 			throw new MeshDomainError('WORKER_DRAINING', 'The broker is shutting down.');
 		}
 	}
+}
+
+export function projectDashboardTaskIndexRecord(
+	record: TaskRecord,
+): DashboardTaskIndexRecord {
+	const common = {
+		schemaVersion: record.schemaVersion,
+		taskId: record.taskId,
+		peerId: record.peerId,
+		workspaceId: record.workspaceId,
+		title: truncateUtf8(
+			redactRemoteText(record.title),
+			PROTOCOL_LIMITS.taskTitleBytes,
+		),
+		state: record.state,
+		createdAt: normalizeDashboardIndexTimestamp(record.createdAt),
+		updatedAt: normalizeDashboardIndexTimestamp(record.updatedAt),
+	};
+	const projected = dashboardTaskIndexRecordSchema.parse(
+		record.schemaVersion === 1
+			? common
+			: {
+				...common,
+				target: { ...record.target },
+				...(record.sourceNodeId === undefined ? {} : {
+					sourceNodeId: record.sourceNodeId,
+				}),
+				...(record.sourceWorkspaceIdentity === undefined
+					|| !workspaceIdentitySchema.safeParse(record.sourceWorkspaceIdentity).success
+					? {}
+					: { sourceWorkspaceIdentity: record.sourceWorkspaceIdentity }),
+			},
+	);
+	if (Buffer.byteLength(JSON.stringify(projected), 'utf8') > DASHBOARD_TASK_INDEX_ENTRY_BYTES) {
+		throw new TypeError('Dashboard task index projection exceeds its memory bound.');
+	}
+	if (projected.schemaVersion === 2) {
+		Object.freeze(projected.target);
+	}
+	return Object.freeze(projected);
+}
+
+function normalizeDashboardIndexTimestamp(value: string): string {
+	if (!timestampSchema.safeParse(value).success) {
+		return 'Unknown';
+	}
+	const timestamp = Date.parse(value);
+	if (!Number.isFinite(timestamp)) {
+		return 'Unknown';
+	}
+	const canonical = new Date(timestamp).toISOString();
+	return /^\d{4}-\d{2}-\d{2}T/u.test(canonical) ? canonical : 'Unknown';
+}
+
+function truncateUtf8(value: string, maximumBytes: number): string {
+	if (Buffer.byteLength(value, 'utf8') <= maximumBytes) {
+		return value;
+	}
+	let result = '';
+	let bytes = 0;
+	for (const character of value) {
+		const characterBytes = Buffer.byteLength(character, 'utf8');
+		if (bytes + characterBytes > maximumBytes) {
+			break;
+		}
+		result += character;
+		bytes += characterBytes;
+	}
+	return result;
+}
+
+function cloneDashboardTaskIndexRecord(
+	record: DashboardTaskIndexRecord,
+): DashboardTaskIndexRecord {
+	return record.schemaVersion === 1
+		? { ...record }
+		: { ...record, target: { ...record.target } };
+}
+
+function compareTaskRecordUpdatedAt(left: TaskRecord, right: TaskRecord): number {
+	const difference = Date.parse(left.updatedAt) - Date.parse(right.updatedAt);
+	return difference !== 0
+		? difference
+		: taskKey(left.peerId, left.taskId).localeCompare(taskKey(right.peerId, right.taskId));
 }
 
 function taskKey(ownerId: string, taskId: string): string {

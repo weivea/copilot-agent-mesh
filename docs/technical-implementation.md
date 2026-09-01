@@ -1000,6 +1000,31 @@ Webview 的 `renameWindow` action 不接受 Workspace identity 或名称；名�
 InputBox 收集，目标由当前 Window Node 的 own claim 与 active editor 所属 Workspace
 服务端派生。多根窗口无法唯一选择时显式失败，Preview 默认关闭时控制禁用。
 
+P7 的 Webview 不再接收 Node/Workspace/Task 完整 ID。策略候选由 Broker 为当前认证 IPC
+Session 签发一次性随机句柄，绑定来源 Workspace、目标稳定 Workspace identity 与在线时的
+精确 Node instance；离线持久条目只允许撤销。View provider 再用 `uiInstanceId` 独立的一次性
+句柄包装。任务目录按精确 source/target 分成 Outgoing/Incoming，取消句柄同时绑定 task ID、
+方向和 owner/target 授权路径。确认前把显示句柄兑换为独立的有界 reservation，使确认期间
+的状态刷新不会重定向操作；拒绝时释放、执行时消费。除该明确的 in-flight reservation 外，
+刷新、策略/拓扑变化、消费、重放、跨 View、错误方向和 Dispose 全部 fail closed；显示名与
+8 位短 ID 永不参与路由或授权。Remote outgoing cache 同样由 Broker task notification 更新、
+有界保留，合并列表严格截断。状态变化由事件驱动，不轮询。
+
+Follow-up 将 active Task action 以
+`ownerId + taskId + direction + authenticated route` 为稳定键，并在同一 `uiInstanceId`
+内保留 Webview alias。非状态 output/progress/tool burst 不触发 Dashboard refresh；
+状态变化按 Session/event-loop 合并。终态或 topology/ownership generation 变化清除句柄，
+reservation commit 再次核验精确绑定。Broker takeover 启动时只扫描一次 Task Store，随后以
+durable transition 更新 generation-scoped、上限 1000 的 Dashboard index，普通 Dashboard
+read 不进入 FileTaskStore mutation queue。Task 时间在 Presenter 边界经 protocol schema
+验证后统一 `toISOString()`；扩展年份或损坏值只投影为 `Unknown`。
+
+Index value 不是 `TaskRecord` clone，而是严格 Zod schema 的 frozen minimal projection，
+单项序列化上限 1 KiB，仅含 Dashboard 分区/显示/重验所需的 task、owner、source、target、
+Workspace、state、safe title、created/updated time。最大 event journal、output、input、
+failure payload、answer、recovery、artifact、grant/runtime 字段都不会进入或在 read 时深拷贝。
+取消 reserve/commit 继续从精确 owner/task 文件读取权威 record，并核对 live route。
+
 ### 14.2 安全
 
 - 交互 UI 需要 Script 时只加载本地 Bundle。

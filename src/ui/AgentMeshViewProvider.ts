@@ -13,9 +13,15 @@ import {
 	DashboardInboundMessage,
 	DashboardOutboundMessage,
 	DashboardOutboundErrorCode,
+	type DashboardAction,
 	parseDashboardInboundMessage,
 } from './DashboardMessages';
-import { DashboardPresenter } from './DashboardPresenter';
+import { DashboardPresenter, type DashboardViewModel } from './DashboardPresenter';
+
+interface ScopedDashboardAction {
+	readonly action: DashboardAction;
+	readonly brokerHandle: string;
+}
 
 interface ViewInstance {
 	readonly id: string;
@@ -25,6 +31,7 @@ interface ViewInstance {
 	requestedRevision: number;
 	publishedRevision: number;
 	publication: Promise<void> | undefined;
+	readonly actions: Map<string, ScopedDashboardAction>;
 }
 
 export const DASHBOARD_COMMANDS = {
@@ -60,6 +67,7 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 			requestedRevision: 0,
 			publishedRevision: 0,
 			publication: undefined,
+			actions: new Map(),
 		};
 		this.instances.set(instance.id, instance);
 
@@ -112,11 +120,12 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 		}
 
 		try {
-			await this.dispatch(message);
+			await this.dispatch(instance, message);
 			await this.publish(instance);
 		} catch (error: unknown) {
 			if (error instanceof DashboardActionError) {
 				await this.postError(instance, error.code, error.message);
+				await this.publish(instance);
 				return;
 			}
 			await this.postError(
@@ -124,22 +133,20 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 				'ACTION_FAILED',
 				'The dashboard action failed. Refresh for the latest service error and suggested action.',
 			);
+			await this.publish(instance);
 		}
 	}
 
-	private async dispatch(message: Extract<DashboardInboundMessage, { type: 'action' }>): Promise<void> {
+	private async dispatch(
+		instance: ViewInstance,
+		message: Extract<DashboardInboundMessage, { type: 'action' }>,
+	): Promise<void> {
 		switch (message.action) {
 			case 'configureDevice':
 				await this.facade.configureDeviceName();
 				return;
 			case 'renameWindow':
 				await this.facade.renameCurrentWindow();
-				return;
-			case 'registerWorkspace':
-				await this.facade.registerCurrentWorkspace();
-				return;
-			case 'removeWorkspace':
-				await this.facade.removeWorkspace(requireTarget(message));
 				return;
 			case 'startListener':
 				await this.facade.startListener();
@@ -150,26 +157,26 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 			case 'copyConnectionUrl':
 				await this.facade.copyConnectionUrl();
 				return;
-			case 'addPeer':
-				await this.facade.addPeer();
+			case 'setAcceptIncoming': {
+				const action = this.consumeAction(instance, message);
+				await this.facade.setAcceptIncoming(action.brokerHandle, requireEnabled(message));
 				return;
-			case 'removePeer':
-				await this.facade.removePeer(requireTarget(message));
+			}
+			case 'setPeerAllowed': {
+				const action = this.consumeAction(instance, message);
+				await this.facade.setPeerAllowed(action.brokerHandle, requireEnabled(message));
 				return;
-			case 'runTask':
-				await this.facade.runTask(message.deviceId === undefined
-					? undefined
-					: {
-						deviceId: message.deviceId,
-						nodeId: message.nodeId!,
-						nodeInstanceId: message.nodeInstanceId!,
-						workspaceId: message.workspaceId!,
-						...(message.peerId === undefined ? {} : { peerId: message.peerId }),
-					});
+			}
+			case 'cancelOutgoingTask': {
+				const action = this.consumeAction(instance, message);
+				await this.facade.cancelDashboardTask(action.brokerHandle, 'outgoing');
 				return;
-			case 'cancelTask':
-				await this.facade.cancelTask(requireTarget(message));
+			}
+			case 'cancelIncomingTask': {
+				const action = this.consumeAction(instance, message);
+				await this.facade.cancelDashboardTask(action.brokerHandle, 'incoming');
 				return;
+			}
 			case 'refresh':
 				return;
 		}
@@ -201,16 +208,18 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 					return;
 				}
 				if (revision === instance.requestedRevision) {
+					const scopedModel = this.scopeActions(instance, model);
 					const message: DashboardOutboundMessage = {
 						version: DASHBOARD_MESSAGE_VERSION,
 						uiInstanceId: instance.id,
 						type: 'dashboard.snapshot',
-						model,
+						model: scopedModel,
 					};
 					await this.safePost(instance, message);
 				}
 			} catch {
 				if (revision === instance.requestedRevision) {
+					instance.actions.clear();
 					await this.postError(
 						instance,
 						'UNSAFE_VIEW_MODEL',
@@ -249,10 +258,83 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 			return;
 		}
 		instance.disposed = true;
+		instance.actions.clear();
 		this.instances.delete(instance.id);
 		for (const subscription of instance.subscriptions.splice(0)) {
 			subscription.dispose();
 		}
+	}
+
+	private scopeActions(instance: ViewInstance, model: DashboardViewModel): DashboardViewModel {
+		const stableTaskAliases = new Map<string, string>();
+		for (const [uiHandle, action] of instance.actions) {
+			if (
+				action.action === 'cancelOutgoingTask'
+				|| action.action === 'cancelIncomingTask'
+			) {
+				stableTaskAliases.set(`${action.action}:${action.brokerHandle}`, uiHandle);
+			}
+		}
+		instance.actions.clear();
+		const scope = (
+			action: DashboardAction,
+			brokerHandle: string | undefined,
+			stable = false,
+		): string | undefined => {
+			if (brokerHandle === undefined) {
+				return undefined;
+			}
+			let handle = stable
+				? stableTaskAliases.get(`${action}:${brokerHandle}`)
+				: undefined;
+			if (handle === undefined) {
+				do {
+					handle = randomBytes(24).toString('base64url');
+				} while (instance.actions.has(handle));
+			}
+			instance.actions.set(handle, { action, brokerHandle });
+			return handle;
+		};
+		return {
+			...model,
+			thisWindow: {
+				...model.thisWindow,
+				acceptActionHandle: scope(
+					'setAcceptIncoming',
+					model.thisWindow.acceptActionHandle,
+				),
+			},
+			localNodes: model.localNodes.map((candidate) => ({
+				...candidate,
+				actionHandle: scope('setPeerAllowed', candidate.actionHandle),
+			})),
+			outgoingTasks: model.outgoingTasks.map((task) => ({
+				...task,
+				actionHandle: scope('cancelOutgoingTask', task.actionHandle, true),
+			})),
+			incomingTasks: model.incomingTasks.map((task) => ({
+				...task,
+				actionHandle: scope('cancelIncomingTask', task.actionHandle, true),
+			})),
+		};
+	}
+
+	private consumeAction(
+		instance: ViewInstance,
+		message: Extract<DashboardInboundMessage, { type: 'action' }>,
+	): ScopedDashboardAction {
+		const handle = message.actionHandle;
+		const action = handle === undefined ? undefined : instance.actions.get(handle);
+		if (handle !== undefined) {
+			instance.actions.delete(handle);
+		}
+		if (action === undefined || action.action !== message.action) {
+			throw new DashboardActionError(
+				'STALE_ACTION',
+				'This Dashboard action is stale. Refresh and try again.',
+			);
+		}
+		return action;
 	}
 }
 
@@ -278,10 +360,11 @@ export function createDashboardHtml(
 	<main>
 		<section aria-labelledby="device-heading"><h2 id="device-heading">This Device</h2><div id="device" class="card loading">Loading...</div></section>
 		<section aria-labelledby="this-window-heading"><h2 id="this-window-heading">This Window</h2><div id="thisWindow" class="card loading">Loading...</div></section>
+		<section aria-labelledby="accept-heading"><h2 id="accept-heading">Accept Incoming Tasks</h2><div id="acceptIncoming" class="card loading">Loading...</div></section>
 		<section aria-labelledby="listener-heading"><h2 id="listener-heading">Listener</h2><div id="listener" class="card loading">Loading...</div></section>
-		<section aria-labelledby="nodes-heading"><h2 id="nodes-heading">Local Window Nodes</h2><div id="localNodes" class="stack loading">Loading...</div><button data-action="registerWorkspace">Refresh Current Workspaces</button></section>
-		<section aria-labelledby="peers-heading"><h2 id="peers-heading">Remote Devices</h2><div id="remoteDevices" class="stack loading">Loading...</div><button data-action="addPeer">Add Connection</button></section>
-		<section aria-labelledby="tasks-heading"><h2 id="tasks-heading">Tasks</h2><div id="tasks" class="stack loading">Loading...</div><button data-action="runTask">Run Task</button></section>
+		<section aria-labelledby="nodes-heading"><h2 id="nodes-heading">Local Window Nodes</h2><p class="detail">A checked box authorizes only this Workspace to delegate to that target. The target must also accept incoming tasks and have one claimed Workspace before it appears to Mesh Tools.</p><div id="localNodes" class="stack loading">Loading...</div></section>
+		<section aria-labelledby="outgoing-heading"><h2 id="outgoing-heading">Outgoing Tasks</h2><div id="outgoingTasks" class="stack loading">Loading...</div></section>
+		<section aria-labelledby="incoming-heading"><h2 id="incoming-heading">Incoming Tasks</h2><div id="incomingTasks" class="stack loading">Loading...</div></section>
 		<section aria-labelledby="errors-heading"><h2 id="errors-heading">Errors</h2><div id="errors" class="stack"></div></section>
 	</main>
 	<div id="announcement" role="status" aria-live="polite"></div>
@@ -290,17 +373,19 @@ export function createDashboardHtml(
 </html>`;
 }
 
-function requireTarget(message: Extract<DashboardInboundMessage, { type: 'action' }>): string {
-	if (message.targetId === undefined) {
-		throw new Error(`Dashboard action ${message.action} requires a target.`);
-	}
-	return message.targetId;
-}
-
 function getOwnExtensionUri(): vscode.Uri {
 	const extension = vscode.extensions.getExtension('weivea.copilot-agent-mesh');
 	if (extension === undefined) {
 		throw new Error('Unable to resolve the Copilot Agent Mesh extension URI.');
 	}
 	return extension.extensionUri;
+}
+
+function requireEnabled(
+	message: Extract<DashboardInboundMessage, { type: 'action' }>,
+): boolean {
+	if (typeof message.enabled !== 'boolean') {
+		throw new Error(`Dashboard action ${message.action} requires a boolean state.`);
+	}
+	return message.enabled;
 }
