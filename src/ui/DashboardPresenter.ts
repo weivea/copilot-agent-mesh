@@ -9,11 +9,15 @@ export interface DashboardViewModel {
 	readonly listener: DashboardSnapshot['listener'];
 	readonly broker: NonNullable<DashboardSnapshot['broker']>;
 	readonly thisWindow: DashboardSnapshot['thisWindow'];
-	readonly localNodes: readonly NonNullable<DashboardSnapshot['policyCandidates']>[number][];
+	readonly localNodes: readonly DashboardLocalNodeViewModel[];
 	readonly outgoingTasks: readonly NonNullable<DashboardSnapshot['outgoingTasks']>[number][];
 	readonly incomingTasks: readonly NonNullable<DashboardSnapshot['incomingTasks']>[number][];
 	readonly errors: DashboardSnapshot['errors'];
 }
+
+type DashboardLocalNodeViewModel =
+	NonNullable<DashboardSnapshot['policyCandidates']>[number]
+	& { readonly online: true };
 
 export class DashboardPresenter {
 	public present(snapshot: DashboardSnapshot): DashboardViewModel {
@@ -52,16 +56,24 @@ export class DashboardPresenter {
 					detail: optionalRedacted(snapshot.thisWindow.agentHost.detail),
 				},
 			},
-			localNodes: (snapshot.policyCandidates ?? []).map((candidate) => ({
-				...candidate,
-				windowLabel: redactRemoteText(candidate.windowLabel),
-				workspaceName: redactRemoteText(candidate.workspaceName),
-			})),
+			localNodes: (snapshot.policyCandidates ?? [])
+				.filter(isOnlinePolicyCandidate)
+				.map((candidate) => ({
+					...candidate,
+					windowLabel: redactRemoteText(candidate.windowLabel),
+					workspaceName: redactRemoteText(candidate.workspaceName),
+				})),
 			outgoingTasks: (snapshot.outgoingTasks ?? []).map(redactDashboardTask),
 			incomingTasks: (snapshot.incomingTasks ?? []).map(redactDashboardTask),
 			errors: snapshot.errors.map(redactError),
 		};
 	}
+}
+
+function isOnlinePolicyCandidate(
+	candidate: NonNullable<DashboardSnapshot['policyCandidates']>[number],
+): candidate is DashboardLocalNodeViewModel {
+	return candidate.online;
 }
 
 function redactBroker(

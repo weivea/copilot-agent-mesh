@@ -206,6 +206,8 @@ test('retains an offline allowlist entry with a removable one-time handle', asyn
 	assert.equal(offline?.windowLabel, 'Backend');
 	assert.equal(offline?.gateState, 'offline');
 	assert.ok(offline?.actionHandle);
+	assert.deepEqual((await fixture.nodeA.listNodes()).nodes, []);
+	assert.deepEqual((await fixture.nodeA.getPeerPolicy(IDENTITY_A)).allowlist, [IDENTITY_B]);
 	await fixture.nodeA.setPeerPolicyCandidate(IDENTITY_A, offline.actionHandle, false);
 	assert.deepEqual((await fixture.nodeA.getPeerPolicy(IDENTITY_A)).allowlist, []);
 });

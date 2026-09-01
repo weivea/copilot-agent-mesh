@@ -227,6 +227,60 @@ suite('Dashboard', () => {
 		}));
 	});
 
+	test('projects only current online Window Nodes while preserving self and reopened Workspaces', () => {
+		const source = snapshot();
+		const target = source.policyCandidates?.[0];
+		assert.ok(target);
+		const model = new DashboardPresenter().present({
+			...source,
+			policyCandidates: [
+				{
+					...target,
+					actionHandle: undefined,
+					windowLabel: 'This Window',
+					workspaceName: 'source-workspace',
+					self: true,
+				},
+				{
+					...target,
+					windowLabel: 'Closed Window',
+					workspaceName: 'closed-workspace',
+					online: false,
+					acceptsIncoming: false,
+					allowlisted: false,
+					canToggle: false,
+					gateState: 'offline',
+				},
+				{
+					...target,
+					actionHandle: 'd'.repeat(32),
+					windowLabel: 'Reopened Window',
+					workspaceName: 'reopened-workspace',
+					online: false,
+					allowlisted: true,
+					canToggle: true,
+					gateState: 'offline',
+				},
+				{
+					...target,
+					actionHandle: 'e'.repeat(32),
+					windowLabel: 'Reopened Window',
+					workspaceName: 'reopened-workspace',
+				},
+			],
+		});
+
+		assert.deepStrictEqual(
+			model.localNodes.map(({ windowLabel }) => windowLabel),
+			['This Window', 'Reopened Window'],
+		);
+		assert.equal(model.localNodes.every(({ online }) => online), true);
+		assert.equal(
+			model.localNodes.filter(({ workspaceName }) => workspaceName === 'reopened-workspace').length,
+			1,
+		);
+	});
+
 	test('presents every Foundation task state and safely truncates valid UTF-8 summaries', () => {
 		const source = snapshot();
 		const presenter = new DashboardPresenter();
@@ -506,6 +560,44 @@ suite('Dashboard', () => {
 			enabled: false,
 		});
 		assert.equal(first.webview.sent.some(({ code }) => code === 'STALE_ACTION'), true);
+		provider.dispose();
+	});
+
+	test('removes offline Window Nodes and invalidates their Webview action handles', async () => {
+		const extension = getExtension();
+		const facade = new RecordingDashboardFacade();
+		const provider = new AgentMeshViewProvider(facade, extension.extensionUri);
+		const view = new TestWebviewView();
+		provider.resolveWebviewView(view);
+		const uiInstanceId = getUiInstanceId(view.webview.html);
+		await view.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'ready' });
+		const handle = getCollectionActionHandle(view.webview.sent[0], 'localNodes');
+		assert.ok(handle);
+		const current = facade.snapshotValue;
+		facade.snapshotValue = {
+			...current,
+			policyCandidates: current.policyCandidates?.map((candidate) => ({
+				...candidate,
+				online: false,
+				gateState: 'offline',
+			})),
+		};
+
+		facade.fireChanged();
+		await settle();
+		const latest = view.webview.sent[view.webview.sent.length - 1];
+		assert.equal(getCollectionLength(latest, 'localNodes'), 0);
+		assert.equal(getCollectionActionHandle(latest, 'localNodes'), undefined);
+		await view.webview.receive({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId,
+			type: 'action',
+			action: 'setPeerAllowed',
+			actionHandle: handle,
+			enabled: false,
+		});
+		assert.equal(view.webview.sent.some(({ code }) => code === 'STALE_ACTION'), true);
+		assert.equal(facade.calls.some((call) => call.startsWith('setPeerAllowed:')), false);
 		provider.dispose();
 	});
 
@@ -1186,6 +1278,18 @@ function getCollectionActionHandle(
 	}
 	const handle = (first as Record<string, unknown>).actionHandle;
 	return typeof handle === 'string' ? handle : undefined;
+}
+
+function getCollectionLength(
+	message: Record<string, unknown>,
+	collection: 'localNodes' | 'outgoingTasks' | 'incomingTasks',
+): number | undefined {
+	const model = message.model;
+	if (typeof model !== 'object' || model === null || Array.isArray(model)) {
+		return undefined;
+	}
+	const items = (model as Record<string, unknown>)[collection];
+	return Array.isArray(items) ? items.length : undefined;
 }
 
 function getThisWindowActionHandle(message: Record<string, unknown>): string | undefined {

@@ -613,6 +613,9 @@ function safeDisplayName(value: string, fallback: string): string {
 }
 
 function candidatePriority(binding: PeerPolicyCandidateBinding): number {
+	if (!binding.candidate.online) {
+		return 3;
+	}
 	return binding.candidate.allowlisted
 		? 0
 		: binding.candidate.self ? 1 : 2;

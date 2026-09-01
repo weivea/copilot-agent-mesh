@@ -36,11 +36,13 @@ Successful writes broadcast `node.policy.changed`, and task/topology/source
 changes use event notifications, so all open dashboards re-render without
 polling or reload.
 
-The peer configuration list is intentionally broader than `mesh_list_workers`.
-It shows every same-device candidate and its online, accept, busy, claim, and
-double-gate state, including self where useful and persisted offline allowlist
-entries. A checked box changes only the current source Workspace's `A -> B`
-allowlist. It never grants `B -> A`.
+The peer configuration service is intentionally broader than `mesh_list_workers`,
+but the Dashboard projects only its online same-device candidates, including self
+where useful. Offline registry tombstones and saved allowlist entries remain in
+the Broker for routing/history safety and stable Workspace-identity rebinding;
+they disappear from `Local Window Nodes` and cannot leave Webview action handles.
+A checked box changes only the current source Workspace's `A -> B` allowlist. It
+never grants `B -> A`, and a transient disconnect never deletes that policy.
 
 Candidate and task mutations use two layers of one-time opaque handles. The
 Broker handle is scoped to the authenticated IPC Session and binds the exact
@@ -49,7 +51,6 @@ ID plus incoming/outgoing authorization path. The View provider wraps it in a
 fresh `uiInstanceId`-scoped handle on every publication. Refresh, topology or
 policy changes, successful/failed consumption, replay, cross-view use, wrong
 direction, and disposal fail closed. No label or short ID authorizes a mutation.
-Offline saved targets can only be unchecked.
 
 Task cancellation redeems the visible action handle into a separate bounded
 in-flight reservation before the Extension Host opens its confirmation modal.

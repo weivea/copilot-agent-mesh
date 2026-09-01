@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
+import { PROTOCOL_LIMITS } from '../../shared/protocol';
 import {
 	NodeRegistry,
 	PeerPolicyService,
@@ -227,6 +228,43 @@ test('retains offline allowlist identities and rebinds them to a new exact node 
 	assert.equal(
 		fixture.service.listAuthorized(identityParams(NODE_A, INSTANCE_A)).nodes[0]?.label,
 		'Persistent Backend',
+	);
+});
+
+test('orders every online candidate ahead of saved offline entries at the transport limit', async (t) => {
+	const fixture = await createFixture();
+	t.after(() => fixture.registry.dispose());
+	for (let index = 0; index < PROTOCOL_LIMITS.nodeListCount - 2; index += 1) {
+		fixture.registry.register(
+			registration(uuid(1_000 + index), uuid(2_000 + index), `Window ${index}`),
+			new FakeSession().route(),
+		);
+	}
+	const offlineIdentities = Array.from(
+		{ length: PROTOCOL_LIMITS.workspaceListCount },
+		(_, index) => createOpaqueWorkspaceIdentity(`offline-workspace-${index}`),
+	);
+	await fixture.service.setPolicy(identityParams(NODE_A, INSTANCE_A), {
+		...identityParams(NODE_A, INSTANCE_A),
+		workspaceIdentity: IDENTITY_A,
+		allowlist: offlineIdentities,
+	});
+
+	const candidates = fixture.service.listCandidates({
+		...identityParams(NODE_A, INSTANCE_A),
+		workspaceIdentity: IDENTITY_A,
+	});
+	assert.equal(
+		candidates.length,
+		PROTOCOL_LIMITS.nodeListCount + PROTOCOL_LIMITS.workspaceListCount,
+	);
+	assert.equal(
+		candidates.slice(0, PROTOCOL_LIMITS.nodeListCount).every(({ candidate }) => candidate.online),
+		true,
+	);
+	assert.equal(
+		candidates.slice(PROTOCOL_LIMITS.nodeListCount).every(({ candidate }) => !candidate.online),
+		true,
 	);
 });
 
