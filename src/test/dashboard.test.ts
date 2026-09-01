@@ -44,6 +44,7 @@ suite('Dashboard', () => {
 		assert.ok(view.webview.html.includes('dashboard.js'));
 		assert.ok(view.webview.html.includes('dashboard.css'));
 		assert.ok(view.webview.html.includes('This Window'));
+		assert.ok(view.webview.html.includes('Saved Authorizations'));
 		provider.dispose();
 	});
 
@@ -53,6 +54,7 @@ suite('Dashboard', () => {
 
 		assert.ok(bundle.includes('textContent'));
 		assert.ok(!bundle.includes('innerHTML'));
+		assert.ok(bundle.includes('Remove saved authorization'));
 	});
 
 	test('validates inbound messages and rejects extra or malformed data', () => {
@@ -227,11 +229,11 @@ suite('Dashboard', () => {
 		}));
 	});
 
-	test('projects only current online Window Nodes while preserving self and reopened Workspaces', () => {
+	test('moves offline policy into Saved Authorizations and restores one row after reopen', () => {
 		const source = snapshot();
 		const target = source.policyCandidates?.[0];
 		assert.ok(target);
-		const model = new DashboardPresenter().present({
+		const closed = new DashboardPresenter().present({
 			...source,
 			policyCandidates: [
 				{
@@ -240,6 +242,7 @@ suite('Dashboard', () => {
 					windowLabel: 'This Window',
 					workspaceName: 'source-workspace',
 					self: true,
+					canToggle: false,
 				},
 				{
 					...target,
@@ -254,12 +257,42 @@ suite('Dashboard', () => {
 				{
 					...target,
 					actionHandle: 'd'.repeat(32),
-					windowLabel: 'Reopened Window',
-					workspaceName: 'reopened-workspace',
+					windowLabel: 'C:\\private\\closed-window',
+					workspaceName: 'file:///private/workspace',
 					online: false,
 					allowlisted: true,
 					canToggle: true,
 					gateState: 'offline',
+				},
+			],
+		});
+
+		assert.deepStrictEqual(
+			closed.localNodes.map(({ windowLabel }) => windowLabel),
+			['This Window'],
+		);
+		assert.deepStrictEqual(closed.savedAuthorizations, [{
+			actionHandle: 'd'.repeat(32),
+			windowLabel: '[redacted sensitive details]',
+			workspaceName: '[redacted sensitive details]',
+		}]);
+		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: 'instance-1',
+			type: 'dashboard.snapshot',
+			model: closed,
+		}));
+
+		const reopened = new DashboardPresenter().present({
+			...source,
+			policyCandidates: [
+				{
+					...target,
+					actionHandle: undefined,
+					windowLabel: 'This Window',
+					workspaceName: 'source-workspace',
+					self: true,
+					canToggle: false,
 				},
 				{
 					...target,
@@ -269,16 +302,16 @@ suite('Dashboard', () => {
 				},
 			],
 		});
-
 		assert.deepStrictEqual(
-			model.localNodes.map(({ windowLabel }) => windowLabel),
+			reopened.localNodes.map(({ windowLabel }) => windowLabel),
 			['This Window', 'Reopened Window'],
 		);
-		assert.equal(model.localNodes.every(({ online }) => online), true);
+		assert.equal(reopened.localNodes.every(({ online }) => online), true);
 		assert.equal(
-			model.localNodes.filter(({ workspaceName }) => workspaceName === 'reopened-workspace').length,
+			reopened.localNodes.filter(({ workspaceName }) => workspaceName === 'reopened-workspace').length,
 			1,
 		);
+		assert.deepStrictEqual(reopened.savedAuthorizations, []);
 	});
 
 	test('presents every Foundation task state and safely truncates valid UTF-8 summaries', () => {
@@ -563,41 +596,108 @@ suite('Dashboard', () => {
 		provider.dispose();
 	});
 
-	test('removes offline Window Nodes and invalidates their Webview action handles', async () => {
+	test('scopes Saved Authorization removal handles and fails closed across transitions', async () => {
 		const extension = getExtension();
 		const facade = new RecordingDashboardFacade();
 		const provider = new AgentMeshViewProvider(facade, extension.extensionUri);
-		const view = new TestWebviewView();
-		provider.resolveWebviewView(view);
-		const uiInstanceId = getUiInstanceId(view.webview.html);
-		await view.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'ready' });
-		const handle = getCollectionActionHandle(view.webview.sent[0], 'localNodes');
-		assert.ok(handle);
+		const first = new TestWebviewView();
+		const second = new TestWebviewView();
+		provider.resolveWebviewView(first);
+		provider.resolveWebviewView(second);
+		const firstId = getUiInstanceId(first.webview.html);
+		const secondId = getUiInstanceId(second.webview.html);
+		await first.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: firstId, type: 'ready' });
+		await second.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: secondId, type: 'ready' });
+		const oldLocalHandle = getCollectionActionHandle(first.webview.sent[0], 'localNodes');
+		assert.ok(oldLocalHandle);
 		const current = facade.snapshotValue;
 		facade.snapshotValue = {
 			...current,
 			policyCandidates: current.policyCandidates?.map((candidate) => ({
 				...candidate,
 				online: false,
+				allowlisted: true,
+				canToggle: true,
 				gateState: 'offline',
 			})),
 		};
 
 		facade.fireChanged();
-		await settle();
-		const latest = view.webview.sent[view.webview.sent.length - 1];
+		await waitFor(() => first.webview.sent.length >= 2 && second.webview.sent.length >= 2);
+		let latest = first.webview.sent[first.webview.sent.length - 1];
 		assert.equal(getCollectionLength(latest, 'localNodes'), 0);
+		assert.equal(getCollectionLength(latest, 'savedAuthorizations'), 1);
 		assert.equal(getCollectionActionHandle(latest, 'localNodes'), undefined);
-		await view.webview.receive({
+		assert.ok(getCollectionActionHandle(latest, 'savedAuthorizations'));
+
+		await first.webview.receive({
 			version: DASHBOARD_MESSAGE_VERSION,
-			uiInstanceId,
+			uiInstanceId: firstId,
 			type: 'action',
 			action: 'setPeerAllowed',
-			actionHandle: handle,
+			actionHandle: oldLocalHandle,
 			enabled: false,
 		});
-		assert.equal(view.webview.sent.some(({ code }) => code === 'STALE_ACTION'), true);
+		assert.equal(first.webview.sent.some(({ code }) => code === 'STALE_ACTION'), true);
+		latest = first.webview.sent[first.webview.sent.length - 1];
+		const firstSavedHandle = getCollectionActionHandle(latest, 'savedAuthorizations');
+		assert.ok(firstSavedHandle);
+		await second.webview.receive({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: secondId,
+			type: 'action',
+			action: 'setPeerAllowed',
+			actionHandle: firstSavedHandle,
+			enabled: false,
+		});
+		assert.equal(second.webview.sent.some(({ code }) => code === 'STALE_ACTION'), true);
+
+		await first.webview.receive({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: firstId,
+			type: 'action',
+			action: 'setPeerAllowed',
+			actionHandle: firstSavedHandle,
+			enabled: true,
+		});
+		assert.equal(first.webview.sent.some(({ code }) => code === 'POLICY_FORBIDDEN'), true);
 		assert.equal(facade.calls.some((call) => call.startsWith('setPeerAllowed:')), false);
+		latest = first.webview.sent[first.webview.sent.length - 1];
+		const removeHandle = getCollectionActionHandle(latest, 'savedAuthorizations');
+		assert.ok(removeHandle);
+		await first.webview.receive({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: firstId,
+			type: 'action',
+			action: 'setPeerAllowed',
+			actionHandle: removeHandle,
+			enabled: false,
+		});
+		assert.ok(facade.calls.includes(`setPeerAllowed:${'a'.repeat(32)}:false`));
+		await first.webview.receive({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: firstId,
+			type: 'action',
+			action: 'setPeerAllowed',
+			actionHandle: removeHandle,
+			enabled: false,
+		});
+		assert.equal(first.webview.sent.filter(({ code }) => code === 'STALE_ACTION').length >= 2, true);
+
+		facade.snapshotValue = {
+			...current,
+			policyCandidates: current.policyCandidates?.map((candidate) => ({
+				...candidate,
+				actionHandle: 'e'.repeat(32),
+				windowLabel: 'Reopened Window',
+			})),
+		};
+		facade.fireChanged();
+		await waitFor(() => {
+			const message = first.webview.sent[first.webview.sent.length - 1];
+			return getCollectionLength(message, 'savedAuthorizations') === 0
+				&& getCollectionLength(message, 'localNodes') === 1;
+		});
 		provider.dispose();
 	});
 
@@ -1261,7 +1361,7 @@ function getSnapshotDeviceName(message: Record<string, unknown>): unknown {
 
 function getCollectionActionHandle(
 	message: Record<string, unknown>,
-	collection: 'localNodes' | 'outgoingTasks' | 'incomingTasks',
+	collection: 'localNodes' | 'savedAuthorizations' | 'outgoingTasks' | 'incomingTasks',
 ): string | undefined {
 	const model = message.model;
 	if (typeof model !== 'object' || model === null || Array.isArray(model)) {
@@ -1282,7 +1382,7 @@ function getCollectionActionHandle(
 
 function getCollectionLength(
 	message: Record<string, unknown>,
-	collection: 'localNodes' | 'outgoingTasks' | 'incomingTasks',
+	collection: 'localNodes' | 'savedAuthorizations' | 'outgoingTasks' | 'incomingTasks',
 ): number | undefined {
 	const model = message.model;
 	if (typeof model !== 'object' || model === null || Array.isArray(model)) {

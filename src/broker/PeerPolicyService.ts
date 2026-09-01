@@ -194,13 +194,15 @@ export class PeerPolicyService implements PeerRouteAuthorizer {
 			input.nodeId,
 		);
 		const labels = this.effectiveNodeLabels();
-		const representedIdentities = new Set<string>();
-		const candidates: PeerPolicyCandidateBinding[] = this.registry.peerNodes()
+		const onlineNodes = this.registry.peerNodes().filter(({ online }) => online);
+		const representedIdentities = new Set(
+			onlineNodes.flatMap(({ workspaces }) =>
+				workspaces.map(({ workspaceIdentity }) => workspaceIdentity)
+			),
+		);
+		const candidates: PeerPolicyCandidateBinding[] = onlineNodes
 			.map((node) => {
 				const workspace = node.workspaces.length === 1 ? node.workspaces[0] : undefined;
-				if (workspace !== undefined) {
-					representedIdentities.add(workspace.workspaceIdentity);
-				}
 				const policy = workspace === undefined
 					? undefined
 					: this.store.get(workspace.workspaceIdentity);

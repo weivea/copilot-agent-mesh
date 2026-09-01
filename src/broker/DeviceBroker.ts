@@ -571,7 +571,10 @@ export class DeviceBroker {
 				this.assertIdentity(binding, input);
 				const actions = this.resetCandidateActions(session);
 				const bindings = this.options.peerPolicies.listCandidates(input);
-				const visibleBindings = bindings.slice(0, PROTOCOL_LIMITS.nodeListCount);
+				const visibleBindings = bindings.slice(
+					0,
+					PROTOCOL_LIMITS.nodeListCount + PROTOCOL_LIMITS.workspaceListCount,
+				);
 				const candidates = visibleBindings.map((candidateBinding) => {
 					const actionHandle = candidateBinding.candidate.canToggle
 						? this.issueDashboardHandle(actions, candidateBinding)

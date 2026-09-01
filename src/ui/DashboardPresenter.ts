@@ -10,6 +10,7 @@ export interface DashboardViewModel {
 	readonly broker: NonNullable<DashboardSnapshot['broker']>;
 	readonly thisWindow: DashboardSnapshot['thisWindow'];
 	readonly localNodes: readonly DashboardLocalNodeViewModel[];
+	readonly savedAuthorizations: readonly DashboardSavedAuthorizationViewModel[];
 	readonly outgoingTasks: readonly NonNullable<DashboardSnapshot['outgoingTasks']>[number][];
 	readonly incomingTasks: readonly NonNullable<DashboardSnapshot['incomingTasks']>[number][];
 	readonly errors: DashboardSnapshot['errors'];
@@ -19,8 +20,15 @@ type DashboardLocalNodeViewModel =
 	NonNullable<DashboardSnapshot['policyCandidates']>[number]
 	& { readonly online: true };
 
+interface DashboardSavedAuthorizationViewModel {
+	readonly actionHandle: string;
+	readonly windowLabel: string;
+	readonly workspaceName: string;
+}
+
 export class DashboardPresenter {
 	public present(snapshot: DashboardSnapshot): DashboardViewModel {
+		const policyCandidates = snapshot.policyCandidates ?? [];
 		return {
 			device: {
 				name: redactRemoteText(snapshot.device.name),
@@ -56,13 +64,16 @@ export class DashboardPresenter {
 					detail: optionalRedacted(snapshot.thisWindow.agentHost.detail),
 				},
 			},
-			localNodes: (snapshot.policyCandidates ?? [])
+			localNodes: policyCandidates
 				.filter(isOnlinePolicyCandidate)
 				.map((candidate) => ({
 					...candidate,
 					windowLabel: redactRemoteText(candidate.windowLabel),
 					workspaceName: redactRemoteText(candidate.workspaceName),
 				})),
+			savedAuthorizations: policyCandidates
+				.filter(({ online, allowlisted }) => !online && allowlisted)
+				.map(toSavedAuthorization),
 			outgoingTasks: (snapshot.outgoingTasks ?? []).map(redactDashboardTask),
 			incomingTasks: (snapshot.incomingTasks ?? []).map(redactDashboardTask),
 			errors: snapshot.errors.map(redactError),
@@ -74,6 +85,19 @@ function isOnlinePolicyCandidate(
 	candidate: NonNullable<DashboardSnapshot['policyCandidates']>[number],
 ): candidate is DashboardLocalNodeViewModel {
 	return candidate.online;
+}
+
+function toSavedAuthorization(
+	candidate: NonNullable<DashboardSnapshot['policyCandidates']>[number],
+): DashboardSavedAuthorizationViewModel {
+	if (!candidate.canToggle || candidate.actionHandle === undefined) {
+		throw new Error('A saved authorization requires a remove action.');
+	}
+	return {
+		actionHandle: candidate.actionHandle,
+		windowLabel: redactRemoteText(candidate.windowLabel),
+		workspaceName: redactRemoteText(candidate.workspaceName),
+	};
 }
 
 function redactBroker(
