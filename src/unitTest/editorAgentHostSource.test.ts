@@ -566,17 +566,8 @@ test('source selector cancellation interrupts editor readiness backoff without f
 	assert.equal(standalone.starts, 0);
 });
 
-test('source selector prevents editor endpoint probes from racing token use', async () => {
-	let releaseProbe!: () => void;
-	let probeStarted!: () => void;
-	const probeStartedPromise = new Promise<void>((resolve) => {
-		probeStarted = resolve;
-	});
+test('source selector keeps editor availability passive until a real task selects it', async () => {
 	const editor = new FakeRuntime();
-	editor.probeBlock = new Promise<void>((resolve) => {
-		releaseProbe = resolve;
-	});
-	editor.onProbe = probeStarted;
 	const standalone = new FakeRuntime();
 	const selector = new AgentHostSourceSelector(selectorOptions({
 		preferEditor: () => true,
@@ -584,27 +575,26 @@ test('source selector prevents editor endpoint probes from racing token use', as
 		standalone,
 	}));
 
-	const initialProbe = selector.probe();
-	await probeStartedPromise;
-	const start = selector.start(taskRequest());
-	const duringStart = await selector.probe();
-	assert.equal(duringStart.source, 'editor');
-	assert.equal(duringStart.available, false);
-	assert.equal(editor.probes, 1);
-	releaseProbe();
-	await initialProbe;
-	await start;
-	assert.equal(editor.probes, 1);
+	const pending = await selector.probe();
+	assert.deepEqual(pending, {
+		available: false,
+		featureEnabled: true,
+		reason: 'AGENT_UNAVAILABLE',
+		source: 'editor',
+	});
+	assert.equal(editor.probes, 0);
+	await selector.start(taskRequest());
+	assert.equal(editor.probes, 0);
 	assert.equal(editor.starts, 1);
 
 	const selectedProbe = await selector.probe();
 	assert.equal(selectedProbe.source, 'editor');
 	assert.equal(selectedProbe.available, true);
-	assert.equal(editor.probes, 1);
+	assert.equal(editor.probes, 0);
 	await selector.dispose();
 });
 
-test('source selector caches pre-selection editor discovery across dashboard probes', async () => {
+test('nonfallback editor errors report the attempted source without leaking details', async () => {
 	const editor = new FakeRuntime();
 	const standalone = new FakeRuntime();
 	const selector = new AgentHostSourceSelector(selectorOptions({
@@ -612,32 +602,8 @@ test('source selector caches pre-selection editor discovery across dashboard pro
 		editor,
 		standalone,
 	}));
-
-	const [first, second, third] = await Promise.all([
-		selector.probe(),
-		selector.probe(),
-		selector.probe(),
-	]);
-	assert.deepEqual(first, second);
-	assert.deepEqual(second, third);
-	assert.equal(editor.probes, 1);
-	assert.equal(standalone.probes, 0);
-	await selector.start(taskRequest());
-	assert.equal(editor.probes, 1);
-	await selector.dispose();
-});
-
-test('nonfallback editor errors replace stale standalone probe status without leaking details', async () => {
-	const editor = new FakeRuntime();
-	const standalone = new FakeRuntime();
-	const selector = new AgentHostSourceSelector(selectorOptions({
-		preferEditor: () => true,
-		editor,
-		standalone,
-	}));
-	editor.probeResult = { available: false, featureEnabled: true };
 	await selector.probe();
-	assert.equal(selector.sourceStatus().source, 'standalone');
+	assert.equal(selector.sourceStatus().source, 'editor');
 	editor.startError = new AgentRuntimeError(
 		'AGENT_CONFIG_REQUIRED',
 		'/private/editor.sock?tkn=secret requires configuration',
@@ -953,13 +919,9 @@ class FakeRuntime implements AgentRuntime {
 	readonly startErrors: unknown[] = [];
 	readonly disposeErrors: unknown[] = [];
 	probeResult: AgentRuntimeProbe = { available: true, featureEnabled: true };
-	probeBlock: Promise<void> | undefined;
-	onProbe: (() => void) | undefined;
 
 	public async probe(): Promise<AgentRuntimeProbe> {
 		this.probes += 1;
-		this.onProbe?.();
-		await this.probeBlock;
 		return this.probeResult;
 	}
 

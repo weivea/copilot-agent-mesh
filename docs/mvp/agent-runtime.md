@@ -37,12 +37,11 @@ unstable, while an independent production connector first succeeded about 82
 seconds after two-window startup without intervening attempts. Invalid protocol
 responses, malformed tokens, and explicit upgrade authentication rejection do
 not retry.
-The selector also serializes the final pre-start endpoint probe with launch and
-caches that first result until a source is selected. It does not rediscover the
-endpoint for repeated Dashboard refreshes, while an editor start is in flight,
-or after editor selection. The actual start still performs a fresh locate. This
-prevents UI refreshes from continuously perturbing the registry before WebSocket
-upgrade.
+Before any task selects a source, Dashboard probes are passive and report editor
+availability as pending rather than executing `code agent endpoints`. The actual
+task start performs the first fresh locate/connect. This prevents UI refreshes
+from perturbing the registry or rotating a connection token before WebSocket
+upgrade. Only after a successful start is editor reported healthy.
 Fallback is forbidden when cleanup of the failed editor attempt is unconfirmed;
 starting standalone in that state could overlap resources or execution. Selector
 disposal retains failed cleanup for an explicit retry.

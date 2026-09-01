@@ -43,8 +43,6 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 	private readonly listeners = new Set<(status: AgentHostSourceStatus) => void>();
 	private status: AgentHostSourceStatus = { source: 'standalone', degraded: false };
 	private sourceSelected = false;
-	private editorProbeOperation: Promise<AgentRuntimeProbe> | undefined;
-	private editorProbeResult: AgentRuntimeProbe | undefined;
 	private readonly inFlightStarts = new Set<{
 		readonly controller: AbortController;
 		readonly operation: Promise<AgentTaskHandle>;
@@ -97,15 +95,13 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 			return probeWithStatus(selected, this.status);
 		}
 
-		const editor = await this.probeEditor();
-		if (editor.available) {
-			this.setStatus({ source: 'editor', degraded: false });
-			return probeWithStatus(editor, this.status);
-		}
-		const status = degradedStatus('EDITOR_DISCOVERY_FAILED');
-		this.setStatus(status);
-		const standalone = await this.options.standalone.probe();
-		return probeWithStatus(standalone, status);
+		this.setStatus({ source: 'editor', degraded: false });
+		return {
+			available: false,
+			featureEnabled: true,
+			reason: 'AGENT_UNAVAILABLE',
+			source: 'editor',
+		};
 	}
 
 	public start(request: AgentTaskRequest): Promise<AgentTaskHandle> {
@@ -147,7 +143,6 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 		}
 
 		let editorFailure: AgentHostSourceFailure | undefined;
-		await this.editorProbeOperation?.catch(() => undefined);
 		for (let attempt = 0; attempt <= this.editorConnectionRetryDelaysMs.length; attempt += 1) {
 			try {
 				const handle = await this.options.editor.start(request);
@@ -189,26 +184,6 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 			this.setStatus(failed);
 			throw normalizeFallbackFailure(error);
 		}
-	}
-
-	private probeEditor(): Promise<AgentRuntimeProbe> {
-		if (this.editorProbeResult !== undefined) {
-			return Promise.resolve(this.editorProbeResult);
-		}
-		if (this.editorProbeOperation !== undefined) {
-			return this.editorProbeOperation;
-		}
-		let operation!: Promise<AgentRuntimeProbe>;
-		operation = this.options.editor.probe().then((result) => {
-			this.editorProbeResult = result;
-			return result;
-		}).finally(() => {
-			if (this.editorProbeOperation === operation) {
-				this.editorProbeOperation = undefined;
-			}
-		});
-		this.editorProbeOperation = operation;
-		return operation;
 	}
 
 	private async approve(request: AgentTaskRequest, signal: AbortSignal): Promise<AgentTaskRequest> {
