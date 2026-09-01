@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { connect as connectSocket } from 'node:net';
 
 import WebSocket from 'ws';
@@ -18,6 +19,8 @@ export type UnixSocketWebSocketErrorCode =
 	| 'UPGRADE_TIMEOUT';
 
 export class UnixSocketWebSocketError extends Error {
+	readonly endpointFingerprint?: string;
+
 	public constructor(
 		readonly code: UnixSocketWebSocketErrorCode,
 		message: string,
@@ -61,6 +64,7 @@ export class UnixSocketWebSocketConnector {
 				'The editor Agent Host connection token is invalid.',
 			));
 		}
+		const endpointFingerprint = editorEndpointFingerprint(socketPath, connectionToken);
 
 		return new Promise((resolve, reject) => {
 			const rawSocket = connectSocket({ path: socketPath });
@@ -104,6 +108,12 @@ export class UnixSocketWebSocketConnector {
 					return;
 				}
 				settled = true;
+				Object.defineProperty(error, 'endpointFingerprint', {
+					configurable: false,
+					enumerable: true,
+					value: endpointFingerprint,
+					writable: false,
+				});
 				cleanup();
 				scrubInspectableState();
 				if (webSocket !== undefined) {
@@ -193,6 +203,16 @@ export class UnixSocketWebSocketConnector {
 			signal?.addEventListener('abort', handleAbort, { once: true });
 		});
 	}
+}
+
+export function editorEndpointFingerprint(socketPath: string, connectionToken: string): string {
+	return createHash('sha256')
+		.update('copilot-agent-mesh/editor-endpoint/v1\0', 'utf8')
+		.update(socketPath, 'utf8')
+		.update('\0', 'utf8')
+		.update(connectionToken, 'utf8')
+		.digest('hex')
+		.slice(0, 16);
 }
 
 function validateUpgradeResponse(response: import('node:http').IncomingMessage): boolean {

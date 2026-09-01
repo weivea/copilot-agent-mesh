@@ -32,6 +32,7 @@ export interface AgentHostSourceFailure {
 		| 'UPGRADE_TIMEOUT';
 	readonly statusCode?: number;
 	readonly socketCode?: 'EACCES' | 'ECONNREFUSED' | 'ENOENT';
+	readonly endpointFingerprint?: string;
 	readonly message: string;
 }
 

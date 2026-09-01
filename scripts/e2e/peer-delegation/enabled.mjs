@@ -1117,6 +1117,10 @@ async function recordCompletionScenario({
 			...(['EACCES', 'ECONNREFUSED', 'ENOENT'].includes(sourceFailure.socketCode)
 				? { socketCode: sourceFailure.socketCode }
 				: {}),
+			...(typeof sourceFailure.endpointFingerprint === 'string'
+				&& /^[a-f0-9]{16}$/u.test(sourceFailure.endpointFingerprint)
+				? { endpointFingerprint: sourceFailure.endpointFingerprint }
+				: {}),
 		}
 		: undefined;
 	const catalogAfter = await request(target, 'peer.session.catalog', {}, 60_000);

@@ -361,6 +361,7 @@ class BorrowedEditorAgentHost implements LaunchedAgentHost {
 	readonly endpoint = borrowedEditorEndpoint;
 	readonly source = 'editor' as const;
 	readonly preserveTerminalSession = true;
+	readonly endpointFingerprint: string;
 	readonly version: string;
 	readonly registryProtocolVersion: string;
 
@@ -370,6 +371,7 @@ class BorrowedEditorAgentHost implements LaunchedAgentHost {
 	) {
 		this.version = located.version;
 		this.registryProtocolVersion = located.registryProtocolVersion;
+		this.endpointFingerprint = located.endpointFingerprint;
 	}
 
 	public openWebSocket(signal?: AbortSignal): ReturnType<LocatedEditorAgentHost['connect']> {
@@ -451,6 +453,9 @@ function safeEditorFailure(error: unknown): AgentHostSourceFailure {
 				...(error.cause.socketCode === undefined
 					? {}
 					: { socketCode: error.cause.socketCode }),
+				...(error.cause.endpointFingerprint === undefined
+					? {}
+					: { endpointFingerprint: error.cause.endpointFingerprint }),
 			}
 			: {}),
 		message: 'The selected editor Agent Host attempt failed safely.',

@@ -907,6 +907,7 @@ async function assertConnectorFailure(
 		(error: unknown) => error instanceof UnixSocketWebSocketError
 			&& error.code === code
 			&& error.statusCode === statusCode
+			&& /^[a-f0-9]{16}$/u.test(error.endpointFingerprint ?? '')
 			&& !error.message.includes(socketPath)
 			&& !error.message.includes(token),
 	);
