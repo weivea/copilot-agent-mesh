@@ -62,6 +62,7 @@ export interface PeerDelegationE2eApiOptions {
 	readonly localIpcEndpoint?: LocalIpcEndpoint;
 	readonly recorder: PeerDelegationE2eRecorder;
 	readonly toolClock: PeerDelegationE2eToolClock;
+	readonly editorProxyRoot?: string;
 }
 
 export function createPeerDelegationE2eApi(
@@ -188,7 +189,11 @@ async function editorInitializeProbe(
 			configuredUserDataDir: configuration.get<unknown>('agentHost.userDataDir'),
 			platform: { productName: options.vscodeApi.env.appName },
 		}),
-		new UnixSocketWebSocketConnector(),
+		new UnixSocketWebSocketConnector({
+			...(options.editorProxyRoot === undefined
+				? {}
+				: { proxyRoot: options.editorProxyRoot }),
+		}),
 	);
 	let host: LaunchedAgentHost | undefined;
 	let connection: AhpConnection | undefined;
@@ -469,7 +474,11 @@ async function editorSessionCatalog(
 			configuredUserDataDir: configuration.get<unknown>('agentHost.userDataDir'),
 			platform: { productName: options.vscodeApi.env.appName },
 		}),
-		new UnixSocketWebSocketConnector(),
+		new UnixSocketWebSocketConnector({
+			...(options.editorProxyRoot === undefined
+				? {}
+				: { proxyRoot: options.editorProxyRoot }),
+		}),
 	);
 	let host: LaunchedAgentHost | undefined;
 	let connection: AhpConnection | undefined;

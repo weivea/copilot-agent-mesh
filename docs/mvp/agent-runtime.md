@@ -37,6 +37,15 @@ unstable, while an independent production connector first succeeded about 82
 seconds after two-window startup without intervening attempts. Invalid protocol
 responses, malformed tokens, and explicit upgrade authentication rejection do
 not retry.
+If an Extension Host receives `ECONNREFUSED` while an ordinary Node process can
+reach the exact fingerprinted endpoint, the connector uses one owned short-lived
+Node byte proxy. The target socket path crosses only the private IPC channel;
+the connection token remains in the Extension Host and passes through the proxy
+only as local authenticated WebSocket handshake bytes. The short proxy socket
+uses a mode-0700 `/tmp/cam-ep-*` directory to stay below the macOS Unix path limit,
+while its command line carries the owning storage-root marker. Close, cancellation,
+parent IPC loss, and startup failure terminate the exact child and remove only
+that exact directory.
 Before any task selects a source, Dashboard probes are passive and report editor
 health as unavailable/pending with an internal `canStart` capability rather than
 executing `code agent endpoints`. The task executor may attempt such a source,

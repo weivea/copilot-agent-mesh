@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
 import {
 	createServer as createNetServer,
@@ -286,6 +286,17 @@ test('Unix socket connector performs authenticated upgrade, scrubs inspectable U
 			first.close();
 			await once(first, 'close');
 			assert.equal(second.readyState, second.OPEN);
+			const proxyRoot = await mkdtemp(join(tmpdir(), 'mesh-editor-proxy-test-'));
+			const proxied = await new UnixSocketWebSocketConnector({
+				timeoutMs: 1_000,
+				proxyRoot,
+				connectionMode: 'proxyOnly',
+			}).connect(socketPath, 'connection-token');
+			assert.equal(proxied.readyState, proxied.OPEN);
+			proxied.close();
+			await once(proxied, 'close');
+			await waitForDirectoryEmpty(proxyRoot);
+			await rm(proxyRoot, { recursive: true, force: true });
 			second.close();
 			second.close();
 			await once(second, 'close');
@@ -911,6 +922,16 @@ async function assertConnectorFailure(
 			&& !error.message.includes(socketPath)
 			&& !error.message.includes(token),
 	);
+}
+
+async function waitForDirectoryEmpty(path: string): Promise<void> {
+	for (let attempt = 0; attempt < 100; attempt += 1) {
+		if ((await readdir(path).catch(() => [])).length === 0) {
+			return;
+		}
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	assert.fail('Timed out waiting for the editor socket proxy to clean up.');
 }
 
 class FakeRuntime implements AgentRuntime {

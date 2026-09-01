@@ -281,6 +281,9 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 					peerDelegationRun === undefined
 						? undefined
 						: join(peerDelegationRun.controlRoot, 'agent-host'),
+					peerDelegationRun === undefined
+						? undefined
+						: join(peerDelegationRun.controlRoot, 'editor-proxy'),
 				);
 				sourceStatusSubscription = runtime.onDidSourceStatusChange(() => changeEvents.fire());
 				return new WindowNodeTaskExecutor({
@@ -389,6 +392,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			? gatedE2e
 			: undefined;
 		const peerDelegationE2e = requestedE2eScenario === 'peerDelegation'
+			&& peerDelegationRun !== undefined
 			&& peerDelegationRecorder !== undefined
 			&& peerDelegationToolClock !== undefined
 			? createPeerDelegationE2eApi({
@@ -404,6 +408,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 				localIpcEndpoint: deriveLocalIpcEndpoint(nodeIdentity),
 				recorder: peerDelegationRecorder,
 				toolClock: peerDelegationToolClock,
+				editorProxyRoot: join(peerDelegationRun.controlRoot, 'editor-proxy'),
 			})
 			: undefined;
 		let meshTools: vscode.Disposable | undefined;

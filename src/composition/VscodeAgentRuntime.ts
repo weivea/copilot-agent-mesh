@@ -201,6 +201,7 @@ export function createVscodeAgentRuntime(
 	approvalCapabilities = new AgentRuntimeApprovalCapabilityIssuer(),
 	lifecycleObserver?: AgentRuntimeLifecycleObserver,
 	standaloneStorageRoot?: string,
+	editorProxyRoot?: string,
 ): AgentRuntime & AgentHostSourceStatusProvider {
 	const configuration = vscodeApi.workspace.getConfiguration(configurationSection);
 	const launcher = new AgentHostLauncher({
@@ -235,7 +236,10 @@ export function createVscodeAgentRuntime(
 				configuredUserDataDir: configuration.get<unknown>('agentHost.userDataDir'),
 				platform: { productName: vscodeApi.env.appName },
 			}),
-			new UnixSocketWebSocketConnector(),
+			new UnixSocketWebSocketConnector({
+				proxyRoot: editorProxyRoot
+					?? vscodeApi.Uri.joinPath(context.globalStorageUri, 'editor-proxy').fsPath,
+			}),
 		),
 		connections: new SdkAhpConnectionFactory(),
 	});

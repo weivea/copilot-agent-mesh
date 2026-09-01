@@ -3,6 +3,11 @@ import { connect as connectSocket } from 'node:net';
 
 import WebSocket from 'ws';
 
+import {
+	EditorSocketProxy,
+	EditorSocketProxyError,
+} from './EditorSocketProxy';
+
 const defaultTimeoutMs = 10_000;
 const maximumTokenBytes = 4_096;
 const maximumPayloadBytes = 16 * 1024 * 1024;
@@ -34,19 +39,25 @@ export class UnixSocketWebSocketError extends Error {
 
 export interface UnixSocketWebSocketConnectorOptions {
 	readonly timeoutMs?: number;
+	readonly proxyRoot?: string;
+	readonly connectionMode?: 'directThenProxy' | 'directOnly' | 'proxyOnly';
 }
 
 export class UnixSocketWebSocketConnector {
 	private readonly timeoutMs: number;
+	private readonly proxyRoot: string | undefined;
+	private readonly connectionMode: 'directThenProxy' | 'directOnly' | 'proxyOnly';
 
 	public constructor(options: UnixSocketWebSocketConnectorOptions = {}) {
 		this.timeoutMs = options.timeoutMs ?? defaultTimeoutMs;
+		this.proxyRoot = options.proxyRoot;
+		this.connectionMode = options.connectionMode ?? 'directThenProxy';
 		if (!Number.isSafeInteger(this.timeoutMs) || this.timeoutMs <= 0) {
 			throw new RangeError('Unix socket WebSocket timeout must be a positive safe integer.');
 		}
 	}
 
-	public connect(
+	public async connect(
 		socketPath: string,
 		connectionToken: string,
 		signal?: AbortSignal,
@@ -65,7 +76,45 @@ export class UnixSocketWebSocketConnector {
 			));
 		}
 		const endpointFingerprint = editorEndpointFingerprint(socketPath, connectionToken);
+		if (this.connectionMode === 'proxyOnly') {
+			return this.connectThroughProxy(
+				socketPath,
+				connectionToken,
+				endpointFingerprint,
+				signal,
+			);
+		}
+		try {
+			return await this.connectAtPath(
+				socketPath,
+				connectionToken,
+				endpointFingerprint,
+				signal,
+			);
+		} catch (error) {
+			if (
+				this.connectionMode === 'directOnly'
+				|| !(error instanceof UnixSocketWebSocketError)
+				|| error.code !== 'CONNECT_FAILED'
+				|| error.socketCode !== 'ECONNREFUSED'
+			) {
+				throw error;
+			}
+			return this.connectThroughProxy(
+				socketPath,
+				connectionToken,
+				endpointFingerprint,
+				signal,
+			);
+		}
+	}
 
+	private connectAtPath(
+		socketPath: string,
+		connectionToken: string,
+		endpointFingerprint: string,
+		signal?: AbortSignal,
+	): Promise<WebSocket> {
 		return new Promise((resolve, reject) => {
 			const rawSocket = connectSocket({ path: socketPath });
 			let webSocket: WebSocket | undefined;
@@ -125,7 +174,7 @@ export class UnixSocketWebSocketConnector {
 				reject(error);
 			};
 			const handleAbort = (): void => settleFailure(cancelled());
-			const handleRawError = (): void => settleFailure(rawConnected
+			const handleRawError = (error: NodeJS.ErrnoException): void => settleFailure(rawConnected
 				? new UnixSocketWebSocketError(
 					'EARLY_CLOSE',
 					'The editor Agent Host socket closed before the WebSocket upgrade completed.',
@@ -133,6 +182,8 @@ export class UnixSocketWebSocketConnector {
 				: new UnixSocketWebSocketError(
 					'CONNECT_FAILED',
 					'The editor Agent Host socket connection failed.',
+					undefined,
+					socketErrorCode(error.code),
 				));
 			const handleRawClose = (): void => settleFailure(new UnixSocketWebSocketError(
 				'EARLY_CLOSE',
@@ -202,6 +253,51 @@ export class UnixSocketWebSocketConnector {
 			rawSocket.once('close', handleRawClose);
 			signal?.addEventListener('abort', handleAbort, { once: true });
 		});
+	}
+
+	private async connectThroughProxy(
+		targetPath: string,
+		connectionToken: string,
+		endpointFingerprint: string,
+		signal?: AbortSignal,
+	): Promise<WebSocket> {
+		if (this.proxyRoot === undefined) {
+			throw fingerprintError(
+				connectionFailed(),
+				endpointFingerprint,
+			);
+		}
+		let proxy: EditorSocketProxy;
+		try {
+			proxy = await EditorSocketProxy.open({
+				targetPath,
+				root: this.proxyRoot,
+				timeoutMs: this.timeoutMs,
+				signal,
+			});
+		} catch (error) {
+			throw error instanceof EditorSocketProxyError
+				? fingerprintError(new UnixSocketWebSocketError(
+					error.code,
+					error.message,
+					undefined,
+					error.socketCode,
+				), endpointFingerprint)
+				: fingerprintError(connectionFailed(), endpointFingerprint);
+		}
+		try {
+			const webSocket = await this.connectAtPath(
+				proxy.socketPath,
+				connectionToken,
+				endpointFingerprint,
+				signal,
+			);
+			proxy.bind(webSocket);
+			return webSocket;
+		} catch (error) {
+			await proxy.dispose();
+			throw error;
+		}
 	}
 }
 
@@ -273,8 +369,8 @@ function webSocketFailure(error: Error & { code?: unknown }): UnixSocketWebSocke
 	if (unexpected !== null) {
 		return unexpectedResponse(Number(unexpected[1]));
 	}
-	if (['EACCES', 'ECONNREFUSED', 'ENOENT'].includes(String(error.code))) {
-		const socketCode = error.code as 'EACCES' | 'ECONNREFUSED' | 'ENOENT';
+	const socketCode = socketErrorCode(error.code);
+	if (socketCode !== undefined) {
 		return new UnixSocketWebSocketError(
 			'CONNECT_FAILED',
 			'The editor Agent Host socket connection failed.',
@@ -307,5 +403,33 @@ function webSocketFailure(error: Error & { code?: unknown }): UnixSocketWebSocke
 	return new UnixSocketWebSocketError(
 		'UPGRADE_FAILED',
 		'The editor Agent Host WebSocket upgrade failed.',
+	);
+}
+
+function socketErrorCode(
+	code: unknown,
+): 'EACCES' | 'ECONNREFUSED' | 'ENOENT' | undefined {
+	return ['EACCES', 'ECONNREFUSED', 'ENOENT'].includes(String(code))
+		? code as 'EACCES' | 'ECONNREFUSED' | 'ENOENT'
+		: undefined;
+}
+
+function fingerprintError(
+	error: UnixSocketWebSocketError,
+	endpointFingerprint: string,
+): UnixSocketWebSocketError {
+	Object.defineProperty(error, 'endpointFingerprint', {
+		configurable: false,
+		enumerable: true,
+		value: endpointFingerprint,
+		writable: false,
+	});
+	return error;
+}
+
+function connectionFailed(): UnixSocketWebSocketError {
+	return new UnixSocketWebSocketError(
+		'CONNECT_FAILED',
+		'The editor Agent Host socket proxy is unavailable.',
 	);
 }
