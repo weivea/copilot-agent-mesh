@@ -38,6 +38,7 @@ export interface LaunchedAgentHost {
 	readonly registryProtocolVersion: string;
 	readonly source?: AgentHostSource;
 	readonly preserveTerminalSession?: boolean;
+	readonly endpointFingerprint?: string;
 	openWebSocket?(signal?: AbortSignal): Promise<WebSocket>;
 	onExit(listener: (error: AgentRuntimeError) => void): { dispose(): void };
 	dispose(): Promise<void>;

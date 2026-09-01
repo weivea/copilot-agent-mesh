@@ -109,6 +109,22 @@ Persisted task records contain identifiers, owner, workspace, canonical request
 hash, state, bounded summaries/events, and recovery metadata. They do not
 contain the full prompt or raw output by default.
 
+## P8 evidence foundation
+
+The real Peer Window Delegation artifact has a strict schema/version and exactly
+12 ordered AC-5 records with resolvable JSON Pointer references. A Pass is
+rejected unless the corresponding real topology, double gate, authoritative
+events, parent result, incoming record, editor source, local-route isolation,
+lease/profile release, and harness-owned zero-residue fields agree.
+
+Evidence safety is checked before schema parsing. Absolute POSIX/Windows/UNC
+paths, file URIs, endpoint query tokens, credential forms, full Workspace
+identities, raw prompt/output fields, oversized strings, and unknown top-level
+fields fail closed. Workspace claims and Agent Session resources are represented
+only by domain-separated truncated hashes. Resource baseline, peak, and final
+counts cover only Harness-owned exact PIDs, descendants, and unique per-run
+markers; unrelated global processes are neither counted nor claimed absent.
+
 ## Foundation interfaces
 
 | Interface | Purpose |

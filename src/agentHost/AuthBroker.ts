@@ -103,6 +103,25 @@ export class VscodeAuthBroker implements AuthBroker {
 	}
 }
 
+export class EditorExistingIdentityAuthBroker implements AuthBroker {
+	public async authenticate(
+		request: AuthenticationRequest,
+		_pushToken: (resource: string, token: string, scopes: readonly string[]) => Promise<void>,
+	): Promise<void> {
+		throwIfAborted(request.signal);
+		if (
+			request.reason === 'initial'
+			|| request.resources.every(({ required }) => required === false)
+		) {
+			return;
+		}
+		throw new AgentRuntimeError(
+			'AGENT_AUTH_REQUIRED',
+			'Authenticate the Agent Host in the selected editor profile before retrying.',
+		);
+	}
+}
+
 function throwIfAborted(signal?: AbortSignal): void {
 	if (signal?.aborted === true) {
 		throw new DOMException('Authentication was aborted.', 'AbortError');

@@ -27,14 +27,36 @@ test('extension entry point delegates activation and awaited deactivation to com
 
 test('composition uses global metadata, SecretStorage, and globalStorageUri without sync keys', () => {
 	const source = readSource('src/composition/createApplication.ts');
+	const runtime = readSource('src/composition/ProductionBrokerRuntime.ts');
+	const agentRuntime = readSource('src/composition/VscodeAgentRuntime.ts');
 	const allProductionSource = [
 		source,
+		runtime,
+		agentRuntime,
 		readSource('src/storage/VscodeStorageAdapters.ts'),
 	].join('\n');
 	assert.match(source, /context\.globalState/);
 	assert.match(source, /context\.secrets/);
 	assert.match(source, /context\.globalStorageUri/);
+	assert.match(
+		source,
+		/runtimeMode === 'development'\s*&& requestedE2eScenario === 'peerDelegation'\s*&& isE2eCapabilityEnabled\(e2eCapability\)\s*\?\s*peerDelegationRunContext/u,
+	);
+	assert.match(
+		source,
+		/new PeerDelegationE2eStateStore\(persistentState, peerDelegationRun\.nonce\)/u,
+	);
+	assert.match(
+		source,
+		/vscode\.Uri\.file\(join\(peerDelegationRun\.controlRoot, 'broker'\)\)/u,
+	);
+	assert.match(runtime, /options\.storageRootUri,\s*'mesh-state'/u);
+	assert.doesNotMatch(source, /new PeerDelegationE2eStateStore\([^,]+,\s*process\.env/u);
 	assert.doesNotMatch(allProductionSource, /setKeysForSync/);
+	assert.match(
+		agentRuntime,
+		/const standalone = new AhpAgentRuntime\(\{[\s\S]*?authBroker: new VscodeAuthBroker[\s\S]*?const editor = new AhpAgentRuntime\(\{[\s\S]*?authBroker: new EditorExistingIdentityAuthBroker\(\)/u,
+	);
 });
 
 test('production manifest contributes only the five registered task tools', () => {

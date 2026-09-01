@@ -285,3 +285,20 @@ Stable user-data 存在且命令成功，但 endpoint/editor 计数均为 0；In
 **unverified**，未创建 Session、未消费模型配额，也未留下 token、socket 或 Workspace
 路径证据。该环境结果不推翻本 Spike 的已证明结果，只说明 P8 必须在一个正在运行并注册
 editor endpoint 的普通 VS Code 实例内完成 O1。
+
+### P8 自动化边界（2026-08-31）
+
+P8 已实现可重复的两个普通窗口 Harness。它在窗口启动后用相同的严格 Locator 连接本次
+唯一 live `editor` endpoint；`createSession` acknowledgement 后，E2E-only lifecycle
+observer 只记录 Host 在 subscribed Session snapshot 或 Session-channel action 中回显的
+created Session channel 事实及 Session/source/endpoint domain-separated 截断 Hash，作为
+AC-5.9 的客观 runtime 证据。与 recovery 共用同一本地 URI 的 hash 相等不算独立证据。另有 bounded
+post-task `listSessions` 只服务 O1 catalog/UI 可见性判断。任何路径都不保存 resource URI、
+socket 路径或 token。
+
+稳定 Extension API 不提供读取 Chat Sessions UI 或向内置 Copilot Agent 自动发送并确认
+消息的接口。P8 在 VS Code 1.135.0 观察到无 Chat context 的
+`vscode.lm.invokeTool` 会执行 `prepareInvocation` 并显示独立 modal，但这个 modal 没有
+父 Chat 身份，不能证明用户在 Copilot 侧边栏接受委派。P8 的人工阶段保留两个真实窗口并
+给出精确 Agent-mode 操作；若没有人工可见观察，Q4' 继续记为 **unverified**，不从
+`listSessions` 或独立 modal 推断为 Pass。

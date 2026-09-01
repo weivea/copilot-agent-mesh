@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 
 import type * as vscode from 'vscode';
 
@@ -27,6 +27,7 @@ import type {
 	AgentHostSourceStatus,
 	AgentHostSourceStatusProvider,
 	AgentRuntime,
+	AgentRuntimeLifecycleObserver,
 	AgentRuntimeProbe,
 	AgentTaskHandle,
 	AgentTaskRequest,
@@ -34,7 +35,11 @@ import type {
 	ResolvedAgentTaskRequest,
 	WorkspaceResolver,
 } from '../agentHost/AgentRuntime';
-import { VscodeAuthBroker, type AuthenticationMapping } from '../agentHost/AuthBroker';
+import {
+	EditorExistingIdentityAuthBroker,
+	VscodeAuthBroker,
+	type AuthenticationMapping,
+} from '../agentHost/AuthBroker';
 import type { StateStore } from '../domain/ports';
 import type { LocalDesktopWorkspaceGuard } from '../application/LocalDesktopWorkspaceGuard';
 import type { LocalTaskConfirmation } from '../application/RemoteTaskRunner';
@@ -194,42 +199,60 @@ export function createVscodeAgentRuntime(
 	workerPlatform: WorkerPlatformSupport,
 	delegatedToolInvocations?: DelegatedToolInvocationRegistry,
 	approvalCapabilities = new AgentRuntimeApprovalCapabilityIssuer(),
+	lifecycleObserver?: AgentRuntimeLifecycleObserver,
+	standaloneStorageRoot?: string,
+	editorProxyRoot?: string,
+	editorProxyNodeExecutable?: string,
+	editorInitialReadinessDelayMs = 0,
 ): AgentRuntime & AgentHostSourceStatusProvider {
 	const configuration = vscodeApi.workspace.getConfiguration(configurationSection);
 	const launcher = new AgentHostLauncher({
-		storageRoot: vscodeApi.Uri.joinPath(context.globalStorageUri, 'agent-host').fsPath,
+		storageRoot: standaloneStorageRoot
+			?? vscodeApi.Uri.joinPath(context.globalStorageUri, 'agent-host').fsPath,
 		configuredCodeCli: configuration.get<string>('codePath') || undefined,
 	});
 	const common = {
 		enabled: () => vscodeApi.workspace
 			.getConfiguration(configurationSection)
 			.get<boolean>('experimental.agentHost', false),
-		authBroker: new VscodeAuthBroker(vscodeApi.authentication, (resource) =>
-			resolveAuthenticationProvider(vscodeApi, resource)),
 		confirmation: approval,
 		approvalCapabilities,
 		workspaceResolver,
 		configResolver: new VscodeSessionConfigurationResolver(vscodeApi),
 		delegatedToolInvocations,
+		lifecycleObserver,
 	};
 	const standalone = new AhpAgentRuntime({
 		...common,
+		authBroker: new VscodeAuthBroker(vscodeApi.authentication, (resource) =>
+			resolveAuthenticationProvider(vscodeApi, resource)),
 		launcher,
 		connections: new SdkAhpConnectionFactory(),
 	});
 	const editor = new AhpAgentRuntime({
 		...common,
+		authBroker: new EditorExistingIdentityAuthBroker(),
 		launcher: new EditorAgentHostLauncher(
 			new EditorAgentHostLocator({
 				configuredCodeCli: configuration.get<string>('codePath') || undefined,
 				configuredUserDataDir: configuration.get<unknown>('agentHost.userDataDir'),
 				platform: { productName: vscodeApi.env.appName },
 			}),
-			new UnixSocketWebSocketConnector(),
+			new UnixSocketWebSocketConnector({
+				proxyRoot: editorProxyRoot
+					?? vscodeApi.Uri.joinPath(context.globalStorageUri, 'editor-proxy').fsPath,
+				...(editorProxyNodeExecutable === undefined
+					? {}
+					: {
+						proxyNodeExecutable: editorProxyNodeExecutable,
+						connectionMode: 'proxyOnly',
+					}),
+			}),
 		),
 		connections: new SdkAhpConnectionFactory(),
 	});
 	const runtime = new AgentHostSourceSelector({
+		enabled: common.enabled,
 		preferEditor: () => vscodeApi.workspace
 			.getConfiguration(configurationSection)
 			.get<boolean>('experimental.peerDelegation', false),
@@ -238,6 +261,7 @@ export function createVscodeAgentRuntime(
 		confirmation: approval,
 		workspaceResolver,
 		approvalCapabilities,
+		editorInitialReadinessDelayMs,
 	});
 	return new GuardedAgentRuntime(runtime, guard, workerPlatform);
 }
@@ -260,6 +284,19 @@ class GuardedAgentRuntime implements AgentRuntime, AgentHostSourceStatusProvider
 		}
 		return this.delegate.probe();
 	}
+
+	public async prepareStart(): Promise<void> {
+		this.guard.assertAllowed({ requireWorkspace: false });
+		if (!this.workerPlatform.supported) {
+			throw new AgentRuntimeError(
+				this.workerPlatform.agentCode,
+				this.workerPlatform.agentMessage,
+			);
+		}
+		this.guard.assertAllowed();
+		await this.delegate.prepareStart?.();
+	}
+
 	public async start(request: AgentTaskRequest): Promise<AgentTaskHandle> {
 		this.guard.assertAllowed({ requireWorkspace: false });
 		this.guard.assertAllowed({ requireWorkspace: false });
@@ -301,35 +338,76 @@ export class VscodeWindowNodeTaskConfirmation implements WindowNodeTaskConfirmat
 
 	public async confirm(
 		request: WindowNodeTaskConfirmationRequest,
+		signal?: AbortSignal,
 	): Promise<WindowNodeTaskConfirmationResult> {
 		assertPromptDisplayable(request.prompt);
+		throwIfConfirmationAborted(signal);
 		if (isE2eCapabilityEnabled(this.e2eCapability)) {
 			return 'once';
 		}
-		const selected = await this.vscodeApi.window.showWarningMessage(
-			'Allow this Copilot Agent Mesh window task?',
-			{
-				modal: true,
-				detail: [
-					`Source window: ${request.sourceWindowLabel}`,
-					`Target window: ${request.targetWindowLabel}`,
-					`Workspace: ${request.workspaceDisplayName}`,
-					`Title: ${request.taskTitle}`,
-					'',
-					'Full prompt:',
-					request.prompt,
-					'',
-					'The agent may modify files and run commands in this workspace.',
-				].join('\n'),
-			},
-			'Run Once',
+		const panel = this.vscodeApi.window.createWebviewPanel(
+			'copilotAgentMesh.windowTaskConfirmation',
+			'Allow Copilot Agent Mesh task?',
+			this.vscodeApi.ViewColumn.Active,
+			{ enableScripts: true, retainContextWhenHidden: false },
 		);
-		return selected === 'Run Once' ? 'once' : 'deny';
+		panel.webview.html = renderWindowTaskConfirmation(panel.webview.cspSource, request);
+		return new Promise<WindowNodeTaskConfirmationResult>((resolve, reject) => {
+			let settled = false;
+			let panelDisposed = false;
+			const subscriptions: vscode.Disposable[] = [];
+			const cleanup = (): void => {
+				signal?.removeEventListener('abort', abort);
+				for (const subscription of subscriptions.splice(0)) {
+					subscription.dispose();
+				}
+				if (!panelDisposed) {
+					panel.dispose();
+				}
+			};
+			const finish = (operation: () => void): void => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				cleanup();
+				operation();
+			};
+			const abort = (): void => finish(() => reject(confirmationAborted()));
+			subscriptions.push(
+				panel.webview.onDidReceiveMessage((message: unknown) => {
+					const decision = message !== null
+						&& typeof message === 'object'
+						&& 'decision' in message
+						? message.decision
+						: undefined;
+					if (
+						decision === 'once'
+						|| decision === 'deny'
+					) {
+						finish(() => resolve(decision));
+					}
+				}),
+				panel.onDidDispose(() => {
+					panelDisposed = true;
+					finish(() => resolve('deny'));
+				}),
+			);
+			signal?.addEventListener('abort', abort, { once: true });
+			if (signal?.aborted === true) {
+				abort();
+				return;
+			}
+		});
 	}
 }
 
 interface DynamicCompletionItem extends vscode.QuickPickItem {
 	readonly completionValue: string;
+}
+
+interface StaticConfigurationItem<T> extends vscode.QuickPickItem {
+	readonly configurationValue: T;
 }
 
 export class VscodeSessionConfigurationResolver implements SessionConfigurationResolver {
@@ -341,8 +419,10 @@ export class VscodeSessionConfigurationResolver implements SessionConfigurationR
 	public async resolve(
 		request: Parameters<SessionConfigurationResolver['resolve']>[0],
 	): Promise<Readonly<Record<string, unknown>>> {
+		throwIfConfigurationAborted(request.signal);
 		const values: Record<string, unknown> = { ...request.values };
 		for (const id of request.schema.required ?? []) {
+			throwIfConfigurationAborted(request.signal);
 			if (values[id] !== undefined) {
 				continue;
 			}
@@ -359,6 +439,7 @@ export class VscodeSessionConfigurationResolver implements SessionConfigurationR
 					property.title,
 					values,
 					request.completions,
+					request.signal,
 				);
 				validateSessionConfigValue(id, property, value);
 				values[id] = value;
@@ -369,40 +450,133 @@ export class VscodeSessionConfigurationResolver implements SessionConfigurationR
 				value,
 			}));
 			if (choices !== undefined && choices.length > 0) {
-				const selected = await this.vscodeApi.window.showQuickPick(
+				const selected = await this.selectStaticChoice(
 					choices,
-					{ title: property.title, ignoreFocusOut: true },
+					property.title,
+					request.signal,
 				);
-				if (selected === undefined) {
-					throw configRequired('Agent session configuration was cancelled.');
-				}
-				validateSessionConfigValue(id, property, selected.value);
-				values[id] = selected.value;
+				validateSessionConfigValue(id, property, selected);
+				values[id] = selected;
 				continue;
 			}
 			if (property.type === 'boolean') {
-				const selected = await this.vscodeApi.window.showQuickPick(
+				const selected = await this.selectStaticChoice(
 					[{ label: 'Yes', value: true }, { label: 'No', value: false }],
-					{ title: property.title, ignoreFocusOut: true },
+					property.title,
+					request.signal,
 				);
-				if (selected === undefined) {
-					throw configRequired('Agent session configuration was cancelled.');
-				}
-				values[id] = selected.value;
+				values[id] = selected;
 				continue;
 			}
-			const entered = await this.vscodeApi.window.showInputBox({
-				title: property.title,
-				prompt: property.description,
-				value: formatSessionConfigDefault(id, property),
-				ignoreFocusOut: true,
-			});
-			if (entered === undefined) {
-				throw configRequired('Agent session configuration was cancelled.');
-			}
+			const entered = await this.enterConfigurationValue(
+				property.title,
+				property.description,
+				formatSessionConfigDefault(id, property),
+				request.signal,
+			);
 			values[id] = parseSessionConfigInput(id, property, entered);
 		}
 		return values;
+	}
+
+	private selectStaticChoice<T>(
+		choices: readonly { readonly label: string; readonly value: T }[],
+		title: string | undefined,
+		signal?: AbortSignal,
+	): Promise<T> {
+		throwIfConfigurationAborted(signal);
+		const picker = this.vscodeApi.window.createQuickPick<StaticConfigurationItem<T>>();
+		picker.title = title;
+		picker.ignoreFocusOut = true;
+		picker.items = choices.map((choice) => ({
+			label: choice.label,
+			configurationValue: choice.value,
+		}));
+		return new Promise<T>((resolve, reject) => {
+			let settled = false;
+			const subscriptions: vscode.Disposable[] = [];
+			const cleanup = (): void => {
+				signal?.removeEventListener('abort', abort);
+				for (const subscription of subscriptions.splice(0)) {
+					subscription.dispose();
+				}
+				picker.hide();
+				picker.dispose();
+			};
+			const finish = (operation: () => void): void => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				cleanup();
+				operation();
+			};
+			const abort = (): void => finish(() => reject(configurationAborted()));
+			subscriptions.push(
+				picker.onDidAccept(() => {
+					const selected = picker.selectedItems[0] ?? picker.activeItems[0];
+					if (selected !== undefined) {
+						finish(() => resolve(selected.configurationValue));
+					}
+				}),
+				picker.onDidHide(() => {
+					finish(() => reject(configRequired('Agent session configuration was cancelled.')));
+				}),
+			);
+			signal?.addEventListener('abort', abort, { once: true });
+			if (signal?.aborted === true) {
+				abort();
+				return;
+			}
+			picker.show();
+		});
+	}
+
+	private enterConfigurationValue(
+		title: string | undefined,
+		prompt: string | undefined,
+		value: string | undefined,
+		signal?: AbortSignal,
+	): Promise<string> {
+		throwIfConfigurationAborted(signal);
+		const input = this.vscodeApi.window.createInputBox();
+		input.title = title;
+		input.prompt = prompt;
+		input.value = value ?? '';
+		input.ignoreFocusOut = true;
+		return new Promise<string>((resolve, reject) => {
+			let settled = false;
+			const subscriptions: vscode.Disposable[] = [];
+			const cleanup = (): void => {
+				signal?.removeEventListener('abort', abort);
+				for (const subscription of subscriptions.splice(0)) {
+					subscription.dispose();
+				}
+				input.hide();
+				input.dispose();
+			};
+			const finish = (operation: () => void): void => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				cleanup();
+				operation();
+			};
+			const abort = (): void => finish(() => reject(configurationAborted()));
+			subscriptions.push(
+				input.onDidAccept(() => finish(() => resolve(input.value))),
+				input.onDidHide(() => {
+					finish(() => reject(configRequired('Agent session configuration was cancelled.')));
+				}),
+			);
+			signal?.addEventListener('abort', abort, { once: true });
+			if (signal?.aborted === true) {
+				abort();
+				return;
+			}
+			input.show();
+		});
 	}
 
 	private selectDynamicCompletion(
@@ -410,7 +584,9 @@ export class VscodeSessionConfigurationResolver implements SessionConfigurationR
 		title: string | undefined,
 		values: Readonly<Record<string, unknown>>,
 		completions: Parameters<SessionConfigurationResolver['resolve']>[0]['completions'],
+		signal?: AbortSignal,
 	): Promise<string> {
+		throwIfConfigurationAborted(signal);
 		const picker = this.vscodeApi.window.createQuickPick<DynamicCompletionItem>();
 		picker.title = title;
 		picker.placeholder = 'Type to search all available values';
@@ -431,6 +607,7 @@ export class VscodeSessionConfigurationResolver implements SessionConfigurationR
 				picker.busy = activeRequests.size > 0 || pendingRequest !== undefined;
 			};
 			const cleanup = (): void => {
+				signal?.removeEventListener('abort', abort);
 				if (debounce !== undefined) {
 					clearTimeout(debounce);
 					debounce = undefined;
@@ -443,6 +620,7 @@ export class VscodeSessionConfigurationResolver implements SessionConfigurationR
 				for (const subscription of subscriptions.splice(0)) {
 					subscription.dispose();
 				}
+				picker.hide();
 				picker.dispose();
 			};
 			const finish = (operation: () => void): void => {
@@ -453,6 +631,7 @@ export class VscodeSessionConfigurationResolver implements SessionConfigurationR
 				cleanup();
 				operation();
 			};
+			const abort = (): void => finish(() => reject(configurationAborted()));
 			const launchLatest = (): void => {
 				if (
 					settled
@@ -533,6 +712,11 @@ export class VscodeSessionConfigurationResolver implements SessionConfigurationR
 					finish(() => reject(configRequired('Agent session configuration was cancelled.')));
 				}),
 			);
+			signal?.addEventListener('abort', abort, { once: true });
+			if (signal?.aborted === true) {
+				abort();
+				return;
+			}
 			picker.show();
 			schedule('', true);
 		});
@@ -573,6 +757,82 @@ async function resolveAuthenticationProvider(
 
 function configRequired(message: string): AgentRuntimeError {
 	return new AgentRuntimeError('AGENT_CONFIG_REQUIRED', message);
+}
+
+function confirmationAborted(): DOMException {
+	return new DOMException('Window task confirmation was interrupted.', 'AbortError');
+}
+
+function throwIfConfirmationAborted(signal?: AbortSignal): void {
+	if (signal?.aborted === true) {
+		throw confirmationAborted();
+	}
+}
+
+function renderWindowTaskConfirmation(
+	cspSource: string,
+	request: WindowNodeTaskConfirmationRequest,
+): string {
+	const nonce = randomBytes(18).toString('base64');
+	const escapedCspSource = escapeHtml(cspSource);
+	return `<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${escapedCspSource} 'nonce-${nonce}'; script-src 'nonce-${nonce}';">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<style nonce="${nonce}">
+		body { max-width: 960px; margin: 0 auto; padding: 24px; font-family: var(--vscode-font-family); color: var(--vscode-foreground); }
+		dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 12px; }
+		dt { font-weight: 600; }
+		dd { margin: 0; overflow-wrap: anywhere; }
+		pre { max-height: 50vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; border: 1px solid var(--vscode-panel-border); background: var(--vscode-textCodeBlock-background); }
+		.actions { display: flex; gap: 8px; margin-top: 16px; }
+		button { padding: 6px 14px; border: 0; color: var(--vscode-button-foreground); background: var(--vscode-button-background); }
+		button.secondary { color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground); }
+	</style>
+</head>
+<body>
+	<h1>Allow this Copilot Agent Mesh window task?</h1>
+	<dl>
+		<dt>Source window</dt><dd>${escapeHtml(request.sourceWindowLabel)}</dd>
+		<dt>Target window</dt><dd>${escapeHtml(request.targetWindowLabel)}</dd>
+		<dt>Workspace</dt><dd>${escapeHtml(request.workspaceDisplayName)}</dd>
+		<dt>Title</dt><dd>${escapeHtml(request.taskTitle)}</dd>
+	</dl>
+	<h2>Full prompt</h2>
+	<pre>${escapeHtml(request.prompt)}</pre>
+	<p>The agent may modify files and run commands in this workspace.</p>
+	<div class="actions">
+		<button id="run" type="button">Run Once</button>
+		<button id="cancel" class="secondary" type="button">Cancel</button>
+	</div>
+	<script nonce="${nonce}">
+		const vscode = acquireVsCodeApi();
+		document.getElementById('run').addEventListener('click', () => vscode.postMessage({ decision: 'once' }));
+		document.getElementById('cancel').addEventListener('click', () => vscode.postMessage({ decision: 'deny' }));
+	</script>
+</body>
+</html>`;
+}
+
+function escapeHtml(value: string): string {
+	return value
+		.replaceAll('&', '&amp;')
+		.replaceAll('<', '&lt;')
+		.replaceAll('>', '&gt;')
+		.replaceAll('"', '&quot;')
+		.replaceAll("'", '&#39;');
+}
+
+function configurationAborted(): DOMException {
+	return new DOMException('Agent session configuration was interrupted.', 'AbortError');
+}
+
+function throwIfConfigurationAborted(signal?: AbortSignal): void {
+	if (signal?.aborted === true) {
+		throw configurationAborted();
+	}
 }
 
 interface PreapprovedTask {

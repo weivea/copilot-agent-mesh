@@ -32,7 +32,7 @@ export const MESH_TOOL_MANIFEST_DESCRIPTORS: readonly ToolManifestDescriptor[] =
 		displayName: 'List Mesh Workers',
 		toolReferenceName: 'meshListWorkers',
 		canBeReferencedInPrompt: true,
-		modelDescription: 'Lists a bounded opaque Device -> Node -> Workspace hierarchy. Call this before delegating to obtain every explicit target ID. Results contain routing/status/capability metadata only, never paths, prompts, secrets, or raw task output.',
+		modelDescription: 'In Agent mode, call this when a user asks to work in another project or VS Code window. It lists the bounded opaque Device -> Node -> Workspace targets currently authorized by the directional peer allowlist and target receive gate; use its exact IDs with mesh_delegate_task. Results contain routing/status/capability metadata only, never paths, prompts, secrets, or raw task output. Tool choice is not guaranteed, so users may explicitly reference #meshListWorkers.',
 		userDescription: 'List available mesh devices, window nodes, and workspaces without exposing filesystem paths.',
 		tags: ['copilot-agent-mesh'],
 		inputSchema: {
@@ -113,7 +113,7 @@ export const MESH_TOOL_MANIFEST_DESCRIPTORS: readonly ToolManifestDescriptor[] =
 		displayName: 'Answer Mesh Task',
 		toolReferenceName: 'meshAnswerTask',
 		canBeReferencedInPrompt: true,
-		modelDescription: 'Answers a pending question or approval request for a task owned by this coordinator. Use the exact task and input IDs from mesh_get_task plus a stable caller-generated answer ID for idempotent retries.',
+		modelDescription: 'Answers a pending question or approval request for a task owned by this coordinator. Use the exact t task ID and i input ID returned by mesh_delegate_task when s=1 (or the exact IDs from mesh_get_task during recovery), plus a stable caller-generated answer ID for idempotent retries.',
 		userDescription: 'Send an answer to a delegated task that is waiting for input.',
 		tags: ['copilot-agent-mesh'],
 		inputSchema: {

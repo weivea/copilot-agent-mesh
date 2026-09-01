@@ -45,6 +45,7 @@ test('subscribes before start and disposes every resource after a fast terminal 
 			}],
 		},
 	});
+
 	await Promise.resolve();
 	assert.equal(starts, 1);
 	assert.deepEqual(fixture.counts(), {
@@ -52,6 +53,26 @@ test('subscribes before start and disposes every resource after a fast terminal 
 		timers: 0,
 		tokenRegistrations: 0,
 		cancels: 0,
+	});
+});
+
+test('a fast terminal event cannot mask a start idempotency conflict', async () => {
+	const fixture = waiterFixture();
+	fixture.onSubscribe = (listener) => listener(snapshot('completed', {
+		summary: 'Historical completion.',
+	}));
+	fixture.start = async () => {
+		throw Object.assign(
+			new Error('The retry payload conflicts with the persisted task.'),
+			{ code: 'IDEMPOTENCY_CONFLICT' },
+		);
+	};
+
+	assert.deepEqual(await fixture.waiter().wait(), {
+		kind: 'failed',
+		taskId: TASK_ID,
+		code: 'IDEMPOTENCY_CONFLICT',
+		message: 'The retry payload conflicts with the persisted task.',
 	});
 });
 

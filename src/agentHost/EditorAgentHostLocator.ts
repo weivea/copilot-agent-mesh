@@ -12,7 +12,10 @@ import {
 	discoverCodeCli,
 	type AgentHostProbe,
 } from './AgentHostLauncher';
-import type { UnixSocketWebSocketConnector } from './UnixSocketWebSocketConnector';
+import {
+	editorEndpointFingerprint,
+	type UnixSocketWebSocketConnector,
+} from './UnixSocketWebSocketConnector';
 import {
 	runOwnedCommand,
 	type RunOwnedCommandOptions,
@@ -101,6 +104,7 @@ interface ParsedEndpoint {
 export class LocatedEditorAgentHost {
 	readonly version: string;
 	readonly registryProtocolVersion = supportedProtocolVersion;
+	readonly endpointFingerprint: string;
 	#connectionToken: string;
 	#socketPath: string;
 	#registration: SensitiveValueRegistration | undefined;
@@ -114,6 +118,10 @@ export class LocatedEditorAgentHost {
 		this.#connectionToken = options.connectionToken;
 		this.#socketPath = options.socketPath;
 		this.version = options.version;
+		this.endpointFingerprint = editorEndpointFingerprint(
+			options.socketPath,
+			options.connectionToken,
+		);
 		this.#registration = registerSensitiveValues(options.sensitiveValues);
 	}
 

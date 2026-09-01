@@ -1,10 +1,177 @@
 # MVP real VS Code E2E
 
-> Evidence date: 2026-08-30
+> Evidence date: 2026-08-31
 > Development baseline: `d5555172b5b6d37200f24f351678adc9ab201593`
 > Final platform: macOS arm64, VS Code `1.135.0`
 
 ## Opt-in boundary
+
+### 0.4.0 Peer Window Delegation
+
+The release gate is exact and default-off:
+
+```sh
+MESH_PEER_DELEGATION_E2E=1 npm run test:peer-delegation-real
+```
+
+Without the exact value `1`, the wrapper exits before compiling or launching VS
+Code. An enabled run requires macOS arm64, creates two ordinary windows with one
+dedicated User Data directory and two different temporary non-sensitive projects,
+and removes only resources identified by its own root PIDs, descendants, and
+unique runtime markers. A persistent authenticated profile is optional and must
+be an explicit dedicated path outside real VS Code profiles:
+
+```sh
+MESH_PEER_DELEGATION_E2E=1 \
+MESH_PEER_DELEGATION_E2E_PROFILE_DIR=$HOME/.mw-profile \
+MESH_PEER_DELEGATION_E2E_AUTH_RESOURCE='https://api.github.com' \
+MESH_PEER_DELEGATION_E2E_AUTH_PROVIDER='github' \
+MESH_PEER_DELEGATION_E2E_AUTH_SCOPES_JSON='["read:user","user:email"]' \
+npm run test:peer-delegation-real
+```
+
+The `AUTH_*` mapping above is retained for an owned standalone fallback only.
+When the editor endpoint is selected, it reuses that editor Host's existing
+identity and receives no proactive OAuth token injection. A later editor
+authentication challenge fails explicitly and must be resolved in the editor
+profile.
+
+The persistent User Data remains the source of VS Code/Copilot authentication, but
+it is not the Mesh state root for a peer-delegation run. After the development-only
+E2E capability validates the environment/profile nonce and role, every Mesh
+`globalState` key is projected through a fixed physical-key envelope containing
+that run nonce. Both windows in one run share those envelopes; a later run treats
+older envelopes as absent and overwrites the same bounded physical keys. Production
+device, workspace catalog, route, delegation, pairing, peer, listener, and Tunnel
+metadata remain untouched.
+
+The Broker owner lock, local IPC identity root, tasks, artifacts, and peer policy
+files live below the unique `<controlRoot>/broker` directory. Standalone Agent Host
+state remains below `<controlRoot>/agent-host`. Cleanup removes the encompassing
+owned run root. The harness never deletes the persistent extension global-storage
+directory, edits its SQLite state directly, raises the 32-workspace limit, or evicts
+production catalog entries.
+
+The default visible phase uses the real Dashboard handle paths for policy and the
+registered LM Tools for the passing Tool+Agent route. Diagnostics-only mode uses
+the same production `TaskToolsCore`/Broker/Window Node/AHP path to collect
+objective runtime evidence without pretending it had a parent Chat or
+confirmation. The short budget override is armed only for the next minute-scale
+delegation timer; ordinary Tool deadlines and the production default/maximum of
+60 minutes are unchanged. No mock AHP, Fake Agent, synthetic terminal state, or
+blocked/cancelled-as-completed result can pass.
+
+Programmatic `vscode.lm.invokeTool` has no parent Chat identity and cannot prove
+the required Copilot sidebar route. The exact enabled command therefore waits for
+the visible Agent-mode phase by default. Setting
+`MESH_PEER_DELEGATION_E2E_MANUAL_UI=0` is diagnostics-only and can never produce
+passing confirmation evidence.
+
+The harness prints one exact `#meshListWorkers` / `#meshDelegateTask` prompt. In
+the named source window, submit it in Copilot Agent mode and click **Continue**
+exactly once. After checking the target Chat Sessions list, record only the two
+boolean observations with the printed command:
+
+```sh
+node scripts/e2e/peer-delegation/attest.mjs <run-id> confirmation-once session-visible
+```
+
+Use `session-not-visible` when that is the observed result. Without this phase,
+AC-5 item 5 and UI visibility remain `unverified`, and the command exits nonzero.
+
+Sanitized JSON and a short summary are written to:
+
+- `artifacts/peer-delegation-e2e/evidence.json`
+- `artifacts/peer-delegation-e2e/summary.md`
+
+These generated artifacts are ignored rather than committed, matching the prior
+real-E2E convention. `npm run validate:peer-delegation-evidence` rejects paths,
+tokens, socket/User Data locations, full Workspace identities, raw prompts or
+output, invalid evidence references, inconsistent Pass states, and any nonzero
+harness-owned final resource count. Baseline, peak, and final counts all use the
+harness ownership scope; unrelated global processes are neither counted nor a
+global-zero assertion.
+
+Cleanup runs as independent best-effort phases: process observation/termination,
+log/sentinel diagnostics, profile-lock release, and exact run-root removal cannot
+short-circuit one another. SIGINT/SIGTERM uses the same idempotent cleanup and
+never performs a name-based or global process kill.
+
+For a persistent profile, its User Data and extension global-storage paths are
+observation-only and never appear in process ownership markers. A lock loser or
+idle-check failure before child launch makes zero termination attempts and cannot
+kill the winner/foreign profile user. Subprocess tests exercise both conflicts
+with a live foreign sentinel.
+
+The E2E-only standalone Agent Host stores its owned instance below the unique
+per-run control directory, which puts a run marker in the detached process
+arguments. Cleanup therefore continues to recognize an immediately reparented
+Host without retaining historical PIDs or matching the shared profile.
+
+Before controller readiness, the Extension Host may write only an allowlisted,
+path-free startup code under the owned window control directory. The harness
+validates its schema and freshness and includes the fixed safe diagnosis in a
+controller timeout. Raw errors, profile paths, workspace names, and secrets are
+never written to this diagnostic.
+
+Before validating the complete evidence schema, the harness atomically writes a
+separately validated minimal diagnostic envelope. If full schema or safety
+validation fails, the diagnostic remains at the stable evidence path with the
+original stable error code and `outcome: fail`. Active Broker task states are
+normalized to `not-observed` rather than copied into terminal-only fields.
+Verbose task journals are projected to at most 256 actual event observations;
+`eventJournalTruncated` is explicit, milestone types retain their original
+monotonic sequence numbers, and no synthetic events or renumbering is allowed.
+The release command writes only to the stable artifact directory or an explicit
+absolute directory outside the repository. A nested repository override is
+rejected before compile or deletion, and log streams must open before a window
+is spawned; later log failures are retained as cleanup failures.
+
+`MESH_PEER_DELEGATION_E2E_TEST_MODE` is internal to subprocess tests. It cannot be
+used through `npm run test:peer-delegation-real`, requires an isolated evidence
+directory, records the actual process OS/architecture with `testMode: true`, and
+emits only a `test-diagnostic` artifact. Both release validator modes reject that
+artifact, and test mode cannot replace the stable release evidence file.
+
+O1 is Pass only when the task Session hash appears in the editor `listSessions`
+catalog and the target UI is visibly observed. O2 is Pass only after a genuine
+60-minute Copilot Tool call; shorter runs are recorded as shorter-duration-only.
+O3 remains non-guaranteed Tool choice, O4 remains undetectable concurrent user
+Copilot edits, and O5 remains unsupported/unverified outside macOS arm64.
+AC-5 item 9 is narrower than O1 but still cannot rely on source status alone:
+it requires a Session resource echoed by the editor Host's subscription snapshot
+or Session-channel action, plus its bounded hash and the editor endpoint
+fingerprint. Equality between locally related `createSession` and recovery
+values is not an independent check and cannot satisfy the item without that
+Host-originated echo. If no Host echo is available, item 9 remains Unverified.
+UI and post-task catalog observation are not required for item 9.
+
+### Recorded P8 objective result
+
+The 2026-09-01 diagnostics-only run on VS Code 1.135.0/macOS arm64 using the
+existing dedicated profile with a full 32-entry production Workspace Catalog
+produced a valid **Unverified** artifact rather than a false Pass:
+
+- AC-5 1-4 passed: two ordinary windows, exactly one Broker, two distinct claim
+  hashes, target absent before authorization, exact `PEER_NOT_ALLOWED` and
+  `PEER_NOT_ACCEPTING`, target visible after both gates, and reverse direction
+  absent; both Dashboard configuration lists contained both windows.
+- AC-5 6 and 8-12 passed: the editor task emitted real
+  `agentStarted`/output/`turnComplete`/`completed`, the Host echoed the created
+  Session channel, the target had an Incoming record,
+  Listener/Tunnel attempt deltas stayed zero, the Workspace lease and Profile
+  Lock were released, and final harness-owned VS Code/Agent
+  Host/Tunnel/socket/timer counts were zero.
+- The run-scoped Mesh state reached both windows without reading or evicting that
+  production Catalog. The authenticated run used the live editor source and
+  passed real needs-input answer/resume, authoritative token cancellation, and
+  the 10-second harness-budget cancellation. The post-task editor catalog
+  remained empty and no user UI attestation was supplied, so AC-5 5 and 7 plus
+  O1 remain Unverified. O2 also remains Unverified because the observed editor
+  invocation was about 87 seconds, not a 60-minute Copilot UI call.
+- No user attestation was created. The full UI rerun still requires the exact
+  enabled command, a signed-in dedicated profile, one visible Agent-mode Tool
+  confirmation, and an honest `session-visible`/`session-not-visible` attestation.
 
 The default `npm test` remains offline. The real test is explicit because it creates a
 public Dev Tunnel and may consume Copilot quota:

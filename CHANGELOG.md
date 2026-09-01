@@ -6,6 +6,8 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [Unreleased]
 
+## [0.4.0 Preview] - 2026-08-31
+
 - Documented the 0.4.0 Peer Window Delegation redesign. Same-device multi-project
   collaboration moves from the Dashboard-driven fixed frontend/backend DAG to
   Copilot Chat driven peer window delegation: each window is its own primary node,
@@ -28,8 +30,74 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 - Recorded that the stable VS Code tool confirmation surface offers only
   Continue/Cancel, so delegation authorization is a binary confirmation whose scope
   is stated in the confirmation body rather than a third button.
-- Marked the collaboration sections of the PRD and the technical implementation
-  plan as superseded. No code has changed yet; 0.3.0 behaviour is unaffected.
+- Removed the 0.3.0 Collaboration service, fixed DAG, three collaboration tools,
+  and Dashboard collaboration entry points while retaining the bounded Artifact
+  Store and all Device Broker, Window Node, task, lease, IPC, and recovery
+  foundations.
+- Implemented the Broker-owned directional peer policy, default-off receive gate,
+  safe window naming, double-gated Tool directory, distinguishable peer errors,
+  long-running delegation result, one-task grant, recursion defense, editor AHP
+  source preference, and P7 Dashboard configuration/task views.
+- Added `MESH_PEER_DELEGATION_E2E=1 npm run test:peer-delegation-real`.
+  The command launches two ordinary same-profile windows only after the exact
+  opt-in, invokes the five registered LM Tools rather than replacing them with
+  Broker calls, records real AHP and cleanup observations, and fails rather than
+  treating missing Copilot UI/authentication evidence as Pass.
+- Added a strict 0.4.0 evidence schema and release validator. Evidence rejects
+  paths, tokens, raw prompts/output, full Workspace identities, malformed
+  references, success-shaped incomplete results, and global-process-zero claims;
+  it records only harness-owned baseline/delta/final resources.
+- Recorded an honest real P8 objective run on VS Code 1.135.0/macOS arm64:
+  AC-5 items 1-4, 6, and 8-12 were observed against the existing authenticated
+  full-Catalog profile, including both peer rejection codes, directionality,
+  real editor output/completion, an objective Host-originated Session-channel echo,
+  Incoming, needs-input resume, token and short-budget cancellation, no
+  Listener/Tunnel access, and complete cleanup. Copilot UI confirmation,
+  same-Chat return, target Chat Sessions UI visibility, and 60-minute UI
+  stability stay Unverified rather than being converted to Pass.
+- Hardened final-stack lifecycle edges: an editor attempt with failed cleanup no
+  longer starts a concurrent standalone fallback, selector disposal can retry,
+  and a fast historical terminal notification cannot mask a retry's
+  `IDEMPOTENCY_CONFLICT`. Later editor-preferred starts drain reachable
+  editor/standalone cleanup before confirmation and launch, while standalone-only
+  mode never touches an unreachable editor runtime; target confirmations and all Session
+  configuration controls are owned and close on deadline/disposal. The target
+  confirmation panel keeps the complete prompt scrollable rather than truncating
+  it to a picker row.
+- Hardened P8 evidence failure handling and persistent-profile ownership:
+  nonterminal Broker states normalize to `not-observed`, strict schema/safety
+  failures retain a separately validated diagnostic artifact, and shared
+  persistent User Data/global-storage paths never confer process kill ownership.
+  Lock/idle conflicts leave foreign profile users alive and perform zero
+  termination attempts. Verbose real task journals retain actual milestone
+  sequence IDs in a bounded projection with explicit truncation evidence.
+  Release evidence overrides cannot target unrelated repository directories,
+  and asynchronous log failures remain inside the owned cleanup path.
+- Made internal E2E fixture mode permanently ineligible for release evidence:
+  it requires an isolated artifact directory, records actual process platform
+  plus `testMode: true` in a separately typed test diagnostic, and is rejected
+  by both normal and `--require-pass` release validation. Unsupported release
+  platforms fail before touching existing evidence.
+- Isolated peer-delegation E2E Mesh metadata and Broker files from persistent
+  authenticated profiles. Fixed-key run-nonce envelopes prevent a full production
+  Workspace Catalog or stale routes from blocking temporary claims, while the
+  run-owned Broker root preserves authentication without deleting, editing, or
+  evicting persistent state. Safe startup diagnostics now distinguish bounded
+  Broker/workspace failures from a bare controller timeout.
+- Split editor and standalone authentication. Borrowed editor Agent Hosts now
+  retain their established profile identity without proactive OAuth injection;
+  later editor challenges fail safely and never trigger credential replacement,
+  while owned standalone hosts retain explicit VS Code authentication mappings.
+  Source status and AC-5 evidence now require the actual editor attempt and a
+  Host-originated Session-channel echo rather than equality between locally
+  related values or a stale probe result. Failed startup cleanup is
+  retried before a later launch, so prior terminal failures do not wedge the
+  window or permit unsafe concurrent reuse.
+  The E2E editor transport uses an owned one-client authenticated loopback TCP
+  bridge when its Extension Host cannot directly reach the live Unix socket.
+- Bumped the Preview extension and VSIX artifact to `0.4.0` while retaining AHP
+  commit `f19dd8b3942d029744a3bdd31d830f9428e8ea47`, TypeScript client `0.9.0`,
+  and protocol offer `1.0.0`.
 
 ## [0.3.0 Preview] - 2026-08-30
 

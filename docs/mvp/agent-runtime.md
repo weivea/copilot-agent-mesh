@@ -29,16 +29,61 @@ live schema-v2 `editor` Unix-socket endpoint at AHP `1.0.0`. Each delegated task
 uses its own `net.connect` + authenticated WebSocket Upgrade + AHP client. Discovery,
 connection, initialize, or protocol failure falls back to the existing standalone
 launcher exactly once and exposes `standalone` plus a bounded degradation reason.
+A retryable `ECONNREFUSED` connection failure waits once for a cancellation-aware
+90-second quiet readiness window, then re-locates and reconnects under the same
+approval capability before fallback; no Session or Turn exists at that boundary.
+Repeated short connection attempts were observed to keep the shared editor Host
+unstable, while an independent production connector first succeeded about 82
+seconds after two-window startup without intervening attempts. Invalid protocol
+responses, malformed tokens, and explicit upgrade authentication rejection do
+not retry.
+If an Extension Host receives `ECONNREFUSED` while an ordinary Node process can
+reach the exact fingerprinted endpoint, the connector uses one owned short-lived
+Node byte proxy. The target socket path crosses only the private IPC channel;
+the connection token remains in the Extension Host and passes through the proxy
+only as local authenticated WebSocket handshake bytes. The helper exposes a
+one-client loopback TCP listener authenticated by a separate 256-bit token sent
+only over private IPC. It validates and strips the `X-Mesh-Editor-Proxy` header
+before forwarding the editor handshake, so neither secret reaches the wrong
+endpoint. Its command line carries the owning storage-root marker. Close,
+cancellation, parent IPC loss, and startup failure terminate the exact child and
+listener. The real P8 harness supplies its already-running absolute
+Node executable only after E2E capability validation; the extension does not
+search `PATH` or download a runtime. That validated E2E path uses proxy-only
+connection so a known-refused Code Helper attempt cannot immediately poison the
+helper attempt; ordinary production remains direct-first.
+Before any task selects a source, Dashboard probes are passive and report editor
+health as unavailable/pending with an internal `canStart` capability rather than
+executing `code agent endpoints`. The task executor may attempt such a source,
+but Dashboard does not report it healthy. The actual task start performs the
+first fresh locate/connect. This prevents UI refreshes from perturbing the
+registry or rotating a connection token before WebSocket upgrade. Only after a
+successful start is editor reported healthy.
+The real two-window P8 harness additionally leaves an 80-second quiet interval
+before its first editor connection so the shared Host can publish and bind its
+listener without any diagnostic connection attempts. The interval is consumed
+only once per harness runtime, not once per delegated task. This delay is
+E2E-only; ordinary production tasks do not inherit it.
+Fallback is forbidden when cleanup of the failed editor attempt is unconfirmed;
+starting standalone in that state could overlap resources or execution. Selector
+disposal retains failed cleanup for an explicit retry.
 With Peer Delegation disabled, the historical standalone behavior is unchanged.
+After an editor connection has initialized, authentication, configuration, title,
+or task-start failures do not fall back. Source status records the editor as the
+selected source plus a bounded failure code/message, rather than retaining an
+older standalone probe result or reporting the editor as healthy.
 
 Source fallback sits below one runtime approval boundary. An exact local
 `DelegationGrant` validated by the target Window Node produces an in-memory,
 WeakMap-backed capability bound to the complete request; same-device peer tasks
 therefore show no target Node/runtime modal because the parent's native
 Continue/Cancel was the sole consent. Legacy, direct, and cross-device tasks without
-that local-source proof retain exactly one target confirmation, whose capability
-covers both source attempts. The capability is not a wire/model boolean and carries
-no serializable grant, path, or identity data.
+that local-source proof retain exactly one owned target confirmation panel with
+a scrollable full prompt, whose capability covers both source attempts. Worker
+deadline or disposal closes the panel, and no unanswered prompt holds the
+runtime startup gate. The
+capability is not a wire/model boolean and carries no serializable grant, path,
+or identity data.
 
 The Dashboard does not infer a healthy source before selection. With Peer
 Delegation off it reports the source as unavailable for delegation. With the
@@ -51,7 +96,10 @@ socket, and user-data paths never enter the ViewModel.
 2. Create an owned instance directory, owner-only token file, dedicated user/server data directories, and an isolated process group.
 3. Diff strict `code agent endpoints` JSON and require exactly one new standalone endpoint matching both an owned PID and the generated token. Stdout/stderr are drained but never interpreted as readiness.
 4. Connect to the loopback endpoint, initialize AHP, apply the root snapshot, and dynamically select an advertised provider.
-5. Authenticate advertised required resources, resolve Session configuration (including dynamic completions), create the Session with the registered workspace URI, and apply the Session snapshot before processing actions.
+5. For standalone, authenticate advertised required resources through the explicit
+   VS Code mapping. For editor, reuse the host's existing identity without an
+   initial `authenticate` request. Then resolve Session configuration, create the
+   Session with the registered workspace URI, and apply its snapshot.
 6. Wait for `defaultChat`, subscribe to the Chat, then dispatch only the supplied
    prompt plus acceptance criteria. AHP 1.0 providers may keep a provisional
    Session in `creating` until that first turn materializes it, so startup must
@@ -80,11 +128,36 @@ Editor connection tokens, socket/user-data/executable paths, and endpoint instan
 are registered in a reference-counted in-memory redaction set for raw and
 percent-encoded forms and are removed after the final borrowing task disposes.
 
-Required Session configuration is rendered from the provider schema. Boolean values use explicit choices, strings remain strings, and numbers, arrays, and objects are parsed and recursively validated as JSON. Invalid, read-only, or unsupported properties fail with `AGENT_CONFIG_REQUIRED` instead of sending a coerced value to the provider.
+The P8 real harness may install a non-throwing, E2E-capability-only lifecycle
+observer. It records only the task UUID and one of
+`chat/turnComplete`/`chat/turnCancelled`/`chat/error`, allowing evidence to
+distinguish the authoritative AHP action from the persisted Mesh terminal state.
+It never records an envelope, prompt, output, URI, endpoint, or token, and no
+observer exists in production extension mode.
+
+Required Session configuration is rendered from the provider schema. Boolean values use explicit choices, strings remain strings, and numbers, arrays, and objects are parsed and recursively validated as JSON. Dynamic, static, and freeform controls are owned by the runtime and close on task disposal. Invalid, read-only, or unsupported properties fail with `AGENT_CONFIG_REQUIRED` instead of sending a coerced value to the provider.
 
 ## Authentication
 
-`VscodeAuthBroker` is silent-first. A modal `createIfNone` request is allowed only when the invocation explicitly permits interactive authentication. The adapter does not infer an authentication provider, GitHub scopes, or a Copilot resource.
+The editor and standalone paths use different authentication policies. A borrowed
+editor endpoint already owns the signed-in Copilot identity: its initial protected
+resource list is informational, so `EditorExistingIdentityAuthBroker` performs no
+VS Code session lookup and sends no root `authenticate` action. If
+`resolveSessionConfig`, `createSession`, a tool, recovery, or a token-invalid
+notification produces a real authentication challenge, the editor path fails
+`AGENT_AUTH_REQUIRED` with a safe instruction to authenticate in that editor
+profile. It never overrides or restarts editor credentials. The failed source
+stays visibly unhealthy, but every later task may re-attempt it; any retained
+failed-start resources are retried to completion before another Host launch.
+The stale probe result therefore does not permanently disable the runtime, and
+cleanup failure never permits standalone fallback or concurrent reuse. When
+editor preference is disabled, preparation touches standalone only; retained
+editor cleanup is retried when editor preference becomes reachable again.
+
+The standalone-only `VscodeAuthBroker` is silent-first. A modal `createIfNone`
+request is allowed only when the invocation explicitly permits interactive
+authentication. It does not infer an authentication provider, GitHub scopes, or
+a Copilot resource.
 
 Map each AHP protected-resource URL or advertised authorization-server URL to an existing VS Code authentication provider:
 
@@ -99,7 +172,12 @@ Map each AHP protected-resource URL or advertised authorization-server URL to an
 }
 ```
 
-An authentication attempt is successful only after the Agent Host accepts `authenticate`. Missing mappings, unavailable silent credentials, or interaction-disabled contexts return `AGENT_AUTH_REQUIRED`; rejected tokens return `AGENT_AUTH_FAILED`. Since tokens are not cached, account/session changes are observed on the next initial, challenge, or invalid-token authentication attempt.
+A standalone authentication attempt is successful only after the Agent Host
+accepts `authenticate`. Missing mappings, unavailable silent credentials, or
+interaction-disabled contexts return `AGENT_AUTH_REQUIRED`; rejected tokens
+return `AGENT_AUTH_FAILED`. Since tokens are not cached, account/session changes
+are observed on the next initial, challenge, or invalid-token authentication
+attempt.
 
 ## Errors and ownership
 
@@ -143,6 +221,20 @@ The 2026-08-31 P6 editor-source experiment ran on macOS arm64. The Stable regist
 command succeeded but returned zero endpoints; Insiders user-data was absent. Editor
 initialize and O1 Session visibility therefore remain unverified in that environment,
 with no Session created and no sensitive evidence persisted.
+
+After `createSession` is acknowledged, P8 records the Session resource returned
+by the Host's subscribed Session snapshot (or a later Host Session-channel
+action) through its E2E-only lifecycle observer. AC-5.9 requires this
+Host-originated Session-channel echo, its domain-separated 16-hex fingerprint,
+and a fingerprinted editor endpoint. Equality with a recovery descriptor that
+uses the same locally generated Session URI is not treated as an independent
+cross-check. If the Host never echoes the Session, AC-5.9 remains Unverified
+even when the task otherwise completes. A separate bounded post-task `listSessions`
+observation remains O1 catalog evidence; it does not open and close a pre-task
+catalog client because that borrowed-client lifecycle can perturb editor
+identity readiness. Only fingerprints and counts leave the Extension Host. A
+standalone fallback can demonstrate degraded execution but can never satisfy
+the editor Session claim.
 
 ## Verified result
 

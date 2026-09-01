@@ -11,6 +11,31 @@ export const AGENT_RUNTIME_ERROR_CODES = [
 export type AgentRuntimeErrorCode = typeof AGENT_RUNTIME_ERROR_CODES[number];
 
 export type AgentHostSource = 'editor' | 'standalone';
+export type AgentHostSourceFailureStage =
+	| 'discovery'
+	| 'connection'
+	| 'initialize'
+	| 'session'
+	| 'task';
+
+export interface AgentHostSourceFailure {
+	readonly code: AgentRuntimeErrorCode;
+	readonly stage: AgentHostSourceFailureStage;
+	readonly detail?: 'CANCELLED'
+		| 'CONNECT_FAILED'
+		| 'EARLY_CLOSE'
+		| 'INVALID_RESPONSE'
+		| 'TOKEN_INVALID'
+		| 'UPGRADE_AUTH_REJECTED'
+		| 'UPGRADE_BUSY'
+		| 'UPGRADE_FAILED'
+		| 'UPGRADE_TIMEOUT';
+	readonly statusCode?: number;
+	readonly socketCode?: 'EACCES' | 'ECONNREFUSED' | 'ENOENT';
+	readonly endpointFingerprint?: string;
+	readonly proxyStage?: 'target' | 'local';
+	readonly message: string;
+}
 
 export type AgentHostDegradationReason =
 	| 'EDITOR_DISCOVERY_FAILED'
@@ -21,6 +46,7 @@ export type AgentHostSourceStatus =
 	| {
 		readonly source: 'editor';
 		readonly degraded: false;
+		readonly failure?: AgentHostSourceFailure;
 	}
 	| {
 		readonly source: 'standalone';
@@ -31,6 +57,7 @@ export type AgentHostSourceStatus =
 		readonly degraded: true;
 		readonly reason: AgentHostDegradationReason;
 		readonly message: string;
+		readonly failure?: AgentHostSourceFailure;
 	};
 
 export interface AgentHostSourceStatusProvider {
@@ -38,6 +65,23 @@ export interface AgentHostSourceStatusProvider {
 	onDidSourceStatusChange(listener: (status: AgentHostSourceStatus) => void): {
 		dispose(): void;
 	};
+}
+
+export type AgentRuntimeLifecycleObservation =
+	| {
+		readonly taskId: string;
+		readonly eventType: 'session/hostObserved';
+		readonly sessionUri: string;
+		readonly source: AgentHostSource;
+		readonly endpointFingerprint?: string;
+	}
+	| {
+		readonly taskId: string;
+		readonly eventType: 'chat/turnComplete' | 'chat/turnCancelled' | 'chat/error';
+	};
+
+export interface AgentRuntimeLifecycleObserver {
+	observeLifecycle(observation: AgentRuntimeLifecycleObservation): void;
 }
 
 export class AgentRuntimeError extends Error {
@@ -197,6 +241,7 @@ export interface AgentTaskHandle {
 
 export interface AgentRuntime {
 	probe(): Promise<AgentRuntimeProbe>;
+	prepareStart?(): Promise<void>;
 	start(request: AgentTaskRequest): Promise<AgentTaskHandle>;
 	dispose(): Promise<void>;
 }
@@ -239,6 +284,7 @@ export class AgentRuntimeLifecycle {
 export interface AgentRuntimeProbe {
 	readonly available: boolean;
 	readonly featureEnabled: boolean;
+	readonly canStart?: boolean;
 	readonly version?: string;
 	readonly reason?: AgentRuntimeErrorCode;
 	readonly source?: AgentHostSource;

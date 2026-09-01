@@ -41,6 +41,7 @@ import {
 	createAgentRuntimeEventQueue,
 	type AgentRuntimeEvent,
 	type AgentRuntimeErrorCode,
+	type AgentRuntimeLifecycleObservation,
 	type AgentTaskRequest,
 	type FirstTaskConfirmation,
 } from '../agentHost/AgentRuntime';
@@ -49,6 +50,7 @@ import type { StateStore } from '../domain/ports';
 import { DelegatedToolInvocationRegistry } from '../tools/DelegatedToolInvocationRegistry';
 import { MESH_TOOL_NAMES } from '../tools/toolManifest';
 import {
+	EditorExistingIdentityAuthBroker,
 	VscodeAuthBroker,
 	type AuthenticationApi,
 	type AuthenticationRequest,
@@ -413,6 +415,7 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 	const transport = new FakeAhpTransport();
 	const launcher = new FakeLauncher();
 	const auth = new RecordingAuthBroker();
+	const lifecycle: AgentRuntimeLifecycleObservation[] = [];
 	let confirmed = false;
 	let completedDynamicConfig = false;
 	const runtime = new AhpAgentRuntime({
@@ -435,6 +438,9 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 			},
 		},
 		cancellationTimeoutMs: 100,
+		lifecycleObserver: {
+			observeLifecycle: (observation) => lifecycle.push(observation),
+		},
 	});
 
 	const handle = await runtime.start(taskRequest());
@@ -450,6 +456,12 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 	assert.deepEqual(transport.completionQueries, ['test']);
 	assert.equal(transport.created?.provider, 'dynamic-provider');
 	assert.deepEqual(transport.created?.workingDirectories, [workspaceUri]);
+	assert.deepEqual(lifecycle, [{
+		taskId: 'task-1',
+		eventType: 'session/hostObserved',
+		sessionUri: handle.recovery.sessionUri,
+		source: 'standalone',
+	}]);
 	assert.equal(transport.dispatched[0]?.action.type, 'chat/turnStarted');
 	assert.equal(
 		((transport.dispatched[0]?.action as Record<string, unknown>).message as Record<string, unknown>).text,
@@ -500,6 +512,7 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 	await handle.cancel();
 	assert.equal((await nextEvent(handle.events)).type, 'progress');
 	assert.equal((await nextEvent(handle.events)).type, 'cancelled');
+	assert.equal(lifecycle.at(-1)?.eventType, 'chat/turnCancelled');
 	await handle.dispose();
 	assert.equal(launcher.host.disposed, true);
 });
@@ -916,6 +929,43 @@ test('non-interactive dynamic Session config fails with a stable configuration b
 	);
 });
 
+test('runtime disposal aborts and awaits interactive Session configuration', async () => {
+	const transport = new FakeAhpTransport();
+	const launcher = new FakeLauncher();
+	let configEntered!: () => void;
+	const entered = new Promise<void>((resolve) => {
+		configEntered = resolve;
+	});
+	let configSignal: AbortSignal | undefined;
+	const runtime = new AhpAgentRuntime({
+		enabled: () => true,
+		launcher,
+		connections: new FakeConnectionFactory([transport]),
+		authBroker: new RecordingAuthBroker(),
+		confirmation: { confirm: async () => 'once' },
+		workspaceResolver: trustedWorkspaceResolver(),
+		configResolver: {
+			resolve: async (request) => {
+				configSignal = request.signal;
+				configEntered();
+				return new Promise(() => undefined);
+			},
+		},
+	});
+
+	const start = runtime.start({
+		...taskRequest(),
+		allowInteractiveAuthentication: true,
+	});
+	await entered;
+	const disposal = runtime.dispose();
+
+	await assert.rejects(start, AgentRuntimeError);
+	await disposal;
+	assert.equal(configSignal?.aborted, true);
+	assert.equal(launcher.host.disposed, true);
+});
+
 test('start failure cleans the task, AHP connection, and owned host without losing the auth error', async () => {
 	const transport = new FakeAhpTransport();
 	transport.shutdownFails = true;
@@ -947,6 +997,63 @@ test('start failure cleans the task, AHP connection, and owned host without losi
 	assert.equal(transport.shutdownCalls, 2);
 });
 
+test('a later start retries failed startup cleanup before launching another Agent task', async () => {
+	const firstTransport = new FakeAhpTransport();
+	firstTransport.shutdownFails = true;
+	const secondTransport = new FakeAhpTransport();
+	const launcher = new FakeLauncher();
+	const connections = new FakeConnectionFactory([firstTransport, secondTransport]);
+	let authenticationAttempts = 0;
+	const authBroker: AuthBroker = {
+		authenticate: async (request, pushToken) => {
+			authenticationAttempts += 1;
+			if (authenticationAttempts === 1) {
+				throw new AgentRuntimeError('AGENT_AUTH_REQUIRED', 'Authentication is not ready.');
+			}
+			for (const resource of request.resources.filter(({ required }) => required !== false)) {
+				await pushToken(resource.resource, 'test-token', resource.scopes_supported ?? []);
+			}
+		},
+	};
+	const runtime = new AhpAgentRuntime({
+		enabled: () => true,
+		launcher,
+		connections,
+		authBroker,
+		confirmation: { confirm: async () => 'once' },
+		workspaceResolver: trustedWorkspaceResolver(),
+		configResolver: { resolve: async () => ({ model: 'test-model' }) },
+	});
+
+	const first = runtime.start(taskRequest());
+	const queued = runtime.start({ ...taskRequest(), taskId: 'task-2' });
+	await assert.rejects(
+		first,
+		(error: unknown) => error instanceof AgentRuntimeError
+			&& error.code === 'AGENT_AUTH_REQUIRED'
+			&& error.cleanupFailed,
+	);
+	assert.equal(connections.connectCalls, 1);
+	assert.equal(launcher.launchCalls, 1);
+
+	await assert.rejects(
+		queued,
+		(error: unknown) => error instanceof AgentRuntimeError
+			&& error.cleanupFailed,
+	);
+	assert.equal(firstTransport.shutdownCalls, 2);
+	assert.equal(connections.connectCalls, 1);
+	assert.equal(launcher.launchCalls, 1);
+	firstTransport.shutdownFails = false;
+	const handle = await runtime.start({ ...taskRequest(), taskId: 'task-3' });
+	assert.equal(firstTransport.shutdownCalls, 3);
+	assert.equal(connections.connectCalls, 2);
+	assert.equal(launcher.launchCalls, 2);
+	assert.equal(secondTransport.initialized, true);
+	await handle.dispose();
+	await runtime.dispose();
+});
+
 test('provisional Session dispatches its first turn before session/ready', async () => {
 	const transport = new FakeAhpTransport();
 	transport.sessionStartsProvisional = true;
@@ -972,6 +1079,35 @@ test('AHP 0.8 creationFailed Session snapshots fail with the reported error', as
 			&& error.code === 'TASK_EXECUTION_FAILED'
 			&& error.message === 'Legacy Session creation failed.',
 	);
+	assert.equal(launcher.host.disposed, true);
+});
+
+test('runtime rejects a mismatched Host-echoed Session without recording local identity', async () => {
+	const transport = new FakeAhpTransport();
+	transport.sessionSnapshotResource = 'ahp-session:/foreign';
+	const launcher = new FakeLauncher();
+	const lifecycle: AgentRuntimeLifecycleObservation[] = [];
+	const runtime = new AhpAgentRuntime({
+		enabled: () => true,
+		launcher,
+		connections: new FakeConnectionFactory([transport]),
+		authBroker: new RecordingAuthBroker(),
+		confirmation: { confirm: async () => 'once' },
+		workspaceResolver: trustedWorkspaceResolver(),
+		configResolver: { resolve: async () => ({ model: 'test-model' }) },
+		lifecycleObserver: {
+			observeLifecycle: (observation) => lifecycle.push(observation),
+		},
+	});
+
+	await assert.rejects(
+		runtime.start(taskRequest()),
+		(error: unknown) => error instanceof AgentRuntimeError
+			&& error.code === 'TASK_EXECUTION_FAILED'
+			&& /mismatched resource/u.test(error.message),
+	);
+	assert.deepEqual(lifecycle, []);
+	assert.equal(transport.unsubscribedUris.includes(transport.created?.sessionUri ?? ''), true);
 	assert.equal(launcher.host.disposed, true);
 });
 
@@ -1022,6 +1158,50 @@ test('runtime disposal aborts and awaits an in-flight editor connection start', 
 	await runtime.dispose();
 	await assert.rejects(start, AgentRuntimeError);
 	assert.equal(launcher.host.disposed, true);
+});
+
+test('runtime disposal drains cleanup ownership recorded by an in-flight start', async () => {
+	const host = new FakeHost();
+	host.disposeFailuresRemaining = 1;
+	let launchEntered!: () => void;
+	let releaseLaunch!: () => void;
+	const entered = new Promise<void>((resolve) => {
+		launchEntered = resolve;
+	});
+	const launchGate = new Promise<void>((resolve) => {
+		releaseLaunch = resolve;
+	});
+	const launcher: AgentHostLauncherLike = {
+		probe: async () => ({ available: true, executable: '/safe/code', version: '1.134.0' }),
+		launch: async () => {
+			launchEntered();
+			await launchGate;
+			return host;
+		},
+		dispose: () => host.dispose(),
+	};
+	const runtime = new AhpAgentRuntime({
+		enabled: () => true,
+		launcher,
+		connections: new FakeConnectionFactory([new FakeAhpTransport()]),
+		authBroker: new RecordingAuthBroker(),
+		confirmation: { confirm: async () => 'once' },
+		workspaceResolver: trustedWorkspaceResolver(),
+		configResolver: { resolve: async () => ({ model: 'test-model' }) },
+	});
+
+	const start = runtime.start(taskRequest());
+	await entered;
+	const disposal = runtime.dispose();
+	releaseLaunch();
+
+	await assert.rejects(
+		start,
+		(error: unknown) => error instanceof AgentRuntimeError && error.cleanupFailed,
+	);
+	await disposal;
+	assert.equal(host.disposeFailuresRemaining, 0);
+	assert.equal(host.disposed, true);
 });
 
 test('root connection loss before Session creation fails startup instead of entering Session recovery', async () => {
@@ -1972,6 +2152,102 @@ test('VS Code auth broker is silent-first, requires explicit interaction, and on
 	);
 });
 
+test('editor identity broker skips initial token injection and runs with the host identity', async () => {
+	const transport = new FakeAhpTransport();
+	transport.completeAfterTurnDispatch = true;
+	const runtime = new AhpAgentRuntime({
+		enabled: () => true,
+		launcher: new FakeLauncher(),
+		connections: new FakeConnectionFactory([transport]),
+		authBroker: new EditorExistingIdentityAuthBroker(),
+		confirmation: { confirm: async () => 'once' },
+		workspaceResolver: trustedWorkspaceResolver(),
+		configResolver: { resolve: async () => ({ model: 'test-model' }) },
+	});
+
+	const handle = await runtime.start(taskRequest());
+	const events = [];
+	for await (const event of handle.events) {
+		events.push(event);
+	}
+	assert.equal(transport.initialized, true);
+	assert.ok(transport.created);
+	assert.deepEqual(transport.authenticated, []);
+	assert.equal(events.at(-1)?.type, 'completed');
+	await handle.dispose();
+});
+
+test('editor identity broker fails closed on challenges without pushing credentials', async () => {
+	const broker = new EditorExistingIdentityAuthBroker();
+	let pushes = 0;
+	await broker.authenticate(
+		{ resources: [protectedResource], interactive: true, reason: 'initial' },
+		async () => {
+			pushes += 1;
+		},
+	);
+	assert.equal(pushes, 0);
+
+	for (const reason of ['challenge', 'tokenInvalid'] as const) {
+		await assert.rejects(
+			broker.authenticate(
+				{ resources: [protectedResource], interactive: true, reason },
+				async () => {
+					pushes += 1;
+				},
+			),
+			(error: unknown) => error instanceof AgentRuntimeError
+				&& error.code === 'AGENT_AUTH_REQUIRED'
+				&& error.message === 'Authenticate the Agent Host in the selected editor profile before retrying.'
+				&& !error.message.includes(protectedResource.resource),
+		);
+	}
+	assert.equal(pushes, 0);
+
+	const abort = new AbortController();
+	abort.abort();
+	await assert.rejects(
+		broker.authenticate(
+			{
+				resources: [protectedResource],
+				interactive: false,
+				reason: 'initial',
+				signal: abort.signal,
+			},
+			async () => {
+				pushes += 1;
+			},
+		),
+		(error: unknown) => error instanceof DOMException && error.name === 'AbortError',
+	);
+	assert.equal(pushes, 0);
+});
+
+test('editor runtime reports createSession authentication challenges without token injection', async () => {
+	const transport = new FakeAhpTransport();
+	transport.createSessionAuthRequired = true;
+	const runtime = new AhpAgentRuntime({
+		enabled: () => true,
+		launcher: new FakeLauncher(),
+		connections: new FakeConnectionFactory([transport]),
+		authBroker: new EditorExistingIdentityAuthBroker(),
+		confirmation: { confirm: async () => 'once' },
+		workspaceResolver: trustedWorkspaceResolver(),
+		configResolver: { resolve: async () => ({ model: 'test-model' }) },
+	});
+
+	await assert.rejects(
+		runtime.start(taskRequest()),
+		(error: unknown) => error instanceof AgentRuntimeError
+			&& error.code === 'AGENT_AUTH_REQUIRED'
+			&& error.message === 'Authenticate the Agent Host in the selected editor profile before retrying.',
+	);
+	assert.equal(transport.initialized, true);
+	assert.deepEqual(transport.authenticated, []);
+	assert.equal(transport.createSessionCalls, 1);
+	await runtime.dispose();
+});
+
 test('VS Code auth broker aborts an in-flight authentication prompt without submitting a token', async () => {
 	const abort = new AbortController();
 	let submitted = false;
@@ -2550,6 +2826,9 @@ class FakeAhpTransport implements AhpConnection {
 	sessionStartsPending = false;
 	sessionStartsProvisional = false;
 	sessionCreationFailed = false;
+	sessionSnapshotResource: string | undefined;
+	createSessionAuthRequired = false;
+	createSessionCalls = 0;
 	sessionDefaultChat = 'ahp-chat:/default';
 	blockSessionSubscriptions = false;
 	notificationDuringInitialize: readonly ProtectedResource[] = [];
@@ -2679,12 +2958,13 @@ class FakeAhpTransport implements AhpConnection {
 		}
 		this.subscribedUris.push(uri);
 		if (uri.startsWith('ahp-session:')) {
+			const resource = this.sessionSnapshotResource ?? uri;
 			return {
 				snapshot: {
-					resource: uri,
+					resource,
 					fromSeq: 2,
 					state: {
-						resource: uri,
+						resource,
 						provider: 'dynamic-provider',
 						title: 'Task',
 						status: 1,
@@ -2792,10 +3072,17 @@ class FakeAhpTransport implements AhpConnection {
 
 	async createSession(params: NonNullable<FakeAhpTransport['created']>): Promise<void> {
 		this.assertOpen();
+		this.createSessionCalls += 1;
+		if (this.createSessionAuthRequired) {
+			throw Object.assign(new Error('Authentication required.'), {
+				code: -32007,
+				data: { resources: [protectedResource] },
+			});
+		}
 		this.created = params;
 	}
 
-	async listSessions(): Promise<readonly { readonly resource: string }[]> {
+	async listSessions(_limit?: number): Promise<readonly { readonly resource: string }[]> {
 		this.assertOpen();
 		return this.created === undefined ? [] : [{ resource: this.created.sessionUri }];
 	}

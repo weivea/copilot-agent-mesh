@@ -83,6 +83,12 @@ task notifications and retained in a bounded per-window cache; merged task
 collections are sorted and truncated to the strict 500-item UI limit with an
 explicit warning. Dashboard has no answer-input path.
 
+P8 uses these production handle paths to configure its real two-window gate:
+the target redeems its current `acceptActionHandle`, and the source redeems the
+one candidate handle for `A -> B`. The harness never injects a Workspace identity
+or mutates policy storage directly. Before authorization the Tool directory omits
+the target while both Dashboard configuration lists still show both windows.
+
 Task timestamps are normalized from every protocol-valid offset/fraction form
 to canonical UTC ISO with three millisecond digits before outbound safety
 inspection. Malformed or out-of-display-range values become the explicit
@@ -93,6 +99,10 @@ source, a bounded degradation enum/message, and change notifications wired into 
 existing Dashboard refresh event. The existing Agent Host component projects
 `Editor`, `Standalone`, or `Standalone (degraded)` without exposing an endpoint
 document or sensitive fields; P7 owns the broader Dashboard rework.
+
+Stable APIs cannot detect a simultaneous edit made by the target window's separate
+user Copilot Chat. This remains an explicit 0.4.0 limitation; the visible Incoming
+Task and its always-authorized target-side cancel action are the mitigation.
 
 ## Facade contract
 

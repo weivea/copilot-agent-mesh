@@ -8,8 +8,7 @@
 > 用户实例的 `editor` endpoint。Broker、Window Node、Workspace Lease、本地 IPC、
 > Task 生命周期与脱敏边界等章节**仍然有效**。
 
-> 状态：0.3.0 Preview Same-device Multi-project Collaboration；Gate G0 在 macOS
-> arm64 验证范围内 Go<br>
+> 状态：0.4.0 Preview Peer Window Delegation 已实现；真实 UI/editor Gate 待显式运行<br>
 > 日期：2026-08-30<br>
 > 依据：[产品需求文档 v0.3](../copilot-agent-mesh-prd.md)<br>
 > 首版范围：本机桌面 Workspace；不支持 SSH、WSL、Dev Containers、Codespaces 或 vscode.dev
@@ -147,7 +146,7 @@ flowchart LR
 | 进程 | 所有者 | 职责 | 禁止暴露 |
 | --- | --- | --- | --- |
 | Broker-owner Extension Host | VS Code | Device Broker、Gateway、一个 Dev Tunnel、Peer Manager、全局 Store、远端路由、Node Registry | Secret、Agent Host token |
-| 其他普通 Extension Host | VS Code | 活跃 Window Node、UI、八个工具、Workspace Claim、自有真实 AHP Runtime/Handle | Broker key、Agent Host token |
+| 其他普通 Extension Host | VS Code | 活跃 Window Node、UI、五个工具、Workspace Claim、自有真实 AHP Runtime/Handle | Broker key、Agent Host token |
 | `devtunnel host` | Mesh 启动 | Relay host 长连接 | 配对密钥、任务内容 |
 | `code agent host` | Mesh 启动或发现 | AHP Server、Copilot Agent Session | AHP connection token |
 | VS Code Webview | Extension | 只显示 ViewModel、发送受限 UI 命令 | Secret、原始本地路径、未脱敏日志 |
@@ -740,7 +739,11 @@ sequenceDiagram
     H-->>M: negotiated version + root snapshot
     M->>M: apply root snapshot
     M->>M: discover Agent provider and capabilities
-    M->>H: authenticate(resource token) when required
+    alt borrowed editor
+        M->>M: reuse editor Host identity; no initial token injection
+    else owned standalone
+        M->>H: authenticate(mapped resource token) when required
+    end
     M->>H: resolve session config when required
     M->>H: createSession(sessionUri, provider, workingDirectories)
     M->>H: subscribe(sessionUri)
@@ -759,7 +762,12 @@ sequenceDiagram
 - `createSession` 使用 `workingDirectories: [registeredFileUri]`；只有 Provider Capability 允许时才传多个目录。
 - 必须处理 `resolveSessionConfig` / `sessionConfigCompletions`，不能假定 Provider 接受空配置。
 - 根据 Provider 动态 Resource Metadata 和 `AuthRequired` Error 重新发现认证要求；`scopes_supported` 只是候选能力，不是可直接照抄的确定请求 Scope。
-- `vscode.authentication.getSession` 只能作为 `AuthBroker` 的候选 Token 来源；不硬编码 Authentication Provider、GitHub Scope 或 Copilot Resource，只有 AHP `authenticate` 成功后才认为 Token 可用。
+- Borrowed editor 初始 protected-resource 列表只描述 Host 自有身份，Mesh 不调用
+  `vscode.authentication.getSession`、不发送 Root `authenticate`。后续真实 challenge/
+  token-invalid 直接安全失败 `AGENT_AUTH_REQUIRED`，要求用户在该 editor Profile 认证。
+- 只有 owned standalone 的 `VscodeAuthBroker` 可把
+  `vscode.authentication.getSession` 作为候选 Token 来源；不硬编码 Authentication
+  Provider、GitHub Scope 或 Copilot Resource，只有 AHP `authenticate` 成功后才认为 Token 可用。
 - 首先 silent lookup；仅在明确用户操作或已确认 Tool Invocation 中触发交互登录。
 - 处理 `AuthRequired`、Token 无效、无 Copilot 权限、配额不足和 Provider 消失。
 - 每次 `initialize` / `subscribe` 返回的 Snapshot 必须先应用，再消费后续 Action。
@@ -1247,6 +1255,15 @@ zod
 4. **Multi-window E2E：** 相同 User Data 的普通 VS Code Windows，验证一个
    Broker、多 Node、IPC、Claim/Reclaim/Conflict、Takeover 与精确清理。默认不
    启动 AHP Task。
+5. **Peer Delegation E2E：** 两个普通窗口、两个一次性项目、同一专用 User Data，
+   通过 Dashboard 一次性句柄配置双重门，并通过真实注册的五个 LM Tool 验证
+   Tool → Broker → Window Node → editor AHP → Broker → Tool Result。VS Code 1.135.0
+   的无 Chat context `vscode.lm.invokeTool` 仍执行 prepare 并显示独立 modal，但无法证明
+   父 Copilot Chat 身份；确认只能由可见 Agent-mode 阶段证明，缺失时明确 `unverified`。
+   持久 User Data 仅复用 Copilot authentication；通过 `E2eCapability` 校验后，全部 Mesh
+   `StateStore` metadata 使用 fixed-key/run-nonce envelope，Broker lock、IPC identity root
+   与 `mesh-state` 使用唯一 `controlRoot/broker`。新 run 不读取旧 run 或生产
+   Workspace/Route state，也不删除持久 global storage、修改 SQLite、提高 limit 或 eviction。
 
 环境变量：
 
@@ -1256,6 +1273,7 @@ MESH_AGENT_HOST_E2E=1
 MESH_TWO_DEVICE_E2E=1
 npm run test:multi-window-real
 MESH_MULTI_WINDOW_E2E_TASKS=1 npm run test:multi-window-real
+MESH_PEER_DELEGATION_E2E=1 npm run test:peer-delegation-real
 ```
 
 macOS Unix Socket 路径过长时使用短目录：
@@ -1285,6 +1303,14 @@ macOS arm64 已记录以下真实运行：
   schema Artifact 由 frontend 精确消费，两边 Validation 与独立检查通过，
   Run completed，Listener/Tunnel Stopped，Takeover 993 ms，Profile Lock 释放且
   Process/Socket/Timer 零残留。
+- `artifacts/peer-delegation-e2e/evidence.json`：
+  P8 使用已有满 32 项生产 Workspace Catalog 的专用 Profile，在 VS Code
+  1.135.0/macOS arm64 objective run 通过两个普通 Window Node、一个 Broker、
+  两个不同 Claim、`PEER_NOT_ALLOWED` / `PEER_NOT_ACCEPTING`、单向可见、Incoming、
+  Listener/Tunnel 零 attempt delta、Lease/Profile Lock 释放与 Harness-owned 资源归零。
+  Run-scoped metadata/file root 未读取、删除或逐出生产 Catalog；所选 Profile 显式
+  standalone 降级并停在 `AGENT_AUTH_REQUIRED`，所以不声明
+  `agentStarted`/output/completed、父 Chat confirmation、O1/O2 或真实 input/cancel/timeout。
 
 实施期间 Unit、Component、Extension Host 和完整 npm Test 均通过；最终发布
 验证完成前不在文档中固定数量。
@@ -1319,8 +1345,9 @@ Linux Extension Host Test 使用 `xvfb-run -a`。[VS Code CI](https://code.visua
 
 ## 21. Release Gate
 
-以下全部通过才可把 0.3.0 Preview Evaluation Package 提升为通过 G0 的发布候选。
-macOS arm64 验证范围现为 Go；这不表示已 Push/Release/Publish：
+以下全部通过才可把 0.4.0 Preview Evaluation Package 提升为 Peer Window
+Delegation 发布候选。历史 G0 的 macOS arm64 验证范围仍为 Go；新的同设备委派必须
+另外通过 12 项真实证据，且这不表示已 Merge/Release/Publish：
 
 1. Gateway 只监听 `127.0.0.1`，只公开 `/healthz` 和认证 RPC Upgrade。
 2. 未认证 Peer 无法读取设备、Workspace 或 Task 信息。
@@ -1349,6 +1376,12 @@ macOS arm64 验证范围现为 Go；这不表示已 Push/Release/Publish：
 21. Authenticated Authoritative AHP start/get/cancel/output/handle-cancel 已通过。
 22. Dashboard/Tool 不暴露 Artifact 内容、绝对路径、Secret、原始
     Prompt/Output；同设备路径始终不触碰 Dev Tunnel。
+23. `MESH_PEER_DELEGATION_E2E=1` 真实运行证明两个普通 Window Node、一个 Broker、
+    两个不同 Claim、双重门两种错误、一次父确认、真实 AHP completed、同次 Tool
+    `taskId`、Incoming、editor source、零 Listener/Tunnel delta、Lease/Profile Lock
+    释放，以及零 Harness-owned Process/Socket/Timer residual。
+24. P8 evidence Validator 拒绝路径、Token、完整 Workspace identity、原始
+    Prompt/Output、无效引用、降级 editor 冒充和全局进程零断言。
 
 ## 22. 参考资料
 

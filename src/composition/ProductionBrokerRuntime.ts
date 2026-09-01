@@ -57,6 +57,7 @@ import { ensureOwnedBrokerKey } from './SharedBrokerIdentity';
 export interface ProductionBrokerRuntimeOptions {
 	readonly vscodeApi: typeof vscode;
 	readonly context: vscode.ExtensionContext;
+	readonly storageRootUri: vscode.Uri;
 	readonly rawState: StateStore;
 	readonly secrets: VscodeSecretStore;
 	readonly ownership: BrokerOwnership;
@@ -200,7 +201,7 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 
 		const leases = new WorkspaceLeaseManager();
 		const storageRoot = options.vscodeApi.Uri.joinPath(
-			options.context.globalStorageUri,
+			options.storageRootUri,
 			'mesh-state',
 		);
 		await options.vscodeApi.workspace.fs.createDirectory(storageRoot);

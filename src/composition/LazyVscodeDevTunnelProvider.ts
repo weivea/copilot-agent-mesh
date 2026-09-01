@@ -30,6 +30,12 @@ export interface LazyDevTunnelDelegate extends DevTunnelProvider {
 	}>;
 }
 
+export interface LazyDevTunnelMetrics {
+	readonly loadAttempts: number;
+	readonly probeAttempts: number;
+	readonly ensureHostedAttempts: number;
+}
+
 /**
  * Keeps the Dev Tunnel implementation out of the local Broker/task startup
  * path. Loading and CLI probing begin only from an explicit Listener/E2E action
@@ -43,14 +49,19 @@ export class LazyVscodeDevTunnelProvider implements DevTunnelProvider {
 	private disposal: Promise<void> | undefined;
 	private disposeRequested = false;
 	private disposed = false;
+	private loadAttempts = 0;
+	private probeAttempts = 0;
+	private ensureHostedAttempts = 0;
 
 	public constructor(private readonly options: LazyVscodeDevTunnelProviderOptions) {}
 
 	public async probe(): Promise<TunnelCapability> {
+		this.probeAttempts += 1;
 		return (await this.load()).probe();
 	}
 
 	public async ensureHosted(request: TunnelRequest): Promise<HostedTunnel> {
+		this.ensureHostedAttempts += 1;
 		return (await this.load()).ensureHosted(request);
 	}
 
@@ -82,6 +93,14 @@ export class LazyVscodeDevTunnelProvider implements DevTunnelProvider {
 
 	public getStatus(): DevTunnelRuntimeStatus {
 		return this.delegate?.getStatus() ?? { state: 'stopped' };
+	}
+
+	public lifecycleMetrics(): LazyDevTunnelMetrics {
+		return {
+			loadAttempts: this.loadAttempts,
+			probeAttempts: this.probeAttempts,
+			ensureHostedAttempts: this.ensureHostedAttempts,
+		};
 	}
 
 	public onDidChange(listener: () => void): { dispose(): void } {
@@ -125,6 +144,7 @@ export class LazyVscodeDevTunnelProvider implements DevTunnelProvider {
 	}
 
 	private async loadOnce(): Promise<LazyDevTunnelDelegate> {
+		this.loadAttempts += 1;
 		const delegate = this.options.loadProvider === undefined
 			? new (await import('../tunnel/DevTunnelCliProvider.js')).DevTunnelCliProvider(
 				this.options,

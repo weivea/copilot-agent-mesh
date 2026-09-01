@@ -1,6 +1,7 @@
 import {
 	AgentRuntimeError,
 	type AgentHostSourceStatus,
+	type AgentHostSourceFailure,
 	type AgentHostSourceStatusProvider,
 	type AgentRuntimeApprovalCapabilityIssuer,
 	type AgentRuntime,
@@ -19,17 +20,25 @@ import {
 	EditorAgentHostLocator,
 	type LocatedEditorAgentHost,
 } from './EditorAgentHostLocator';
-import { UnixSocketWebSocketConnector } from './UnixSocketWebSocketConnector';
+import {
+	UnixSocketWebSocketConnector,
+	UnixSocketWebSocketError,
+} from './UnixSocketWebSocketConnector';
 
 const borrowedEditorEndpoint = new URL('ws://editor-agent-host.invalid/');
+const defaultEditorConnectionRetryDelaysMs = [90_000] as const;
 
 export interface AgentHostSourceSelectorOptions {
+	readonly enabled?: () => boolean;
 	readonly preferEditor: () => boolean;
 	readonly editor: AgentRuntime;
 	readonly standalone: AgentRuntime;
 	readonly confirmation: FirstTaskConfirmation;
 	readonly workspaceResolver: WorkspaceResolver;
 	readonly approvalCapabilities: AgentRuntimeApprovalCapabilityIssuer;
+	readonly editorConnectionRetryDelaysMs?: readonly number[];
+	readonly editorInitialReadinessDelayMs?: number;
+	readonly waitForEditorRetry?: (delayMs: number, signal: AbortSignal) => Promise<void>;
 }
 
 export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceStatusProvider {
@@ -42,37 +51,115 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 	}>();
 	private disposed = false;
 	private disposal: Promise<void> | undefined;
+	private readonly editorConnectionRetryDelaysMs: readonly number[];
+	private readonly editorInitialReadinessDelayMs: number;
+	private readonly waitForEditorRetry: (delayMs: number, signal: AbortSignal) => Promise<void>;
+	private readonly editorInitialReadinessController = new AbortController();
+	private editorInitialReadinessWait: Promise<void> | undefined;
 
-	public constructor(private readonly options: AgentHostSourceSelectorOptions) {}
+	public constructor(private readonly options: AgentHostSourceSelectorOptions) {
+		this.editorConnectionRetryDelaysMs = options.editorConnectionRetryDelaysMs
+			?? defaultEditorConnectionRetryDelaysMs;
+		this.editorInitialReadinessDelayMs = options.editorInitialReadinessDelayMs ?? 0;
+		if (
+			!Number.isSafeInteger(this.editorInitialReadinessDelayMs)
+			|| this.editorInitialReadinessDelayMs < 0
+			|| this.editorInitialReadinessDelayMs > 120_000
+			||
+			this.editorConnectionRetryDelaysMs.length > 2
+			|| this.editorConnectionRetryDelaysMs.some(
+				(delayMs) => !Number.isSafeInteger(delayMs) || delayMs < 0 || delayMs > 120_000,
+			)
+		) {
+			throw new RangeError('Editor connection retry delays are invalid.');
+		}
+		this.waitForEditorRetry = options.waitForEditorRetry ?? waitForEditorRetry;
+	}
 
 	public async probe(): Promise<AgentRuntimeProbe> {
 		this.assertActive();
+		if (this.options.enabled?.() === false) {
+			return {
+				available: false,
+				featureEnabled: false,
+				reason: 'AGENT_UNAVAILABLE',
+				source: this.options.preferEditor() ? 'editor' : 'standalone',
+			};
+		}
 		if (!this.options.preferEditor()) {
 			const probe = await this.options.standalone.probe();
 			this.sourceSelected = true;
 			this.setStatus({ source: 'standalone', degraded: false });
 			return { ...probe, source: 'standalone', degradation: undefined };
 		}
+		if (this.inFlightStarts.size > 0) {
+			return {
+				available: false,
+				featureEnabled: true,
+				canStart: true,
+				reason: 'AGENT_UNAVAILABLE',
+				source: 'editor',
+			};
+		}
 		if (this.sourceSelected) {
 			const selected = this.status.source === 'editor'
-				? await this.options.editor.probe()
+				? {
+					available: this.status.failure === undefined,
+					featureEnabled: true,
+					...(this.status.failure === undefined
+						? {}
+						: {
+							reason: this.status.failure.code,
+							canStart: true,
+						}),
+				}
 				: await this.options.standalone.probe();
 			return probeWithStatus(selected, this.status);
 		}
 
-		const editor = await this.options.editor.probe();
-		if (editor.available) {
-			this.setStatus({ source: 'editor', degraded: false });
-			return probeWithStatus(editor, this.status);
+		this.setStatus({ source: 'editor', degraded: false });
+		return {
+			available: false,
+			featureEnabled: true,
+			canStart: true,
+			reason: 'AGENT_UNAVAILABLE',
+			source: 'editor',
+		};
+	}
+
+	public async prepareStart(): Promise<void> {
+		this.assertActive();
+		if (this.options.enabled?.() === false) {
+			throw new AgentRuntimeError(
+				'AGENT_UNAVAILABLE',
+				'The experimental Agent Host runtime is disabled.',
+			);
 		}
-		const status = degradedStatus('EDITOR_DISCOVERY_FAILED');
-		this.setStatus(status);
-		const standalone = await this.options.standalone.probe();
-		return probeWithStatus(standalone, status);
+		const runtimes = this.options.preferEditor()
+			? [this.options.editor, this.options.standalone]
+			: [this.options.standalone];
+		for (const runtime of runtimes) {
+			try {
+				await runtime.prepareStart?.();
+			} catch (error) {
+				if (runtime === this.options.editor) {
+					this.sourceSelected = true;
+					this.setStatus(editorFailureStatus(safeEditorFailure(error)));
+				}
+				throw error;
+			}
+		}
+		this.assertActive();
 	}
 
 	public start(request: AgentTaskRequest): Promise<AgentTaskHandle> {
 		this.assertActive();
+		if (this.options.enabled?.() === false) {
+			throw new AgentRuntimeError(
+				'AGENT_UNAVAILABLE',
+				'The experimental Agent Host runtime is disabled.',
+			);
+		}
 		const controller = new AbortController();
 		let tracked!: {
 			readonly controller: AbortController;
@@ -92,13 +179,16 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 		const approvedRequest = await this.approve(request, signal);
 		try {
 			throwIfSelectorAborted(signal);
-			return await this.startApproved(approvedRequest);
+			return await this.startApproved(approvedRequest, signal);
 		} finally {
 			this.options.approvalCapabilities.revoke(approvedRequest.approvalCapability);
 		}
 	}
 
-	private async startApproved(request: AgentTaskRequest): Promise<AgentTaskHandle> {
+	private async startApproved(
+		request: AgentTaskRequest,
+		signal: AbortSignal,
+	): Promise<AgentTaskHandle> {
 		if (!this.options.preferEditor()) {
 			const handle = await this.options.standalone.start(request);
 			this.sourceSelected = true;
@@ -106,20 +196,46 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 			return handle;
 		}
 
-		try {
-			const handle = await this.options.editor.start(request);
-			this.assertActive();
-			this.sourceSelected = true;
-			this.setStatus({ source: 'editor', degraded: false });
-			return handle;
-		} catch (error: unknown) {
-			this.assertActive();
-			if (!isFallbackEligible(error)) {
-				throw error;
+		let editorFailure: AgentHostSourceFailure | undefined;
+		if (
+			this.editorInitialReadinessDelayMs > 0
+		) {
+			this.editorInitialReadinessWait ??= this.waitForEditorRetry(
+				this.editorInitialReadinessDelayMs,
+				this.editorInitialReadinessController.signal,
+			);
+			await abortableSelectorOperation(this.editorInitialReadinessWait, signal);
+		}
+		for (let attempt = 0; attempt <= this.editorConnectionRetryDelaysMs.length; attempt += 1) {
+			try {
+				const handle = await this.options.editor.start(request);
+				this.assertActive();
+				this.sourceSelected = true;
+				this.setStatus({ source: 'editor', degraded: false });
+				return handle;
+			} catch (error: unknown) {
+				this.assertActive();
+				editorFailure = safeEditorFailure(error);
+				if (!isFallbackEligible(error)) {
+					this.sourceSelected = true;
+					this.setStatus(editorFailureStatus(editorFailure));
+					throw error;
+				}
+				if (
+					isRetryableEditorConnectionFailure(editorFailure)
+					&& attempt < this.editorConnectionRetryDelaysMs.length
+				) {
+					await this.waitForEditorRetry(
+						this.editorConnectionRetryDelaysMs[attempt]!,
+						signal,
+					);
+					continue;
+				}
+				break;
 			}
 		}
 
-		const status = degradedStatus('EDITOR_START_FAILED');
+		const status = degradedStatus('EDITOR_START_FAILED', editorFailure);
 		this.sourceSelected = true;
 		this.setStatus(status);
 		try {
@@ -179,15 +295,22 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 	public dispose(): Promise<void> {
 		this.disposed = true;
 		this.listeners.clear();
-		this.disposal ??= this.disposeRuntimes().finally(() => {
-			if (!this.disposed) {
+		if (this.disposal !== undefined) {
+			return this.disposal;
+		}
+		let operation!: Promise<void>;
+		operation = this.disposeRuntimes().catch((error: unknown) => {
+			if (this.disposal === operation) {
 				this.disposal = undefined;
 			}
+			throw error;
 		});
-		return this.disposal;
+		this.disposal = operation;
+		return operation;
 	}
 
 	private async disposeRuntimes(): Promise<void> {
+		this.editorInitialReadinessController.abort();
 		for (const start of this.inFlightStarts) {
 			start.controller.abort();
 		}
@@ -300,6 +423,7 @@ class BorrowedEditorAgentHost implements LaunchedAgentHost {
 	readonly endpoint = borrowedEditorEndpoint;
 	readonly source = 'editor' as const;
 	readonly preserveTerminalSession = true;
+	readonly endpointFingerprint: string;
 	readonly version: string;
 	readonly registryProtocolVersion: string;
 
@@ -309,6 +433,7 @@ class BorrowedEditorAgentHost implements LaunchedAgentHost {
 	) {
 		this.version = located.version;
 		this.registryProtocolVersion = located.registryProtocolVersion;
+		this.endpointFingerprint = located.endpointFingerprint;
 	}
 
 	public openWebSocket(signal?: AbortSignal): ReturnType<LocatedEditorAgentHost['connect']> {
@@ -327,6 +452,7 @@ class BorrowedEditorAgentHost implements LaunchedAgentHost {
 
 function degradedStatus(
 	reason: Extract<AgentHostSourceStatus, { degraded: true }>['reason'],
+	failure?: AgentHostSourceFailure,
 ): Extract<AgentHostSourceStatus, { degraded: true }> {
 	const message = reason === 'EDITOR_DISCOVERY_FAILED'
 		? 'Editor Agent Host discovery failed; standalone mode is in use.'
@@ -338,11 +464,79 @@ function degradedStatus(
 		degraded: true,
 		reason,
 		message,
+		...(failure === undefined ? {} : { failure }),
 	};
 }
 
+function editorFailureStatus(
+	failure: AgentHostSourceFailure,
+): Extract<AgentHostSourceStatus, { source: 'editor' }> {
+	const { code } = failure;
+	const message = code === 'AGENT_AUTH_REQUIRED'
+		? 'The selected editor Agent Host requires authentication in its editor profile.'
+		: code === 'AGENT_AUTH_FAILED'
+			? 'The selected editor Agent Host could not authenticate with its existing identity.'
+			: code === 'AGENT_CONFIG_REQUIRED'
+				? 'The selected editor Agent Host requires Session configuration.'
+				: 'The selected editor Agent Host could not start the task.';
+	return {
+		source: 'editor',
+		degraded: false,
+		failure: { ...failure, message },
+	};
+}
+
+function safeEditorFailure(error: unknown): AgentHostSourceFailure {
+	const code = error instanceof AgentRuntimeError
+		? error.code
+		: 'TASK_EXECUTION_FAILED';
+	const message = error instanceof AgentRuntimeError ? error.message : '';
+	const stage = ['AGENT_AUTH_REQUIRED', 'AGENT_AUTH_FAILED', 'AGENT_CONFIG_REQUIRED'].includes(code)
+		? 'session'
+		: /endpoint is unavailable/u.test(message)
+		? 'discovery'
+		: /connection could not be established|WebSocket/u.test(message)
+			? 'connection'
+			: /protocol|initialize|root snapshot|root snapshot did not contain|provider/u.test(message)
+				? 'initialize'
+				: /Session|session|connection closed while the task was starting/u.test(message)
+					? 'session'
+					: 'task';
+	return {
+		code,
+		stage,
+		...(error instanceof AgentRuntimeError
+			&& error.cause instanceof UnixSocketWebSocketError
+			? {
+				detail: error.cause.code,
+				...(error.cause.statusCode === undefined
+					? {}
+					: { statusCode: error.cause.statusCode }),
+				...(error.cause.socketCode === undefined
+					? {}
+					: { socketCode: error.cause.socketCode }),
+				...(error.cause.endpointFingerprint === undefined
+					? {}
+					: { endpointFingerprint: error.cause.endpointFingerprint }),
+				...(error.cause.proxyStage === undefined
+					? {}
+					: { proxyStage: error.cause.proxyStage }),
+			}
+			: {}),
+		message: 'The selected editor Agent Host attempt failed safely.',
+	};
+}
+
+function isRetryableEditorConnectionFailure(failure: AgentHostSourceFailure): boolean {
+	return failure.stage === 'connection'
+		&& failure.detail === 'CONNECT_FAILED'
+		&& failure.socketCode === 'ECONNREFUSED';
+}
+
 function isFallbackEligible(error: unknown): boolean {
-	return error instanceof AgentRuntimeError && error.code === 'AGENT_UNAVAILABLE';
+	return error instanceof AgentRuntimeError
+		&& error.code === 'AGENT_UNAVAILABLE'
+		&& !error.cleanupFailed;
 }
 
 function normalizeFallbackFailure(error: unknown): AgentRuntimeError {
@@ -374,6 +568,15 @@ function probeWithStatus(
 	probe: AgentRuntimeProbe,
 	status: AgentHostSourceStatus,
 ): AgentRuntimeProbe {
+	if (status.source === 'editor' && status.failure !== undefined) {
+		return {
+			...probe,
+			available: false,
+			reason: status.failure.code,
+			source: 'editor',
+			degradation: undefined,
+		};
+	}
 	return {
 		...probe,
 		source: status.source,
@@ -393,6 +596,22 @@ function throwIfSelectorAborted(signal: AbortSignal): void {
 			'The Agent Host source selection was cancelled during shutdown.',
 		);
 	}
+}
+
+function waitForEditorRetry(delayMs: number, signal: AbortSignal): Promise<void> {
+	throwIfSelectorAborted(signal);
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(() => {
+			signal.removeEventListener('abort', abort);
+			resolve();
+		}, delayMs);
+		const abort = () => {
+			clearTimeout(timer);
+			signal.removeEventListener('abort', abort);
+			reject(new DOMException('Agent Host source selection was cancelled.', 'AbortError'));
+		};
+		signal.addEventListener('abort', abort, { once: true });
+	});
 }
 
 function abortableSelectorOperation<T>(

@@ -564,8 +564,10 @@ test('fatal background task-start closes the IPC generation after durable accept
 			'TASK_RECOVERY_UNAVAILABLE',
 		].includes(failed.failure?.code ?? ''));
 	} finally {
-		await client.dispose();
-		await fixture.broker.dispose();
+		await Promise.allSettled([
+			client.dispose(),
+			fixture.broker.dispose(),
+		]);
 		await rm(fixture.identity.tempDirectory, { recursive: true, force: true });
 	}
 });

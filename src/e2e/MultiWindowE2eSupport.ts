@@ -1,9 +1,17 @@
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 
 const uuidV4Pattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const actionPattern = /^[a-z][a-z0-9.]{0,63}$/u;
 const workspaceKeyPattern = /^[a-z0-9][a-z0-9-]{0,63}-[a-f0-9]{12}$/u;
+const isoTimestampPattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
+const startupMessages = {
+	BROKER_RUNTIME_START_FAILED: 'The Device Broker runtime failed to start.',
+	WINDOW_NODE_CONNECT_FAILED: 'The Window Node could not connect to the local Device Broker.',
+	WORKSPACE_BUSY: 'The Window Node workspace claim was rejected as busy.',
+	WORKSPACE_NOT_FOUND: 'The Window Node workspace could not be resolved.',
+} as const;
 
 export interface MultiWindowRequestEnvelope {
 	readonly schemaVersion: 1;
@@ -33,6 +41,17 @@ export interface OwnedProcessSelection {
 	readonly rootPids: ReadonlySet<number>;
 	readonly markers: readonly string[];
 	readonly selfPid: number;
+}
+
+export type MultiWindowStartupDiagnosticCode = keyof typeof startupMessages;
+
+export interface MultiWindowStartupDiagnostic {
+	readonly schemaVersion: 1;
+	readonly code: MultiWindowStartupDiagnosticCode;
+	readonly message: string;
+	readonly recordedAt: string;
+	readonly workspaceKey: string;
+	readonly windowId: string;
 }
 
 export function multiWindowWorkspaceKey(workspaceBasename: string): string {
@@ -76,6 +95,107 @@ export function multiWindowControlDirectory(
 		multiWindowWorkspaceKey(workspaceBasename),
 		windowId,
 	);
+}
+
+export function multiWindowStartupDiagnosticPath(
+	controlRoot: string,
+	workspaceBasename: string,
+	windowId: string,
+): string {
+	return join(
+		multiWindowControlDirectory(controlRoot, workspaceBasename, windowId),
+		'startup-failure.json',
+	);
+}
+
+export async function writeMultiWindowStartupDiagnostic(input: {
+	readonly controlRoot: string;
+	readonly workspaceBasename: string;
+	readonly windowId: string;
+	readonly code: MultiWindowStartupDiagnosticCode;
+}): Promise<void> {
+	const path = multiWindowStartupDiagnosticPath(
+		input.controlRoot,
+		input.workspaceBasename,
+		input.windowId,
+	);
+	const controlDirectory = multiWindowControlDirectory(
+		input.controlRoot,
+		input.workspaceBasename,
+		input.windowId,
+	);
+	const value = {
+		schemaVersion: 1,
+		code: input.code,
+		recordedAt: new Date().toISOString(),
+	};
+	const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+	await mkdir(controlDirectory, { recursive: true });
+	try {
+		await writeFile(temporary, `${JSON.stringify(value)}\n`, {
+			encoding: 'utf8',
+			mode: 0o600,
+			flag: 'wx',
+		});
+		await rename(temporary, path);
+	} finally {
+		await rm(temporary, { force: true });
+	}
+}
+
+export async function clearMultiWindowStartupDiagnostic(
+	controlRoot: string,
+	workspaceBasename: string,
+	windowId: string,
+): Promise<void> {
+	await rm(
+		multiWindowStartupDiagnosticPath(controlRoot, workspaceBasename, windowId),
+		{ force: true },
+	);
+}
+
+export async function readMultiWindowStartupDiagnostic(
+	path: string,
+	expected: {
+		readonly workspaceKey: string;
+		readonly windowId: string;
+		readonly launchedAt: number;
+	},
+): Promise<MultiWindowStartupDiagnostic> {
+	const value = JSON.parse(await readFile(path, 'utf8')) as unknown;
+	return parseMultiWindowStartupDiagnostic(value, expected);
+}
+
+export function parseMultiWindowStartupDiagnostic(
+	value: unknown,
+	expected: {
+		readonly workspaceKey: string;
+		readonly windowId: string;
+		readonly launchedAt: number;
+	},
+): MultiWindowStartupDiagnostic {
+	if (
+		!isPlainRecord(value)
+		|| Object.keys(value).sort().join(',') !== 'code,recordedAt,schemaVersion'
+		|| value.schemaVersion !== 1
+		|| typeof value.code !== 'string'
+		|| !Object.hasOwn(startupMessages, value.code)
+		|| typeof value.recordedAt !== 'string'
+		|| !isoTimestampPattern.test(value.recordedAt)
+		|| !isCanonicalTimestamp(value.recordedAt)
+		|| Date.parse(value.recordedAt) < expected.launchedAt - 1_000
+	) {
+		throw new TypeError('Invalid multi-window E2E startup diagnostic.');
+	}
+	const code = value.code as MultiWindowStartupDiagnosticCode;
+	return {
+		schemaVersion: 1,
+		code,
+		message: startupMessages[code],
+		recordedAt: value.recordedAt,
+		workspaceKey: expected.workspaceKey,
+		windowId: expected.windowId,
+	};
 }
 
 export function parseMultiWindowRequest(
@@ -211,6 +331,12 @@ export function selectOwnedProcesses(
 	return entries
 		.filter((entry) => owned.has(entry.pid))
 		.sort((left, right) => depth(right) - depth(left) || right.pid - left.pid);
+}
+
+function isCanonicalTimestamp(value: string): boolean {
+	const milliseconds = Date.parse(value);
+	return Number.isFinite(milliseconds)
+		&& new Date(milliseconds).toISOString() === value;
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {

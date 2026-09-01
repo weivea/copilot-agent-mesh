@@ -25,6 +25,12 @@ never displays IDs, paths, the raw prompt, or secrets, and it never persists an
 intent or contacts a worker. P5 never treats a working directory or arbitrary
 tool prose as proof that a terminal command is confined to the Workspace.
 
+Copilot decides whether to choose a Tool, so automatic selection is not a product
+guarantee. Users must use Agent mode with Tools enabled and can explicitly invoke
+`#meshListWorkers` followed by `#meshDelegateTask`. The list description calls out
+cross-project/window requests; `mesh_answer_task` tells the model to reuse exact
+`t`/`i` values from a compact `s=1` delegation result.
+
 Same-device peer delegation is default-off behind
 `copilotAgentMesh.experimental.peerDelegation`. When enabled, a local target is
 listed only when its sole workspace is online and claimed, its
@@ -41,6 +47,16 @@ enabled; disabling it disposes their registrations. The Dashboard remains
 available for base device/Workspace/Broker safety state, while its receive and
 allowlist controls become unavailable. Configuration uses the separate
 unfiltered candidate RPC and never weakens `mesh_list_workers` filtering.
+
+The P8 real harness invokes these same registrations through
+`vscode.lm.invokeTool`; it does not call the Broker start method as a substitute.
+On VS Code 1.135.0, a programmatic invocation without Chat context still runs
+`prepareInvocation` and shows a separate modal. That proves neither a parent
+Copilot Chat route nor a sidebar confirmation. Only the visible Agent-mode phase
+may mark the one parent confirmation as Pass. Because an unauthorized target is
+intentionally absent from the display directory, the two direct-address rejection
+codes are collected through the gated E2E control API against the same production
+Broker start route; they are not counted as task completion evidence.
 
 Policy configuration uses a separate authenticated RPC surface. A multi-root
 window may pass one of its own claimed `workspaceIdentity` values to
@@ -164,6 +180,11 @@ not snapshot polling loops. `mesh_get_task` remains available for abnormal Tool
 host interruption and explicit tracking of another task, but normal delegation
 does not poll it.
 
+Terminal notifications received during start reconciliation are buffered until
+the persisted idempotency mapping is validated. A conflicting retry therefore
+returns `IDEMPOTENCY_CONFLICT`; it cannot reuse the prior task's fast completed
+event as a success-shaped result.
+
 ## Facade integration
 
 `TaskToolFacade` is the production seam for the future `TaskCoordinator` and
@@ -217,7 +238,7 @@ production descriptors and whether the legacy spike is still present.
 The `66b2954` baseline still imports and registers `registerMeshSpikeEchoTool`
 from `src/extension.ts` and contributes `mesh_spike_echo` from `package.json`.
 The parent integration must remove both legacy registration points when it
-installs the eight production descriptors and calls
+installs the five production descriptors and calls
 `registerMeshTaskTools(realFacade)`. Do not register the spike alongside the
 production tools: it owns an in-memory simulated task lifecycle and is retained
 only as isolated Phase 0 evidence under the spike-specific source and docs.

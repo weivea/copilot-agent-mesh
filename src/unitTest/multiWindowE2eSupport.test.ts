@@ -1,13 +1,20 @@
 import assert from 'node:assert/strict';
+import { access, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { test } from 'node:test';
 
 import {
 	multiWindowControlDirectory,
+	clearMultiWindowStartupDiagnostic,
+	multiWindowStartupDiagnosticPath,
 	multiWindowWorkspaceKey,
 	parseMultiWindowRequest,
+	parseMultiWindowStartupDiagnostic,
 	parseProcessTable,
+	readMultiWindowStartupDiagnostic,
 	selectOwnedProcesses,
+	writeMultiWindowStartupDiagnostic,
 } from '../e2e/MultiWindowE2eSupport';
 
 const nonce = '00000000-0000-4000-8000-000000000001';
@@ -62,6 +69,55 @@ test('multi-window controller accepts only the exact nonce and window envelope',
 			() => parseMultiWindowRequest(invalid, { nonce, workspaceKey, windowId }),
 			/Invalid multi-window E2E request envelope/u,
 		);
+	}
+});
+
+test('startup diagnostics persist only allowlisted path-free failure metadata', async () => {
+	const root = await mkdtemp(resolve(tmpdir(), 'mesh-window-startup-'));
+	const workspaceBasename = 'repo-a';
+	const workspaceKey = multiWindowWorkspaceKey(workspaceBasename);
+	const launchedAt = Date.now();
+	try {
+		await writeMultiWindowStartupDiagnostic({
+			controlRoot: root,
+			workspaceBasename,
+			windowId,
+			code: 'WORKSPACE_BUSY',
+		});
+		const path = multiWindowStartupDiagnosticPath(root, workspaceBasename, windowId);
+		const raw = await readFile(path, 'utf8');
+		assert.doesNotMatch(raw, /repo-a|\/tmp|Users|Workspace catalog/u);
+		const parsed = await readMultiWindowStartupDiagnostic(path, {
+			workspaceKey,
+			windowId,
+			launchedAt,
+		});
+		assert.deepEqual(parsed, {
+			schemaVersion: 1,
+			code: 'WORKSPACE_BUSY',
+			message: 'The Window Node workspace claim was rejected as busy.',
+			recordedAt: parsed.recordedAt,
+			workspaceKey,
+			windowId,
+		});
+		for (const invalid of [
+			{ ...JSON.parse(raw), code: 'UNSAFE_DETAIL' },
+			{ ...JSON.parse(raw), extra: '/private/path' },
+			{ ...JSON.parse(raw), recordedAt: '2020-01-01T00:00:00.000Z' },
+		]) {
+			assert.throws(
+				() => parseMultiWindowStartupDiagnostic(invalid, {
+					workspaceKey,
+					windowId,
+					launchedAt,
+				}),
+				/Invalid multi-window E2E startup diagnostic/u,
+			);
+		}
+		await clearMultiWindowStartupDiagnostic(root, workspaceBasename, windowId);
+		await assert.rejects(access(path), { code: 'ENOENT' });
+	} finally {
+		await rm(root, { recursive: true, force: true });
 	}
 });
 
