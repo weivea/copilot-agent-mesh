@@ -26,6 +26,7 @@ import {
 	resolve,
 	sep,
 } from 'node:path';
+import { finished } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -73,6 +74,7 @@ function revalidateEvidenceDestination(additionalFileNames = []) {
 		repositoryRoot,
 		configuredRoot: evidenceRoot,
 		additionalFileNames,
+		allowRepositoryNestedOverride: testMode,
 	});
 }
 
@@ -113,6 +115,7 @@ const releaseEvidenceRoot = join(repositoryRoot, 'artifacts', 'peer-delegation-e
 const evidenceDestination = await resolvePeerDelegationEvidenceDestination({
 	repositoryRoot,
 	configuredRoot: configuredEvidenceRoot,
+	allowRepositoryNestedOverride: testMode,
 });
 const evidenceRoot = evidenceDestination.root;
 const evidencePath = evidenceDestination.evidencePath;
@@ -851,7 +854,7 @@ async function launchAndDiscover(workspacePath) {
 	const launchedAt = Date.now();
 	const opener = [...activeControllers.values()][0];
 	if (opener === undefined) {
-		launchWindow(workspacePath);
+		await launchWindow(workspacePath);
 	} else {
 		await request(opener, 'window.open', { workspacePath }, 10_000);
 		windowOpenRecords.push({ workspacePath });
@@ -862,7 +865,7 @@ async function launchAndDiscover(workspacePath) {
 	return controller;
 }
 
-function launchWindow(workspacePath) {
+async function launchWindow(workspacePath) {
 	const args = [
 		workspacePath,
 		`--user-data-dir=${userDataDirectory}`,
@@ -880,6 +883,26 @@ function launchWindow(workspacePath) {
 	];
 	const logPath = join(logsDirectory, `${basename(workspacePath)}.log`);
 	const output = createWriteStream(logPath, { flags: 'wx', mode: 0o600 });
+	let outputFailure;
+	let record;
+	output.on('error', (error) => {
+		outputFailure ??= error;
+		if (record !== undefined) {
+			record.outputFailure ??= error;
+		}
+	});
+	try {
+		await new Promise((resolveOpen, rejectOpen) => {
+			output.once('open', resolveOpen);
+			output.once('error', rejectOpen);
+		});
+	} catch {
+		output.destroy();
+		throw Object.assign(
+			new Error('The peer-delegation E2E log could not be opened.'),
+			{ code: 'E2E_LOG_FAILED' },
+		);
+	}
 	const environment = { ...process.env };
 	for (const name of [
 		'MESH_TWO_DEVICE_E2E',
@@ -894,18 +917,19 @@ function launchWindow(workspacePath) {
 	environment[`${environmentPrefix}_NONCE`] = nonce;
 	environment[`${environmentPrefix}_BUDGET_MS`] = String(budgetMs);
 	environment[`${environmentPrefix}_NODE_EXECUTABLE`] = process.execPath;
-	const child = spawn(vscodeExecutablePath, args, {
-		env: environment,
-		shell: false,
-		stdio: ['ignore', 'pipe', 'pipe'],
-	});
-	if (child.pid === undefined) {
-		throw new Error('VS Code did not expose a child PID for the peer E2E.');
+	let child;
+	try {
+		child = spawn(vscodeExecutablePath, args, {
+			env: environment,
+			shell: false,
+			stdio: ['ignore', 'pipe', 'pipe'],
+		});
+	} catch (error) {
+		output.end();
+		await finished(output, { cleanup: true }).catch(() => undefined);
+		throw error;
 	}
-	startOwnershipSampler();
-	child.stdout.pipe(output, { end: false });
-	child.stderr.pipe(output, { end: false });
-	const record = { child, output, logPath, exit: undefined };
+	record = { child, output, logPath, exit: undefined, outputFailure };
 	child.once('error', (error) => {
 		record.exit = { error: error.message };
 	});
@@ -913,6 +937,12 @@ function launchWindow(workspacePath) {
 		record.exit = { code, signal };
 	});
 	launchRecords.push(record);
+	if (child.pid === undefined) {
+		throw new Error('VS Code did not expose a child PID for the peer E2E.');
+	}
+	startOwnershipSampler();
+	child.stdout.pipe(output, { end: false });
+	child.stderr.pipe(output, { end: false });
 	refreshOwnedProcesses();
 }
 
@@ -1939,15 +1969,25 @@ async function cleanupAfterSignal(signal) {
 }
 
 async function closeLogStreams() {
-	await Promise.all(launchRecords.map(({ child, output }) => new Promise((resolveOutput) => {
+	await Promise.all(launchRecords.map(async (record) => {
+		const { child, output } = record;
 		child.stdout?.unpipe(output);
 		child.stderr?.unpipe(output);
-		if (output.closed) {
-			resolveOutput();
-		} else {
-			output.end(resolveOutput);
+		if (!output.destroyed) {
+			output.end();
 		}
-	})));
+		try {
+			await finished(output, { cleanup: true });
+		} catch (error) {
+			record.outputFailure ??= error;
+		}
+	}));
+	const failures = launchRecords
+		.map(({ outputFailure }) => outputFailure)
+		.filter((failure) => failure !== undefined);
+	if (failures.length > 0) {
+		throw new AggregateError(failures, 'One or more peer-delegation E2E logs failed.');
+	}
 }
 
 async function saveSanitizedLogs() {

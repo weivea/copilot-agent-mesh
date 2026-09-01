@@ -8,6 +8,7 @@ import {
 	mkdtemp,
 	readFile,
 	readdir,
+	realpath,
 	rm,
 	stat,
 	symlink,
@@ -304,7 +305,7 @@ for (const aliasKind of ['symlink', 'hardlink'] as const) {
 		},
 		async () => {
 			await withStableArtifactSentinels(async () => {
-				const parent = resolve('.vscode-test', 'peer-process-ownership');
+				const parent = join(await realpath(tmpdir()), 'copilot-agent-mesh-peer-evidence');
 				await mkdir(parent, { recursive: true });
 				const root = await mkdtemp(join(parent, `wrapper-${aliasKind}-`));
 				const evidenceRoot = join(root, 'evidence');
@@ -347,8 +348,42 @@ for (const aliasKind of ['symlink', 'hardlink'] as const) {
 	);
 }
 
-test('release wrapper rejects a dirty tree before compile and preserves prior evidence', async () => {
+test('release wrapper rejects a nested repository override without deleting prior files', async () => {
 	const parent = resolve('.vscode-test', 'peer-process-ownership');
+	await mkdir(parent, { recursive: true });
+	const root = await mkdtemp(join(parent, 'nested-evidence-'));
+	const evidenceRoot = join(root, 'unrelated-repository-directory');
+	const runtimeRoot = join(root, 'runtime');
+	const profileRoot = join(root, 'profile');
+	const evidencePath = join(evidenceRoot, 'evidence.json');
+	const summaryPath = join(evidenceRoot, 'summary.md');
+	const evidenceBytes = Buffer.from('prior unrelated evidence\n', 'utf8');
+	const summaryBytes = Buffer.from('prior unrelated summary\n', 'utf8');
+	try {
+		await mkdir(evidenceRoot);
+		await writeFile(evidencePath, evidenceBytes);
+		await writeFile(summaryPath, summaryBytes);
+		const result = await runReleaseWrapper({
+			scriptPath: resolve('scripts/e2e/peer-delegation/run.mjs'),
+			repositoryRoot: resolve('.'),
+			evidenceRoot,
+			runtimeRoot,
+			profileRoot,
+		});
+		assert.notEqual(result.exitCode, 0);
+		assert.equal(result.stdout, '', 'The wrapper reached npm compile output.');
+		assert.match(result.stderr, /stable artifact directory or outside the repository/u);
+		assert.deepEqual(await readFile(evidencePath), evidenceBytes);
+		assert.deepEqual(await readFile(summaryPath), summaryBytes);
+		await assert.rejects(access(runtimeRoot), { code: 'ENOENT' });
+		await assert.rejects(access(profileRoot), { code: 'ENOENT' });
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test('release wrapper rejects a dirty tree before compile and preserves prior evidence', async () => {
+	const parent = join(await realpath(tmpdir()), 'copilot-agent-mesh-peer-evidence');
 	await mkdir(parent, { recursive: true });
 	const root = await mkdtemp(join(parent, 'wrapper-dirty-'));
 	const repositoryRoot = join(root, 'repository');
@@ -431,7 +466,7 @@ for (const fileName of ['evidence.json', 'summary.md'] as const) {
 		{ skip: process.platform === 'win32' ? 'POSIX link fixture.' : false },
 		async () => {
 			await withStableArtifactSentinels(async () => {
-				const parent = resolve('.vscode-test', 'peer-process-ownership');
+				const parent = join(await realpath(tmpdir()), 'copilot-agent-mesh-peer-evidence');
 				await mkdir(parent, { recursive: true });
 				const root = await mkdtemp(join(parent, `${aliasKind}-alias-`));
 				const evidenceRoot = join(root, 'evidence');
@@ -467,7 +502,7 @@ test(
 	{ skip: process.platform === 'win32' ? 'POSIX symlink fixture.' : false },
 	async () => {
 		await withStableArtifactSentinels(async () => {
-			const parent = resolve('.vscode-test', 'peer-process-ownership');
+			const parent = join(await realpath(tmpdir()), 'copilot-agent-mesh-peer-evidence');
 			await mkdir(parent, { recursive: true });
 			const root = await mkdtemp(join(parent, 'ancestor-alias-'));
 			const externalRoot = join(root, 'external');
@@ -499,7 +534,7 @@ test(
 	{ skip: process.platform === 'win32' ? 'POSIX symlink fixture.' : false },
 	async () => {
 		await withStableEvidencePreserved(async () => {
-			const parent = resolve('.vscode-test', 'peer-process-ownership');
+			const parent = join(await realpath(tmpdir()), 'copilot-agent-mesh-peer-evidence');
 			await mkdir(parent, { recursive: true });
 			const root = await mkdtemp(join(parent, 'root-alias-'));
 			const target = join(root, 'external-target');

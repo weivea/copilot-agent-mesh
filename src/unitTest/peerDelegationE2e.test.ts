@@ -367,6 +367,17 @@ test('0.4.0 release metadata keeps the real peer gate default-off and five-tool 
 	);
 	assert.match(brokerRuntime, /options\.storageRootUri,\s*'mesh-state'/u);
 	assert.match(harness, /readMultiWindowStartupDiagnostic/u);
+	const logStreamCreation = harness.indexOf('const output = createWriteStream');
+	const logStreamOpen = harness.indexOf("output.once('open'", logStreamCreation);
+	const windowSpawn = harness.indexOf('child = spawn', logStreamCreation);
+	assert.ok(
+		logStreamCreation >= 0
+			&& logStreamCreation < logStreamOpen
+			&& logStreamOpen < windowSpawn,
+		'The owned log stream must open before the VS Code process is spawned.',
+	);
+	assert.match(harness, /output\.on\('error'[\s\S]*record\.outputFailure/u);
+	assert.match(harness, /async function closeLogStreams[\s\S]*await finished\(output[\s\S]*throw new AggregateError/u);
 	assert.match(validator, /evidence\.gitCommit !== head/u);
 	assert.match(validator, /status\.length !== 0/u);
 });

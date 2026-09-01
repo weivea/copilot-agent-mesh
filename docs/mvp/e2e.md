@@ -122,6 +122,10 @@ normalized to `not-observed` rather than copied into terminal-only fields.
 Verbose task journals are projected to at most 256 actual event observations;
 `eventJournalTruncated` is explicit, milestone types retain their original
 monotonic sequence numbers, and no synthetic events or renumbering is allowed.
+The release command writes only to the stable artifact directory or an explicit
+absolute directory outside the repository. A nested repository override is
+rejected before compile or deletion, and log streams must open before a window
+is spawned; later log failures are retained as cleanup failures.
 
 `MESH_PEER_DELEGATION_E2E_TEST_MODE` is internal to subprocess tests. It cannot be
 used through `npm run test:peer-delegation-real`, requires an isolated evidence

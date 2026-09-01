@@ -528,7 +528,46 @@ test('source selector reports standalone failure explicitly and does not fallbac
 	assert.equal(probe.source, 'editor');
 	assert.equal(probe.available, false);
 	assert.equal(probe.reason, 'AGENT_AUTH_REQUIRED');
+	assert.equal(probe.canStart, true);
+	editor.startError = undefined;
+	await selector.start(taskRequest());
+	assert.equal(editor.starts, 3);
+	assert.equal(standalone.starts, 1);
 	await selector.dispose();
+	await selector.dispose();
+});
+
+test('source selector preserves the Agent Host feature gate before probing or confirmation', async () => {
+	const editor = new FakeRuntime();
+	const standalone = new FakeRuntime();
+	let confirmations = 0;
+	const selector = new AgentHostSourceSelector({
+		...selectorOptions({
+			preferEditor: () => true,
+			editor,
+			standalone,
+		}),
+		enabled: () => false,
+		confirmation: {
+			confirm: async () => {
+				confirmations += 1;
+				return 'once';
+			},
+		},
+	});
+
+	assert.deepEqual(await selector.probe(), {
+		available: false,
+		featureEnabled: false,
+		reason: 'AGENT_UNAVAILABLE',
+		source: 'editor',
+	});
+	assert.throws(() => selector.start(taskRequest()), { code: 'AGENT_UNAVAILABLE' });
+	assert.equal(editor.probes, 0);
+	assert.equal(standalone.probes, 0);
+	assert.equal(editor.starts, 0);
+	assert.equal(standalone.starts, 0);
+	assert.equal(confirmations, 0);
 	await selector.dispose();
 });
 

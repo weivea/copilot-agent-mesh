@@ -252,6 +252,7 @@ export function createVscodeAgentRuntime(
 		connections: new SdkAhpConnectionFactory(),
 	});
 	const runtime = new AgentHostSourceSelector({
+		enabled: common.enabled,
 		preferEditor: () => vscodeApi.workspace
 			.getConfiguration(configurationSection)
 			.get<boolean>('experimental.peerDelegation', false),

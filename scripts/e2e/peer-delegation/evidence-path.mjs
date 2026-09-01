@@ -27,12 +27,6 @@ export async function resolvePeerDelegationEvidenceDestination(options) {
 	}
 	if (
 		configuredRoot !== undefined
-		&& (root === repositoryRoot || isWithin(root, repositoryRoot))
-	) {
-		throw new Error('The peer-delegation evidence directory must not contain the repository.');
-	}
-	if (
-		configuredRoot !== undefined
 		&& root !== defaultRoot
 		&& (
 			filesystemPathKey(root) === filesystemPathKey(defaultRoot)
@@ -40,6 +34,20 @@ export async function resolvePeerDelegationEvidenceDestination(options) {
 		)
 	) {
 		throw new Error('The peer-delegation evidence directory aliases the stable release directory.');
+	}
+	if (
+		configuredRoot !== undefined
+		&& root !== defaultRoot
+		&& options.allowRepositoryNestedOverride !== true
+		&& (
+			root === repositoryRoot
+			|| isWithin(repositoryRoot, root)
+			|| isWithin(root, repositoryRoot)
+		)
+	) {
+		throw new Error(
+			'The peer-delegation evidence directory override must be the stable artifact directory or outside the repository.',
+		);
 	}
 	await assertPathComponentsHaveNoSymlink(root);
 	await assertSafeExistingFiles(

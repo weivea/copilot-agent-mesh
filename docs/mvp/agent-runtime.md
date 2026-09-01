@@ -143,7 +143,10 @@ VS Code session lookup and sends no root `authenticate` action. If
 `resolveSessionConfig`, `createSession`, a tool, recovery, or a token-invalid
 notification produces a real authentication challenge, the editor path fails
 `AGENT_AUTH_REQUIRED` with a safe instruction to authenticate in that editor
-profile. It never overrides or restarts editor credentials.
+profile. It never overrides or restarts editor credentials. The failed source
+stays visibly unhealthy, but a later task may retry after the user fixes
+authentication or configuration; the stale probe result does not permanently
+disable the editor runtime.
 
 The standalone-only `VscodeAuthBroker` is silent-first. A modal `createIfNone`
 request is allowed only when the invocation explicitly permits interactive

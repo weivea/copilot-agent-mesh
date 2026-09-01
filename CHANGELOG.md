@@ -66,6 +66,8 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
   Lock/idle conflicts leave foreign profile users alive and perform zero
   termination attempts. Verbose real task journals retain actual milestone
   sequence IDs in a bounded projection with explicit truncation evidence.
+  Release evidence overrides cannot target unrelated repository directories,
+  and asynchronous log failures remain inside the owned cleanup path.
 - Made internal E2E fixture mode permanently ineligible for release evidence:
   it requires an isolated artifact directory, records actual process platform
   plus `testMode: true` in a separately typed test diagnostic, and is rejected

@@ -29,6 +29,7 @@ const borrowedEditorEndpoint = new URL('ws://editor-agent-host.invalid/');
 const defaultEditorConnectionRetryDelaysMs = [90_000] as const;
 
 export interface AgentHostSourceSelectorOptions {
+	readonly enabled?: () => boolean;
 	readonly preferEditor: () => boolean;
 	readonly editor: AgentRuntime;
 	readonly standalone: AgentRuntime;
@@ -77,6 +78,14 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 
 	public async probe(): Promise<AgentRuntimeProbe> {
 		this.assertActive();
+		if (this.options.enabled?.() === false) {
+			return {
+				available: false,
+				featureEnabled: false,
+				reason: 'AGENT_UNAVAILABLE',
+				source: this.options.preferEditor() ? 'editor' : 'standalone',
+			};
+		}
 		if (!this.options.preferEditor()) {
 			const probe = await this.options.standalone.probe();
 			this.sourceSelected = true;
@@ -99,7 +108,12 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 					featureEnabled: true,
 					...(this.status.failure === undefined
 						? {}
-						: { reason: this.status.failure.code }),
+						: {
+							reason: this.status.failure.code,
+							...(isRemediableEditorFailure(this.status.failure.code)
+								? { canStart: true }
+								: {}),
+						}),
 				}
 				: await this.options.standalone.probe();
 			return probeWithStatus(selected, this.status);
@@ -117,6 +131,12 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 
 	public start(request: AgentTaskRequest): Promise<AgentTaskHandle> {
 		this.assertActive();
+		if (this.options.enabled?.() === false) {
+			throw new AgentRuntimeError(
+				'AGENT_UNAVAILABLE',
+				'The experimental Agent Host runtime is disabled.',
+			);
+		}
 		const controller = new AbortController();
 		let tracked!: {
 			readonly controller: AbortController;
@@ -544,6 +564,13 @@ function probeWithStatus(
 			}
 			: undefined,
 	};
+}
+
+function isRemediableEditorFailure(code: AgentRuntimeError['code']): boolean {
+	return code === 'AGENT_AUTH_REQUIRED'
+		|| code === 'AGENT_AUTH_FAILED'
+		|| code === 'AGENT_CONFIG_REQUIRED'
+		|| code === 'TASK_EXECUTION_FAILED';
 }
 
 function throwIfSelectorAborted(signal: AbortSignal): void {
