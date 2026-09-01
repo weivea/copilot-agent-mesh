@@ -422,7 +422,10 @@ async function editorSessionCatalog(
 				: { proxyRoot: options.editorProxyRoot }),
 			...(options.editorProxyNodeExecutable === undefined
 				? {}
-				: { proxyNodeExecutable: options.editorProxyNodeExecutable }),
+				: {
+					proxyNodeExecutable: options.editorProxyNodeExecutable,
+					connectionMode: 'proxyOnly',
+				}),
 		}),
 	);
 	let host: LaunchedAgentHost | undefined;

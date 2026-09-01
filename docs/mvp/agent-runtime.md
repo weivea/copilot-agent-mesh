@@ -47,7 +47,9 @@ while its command line carries the owning storage-root marker. Close, cancellati
 parent IPC loss, and startup failure terminate the exact child and remove only
 that exact directory. The real P8 harness supplies its already-running absolute
 Node executable only after E2E capability validation; the extension does not
-search `PATH` or download a runtime.
+search `PATH` or download a runtime. That validated E2E path uses proxy-only
+connection so a known-refused Code Helper attempt cannot immediately poison the
+helper attempt; ordinary production remains direct-first.
 Before any task selects a source, Dashboard probes are passive and report editor
 health as unavailable/pending with an internal `canStart` capability rather than
 executing `code agent endpoints`. The task executor may attempt such a source,

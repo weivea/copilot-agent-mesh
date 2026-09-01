@@ -243,7 +243,10 @@ export function createVscodeAgentRuntime(
 					?? vscodeApi.Uri.joinPath(context.globalStorageUri, 'editor-proxy').fsPath,
 				...(editorProxyNodeExecutable === undefined
 					? {}
-					: { proxyNodeExecutable: editorProxyNodeExecutable }),
+					: {
+						proxyNodeExecutable: editorProxyNodeExecutable,
+						connectionMode: 'proxyOnly',
+					}),
 			}),
 		),
 		connections: new SdkAhpConnectionFactory(),
