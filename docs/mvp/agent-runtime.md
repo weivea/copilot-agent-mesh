@@ -55,6 +55,10 @@ but Dashboard does not report it healthy. The actual task start performs the
 first fresh locate/connect. This prevents UI refreshes from perturbing the
 registry or rotating a connection token before WebSocket upgrade. Only after a
 successful start is editor reported healthy.
+The real two-window P8 harness additionally leaves an 80-second quiet interval
+before its first editor connection so the shared Host can publish and bind its
+listener without any diagnostic connection attempts. This delay is E2E-only;
+ordinary production tasks do not inherit it.
 Fallback is forbidden when cleanup of the failed editor attempt is unconfirmed;
 starting standalone in that state could overlap resources or execution. Selector
 disposal retains failed cleanup for an explicit retry.

@@ -285,6 +285,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 						? undefined
 						: join(peerDelegationRun.controlRoot, 'editor-proxy'),
 					peerDelegationRun?.nodeExecutable,
+					peerDelegationRun === undefined ? 0 : 80_000,
 				);
 				sourceStatusSubscription = runtime.onDidSourceStatusChange(() => changeEvents.fire());
 				return new WindowNodeTaskExecutor({

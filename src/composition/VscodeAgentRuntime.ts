@@ -203,6 +203,7 @@ export function createVscodeAgentRuntime(
 	standaloneStorageRoot?: string,
 	editorProxyRoot?: string,
 	editorProxyNodeExecutable?: string,
+	editorInitialReadinessDelayMs = 0,
 ): AgentRuntime & AgentHostSourceStatusProvider {
 	const configuration = vscodeApi.workspace.getConfiguration(configurationSection);
 	const launcher = new AgentHostLauncher({
@@ -256,6 +257,7 @@ export function createVscodeAgentRuntime(
 		confirmation: approval,
 		workspaceResolver,
 		approvalCapabilities,
+		editorInitialReadinessDelayMs,
 	});
 	return new GuardedAgentRuntime(runtime, guard, workerPlatform);
 }

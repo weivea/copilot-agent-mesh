@@ -36,6 +36,7 @@ export interface AgentHostSourceSelectorOptions {
 	readonly workspaceResolver: WorkspaceResolver;
 	readonly approvalCapabilities: AgentRuntimeApprovalCapabilityIssuer;
 	readonly editorConnectionRetryDelaysMs?: readonly number[];
+	readonly editorInitialReadinessDelayMs?: number;
 	readonly waitForEditorRetry?: (delayMs: number, signal: AbortSignal) => Promise<void>;
 }
 
@@ -50,12 +51,18 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 	private disposed = false;
 	private disposal: Promise<void> | undefined;
 	private readonly editorConnectionRetryDelaysMs: readonly number[];
+	private readonly editorInitialReadinessDelayMs: number;
 	private readonly waitForEditorRetry: (delayMs: number, signal: AbortSignal) => Promise<void>;
 
 	public constructor(private readonly options: AgentHostSourceSelectorOptions) {
 		this.editorConnectionRetryDelaysMs = options.editorConnectionRetryDelaysMs
 			?? defaultEditorConnectionRetryDelaysMs;
+		this.editorInitialReadinessDelayMs = options.editorInitialReadinessDelayMs ?? 0;
 		if (
+			!Number.isSafeInteger(this.editorInitialReadinessDelayMs)
+			|| this.editorInitialReadinessDelayMs < 0
+			|| this.editorInitialReadinessDelayMs > 120_000
+			||
 			this.editorConnectionRetryDelaysMs.length > 2
 			|| this.editorConnectionRetryDelaysMs.some(
 				(delayMs) => !Number.isSafeInteger(delayMs) || delayMs < 0 || delayMs > 120_000,
@@ -145,6 +152,9 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 		}
 
 		let editorFailure: AgentHostSourceFailure | undefined;
+		if (this.editorInitialReadinessDelayMs > 0) {
+			await this.waitForEditorRetry(this.editorInitialReadinessDelayMs, signal);
+		}
 		for (let attempt = 0; attempt <= this.editorConnectionRetryDelaysMs.length; attempt += 1) {
 			try {
 				const handle = await this.options.editor.start(request);
