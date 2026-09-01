@@ -14,6 +14,8 @@ import {
 	BrokerTaskService,
 	DeviceBroker,
 	NodeRegistry,
+	PeerPolicyService,
+	PeerPolicyStore,
 	TaskRouteCatalog,
 	type BrokerRuntime,
 	type NodeTaskBinding,
@@ -72,6 +74,7 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 	public readonly profile: DeviceProfile;
 	public readonly leases: WorkspaceLeaseManager;
 	public readonly registry: NodeRegistry;
+	public readonly peerPolicies: PeerPolicyService;
 	public readonly tasks: FileTaskStore;
 	public readonly artifacts: ArtifactStore;
 	public readonly brokerTasks: BrokerTaskService;
@@ -101,6 +104,7 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 			readonly profile: DeviceProfile;
 			readonly leases: WorkspaceLeaseManager;
 			readonly registry: NodeRegistry;
+			readonly peerPolicies: PeerPolicyService;
 			readonly tasks: FileTaskStore;
 			readonly artifacts: ArtifactStore;
 			readonly brokerTasks: BrokerTaskService;
@@ -117,6 +121,7 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 		this.profile = components.profile;
 		this.leases = components.leases;
 		this.registry = components.registry;
+		this.peerPolicies = components.peerPolicies;
 		this.tasks = components.tasks;
 		this.artifacts = components.artifacts;
 		this.brokerTasks = components.brokerTasks;
@@ -189,6 +194,12 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 			ownership: options.ownership,
 			generation: options.generation,
 		});
+		const peerPolicyStore = new PeerPolicyStore(files, {
+			ownership: options.ownership,
+			generation: options.generation,
+			clock: systemClock,
+		});
+		await peerPolicyStore.initialize();
 		let brokerTasks: BrokerTaskService | undefined;
 		const registry = new NodeRegistry({
 			deviceId: profile.deviceId,
@@ -206,6 +217,13 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 				});
 			},
 		});
+		const peerPolicies = new PeerPolicyService(peerPolicyStore, registry, {
+			enabled: () => options.vscodeApi.workspace
+				.getConfiguration('copilotAgentMesh')
+				.get<boolean>('experimental.peerDelegation', false),
+			onDidChange: options.onDidChange,
+		});
+		registry.setPeerRouteAuthorizer(peerPolicies);
 		const taskRoutes = new TaskRouteCatalog(fencedState);
 		let listener: ListenerService | undefined;
 		brokerTasks = new BrokerTaskService(
@@ -263,6 +281,7 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 			brokerKey,
 			ownership: options.ownership,
 			registry,
+			peerPolicies,
 			taskService: brokerTasks,
 			remoteTaskService: remoteTasks,
 			taskRoutes,
@@ -304,6 +323,7 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 			profile,
 			leases,
 			registry,
+			peerPolicies,
 			tasks,
 			artifacts,
 			brokerTasks,

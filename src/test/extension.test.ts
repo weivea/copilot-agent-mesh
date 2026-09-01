@@ -82,6 +82,7 @@ suite('Copilot Agent Mesh', () => {
 		const properties = manifest.contributes.configuration.properties as Record<string, { default?: unknown }>;
 
 		assert.strictEqual(properties['copilotAgentMesh.experimental.agentHost']?.default, false);
+		assert.strictEqual(properties['copilotAgentMesh.experimental.peerDelegation']?.default, false);
 		assert.strictEqual(properties['copilotAgentMesh.experimental.sameDeviceCollaboration'], undefined);
 	});
 
@@ -102,11 +103,15 @@ suite('Copilot Agent Mesh', () => {
 		assert.strictEqual(api.nodeState().registered, true);
 		assert.strictEqual(api.brokerState().state, 'running');
 		assert.strictEqual(api.brokerState().owner, true);
-		const directory = await api.node.listNodes();
-		assert.ok(directory.nodes.some((node) =>
+		assert.deepEqual((await api.node.listNodes()).nodes, []);
+		const dashboard = await api.node.listDashboardNodes();
+		const thisWindow = dashboard.nodes.find((node) =>
 			node.nodeId === api.nodeId
 			&& node.nodeInstanceId === api.nodeInstanceId,
-		));
+		);
+		assert.ok(thisWindow);
+		assert.strictEqual(thisWindow.workspaces.length, api.nodeState().workspaceCount);
+		assert.ok(!JSON.stringify(dashboard).includes('sha256:'));
 	});
 
 	test('defines the initial gateway protocol surface', () => {

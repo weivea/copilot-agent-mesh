@@ -136,14 +136,20 @@ export class BrokerTaskService {
 	}
 
 	public startLocal(
-		sourceNodeId: string,
+		sourceNode: { readonly nodeId: string; readonly nodeInstanceId: string },
 		input: RoutedTaskStartParams,
 		outcome?: BrokerTaskStartOutcome,
 	): Promise<TaskSnapshot> {
 		this.assertActive();
-		const { source, params } = this.localStartParams(sourceNodeId, input);
+		const { source, params } = this.localStartParams(sourceNode.nodeId, input);
 		const sourceLabel = this.registry.lookupNodeLabel(source) ?? source;
-		return this.trackOperation(this.start(this.deviceId, params, sourceLabel, outcome));
+		return this.trackOperation(this.start(
+			this.deviceId,
+			params,
+			sourceLabel,
+			outcome,
+			sourceNode,
+		));
 	}
 
 	public prevalidateRemote(
@@ -159,13 +165,16 @@ export class BrokerTaskService {
 	}
 
 	public prevalidateLocal(
-		sourceNodeId: string,
+		sourceNode: { readonly nodeId: string; readonly nodeInstanceId: string },
 		input: RoutedTaskStartParams,
 	): Promise<void> {
 		this.assertActive();
-		const { params } = this.localStartParams(sourceNodeId, input);
+		const { params } = this.localStartParams(sourceNode.nodeId, input);
 		return this.trackOperation(this.serializeStart(() =>
-			this.enqueueTask(params.taskId, () => this.prevalidateStart(this.deviceId, params)),
+			this.enqueueTask(
+				params.taskId,
+				() => this.prevalidateStart(this.deviceId, params, sourceNode),
+			),
 		));
 	}
 
@@ -357,10 +366,11 @@ export class BrokerTaskService {
 		params: RoutedTaskStartParams,
 		sourceLabel?: string,
 		outcome?: BrokerTaskStartOutcome,
+		sourceNode?: { readonly nodeId: string; readonly nodeInstanceId: string },
 	): Promise<TaskSnapshot> {
 		this.assertTargetDevice(params);
 		const prepared = await this.serializeStart(() =>
-			this.enqueueTask(params.taskId, () => this.prepareStart(ownerId, params)),
+			this.enqueueTask(params.taskId, () => this.prepareStart(ownerId, params, sourceNode)),
 		);
 		if (!('route' in prepared)) {
 			return prepared;
@@ -378,6 +388,7 @@ export class BrokerTaskService {
 	private async prepareStart(
 		ownerId: string,
 		params: RoutedTaskStartParams,
+		sourceNode?: { readonly nodeId: string; readonly nodeInstanceId: string },
 	): Promise<PreparedStart | TaskSnapshot> {
 		this.assertActive();
 		const records = await this.store.list();
@@ -395,6 +406,10 @@ export class BrokerTaskService {
 			nodeId: params.target.nodeId,
 			nodeInstanceId: params.target.nodeInstanceId,
 			workspaceId: params.target.workspaceId,
+			...(sourceNode === undefined ? {} : {
+				sourceNodeId: sourceNode.nodeId,
+				sourceNodeInstanceId: sourceNode.nodeInstanceId,
+			}),
 		});
 		const resolved: ResolvedTaskRoute = {
 			...params.target,
@@ -580,6 +595,7 @@ export class BrokerTaskService {
 	private async prevalidateStart(
 		ownerId: string,
 		params: RoutedTaskStartParams,
+		sourceNode?: { readonly nodeId: string; readonly nodeInstanceId: string },
 	): Promise<void> {
 		this.assertTargetDevice(params);
 		const records = await this.store.list();
@@ -593,6 +609,10 @@ export class BrokerTaskService {
 			nodeId: params.target.nodeId,
 			nodeInstanceId: params.target.nodeInstanceId,
 			workspaceId: params.target.workspaceId,
+			...(sourceNode === undefined ? {} : {
+				sourceNodeId: sourceNode.nodeId,
+				sourceNodeInstanceId: sourceNode.nodeInstanceId,
+			}),
 		});
 	}
 

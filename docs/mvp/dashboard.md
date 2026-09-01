@@ -3,6 +3,21 @@
 The dashboard is a secure presentation and command surface. It does not own device,
 listener, tunnel, workspace, peer, or task state.
 
+The P2 peer-policy boundary deliberately does not add a Dashboard panel. The
+Broker nevertheless exposes a separate typed configuration projection for
+future peer controls. Unlike Tool-facing `node.list`, it includes every known
+same-device candidate, but only as bounded safe display labels, workspace
+display names, online/accept/busy/gate state, and short opaque IDs. It never
+contains absolute paths, full workspace identities, credentials, prompts, or
+outputs. Candidate display strings reuse the Dashboard path/secret guard.
+
+The existing Dashboard reads `node.dashboard.list`, not Tool-facing
+`node.list`. This safe unfiltered projection preserves this-window identity,
+Workspace claim/conflict and busy state, active task naming, and
+directory-truncation warnings even while peer delegation is disabled or no
+target passes the authorization gate. Full workspace identities are removed at
+the Broker boundary.
+
 ## Facade contract
 
 `src/ui/DashboardFacade.ts` exports `DashboardFacade`, `DashboardSnapshot`,

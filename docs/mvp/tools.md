@@ -10,7 +10,7 @@ state.
 
 | Tool | Behavior | Application deadline |
 | --- | --- | ---: |
-| `mesh_list_workers` | Returns bounded peer capability and opaque workspace metadata. | 5 s |
+| `mesh_list_workers` | Returns bounded peer capability and opaque workspace metadata; same-device Window Nodes are visible only after the directional double authorization gate. | 5 s |
 | `mesh_delegate_task` | Persists an intent, waits for durable broker acceptance, then returns `pending` before Agent startup completes. | 15 s |
 | `mesh_get_task` | Returns a bounded snapshot, event cursor, event-gap indicator, and truncation indicator. | 10 s |
 | `mesh_cancel_task` | Requests cancellation through the owner-scoped Facade method. | 10 s |
@@ -19,6 +19,23 @@ state.
 `prepareInvocation` is pure. Delegate confirmation displays only peer ID,
 opaque workspace ID, and title summary. It never persists an intent or contacts
 a worker.
+
+Same-device peer delegation is default-off behind
+`copilotAgentMesh.experimental.peerDelegation`. When enabled, a local target is
+listed only when its sole workspace is online and claimed, its
+`acceptsIncoming` policy is on, and every claimed source workspace allowlists
+the target's stable `workspaceIdentity`. Labels and workspace display names do
+not participate in authorization or routing. `node.task.start` repeats the same
+checks immediately before route lease acquisition. Direct starts distinguish
+`PEER_NOT_ALLOWED`, `PEER_NOT_ACCEPTING`, `PEER_OFFLINE`, and
+`PEER_MULTI_WORKSPACE`; the filtered list never reveals which failed gate hid a
+candidate.
+
+Policy configuration uses a separate authenticated RPC surface. A multi-root
+window may pass one of its own claimed `workspaceIdentity` values to
+`node.policy.get` to read and update each policy independently; the Broker
+rejects foreign identities. This selector never changes Tool source
+authorization, which remains derived from the registered Window Node.
 
 All inputs are checked again at runtime with exact object properties and UTF-8
 byte limits. Facade output is parsed through a strict allowlist before it can

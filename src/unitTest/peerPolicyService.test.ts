@@ -1,0 +1,538 @@
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+
+import {
+	NodeRegistry,
+	PeerPolicyService,
+	PeerPolicyStore,
+	type RegistryScheduler,
+} from '../broker';
+import { MeshDomainError } from '../domain/errors';
+import type { StateStore } from '../domain/ports';
+import type { LocalIpcSession } from '../ipc';
+import { AtomicFileStore } from '../storage/AtomicFileStore';
+import { WorkspaceLeaseManager } from '../tasks/WorkspaceLeaseManager';
+import { createOpaqueWorkspaceIdentity } from '../workspaces/OpaqueWorkspaceIdentity';
+import {
+	MemoryAtomicFileSystem,
+	TestOwnership,
+	uuid,
+} from './artifactStoreTestSupport';
+
+const DEVICE = uuid(1);
+const NODE_A = uuid(2);
+const NODE_B = uuid(3);
+const NODE_C = uuid(4);
+const INSTANCE_A = uuid(5);
+const INSTANCE_B = uuid(6);
+const INSTANCE_B2 = uuid(7);
+const INSTANCE_C = uuid(8);
+const WORKSPACE_A = uuid(9);
+const WORKSPACE_B = uuid(10);
+const WORKSPACE_C = uuid(11);
+const TASK = uuid(12);
+const NOW = new Date('2026-08-30T11:00:00.000Z');
+const IDENTITY_A = createOpaqueWorkspaceIdentity('workspace-a');
+const IDENTITY_B = createOpaqueWorkspaceIdentity('workspace-b');
+const IDENTITY_C = createOpaqueWorkspaceIdentity('workspace-c');
+
+test('applies all four directional allowlist and accepting gate combinations', async (t) => {
+	const fixture = await createFixture();
+	t.after(() => fixture.registry.dispose());
+
+	for (const combination of [
+		{ allow: false, accept: false, visible: false, error: 'PEER_NOT_ALLOWED' },
+		{ allow: false, accept: true, visible: false, error: 'PEER_NOT_ALLOWED' },
+		{ allow: true, accept: false, visible: false, error: 'PEER_NOT_ACCEPTING' },
+		{ allow: true, accept: true, visible: true, error: undefined },
+	] as const) {
+		await setGate(fixture, combination.allow, combination.accept);
+		const listed = fixture.service.listAuthorized(identityParams(NODE_A, INSTANCE_A));
+		assert.equal(listed.nodes.some(({ nodeId }) => nodeId === NODE_B), combination.visible);
+		if (combination.error === undefined) {
+			await fixture.registry.validateTaskRoute(route());
+		} else {
+			await assert.rejects(
+				fixture.registry.validateTaskRoute(route()),
+				hasReason(combination.error),
+			);
+		}
+	}
+
+	assert.equal(
+		fixture.service.listAuthorized(identityParams(NODE_B, INSTANCE_B))
+			.nodes.some(({ nodeId }) => nodeId === NODE_A),
+		false,
+	);
+});
+
+test('defaults ambiguous multi-workspace sources to all-workspaces authorization', async (t) => {
+	const fixture = await createFixture();
+	t.after(() => fixture.registry.dispose());
+	await fixture.registry.claimWorkspace(claim(
+		NODE_A,
+		INSTANCE_A,
+		WORKSPACE_C,
+		IDENTITY_C,
+		'Repository C',
+	));
+	await setGate(fixture, true, true);
+
+	assert.equal(fixture.service.listAuthorized(identityParams(NODE_A, INSTANCE_A)).nodes.length, 0);
+	await assert.rejects(fixture.registry.validateTaskRoute(route()), hasReason('PEER_NOT_ALLOWED'));
+
+	await fixture.service.setPolicy(identityParams(NODE_A, INSTANCE_A), {
+		...identityParams(NODE_A, INSTANCE_A),
+		workspaceIdentity: IDENTITY_C,
+		allowlist: [IDENTITY_B],
+	});
+	assert.equal(
+		fixture.service.listAuthorized(identityParams(NODE_A, INSTANCE_A)).nodes[0]?.nodeId,
+		NODE_B,
+	);
+	await fixture.registry.validateTaskRoute(route());
+});
+
+test('reads each owned multi-root policy explicitly and rejects foreign identities', async (t) => {
+	const fixture = await createFixture();
+	t.after(() => fixture.registry.dispose());
+	await fixture.registry.claimWorkspace(claim(
+		NODE_A,
+		INSTANCE_A,
+		WORKSPACE_C,
+		IDENTITY_C,
+		'Repository C',
+	));
+	await fixture.service.setPolicy(identityParams(NODE_A, INSTANCE_A), {
+		...identityParams(NODE_A, INSTANCE_A),
+		workspaceIdentity: IDENTITY_C,
+		allowlist: [IDENTITY_B],
+	});
+
+	assert.deepEqual(fixture.service.getPolicy({
+		...identityParams(NODE_A, INSTANCE_A),
+		workspaceIdentity: IDENTITY_C,
+	}).allowlist, [IDENTITY_B]);
+	assert.throws(
+		() => fixture.service.getPolicy({
+			...identityParams(NODE_A, INSTANCE_A),
+			workspaceIdentity: IDENTITY_B,
+		}),
+		hasReason('POLICY_FORBIDDEN'),
+	);
+	assert.throws(
+		() => fixture.service.getPolicy(identityParams(NODE_A, INSTANCE_A)),
+		hasReason('POLICY_FORBIDDEN'),
+	);
+});
+
+test('serializes same-identity partial patches without restoring revoked gates', async (t) => {
+	const fixture = await createFixture();
+	t.after(() => fixture.registry.dispose());
+	await setGate(fixture, true, true);
+
+	await Promise.all([
+		fixture.service.setPolicy(identityParams(NODE_A, INSTANCE_A), {
+			...identityParams(NODE_A, INSTANCE_A),
+			workspaceIdentity: IDENTITY_A,
+			allowlist: [],
+		}),
+		fixture.service.setPolicy(identityParams(NODE_A, INSTANCE_A), {
+			...identityParams(NODE_A, INSTANCE_A),
+			workspaceIdentity: IDENTITY_A,
+			windowName: 'renamed-source',
+		}),
+		fixture.service.setPolicy(identityParams(NODE_B, INSTANCE_B), {
+			...identityParams(NODE_B, INSTANCE_B),
+			workspaceIdentity: IDENTITY_B,
+			acceptsIncoming: false,
+		}),
+		fixture.service.setPolicy(identityParams(NODE_B, INSTANCE_B), {
+			...identityParams(NODE_B, INSTANCE_B),
+			workspaceIdentity: IDENTITY_B,
+			windowName: 'renamed-target',
+		}),
+	]);
+
+	const source = fixture.service.getPolicy(identityParams(NODE_A, INSTANCE_A));
+	const target = fixture.service.getPolicy(identityParams(NODE_B, INSTANCE_B));
+	assert.equal(source.windowName, 'renamed-source');
+	assert.deepEqual(source.allowlist, []);
+	assert.equal(target.windowName, 'renamed-target');
+	assert.equal(target.acceptsIncoming, false);
+	assert.equal(fixture.service.listAuthorized(identityParams(NODE_A, INSTANCE_A)).nodes.length, 0);
+});
+
+test('only lets a registered caller mutate its own claimed workspace policy', async (t) => {
+	const fixture = await createFixture();
+	t.after(() => fixture.registry.dispose());
+
+	await assert.rejects(
+		fixture.service.setPolicy(identityParams(NODE_A, INSTANCE_A), {
+			...identityParams(NODE_A, INSTANCE_A),
+			workspaceIdentity: IDENTITY_B,
+			acceptsIncoming: true,
+		}),
+		hasReason('POLICY_FORBIDDEN'),
+	);
+	await assert.rejects(
+		fixture.service.setPolicy(identityParams(NODE_A, INSTANCE_A), {
+			...identityParams(NODE_A, INSTANCE_A),
+			workspaceIdentity: IDENTITY_A,
+			allowlist: [IDENTITY_A],
+		}),
+		hasReason('POLICY_FORBIDDEN'),
+	);
+});
+
+test('retains offline allowlist identities and rebinds them to a new exact node instance', async (t) => {
+	const fixture = await createFixture();
+	t.after(() => fixture.registry.dispose());
+	await setGate(fixture, true, true);
+
+	fixture.registry.unregister(identityParams(NODE_B, INSTANCE_B));
+	assert.deepEqual(fixture.service.getPolicy(identityParams(NODE_A, INSTANCE_A)).allowlist, [
+		IDENTITY_B,
+	]);
+	assert.equal(fixture.service.listAuthorized(identityParams(NODE_A, INSTANCE_A)).nodes.length, 0);
+	await assert.rejects(fixture.registry.validateTaskRoute(route()), hasReason('PEER_OFFLINE'));
+
+	fixture.registry.register(registration(NODE_B, INSTANCE_B2, 'Window B'), new FakeSession().route());
+	await fixture.registry.claimWorkspace(claim(
+		NODE_B,
+		INSTANCE_B2,
+		WORKSPACE_B,
+		IDENTITY_B,
+		'Repository B',
+	));
+	assert.equal(
+		fixture.service.listAuthorized(identityParams(NODE_A, INSTANCE_A)).nodes[0]?.nodeInstanceId,
+		INSTANCE_B2,
+	);
+});
+
+test('distinguishes offline, non-claimed, and multi-workspace targets', async (t) => {
+	const fixture = await createFixture();
+	t.after(() => fixture.registry.dispose());
+	await setGate(fixture, true, true);
+
+	fixture.registry.unregister(identityParams(NODE_B, INSTANCE_B));
+	await assert.rejects(fixture.registry.validateTaskRoute(route()), hasReason('PEER_OFFLINE'));
+
+	fixture.registry.register(registration(NODE_B, INSTANCE_B2, 'Window B'), new FakeSession().route());
+	fixture.registry.register(registration(NODE_C, INSTANCE_C, 'Window C'), new FakeSession().route());
+	await fixture.registry.claimWorkspace(claim(
+		NODE_C,
+		INSTANCE_C,
+		WORKSPACE_B,
+		IDENTITY_B,
+		'Repository B',
+	));
+	await fixture.registry.claimWorkspace(claim(
+		NODE_B,
+		INSTANCE_B2,
+		WORKSPACE_B,
+		IDENTITY_B,
+		'Repository B',
+	));
+	await assert.rejects(
+		fixture.registry.validateTaskRoute(route(INSTANCE_B2)),
+		hasReason('PEER_OFFLINE'),
+	);
+
+	fixture.registry.unregister(identityParams(NODE_C, INSTANCE_C));
+	await fixture.registry.claimWorkspace(claim(
+		NODE_B,
+		INSTANCE_B2,
+		WORKSPACE_B,
+		IDENTITY_B,
+		'Repository B',
+	));
+	await fixture.registry.claimWorkspace(claim(
+		NODE_B,
+		INSTANCE_B2,
+		WORKSPACE_C,
+		IDENTITY_C,
+		'Repository C',
+	));
+	await assert.rejects(
+		fixture.registry.validateTaskRoute(route(INSTANCE_B2)),
+		hasReason('PEER_MULTI_WORKSPACE'),
+	);
+});
+
+test('revocation is immediate and route acquisition rechecks after prevalidation', async (t) => {
+	const fixture = await createFixture();
+	t.after(() => fixture.registry.dispose());
+	await setGate(fixture, true, true);
+	await fixture.registry.validateTaskRoute(route());
+
+	await fixture.service.setPolicy(identityParams(NODE_A, INSTANCE_A), {
+		...identityParams(NODE_A, INSTANCE_A),
+		workspaceIdentity: IDENTITY_A,
+		allowlist: [],
+	});
+
+	assert.equal(fixture.service.listAuthorized(identityParams(NODE_A, INSTANCE_A)).nodes.length, 0);
+	await assert.rejects(fixture.registry.acquireTaskRoute(route()), hasReason('PEER_NOT_ALLOWED'));
+	assert.equal(fixture.leases.isLeased(IDENTITY_B), false);
+});
+
+test('uses stable identities and exact instances rather than duplicate or spoofed labels', async (t) => {
+	const fixture = await createFixture({ targetLabel: 'frontend' });
+	t.after(() => fixture.registry.dispose());
+	await fixture.service.setPolicy(identityParams(NODE_A, INSTANCE_A), {
+		...identityParams(NODE_A, INSTANCE_A),
+		workspaceIdentity: IDENTITY_A,
+		windowName: 'frontend',
+		allowlist: [IDENTITY_B],
+	});
+	await fixture.service.setPolicy(identityParams(NODE_B, INSTANCE_B), {
+		...identityParams(NODE_B, INSTANCE_B),
+		workspaceIdentity: IDENTITY_B,
+		windowName: 'frontend',
+		acceptsIncoming: true,
+	});
+
+	const listed = fixture.service.listAuthorized(identityParams(NODE_A, INSTANCE_A));
+	assert.equal(listed.nodes[0]?.label, 'frontend');
+	assert.equal(listed.nodes[0]?.nodeId, NODE_B);
+	assert.equal(listed.nodes[0]?.workspaces[0]?.workspaceIdentity, IDENTITY_B);
+	await assert.rejects(
+		fixture.registry.validateTaskRoute(route(INSTANCE_B2)),
+		hasReason('PEER_OFFLINE'),
+	);
+});
+
+test('keeps the configuration directory safe and separate from Tool visibility', async (t) => {
+	const fixture = await createFixture({
+		targetLabel: '/Users/private/secret-project',
+		targetWorkspaceName: 'C:\\private\\secret-project',
+		targetCapabilityTags: ['typescript', 'token=secret'],
+	});
+	t.after(() => fixture.registry.dispose());
+
+	assert.equal(fixture.service.listAuthorized(identityParams(NODE_A, INSTANCE_A)).nodes.length, 0);
+	const configuration = fixture.service.listCandidates(identityParams(NODE_A, INSTANCE_A));
+	assert.equal(configuration.candidates.length, 1);
+	assert.equal(configuration.candidates[0]?.nodeId, NODE_B.slice(0, 8));
+	assert.equal(configuration.candidates[0]?.nodeInstanceId, INSTANCE_B.slice(0, 8));
+	assert.equal(configuration.candidates[0]?.label, NODE_B.slice(0, 8));
+	assert.equal(configuration.candidates[0]?.workspaceName, 'Workspace');
+	const serialized = JSON.stringify(configuration);
+	assert.doesNotMatch(serialized, /sha256:/u);
+	assert.doesNotMatch(serialized, /Users|private|secret-project/u);
+	const dashboard = fixture.service.listDashboard(identityParams(NODE_A, INSTANCE_A));
+	assert.deepEqual(dashboard.nodes[1]?.workspaces[0]?.capabilityTags, [
+		'typescript',
+		'Capability',
+	]);
+
+	await setGate(fixture, true, true);
+	const authorized = fixture.service.listAuthorized(identityParams(NODE_A, INSTANCE_A));
+	assert.equal(authorized.nodes[0]?.label, NODE_B.slice(0, 8));
+	assert.equal(authorized.nodes[0]?.workspaces[0]?.name, 'Workspace');
+});
+
+test('redacts credential-shaped candidate labels and forgets explicitly released workspaces', async (t) => {
+	const fixture = await createFixture();
+	t.after(() => fixture.registry.dispose());
+	await fixture.service.setPolicy(identityParams(NODE_B, INSTANCE_B), {
+		...identityParams(NODE_B, INSTANCE_B),
+		workspaceIdentity: IDENTITY_B,
+		windowName: 'ghp_123456789012345678901234567890123456',
+	});
+
+	let candidate = fixture.service.listCandidates(identityParams(NODE_A, INSTANCE_A)).candidates[0];
+	assert.equal(candidate?.label, NODE_B.slice(0, 8));
+	assert.equal(candidate?.workspaceName, 'Repository B');
+
+	fixture.registry.releaseWorkspace({
+		...identityParams(NODE_B, INSTANCE_B),
+		workspaceId: WORKSPACE_B,
+	});
+	fixture.registry.unregister(identityParams(NODE_B, INSTANCE_B));
+	candidate = fixture.service.listCandidates(identityParams(NODE_A, INSTANCE_A)).candidates[0];
+	assert.equal(candidate?.workspaceName, undefined);
+	assert.equal(candidate?.gateState, 'offline');
+});
+
+test('keeps peer visibility and receiving disabled behind the Preview flag', async (t) => {
+	const fixture = await createFixture({ enabled: false });
+	t.after(() => fixture.registry.dispose());
+
+	assert.equal(fixture.service.listAuthorized(identityParams(NODE_A, INSTANCE_A)).nodes.length, 0);
+	await assert.rejects(
+		fixture.service.setPolicy(identityParams(NODE_A, INSTANCE_A), {
+			...identityParams(NODE_A, INSTANCE_A),
+			workspaceIdentity: IDENTITY_A,
+			acceptsIncoming: true,
+		}),
+		hasReason('POLICY_FORBIDDEN'),
+	);
+	await assert.rejects(fixture.registry.validateTaskRoute(route()), hasReason('PEER_NOT_ACCEPTING'));
+});
+
+interface Fixture {
+	readonly registry: NodeRegistry;
+	readonly service: PeerPolicyService;
+	readonly store: PeerPolicyStore;
+	readonly leases: WorkspaceLeaseManager;
+}
+
+async function createFixture(options: {
+	readonly enabled?: boolean;
+	readonly targetLabel?: string;
+	readonly targetWorkspaceName?: string;
+	readonly targetCapabilityTags?: string[];
+} = {}): Promise<Fixture> {
+	const leases = new WorkspaceLeaseManager();
+	const registry = await NodeRegistry.create({
+		deviceId: DEVICE,
+		state: new MemoryState(),
+		ids: { next: () => uuid(99) },
+		clock: { now: () => NOW },
+		workspaceLeases: leases,
+		scheduler: new NoopScheduler(),
+	});
+	registry.register(registration(NODE_A, INSTANCE_A, 'frontend'), new FakeSession().route());
+	registry.register(
+		registration(NODE_B, INSTANCE_B, options.targetLabel ?? 'backend'),
+		new FakeSession().route(),
+	);
+	await registry.claimWorkspace(claim(
+		NODE_A,
+		INSTANCE_A,
+		WORKSPACE_A,
+		IDENTITY_A,
+		'Repository A',
+	));
+	await registry.claimWorkspace(claim(
+		NODE_B,
+		INSTANCE_B,
+		WORKSPACE_B,
+		IDENTITY_B,
+		options.targetWorkspaceName ?? 'Repository B',
+		options.targetCapabilityTags,
+	));
+	const ownership = new TestOwnership();
+	const store = new PeerPolicyStore(
+		new AtomicFileStore('memory', new MemoryAtomicFileSystem(), {
+			next: () => 'policy-temp',
+		}),
+		{
+			ownership,
+			generation: ownership.generation,
+			clock: { now: () => NOW },
+		},
+	);
+	await store.initialize();
+	const service = new PeerPolicyService(store, registry, {
+		enabled: () => options.enabled ?? true,
+	});
+	registry.setPeerRouteAuthorizer(service);
+	return { registry, service, store, leases };
+}
+
+async function setGate(fixture: Fixture, allow: boolean, accept: boolean): Promise<void> {
+	await fixture.service.setPolicy(identityParams(NODE_A, INSTANCE_A), {
+		...identityParams(NODE_A, INSTANCE_A),
+		workspaceIdentity: IDENTITY_A,
+		allowlist: allow ? [IDENTITY_B] : [],
+	});
+	await fixture.service.setPolicy(identityParams(NODE_B, INSTANCE_B), {
+		...identityParams(NODE_B, INSTANCE_B),
+		workspaceIdentity: IDENTITY_B,
+		acceptsIncoming: accept,
+	});
+}
+
+function registration(nodeId: string, nodeInstanceId: string, label: string) {
+	return {
+		nodeId,
+		nodeInstanceId,
+		label,
+		capabilities: ['tasks'],
+		status: 'online' as const,
+		startedAt: NOW.toISOString(),
+	};
+}
+
+function claim(
+	nodeId: string,
+	nodeInstanceId: string,
+	workspaceId: string,
+	workspaceIdentity: string,
+	name: string,
+	capabilityTags: string[] = ['typescript'],
+) {
+	return {
+		nodeId,
+		nodeInstanceId,
+		workspaceId,
+		workspaceIdentity,
+		name,
+		capabilityTags,
+	};
+}
+
+function identityParams(nodeId: string, nodeInstanceId: string) {
+	return { nodeId, nodeInstanceId };
+}
+
+function route(targetInstanceId = INSTANCE_B) {
+	return {
+		nodeId: NODE_B,
+		nodeInstanceId: targetInstanceId,
+		workspaceId: WORKSPACE_B,
+		ownerId: DEVICE,
+		taskId: TASK,
+		sourceNodeId: NODE_A,
+		sourceNodeInstanceId: INSTANCE_A,
+	};
+}
+
+function hasReason(reason: string) {
+	return (error: unknown) =>
+		error instanceof MeshDomainError
+		&& error.reason === reason;
+}
+
+class MemoryState implements StateStore {
+	private readonly values = new Map<string, unknown>();
+
+	public get<T>(key: string): T | undefined {
+		return structuredClone(this.values.get(key)) as T | undefined;
+	}
+
+	public async update(key: string, value: unknown): Promise<void> {
+		this.values.set(key, structuredClone(value));
+	}
+}
+
+class NoopScheduler implements RegistryScheduler {
+	public repeat(): { dispose(): void } {
+		return { dispose: () => undefined };
+	}
+}
+
+class FakeSession {
+	public closed = false;
+	private readonly listeners = new Set<() => void>();
+
+	public onClose(listener: () => void): () => void {
+		this.listeners.add(listener);
+		return () => this.listeners.delete(listener);
+	}
+
+	public close(): void {
+		this.closed = true;
+		for (const listener of [...this.listeners]) {
+			listener();
+		}
+	}
+
+	public route(): LocalIpcSession {
+		return this as unknown as LocalIpcSession;
+	}
+}

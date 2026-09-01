@@ -304,7 +304,10 @@ test('runs a local v2 task vertically and persists before notification', async (
 		return null;
 	};
 
-	const started = await fixture.service.startLocal(SOURCE_ID, startParams());
+	const started = await fixture.service.startLocal({
+		nodeId: SOURCE_ID,
+		nodeInstanceId: INSTANCE_ID,
+	}, startParams());
 	assert.equal(started.state, 'startingAgent');
 	assert.deepEqual(started.events.map(({ type }) => type), [
 		'agentStartRequested',

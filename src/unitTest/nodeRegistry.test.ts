@@ -399,7 +399,7 @@ test('migration rejects corrupt and unknown versions without a fallback write', 
 	assert.deepEqual(failing.values.get(WORKSPACE_CATALOG_STATE_KEY), v1);
 });
 
-test('serialized directory never leaks a workspace path or opaque identity', async (t) => {
+test('serialized directory exposes only the one-way workspace identity, never its source or path', async (t) => {
 	const { registry } = await createFixture();
 	t.after(() => registry.dispose());
 	registry.register(registration(), new FakeSession().asRoute());
@@ -410,8 +410,9 @@ test('serialized directory never leaks a workspace path or opaque identity', asy
 	const serialized = JSON.stringify(registry.list());
 	assert.doesNotMatch(
 		serialized,
-		/opaque-sensitive-token|workspaceIdentity|fileIdentity|localUri/,
+		/opaque-sensitive-token|fileIdentity|localUri/,
 	);
+	assert.match(serialized, /"workspaceIdentity":"sha256:[A-Za-z0-9_-]{43}"/u);
 	assert.match(serialized, /Repository/);
 });
 

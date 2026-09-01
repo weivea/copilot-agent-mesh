@@ -66,14 +66,14 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 		const owner = this.options.ownerRuntime();
 		const lifecycle = this.options.lifecycle.snapshot();
 		const errors: DashboardSnapshot['errors'][number][] = [];
-		let localDirectory: Awaited<ReturnType<WindowNodeClient['listNodes']>> = {
+		let localDirectory: Awaited<ReturnType<WindowNodeClient['listDashboardNodes']>> = {
 			deviceId: profile.deviceId,
 			nodes: [],
 			truncated: false,
 			totalNodes: 0,
 		};
 		try {
-			localDirectory = await this.options.node.listNodes();
+			localDirectory = await this.options.node.listDashboardNodes();
 		} catch {
 			errors.push({
 				code: 'LOCAL_BROKER_UNAVAILABLE',
@@ -569,7 +569,7 @@ function listenerSnapshot(
 }
 
 function toDashboardNode(
-	node: Awaited<ReturnType<WindowNodeClient['listNodes']>>['nodes'][number],
+	node: Awaited<ReturnType<WindowNodeClient['listDashboardNodes']>>['nodes'][number],
 	thisNodeId: string,
 ): DashboardNodeSnapshot {
 	return {

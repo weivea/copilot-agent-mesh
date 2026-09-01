@@ -92,6 +92,15 @@ Device → Node → Workspace task through that route. A run may claim
 start/get/cancel/output only after authoritative AHP events are observed; an
 authentication block is not counted as task-path success.
 
+The 0.4.0 P2 authorization layer adds offline unit/component coverage for all
+four allowlist/accept-switch combinations, directional policy, exact caller
+ownership, offline identity rebinding, multi-workspace target rejection,
+immediate revocation, and the route-acquisition TOCTOU recheck. The historical
+real task mode above does not yet configure the new default-off peer policies;
+P8 must update that harness before it can be used as 0.4.0 peer-delegation
+evidence. Transport/lifecycle mode remains valid because it does not start a
+peer task.
+
 ## Recorded 0.2.0 multi-window evidence
 
 The ordinary transport/lifecycle run passed on VS Code `1.134.0`, macOS arm64:

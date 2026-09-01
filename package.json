@@ -425,6 +425,12 @@
           "scope": "machine",
           "markdownDescription": "Enable the real macOS arm64 Worker Preview Agent Host/AHP runtime. This may consume Copilot quota. Windows, Linux, macOS x64, and other architectures remain Coordinator-only."
         },
+        "copilotAgentMesh.experimental.peerDelegation": {
+          "type": "boolean",
+          "default": false,
+          "scope": "machine",
+          "markdownDescription": "Enable Preview same-device peer window discovery, policy configuration, and incoming task routing. Authorization remains default-deny."
+        },
         "copilotAgentMesh.experimental.authenticationProviders": {
           "type": "object",
           "default": {},
