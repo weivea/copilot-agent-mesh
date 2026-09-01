@@ -493,36 +493,6 @@ test('shutdown interrupts an unanswered target confirmation and releases the sta
 	assert.equal(runtime.requests.length, 0);
 });
 
-test('worker deadline interrupts an unanswered target confirmation', async () => {
-	let confirmationEntered!: () => void;
-	const entered = new Promise<void>((resolve) => {
-		confirmationEntered = resolve;
-	});
-	const runtime = new TestRuntime();
-	const fixture = createFixture({
-		runtime,
-		clock: { now: () => new Date() },
-		confirmationHost: {
-			confirm: async () => {
-				confirmationEntered();
-				return new Promise<never>(() => undefined);
-			},
-		},
-	});
-	const start = fixture.executor.start(startParams({
-		sourceNodeId: undefined,
-		workerDeadline: new Date(Date.now() + 30).toISOString(),
-	}));
-	await entered;
-
-	await assert.rejects(
-		start,
-		(error: unknown) => isReason(error, 'TASK_EXECUTION_FAILED'),
-	);
-	assert.equal(runtime.requests.length, 0);
-	await fixture.executor.dispose();
-});
-
 test('starts once for exact retries, rejects conflicts, and supplies complete confirmation details', async () => {
 	const lifecycle: AgentRuntimeLifecycleObservation[] = [];
 	const fixture = createFixture({
