@@ -296,7 +296,6 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 					workspaceResolver,
 					confirmationHost: nodeConfirmation,
 					approvalCapabilities: runtimeApprovalCapabilities,
-					lifecycleObserver: peerDelegationRecorder,
 					eventSink,
 					ids: { next: randomUUID },
 					clock: { now: () => new Date() },

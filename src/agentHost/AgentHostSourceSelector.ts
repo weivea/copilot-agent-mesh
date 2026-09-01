@@ -137,7 +137,7 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 		}
 		const runtimes = this.options.preferEditor()
 			? [this.options.editor, this.options.standalone]
-			: [this.options.standalone, this.options.editor];
+			: [this.options.standalone];
 		for (const runtime of runtimes) {
 			try {
 				await runtime.prepareStart?.();

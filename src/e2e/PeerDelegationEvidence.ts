@@ -187,9 +187,8 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 		catalogBefore: nonNegativeInteger,
 		catalogAfter: nonNegativeInteger,
 		hostSessionHash: fingerprint.optional(),
-		recoverySessionHash: fingerprint.optional(),
 		editorEndpointFingerprint: fingerprint.optional(),
-		hostSessionHashMatched: z.boolean(),
+		hostSessionEchoObserved: z.boolean(),
 		catalogSessionHashMatched: z.boolean(),
 		uiObserved: z.boolean(),
 	}),
@@ -672,17 +671,15 @@ function validateAc5Correspondence(
 			status: evidence.completion.source === 'editor'
 				&& !evidence.completion.degraded
 				&& evidence.sessionVisibility.source === 'editor'
-				&& evidence.sessionVisibility.hostSessionHashMatched
+				&& evidence.sessionVisibility.hostSessionEchoObserved
 				&& evidence.sessionVisibility.hostSessionHash !== undefined
-				&& evidence.sessionVisibility.recoverySessionHash !== undefined
-				&& evidence.sessionVisibility.hostSessionHash === evidence.sessionVisibility.recoverySessionHash
 				&& evidence.sessionVisibility.editorEndpointFingerprint !== undefined
 				? 'pass'
 				: evidence.completion.status === 'fail' ? 'fail' : 'unverified',
 			referencePrefixes: [
 				'#/completion/source',
 				'#/sessionVisibility/source',
-				'#/sessionVisibility/hostSessionHashMatched',
+				'#/sessionVisibility/hostSessionEchoObserved',
 			],
 		},
 		{
@@ -803,22 +800,20 @@ function validateAc5Correspondence(
 		addInvariantIssue(context, ['timeout'], 'Passing timeout evidence requires budget cancellation, authoritative terminal state, and lease release.');
 	}
 	if (
-		evidence.sessionVisibility.hostSessionHashMatched
+		evidence.sessionVisibility.hostSessionEchoObserved
 		&& (
 			evidence.sessionVisibility.source !== 'editor'
 			|| evidence.sessionVisibility.hostSessionHash === undefined
-			|| evidence.sessionVisibility.recoverySessionHash === undefined
-			|| evidence.sessionVisibility.hostSessionHash !== evidence.sessionVisibility.recoverySessionHash
 			|| evidence.sessionVisibility.editorEndpointFingerprint === undefined
 		)
 	) {
-		addInvariantIssue(context, ['sessionVisibility'], 'A matched Host Session requires an echoed editor Session and endpoint fingerprint.');
+		addInvariantIssue(context, ['sessionVisibility'], 'A Host Session echo requires an editor source, channel hash, and endpoint fingerprint.');
 	}
 	if (
 		evidence.sessionVisibility.status === 'pass'
 		&& (
 			evidence.sessionVisibility.source !== 'editor'
-			|| !evidence.sessionVisibility.hostSessionHashMatched
+			|| !evidence.sessionVisibility.hostSessionEchoObserved
 			|| !evidence.sessionVisibility.catalogSessionHashMatched
 			|| !evidence.sessionVisibility.uiObserved
 			|| evidence.sessionVisibility.catalogAfter < 1

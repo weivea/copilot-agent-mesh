@@ -140,10 +140,11 @@ O3 remains non-guaranteed Tool choice, O4 remains undetectable concurrent user
 Copilot edits, and O5 remains unsupported/unverified outside macOS arm64.
 AC-5 item 9 is narrower than O1 but still cannot rely on source status alone:
 it requires a Session resource echoed by the editor Host's subscription snapshot
-or Session-channel action to match the task recovery Session fingerprint, and
-records the editor endpoint fingerprint. A locally generated `createSession`
-URI cannot satisfy the item. If no Host echo is available, item 9 remains
-Unverified. UI and post-task catalog observation are not required for item 9.
+or Session-channel action, plus its bounded hash and the editor endpoint
+fingerprint. Equality between locally related `createSession` and recovery
+values is not an independent check and cannot satisfy the item without that
+Host-originated echo. If no Host echo is available, item 9 remains Unverified.
+UI and post-task catalog observation are not required for item 9.
 
 ### Recorded P8 objective result
 
@@ -156,8 +157,8 @@ produced a valid **Unverified** artifact rather than a false Pass:
   `PEER_NOT_ACCEPTING`, target visible after both gates, and reverse direction
   absent; both Dashboard configuration lists contained both windows.
 - AC-5 6 and 8-12 passed: the editor task emitted real
-  `agentStarted`/output/`turnComplete`/`completed`, its Host-echoed Session and
-  recovery fingerprints matched, the target had an Incoming record,
+  `agentStarted`/output/`turnComplete`/`completed`, the Host echoed the created
+  Session channel, the target had an Incoming record,
   Listener/Tunnel attempt deltas stayed zero, the Workspace lease and Profile
   Lock were released, and final harness-owned VS Code/Agent
   Host/Tunnel/socket/timer counts were zero.

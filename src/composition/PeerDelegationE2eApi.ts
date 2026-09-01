@@ -377,7 +377,6 @@ async function taskEvidence(
 	readonly outputCount: number;
 	readonly outputBytes: number;
 	readonly outputHash?: string;
-	readonly recoverySessionHash?: string;
 	readonly leaseReleased: boolean;
 }> {
 	const owner = requireOwner(options);
@@ -410,12 +409,6 @@ async function taskEvidence(
 		outputCount: output.length,
 		outputBytes: output.reduce((total, value) => total + Buffer.byteLength(value, 'utf8'), 0),
 		...(output.length === 0 ? {} : { outputHash: fingerprint('task-output', output.join('\0')) }),
-		...(record.recoveryDescriptor === undefined ? {} : {
-			recoverySessionHash: fingerprint(
-				'agent-session',
-				record.recoveryDescriptor.sessionId,
-			),
-		}),
 		leaseReleased: !owner.leases.isLeased(record.workspaceLeaseKey),
 	};
 }

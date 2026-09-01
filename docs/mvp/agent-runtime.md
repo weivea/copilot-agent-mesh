@@ -150,7 +150,9 @@ profile. It never overrides or restarts editor credentials. The failed source
 stays visibly unhealthy, but every later task may re-attempt it; any retained
 failed-start resources are retried to completion before another Host launch.
 The stale probe result therefore does not permanently disable the runtime, and
-cleanup failure never permits standalone fallback or concurrent reuse.
+cleanup failure never permits standalone fallback or concurrent reuse. When
+editor preference is disabled, preparation touches standalone only; retained
+editor cleanup is retried when editor preference becomes reachable again.
 
 The standalone-only `VscodeAuthBroker` is silent-first. A modal `createIfNone`
 request is allowed only when the invocation explicitly permits interactive
@@ -222,11 +224,12 @@ with no Session created and no sensitive evidence persisted.
 
 After `createSession` is acknowledged, P8 records the Session resource returned
 by the Host's subscribed Session snapshot (or a later Host Session-channel
-action) through its E2E-only lifecycle observer. It compares that
-domain-separated 16-hex fingerprint with the task recovery Session and requires
-a fingerprinted editor endpoint. A locally generated Session URI alone is not
-evidence. If the Host never echoes the Session, AC-5.9 remains Unverified even
-when the task otherwise completes. A separate bounded post-task `listSessions`
+action) through its E2E-only lifecycle observer. AC-5.9 requires this
+Host-originated Session-channel echo, its domain-separated 16-hex fingerprint,
+and a fingerprinted editor endpoint. Equality with a recovery descriptor that
+uses the same locally generated Session URI is not treated as an independent
+cross-check. If the Host never echoes the Session, AC-5.9 remains Unverified
+even when the task otherwise completes. A separate bounded post-task `listSessions`
 observation remains O1 catalog evidence; it does not open and close a pre-task
 catalog client because that borrowed-client lifecycle can perturb editor
 identity readiness. Only fingerprints and counts leave the Extension Host. A

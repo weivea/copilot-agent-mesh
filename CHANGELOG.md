@@ -50,7 +50,7 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 - Recorded an honest real P8 objective run on VS Code 1.135.0/macOS arm64:
   AC-5 items 1-4, 6, and 8-12 were observed against the existing authenticated
   full-Catalog profile, including both peer rejection codes, directionality,
-  real editor output/completion, matching Host-echoed/recovery Session hashes,
+  real editor output/completion, an objective Host-originated Session-channel echo,
   Incoming, needs-input resume, token and short-budget cancellation, no
   Listener/Tunnel access, and complete cleanup. Copilot UI confirmation,
   same-Chat return, target Chat Sessions UI visibility, and 60-minute UI
@@ -58,8 +58,9 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 - Hardened final-stack lifecycle edges: an editor attempt with failed cleanup no
   longer starts a concurrent standalone fallback, selector disposal can retry,
   and a fast historical terminal notification cannot mask a retry's
-  `IDEMPOTENCY_CONFLICT`. Later starts drain retained editor/standalone cleanup
-  before confirmation and launch; target confirmations and all Session
+  `IDEMPOTENCY_CONFLICT`. Later editor-preferred starts drain reachable
+  editor/standalone cleanup before confirmation and launch, while standalone-only
+  mode never touches an unreachable editor runtime; target confirmations and all Session
   configuration controls are owned and close on deadline/disposal. The target
   confirmation panel keeps the complete prompt scrollable rather than truncating
   it to a picker row.
@@ -88,8 +89,8 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
   later editor challenges fail safely and never trigger credential replacement,
   while owned standalone hosts retain explicit VS Code authentication mappings.
   Source status and AC-5 evidence now require the actual editor attempt and a
-  Host-echoed subscription Session/task-recovery hash match rather than two
-  locally derived values or a stale probe result. Failed startup cleanup is
+  Host-originated Session-channel echo rather than equality between locally
+  related values or a stale probe result. Failed startup cleanup is
   retried before a later launch, so prior terminal failures do not wedge the
   window or permit unsafe concurrent reuse.
   The E2E editor transport uses an owned one-client authenticated loopback TCP

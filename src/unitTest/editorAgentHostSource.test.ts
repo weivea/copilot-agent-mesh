@@ -602,6 +602,70 @@ test('source selector prepares both editor and standalone cleanup before task co
 	await selector.dispose();
 });
 
+test('standalone-only preparation leaves retained editor cleanup untouched until editor is reachable', async () => {
+	let preferEditor = true;
+	const editor = new FakeRuntime();
+	const cleanupFailure = new AgentRuntimeError(
+		'AGENT_UNAVAILABLE',
+		'Editor cleanup is incomplete.',
+		false,
+		undefined,
+		true,
+	);
+	editor.startErrors.push(cleanupFailure);
+	editor.prepareErrors.push(cleanupFailure);
+	const standalone = new FakeRuntime();
+	const selector = new AgentHostSourceSelector(selectorOptions({
+		preferEditor: () => preferEditor,
+		editor,
+		standalone,
+	}));
+
+	await assert.rejects(selector.start(taskRequest()), { cleanupFailed: true });
+	preferEditor = false;
+	await selector.prepareStart();
+	await selector.start(taskRequest());
+	assert.equal(editor.prepareCalls, 0);
+	assert.equal(standalone.prepareCalls, 1);
+	assert.equal(standalone.starts, 1);
+	assert.deepEqual(selector.sourceStatus(), { source: 'standalone', degraded: false });
+
+	preferEditor = true;
+	await assert.rejects(selector.prepareStart(), { cleanupFailed: true });
+	assert.equal(editor.prepareCalls, 1);
+	assert.equal(editor.starts, 1);
+	await selector.prepareStart();
+	await selector.start(taskRequest());
+	assert.equal(editor.prepareCalls, 2);
+	assert.equal(standalone.prepareCalls, 2);
+	assert.equal(editor.starts, 2);
+	assert.deepEqual(selector.sourceStatus(), { source: 'editor', degraded: false });
+	await selector.dispose();
+});
+
+test('standalone-only preparation blocks on retained standalone cleanup', async () => {
+	const editor = new FakeRuntime();
+	const standalone = new FakeRuntime();
+	standalone.prepareErrors.push(new AgentRuntimeError(
+		'TASK_EXECUTION_FAILED',
+		'Standalone cleanup is incomplete.',
+		false,
+		undefined,
+		true,
+	));
+	const selector = new AgentHostSourceSelector(selectorOptions({
+		preferEditor: () => false,
+		editor,
+		standalone,
+	}));
+
+	await assert.rejects(selector.prepareStart(), { cleanupFailed: true });
+	assert.equal(standalone.prepareCalls, 1);
+	assert.equal(editor.prepareCalls, 0);
+	assert.equal(standalone.starts, 0);
+	await selector.dispose();
+});
+
 for (const scenario of [
 	{
 		name: 'recovery failure',

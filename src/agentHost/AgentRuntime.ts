@@ -77,11 +77,6 @@ export type AgentRuntimeLifecycleObservation =
 	}
 	| {
 		readonly taskId: string;
-		readonly eventType: 'task/sessionBound';
-		readonly sessionUri: string;
-	}
-	| {
-		readonly taskId: string;
 		readonly eventType: 'chat/turnComplete' | 'chat/turnCancelled' | 'chat/error';
 	};
 

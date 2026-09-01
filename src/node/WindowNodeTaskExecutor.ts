@@ -22,7 +22,6 @@ import {
 	type AgentRuntimeApprovalCapabilityIssuer,
 	type AgentRuntime,
 	type AgentRuntimeEvent,
-	type AgentRuntimeLifecycleObserver,
 	type AgentTaskAnswer,
 	type AgentTaskHandle,
 	type AgentTaskRequest,
@@ -69,7 +68,6 @@ export interface WindowNodeTaskExecutorOptions {
 	readonly workspaceResolver: WorkspaceResolver;
 	readonly confirmationHost: WindowNodeTaskConfirmationHost;
 	readonly approvalCapabilities?: AgentRuntimeApprovalCapabilityIssuer;
-	readonly lifecycleObserver?: AgentRuntimeLifecycleObserver;
 	readonly eventSink: WindowNodeTaskEventSink;
 	readonly ids: IdGenerator | (() => string);
 	readonly clock: Clock | (() => Date);
@@ -486,15 +484,6 @@ export class WindowNodeTaskExecutor {
 			throwCleanupFailures(cleanup, 'The Agent runtime returned an invalid recovery descriptor.', error);
 			record.active = undefined;
 			throw error;
-		}
-		try {
-			this.options.lifecycleObserver?.observeLifecycle({
-				taskId: params.taskId,
-				eventType: 'task/sessionBound',
-				sessionUri: handle.recovery.sessionUri,
-			});
-		} catch {
-			// Optional lifecycle observation must not affect task execution.
 		}
 		record.result = result;
 		const pump = this.pump(record, active);

@@ -104,8 +104,7 @@ export class PeerDelegationE2eRecorder implements
 			if (!uuidPattern.test(observation.taskId)) {
 				return;
 			}
-			const observesSession = observation.eventType === 'session/hostObserved'
-				|| observation.eventType === 'task/sessionBound';
+			const observesSession = observation.eventType === 'session/hostObserved';
 			if (
 				observesSession
 				&& (
@@ -124,17 +123,13 @@ export class PeerDelegationE2eRecorder implements
 					? {}
 					: {
 						sessionHash: digest('agent-session', observation.sessionUri).slice(0, 16),
-						...(observation.eventType !== 'session/hostObserved'
-							? {}
-							: {
-								source: observation.source,
-								...(
-									observation.endpointFingerprint === undefined
-									|| !/^[a-f0-9]{16}$/u.test(observation.endpointFingerprint)
-										? {}
-										: { endpointFingerprint: observation.endpointFingerprint }
-								),
-							}),
+						source: observation.source,
+						...(
+							observation.endpointFingerprint === undefined
+							|| !/^[a-f0-9]{16}$/u.test(observation.endpointFingerprint)
+								? {}
+								: { endpointFingerprint: observation.endpointFingerprint }
+						),
 					}),
 			});
 		} catch {

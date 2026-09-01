@@ -1169,39 +1169,24 @@ async function recordCompletionScenario({
 		.find((observation) =>
 			observation.taskId === completionTaskId
 			&& observation.eventType === 'session/hostObserved');
-	const recoverySessionObservation = [...completionObservations.ahp]
-		.reverse()
-		.find((observation) =>
-			observation.taskId === completionTaskId
-			&& observation.eventType === 'task/sessionBound');
 	const hostSessionHash = typeof hostSessionObservation?.sessionHash === 'string'
 		&& /^[a-f0-9]{16}$/u.test(hostSessionObservation.sessionHash)
 		? hostSessionObservation.sessionHash
 		: undefined;
-	const recoverySessionHash = typeof recoverySessionObservation?.sessionHash === 'string'
-		&& /^[a-f0-9]{16}$/u.test(recoverySessionObservation.sessionHash)
-		? recoverySessionObservation.sessionHash
-		: undefined;
 	const catalogSessionHashMatched = catalogAfter.available === true
-		&& recoverySessionHash !== undefined
-		&& catalogAfter.sessionHashes.includes(recoverySessionHash);
+		&& hostSessionHash !== undefined
+		&& catalogAfter.sessionHashes.includes(hostSessionHash);
 	const editorEndpointFingerprint = typeof hostSessionObservation?.endpointFingerprint === 'string'
 		&& /^[a-f0-9]{16}$/u.test(hostSessionObservation.endpointFingerprint)
 		? hostSessionObservation.endpointFingerprint
 		: undefined;
-	const hostSessionHashMatched = hostSessionHash !== undefined
-		&& recoverySessionHash !== undefined
+	const hostSessionEchoObserved = hostSessionHash !== undefined
 		&& editorEndpointFingerprint !== undefined
-		&& hostSessionObservation?.source === 'editor'
-		&& recoverySessionHash === hostSessionHash
-		&& (
-			completionTask.recoverySessionHash === undefined
-			|| completionTask.recoverySessionHash === recoverySessionHash
-		);
+		&& hostSessionObservation?.source === 'editor';
 	const editorSessionObserved = sourceKind === 'editor'
 		&& !degraded
 		&& sourceFailure === undefined
-		&& hostSessionHashMatched;
+		&& hostSessionEchoObserved;
 	const completed = completionResult.s === 0;
 	const completionPass = completed
 		&& authoritativeOrder
@@ -1270,7 +1255,7 @@ async function recordCompletionScenario({
 		incomingRecord ? ['#/completion/incomingRecord'] : [],
 	);
 	setAc5(9, editorSessionObserved ? 'pass' : 'unverified', editorSessionObserved
-		? ['#/completion/source', '#/sessionVisibility/hostSessionHashMatched']
+		? ['#/completion/source', '#/sessionVisibility/hostSessionEchoObserved']
 		: []);
 
 	const uiObserved = completionRun.uiAttestation?.targetSessionVisible === true;
@@ -1282,9 +1267,8 @@ async function recordCompletionScenario({
 		catalogBefore: catalogBeforeCount,
 		catalogAfter: catalogAfter.available ? catalogAfter.sessionCount : 0,
 		...(hostSessionHash === undefined ? {} : { hostSessionHash }),
-		...(recoverySessionHash === undefined ? {} : { recoverySessionHash }),
 		...(editorEndpointFingerprint === undefined ? {} : { editorEndpointFingerprint }),
-		hostSessionHashMatched,
+		hostSessionEchoObserved,
 		catalogSessionHashMatched,
 		uiObserved,
 	};
@@ -2487,7 +2471,7 @@ function initialEvidence() {
 			source: 'unavailable',
 			catalogBefore: 0,
 			catalogAfter: 0,
-			hostSessionHashMatched: false,
+			hostSessionEchoObserved: false,
 			catalogSessionHashMatched: false,
 			uiObserved: false,
 		},
