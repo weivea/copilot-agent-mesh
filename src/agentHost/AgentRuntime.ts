@@ -33,6 +33,7 @@ export interface AgentHostSourceFailure {
 	readonly statusCode?: number;
 	readonly socketCode?: 'EACCES' | 'ECONNREFUSED' | 'ENOENT';
 	readonly endpointFingerprint?: string;
+	readonly proxyStage?: 'target' | 'local';
 	readonly message: string;
 }
 

@@ -466,6 +466,9 @@ function safeEditorFailure(error: unknown): AgentHostSourceFailure {
 				...(error.cause.endpointFingerprint === undefined
 					? {}
 					: { endpointFingerprint: error.cause.endpointFingerprint }),
+				...(error.cause.proxyStage === undefined
+					? {}
+					: { proxyStage: error.cause.proxyStage }),
 			}
 			: {}),
 		message: 'The selected editor Agent Host attempt failed safely.',

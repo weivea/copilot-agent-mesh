@@ -31,6 +31,7 @@ export class UnixSocketWebSocketError extends Error {
 		message: string,
 		readonly statusCode?: number,
 		readonly socketCode?: 'EACCES' | 'ECONNREFUSED' | 'ENOENT',
+		readonly proxyStage?: 'target' | 'local',
 	) {
 		super(message);
 		this.name = 'UnixSocketWebSocketError';
@@ -288,6 +289,7 @@ export class UnixSocketWebSocketConnector {
 					error.message,
 					undefined,
 					error.socketCode,
+					'target',
 				), endpointFingerprint)
 				: fingerprintError(connectionFailed(), endpointFingerprint);
 		}
@@ -302,6 +304,14 @@ export class UnixSocketWebSocketConnector {
 			return webSocket;
 		} catch (error) {
 			await proxy.dispose();
+			if (error instanceof UnixSocketWebSocketError) {
+				Object.defineProperty(error, 'proxyStage', {
+					configurable: false,
+					enumerable: true,
+					value: 'local',
+					writable: false,
+				});
+			}
 			throw error;
 		}
 	}

@@ -138,6 +138,7 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 			statusCode: z.number().int().min(100).max(599).optional(),
 			socketCode: z.enum(['EACCES', 'ECONNREFUSED', 'ENOENT']).optional(),
 			endpointFingerprint: fingerprint.optional(),
+			proxyStage: z.enum(['target', 'local']).optional(),
 		}).optional(),
 		leaseReleased: z.boolean(),
 		durationMs: nonNegativeInteger,

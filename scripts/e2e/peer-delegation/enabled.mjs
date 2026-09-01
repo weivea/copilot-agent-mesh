@@ -1122,6 +1122,9 @@ async function recordCompletionScenario({
 				&& /^[a-f0-9]{16}$/u.test(sourceFailure.endpointFingerprint)
 				? { endpointFingerprint: sourceFailure.endpointFingerprint }
 				: {}),
+			...(['target', 'local'].includes(sourceFailure.proxyStage)
+				? { proxyStage: sourceFailure.proxyStage }
+				: {}),
 		}
 		: undefined;
 	const catalogAfter = await request(target, 'peer.session.catalog', {}, 60_000);
