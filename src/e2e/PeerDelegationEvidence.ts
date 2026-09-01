@@ -115,6 +115,7 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 		compactStatus: z.number().int().min(0).max(3).optional(),
 		eventTypes: z.array(z.string().min(1).max(64)).max(256),
 		eventSequences: z.array(z.number().int().positive()).max(256),
+		eventJournalTruncated: z.boolean(),
 		authoritativeOrder: z.boolean(),
 		ahpTurnCompleteObserved: z.boolean(),
 		output: scenarioOutput,
@@ -150,6 +151,7 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 		inputId: taskUuid.optional(),
 		questionPresent: z.boolean(),
 		eventTypes: z.array(z.string().min(1).max(64)).max(256),
+		eventJournalTruncated: z.boolean(),
 		answerTaskIdMatched: z.boolean(),
 		answerInputIdMatched: z.boolean(),
 		resumed: z.boolean(),
@@ -162,6 +164,7 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 		compactStatus: z.number().int().min(0).max(3).optional(),
 		reason: z.enum(['token', 'budget', 'peer', 'not-observed']),
 		eventTypes: z.array(z.string().min(1).max(64)).max(256),
+		eventJournalTruncated: z.boolean(),
 		terminalState,
 		leaseReleased: z.boolean(),
 	}),
@@ -174,6 +177,7 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 		productionDefaultMinutes: z.literal(60),
 		productionMaximumMinutes: z.literal(60),
 		eventTypes: z.array(z.string().min(1).max(64)).max(256),
+		eventJournalTruncated: z.boolean(),
 		terminalState,
 		leaseReleased: z.boolean(),
 	}),
@@ -343,7 +347,15 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 				evidence.completion.eventTypes,
 				['agentStarted', 'output', 'completed'],
 			)
-			|| !strictlyContiguous(evidence.completion.eventSequences)
+			|| !(
+				evidence.completion.eventJournalTruncated
+					? strictlyIncreasing(evidence.completion.eventSequences)
+					: strictlyContiguous(evidence.completion.eventSequences)
+			)
+			|| (
+				!evidence.completion.eventJournalTruncated
+				&& evidence.completion.eventSequences[0] !== 1
+			)
 			|| evidence.completion.eventSequences.length !== evidence.completion.eventTypes.length
 			|| !evidence.completion.ahpTurnCompleteObserved
 			|| evidence.completion.output.count < 1
@@ -868,6 +880,11 @@ function orderedSubsequence(values: readonly string[], required: readonly string
 function strictlyContiguous(values: readonly number[]): boolean {
 	return values.every((value, index) =>
 		index === 0 || value === values[index - 1]! + 1);
+}
+
+function strictlyIncreasing(values: readonly number[]): boolean {
+	return values.every((value, index) =>
+		index === 0 || value > values[index - 1]!);
 }
 
 function deriveOutcome(evidence: {

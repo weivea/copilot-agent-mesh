@@ -164,6 +164,58 @@ export class PeerDelegationE2eRecorder implements
 	}
 }
 
+export function projectPeerTaskEvents<
+	T extends { readonly eventSeq: number; readonly type: string },
+>(
+	events: readonly T[],
+	limit = 256,
+): { readonly events: readonly T[]; readonly truncated: boolean } {
+	if (!Number.isSafeInteger(limit) || limit < 16 || limit > 256) {
+		throw new RangeError('Peer task evidence event limit must be between 16 and 256.');
+	}
+	if (events.length <= limit) {
+		return { events, truncated: false };
+	}
+	const collapsed = events.filter((event, index) =>
+		index === 0 || event.type !== events[index - 1]!.type);
+	if (collapsed.length <= limit) {
+		return { events: collapsed, truncated: true };
+	}
+	const selected = new Set<number>([0, collapsed.length - 1]);
+	for (const type of [
+		'agentStarted',
+		'output',
+		'inputRequired',
+		'inputAnswered',
+		'cancelRequested',
+		'cancelConfirmed',
+		'completed',
+		'failed',
+		'timedOut',
+	]) {
+		const index = collapsed.findIndex((event) => event.type === type);
+		if (index >= 0) {
+			selected.add(index);
+		}
+	}
+	let left = 0;
+	let right = collapsed.length - 1;
+	while (selected.size < limit && left <= right) {
+		selected.add(left);
+		left += 1;
+		if (selected.size < limit) {
+			selected.add(right);
+			right -= 1;
+		}
+	}
+	return {
+		events: [...selected]
+			.sort((first, second) => first - second)
+			.map((index) => collapsed[index]!),
+		truncated: true,
+	};
+}
+
 export interface PeerDelegationToolClockSnapshot {
 	readonly budgetOverrideMs: number;
 	readonly timersCreated: number;

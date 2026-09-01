@@ -12,6 +12,7 @@ import {
 import {
 	PeerDelegationE2eRecorder,
 	PeerDelegationE2eToolClock,
+	projectPeerTaskEvents,
 } from '../e2e/PeerDelegationE2eRecorder';
 
 const runId = '00000000-0000-4000-8000-000000000001';
@@ -106,6 +107,24 @@ test('peer-delegation passing evidence requires all real AC-5 conditions', () =>
 			eventTypes: ['agentStarted', 'cancelRequested', 'cancelConfirmed'],
 		},
 	}).outcome, 'pass');
+	assert.equal(assertPassingPeerDelegationEvidence({
+		...evidence,
+		completion: {
+			...evidence.completion,
+			eventSequences: [1, 100, 300],
+			eventJournalTruncated: true,
+		},
+	}).outcome, 'pass');
+	assert.throws(
+		() => parsePeerDelegationEvidence({
+			...evidence,
+			completion: {
+				...evidence.completion,
+				eventSequences: [2, 3, 4],
+			},
+		}),
+		/complete real editor Tool-to-Agent route/u,
+	);
 	assert.throws(
 		() => parsePeerDelegationEvidence({
 			...evidence,
@@ -237,6 +256,30 @@ test('peer-delegation recorder stores identities and hashes without prompt or ou
 	assert.match(snapshot.ahp[0]?.sessionHash ?? '', /^[a-f0-9]{16}$/u);
 	assert.equal(snapshot.ahp[0]?.sessionHash, snapshot.ahp[1]?.sessionHash);
 	assert.equal(JSON.stringify(snapshot).includes('do-not-persist-this-identifier'), false);
+});
+
+test('peer task evidence projection bounds verbose journals without inventing milestones', () => {
+	const events = Array.from({ length: 300 }, (_, index) => ({
+		eventSeq: index + 1,
+		type: index % 2 === 0 ? 'progress' : 'output',
+	}));
+	events[0] = { eventSeq: 1, type: 'agentStartRequested' };
+	events[1] = { eventSeq: 2, type: 'agentStarted' };
+	events[150] = { eventSeq: 151, type: 'cancelRequested' };
+	events[299] = { eventSeq: 300, type: 'cancelConfirmed' };
+
+	const projected = projectPeerTaskEvents(events, 16);
+
+	assert.equal(projected.truncated, true);
+	assert.equal(projected.events.length, 16);
+	const types = projected.events.map(({ type }) => type);
+	assert.ok(types.indexOf('agentStarted') < types.indexOf('output'));
+	assert.ok(types.indexOf('output') < types.indexOf('cancelRequested'));
+	assert.ok(types.indexOf('cancelRequested') < types.indexOf('cancelConfirmed'));
+	assert.equal(projected.events.every((event) => events.includes(event)), true);
+	assert.equal(projected.events.every((event, index) =>
+		index === 0 || event.eventSeq > projected.events[index - 1]!.eventSeq), true);
+	assert.throws(() => projectPeerTaskEvents(events, 15), RangeError);
 });
 
 test('peer-delegation Tool clock shortens only minute-scale budget timers', () => {
@@ -386,6 +429,7 @@ function unverifiedEvidence(): PeerDelegationEvidence {
 			invocationSource: 'none',
 			eventTypes: [],
 			eventSequences: [],
+			eventJournalTruncated: false,
 			authoritativeOrder: false,
 			ahpTurnCompleteObserved: false,
 			output: { count: 0, bytes: 0 },
@@ -399,6 +443,7 @@ function unverifiedEvidence(): PeerDelegationEvidence {
 			status: 'unverified',
 			questionPresent: false,
 			eventTypes: [],
+			eventJournalTruncated: false,
 			answerTaskIdMatched: false,
 			answerInputIdMatched: false,
 			resumed: false,
@@ -409,6 +454,7 @@ function unverifiedEvidence(): PeerDelegationEvidence {
 			status: 'unverified',
 			reason: 'not-observed',
 			eventTypes: [],
+			eventJournalTruncated: false,
 			terminalState: 'not-observed',
 			leaseReleased: false,
 		},
@@ -419,6 +465,7 @@ function unverifiedEvidence(): PeerDelegationEvidence {
 			productionDefaultMinutes: 60,
 			productionMaximumMinutes: 60,
 			eventTypes: [],
+			eventJournalTruncated: false,
 			terminalState: 'not-observed',
 			leaseReleased: false,
 		},
@@ -564,6 +611,7 @@ function passingEvidence(): PeerDelegationEvidence {
 			compactStatus: 0,
 			eventTypes: ['agentStarted', 'output', 'completed'],
 			eventSequences: [1, 2, 3],
+			eventJournalTruncated: false,
 			authoritativeOrder: true,
 			ahpTurnCompleteObserved: true,
 			output: {
@@ -584,6 +632,7 @@ function passingEvidence(): PeerDelegationEvidence {
 			inputId,
 			questionPresent: true,
 			eventTypes: ['inputRequired', 'inputAnswered', 'completed'],
+			eventJournalTruncated: false,
 			answerTaskIdMatched: true,
 			answerInputIdMatched: true,
 			resumed: true,
@@ -596,6 +645,7 @@ function passingEvidence(): PeerDelegationEvidence {
 			compactStatus: 3,
 			reason: 'token',
 			eventTypes: ['agentStarted', 'output', 'cancelRequested', 'cancelConfirmed'],
+			eventJournalTruncated: false,
 			terminalState: 'cancelled',
 			leaseReleased: true,
 		},
@@ -608,6 +658,7 @@ function passingEvidence(): PeerDelegationEvidence {
 			productionDefaultMinutes: 60,
 			productionMaximumMinutes: 60,
 			eventTypes: ['agentStarted', 'output', 'cancelRequested', 'cancelConfirmed'],
+			eventJournalTruncated: false,
 			terminalState: 'cancelled',
 			leaseReleased: true,
 		},

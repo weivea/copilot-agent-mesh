@@ -32,9 +32,10 @@ import {
 	MESH_RUNTIME_TOOL_NAMES,
 	MESH_TOOL_NAMES,
 } from '../tools/toolManifest';
-import type {
-	PeerDelegationE2eRecorder,
-	PeerDelegationE2eToolClock,
+import {
+	projectPeerTaskEvents,
+	type PeerDelegationE2eRecorder,
+	type PeerDelegationE2eToolClock,
 } from '../e2e/PeerDelegationE2eRecorder';
 import type { ProductionDashboardBindings } from './ProductionDashboardBindings';
 import type { ProductionBrokerRuntime } from './ProductionBrokerRuntime';
@@ -372,6 +373,7 @@ async function taskEvidence(
 	readonly state: string;
 	readonly eventTypes: readonly string[];
 	readonly eventSequences: readonly number[];
+	readonly eventJournalTruncated: boolean;
 	readonly outputCount: number;
 	readonly outputBytes: number;
 	readonly outputHash?: string;
@@ -389,6 +391,7 @@ async function taskEvidence(
 			state: 'not-found',
 			eventTypes: [],
 			eventSequences: [],
+			eventJournalTruncated: false,
 			outputCount: 0,
 			outputBytes: 0,
 			leaseReleased: true,
@@ -397,11 +400,13 @@ async function taskEvidence(
 	const output = record.events
 		.filter(({ type, summary }) => type === 'output' && summary !== undefined)
 		.map(({ summary }) => summary!);
+	const projectedEvents = projectPeerTaskEvents(record.events);
 	return {
 		taskId: record.taskId,
 		state: record.state,
-		eventTypes: record.events.map(({ type }) => type),
-		eventSequences: record.events.map(({ eventSeq }) => eventSeq),
+		eventTypes: projectedEvents.events.map(({ type }) => type),
+		eventSequences: projectedEvents.events.map(({ eventSeq }) => eventSeq),
+		eventJournalTruncated: record.eventsTruncated || projectedEvents.truncated,
 		outputCount: output.length,
 		outputBytes: output.reduce((total, value) => total + Buffer.byteLength(value, 'utf8'), 0),
 		...(output.length === 0 ? {} : { outputHash: fingerprint('task-output', output.join('\0')) }),

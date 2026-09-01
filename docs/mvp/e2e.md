@@ -119,6 +119,9 @@ separately validated minimal diagnostic envelope. If full schema or safety
 validation fails, the diagnostic remains at the stable evidence path with the
 original stable error code and `outcome: fail`. Active Broker task states are
 normalized to `not-observed` rather than copied into terminal-only fields.
+Verbose task journals are projected to at most 256 actual event observations;
+`eventJournalTruncated` is explicit, milestone types retain their original
+monotonic sequence numbers, and no synthetic events or renumbering is allowed.
 
 `MESH_PEER_DELEGATION_E2E_TEST_MODE` is internal to subprocess tests. It cannot be
 used through `npm run test:peer-delegation-real`, requires an isolated evidence
