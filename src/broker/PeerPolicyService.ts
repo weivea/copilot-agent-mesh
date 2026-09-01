@@ -27,6 +27,7 @@ import type {
 	TaskRouteRequest,
 } from './NodeRegistry';
 import type { PeerPolicyEntry, PeerPolicyStore } from './PeerPolicyStore';
+import { foldWindowName, resolveWindowDisplayName } from './WindowName';
 
 export interface PeerPolicyServiceOptions {
 	readonly enabled: () => boolean;
@@ -52,7 +53,11 @@ export class PeerPolicyService implements PeerRouteAuthorizer {
 		const workspace = input.workspaceIdentity === undefined
 			? this.requireSingleOwnedWorkspace(identity)
 			: this.requireOwnedWorkspace(identity, input.workspaceIdentity);
-		return this.projectPolicy(workspace.workspaceIdentity, workspace.name);
+		return this.projectPolicy(
+			workspace.workspaceIdentity,
+			workspace.name,
+			identity.nodeId,
+		);
 	}
 
 	public async setPolicy(
@@ -75,13 +80,20 @@ export class PeerPolicyService implements PeerRouteAuthorizer {
 				'A workspace cannot allowlist itself.',
 			);
 		}
+		const effectiveNames = this.effectiveWorkspaceNames();
 		const entry = await this.store.update(input.workspaceIdentity, (current) => ({
-			windowName: input.windowName ?? current?.windowName ?? owned.name,
+			windowName: input.windowName
+				?? current?.windowName
+				?? effectiveNames.get(input.workspaceIdentity)
+				?? resolveWindowDisplayName(undefined, owned.name, identity.nodeId),
 			acceptsIncoming: input.acceptsIncoming ?? current?.acceptsIncoming ?? false,
 			allowlist: input.allowlist === undefined
 				? [...(current?.allowlist ?? [])]
 				: [...input.allowlist],
-		}));
+		}), [...effectiveNames].map(([workspaceIdentity, windowName]) => ({
+			workspaceIdentity,
+			windowName,
+		})));
 		this.changed();
 		return this.toResult(input.workspaceIdentity, entry);
 	}
@@ -91,6 +103,7 @@ export class PeerPolicyService implements PeerRouteAuthorizer {
 		if (!this.options.enabled()) {
 			return emptyDirectory(this.registry.list().deviceId);
 		}
+
 		const source = this.registry.peerNode(identity);
 		if (source === undefined) {
 			throw new MeshDomainError('POLICY_FORBIDDEN', 'The policy caller is not registered.');
@@ -100,6 +113,7 @@ export class PeerPolicyService implements PeerRouteAuthorizer {
 			return emptyDirectory(this.registry.list().deviceId);
 		}
 		const raw = this.registry.list();
+		const labels = this.effectiveNodeLabels();
 		const nodes = raw.nodes
 			.filter((node) =>
 				node.nodeId !== identity.nodeId
@@ -112,7 +126,7 @@ export class PeerPolicyService implements PeerRouteAuthorizer {
 					undefined,
 				) === 'allowed',
 			)
-			.map((node) => this.projectAuthorizedNode(node));
+			.map((node) => this.projectAuthorizedNode(node, labels.get(node.nodeId)));
 		return nodeDirectoryResultSchema.parse({
 			deviceId: raw.deviceId,
 			nodes,
@@ -121,23 +135,21 @@ export class PeerPolicyService implements PeerRouteAuthorizer {
 		});
 	}
 
+	public displayLabel(node: PeerNodeSnapshot): string {
+		return this.effectiveNodeLabels().get(node.nodeId) ?? node.nodeId.slice(0, 8);
+	}
+
 	public listDashboard(caller: NodeIdentityParams): DashboardNodeDirectoryResult {
 		this.requireCaller(caller);
 		const raw = this.registry.list();
+		const labels = this.effectiveNodeLabels();
 		return dashboardNodeDirectoryResultSchema.parse({
 			deviceId: raw.deviceId,
 			nodes: raw.nodes.map((node) => {
-				const workspace = node.workspaces.length === 1 ? node.workspaces[0] : undefined;
-				const policy = workspace === undefined
-					? undefined
-					: this.store.get(workspace.workspaceIdentity);
 				return {
 					nodeId: node.nodeId,
 					nodeInstanceId: node.nodeInstanceId,
-					label: safeDisplayName(
-						policy?.windowName ?? workspace?.name ?? node.label,
-						shortId(node.nodeId),
-					),
+					label: labels.get(node.nodeId) ?? node.nodeId.slice(0, 8),
 					status: node.status,
 					workspaces: node.workspaces.map((entry) => ({
 						workspaceId: entry.workspaceId,
@@ -166,6 +178,7 @@ export class PeerPolicyService implements PeerRouteAuthorizer {
 		if (source === undefined) {
 			throw new MeshDomainError('POLICY_FORBIDDEN', 'The policy caller is not registered.');
 		}
+		const labels = this.effectiveNodeLabels();
 		const candidates = this.registry.peerNodes()
 			.filter((node) => node.nodeId !== identity.nodeId)
 			.slice(0, PROTOCOL_LIMITS.nodeListCount)
@@ -178,10 +191,7 @@ export class PeerPolicyService implements PeerRouteAuthorizer {
 					nodeId: shortId(node.nodeId),
 					nodeInstanceId: shortId(node.nodeInstanceId),
 					...(workspace === undefined ? {} : { workspaceId: shortId(workspace.workspaceId) }),
-					label: safeDisplayName(
-						policy?.windowName ?? workspace?.name ?? node.label,
-						shortId(node.nodeId),
-					),
+					label: labels.get(node.nodeId) ?? node.nodeId.slice(0, 8),
 					...(node.workspaces.length > 1
 						? { workspaceName: `${node.workspaces.length} workspaces` }
 						: workspace === undefined
@@ -305,23 +315,81 @@ export class PeerPolicyService implements PeerRouteAuthorizer {
 		return this.gateState(source, target, target.workspaces[0].workspaceIdentity);
 	}
 
-	private projectAuthorizedNode(node: WindowNodeDescriptor): WindowNodeDescriptor {
-		const workspace = node.workspaces[0];
-		const policy = workspace === undefined
-			? undefined
-			: this.store.get(workspace.workspaceIdentity);
+	private projectAuthorizedNode(
+		node: WindowNodeDescriptor,
+		label: string | undefined,
+	): WindowNodeDescriptor {
 		return {
 			...node,
-			label: safeDisplayName(
-				policy?.windowName ?? workspace?.name ?? node.label,
-				shortId(node.nodeId),
-			),
+			label: label ?? node.nodeId.slice(0, 8),
 			workspaces: node.workspaces.map((entry) => ({
 				...entry,
 				name: safeDisplayName(entry.name, 'Workspace'),
 				acceptsIncoming: this.store.get(entry.workspaceIdentity)?.acceptsIncoming ?? false,
 			})),
 		};
+	}
+
+	private effectiveWorkspaceNames(): ReadonlyMap<string, string> {
+		const names = new Map<string, string>();
+		const used = new Set<string>();
+		for (const [workspaceIdentity, entry] of Object.entries(this.store.snapshot().entries)) {
+			names.set(workspaceIdentity, entry.windowName);
+			used.add(entry.windowNameFold);
+		}
+		const claimed = this.registry.peerNodes()
+			.flatMap((node) => node.workspaces
+				.filter(({ status }) => status === 'claimed')
+				.map((workspace) => ({ nodeId: node.nodeId, workspace })))
+			.sort((left, right) =>
+				left.workspace.workspaceIdentity.localeCompare(right.workspace.workspaceIdentity),
+			);
+		for (const [index, { nodeId, workspace }] of claimed.entries()) {
+			if (names.has(workspace.workspaceIdentity)) {
+				continue;
+			}
+			const candidate = resolveWindowDisplayName(undefined, workspace.name, nodeId);
+			const windowName = used.has(foldWindowName(candidate))
+				? allocateEffectiveFallback(nodeId, index, used)
+				: candidate;
+			names.set(workspace.workspaceIdentity, windowName);
+			used.add(foldWindowName(windowName));
+		}
+		return names;
+	}
+
+	private effectiveNodeLabels(): ReadonlyMap<string, string> {
+		const workspaceNames = this.effectiveWorkspaceNames();
+		const nodes = this.registry.peerNodes();
+		const labels = new Map<string, string>();
+		const used = new Set<string>();
+		const candidates = nodes.map((node) => {
+			const workspace = node.workspaces.length === 1 ? node.workspaces[0] : undefined;
+			const policy = workspace === undefined
+				? undefined
+				: this.store.get(workspace.workspaceIdentity);
+			const ownsClaim = node.online && workspace?.status === 'claimed';
+			return {
+				node,
+				candidate: workspace === undefined
+					? node.nodeId.slice(0, 8)
+					: workspaceNames.get(workspace.workspaceIdentity)
+						?? resolveWindowDisplayName(undefined, workspace.name, node.nodeId),
+				priority: policy === undefined
+					? ownsClaim ? 2 : 3
+					: ownsClaim ? 0 : 1,
+			};
+		}).sort((left, right) =>
+			left.priority - right.priority || left.node.nodeId.localeCompare(right.node.nodeId),
+		);
+		for (const [index, { node, candidate }] of candidates.entries()) {
+			const label = used.has(foldWindowName(candidate))
+				? allocateEffectiveFallback(node.nodeId, index, used)
+				: candidate;
+			labels.set(node.nodeId, label);
+			used.add(foldWindowName(label));
+		}
+		return labels;
 	}
 
 	private requireSingleOwnedWorkspace(caller: NodeIdentityParams) {
@@ -360,11 +428,17 @@ export class PeerPolicyService implements PeerRouteAuthorizer {
 		return node;
 	}
 
-	private projectPolicy(workspaceIdentity: string, fallbackName: string): NodePolicyResult {
+	private projectPolicy(
+		workspaceIdentity: string,
+		fallbackName: string,
+		nodeId: string,
+	): NodePolicyResult {
 		const entry = this.store.get(workspaceIdentity);
 		return nodePolicyResultSchema.parse({
 			workspaceIdentity,
-			windowName: entry?.windowName ?? fallbackName,
+			windowName: entry?.windowName
+				?? this.effectiveWorkspaceNames().get(workspaceIdentity)
+				?? resolveWindowDisplayName(undefined, fallbackName, nodeId),
 			acceptsIncoming: entry?.acceptsIncoming ?? false,
 			allowlist: [...(entry?.allowlist ?? [])],
 		});
@@ -407,6 +481,23 @@ function emptyDirectory(deviceId: string): NodeDirectoryResult {
 
 function shortId(value: string): string {
 	return value.slice(0, 8);
+}
+
+function allocateEffectiveFallback(
+	nodeId: string,
+	index: number,
+	used: ReadonlySet<string>,
+): string {
+	const shortNodeId = nodeId.slice(0, 8);
+	for (let attempt = 0; ; attempt += 1) {
+		const suffix = attempt === 0 ? `${index + 1}` : `${index + 1}-${attempt + 1}`;
+		const candidate = attempt === 0 && !used.has(foldWindowName(shortNodeId))
+			? shortNodeId
+			: `${shortNodeId}-${suffix}`;
+		if (!used.has(foldWindowName(candidate))) {
+			return candidate;
+		}
+	}
 }
 
 function safeDisplayName(value: string, fallback: string): string {

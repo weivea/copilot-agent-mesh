@@ -5,3 +5,4 @@ export * from './NodeRegistry';
 export * from './PeerPolicyService';
 export * from './PeerPolicyStore';
 export * from './TaskRouteCatalog';
+export * from './WindowName';

@@ -2,10 +2,11 @@ import { DashboardViewModel } from './DashboardPresenter';
 import { containsUnsafeDashboardText } from './DashboardRedaction';
 import { TASK_STATUSES, utf8ByteLength } from '../../shared/protocol';
 
-export const DASHBOARD_MESSAGE_VERSION = 3 as const;
+export const DASHBOARD_MESSAGE_VERSION = 4 as const;
 
 export const DASHBOARD_ACTIONS = [
 	'configureDevice',
+	'renameWindow',
 	'registerWorkspace',
 	'removeWorkspace',
 	'startListener',
@@ -19,6 +20,16 @@ export const DASHBOARD_ACTIONS = [
 ] as const;
 
 export type DashboardAction = typeof DASHBOARD_ACTIONS[number];
+
+export type DashboardOutboundErrorCode =
+	| 'INVALID_MESSAGE'
+	| 'ACTION_FAILED'
+	| 'UNSAFE_VIEW_MODEL'
+	| 'WINDOW_NAME_CONFLICT'
+	| 'WINDOW_NAME_INVALID'
+	| 'PEER_DELEGATION_DISABLED'
+	| 'WORKSPACE_SELECTION_AMBIGUOUS'
+	| 'POLICY_FORBIDDEN';
 
 export type DashboardInboundMessage =
 	| {
@@ -50,7 +61,7 @@ export type DashboardOutboundMessage =
 		readonly version: typeof DASHBOARD_MESSAGE_VERSION;
 		readonly uiInstanceId: string;
 		readonly type: 'dashboard.error';
-		readonly code: 'INVALID_MESSAGE' | 'ACTION_FAILED' | 'UNSAFE_VIEW_MODEL';
+		readonly code: DashboardOutboundErrorCode;
 		readonly message: string;
 	};
 
@@ -136,7 +147,16 @@ export function assertSafeDashboardOutboundMessage(value: DashboardOutboundMessa
 		assertDashboardViewModel(value.model);
 	} else {
 		assertExactRecord(value, ['version', 'uiInstanceId', 'type', 'code', 'message'], []);
-		if (!['INVALID_MESSAGE', 'ACTION_FAILED', 'UNSAFE_VIEW_MODEL'].includes(value.code)) {
+		if (![
+			'INVALID_MESSAGE',
+			'ACTION_FAILED',
+			'UNSAFE_VIEW_MODEL',
+			'WINDOW_NAME_CONFLICT',
+			'WINDOW_NAME_INVALID',
+			'PEER_DELEGATION_DISABLED',
+			'WORKSPACE_SELECTION_AMBIGUOUS',
+			'POLICY_FORBIDDEN',
+		].includes(value.code)) {
 			throw new Error('Invalid dashboard error code.');
 		}
 	}
@@ -150,6 +170,7 @@ function assertDashboardViewModel(model: unknown): asserts model is DashboardVie
 			'device',
 			'listener',
 			'broker',
+			'thisWindow',
 			'localNodes',
 			'remoteDevices',
 			'workspaces',
@@ -200,6 +221,23 @@ function assertDashboardViewModel(model: unknown): asserts model is DashboardVie
 	if (model.broker.error !== undefined) {
 		assertDashboardError(model.broker.error);
 	}
+
+	assertExactRecord(
+		model.thisWindow,
+		['name', 'workspaceName', 'claimStatus', 'previewEnabled', 'canRename'],
+		['detail'],
+	);
+	assertStrings(model.thisWindow, ['name', 'workspaceName']);
+	assertEnum(model.thisWindow.claimStatus, [
+		'claimed',
+		'readOnly',
+		'conflict',
+		'unclaimed',
+		'ambiguous',
+	]);
+	assertBoolean(model.thisWindow.previewEnabled);
+	assertBoolean(model.thisWindow.canRename);
+	assertOptionalString(model.thisWindow.detail);
 
 	assertArray(model.localNodes, 128);
 	model.localNodes.forEach(assertNode);

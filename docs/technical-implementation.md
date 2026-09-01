@@ -226,7 +226,12 @@ Gateway/Tunnel → Broker → Target Node；Broker 在发送前持久化 Route C
 0.4.0 的 Broker 独占 `mesh-state/peers/policy.json`。版本 1 的策略按不可逆
 `workspaceIdentity` 保存窗口显示名、`acceptsIncoming` 和单向 allowlist；不保存路径。
 Store 复用原子临时文件、file fsync、rename、directory fsync，并在持久化前后检查
-Broker generation。损坏 JSON、未知版本或越界数据都显式失败。
+Broker generation。窗口名的 NFKC/case-fold 唯一性检查、partial policy 合并与原子写入
+位于同一个串行 Store mutation 中，因此并发同名请求只有一个可以成功，且不会覆盖
+`acceptsIncoming` 或 allowlist。P2 结构合法的 schema-v1 条目可带旧 fold 或旧版允许的
+不安全 Workspace fallback；启动时通过 generation-fenced 原子兼容改写更新 fold，并为
+不安全/冲突名分配确定性安全回退，同时保留接收门、allowlist 与时间戳。损坏 JSON、
+未知版本、结构越界或不匹配旧 fold 的数据仍显式失败。
 
 `PeerPolicyService` 是唯一策略裁决者。写入者必须是已认证的精确
 `nodeId`/`nodeInstanceId`，且只能修改自己当前 `claimed` 的 Workspace。Tool
@@ -238,6 +243,11 @@ Lease 前再次求值，关闭列出后撤销的 TOCTOU 窗口。多根来源窗
 Tool Workspace 上下文，因此必须由每个当前 `claimed` 的来源 Workspace 都 allowlist
 目标；`node.policy.get` 可显式选择调用者自己已 claim 的 Workspace 以逐项配置，
 但该选择不作为任务来源断言。目标窗口仍必须恰好 claim 一个 Workspace。
+窗口显示统一复用 `windowNodeDescriptor.label`，按已存策略名 → 安全 Workspace 显示名 →
+短 node ID 回退。有效名分配同时保留所有显式名，并在当前 claimed Workspace fallback
+重名时按稳定 identity 确定性使用短 ID；重命名与这些有效 fallback 冲突时显式失败。
+授权目录、Dashboard、候选与 Task 来源使用同一分配；显示名不参与 allowlist、路由、
+Lease 或 Task ownership。
 
 ### 4.7 0.1 Migration
 
@@ -962,6 +972,7 @@ Webview 不直接操作 Tunnel、Peer 或 Task。`DashboardPresenter` 从各 Sto
 interface DashboardViewModel {
   device: DeviceViewModel;
   broker: BrokerViewModel;
+  thisWindow: ThisWindowViewModel;
   listener: ListenerViewModel;
   localNodes: readonly NodeViewModel[];
   workspaceConflicts: readonly WorkspaceConflictViewModel[];
@@ -974,6 +985,11 @@ Dashboard 明确显示 Broker Owner/Generation/Takeover、本机 Nodes、Workspa
 Claims/Conflicts、Remote Nodes 和 Tasks。所有操作与五个 Tool 一样使用
 Device → Node → Workspace Target。UI Command 进入 Extension Host 后通过 IPC
 交给 Broker/Application Service，再由权威 Store Event multiplex 刷新全部窗口。
+
+`This Window` 显示当前窗口名、当前 Workspace 显示名、claim 状态与 Peer Preview 状态。
+Webview 的 `renameWindow` action 不接受 Workspace identity 或名称；名称由 Extension Host
+InputBox 收集，目标由当前 Window Node 的 own claim 与 active editor 所属 Workspace
+服务端派生。多根窗口无法唯一选择时显式失败，Preview 默认关闭时控制禁用。
 
 ### 14.2 安全
 

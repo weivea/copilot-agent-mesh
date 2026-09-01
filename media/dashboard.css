@@ -144,6 +144,12 @@ button:hover {
 	background: var(--vscode-button-hoverBackground);
 }
 
+button:disabled {
+	color: var(--vscode-disabledForeground);
+	background: var(--vscode-button-secondaryBackground);
+	cursor: not-allowed;
+}
+
 button.danger {
 	color: var(--vscode-errorForeground);
 	background: transparent;

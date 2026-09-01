@@ -1,9 +1,11 @@
 import { randomUUID } from 'node:crypto';
 
 import type * as vscode from 'vscode';
+import { z } from 'zod';
 
 import {
 	ACTIVE_TASK_STATUSES,
+	JSON_RPC_ERROR_CODES,
 	PROTOCOL_LIMITS,
 	utf8String,
 } from '../../shared/protocol';
@@ -19,6 +21,8 @@ import type {
 	BrokerLifecycle,
 	BrokerLifecycleStatus,
 } from '../broker/BrokerLifecycle';
+import { resolveWindowDisplayName } from '../broker/WindowName';
+import { LocalIpcRemoteError } from '../ipc';
 import type { DeviceProfile } from '../storage/DeviceProfileStore';
 import type { LocalBrokerTaskFacade } from '../tools/LocalBrokerTaskFacade';
 import type {
@@ -26,7 +30,12 @@ import type {
 	DashboardServiceBindings,
 	DashboardSnapshot,
 	DashboardTaskTarget,
+	DashboardWindowRenameSession,
 } from '../ui/DashboardFacade';
+import {
+	DashboardActionError,
+	type DashboardActionErrorCode,
+} from '../ui/DashboardActionError';
 import type { WindowNodeClient } from '../node/WindowNodeClient';
 import type { LocalIpcRemoteTaskAdapter } from '../node/LocalIpcRemoteTaskAdapter';
 import type { ProductionBrokerRuntime } from './ProductionBrokerRuntime';
@@ -100,6 +109,7 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 				});
 			}
 		}
+		const thisWindow = await this.thisWindowSnapshot(localNodes, errors);
 
 		let remoteDirectory: MeshRemoteDirectorySnapshot = {
 			devices: [],
@@ -255,6 +265,7 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 				extensionVersion: profile.extensionVersion,
 			},
 			broker,
+			thisWindow,
 			listener,
 			localNodes,
 			remoteDevices,
@@ -290,6 +301,66 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 		);
 		await owner.device.rename(name);
 		this.options.changed.fire();
+	}
+
+	public async prepareWindowRename(): Promise<DashboardWindowRenameSession> {
+		this.options.guard.assertAllowed({ requireWorkspace: false });
+		if (!this.peerDelegationEnabled()) {
+			throw new DashboardActionError(
+				'PEER_DELEGATION_DISABLED',
+				'Enable the Peer Delegation Preview before renaming this window.',
+			);
+		}
+		const selection = this.options.node.selectPeerPolicyWorkspace(
+			this.activeWorkspaceUri(),
+		);
+		if (selection.kind !== 'selected') {
+			throw renameSelectionError(selection.claimStatus);
+		}
+		let policy;
+		try {
+			policy = await this.options.node.getPeerPolicy(selection.workspaceIdentity);
+		} catch (error: unknown) {
+			throw toDashboardPolicyError(error);
+		}
+		return {
+			currentName: resolveWindowDisplayName(
+				policy.windowName,
+				selection.workspaceName,
+				this.options.node.nodeId,
+			),
+			rename: async (name: string) => {
+				this.options.guard.assertAllowed({ requireWorkspace: false });
+				if (!this.peerDelegationEnabled()) {
+					throw new DashboardActionError(
+						'PEER_DELEGATION_DISABLED',
+						'Enable the Peer Delegation Preview before renaming this window.',
+					);
+				}
+				const live = this.options.node.selectPeerPolicyWorkspace(
+					this.activeWorkspaceUri(),
+				);
+				if (
+					live.kind !== 'selected'
+					|| live.workspaceIdentity !== selection.workspaceIdentity
+					|| live.workspaceId !== selection.workspaceId
+				) {
+					throw new DashboardActionError(
+						'WORKSPACE_SELECTION_AMBIGUOUS',
+						'The active Workspace changed while renaming. Reopen rename and try again.',
+					);
+				}
+				try {
+					await this.options.node.setPeerPolicy({
+						workspaceIdentity: selection.workspaceIdentity,
+						windowName: name,
+					});
+				} catch (error: unknown) {
+					throw toDashboardPolicyError(error);
+				}
+				this.options.changed.fire();
+			},
+		};
 	}
 
 	public async registerCurrentWorkspace(): Promise<void> {
@@ -385,6 +456,85 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 		}
 	}
 
+	private async thisWindowSnapshot(
+		localNodes: readonly DashboardNodeSnapshot[],
+		errors: DashboardSnapshot['errors'][number][],
+	): Promise<DashboardSnapshot['thisWindow']> {
+		const previewEnabled = this.peerDelegationEnabled();
+		const selection = this.options.node.selectPeerPolicyWorkspace(
+			this.activeWorkspaceUri(),
+		);
+		const node = localNodes.find(({ thisWindow }) => thisWindow);
+		if (selection.kind !== 'selected') {
+			const workspaceName = resolveWindowDisplayName(
+				undefined,
+				selection.workspaceName,
+				this.options.node.nodeId,
+			);
+			return {
+				name: node?.label ?? this.options.node.nodeId.slice(0, 8),
+				workspaceName,
+				claimStatus: selection.claimStatus,
+				previewEnabled,
+				canRename: false,
+				detail: selection.claimStatus === 'ambiguous'
+					? 'Select an editor in one claimed Workspace before renaming.'
+					: 'This window does not have a mutable claimed Workspace.',
+			};
+		}
+
+		const workspaceName = node?.workspaces.find(
+			({ workspaceId }) => workspaceId === selection.workspaceId,
+		)?.name ?? resolveWindowDisplayName(
+			undefined,
+			selection.workspaceName,
+			this.options.node.nodeId,
+		);
+		let name = node?.workspaces.length === 1
+			? node.label
+			: resolveWindowDisplayName(undefined, workspaceName, this.options.node.nodeId);
+		let canRename = previewEnabled;
+		if (previewEnabled) {
+			try {
+				const policy = await this.options.node.getPeerPolicy(selection.workspaceIdentity);
+				name = resolveWindowDisplayName(
+					policy.windowName,
+					workspaceName,
+					this.options.node.nodeId,
+				);
+			} catch {
+				canRename = false;
+				errors.push({
+					code: 'PEER_POLICY_UNAVAILABLE',
+					message: 'This window policy is reconnecting.',
+					action: 'Wait for Broker takeover or refresh the dashboard.',
+				});
+			}
+		}
+		return {
+			name,
+			workspaceName,
+			claimStatus: 'claimed',
+			previewEnabled,
+			canRename,
+			...(previewEnabled ? {} : {
+				detail: 'Enable copilotAgentMesh.experimental.peerDelegation to rename this window.',
+			}),
+		};
+	}
+
+	private activeWorkspaceUri(): string | undefined {
+		const documentUri = this.options.vscodeApi.window.activeTextEditor?.document.uri;
+		return documentUri === undefined
+			? undefined
+			: this.options.vscodeApi.workspace.getWorkspaceFolder(documentUri)?.uri.toString();
+	}
+
+	private peerDelegationEnabled(): boolean {
+		return this.options.vscodeApi.workspace.getConfiguration('copilotAgentMesh')
+			.get<boolean>('experimental.peerDelegation', false);
+	}
+
 	private requireOwner(): ProductionBrokerRuntime {
 		const owner = this.options.ownerRuntime();
 		if (owner === undefined || this.options.lifecycle.snapshot().state !== 'running') {
@@ -474,6 +624,77 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 			...(device.peerId === undefined ? {} : { peerId: device.peerId }),
 		};
 	}
+}
+
+function toDashboardPolicyError(error: unknown): Error {
+	if (error instanceof DashboardActionError) {
+		return error;
+	}
+	if (error instanceof z.ZodError) {
+		return new DashboardActionError(
+			'WINDOW_NAME_INVALID',
+			'The window name is empty or exceeds the UTF-8 protocol limit.',
+		);
+	}
+	if (error instanceof LocalIpcRemoteError) {
+		const reason = remoteErrorReason(error);
+		if (
+			reason === 'WINDOW_NAME_CONFLICT'
+			|| reason === 'WINDOW_NAME_INVALID'
+			|| reason === 'POLICY_FORBIDDEN'
+		) {
+			return new DashboardActionError(
+				reason,
+				reason === 'WINDOW_NAME_CONFLICT'
+					? 'Another Workspace already uses an equivalent window name.'
+					: reason === 'WINDOW_NAME_INVALID'
+						? 'The window name contains a path, invisible character, or secret-like value.'
+						: 'Only a Workspace claimed by this window can be renamed.',
+			);
+		}
+		if (error.code === JSON_RPC_ERROR_CODES.INVALID_PARAMS) {
+			return new DashboardActionError(
+				'WINDOW_NAME_INVALID',
+				'The window name is empty or exceeds the UTF-8 protocol limit.',
+			);
+		}
+	}
+	return error instanceof Error
+		? error
+		: new Error('The window rename failed without diagnostic details.');
+}
+
+function renameSelectionError(
+	claimStatus: 'unclaimed' | 'readOnly' | 'conflict' | 'ambiguous',
+): DashboardActionError {
+	return claimStatus === 'ambiguous'
+		? new DashboardActionError(
+			'WORKSPACE_SELECTION_AMBIGUOUS',
+			'Select an editor in the Workspace you want to rename, then retry.',
+		)
+		: new DashboardActionError(
+			'POLICY_FORBIDDEN',
+			'Only a Workspace claimed by this window can be renamed.',
+		);
+}
+
+function remoteErrorReason(error: LocalIpcRemoteError): DashboardActionErrorCode | undefined {
+	if (
+		typeof error.data !== 'object'
+		|| error.data === null
+		|| Array.isArray(error.data)
+		|| !('reason' in error.data)
+	) {
+		return undefined;
+	}
+	const reason = error.data.reason;
+	return typeof reason === 'string' && [
+		'WINDOW_NAME_CONFLICT',
+		'WINDOW_NAME_INVALID',
+		'POLICY_FORBIDDEN',
+	].includes(reason)
+		? reason as DashboardActionErrorCode
+		: undefined;
 }
 
 function brokerSnapshot(

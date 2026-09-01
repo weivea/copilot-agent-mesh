@@ -174,8 +174,23 @@ interface WorkspaceObservation {
 	readonly workspaceIdentity: string;
 	readonly workspaceId: string;
 	readonly status: WorkspaceClaimStatus;
+	readonly sourceUri: string;
 	readonly workspace: RegisteredLocalWorkspace;
 }
+
+export type PeerPolicyWorkspaceSelection =
+	| {
+		readonly kind: 'selected';
+		readonly workspaceIdentity: string;
+		readonly workspaceId: string;
+		readonly workspaceName: string;
+		readonly claimStatus: 'claimed';
+	}
+	| {
+		readonly kind: 'unavailable';
+		readonly workspaceName: string;
+		readonly claimStatus: 'unclaimed' | 'readOnly' | 'conflict' | 'ambiguous';
+	};
 
 const defaultScheduler: WindowNodeScheduler = {
 	schedule(callback, delayMs) {
@@ -310,6 +325,32 @@ export class WindowNodeClient implements WorkspaceResolver {
 	public async resolve(workspaceId: string): Promise<RegisteredLocalWorkspace | undefined> {
 		const id = uuidSchema.safeParse(workspaceId);
 		return id.success ? this.workspaces.get(id.data) : undefined;
+	}
+
+	public selectPeerPolicyWorkspace(
+		activeWorkspaceUri?: string,
+	): PeerPolicyWorkspaceSelection {
+		const observations = [...this.observations.values()];
+		const active = activeWorkspaceUri === undefined
+			? undefined
+			: observations.find(({ sourceUri, workspace }) =>
+				sourceUri === activeWorkspaceUri || workspace.uri === activeWorkspaceUri,
+			);
+		if (active !== undefined) {
+			return policyWorkspaceSelection(active);
+		}
+		const claimed = observations.filter(({ status }) => status === 'claimed');
+		if (claimed.length === 1) {
+			return policyWorkspaceSelection(claimed[0]);
+		}
+		if (observations.length === 1) {
+			return policyWorkspaceSelection(observations[0]);
+		}
+		return {
+			kind: 'unavailable',
+			workspaceName: observations.length === 0 ? 'No Workspace' : 'Multiple Workspaces',
+			claimStatus: observations.length === 0 ? 'unclaimed' : 'ambiguous',
+		};
 	}
 
 	public listNodes(): Promise<NodeDirectoryResult> {
@@ -718,6 +759,7 @@ export class WindowNodeClient implements WorkspaceResolver {
 				workspaceIdentity,
 				workspaceId: result.workspaceId,
 				status: result.status,
+				sourceUri: entry.localUri,
 				workspace,
 			});
 			if (result.status === 'claimed' && result.canExecute) {
@@ -1293,6 +1335,25 @@ export function toWindowNodeHandlerError(error: unknown): LocalIpcHandlerError {
 			? { diagnostic: safeErrorKind(error) }
 			: undefined,
 	);
+}
+
+function policyWorkspaceSelection(
+	observation: WorkspaceObservation,
+): PeerPolicyWorkspaceSelection {
+	if (observation.status !== 'claimed') {
+		return {
+			kind: 'unavailable',
+			workspaceName: observation.workspace.displayName,
+			claimStatus: observation.status,
+		};
+	}
+	return {
+		kind: 'selected',
+		workspaceIdentity: observation.workspaceIdentity,
+		workspaceId: observation.workspaceId,
+		workspaceName: observation.workspace.displayName,
+		claimStatus: 'claimed',
+	};
 }
 
 function safeErrorKind(error: unknown): string {

@@ -14,6 +14,7 @@ import {
 	type AtomicFileStore,
 } from '../storage/AtomicFileStore';
 import type { WorkerOwnership } from '../storage/WorkerOwnerLock';
+import { foldWindowName, validateWindowName } from './WindowName';
 
 export const PEER_POLICY_PATH = 'peers/policy.json';
 export const MAX_PEER_POLICY_ENTRIES = 256;
@@ -28,7 +29,7 @@ export const peerPolicyEntrySchema = z.strictObject({
 	updatedAt: timestampSchema,
 });
 
-export const peerPolicyDocumentSchema = z.strictObject({
+const peerPolicyDocumentStructureSchema = z.strictObject({
 	schemaVersion: z.literal(1),
 	entries: z.record(workspaceIdentitySchema, peerPolicyEntrySchema)
 		.refine(
@@ -37,9 +38,61 @@ export const peerPolicyDocumentSchema = z.strictObject({
 		),
 });
 
+const peerPolicyCompatibilitySchema = peerPolicyDocumentStructureSchema.superRefine(
+	(document, context) => {
+		for (const [identity, entry] of Object.entries(document.entries)) {
+			if (entry.windowNameFold !== legacyFoldWindowName(entry.windowName)) {
+				context.addIssue({
+					code: 'custom',
+					path: ['entries', identity, 'windowNameFold'],
+					message: 'Stored legacy window name fold does not match the window name',
+				});
+			}
+		}
+	},
+);
+
+export const peerPolicyDocumentSchema = peerPolicyDocumentStructureSchema.superRefine((document, context) => {
+	const owners = new Map<string, string>();
+	for (const [identity, entry] of Object.entries(document.entries)) {
+		try {
+			validateWindowName(entry.windowName);
+		} catch {
+			context.addIssue({
+				code: 'custom',
+				path: ['entries', identity, 'windowName'],
+				message: 'Stored window name is unsafe',
+			});
+		}
+		const fold = foldWindowName(entry.windowName);
+		if (entry.windowNameFold !== fold) {
+			context.addIssue({
+				code: 'custom',
+				path: ['entries', identity, 'windowNameFold'],
+				message: 'Stored window name fold does not match the window name',
+			});
+		}
+		const owner = owners.get(fold);
+		if (owner !== undefined && owner !== identity) {
+			context.addIssue({
+				code: 'custom',
+				path: ['entries', identity, 'windowNameFold'],
+				message: 'Stored window names must be device-wide unique',
+			});
+		} else {
+			owners.set(fold, identity);
+		}
+	}
+});
+
 export type PeerPolicyEntry = z.infer<typeof peerPolicyEntrySchema>;
 export type PeerPolicyDocument = z.infer<typeof peerPolicyDocumentSchema>;
 export type PeerPolicyValue = Omit<PeerPolicyEntry, 'updatedAt' | 'windowNameFold'>;
+
+export interface PeerPolicyEffectiveName {
+	readonly workspaceIdentity: string;
+	readonly windowName: string;
+}
 
 export interface PeerPolicyStoreOptions {
 	readonly ownership: WorkerOwnership;
@@ -67,13 +120,22 @@ export class PeerPolicyStore {
 				return;
 			}
 			const parsed = peerPolicyDocumentSchema.safeParse(stored);
-			if (!parsed.success) {
+			if (parsed.success) {
+				this.document = parsed.data;
+				return;
+			}
+			const compatible = peerPolicyCompatibilitySchema.safeParse(stored);
+			if (!compatible.success) {
 				throw new StorageCorruptionError(
 					PEER_POLICY_PATH,
-					z.prettifyError(parsed.error),
+					z.prettifyError(compatible.error),
 				);
 			}
-			this.document = parsed.data;
+			const migrated = migrateCompatibleDocument(compatible.data);
+			await this.assertFence('before');
+			await this.files.writeJson(PEER_POLICY_PATH, migrated);
+			await this.assertFence('during');
+			this.document = migrated;
 		});
 	}
 
@@ -96,14 +158,16 @@ export class PeerPolicyStore {
 	public update(
 		workspaceIdentity: string,
 		update: (current: PeerPolicyEntry | undefined) => PeerPolicyValue,
+		effectiveNames: readonly PeerPolicyEffectiveName[] = [],
 	): Promise<PeerPolicyEntry> {
 		const identity = workspaceIdentitySchema.parse(workspaceIdentity);
-		return this.mutate(identity, update);
+		return this.mutate(identity, update, effectiveNames);
 	}
 
 	private mutate(
 		identity: WorkspaceIdentity,
 		update: (current: PeerPolicyEntry | undefined) => PeerPolicyValue,
+		effectiveNames: readonly PeerPolicyEffectiveName[],
 	): Promise<PeerPolicyEntry> {
 		let result: PeerPolicyEntry | undefined;
 		const operation = this.serialize(async () => {
@@ -118,9 +182,35 @@ export class PeerPolicyStore {
 				);
 			}
 			const policy = update(structuredClone(current.entries[identity]));
+			validateWindowName(policy.windowName);
+			const windowNameFold = foldWindowName(policy.windowName);
+			const conflict = Object.entries(current.entries).find(
+				([candidateIdentity, candidate]) =>
+					candidateIdentity !== identity
+					&& candidate.windowNameFold === windowNameFold,
+			);
+			if (conflict !== undefined) {
+				throw new MeshDomainError(
+					'WINDOW_NAME_CONFLICT',
+					'Another workspace already uses an equivalent window name.',
+				);
+			}
+			for (const candidate of effectiveNames) {
+				const candidateIdentity = workspaceIdentitySchema.parse(candidate.workspaceIdentity);
+				validateWindowName(candidate.windowName);
+				if (
+					candidateIdentity !== identity
+					&& foldWindowName(candidate.windowName) === windowNameFold
+				) {
+					throw new MeshDomainError(
+						'WINDOW_NAME_CONFLICT',
+						'Another workspace already uses an equivalent window name.',
+					);
+				}
+			}
 			const entry = peerPolicyEntrySchema.parse({
 				...policy,
-				windowNameFold: foldWindowName(policy.windowName),
+				windowNameFold,
 				updatedAt: this.options.clock.now().toISOString(),
 			});
 			const next = peerPolicyDocumentSchema.parse({
@@ -168,7 +258,65 @@ export class PeerPolicyStore {
 	}
 }
 
-function foldWindowName(value: string): string {
+function migrateCompatibleDocument(document: PeerPolicyDocument): PeerPolicyDocument {
+	const entries = Object.entries(document.entries)
+		.sort(([left], [right]) => left.localeCompare(right));
+	const used = new Set<string>();
+	const names = new Map<string, string>();
+	for (const [identity, entry] of entries) {
+		if (isValidWindowName(entry.windowName)) {
+			const fold = foldWindowName(entry.windowName);
+			if (!used.has(fold)) {
+				names.set(identity, entry.windowName);
+				used.add(fold);
+			}
+		}
+	}
+	for (const [index, [identity]] of entries.entries()) {
+		if (!names.has(identity)) {
+			const name = compatibilityWindowName(identity, index, used);
+			names.set(identity, name);
+			used.add(foldWindowName(name));
+		}
+	}
+	return peerPolicyDocumentSchema.parse({
+		schemaVersion: 1,
+		entries: Object.fromEntries(entries.map(([identity, entry]) => {
+			const windowName = names.get(identity)!;
+			return [identity, {
+				...entry,
+				windowName,
+				windowNameFold: foldWindowName(windowName),
+			}];
+		})),
+	});
+}
+
+function compatibilityWindowName(
+	workspaceIdentity: string,
+	index: number,
+	used: ReadonlySet<string>,
+): string {
+	const digest = workspaceIdentity.slice('sha256:'.length);
+	for (let attempt = 0; ; attempt += 1) {
+		const suffix = attempt === 0 ? `${index + 1}` : `${index + 1}-${attempt + 1}`;
+		const candidate = `Window ${digest.slice(0, 8)}-${suffix}`;
+		if (!used.has(foldWindowName(candidate))) {
+			return candidate;
+		}
+	}
+}
+
+function isValidWindowName(value: string): boolean {
+	try {
+		validateWindowName(value);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function legacyFoldWindowName(value: string): string {
 	return value.normalize('NFKC').toLocaleLowerCase('en-US');
 }
 

@@ -3,7 +3,7 @@
 
 	const vscode = acquireVsCodeApi();
 	const uiInstanceId = document.body.dataset.uiInstanceId;
-	const version = 3;
+	const version = 4;
 
 	document.addEventListener('click', (event) => {
 		const button = event.target.closest('button[data-action]');
@@ -44,12 +44,34 @@
 	function render(model) {
 		currentModel = { deviceId: model.device.deviceId || '' };
 		renderDevice(model.device, model.broker);
+		renderThisWindow(model.thisWindow);
 		renderListener(model.listener);
 		renderCollection('localNodes', model.localNodes, renderLocalNode, 'No local Window Nodes connected.');
 		renderCollection('remoteDevices', model.remoteDevices, renderRemoteDevice, 'No remote devices configured.');
 		renderCollection('tasks', model.tasks, renderTask, 'No delegated tasks.');
 		renderCollection('errors', model.errors, renderError, '');
 		setText(document.getElementById('announcement'), 'Dashboard refreshed.');
+	}
+
+	function renderThisWindow(thisWindow) {
+		const root = reset(document.getElementById('thisWindow'));
+		root.append(
+			definition('Window name', thisWindow.name),
+			definition('Workspace', thisWindow.workspaceName),
+			definition('Claim', thisWindow.claimStatus),
+			definition('Peer Preview', thisWindow.previewEnabled ? 'Enabled' : 'Disabled'),
+		);
+		if (thisWindow.detail) {
+			root.append(textElement('p', thisWindow.detail, 'detail'));
+		}
+		root.append(actionButton(
+			'Rename',
+			'renameWindow',
+			undefined,
+			false,
+			undefined,
+			!thisWindow.canRename,
+		));
 	}
 
 	function renderDevice(device, broker) {
@@ -219,7 +241,7 @@
 		return row;
 	}
 
-	function actionButton(label, action, targetId, dangerous, route) {
+	function actionButton(label, action, targetId, dangerous, route, disabled) {
 		const button = document.createElement('button');
 		button.type = 'button';
 		button.dataset.action = action;
@@ -236,6 +258,7 @@
 		if (dangerous) {
 			button.className = 'danger';
 		}
+		button.disabled = disabled === true;
 		setText(button, label);
 		return button;
 	}
