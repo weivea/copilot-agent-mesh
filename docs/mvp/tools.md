@@ -11,14 +11,17 @@ state.
 | Tool | Behavior | Application deadline |
 | --- | --- | ---: |
 | `mesh_list_workers` | Returns bounded peer capability and opaque workspace metadata; same-device Window Nodes are visible only after the directional double authorization gate. | 5 s |
-| `mesh_delegate_task` | Persists an intent, waits for durable broker acceptance, then returns `pending` before Agent startup completes. | 15 s |
-| `mesh_get_task` | Returns a bounded snapshot, event cursor, event-gap indicator, and truncation indicator. | 10 s |
+| `mesh_delegate_task` | Starts or reconciles one durable task, then remains pending until an authoritative completed, needs-input, failed, or cancelled state. | 60 min maximum |
+| `mesh_get_task` | Returns a bounded snapshot, event cursor, event-gap indicator, and truncation indicator for abnormal interruption recovery or another task. | 10 s |
 | `mesh_cancel_task` | Requests cancellation through the owner-scoped Facade method. | 10 s |
 | `mesh_answer_task` | Sends an idempotent answer through the owner-scoped Facade method. | 10 s |
 
-`prepareInvocation` is pure. Delegate confirmation displays only peer ID,
-opaque workspace ID, and title summary. It never persists an intent or contacts
-a worker.
+`prepareInvocation` is side-effect free. Delegate confirmation resolves safe
+Window and Workspace display names and includes a bounded title summary,
+one-task scope, never-auto-approved categories, and the 60-minute maximum. It
+never displays IDs, paths, the raw prompt, or secrets, and it never persists an
+intent or contacts a worker. P4 keeps the native confirmation active and does
+not claim that P5 auto-approval is available.
 
 Same-device peer delegation is default-off behind
 `copilotAgentMesh.experimental.peerDelegation`. When enabled, a local target is
@@ -89,23 +92,46 @@ wire form before any generic error or empty-text fallback:
 
 | `s` | Meaning | Compact fields |
 | ---: | --- | --- |
-| `0` | Broker accepted; Agent startup is pending | `t` task ID, `d` delegation request ID |
-| `1` | Caller wait ended; durable delegation needs reconciliation | `t`, `d`, `r:1` |
-| `2` | Durable delegation error | `t`, `d`, `e` stable error code, `r` retry flag |
-| `3` | Intent persistence is still pending and IDs are not available | `r:1` |
+| `0` | Authoritative completion | `t` task ID, `d` delegation request ID, `r` bounded structured result |
+| `1` | Authoritative input request | `t`, `d`, `i` input ID, `q` bounded question |
+| `2` | Authoritative failure or start/reconciliation failure after identity allocation | `t`, `d`, `e` stable error code |
+| `3` | Authoritative cancellation | `t`, `d`, `e` stable error code, `x` = `token`, `budget`, or `peer` |
 
-The keys are `s` state, `t` task ID, `d` delegation request ID, `e` error code,
-and `r` retry/reconciliation flag. State is derived from the full result, never
-inferred merely from the presence of both IDs. The pending and reconciliation
-forms fit a 100-character budget with canonical UUIDs; a conflict error with
-`r:0` fits 200 characters. If the matching compact form does not fit, the
-result is empty text rather than a semantically different generic error.
+The branch-specific fields are exact: `r` appears only for completion; `i` and
+`q` only for needs-input; and `x` only for cancellation. Every compact branch
+preserves `t` and `d`. Questions, result summaries, and error text normalize benign multiline
+whitespace, redact unsafe path/control spans, and remain bounded before token
+contraction. A field containing a recognized credential assignment or bearer
+credential is redacted in full before whitespace normalization, so continuation
+text cannot escape the credential boundary; otherwise safe surrounding content
+is retained. Valid percent-encoded credential-free prose remains available for
+inspection. Malformed, undecodable, or excessively nested percent encoding fails
+closed by redacting the full field, because it can otherwise split a credential
+key from its value. Every decoded form also removes C0, C1, and Unicode format
+controls for credential-key inspection, preventing encoded controls from splitting
+a key. Credential assignment parsing examines a bounded candidate before `=` or
+`:`, treats clear ASCII punctuation as structural boundaries, and normalizes
+wrapper quotes, apostrophes, key whitespace, separators, and inserted Unicode
+marks, symbols, controls, private-use/surrogate code points, separators, and
+default-ignorables away from ASCII alphanumerics. This catches variation selectors,
+combining marks, fillers, visible emoji, quoted-key, and spaced-key obfuscation.
+Ordinary Unicode letters, numbers, and punctuation remain structural prose
+boundaries, so international labels are not collapsed into credential keys.
+Ordinary valid percent-encoded prose remains available. Canonical inspection is
+bounded to a fixed number of linear decode
+passes. Assignment parsing makes one forward pass with rolling normalized key
+state capped at 256 code units, so long runs of ignored filler cannot exhaust a
+backward-search budget or introduce quadratic rescans. Byte-budget
+contraction always preserves `t` and `d`; if a completed or needs-input payload
+cannot fit, it becomes exact compact failure
+`{s:2,t,d,e:"OUTPUT_TOO_LARGE"}` rather than an identity-free generic result.
 
-Cancelling a `CancellationToken` aborts only the current Tool wait. In
-particular, delegate cancellation or acknowledgement timeout does not call the
-remote cancellation method. Once `persistDelegationIntent` resolves, the result
-retains `delegationRequestId` and `taskId` so the durable task can be polled or
-explicitly cancelled.
+Cancelling a VS Code `CancellationToken` sends exactly one task cancellation
+request and continues waiting for an authoritative cancelled or failed state.
+The single 60-minute budget timer uses the same rule. If authoritative
+completion wins before cancellation acceptance it remains completion; after
+cancellation acceptance it cannot be reported as successful. Independent peer
+cancellation is reported separately.
 
 `mesh_delegate_task` accepts an optional `delegationRequestId`. Omit it for a
 new user invocation; the Tool generates and returns a fresh ID. Reuse that ID
@@ -114,14 +140,21 @@ recovers the same task whether acknowledgement was lost or the task is still
 in flight, while a fresh invocation creates a new task even when a terminal
 historical intent has identical semantics.
 
-The delegate's 15-second budget covers both durable intent persistence and the
-broker acceptance wait. Agent startup continues asynchronously and is observed
-through `mesh_get_task`. Persistence itself is deliberately not given an abort
-signal: if the caller budget or cancellation wins first, the durable promise
-continues in the background and the Tool returns `pending`,
-`reconciliationPending: true`, and `retrySameIntent: true`. Retrying the exact
-intent with the returned `delegationRequestId` lets the Facade recover the IDs
-after persistence completes instead of creating another task.
+The idempotency key is stable source Workspace scope identity plus
+`delegationRequestId`; a single claimed source uses its Workspace identity and
+multiple claimed sources use their sorted canonical set hash. Active editor,
+display names, and Window Node instance IDs do not define the scope. P2
+authorization still checks every claimed source Workspace separately. Exact
+retries reuse the task ID and never restart an accepted task.
+Changing target, title, prompt, criteria, or timeout returns
+`IDEMPOTENCY_CONFLICT`. Broker generation takeover restores the persisted route
+mapping before accepting another start.
+
+The delegate subscribes before starting or reconciling the task, so an immediate
+terminal event cannot be lost. It uses Broker-published authoritative snapshots,
+not snapshot polling loops. `mesh_get_task` remains available for abnormal Tool
+host interruption and explicit tracking of another task, but normal delegation
+does not poll it.
 
 ## Facade integration
 
@@ -131,11 +164,10 @@ after persistence completes instead of creating another task.
 ```ts
 interface TaskToolFacade {
   listWorkers(signal: AbortSignal): Promise<MeshWorkerDirectorySnapshot>;
+  identifyDelegation(intent: DelegationIntentInput): DelegationIdentity;
+  describeDelegationTarget(intent: DelegationIntentInput, signal: AbortSignal): Promise<DelegationTargetDisplay>;
+  subscribeToTask(taskId: string, listener: (snapshot: TaskToolSnapshot) => void, onError: (error: unknown) => void): TaskSnapshotSubscription;
   persistDelegationIntent(intent: DelegationIntentInput): Promise<PersistedDelegationIntent>;
-  waitForDelegationAcceptance(ids: {
-    delegationRequestId: string;
-    taskId: string;
-  }, signal: AbortSignal): Promise<DelegationAcceptance>;
   getTask(request: {
     taskId: string;
     afterEventSequence?: number;
@@ -154,9 +186,9 @@ interface TaskToolFacade {
 The persistence method must durably allocate both IDs before resolving and must
 recover the same IDs for an exact retry carrying the same `delegationRequestId`.
 Historical semantic hashes are retained for audit and conflict detection, not
-used as a global deduplication key. Aborting the acceptance signal stops
-only that acknowledgement wait. Ownership is taken from the Facade's
-authenticated coordinator context, never from tool input.
+used as a global deduplication key. Ownership and source Workspace provenance
+come from the Facade's authenticated coordinator context, never from display
+labels or caller-supplied Tool input.
 
 ## Parent-session wiring
 

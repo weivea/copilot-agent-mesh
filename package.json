@@ -77,8 +77,8 @@
         "displayName": "Delegate Mesh Task",
         "toolReferenceName": "meshDelegateTask",
         "canBeReferencedInPrompt": true,
-        "modelDescription": "Delegates a coding task to one explicit Device -> Node -> Workspace target from mesh_list_workers. deviceId, nodeId, nodeInstanceId, and workspaceId are always required; optional peerId is internal remote routing metadata and never replaces those IDs. Omit delegationRequestId for a fresh user invocation; the tool generates and returns one. Reuse that ID only to retry the exact same payload, which recovers the same task; the same ID with a different payload conflicts. Returns after durable broker acceptance and before Agent startup completes with a pending task ID; use mesh_get_task to poll startup and terminal outcomes. Under a small token budget, compact JSON uses s state (0 accepted pending, 1 reconcile the same intent, 2 error, 3 persistence pending), t taskId, d delegationRequestId, e stable error code, and r retry/reconciliation flag; s=1 or s=3 with r=1 means retry the exact same intent and ID. Do not use this tool for Git, branch, worktree, commit, push, or pull request management.",
-        "userDescription": "Start an asynchronous coding task on an explicitly selected device, node, and workspace.",
+        "modelDescription": "In Agent mode, delegates one coding task to an explicit Device -> Node -> Workspace target from mesh_list_workers and waits in this invocation for authoritative completed, needsInput, failed, or cancelled state; normal-path mesh_get_task polling is unnecessary. Omit delegationRequestId for a fresh invocation and reuse the returned ID only for the exact same target/title/prompt/criteria/timeout semantics; conflicts return IDEMPOTENCY_CONFLICT. Compact JSON is s=0 completed with t,d,r; s=1 needsInput with t,d,i,q; s=2 failed with t,d,e; or s=3 cancelled with t,d,e,x where x is token, budget, or peer. Preserve t for recovery if the Tool host interrupts the call; use mesh_get_task only for abnormal interruption or other-task tracking. The default and maximum timeout are 60 minutes. Users can explicitly select this Tool with #meshDelegateTask, but Tool selection is not guaranteed. Do not use it for Git, branch, worktree, commit, push, or pull request management.",
+        "userDescription": "Delegate one coding task and wait up to 60 minutes for completion, input, failure, or cancellation.",
         "tags": [
           "copilot-agent-mesh"
         ],
@@ -152,7 +152,8 @@
             "timeoutMinutes": {
               "type": "integer",
               "minimum": 1,
-              "maximum": 1440
+              "maximum": 60,
+              "default": 60
             }
           },
           "required": [
@@ -171,8 +172,8 @@
         "displayName": "Get Mesh Task",
         "toolReferenceName": "meshGetTask",
         "canBeReferencedInPrompt": true,
-        "modelDescription": "Returns a bounded snapshot and event summary for an asynchronous Copilot Agent Mesh task, including event-gap and truncation indicators. Event sequences are positive and consecutive; eventGap identifies every omitted leading event, while eventCursor always equals the last returned sequence or the requested afterEventSequence for an empty window. Recovering snapshots may retain pending input, but only needsInput snapshots expose mesh_answer_task. Failed and timedOut snapshots include safe failure code, message, and retryable fields. Never returns a raw transcript.",
-        "userDescription": "Check a delegated task status and bounded results.",
+        "modelDescription": "Returns a bounded snapshot and event summary for abnormal mesh_delegate_task interruption recovery or tracking another task. Do not poll this Tool on the normal delegation path because mesh_delegate_task waits for an authoritative outcome. Event gaps and truncation are explicit; no raw transcript is returned.",
+        "userDescription": "Recover or inspect a delegated task outside the normal waiting path.",
         "tags": [
           "copilot-agent-mesh"
         ],

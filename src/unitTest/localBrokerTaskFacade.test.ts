@@ -7,13 +7,17 @@ import {
 	type RoutedTaskStartParams,
 	type TaskSnapshot,
 } from '../../shared/protocol';
-import type { DelegationIntentInput } from '../../shared/toolProtocol';
+import type { DelegationIntentInput, TaskToolSnapshot } from '../../shared/toolProtocol';
 import { LocalIpcRemoteError } from '../ipc';
 import {
 	deterministicTaskId,
 	LocalBrokerTaskFacade,
 } from '../tools/LocalBrokerTaskFacade';
 import { TaskToolFacadeError } from '../tools/taskToolFacade';
+import {
+	createOpaqueWorkspaceIdentity,
+	createWorkspaceScopeIdentity,
+} from '../workspaces/OpaqueWorkspaceIdentity';
 
 const DEVICE_ID = '00000000-0000-4000-8000-000000000001';
 const NODE_ID = '00000000-0000-4000-8000-000000000002';
@@ -24,6 +28,8 @@ const WORKSPACE_ID = '00000000-0000-4000-8000-000000000006';
 const DELEGATION_ID = '00000000-0000-4000-8000-000000000007';
 const INPUT_ID = '00000000-0000-4000-8000-000000000008';
 const ANSWER_ID = '00000000-0000-4000-8000-000000000009';
+const SOURCE_IDENTITY_A = `sha256:${'A'.repeat(43)}`;
+const SOURCE_IDENTITY_B = `sha256:${'B'.repeat(43)}`;
 
 test('local facade lists this device and every broker-listed node opaquely', async () => {
 	const client = new FakeWindowNodeClient();
@@ -101,7 +107,7 @@ test('stable task IDs survive facade reload and changed retries surface broker c
 			prompt: 'Changed payload.',
 		}),
 		(error: unknown) =>
-			error instanceof TaskToolFacadeError && error.code === 'TASK_ID_CONFLICT',
+			error instanceof TaskToolFacadeError && error.code === 'IDEMPOTENCY_CONFLICT',
 	);
 
 	const concurrentClient = new FakeWindowNodeClient();
@@ -115,6 +121,72 @@ test('stable task IDs survive facade reload and changed retries surface broker c
 	]);
 	assert.equal(concurrent[0].taskId, concurrent[1].taskId);
 	assert.deepStrictEqual(concurrent.map(({ recovered }) => recovered), [false, true]);
+});
+
+test('source Workspace identity scopes stable delegation keys independently of display names', async () => {
+	const client = new FakeWindowNodeClient();
+	const sourceA = new LocalBrokerTaskFacade(client, {
+		deviceName: 'Same Display Name',
+		sourceWorkspaceIdentity: () => SOURCE_IDENTITY_A,
+	});
+	const sourceAReloaded = new LocalBrokerTaskFacade(client, {
+		deviceName: 'Renamed Display',
+		sourceWorkspaceIdentity: () => SOURCE_IDENTITY_A,
+	});
+	const sourceB = new LocalBrokerTaskFacade(client, {
+		deviceName: 'Same Display Name',
+		sourceWorkspaceIdentity: () => SOURCE_IDENTITY_B,
+	});
+
+	const first = await sourceA.persistDelegationIntent(intent());
+	const retry = await sourceAReloaded.persistDelegationIntent(intent());
+	const independent = await sourceB.persistDelegationIntent(intent());
+
+	assert.equal(first.taskId, deterministicTaskId(DELEGATION_ID, SOURCE_IDENTITY_A));
+	assert.equal(retry.taskId, first.taskId);
+	assert.notEqual(independent.taskId, first.taskId);
+	assert.equal(independent.taskId, deterministicTaskId(DELEGATION_ID, SOURCE_IDENTITY_B));
+	assert.equal(client.lastStart?.sourceWorkspaceIdentity, SOURCE_IDENTITY_B);
+});
+
+test('claimed Workspace-set scope is order-stable and changes only with membership', () => {
+	const sourceC = createOpaqueWorkspaceIdentity('source-workspace-c');
+	const first = createWorkspaceScopeIdentity([SOURCE_IDENTITY_A, SOURCE_IDENTITY_B]);
+	const reordered = createWorkspaceScopeIdentity([SOURCE_IDENTITY_B, SOURCE_IDENTITY_A]);
+	const changed = createWorkspaceScopeIdentity([SOURCE_IDENTITY_A, sourceC]);
+
+	assert.equal(first, reordered);
+	assert.notEqual(first, changed);
+	assert.equal(createWorkspaceScopeIdentity([SOURCE_IDENTITY_A]), SOURCE_IDENTITY_A);
+	assert.throws(() => createWorkspaceScopeIdentity([]), /scope is invalid/u);
+});
+
+test('task subscription reconciles an authoritative snapshot after Broker reconnect', async () => {
+	const client = new FakeWindowNodeClient();
+	const facade = new LocalBrokerTaskFacade(client, {
+		deviceName: 'Local Device',
+		sourceWorkspaceIdentity: () => SOURCE_IDENTITY_A,
+	});
+	const persisted = await facade.persistDelegationIntent(intent());
+	const reconciled = new Promise<TaskToolSnapshot>((resolve, reject) => {
+		const registration = facade.subscribeToTask(
+			persisted.taskId,
+			(snapshot) => {
+				registration.dispose();
+				resolve(snapshot);
+			},
+			reject,
+		);
+	});
+
+	client.setRegistered(false);
+	client.failTask(persisted.taskId, 'TASK_EXECUTION_FAILED');
+	client.setRegistered(true);
+
+	const snapshot = await reconciled;
+	assert.equal(snapshot.taskId, persisted.taskId);
+	assert.equal(snapshot.status, 'failed');
+	assert.equal(client.stateListenerCount, 0);
 });
 
 test('local facade converts get, cancel, answer, and abort behavior', async () => {
@@ -242,9 +314,31 @@ class FakeWindowNodeClient {
 		input: RoutedTaskStartParams;
 		snapshot: TaskSnapshot;
 	}>();
+	private readonly stateListeners = new Set<() => void>();
+	private registered = true;
 	startCalls = 0;
 	lastStart?: RoutedTaskStartParams;
 	listError?: unknown;
+
+	get stateListenerCount(): number {
+		return this.stateListeners.size;
+	}
+
+	snapshot(): { readonly registered: boolean } {
+		return { registered: this.registered };
+	}
+
+	onDidChange(listener: () => void): { dispose(): void } {
+		this.stateListeners.add(listener);
+		return { dispose: () => this.stateListeners.delete(listener) };
+	}
+
+	setRegistered(registered: boolean): void {
+		this.registered = registered;
+		for (const listener of this.stateListeners) {
+			listener();
+		}
+	}
 
 	async listNodes(): Promise<NodeDirectoryResult> {
 		if (this.listError !== undefined) {
@@ -291,7 +385,7 @@ class FakeWindowNodeClient {
 		const existing = this.tasks.get(input.taskId);
 		if (existing !== undefined) {
 			if (JSON.stringify(existing.input) !== JSON.stringify(input)) {
-				throw meshError('TASK_ID_CONFLICT');
+				throw meshError('IDEMPOTENCY_CONFLICT');
 			}
 			return existing.snapshot;
 		}

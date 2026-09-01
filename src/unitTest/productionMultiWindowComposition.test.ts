@@ -59,6 +59,8 @@ test('production composition uses per-window runtime and local Broker tools', ()
 	assert.match(application, /new LocalBrokerTaskFacade/u);
 	assert.match(application, /new LocalIpcRemoteTaskAdapter\(node\)/u);
 	assert.match(application, /remoteAdapter: remoteTasks/u);
+	assert.match(application, /sourceWorkspaceIdentity: \(\) => node\.delegationSourceScopeIdentity\(\)/u);
+	assert.doesNotMatch(application, /activeTextEditor[\s\S]{0,500}sourceWorkspaceIdentity/u);
 	assert.match(application, /registerMeshTaskTools\(localTasks\)/u);
 	assert.doesNotMatch(application, /Collaboration|collaboration/u);
 	assert.doesNotMatch(owner, /CollaborationService|FileCollaborationStore|sameDeviceCollaboration/u);

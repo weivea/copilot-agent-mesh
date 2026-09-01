@@ -110,7 +110,7 @@ test('reusing an explicit key with a different payload conflicts', async () => {
 		}),
 		(error: unknown) => (
 			error instanceof TaskToolFacadeError
-			&& error.code === 'TASK_ID_CONFLICT'
+			&& error.code === 'IDEMPOTENCY_CONFLICT'
 		),
 	);
 	assert.equal(coordinator.listKnownTasks().length, 1);

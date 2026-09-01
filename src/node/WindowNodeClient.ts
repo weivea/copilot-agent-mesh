@@ -63,7 +63,10 @@ import {
 	NodeFileIdentityResolver,
 	type FileIdentityFileSystem,
 } from '../workspaces/NodeFileIdentityResolver';
-import { createOpaqueWorkspaceIdentity } from '../workspaces/OpaqueWorkspaceIdentity';
+import {
+	createOpaqueWorkspaceIdentity,
+	createWorkspaceScopeIdentity,
+} from '../workspaces/OpaqueWorkspaceIdentity';
 import type { FileIdentityResolver } from '../workspaces/WorkspaceRegistry';
 import {
 	WindowNodeTaskExecutorDisposalError,
@@ -237,6 +240,7 @@ export class WindowNodeClient implements WorkspaceResolver {
 	private rejectFirstConnection: ((error: Error) => void) | undefined;
 	private reconnectAttempt = 0;
 	private readonly stateListeners = new Set<() => void>();
+	private readonly taskSnapshotListeners = new Set<(snapshot: TaskSnapshot) => void>();
 	private stateValue: WindowNodeClientState = 'idle';
 	private registered = false;
 	private started = false;
@@ -300,6 +304,11 @@ export class WindowNodeClient implements WorkspaceResolver {
 		return { dispose: () => this.stateListeners.delete(listener) };
 	}
 
+	public onTaskSnapshot(listener: (snapshot: TaskSnapshot) => void): { dispose(): void } {
+		this.taskSnapshotListeners.add(listener);
+		return { dispose: () => this.taskSnapshotListeners.delete(listener) };
+	}
+
 	public start(): Promise<void> {
 		if (this.disposed) {
 			return Promise.reject(new Error('Window Node client is disposed.'));
@@ -351,6 +360,14 @@ export class WindowNodeClient implements WorkspaceResolver {
 			workspaceName: observations.length === 0 ? 'No Workspace' : 'Multiple Workspaces',
 			claimStatus: observations.length === 0 ? 'unclaimed' : 'ambiguous',
 		};
+	}
+
+	public delegationSourceScopeIdentity(): string {
+		return createWorkspaceScopeIdentity(
+			[...this.observations.values()]
+				.filter(({ status }) => status === 'claimed')
+				.map(({ workspaceIdentity }) => workspaceIdentity),
+		);
 	}
 
 	public listNodes(): Promise<NodeDirectoryResult> {
@@ -828,6 +845,13 @@ export class WindowNodeClient implements WorkspaceResolver {
 					z.strictObject({}).parse(params);
 					this.changed();
 					return null;
+				case LOCAL_BROKER_NOTIFICATIONS.taskSnapshot: {
+					const snapshot = taskSnapshotSchema.parse(params);
+					for (const listener of [...this.taskSnapshotListeners]) {
+						listener(snapshot);
+					}
+					return null;
+				}
 				case LOCAL_BROKER_METHODS.taskStart: {
 					const input = nodeTaskStartParamsSchema.parse(params);
 					this.assertTaskTarget(input.target.nodeId, input.target.nodeInstanceId);
@@ -1281,6 +1305,7 @@ export class WindowNodeClient implements WorkspaceResolver {
 			this.rejectFirstConnection = undefined;
 		}
 		this.stateListeners.clear();
+		this.taskSnapshotListeners.clear();
 		if (failures.length > 0) {
 			throw new AggregateError(failures, 'Window Node client cleanup failed.');
 		}

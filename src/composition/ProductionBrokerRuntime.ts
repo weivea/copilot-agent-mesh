@@ -134,8 +134,34 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 		this.tunnel = components.tunnel;
 		for (const subscription of [
 			this.listener.onDidChange(this.options.onDidChange),
-			{ dispose: this.peers.onDidChange(this.options.onDidChange) },
-			{ dispose: this.peers.onNotification(this.options.onDidChange) },
+			{
+				dispose: this.peers.onDidChange(() => {
+					this.options.onDidChange();
+					void this.broker.reconcileRemoteTasks().catch((error: unknown) => {
+						this.options.logger.error(
+							'task',
+							'Retained remote task reconciliation failed safely.',
+							error,
+						);
+					});
+				}),
+			},
+			{
+				dispose: this.peers.onNotification((profileId, method, params) => {
+					this.options.onDidChange();
+					void this.broker.reconcileRemoteTaskNotification(
+						profileId,
+						method,
+						params,
+					).catch((error: unknown) => {
+						this.options.logger.error(
+							'task',
+							'Remote task notification reconciliation failed safely.',
+							error,
+						);
+					});
+				}),
+			},
 		]) {
 			this.subscriptions.add(subscription);
 		}
@@ -201,6 +227,7 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 		});
 		await peerPolicyStore.initialize();
 		let brokerTasks: BrokerTaskService | undefined;
+		let broker: DeviceBroker | undefined;
 		const registry = new NodeRegistry({
 			deviceId: profile.deviceId,
 			state: fencedState,
@@ -233,10 +260,11 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 			systemClock,
 			{
 				onDidChange: options.onDidChange,
-				onTaskSnapshot: async (snapshot) => {
+				onTaskSnapshot: async (snapshot, sourceNodeId) => {
 					if (taskRoutes.get(snapshot.taskId) !== undefined) {
 						await taskRoutes.markSnapshot(snapshot);
 					}
+					broker?.publishTaskSnapshot(snapshot, sourceNodeId);
 				},
 				onBackgroundError: (error) => options.logger.error(
 					'broker',
@@ -276,7 +304,7 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 			peerProfiles,
 			fencedState,
 		);
-		const broker = new DeviceBroker({
+		broker = new DeviceBroker({
 			identity: options.identityFor(profile.deviceId),
 			brokerKey,
 			ownership: options.ownership,

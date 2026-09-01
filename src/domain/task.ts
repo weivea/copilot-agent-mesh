@@ -104,6 +104,8 @@ export function canonicalRoutedTaskRequest(request: OwnedRoutedTaskStart): strin
 		normalized.target.nodeInstanceId,
 		normalized.target.workspaceId,
 		normalized.sourceNodeId ?? '',
+		normalized.sourceWorkspaceIdentity ?? '',
+		String(normalized.timeoutMinutes ?? ''),
 		normalized.title,
 		normalized.prompt,
 		String(normalized.acceptanceCriteria.length),
@@ -159,6 +161,12 @@ export function createAcceptedRoutedTask(
 		...(normalized.sourceNodeId === undefined
 			? {}
 			: { sourceNodeId: normalized.sourceNodeId }),
+		...(normalized.sourceWorkspaceIdentity === undefined
+			? {}
+			: { sourceWorkspaceIdentity: normalized.sourceWorkspaceIdentity }),
+		...(normalized.timeoutMinutes === undefined
+			? {}
+			: { timeoutMinutes: normalized.timeoutMinutes }),
 		title: normalized.title,
 		state: 'accepted',
 		createdAt: at,
@@ -206,7 +214,16 @@ export function matchIdempotentRoutedStart(
 	request: OwnedRoutedTaskStart,
 ): TaskRecord | undefined {
 	const normalized = normalizeOwnedRoutedTaskStart(request);
-	const sameScope = records.filter((record) => record.peerId === normalized.peerId);
+	const sameScope = records.filter((record) =>
+		record.peerId === normalized.peerId
+		&& (
+			normalized.sourceWorkspaceIdentity === undefined
+			|| (
+				record.schemaVersion === 2
+				&& record.sourceWorkspaceIdentity === normalized.sourceWorkspaceIdentity
+			)
+		),
+	);
 	const match = sameScope.find((record) =>
 		record.delegationRequestId === normalized.delegationRequestId
 		|| record.taskId === normalized.taskId,
@@ -248,7 +265,7 @@ export function matchIdempotentRoutedStart(
 		|| !targetMatches
 	) {
 		throw new MeshDomainError(
-			'TASK_ID_CONFLICT',
+			'IDEMPOTENCY_CONFLICT',
 			'The task identifiers are already associated with a different routed request.',
 		);
 	}

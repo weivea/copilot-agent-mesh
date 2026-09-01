@@ -134,9 +134,9 @@ Windows Copilot Agent：
    任务走一个 Device Gateway/Tunnel → Remote Broker → Target Node。
 5. Target Window Node 使用自己的真实 AHP Runtime 创建 Copilot Agent Session。
 6. 进度实时显示在主设备控制界面。
-7. `mesh_delegate_task` 在 Worker 接受后立即返回 `pending + taskId`，不等待完整编码任务。
-8. 主 Agent 可调用 `mesh_get_task` 查询状态；用户也可在 Dashboard 查看进度。
-9. 远端 Agent 完成后，`mesh_get_task` 返回受限的结构化结果，主 Agent 可在当前会话继续处理。
+7. `mesh_delegate_task` 在同一次调用中等待 Broker 权威的 completed、needsInput、failed 或 cancelled 状态。
+8. 主 Agent 正常路径不需要轮询；`mesh_get_task` 仅用于调用异常中断后的恢复或显式追踪其他任务。
+9. 远端 Agent 完成后，`mesh_delegate_task` 返回受限的结构化结果，主 Agent 可在当前会话继续处理。
 
 Broker 在发送前持久化 Route Catalog；AHP 事件先进入 Broker Store，再经 IPC
 multiplex 给所有本机窗口。
@@ -267,8 +267,8 @@ https://<tunnel-port-uri>/agent-mesh/connect?v=2&device=<device-id>#secret=<pair
 | Tool | 用途 |
 | --- | --- |
 | `mesh_list_workers` | 返回在线设备、能力标签、Workspace 和忙闲状态。 |
-| `mesh_delegate_task` | 向指定设备和 Workspace 创建异步开发任务，Worker 接受后立即返回 `taskId`。 |
-| `mesh_get_task` | 查询任务状态、阶段和已产生的结果。 |
+| `mesh_delegate_task` | 向指定 Device → Node → Workspace 创建或对账一个任务，并等待权威结果。 |
+| `mesh_get_task` | 在 Tool 异常中断后恢复查询，或显式追踪其他任务。 |
 | `mesh_cancel_task` | 取消远端任务。 |
 | `mesh_answer_task` | 回答远端 Agent 的问题或审批请求。 |
 
@@ -297,8 +297,9 @@ interface DelegateTaskInput {
 - Tool 执行前显示目标设备、Workspace 和任务摘要确认。
 - Tool 支持 VS Code `CancellationToken`。
 - 成功、失败、超时、离线必须返回不同的结构化结果。
-- Tool API 是一次性结果；`mesh_delegate_task` 不等待完整任务，返回 `pending + taskId`，由 `mesh_get_task` 查询。
-- Tool 调用取消或确认超时不等于远端任务取消；已接受任务继续由 Dashboard 和 `mesh_get_task` 管理。
+- Tool API 是一次性结果；`mesh_delegate_task` 的 Promise 保持未完成，直到权威 completed、needsInput、failed 或 cancelled。
+- `timeoutMinutes` 默认和最大均为 60；预算到期或 Tool CancellationToken 触发时只发送一次取消，并等待权威 cancelled 或 failed 后返回。
+- 正常路径不轮询 `mesh_get_task`；异常宿主中断后使用始终保留的 `taskId` 恢复。
 - 远程输出过大时只返回摘要和引用，避免占满主 Agent 上下文。
 
 ### FR-8：Worker 任务执行
@@ -334,7 +335,7 @@ running → completed | failed | cancelled | timedOut
 - Worker 将任务最小状态持久化，扩展重启后可恢复展示。
 - Global Task/Delegation State、Route Catalog 和 Reducer/Event Log 由 Broker
   Owner 持久化并使用 Generation Fence。
-- Tool 确认等待超时或取消不等同于远端任务失败；任务可继续运行并通过 `mesh_get_task` 查询。
+- Tool 预算或 CancellationToken 会请求精确取消，并在权威 cancelled 或 failed 后返回；独立 Peer 取消保持可区分。
 
 ### FR-10：任务结果
 
@@ -637,7 +638,7 @@ MVP 采用 CLI 的原因：
 
 AHP 的 Root、Session、Chat 和 Terminal channel 在当前规范中标记为 Stable，但 VS Code Agent Host 本身仍在持续演进。实现必须使用协议版本协商与 capability detection，不依赖内部对象结构。
 
-`mesh_delegate_task` 必须采用异步 `pending + taskId` 语义。扩展不能依赖长时间保持 Tool Invocation，也不能在旧 Copilot Turn 结束后主动追加结果。
+`mesh_delegate_task` 必须在同一次 Tool Invocation 中等待权威结果。扩展不能在旧 Copilot Turn 结束后主动追加结果，因此正常路径保持调用未完成且不轮询；异常中断后通过保留的 `taskId` 查询。
 
 ## 12. 简化安全模型
 
@@ -725,7 +726,7 @@ AHP 的 Root、Session、Chat 和 Terminal channel 在当前规范中标记为 S
    `mesh_cancel_task`、`mesh_answer_task`，均使用 Device → Node → Workspace。
 9. macOS arm64 Worker 通过 AHP 调用内置 Copilot Agent。
 10. 主设备 UI 显示任务状态和输出摘要。
-11. 任务完成结果可通过 `mesh_get_task` 在当前 Copilot 会话中查询。
+11. 任务完成结果由 `mesh_delegate_task` 在当前调用返回；异常中断可通过 `mesh_get_task` 恢复查询。
 12. 一台设备可注册多个 Workspace，但每个 Workspace 同时只执行一个任务。
 13. 插件不检查或管理 Git 状态、分支和 worktree，也不向 Agent 注入相关操作要求。
 
@@ -755,7 +756,7 @@ AHP 的 Root、Session、Chat 和 Terminal channel 在当前规范中标记为 S
 - Mac 创建内置 Copilot Agent Session，在注册的 Workspace 中执行。
 - 创建 Session 前，扩展不检查或修改 Git 状态、分支与 worktree，也不向 Agent 注入 Git 操作提示。
 - Mac 的文本输出和状态可在 Windows 控制界面查看。
-- `mesh_delegate_task` 先返回 `pending + taskId`；完成后 Windows Copilot Agent 可通过 `mesh_get_task` 取得结果并继续回复。
+- `mesh_delegate_task` 保持调用直到返回权威结果；`needsInput` 时 Windows Copilot Agent 在当前 Chat 询问用户并调用 `mesh_answer_task`。
 
 ### AC-3：Preview 多平台 Coordinator 与多仓库
 
@@ -817,7 +818,7 @@ macOS 使用 `$HOME/.mw` 这类短路径以避开 Unix-domain socket path limit�
 - 使用 `vscode.authentication` 完成本机 AHP Copilot认证。
 - `devtunnel host` 能稳定转发 Gateway WebSocket。
 - `devtunnel show --json` 在目标平台能通过版本化 Decoder 唯一发现目标 Port 的 HTTPS URI。
-- 一个 Language Model Tool 能创建异步任务并返回 `pending + taskId`，随后可通过另一个 Tool 查询结果。
+- 一个 Language Model Tool 能创建任务、保持调用并返回权威 completed、needsInput、failed 或 cancelled 结果。
 
 ### Phase 1：设备连接
 
@@ -851,7 +852,7 @@ macOS 使用 `$HOME/.mw` 这类短路径以避开 Unix-domain socket path limit�
 | --- | --- | --- |
 | Dev Tunnels 仍是 Public Preview | CLI 或服务行为变化 | 封装 `DevTunnelProvider`；锁定最低版本；保留 SDK 替换路径。 |
 | Agent Host持续演进 | AHP 集成可能随 VS Code 变化 | 使用正式 AHP SDK、版本协商和 capability detection。 |
-| Language Model Tool 是一次性调用 | 不能持续推送远端任务进度或写回旧 Turn | Delegate 仅等待 accepted，立即返回 pending + taskId，并允许 `mesh_get_task` 查询。 |
+| Language Model Tool 是一次性调用 | 不能持续推送远端任务进度或写回旧 Turn | Delegate 在同一次 Promise 中订阅权威状态；异常中断后才使用 `mesh_get_task`。 |
 | Worker 睡眠或 VS Code 关闭 | 远程任务中断 | 状态持久化、自动重连、明确 Offline；后续支持系统 keep-awake。 |
 | 远端 Workspace 状态不适合执行任务 | Agent 可能无法开始或需要用户决策 | 由远端 Agent 自主判断并通过现有输入/审批通道反馈；扩展不做 Git 预检或策略注入。 |
 | 远程执行风险 | 从设备文件或命令被误操作 | Workspace 白名单、任务确认、审批转发、可取消。 |

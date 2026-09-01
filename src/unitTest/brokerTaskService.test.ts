@@ -460,7 +460,7 @@ test('concurrent conflicting starts persist and dispatch only one request', asyn
 	assert.equal(results[0].status, 'fulfilled');
 	assert.equal(results[1].status, 'rejected');
 	if (results[1].status === 'rejected') {
-		assert.equal(isReason(results[1].reason, 'TASK_ID_CONFLICT'), true);
+		assert.equal(isReason(results[1].reason, 'IDEMPOTENCY_CONFLICT'), true);
 	}
 	assert.equal((await fixture.store.list()).length, 1);
 	assert.equal(
@@ -675,7 +675,7 @@ test('enforces owner, explicit target, workspace, and exact idempotency boundari
 	);
 	await assert.rejects(
 		fixture.service.startRemote(OWNER_ID, startParams({ prompt: 'Different.' })),
-		(error: unknown) => isReason(error, 'TASK_ID_CONFLICT'),
+		(error: unknown) => isReason(error, 'IDEMPOTENCY_CONFLICT'),
 	);
 	await assert.rejects(
 		fixture.service.startRemote(OWNER_ID, startParams({

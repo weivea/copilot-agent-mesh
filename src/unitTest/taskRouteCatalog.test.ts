@@ -61,7 +61,7 @@ test('authoritative route reservation atomically fences local and remote starts'
 	assert.ok(
 		results[1].status === 'rejected'
 		&& results[1].reason instanceof MeshDomainError
-		&& results[1].reason.reason === 'TASK_ID_CONFLICT',
+		&& results[1].reason.reason === 'IDEMPOTENCY_CONFLICT',
 	);
 	assert.equal(state.writes, 1);
 	const persisted = JSON.stringify(state.values.get(TASK_ROUTE_CATALOG_STATE_KEY));
@@ -74,13 +74,27 @@ test('authoritative route reservation atomically fences local and remote starts'
 	]);
 	assert.deepStrictEqual(retry[0], retry[1]);
 	assert.equal(state.writes, 1);
+	const restoredCatalog = new TaskRouteCatalog(state, () => new Date(AT));
+	assert.deepEqual(
+		await restoredCatalog.reserveLocal(local, { nodeId: LOCAL_NODE_ID }),
+		retry[0],
+	);
+	assert.equal(state.writes, 1);
 	await assert.rejects(
 		catalog.reserveLocal(
 			{ ...local, prompt: 'changed payload' },
 			{ nodeId: LOCAL_NODE_ID },
 		),
 		(error: unknown) =>
-			error instanceof MeshDomainError && error.reason === 'TASK_ID_CONFLICT',
+			error instanceof MeshDomainError && error.reason === 'IDEMPOTENCY_CONFLICT',
+	);
+	await assert.rejects(
+		restoredCatalog.reserveLocal(
+			{ ...local, timeoutMinutes: 59 },
+			{ nodeId: LOCAL_NODE_ID },
+		),
+		(error: unknown) =>
+			error instanceof MeshDomainError && error.reason === 'IDEMPOTENCY_CONFLICT',
 	);
 	assert.equal(catalog.requireForNode(TASK_ID, LOCAL_NODE_ID).routeKind, 'local');
 	assert.throws(
@@ -166,9 +180,11 @@ function startParams(
 			workspaceId: WORKSPACE_ID,
 		},
 		sourceNodeId: LOCAL_NODE_ID,
+		sourceWorkspaceIdentity: `sha256:${'A'.repeat(43)}`,
 		title: 'Safe title',
 		prompt: 'secret prompt with private path',
 		acceptanceCriteria: ['Tests pass.'],
+		timeoutMinutes: 60,
 		workerDeadline: '2026-08-25T13:00:00.000Z',
 	};
 }

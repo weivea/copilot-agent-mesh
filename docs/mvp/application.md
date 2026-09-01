@@ -66,7 +66,7 @@ The coordinator persists a semantic-hash `DelegationIntent`, UUID task ID, expli
 ID, and deadline before sending `task.start`. The Tool generates a fresh invocation ID when the
 caller omits one. Lost acknowledgements and in-flight retries reuse the returned invocation ID
 with the exact payload to recover the same task; reusing an ID with different semantics fails
-with `TASK_ID_CONFLICT`. Terminal intents remain append-only audit history, but never globally
+with `IDEMPOTENCY_CONFLICT`. Terminal intents remain append-only audit history, but never globally
 deduplicate a later fresh invocation with the same semantics.
 Worker start verifies ownership, resolves only an opaque registered workspace ID, checks the
 Agent Host feature/probe, acquires the workspace lease, and atomically persists `accepted`

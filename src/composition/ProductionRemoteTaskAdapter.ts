@@ -220,7 +220,13 @@ export class ProductionRemoteTaskAdapter implements RemoteTaskRouteAdapter {
 			title: params.title,
 			prompt: params.prompt,
 			acceptanceCriteria: params.acceptanceCriteria,
+			...(params.timeoutMinutes === undefined
+				? {}
+				: { timeoutMinutes: params.timeoutMinutes }),
 			workerDeadline: params.workerDeadline,
+			...(params.sourceWorkspaceIdentity === undefined
+				? {}
+				: { sourceWorkspaceIdentity: params.sourceWorkspaceIdentity }),
 		};
 		const dispatch = outcome ?? { taskStartRequestAttempted: false };
 		try {
@@ -354,7 +360,7 @@ export class ProductionRemoteTaskAdapter implements RemoteTaskRouteAdapter {
 			if (existing !== undefined) {
 				if (!sameRoute(existing, input, peerId)) {
 					throw new MeshDomainError(
-						'TASK_ID_CONFLICT',
+						'IDEMPOTENCY_CONFLICT',
 						'The task ID is already bound to another explicit remote route.',
 					);
 				}
@@ -528,7 +534,7 @@ export class ProductionRemoteTaskAdapter implements RemoteTaskRouteAdapter {
 		const existing = this.taskRoutes.get(params.taskId);
 		if (existing !== undefined && !sameRoute(existing, params, peerId)) {
 			throw new MeshDomainError(
-				'TASK_ID_CONFLICT',
+				'IDEMPOTENCY_CONFLICT',
 				'The task ID is already bound to another explicit remote route.',
 			);
 		}
@@ -778,6 +784,8 @@ function remoteRequestHash(input: RoutedTaskStartParams, peerId: string): string
 		input.target.nodeInstanceId,
 		input.target.workspaceId,
 		input.sourceNodeId ?? '',
+		input.sourceWorkspaceIdentity ?? '',
+		String(input.timeoutMinutes ?? ''),
 		input.title,
 		input.prompt,
 		String(input.acceptanceCriteria.length),

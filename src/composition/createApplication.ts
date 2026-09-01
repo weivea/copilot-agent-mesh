@@ -267,6 +267,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 				?? profile?.name
 				?? sharedProfile.name,
 			remoteAdapter: remoteTasks,
+			sourceWorkspaceIdentity: () => node.delegationSourceScopeIdentity(),
 		});
 		const bindings = new ProductionDashboardBindings({
 			vscodeApi: vscode,
