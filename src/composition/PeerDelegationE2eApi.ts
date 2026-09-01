@@ -14,7 +14,10 @@ import type {
 import type { LaunchedAgentHost } from '../agentHost/AgentHostLauncher';
 import { EditorAgentHostLauncher } from '../agentHost/AgentHostSourceSelector';
 import { EditorAgentHostLocator } from '../agentHost/EditorAgentHostLocator';
-import { UnixSocketWebSocketConnector } from '../agentHost/UnixSocketWebSocketConnector';
+import {
+	UnixSocketWebSocketConnector,
+	UnixSocketWebSocketError,
+} from '../agentHost/UnixSocketWebSocketConnector';
 import type { BrokerLifecycle } from '../broker/BrokerLifecycle';
 import type { WindowNodeClient } from '../node/WindowNodeClient';
 import type { LocalIpcRemoteTaskAdapter } from '../node/LocalIpcRemoteTaskAdapter';
@@ -117,6 +120,8 @@ export function createPeerDelegationE2eApi(
 					};
 				case 'peer.session.catalog':
 					return editorSessionCatalog(options);
+				case 'peer.editor.initialize':
+					return editorInitializeProbe(options);
 				case 'peer.resources':
 					return resourceMetrics(options);
 				default:
@@ -166,6 +171,58 @@ export function createPeerDelegationE2eApi(
 			}
 		},
 	};
+}
+
+async function editorInitializeProbe(
+	options: PeerDelegationE2eApiOptions,
+): Promise<{
+	readonly available: boolean;
+	readonly protocolVersion?: string;
+	readonly endpointFingerprint?: string;
+	readonly errorCode?: string;
+}> {
+	const configuration = options.vscodeApi.workspace.getConfiguration('copilotAgentMesh');
+	const launcher = new EditorAgentHostLauncher(
+		new EditorAgentHostLocator({
+			configuredCodeCli: configuration.get<string>('codePath') || undefined,
+			configuredUserDataDir: configuration.get<unknown>('agentHost.userDataDir'),
+			platform: { productName: options.vscodeApi.env.appName },
+		}),
+		new UnixSocketWebSocketConnector(),
+	);
+	let host: LaunchedAgentHost | undefined;
+	let connection: AhpConnection | undefined;
+	try {
+		host = await launcher.launch();
+		connection = await new SdkAhpConnectionFactory().connect(host);
+		const initialized = await connection.initialize(`mesh-peer-probe-${randomUUID()}`);
+		return {
+			available: AHP_PROTOCOL_OFFER.includes(initialized.protocolVersion as '1.0.0'),
+			protocolVersion: initialized.protocolVersion,
+			...(host.endpointFingerprint === undefined
+				? {}
+				: { endpointFingerprint: host.endpointFingerprint }),
+		};
+	} catch (error) {
+		const connector = error instanceof UnixSocketWebSocketError
+			? error
+			: error instanceof Error && error.cause instanceof UnixSocketWebSocketError
+				? error.cause
+				: undefined;
+		return {
+			available: false,
+			errorCode: connector?.code ?? 'EDITOR_INITIALIZE_FAILED',
+			...(connector?.endpointFingerprint === undefined
+				? {}
+				: { endpointFingerprint: connector.endpointFingerprint }),
+		};
+	} finally {
+		await Promise.allSettled([
+			connection?.shutdown(),
+			host?.dispose(),
+			launcher.dispose(),
+		].filter((operation): operation is Promise<void> => operation !== undefined));
+	}
 }
 
 async function renameCurrentWindow(

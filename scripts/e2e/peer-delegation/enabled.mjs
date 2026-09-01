@@ -353,6 +353,14 @@ try {
 	};
 	setAc5(4, 'pass', ['#/doubleGate']);
 
+	const editorInitializeProbe = await request(
+		target,
+		'peer.editor.initialize',
+		{},
+		60_000,
+	);
+	console.log(JSON.stringify({ editorInitializeProbe }));
+
 	const completionAvailable = await recordCompletionScenario({
 		source,
 		target,
