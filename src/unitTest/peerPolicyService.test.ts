@@ -278,6 +278,40 @@ test('orders every online candidate ahead of saved offline entries at the transp
 	);
 });
 
+test('serializes concurrent saved-authorization removals without restoring either entry', async (t) => {
+	const fixture = await createFixture();
+	t.after(() => fixture.registry.dispose());
+	const offlineIdentities = [
+		createOpaqueWorkspaceIdentity('offline-concurrent-a'),
+		createOpaqueWorkspaceIdentity('offline-concurrent-b'),
+	];
+	await fixture.service.setPolicy(identityParams(NODE_A, INSTANCE_A), {
+		...identityParams(NODE_A, INSTANCE_A),
+		workspaceIdentity: IDENTITY_A,
+		allowlist: offlineIdentities,
+	});
+	const bindings = fixture.service.listCandidates({
+		...identityParams(NODE_A, INSTANCE_A),
+		workspaceIdentity: IDENTITY_A,
+	}).filter(({ candidate }) => !candidate.online && candidate.allowlisted);
+	assert.equal(bindings.length, 2);
+
+	await Promise.all(bindings.map((binding) =>
+		fixture.service.setCandidateAllowed(
+			identityParams(NODE_A, INSTANCE_A),
+			binding,
+			false,
+		)
+	));
+	assert.deepEqual(
+		fixture.service.getPolicy({
+			...identityParams(NODE_A, INSTANCE_A),
+			workspaceIdentity: IDENTITY_A,
+		}).allowlist,
+		[],
+	);
+});
+
 test('does not synthesize saved authorization for a Workspace on an online multi-root node', async (t) => {
 	const fixture = await createFixture();
 	t.after(() => fixture.registry.dispose());

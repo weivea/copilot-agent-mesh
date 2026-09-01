@@ -281,12 +281,22 @@ export class PeerPolicyService implements PeerRouteAuthorizer {
 	): Promise<NodePolicyResult> {
 		this.assertEnabled();
 		const identity = nodeIdentityParamsSchema.parse(caller);
-		this.requireOwnedWorkspace(identity, binding.sourceWorkspaceIdentity);
+		const owned = this.requireOwnedWorkspace(identity, binding.sourceWorkspaceIdentity);
 		const targetWorkspaceIdentity = binding.targetWorkspaceIdentity;
 		if (targetWorkspaceIdentity === undefined || targetWorkspaceIdentity === binding.sourceWorkspaceIdentity) {
 			throw new MeshDomainError('POLICY_FORBIDDEN', 'The policy candidate cannot be selected.');
 		}
-		if (binding.targetNodeId !== undefined || binding.targetNodeInstanceId !== undefined) {
+		const validateTarget = (): void => {
+			this.requireOwnedWorkspace(identity, binding.sourceWorkspaceIdentity);
+			if (binding.targetNodeId === undefined && binding.targetNodeInstanceId === undefined) {
+				if (allowed) {
+					throw new MeshDomainError(
+						'POLICY_FORBIDDEN',
+						'An offline policy entry cannot be newly allowlisted.',
+					);
+				}
+				return;
+			}
 			if (binding.targetNodeId === undefined || binding.targetNodeInstanceId === undefined) {
 				throw new MeshDomainError('POLICY_FORBIDDEN', 'The policy candidate binding is incomplete.');
 			}
@@ -301,24 +311,30 @@ export class PeerPolicyService implements PeerRouteAuthorizer {
 			if (allowed && (!live?.online || workspace.status !== 'claimed')) {
 				throw new MeshDomainError('POLICY_FORBIDDEN', 'Only a live claimed candidate can be allowlisted.');
 			}
-		} else if (allowed) {
-			throw new MeshDomainError('POLICY_FORBIDDEN', 'An offline policy entry cannot be newly allowlisted.');
-		}
-		const policy = this.getPolicy({
-			...identity,
-			workspaceIdentity: binding.sourceWorkspaceIdentity,
-		});
-		const allowlist = new Set(policy.allowlist);
-		if (allowed) {
-			allowlist.add(targetWorkspaceIdentity);
-		} else {
-			allowlist.delete(targetWorkspaceIdentity);
-		}
-		return this.setPolicy(identity, {
-			...identity,
-			workspaceIdentity: binding.sourceWorkspaceIdentity,
-			allowlist: [...allowlist],
-		});
+		};
+		validateTarget();
+		const effectiveNames = this.effectiveWorkspaceNames();
+		const entry = await this.store.update(binding.sourceWorkspaceIdentity, (current) => {
+			validateTarget();
+			const allowlist = new Set(current?.allowlist ?? []);
+			if (allowed) {
+				allowlist.add(targetWorkspaceIdentity);
+			} else {
+				allowlist.delete(targetWorkspaceIdentity);
+			}
+			return {
+				windowName: current?.windowName
+					?? effectiveNames.get(binding.sourceWorkspaceIdentity)
+					?? resolveWindowDisplayName(undefined, owned.name, identity.nodeId),
+				acceptsIncoming: current?.acceptsIncoming ?? false,
+				allowlist: [...allowlist],
+			};
+		}, [...effectiveNames].map(([workspaceIdentity, windowName]) => ({
+			workspaceIdentity,
+			windowName,
+		})));
+		this.changed();
+		return this.toResult(binding.sourceWorkspaceIdentity, entry);
 	}
 
 	public assertRouteAllowed(

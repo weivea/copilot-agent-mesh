@@ -189,7 +189,7 @@ test('default-off Tool listing stays empty while the safe Dashboard directory re
 });
 
 test('retains an offline allowlist entry with a removable one-time handle', async (t) => {
-	const fixture = await createFixture();
+	const fixture = await createFixture({ includeNodeC: true });
 	t.after(() => fixture.dispose());
 	await fixture.nodeB.setPeerPolicy({
 		workspaceIdentity: IDENTITY_B,
@@ -208,7 +208,18 @@ test('retains an offline allowlist entry with a removable one-time handle', asyn
 	assert.ok(offline?.actionHandle);
 	assert.deepEqual((await fixture.nodeA.listNodes()).nodes, []);
 	assert.deepEqual((await fixture.nodeA.getPeerPolicy(IDENTITY_A)).allowlist, [IDENTITY_B]);
-	await fixture.nodeA.setPeerPolicyCandidate(IDENTITY_A, offline.actionHandle, false);
+	assert.ok(fixture.nodeC);
+	await fixture.nodeC.dispose();
+	await assert.rejects(
+		fixture.nodeA.setPeerPolicyCandidate(IDENTITY_A, offline.actionHandle, false),
+		(error: unknown) =>
+			error instanceof LocalIpcRemoteError
+			&& errorReason(error) === 'POLICY_FORBIDDEN',
+	);
+	const refreshed = (await fixture.nodeA.listPeerPolicyCandidates(IDENTITY_A))
+		.candidates.find(({ online, allowlisted }) => !online && allowlisted);
+	assert.ok(refreshed?.actionHandle);
+	await fixture.nodeA.setPeerPolicyCandidate(IDENTITY_A, refreshed.actionHandle, false);
 	assert.deepEqual((await fixture.nodeA.getPeerPolicy(IDENTITY_A)).allowlist, []);
 });
 

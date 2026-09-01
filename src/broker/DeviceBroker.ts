@@ -334,6 +334,7 @@ export class DeviceBroker {
 			) {
 				continue;
 			}
+			this.dashboardActions.get(session)?.candidates.clear();
 			if (invalidateTaskActions) {
 				this.invalidateDashboardTaskActions(session);
 			}
