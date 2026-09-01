@@ -8,11 +8,13 @@ import {
 	brokerRemoteTaskCancelParamsSchema,
 	brokerRemoteTaskGetParamsSchema,
 	brokerRemoteTaskStartParamsSchema,
+	brokerLocalTaskStartParamsSchema,
 	JSON_RPC_ERROR_CODES,
 	LOCAL_BROKER_METHODS,
 	LOCAL_BROKER_NOTIFICATIONS,
 	nodeHeartbeatParamsSchema,
 	nodeIdentityParamsSchema,
+	nodeRegistrationResultSchema,
 	nodePolicyGetParamsSchema,
 	nodePolicySetParamsSchema,
 	nodeRegisterParamsSchema,
@@ -389,11 +391,21 @@ export class DeviceBroker {
 				);
 			}
 			const descriptor = this.options.registry.register(input, session);
+			const delegationPrincipal = this.options.registry.windowDelegationPrincipal(
+				session,
+				{
+					nodeId: input.nodeId,
+					nodeInstanceId: input.nodeInstanceId,
+				},
+			);
 			this.registrations.set(session, {
 				nodeId: input.nodeId,
 				nodeInstanceId: input.nodeInstanceId,
 			});
-			return toJsonValue(descriptor);
+			return toJsonValue(nodeRegistrationResultSchema.parse({
+				node: descriptor,
+				delegationPrincipal,
+			}));
 		}
 
 		const binding = this.requireRegistration(session);
@@ -447,20 +459,29 @@ export class DeviceBroker {
 				return toJsonValue(this.options.peerPolicies.listCandidates(input));
 			}
 			case LOCAL_BROKER_METHODS.taskStart: {
-				const input = routedTaskStartParamsSchema.parse(params);
+				const input = brokerLocalTaskStartParamsSchema.parse(params);
 				if (input.sourceNodeId !== binding.nodeId) {
 					throw new MeshDomainError(
 						'AUTH_FAILED',
 						'The task source does not match the authenticated Window Node.',
 					);
 				}
+				this.options.registry.assertDelegationPrincipal(
+					session,
+					binding,
+					input.delegationPrincipal,
+				);
+				const {
+					delegationPrincipal: _delegationPrincipal,
+					...routeInput
+				} = input;
 				const snapshot = await this.startLocalRoute(
-					input,
+					routeInput,
 					{ nodeId: binding.nodeId },
 					this.options.identity.deviceId,
-					() => this.options.taskService.prevalidateLocal(binding, input),
+					() => this.options.taskService.prevalidateLocal(binding, routeInput),
 					(outcome) =>
-						this.options.taskService.startLocal(binding, input, outcome),
+						this.options.taskService.startLocal(binding, routeInput, outcome),
 				);
 				return toJsonValue(snapshot);
 			}
@@ -516,6 +537,11 @@ export class DeviceBroker {
 						'The remote task source does not match the authenticated Window Node.',
 					);
 				}
+				this.options.registry.assertDelegationPrincipal(
+					session,
+					binding,
+					input.delegationPrincipal,
+				);
 				const routeInput: RoutedTaskStartParams = {
 					delegationRequestId: input.delegationRequestId,
 					taskId: input.taskId,

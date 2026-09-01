@@ -13,6 +13,7 @@ import type {
 
 import {
 	AhpAgentRuntime,
+	DELEGATED_AGENT_CLIENT_TOOLS,
 	type AhpConnection,
 	type AhpConnectionFactory,
 	type AhpSubscription,
@@ -36,6 +37,8 @@ import {
 	type AgentRuntimeErrorCode,
 	type AgentTaskRequest,
 } from '../agentHost/AgentRuntime';
+import { DelegatedToolInvocationRegistry } from '../tools/DelegatedToolInvocationRegistry';
+import { MESH_TOOL_NAMES } from '../tools/toolManifest';
 import {
 	VscodeAuthBroker,
 	type AuthenticationApi,
@@ -540,6 +543,7 @@ test('runtime resolves workspace IDs through the trusted registry and ignores fo
 		workspaceResolver: trustedWorkspaceResolver(),
 		configResolver: { resolve: async () => ({ model: 'test-model' }) },
 	});
+
 	const forged = {
 		...taskRequest(),
 		workspace: {
@@ -561,6 +565,116 @@ test('runtime resolves workspace IDs through the trusted registry and ignores fo
 	);
 	assert.equal(launcher.launchCalls, 1);
 	await runtime.dispose();
+});
+
+test('runtime correlates an observed child AHP Mesh call and clears it on cancellation', async () => {
+	const transport = new FakeAhpTransport();
+	const launcher = new FakeLauncher();
+	const delegatedToolInvocations = new DelegatedToolInvocationRegistry();
+	const runtime = new AhpAgentRuntime({
+		enabled: () => true,
+		launcher,
+		connections: new FakeConnectionFactory([transport]),
+		authBroker: new RecordingAuthBroker(),
+		confirmation: { confirm: async () => 'once' },
+		workspaceResolver: trustedWorkspaceResolver(),
+		configResolver: { resolve: async () => ({ model: 'test-model' }) },
+		delegatedToolInvocations,
+	});
+	const executionContext = {
+		kind: 'delegatedChild' as const,
+		taskId: '00000000-0000-4000-8000-000000000080',
+		capability: 'c'.repeat(43),
+	};
+	const input = {
+		delegationRequestId: '00000000-0000-4000-8000-000000000081',
+		deviceId: '00000000-0000-4000-8000-000000000082',
+		nodeId: '00000000-0000-4000-8000-000000000083',
+		nodeInstanceId: '00000000-0000-4000-8000-000000000084',
+		workspaceId: '00000000-0000-4000-8000-000000000085',
+		title: 'Nested task',
+		prompt: 'Attempt nested delegation.',
+		acceptanceCriteria: ['Rejected'],
+	};
+	const handle = await runtime.start({
+		...taskRequest(),
+		taskId: executionContext.taskId,
+		delegatedExecutionContext: executionContext,
+	});
+	await nextEvent(handle.events);
+	await transport.emitChat({
+		type: 'chat/toolCallStart',
+		turnId: 'turn-1',
+		toolCallId: 'mesh-call-1',
+		toolName: MESH_TOOL_NAMES.delegateTask,
+		displayName: 'Delegate Task',
+	});
+	await nextEvent(handle.events);
+	await transport.emitChat({
+		type: 'chat/toolCallReady',
+		turnId: 'turn-1',
+		toolCallId: 'mesh-call-1',
+		invocationMessage: 'Delegate task',
+		toolInput: JSON.stringify(input),
+		confirmed: 'not-needed',
+	});
+	await nextEvent(handle.events);
+	assert.deepEqual(delegatedToolInvocations.consume(input), executionContext);
+
+	await transport.emitChat({
+		type: 'chat/toolCallReady',
+		turnId: 'turn-1',
+		toolCallId: 'mesh-call-2',
+		invocationMessage: 'Delegate task',
+		toolInput: JSON.stringify(input),
+		confirmed: 'not-needed',
+	});
+	await nextEvent(handle.events);
+	assert.equal(delegatedToolInvocations.size, 1);
+	assert.deepEqual(delegatedToolInvocations.consume(input), executionContext);
+	await transport.emitChat({
+		type: 'chat/toolCallStart',
+		turnId: 'turn-1',
+		toolCallId: 'mesh-call-2',
+		toolName: MESH_TOOL_NAMES.delegateTask,
+		displayName: 'Delegate Task',
+	});
+	await nextEvent(handle.events);
+	await transport.emitChat({
+		type: 'chat/toolCallReady',
+		turnId: 'turn-1',
+		toolCallId: 'mesh-call-2',
+		invocationMessage: 'Delegate task',
+		toolInput: JSON.stringify(input),
+		confirmed: 'not-needed',
+	});
+	await nextEvent(handle.events);
+	assert.equal(delegatedToolInvocations.size, 2);
+	await handle.cancel();
+	assert.equal(delegatedToolInvocations.size, 0);
+	await handle.dispose();
+	await runtime.dispose();
+});
+
+test('runtime explicitly rejects the removed legacy always approval', async () => {
+	const launcher = new FakeLauncher();
+	const runtime = new AhpAgentRuntime({
+		enabled: () => true,
+		launcher,
+		connections: new FakeConnectionFactory([new FakeAhpTransport()]),
+		authBroker: new RecordingAuthBroker(),
+		confirmation: {
+			confirm: async () => 'always' as never,
+		},
+		workspaceResolver: trustedWorkspaceResolver(),
+	});
+	await assert.rejects(
+		runtime.start(taskRequest()),
+		(error: unknown) =>
+			error instanceof AgentRuntimeError
+			&& error.code === 'TASK_EXECUTION_FAILED',
+	);
+	assert.equal(launcher.launchCalls, 0);
 });
 
 test('runtime attaches the root subscription before initialize and preserves notifications from that window', async () => {
@@ -831,6 +945,90 @@ test('runtime reconnects with the recovery descriptor and fails truthfully on ho
 		assert.equal(failed.error.code, 'TASK_RECOVERY_UNAVAILABLE');
 	}
 	await handle.dispose();
+});
+
+test('runtime drops replayed child correlations and accepts only fresh calls after recovery', async () => {
+	const first = new FakeAhpTransport();
+	const recovered = new FakeAhpTransport();
+	const input = {
+		delegationRequestId: '00000000-0000-4000-8000-0000000000a1',
+		deviceId: '00000000-0000-4000-8000-0000000000a2',
+		nodeId: '00000000-0000-4000-8000-0000000000a3',
+		nodeInstanceId: '00000000-0000-4000-8000-0000000000a4',
+		workspaceId: '00000000-0000-4000-8000-0000000000a5',
+		title: 'Recovered nested task',
+		prompt: 'Attempt nested delegation after recovery.',
+		acceptanceCriteria: ['Rejected'],
+	};
+	recovered.reconnectResult = {
+		type: 'replay',
+		actions: [
+			envelope('ahp-chat:/default', {
+				type: 'chat/toolCallStart',
+				turnId: 'turn-1',
+				toolCallId: 'replayed-tool',
+				toolName: MESH_TOOL_NAMES.delegateTask,
+				displayName: 'Delegate Task',
+			}, 9),
+			envelope('ahp-chat:/default', {
+				type: 'chat/toolCallReady',
+				turnId: 'turn-1',
+				toolCallId: 'replayed-tool',
+				invocationMessage: 'Delegate task',
+				toolInput: JSON.stringify(input),
+				confirmed: 'not-needed',
+			}, 10),
+		],
+		missing: [],
+	};
+	const registry = new DelegatedToolInvocationRegistry();
+	const launcher = new FakeLauncher();
+	const runtime = createRuntime(
+		launcher,
+		new FakeConnectionFactory([first, recovered]),
+		new RecordingAuthBroker(),
+		registry,
+	);
+	const executionContext = {
+		kind: 'delegatedChild' as const,
+		taskId: '00000000-0000-4000-8000-0000000000a0',
+		capability: 'd'.repeat(43),
+	};
+	const handle = await runtime.start({
+		...taskRequest(),
+		taskId: executionContext.taskId,
+		delegatedExecutionContext: executionContext,
+	});
+	await nextEvent(handle.events);
+	recovered.created = first.created;
+
+	first.failChat();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	assert.equal((await nextEvent(handle.events)).type, 'tool');
+	assert.equal((await nextEvent(handle.events)).type, 'tool');
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	assert.equal(registry.size, 0);
+
+	await recovered.emitChat({
+		type: 'chat/toolCallStart',
+		turnId: 'turn-2',
+		toolCallId: 'fresh-tool',
+		toolName: MESH_TOOL_NAMES.delegateTask,
+		displayName: 'Delegate Task',
+	});
+	await nextEvent(handle.events);
+	await recovered.emitChat({
+		type: 'chat/toolCallReady',
+		turnId: 'turn-2',
+		toolCallId: 'fresh-tool',
+		invocationMessage: 'Delegate task',
+		toolInput: JSON.stringify(input),
+		confirmed: 'not-needed',
+	});
+	await nextEvent(handle.events);
+	assert.deepEqual(registry.consume(input), executionContext);
+	await handle.dispose();
+	await runtime.dispose();
 });
 
 test('dispose aborts and awaits in-flight recovery before releasing owned resources', async () => {
@@ -1583,6 +1781,71 @@ test('event mapper reports authoritative turn completion and bounded terminal su
 	}, 11)), [{ type: 'terminal', summary: 'hello' }]);
 });
 
+test('delegated Agent sessions contribute no Mesh tools', () => {
+	assert.deepEqual(DELEGATED_AGENT_CLIENT_TOOLS, []);
+	for (const meshTool of Object.values(MESH_TOOL_NAMES)) {
+		assert.equal(DELEGATED_AGENT_CLIENT_TOOLS.includes(meshTool as never), false);
+	}
+});
+
+test('event mapper retains only structured file confirmation evidence', () => {
+	const mapper = new AhpEventMapper();
+	mapper.map(envelope('ahp-chat:/default', {
+		type: 'chat/toolCallStart',
+		turnId: 'turn-1',
+		toolCallId: 'tool-1',
+		toolName: 'write_file',
+		displayName: 'Write File',
+	}, 10));
+	const [event] = mapper.map(envelope('ahp-chat:/default', {
+		type: 'chat/toolCallReady',
+		turnId: 'turn-1',
+		toolCallId: 'tool-1',
+		invocationMessage: 'Write a file',
+		toolInput: '{"path":"/sensitive/raw/path"}',
+		riskAssessment: {
+			kind: 'model',
+			status: 'complete',
+			reason: 'Untrusted prose',
+			safety: 1,
+		},
+		edits: {
+			items: [{
+				after: {
+					uri: 'file:///workspace/new.ts',
+					content: { uri: 'ahp-content:/after' },
+				},
+			}],
+		},
+	}, 11));
+	assert.equal(event?.type, 'inputRequired');
+	if (event?.type !== 'inputRequired') {
+		return;
+	}
+	assert.deepEqual(event.request.confirmationEvidence, {
+		phase: 'operation',
+		toolName: 'write_file',
+		fileEdits: [{ afterUri: 'file:///workspace/new.ts' }],
+	});
+	assert.equal(JSON.stringify(event.request).includes('/sensitive/raw/path'), false);
+	assert.equal(JSON.stringify(event.request).includes('Untrusted prose'), false);
+
+	const mapperWithoutStart = new AhpEventMapper();
+	const [unknown] = mapperWithoutStart.map(envelope('ahp-chat:/default', {
+		type: 'chat/toolCallReady',
+		turnId: 'turn-1',
+		toolCallId: 'tool-1',
+		invocationMessage: 'Write a file',
+		edits: { items: [] },
+	}, 12));
+	assert.equal(
+		unknown?.type === 'inputRequired'
+			? unknown.request.confirmationEvidence
+			: 'unexpected',
+		undefined,
+	);
+});
+
 test('event mapper accepts AHP 1.0 and 0.8 turn error shapes', () => {
 	const mapper = new AhpEventMapper();
 	const actions = [
@@ -1776,6 +2039,7 @@ function createRuntime(
 		launcher: FakeLauncher,
 		connections: AhpConnectionFactory,
 		authBroker: AuthBroker = new RecordingAuthBroker(),
+		delegatedToolInvocations?: DelegatedToolInvocationRegistry,
 ): AhpAgentRuntime {
 		return new AhpAgentRuntime({
 			enabled: () => true,
@@ -1786,6 +2050,7 @@ function createRuntime(
 		workspaceResolver: trustedWorkspaceResolver(),
 		configResolver: { resolve: async () => ({ model: 'test-model' }) },
 		cancellationTimeoutMs: 100,
+		delegatedToolInvocations,
 	});
 }
 

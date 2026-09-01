@@ -25,6 +25,7 @@ export class AgentRuntimeError extends Error {
 
 export interface RegisteredLocalWorkspace {
 	readonly workspaceId: string;
+	readonly workspaceIdentity?: string;
 	readonly displayName: string;
 	readonly uri: string;
 }
@@ -37,6 +38,7 @@ export interface AgentTaskRequest {
 	readonly workspaceId: string;
 	readonly providerId?: string;
 	readonly allowInteractiveAuthentication?: boolean;
+	readonly delegatedExecutionContext?: DelegatedExecutionContext;
 	readonly approvalContext?: {
 		readonly peerId: string;
 		readonly workspaceId: string;
@@ -53,7 +55,7 @@ export interface WorkspaceResolver {
 }
 
 export interface FirstTaskConfirmation {
-	confirm(request: ResolvedAgentTaskRequest): Promise<'once' | 'always' | 'deny'>;
+	confirm(request: ResolvedAgentTaskRequest): Promise<'once' | 'deny'>;
 }
 
 export type AgentInputKind = 'chatInput' | 'toolConfirmation' | 'toolAuthentication';
@@ -70,6 +72,14 @@ export interface AgentInputRequest {
 	readonly prompt: string;
 	readonly url?: string;
 	readonly options?: readonly AgentInputOption[];
+	readonly confirmationEvidence?: {
+		readonly phase: 'operation' | 'result';
+		readonly toolName: string;
+		readonly fileEdits?: readonly {
+			readonly beforeUri?: string;
+			readonly afterUri?: string;
+		}[];
+	};
 	readonly fields?: readonly {
 		readonly id: string;
 		readonly prompt: string;
@@ -603,3 +613,4 @@ function positiveInteger(value: number, name: string): number {
 	}
 	return value;
 }
+import type { DelegatedExecutionContext } from '../../shared/protocol';

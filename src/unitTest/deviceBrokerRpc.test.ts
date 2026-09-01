@@ -1,15 +1,16 @@
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { lstat, mkdir, rm } from 'node:fs/promises';
-import { sep } from 'node:path';
+import { join, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { test } from 'node:test';
 
 import type {
+	NodeRegisterParams,
 	RoutedTaskStartParams,
 	TaskSnapshot,
 } from '../../shared/protocol';
-import { LOCAL_BROKER_METHODS } from '../../shared/protocol';
+import { LOCAL_BROKER_METHODS, MESH_ERROR_CODES } from '../../shared/protocol';
 import {
 	createAgentRuntimeEventQueue,
 	type AgentRuntime,
@@ -252,6 +253,9 @@ interface ClientFixture {
 	readonly confirmations: WindowNodeTaskConfirmationRequest[];
 	readonly executorCreations: () => number;
 	readonly previousGenerationWasDrained: () => boolean;
+	readonly executionContext: (
+		taskId: string,
+	) => ReturnType<WindowNodeTaskExecutor['delegatedExecutionContext']>;
 }
 
 function createClient(
@@ -264,6 +268,7 @@ function createClient(
 	const confirmations: WindowNodeTaskConfirmationRequest[] = [];
 	let executorCreations = 0;
 	let previousGenerationWasDrained = true;
+	let executor: WindowNodeTaskExecutor | undefined;
 	const client = new WindowNodeClient({
 		nodeId,
 		nodeInstanceId,
@@ -278,7 +283,7 @@ function createClient(
 				);
 			}
 			executorCreations += 1;
-			return new WindowNodeTaskExecutor({
+			executor = new WindowNodeTaskExecutor({
 				nodeId,
 				nodeInstanceId,
 				nodeLabel: label,
@@ -294,6 +299,7 @@ function createClient(
 				ids: { next: () => INPUT_ID },
 				clock: { now: () => new Date() },
 			});
+			return executor;
 		},
 		workspaceSource: {
 			list: () => [{
@@ -316,6 +322,7 @@ function createClient(
 		confirmations,
 		executorCreations: () => executorCreations,
 		previousGenerationWasDrained: () => previousGenerationWasDrained,
+		executionContext: (taskId) => executor?.delegatedExecutionContext(taskId),
 	};
 }
 
@@ -423,7 +430,15 @@ test('DeviceBroker closes sessions and drains active handlers before shared stat
 			dispose: () => Promise.resolve(),
 		},
 		registry: {
-			register: () => ({}),
+			register: (input: NodeRegisterParams) => ({
+				...input,
+				lastHeartbeatAt: input.startedAt,
+				workspaces: [],
+			}),
+			windowDelegationPrincipal: () => ({
+				kind: 'window',
+				capability: 'w'.repeat(43),
+			}),
 			dispose: () => {
 				disposalOrder.push('registry');
 			},
@@ -641,6 +656,39 @@ test('routes authenticated local RPC across two nodes and fences workspace execu
 		await emit(windowA.runtime.handles[1], {
 			type: 'inputRequired',
 			request: {
+				requestId: 'safe-file-write',
+				kind: 'toolConfirmation',
+				prompt: 'Write file?',
+				confirmationEvidence: {
+					phase: 'operation',
+					toolName: 'write_file',
+					fileEdits: [{
+						afterUri: pathToFileURL(join(process.cwd(), 'safe-generated.ts')).href,
+					}],
+				},
+			},
+		});
+		await waitFor(async () => windowA.runtime.handles[1].answers.length === 1);
+		assert.deepEqual(windowA.runtime.handles[1].answers[0], {
+			requestId: 'safe-file-write',
+			outcome: 'accept',
+		});
+		assert.notEqual((await clientB.getTask(TASK_B)).state, 'needsInput');
+		const executionContext = windowA.executionContext(TASK_B);
+		assert.ok(executionContext);
+		await assert.rejects(
+			clientA.startTaskFromDelegatedChild(task(indexedUuid(80_000), indexedUuid(80_001), {
+				nodeId: NODE_A,
+				nodeInstanceId: INSTANCE_A,
+				workspaceId: nodeA.workspaces[0].workspaceId,
+			}), executionContext),
+			(error: unknown) =>
+				error instanceof LocalIpcRemoteError
+				&& error.code === MESH_ERROR_CODES.DELEGATION_RECURSION,
+		);
+		await emit(windowA.runtime.handles[1], {
+			type: 'inputRequired',
+			request: {
 				requestId: 'runtime-input',
 				kind: 'chatInput',
 				prompt: 'Continue?',
@@ -658,7 +706,7 @@ test('routes authenticated local RPC across two nodes and fences workspace execu
 			(error: unknown) => error instanceof LocalIpcRemoteError && error.code === 1007,
 		);
 		await clientB.answerTask(TASK_B, INPUT_ID, ANSWER_ID, 'yes');
-		assert.equal(windowA.runtime.handles[1].answers.length, 1);
+		assert.equal(windowA.runtime.handles[1].answers.length, 2);
 		await clientA.dispose();
 		await waitFor(async () => {
 			const offline = (await clientB.listNodes()).nodes.find((node) => node.nodeId === NODE_A);

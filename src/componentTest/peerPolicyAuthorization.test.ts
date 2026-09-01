@@ -13,6 +13,7 @@ import {
 	TaskRouteCatalog,
 	type RegistryScheduler,
 } from '../broker';
+import type { NodeTaskStartParams } from '../../shared/protocol';
 import type { StateStore } from '../domain/ports';
 import { LocalIpcRemoteError, type LocalIpcIdentity } from '../ipc';
 import { WindowNodeClient, type WindowNodeExecutor } from '../node';
@@ -21,7 +22,9 @@ import type { BrokerOwnership } from '../storage/WorkerOwnerLock';
 import { FileTaskStore } from '../tasks/FileTaskStore';
 import { WorkspaceLeaseManager } from '../tasks/WorkspaceLeaseManager';
 import { LocalBrokerTaskFacade } from '../tools/LocalBrokerTaskFacade';
+import { DelegatedToolInvocationRegistry } from '../tools/DelegatedToolInvocationRegistry';
 import { TaskToolsCore } from '../tools/taskToolsCore';
+import { MESH_TOOL_NAMES } from '../tools/toolManifest';
 import { createOpaqueWorkspaceIdentity } from '../workspaces/OpaqueWorkspaceIdentity';
 import {
 	MemoryAtomicFileSystem,
@@ -32,14 +35,18 @@ import {
 const DEVICE = uuid(201);
 const NODE_A = uuid(202);
 const NODE_B = uuid(203);
+const NODE_C = uuid(230);
 const INSTANCE_A = uuid(204);
 const INSTANCE_B = uuid(205);
+const INSTANCE_C = uuid(231);
 const WORKSPACE_A = uuid(206);
 const WORKSPACE_B = uuid(207);
 const WORKSPACE_C = uuid(208);
+const WORKSPACE_D = uuid(232);
 const IDENTITY_A = createOpaqueWorkspaceIdentity('component-workspace-a');
 const IDENTITY_B = createOpaqueWorkspaceIdentity('component-workspace-b');
 const IDENTITY_C = createOpaqueWorkspaceIdentity('component-workspace-c');
+const IDENTITY_D = createOpaqueWorkspaceIdentity('component-workspace-d');
 
 test('authenticated broker RPC keeps Tool and configuration directories separate', async (t) => {
 	const fixture = await createFixture();
@@ -319,10 +326,95 @@ test('stable claimed-set source scope survives focus changes, no editor, and Bro
 	assert.equal(fixture.executorB.startCount, 1);
 });
 
+test('delegated child context blocks recursion without blocking the window primary role', async (t) => {
+	const fixture = await createFixture({ includeNodeC: true });
+	t.after(() => fixture.dispose());
+	const nodeC = fixture.nodeC!;
+	const executorC = fixture.executorC!;
+	await fixture.nodeA.setPeerPolicy({
+		workspaceIdentity: IDENTITY_A,
+		allowlist: [IDENTITY_B],
+	});
+	await fixture.nodeB.setPeerPolicy({
+		workspaceIdentity: IDENTITY_B,
+		acceptsIncoming: true,
+		allowlist: [IDENTITY_D],
+	});
+	await nodeC.setPeerPolicy({
+		workspaceIdentity: IDENTITY_D,
+		acceptsIncoming: true,
+	});
+
+	const incomingTaskId = uuid(233);
+	const incomingStarted = fixture.executorB.nextStartedTaskId();
+	await fixture.nodeA.startTask(task(incomingTaskId));
+	await incomingStarted;
+	const childContext = fixture.executorB.lastStart?.delegatedExecutionContext;
+	assert.ok(childContext);
+
+	const facadeB = new LocalBrokerTaskFacade(fixture.nodeB, {
+		deviceName: 'Component Device',
+		now: () => new Date('2026-08-30T12:00:00.000Z'),
+		sourceWorkspaceIdentity: () => IDENTITY_B,
+	});
+	const delegatedToolInvocations = new DelegatedToolInvocationRegistry();
+	t.after(() => delegatedToolInvocations.dispose());
+	const primaryCore = new TaskToolsCore(facadeB, { delegatedToolInvocations });
+	const primaryInput = delegationFromBToC(234);
+	const primaryTaskId = facadeB.identifyDelegation(primaryInput).taskId;
+	const primaryStarted = executorC.nextStartedTaskId();
+	const primary = primaryCore.delegateTask(primaryInput);
+	await primaryStarted;
+	assert.equal(executorC.lastStart?.taskId, primaryTaskId);
+
+	const childCore = new TaskToolsCore(facadeB, { delegatedToolInvocations });
+	const childInput = delegationFromBToC(236);
+	delegatedToolInvocations.observe({
+		scopeId: 'ahp-session:/component-child',
+		invocationId: 'turn-1\u0000tool-1',
+		toolName: MESH_TOOL_NAMES.delegateTask,
+		toolInput: JSON.stringify(childInput),
+		context: childContext,
+	});
+	const childResult = await childCore.delegateTask(childInput);
+	assert.equal(childResult.e, 'DELEGATION_RECURSION');
+	const duplicateChildResult = await childCore.delegateTask(childInput);
+	assert.equal(duplicateChildResult.e, 'DELEGATION_RECURSION');
+	assert.equal(delegatedToolInvocations.size, 1);
+	delegatedToolInvocations.forget('ahp-session:/component-child', 'turn-1\u0000tool-1');
+	assert.equal(delegatedToolInvocations.size, 0);
+
+	await nodeC.publishTaskEvent(taskEventFor(
+		NODE_C,
+		INSTANCE_C,
+		primaryTaskId,
+		{ type: 'completed', summary: 'Primary delegation completed.' },
+	));
+	assert.equal((await primary).s, 0);
+	await fixture.nodeB.publishTaskEvent(taskEvent(incomingTaskId, {
+		type: 'completed',
+		summary: 'Incoming child task completed.',
+	}));
+
+	const staleInput = delegationFromBToC(238);
+	delegatedToolInvocations.observe({
+		scopeId: 'ahp-session:/component-child',
+		invocationId: 'turn-1\u0000tool-2',
+		toolName: MESH_TOOL_NAMES.delegateTask,
+		toolInput: JSON.stringify(staleInput),
+		context: childContext,
+	});
+	const staleResult = await childCore.delegateTask(staleInput);
+	assert.equal(staleResult.e, 'AUTH_FAILED');
+	assert.equal(executorC.startCount, 1);
+});
+
 interface Fixture {
 	readonly nodeA: WindowNodeClient;
 	readonly nodeB: WindowNodeClient;
+	readonly nodeC?: WindowNodeClient;
 	readonly executorB: RecordingExecutor;
+	readonly executorC?: RecordingExecutor;
 	restartBroker(): Promise<void>;
 	dispose(): Promise<void>;
 }
@@ -330,6 +422,7 @@ interface Fixture {
 async function createFixture(options: {
 	readonly enabled?: boolean;
 	readonly sourceWorkspaceIdentities?: readonly string[];
+	readonly includeNodeC?: boolean;
 } = {}): Promise<Fixture> {
 	const tempDirectory = await mkdtemp(
 		process.platform === 'win32' ? join(tmpdir(), 'mesh-pp-') : '/tmp/mesh-pp-',
@@ -356,6 +449,7 @@ async function createFixture(options: {
 		WORKSPACE_A,
 		...(options.sourceWorkspaceIdentities?.length === 2 ? [WORKSPACE_C] : []),
 		WORKSPACE_B,
+		...(options.includeNodeC ? [WORKSPACE_D] : []),
 	];
 	let registry: NodeRegistry;
 	let policies: PeerPolicyService;
@@ -400,8 +494,10 @@ async function createFixture(options: {
 	};
 	await startBroker();
 	const executorB = new RecordingExecutor();
+	const executorC = options.includeNodeC ? new RecordingExecutor() : undefined;
 	let nodeA: WindowNodeClient;
 	let nodeB: WindowNodeClient;
+	let nodeC: WindowNodeClient | undefined;
 	const startNodes = async (): Promise<void> => {
 		nodeA = nodeClient(
 			identity,
@@ -416,8 +512,18 @@ async function createFixture(options: {
 			['component-workspace-b'],
 			executorB,
 		);
+		nodeC = options.includeNodeC
+			? nodeClient(
+				identity,
+				NODE_C,
+				INSTANCE_C,
+				['component-workspace-d'],
+				executorC!,
+			)
+			: undefined;
 		await nodeA.start();
 		await nodeB.start();
+		await nodeC?.start();
 	};
 	await startNodes();
 	return {
@@ -427,10 +533,15 @@ async function createFixture(options: {
 		get nodeB() {
 			return nodeB;
 		},
+		get nodeC() {
+			return nodeC;
+		},
 		executorB,
+		executorC,
 		restartBroker: async () => {
 			await nodeA.dispose();
 			await nodeB.dispose();
+			await nodeC?.dispose();
 			await broker?.dispose();
 			broker = undefined;
 			await startBroker();
@@ -439,6 +550,7 @@ async function createFixture(options: {
 		dispose: async () => {
 			await nodeA.dispose().catch(() => undefined);
 			await nodeB.dispose().catch(() => undefined);
+			await nodeC?.dispose().catch(() => undefined);
 			await broker?.dispose().catch(() => undefined);
 			await rm(tempDirectory, { recursive: true, force: true });
 		},
@@ -457,12 +569,14 @@ function nodeClient(
 		brokerKey: Buffer.alloc(32, 0x5a),
 		nodeId,
 		nodeInstanceId,
-		label: nodeId === NODE_A ? 'frontend' : 'backend',
+		label: nodeId === NODE_A ? 'frontend' : nodeId === NODE_B ? 'backend' : 'worker',
 		capabilities: ['tasks'],
 		executor,
 		workspaceSource: () => fileIdentities.map((fileIdentity, index) => ({
 			localUri: `file:///${fileIdentity}`,
-			name: nodeId === NODE_A ? `Repository ${index + 1}` : 'Repository B',
+			name: nodeId === NODE_A
+				? `Repository ${index + 1}`
+				: nodeId === NODE_B ? 'Repository B' : 'Repository C',
 			capabilityTags: ['typescript'],
 		})),
 		fileIdentityResolver: {
@@ -516,6 +630,25 @@ function task(taskId: string) {
 	};
 }
 
+function taskFromBToC(taskId: string, delegationRequestId: string) {
+	return {
+		delegationRequestId,
+		taskId,
+		target: {
+			deviceId: DEVICE,
+			nodeId: NODE_C,
+			nodeInstanceId: INSTANCE_C,
+			workspaceId: WORKSPACE_D,
+		},
+		sourceNodeId: NODE_B,
+		sourceWorkspaceIdentity: IDENTITY_B,
+		title: 'Simultaneous primary delegation',
+		prompt: 'Run while this window also executes an incoming child task.',
+		acceptanceCriteria: [],
+		workerDeadline: '2026-08-30T13:00:00.000Z',
+	};
+}
+
 function delegationInput(index: number) {
 	return {
 		delegationRequestId: uuid(index),
@@ -530,6 +663,20 @@ function delegationInput(index: number) {
 	};
 }
 
+function delegationFromBToC(index: number) {
+	return {
+		delegationRequestId: uuid(index),
+		deviceId: DEVICE,
+		nodeId: NODE_C,
+		nodeInstanceId: INSTANCE_C,
+		workspaceId: WORKSPACE_D,
+		title: 'Component nested task',
+		prompt: 'Attempt delegation from Window B.',
+		acceptanceCriteria: ['Reach Window C'],
+		timeoutMinutes: 60,
+	};
+}
+
 function taskEvent(
 	taskId: string,
 	event: Parameters<WindowNodeClient['publishTaskEvent']>[0]['event'],
@@ -537,6 +684,21 @@ function taskEvent(
 	return {
 		nodeId: NODE_B,
 		nodeInstanceId: INSTANCE_B,
+		taskId,
+		at: '2026-08-30T12:00:01.000Z',
+		event,
+	};
+}
+
+function taskEventFor(
+	nodeId: string,
+	nodeInstanceId: string,
+	taskId: string,
+	event: Parameters<WindowNodeClient['publishTaskEvent']>[0]['event'],
+): Parameters<WindowNodeClient['publishTaskEvent']>[0] {
+	return {
+		nodeId,
+		nodeInstanceId,
 		taskId,
 		at: '2026-08-30T12:00:01.000Z',
 		event,
@@ -591,11 +753,13 @@ class RecordingExecutor implements WindowNodeExecutor {
 	private readonly startedTaskIds: string[] = [];
 	private readonly waiters: Array<(taskId: string) => void> = [];
 	public startCount = 0;
+	public lastStart: NodeTaskStartParams | undefined;
 
 	public start(
 		input: Parameters<WindowNodeExecutor['start']>[0],
 	): Promise<Awaited<ReturnType<WindowNodeExecutor['start']>>> {
 		this.startCount += 1;
+		this.lastStart = structuredClone(input);
 		const waiter = this.waiters.shift();
 		if (waiter === undefined) {
 			this.startedTaskIds.push(input.taskId);

@@ -19,6 +19,8 @@ import {
 	MESH_RUNTIME_TOOL_NAMES,
 	MESH_TOOL_NAMES,
 } from '../tools/toolManifest';
+import { DelegatedToolInvocationRegistry } from '../tools/DelegatedToolInvocationRegistry';
+import { TaskToolFacadeError } from '../tools/taskToolFacade';
 import type { AgentMeshExtensionApi } from '../composition/createApplication';
 
 suite('Copilot Agent Mesh', () => {
@@ -192,6 +194,72 @@ suite('Copilot Agent Mesh', () => {
 			}
 		} finally {
 			cancellation.dispose();
+		}
+	});
+
+	test('registered delegate tool carries an exact child correlation into its facade', async () => {
+		const delegatedToolInvocations = new DelegatedToolInvocationRegistry();
+		const executionContext = {
+			kind: 'delegatedChild' as const,
+			taskId: '00000000-0000-4000-8000-000000000090',
+			capability: 'e'.repeat(43),
+		};
+		const input = {
+			delegationRequestId: '00000000-0000-4000-8000-000000000091',
+			deviceId: '00000000-0000-4000-8000-000000000092',
+			nodeId: '00000000-0000-4000-8000-000000000093',
+			nodeInstanceId: '00000000-0000-4000-8000-000000000094',
+			workspaceId: '00000000-0000-4000-8000-000000000095',
+			title: 'Blocked child delegation',
+			prompt: 'Attempt a nested task.',
+			acceptanceCriteria: ['Rejected'],
+		};
+		delegatedToolInvocations.observe({
+			scopeId: 'ahp-session:/extension-child',
+			invocationId: 'turn-1\u0000tool-1',
+			toolName: MESH_TOOL_NAMES.delegateTask,
+			toolInput: JSON.stringify(input),
+			context: executionContext,
+		});
+		let receivedContext: unknown;
+		const facade: TaskToolFacade = {
+			identifyDelegation: () => ({
+				delegationRequestId: input.delegationRequestId,
+				taskId: '00000000-0000-4000-8000-000000000096',
+				sourceWorkspaceIdentity: `sha256:${'f'.repeat(43)}`,
+			}),
+			listWorkers: async () => ({ devices: [], truncated: false }),
+			subscribeToTask: () => ({ dispose: () => undefined }),
+			persistDelegationIntent: async (_intent, context) => {
+				receivedContext = context;
+				throw new TaskToolFacadeError('DELEGATION_RECURSION');
+			},
+			waitForDelegationAcceptance: async () => ({ status: 'accepted' }),
+			getTask: async () => {
+				throw new TaskToolFacadeError('TASK_NOT_FOUND');
+			},
+			cancelOwnedTask: async () => {
+				throw new TaskToolFacadeError('TASK_NOT_CANCELLABLE');
+			},
+			answerOwnedTask: async () => {
+				throw new TaskToolFacadeError('INPUT_NOT_PENDING');
+			},
+		};
+		const cancellation = new vscode.CancellationTokenSource();
+		try {
+			const result = await new MeshDelegateTaskTool(facade, {
+				delegatedToolInvocations,
+			}).invoke({
+				input,
+				toolInvocationToken: undefined,
+			}, cancellation.token);
+			assert.deepStrictEqual(receivedContext, executionContext);
+			const [part] = result.content;
+			assert.ok(part instanceof vscode.LanguageModelTextPart);
+			assert.strictEqual(JSON.parse(part.value).e, 'DELEGATION_RECURSION');
+		} finally {
+			cancellation.dispose();
+			delegatedToolInvocations.dispose();
 		}
 	});
 });

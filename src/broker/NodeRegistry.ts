@@ -1,8 +1,11 @@
+import { randomBytes, timingSafeEqual } from 'node:crypto';
+
 import { z } from 'zod';
 
 import {
 	PROTOCOL_LIMITS,
 	nodeDirectoryResultSchema,
+	delegationPrincipalSchema,
 	nodeHeartbeatParamsSchema,
 	nodeIdentityParamsSchema,
 	nodeRegisterParamsSchema,
@@ -19,6 +22,9 @@ import {
 	type NodeStatus,
 	type NodeWorkspaceClaimParams,
 	type NodeWorkspaceReleaseParams,
+	type DelegatedExecutionContext,
+	type DelegationPrincipal,
+	type WindowDelegationPrincipal,
 	type WindowNodeDescriptor,
 	type WorkspaceClaimStatus,
 } from '../../shared/protocol';
@@ -112,12 +118,14 @@ export interface TaskRouteRequest {
 export interface TaskRoute {
 	readonly session: LocalIpcSession;
 	readonly workspaceLeaseKey: string;
+	readonly delegatedExecutionContext: DelegatedExecutionContext;
 }
 
 export interface ResolvedTaskRoute extends TaskRoute, NodeTaskBinding {}
 
 export interface NodeTaskBinding extends TaskRouteRequest {
 	readonly workspaceLeaseKey: string;
+	readonly delegatedExecutionContext: DelegatedExecutionContext;
 }
 
 export interface AuthenticatedNodeTaskEvent {
@@ -197,6 +205,7 @@ interface NodeRecord {
 	offlineAt: number | undefined;
 	session: LocalIpcSession | undefined;
 	removeCloseListener: (() => void) | undefined;
+	windowDelegationCapability: string;
 	readonly workspaces: Map<string, WorkspaceObservation>;
 	readonly workspaceHistory: Map<string, WorkspaceObservation>;
 }
@@ -297,6 +306,7 @@ export class NodeRegistry {
 			existing.lastHeartbeatReceivedAt = now.getTime();
 			existing.offlineAt = undefined;
 			existing.session = session;
+			existing.windowDelegationCapability = randomBytes(32).toString('base64url');
 			existing.removeCloseListener = this.listenForNodeClose(existing, session);
 			return this.descriptor(existing);
 		}
@@ -337,6 +347,7 @@ export class NodeRegistry {
 			offlineAt: undefined,
 			session,
 			removeCloseListener: undefined,
+			windowDelegationCapability: randomBytes(32).toString('base64url'),
 			workspaces: new Map(),
 			workspaceHistory: new Map(),
 		};
@@ -423,6 +434,69 @@ export class NodeRegistry {
 			return undefined;
 		}
 		return this.peerRouteAuthorizer?.displayLabel?.(this.peerSnapshot(node)) ?? node.label;
+	}
+
+	public windowDelegationPrincipal(
+		session: LocalIpcSession,
+		identity: NodeIdentityParams,
+	): WindowDelegationPrincipal {
+		this.assertReady();
+		const node = this.requireLiveNode(nodeIdentityParamsSchema.parse(identity));
+		if (node.session !== session || session.closed) {
+			throw new MeshDomainError(
+				'AUTH_FAILED',
+				'The Window Node delegation principal session is stale or mismatched.',
+			);
+		}
+		return {
+			kind: 'window',
+			capability: node.windowDelegationCapability,
+		};
+	}
+
+	public assertDelegationPrincipal(
+		session: LocalIpcSession,
+		identity: NodeIdentityParams,
+		principal: DelegationPrincipal,
+	): void {
+		this.assertReady();
+		const execution = delegationPrincipalSchema.parse(principal);
+		const source = nodeIdentityParamsSchema.parse(identity);
+		const node = this.requireLiveNode(source);
+		if (node.session !== session || session.closed) {
+			throw new MeshDomainError(
+				'AUTH_FAILED',
+				'The delegation principal session is stale or mismatched.',
+			);
+		}
+		if (execution.kind === 'window') {
+			if (!capabilitiesEqual(node.windowDelegationCapability, execution.capability)) {
+				throw new MeshDomainError(
+					'AUTH_FAILED',
+					'The Window Node delegation principal is invalid or expired.',
+				);
+			}
+			return;
+		}
+		const binding = this.taskBindings.get(execution.taskId);
+		if (
+			binding === undefined
+			|| binding.nodeId !== node.nodeId
+			|| binding.nodeInstanceId !== node.nodeInstanceId
+			|| !capabilitiesEqual(
+				binding.delegatedExecutionContext.capability,
+				execution.capability,
+			)
+		) {
+			throw new MeshDomainError(
+				'AUTH_FAILED',
+				'The delegated child execution context is invalid or expired.',
+			);
+		}
+		throw new MeshDomainError(
+			'DELEGATION_RECURSION',
+			'A delegated child task cannot delegate another task.',
+		);
 	}
 
 	public setPeerRouteAuthorizer(authorizer: PeerRouteAuthorizer): void {
@@ -544,11 +618,19 @@ export class NodeRegistry {
 			const binding: NodeTaskBinding = {
 				...identity,
 				workspaceLeaseKey: claim.workspaceIdentity,
+				delegatedExecutionContext: this.taskBindings.get(identity.taskId)
+					?.delegatedExecutionContext
+					?? {
+						kind: 'delegatedChild' as const,
+						taskId: identity.taskId,
+						capability: randomBytes(32).toString('base64url'),
+					},
 			};
 			this.taskBindings.set(identity.taskId, binding);
 			return {
 				session: node.session!,
 				workspaceLeaseKey: claim.workspaceIdentity,
+				delegatedExecutionContext: binding.delegatedExecutionContext,
 			};
 		});
 	}
@@ -1118,6 +1200,13 @@ function schemaVersionOf(value: unknown): unknown {
 	return typeof value === 'object' && value !== null && 'schemaVersion' in value
 		? value.schemaVersion
 		: undefined;
+}
+
+function capabilitiesEqual(left: string, right: string): boolean {
+	const leftBytes = Buffer.from(left);
+	const rightBytes = Buffer.from(right);
+	return leftBytes.byteLength === rightBytes.byteLength
+		&& timingSafeEqual(leftBytes, rightBytes);
 }
 
 export function migrateWorkspaceRegistryV1(value: unknown): WorkspaceCatalogV2 {

@@ -230,7 +230,9 @@ suite('TaskToolsCore', () => {
 		assert.match(first.confirmationMessage, /Target window: Window One/);
 		assert.match(first.confirmationMessage, /Workspace: app/);
 		assert.match(first.confirmationMessage, /Task: Fix scheduler/);
-		assert.match(first.confirmationMessage, /does not auto-approve operations/);
+		assert.match(first.confirmationMessage, /non-control-plane structured file changes proven to stay inside/);
+		assert.match(first.confirmationMessage, /Terminal commands.*still require confirmation/);
+		assert.match(first.confirmationMessage, /execution\/instruction-control files/);
 		assert.match(first.confirmationMessage, /at most 60 minutes/);
 		assert.doesNotMatch(first.confirmationMessage, new RegExp(NODE_ID));
 		assert.doesNotMatch(first.confirmationMessage, new RegExp(WORKSPACE_ID));

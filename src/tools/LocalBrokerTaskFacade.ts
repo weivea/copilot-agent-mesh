@@ -7,6 +7,7 @@ import {
 	uuidSchema,
 	workspaceIdentitySchema,
 	type NodeDirectoryResult,
+	type DelegatedExecutionContext,
 	type RoutedTaskStartParams,
 	type TaskSnapshot,
 	type TaskSnapshotAfterEventSeq,
@@ -47,6 +48,7 @@ type WindowNodeFacadeClient = Pick<
 	| 'cancelTask'
 	| 'answerTask'
 > & {
+	readonly startTaskFromDelegatedChild?: WindowNodeClient['startTaskFromDelegatedChild'];
 	readonly onTaskSnapshot?: WindowNodeClient['onTaskSnapshot'];
 	readonly onDidChange?: WindowNodeClient['onDidChange'];
 	readonly snapshot?: () => { readonly registered: boolean };
@@ -60,7 +62,10 @@ export interface RemoteTaskRouteAdapter {
 	): Promise<void>;
 	startTask(
 		input: RoutedTaskStartParams,
-		route: { readonly peerId?: string },
+		route: {
+			readonly peerId?: string;
+			readonly delegatedExecutionContext?: DelegatedExecutionContext;
+		},
 		outcome?: RemoteTaskStartOutcome,
 	): Promise<TaskSnapshot>;
 	getTask(
@@ -277,10 +282,11 @@ export class LocalBrokerTaskFacade implements TaskToolFacade {
 
 	public persistDelegationIntent(
 		intent: DelegationIntentInput,
+		context?: DelegatedExecutionContext,
 	): Promise<PersistedDelegationIntent> {
 		const result = this.persistenceQueue.then(
-			() => this.persistDelegationIntentCore(intent),
-			() => this.persistDelegationIntentCore(intent),
+			() => this.persistDelegationIntentCore(intent, context),
+			() => this.persistDelegationIntentCore(intent, context),
 		);
 		this.persistenceQueue = result.then(() => undefined, () => undefined);
 		return result;
@@ -288,6 +294,7 @@ export class LocalBrokerTaskFacade implements TaskToolFacade {
 
 	private async persistDelegationIntentCore(
 		intent: DelegationIntentInput,
+		context?: DelegatedExecutionContext,
 	): Promise<PersistedDelegationIntent> {
 		if (intent.delegationRequestId === undefined) {
 			throw new TaskToolFacadeError('INVALID_INPUT');
@@ -339,9 +346,20 @@ export class LocalBrokerTaskFacade implements TaskToolFacade {
 			};
 			let snapshot: TaskSnapshot;
 			if (remote === undefined) {
-				snapshot = await this.client.startTask(input);
+				if (context === undefined) {
+					snapshot = await this.client.startTask(input);
+				} else {
+					const childStart = this.client.startTaskFromDelegatedChild?.bind(this.client);
+					if (childStart === undefined) {
+						throw new TaskToolFacadeError('OUTPUT_INVALID');
+					}
+					snapshot = await childStart(input, context);
+				}
 			} else {
-				snapshot = await remote.startTask(input, { peerId: remotePeerId });
+				snapshot = await remote.startTask(input, {
+					peerId: remotePeerId,
+					...(context === undefined ? {} : { delegatedExecutionContext: context }),
+				});
 			}
 			if (snapshot.taskId !== taskId) {
 				throw new TaskToolFacadeError('OUTPUT_INVALID');

@@ -7,6 +7,9 @@ import {
 	brokerRemoteTaskCancelParamsSchema,
 	brokerRemoteTaskGetParamsSchema,
 	brokerRemoteTaskStartParamsSchema,
+	brokerLocalTaskStartParamsSchema,
+	delegatedExecutionContextSchema,
+	nodeRegistrationResultSchema,
 	dashboardNodeDirectoryResultSchema,
 	JSON_RPC_ERROR_CODES,
 	LOCAL_BROKER_METHODS,
@@ -31,6 +34,9 @@ import {
 	uuidSchema,
 	windowNodeDescriptorSchema,
 	type DashboardNodeDirectoryResult,
+	type DelegatedExecutionContext,
+	type DelegationPrincipal,
+	type WindowDelegationPrincipal,
 	type NodeDirectoryResult,
 	type NodePolicyResult,
 	type NodePolicySetParams,
@@ -228,6 +234,7 @@ export class WindowNodeClient implements WorkspaceResolver {
 	private readonly knownWorkspaceIds = new Map<string, string>();
 	private client: LocalIpcClient | undefined;
 	private session: LocalIpcSession | undefined;
+	private windowDelegationPrincipal: WindowDelegationPrincipal | undefined;
 	private removeCloseListener: (() => void) | undefined;
 	private heartbeatTimer: WindowNodeTimer | undefined;
 	private reconnectTimer: WindowNodeTimer | undefined;
@@ -436,6 +443,22 @@ export class WindowNodeClient implements WorkspaceResolver {
 		input: RoutedTaskStartParams,
 		peerId: string,
 	): Promise<TaskSnapshot> {
+		return this.startRemoteTaskCore(input, peerId);
+	}
+
+	public startRemoteTaskFromDelegatedChild(
+		input: RoutedTaskStartParams,
+		peerId: string,
+		context: DelegatedExecutionContext,
+	): Promise<TaskSnapshot> {
+		return this.startRemoteTaskCore(input, peerId, delegatedExecutionContextSchema.parse(context));
+	}
+
+	private startRemoteTaskCore(
+		input: RoutedTaskStartParams,
+		peerId: string,
+		context?: DelegatedExecutionContext,
+	): Promise<TaskSnapshot> {
 		const parsed = routedTaskStartParamsSchema.parse(input);
 		if (parsed.sourceNodeId !== undefined && parsed.sourceNodeId !== this.nodeId) {
 			throw new MeshDomainError(
@@ -447,6 +470,7 @@ export class WindowNodeClient implements WorkspaceResolver {
 			...parsed,
 			sourceNodeId: this.nodeId,
 			peerId,
+			delegationPrincipal: this.delegationPrincipal(context),
 		});
 		return this.request(
 			LOCAL_BROKER_METHODS.remoteTaskStart,
@@ -503,6 +527,20 @@ export class WindowNodeClient implements WorkspaceResolver {
 	}
 
 	public startTask(input: RoutedTaskStartParams): Promise<TaskSnapshot> {
+		return this.startTaskCore(input);
+	}
+
+	public startTaskFromDelegatedChild(
+		input: RoutedTaskStartParams,
+		context: DelegatedExecutionContext,
+	): Promise<TaskSnapshot> {
+		return this.startTaskCore(input, delegatedExecutionContextSchema.parse(context));
+	}
+
+	private startTaskCore(
+		input: RoutedTaskStartParams,
+		context?: DelegatedExecutionContext,
+	): Promise<TaskSnapshot> {
 		const parsed = routedTaskStartParamsSchema.parse(input);
 		if (parsed.sourceNodeId !== undefined && parsed.sourceNodeId !== this.nodeId) {
 			throw new MeshDomainError(
@@ -510,9 +548,14 @@ export class WindowNodeClient implements WorkspaceResolver {
 				'The task source does not match this Window Node.',
 			);
 		}
+		const params = brokerLocalTaskStartParamsSchema.parse({
+			...parsed,
+			sourceNodeId: this.nodeId,
+			delegationPrincipal: this.delegationPrincipal(context),
+		});
 		return this.request(
 			LOCAL_BROKER_METHODS.taskStart,
-			toJsonValue({ ...parsed, sourceNodeId: this.nodeId }),
+			toJsonValue(params),
 			taskSnapshotSchema,
 		);
 	}
@@ -697,7 +740,7 @@ export class WindowNodeClient implements WorkspaceResolver {
 			}
 			this.session = session;
 			this.removeCloseListener = session.onClose(() => this.handleDisconnect(session, client));
-			const descriptor = await session.request(
+			const registration = nodeRegistrationResultSchema.parse(await session.request(
 				LOCAL_BROKER_METHODS.register,
 				toJsonValue({
 					nodeId: this.nodeId,
@@ -707,8 +750,8 @@ export class WindowNodeClient implements WorkspaceResolver {
 					status: this.status,
 					startedAt: this.startedAt,
 				}),
-			);
-			windowNodeDescriptorSchema.parse(descriptor);
+			));
+			this.windowDelegationPrincipal = registration.delegationPrincipal;
 			this.assertCurrent(session);
 			this.registered = true;
 			await this.claimCurrentWorkspaces(session);
@@ -750,6 +793,7 @@ export class WindowNodeClient implements WorkspaceResolver {
 					'A local workspace could not be resolved safely.',
 				);
 			}
+
 			this.assertCurrent(session);
 			const workspaceIdentity = createOpaqueWorkspaceIdentity(resolved.identity);
 			nextIdentities.add(workspaceIdentity);
@@ -768,6 +812,7 @@ export class WindowNodeClient implements WorkspaceResolver {
 			));
 			const workspace: RegisteredLocalWorkspace = {
 				workspaceId: result.workspaceId,
+				workspaceIdentity,
 				displayName: entry.name,
 				uri: resolved.canonicalUri,
 			};
@@ -802,6 +847,21 @@ export class WindowNodeClient implements WorkspaceResolver {
 			this.workspaces.delete(observation.workspaceId);
 		}
 		this.changed();
+	}
+
+	private delegationPrincipal(
+		childContext: DelegatedExecutionContext | undefined,
+	): DelegationPrincipal {
+		if (childContext !== undefined) {
+			return childContext;
+		}
+		if (this.windowDelegationPrincipal === undefined) {
+			throw new MeshDomainError(
+				'AUTH_REQUIRED',
+				'The Window Node has no authenticated delegation principal.',
+			);
+		}
+		return this.windowDelegationPrincipal;
 	}
 
 	private async readWorkspaceSource(): Promise<readonly z.infer<typeof workspaceSourceEntrySchema>[]> {
@@ -923,6 +983,7 @@ export class WindowNodeClient implements WorkspaceResolver {
 		this.heartbeatTimer?.dispose();
 		this.heartbeatTimer = undefined;
 		this.registered = false;
+		this.windowDelegationPrincipal = undefined;
 		this.session = undefined;
 		this.client = undefined;
 		this.observations.clear();
@@ -1236,6 +1297,7 @@ export class WindowNodeClient implements WorkspaceResolver {
 		}
 
 		this.registered = false;
+		this.windowDelegationPrincipal = undefined;
 		this.removeCloseListener?.();
 		this.removeCloseListener = undefined;
 		this.session = undefined;
