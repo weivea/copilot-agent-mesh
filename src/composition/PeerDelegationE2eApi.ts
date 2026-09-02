@@ -459,6 +459,7 @@ async function editorSessionCatalog(
 			readonly source: 'editor';
 			readonly errorCode: 'EDITOR_CATALOG_UNAVAILABLE';
 			readonly errorStage: 'launch' | 'connect' | 'initialize' | 'list';
+			readonly errorKind: 'protocol' | 'timeout' | 'transport' | 'closed' | 'other';
 		};
 	let stage: 'launch' | 'connect' | 'initialize' | 'list' = 'launch';
 	try {
@@ -482,12 +483,22 @@ async function editorSessionCatalog(
 				.map(({ resource }) => fingerprint('agent-session', resource))
 				.sort(),
 		};
-	} catch {
+	} catch (error: unknown) {
+		const errorName = error instanceof Error ? error.name : '';
 		result = {
 			available: false,
 			source: 'editor',
 			errorCode: 'EDITOR_CATALOG_UNAVAILABLE',
 			errorStage: stage,
+			errorKind: errorName.includes('Protocol')
+				? 'protocol'
+				: errorName.includes('Timeout')
+					? 'timeout'
+					: errorName.includes('Transport')
+						? 'transport'
+						: errorName.includes('Closed')
+							? 'closed'
+							: 'other',
 		};
 	}
 	const cleanup = await Promise.allSettled([

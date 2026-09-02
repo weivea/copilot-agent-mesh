@@ -1180,6 +1180,7 @@ async function recordCompletionScenario({
 		type: 'sanitized-agent-host-catalog',
 		available: catalogAfter.available === true,
 		...(catalogAfter.errorStage === undefined ? {} : { stage: catalogAfter.errorStage }),
+		...(catalogAfter.errorKind === undefined ? {} : { kind: catalogAfter.errorKind }),
 	}));
 	if (catalogAfter.errorCode === 'EDITOR_CATALOG_CLEANUP_FAILED') {
 		const error = new Error('Editor Session catalog cleanup failed.');
