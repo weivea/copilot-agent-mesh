@@ -965,12 +965,18 @@ class AhpTask implements AgentTaskHandle {
 						},
 					})),
 		);
+		if (this.authoritativeTurnTerminal && this.host.preserveTerminalSession === true) {
+			this.observeLifecycleEvent('session/subscriptionIteratorsClosed');
+		}
 		await runCleanupPhase([{
 			label: 'settle AHP subscription pumps',
 			run: async () => {
 				await Promise.all([...this.subscriptionPumps]);
 			},
 		}]);
+		if (this.authoritativeTurnTerminal && this.host.preserveTerminalSession === true) {
+			this.observeLifecycleEvent('session/subscriptionPumpsSettled');
+		}
 		await runCleanupPhase(
 			[...this.subscriptionCleanup]
 				.filter(([, state]) => !state.unsubscribed)
@@ -982,6 +988,9 @@ class AhpTask implements AgentTaskHandle {
 						},
 					})),
 		);
+		if (this.authoritativeTurnTerminal && this.host.preserveTerminalSession === true) {
+			this.observeLifecycleEvent('session/channelsUnsubscribed');
+		}
 		this.subscriptions.clear();
 		if (this.authoritativeTurnTerminal && this.host.preserveTerminalSession === true) {
 			this.observeLifecycleEvent('session/subscriptionsClosed');
