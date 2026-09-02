@@ -113,19 +113,19 @@ removes the provisional Session. An authoritative editor-host terminal action mu
 match the dispatched turn ID. If its Session is still provisional, the runtime waits
 up to 10 seconds for the exact Session's protocol-defined `session/ready` materialization
 transition. Before publishing that terminal Mesh event, it then unsubscribes the Session
-channel so VS Code removes the delegated active client.
+channel after dispatching its own AHP `session/activeClientRemoved` action and receiving
+the authoritative Host echo, so VS Code removes the delegated active client and tools.
 VS Code 1.135.0 can keep returning an empty `listSessions` catalog on that same client
 until the connection itself is gone, so same-handle catalog visibility is not a valid
-runtime readiness precondition. Mesh does not invent an `activeClientRemoved` action.
+runtime readiness precondition.
 Cleanup unsubscribes remaining channels before closing their iterators and settling
 subscription pumps because the pinned SDK's iterator `return()` does not wake an
 already parked `next()`. It then closes the client connection, socket, and timers
 without calling `disposeSession`, because that command removes the user-visible
 history. Connection shutdown allows a bounded graceful WebSocket close before forcing
 the local socket closed, so a Host that does not complete the close handshake cannot
-hang task disposal. Session unsubscribe remains the protocol-defined Host boundary for removing
-the active client and its tools/customizations; Mesh does not modify read state.
-An unsubscribe failure fails closed and leaves disposal to remove the orphan.
+hang task disposal. A rejected/unacknowledged active-client removal or unsubscribe failure
+fails closed and leaves disposal to remove the orphan; Mesh does not modify read state.
 Missing materialization also fails retryably and disposal removes the orphan. Standalone
 cleanup continues to dispose the Session and owned Host. Objective catalog
 proof is instead collected only after handle cleanup by a fresh independent connection,

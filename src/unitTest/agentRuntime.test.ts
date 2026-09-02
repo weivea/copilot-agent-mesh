@@ -793,6 +793,13 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 			const session = catalog.session(transport.created!.sessionUri);
 			assert.equal(session?.status, terminal === 'chat/error' ? 2 : 1);
 			assert.equal(session?.activeClientCount, 0);
+			assert.deepEqual(
+				transport.dispatched.find(({ action }) => action.type === 'session/activeClientRemoved')?.action,
+				{
+					type: 'session/activeClientRemoved',
+					clientId: transport.created!.clientId,
+				},
+			);
 			assert.equal(transport.disposeSessionCalls, 0);
 		}
 	});
@@ -862,6 +869,31 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 		assert.equal(transport.disposeSessionCalls, 1);
 		assert.equal(catalog.session(transport.created!.sessionUri), undefined);
 		assert.equal(transport.shutdownCalls, 1);
+	});
+
+	test('rejected active-client removal fails closed before Session unsubscribe', async () => {
+		const catalog = new FakeAhpHostCatalog();
+		const transport = new FakeAhpTransport(catalog);
+		transport.rejectDispatchType = 'session/activeClientRemoved';
+		const launcher = new FakeLauncher();
+		launcher.host.preserveTerminalSession = true;
+		const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+		const handle = await runtime.start({
+			...taskRequest(),
+			sourceWindowName: 'frontend',
+		});
+		await nextEvent(handle.events);
+		await transport.emitChat({
+			type: 'chat/turnComplete',
+			turnId: currentTurnId(transport),
+			duration: 0,
+		});
+		assert.equal((await nextEvent(handle.events)).type, 'failed');
+		assert.equal(transport.unsubscribedUris.includes(transport.created!.sessionUri), false);
+
+		await handle.dispose();
+		assert.equal(transport.disposeSessionCalls, 1);
+		assert.equal(catalog.session(transport.created!.sessionUri), undefined);
 	});
 
 	test('standalone terminal Sessions remain owned and are disposed', async () => {
@@ -3327,6 +3359,13 @@ class FakeAhpHostCatalog {
 			session.activeTurnId = undefined;
 			session.status = action.type === 'chat/error' ? 2 : 1;
 			session.materialized = true;
+			return;
+		}
+		if (
+			action.type === 'session/activeClientRemoved'
+			&& typeof action.clientId === 'string'
+		) {
+			session.activeClients.delete(action.clientId);
 		}
 	}
 
@@ -3759,9 +3798,6 @@ class FakeAhpTransport implements AhpConnection {
 			throw new Error('synthetic unsubscribe failure');
 		}
 		this.unsubscribedUris.push(uri);
-		if (uri === this.created?.sessionUri) {
-			this.hostCatalog?.removeClient(uri, this.initializedClientId);
-		}
 		this.queue(uri).finish();
 	}
 
@@ -3822,6 +3858,8 @@ class FakeAhpTransport implements AhpConnection {
 	): Promise<boolean> {
 		if (channel.startsWith('ahp-chat:') && this.created !== undefined) {
 			this.hostCatalog?.record(this.created.sessionUri, action);
+		} else if (channel === this.created?.sessionUri) {
+			this.hostCatalog?.record(channel, action);
 		}
 		return this.queue(channel).push({
 			type: 'action',

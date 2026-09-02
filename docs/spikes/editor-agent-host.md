@@ -308,10 +308,10 @@ Host GC。仅跳过 `disposeSession` 因此不是 persistence proof。客户端�
 `unsubscribe(session)` 但保留同一连接时，catalog 都可能继续为空；因此同一 handle 的
 `listSessions` 不能作为 terminal readiness barrier。AHP 1.0 的 `session/ready` 是 provisional
 Session 完成 materialization 的明确生命周期信号；客户端在权威终止后有界等待 exact Session
-ready，再 unsubscribe Session 以移除 active client，随后发布终止并由正常 handle disposal
-关闭其余订阅和连接。不会伪造
-`session/activeClientRemoved`；unsubscribe 仍是 Host-managed active-client/tool cleanup 的协议
-边界，read/archive metadata 不由 Mesh 伪造。只有 disposal 完成后，诊断才从新的独立连接进行
+ready，再 dispatch 自身 `session/activeClientRemoved` 并等待 Host 权威 echo，之后
+unsubscribe Session，随后发布终止并由正常 handle disposal 关闭其余订阅和连接。这样不会依赖
+Host 对 unsubscribe/disconnect 的 SHOULD 级隐式清理，且 active-client tools/customizations
+明确移除；read/archive metadata 不由 Mesh 伪造。只有 disposal 完成后，诊断才从新的独立连接进行
 有界分页，并要求 exact Session 为 Idle/Error、非 InProgress、非 Archived。连接 shutdown
 只给 WebSocket 有界的 graceful-close 时间，随后强制关闭本地 socket，避免 Host close handshake
 不结束时永久卡住 handle disposal。清理必须先 unsubscribe 其余 channel，再关闭 iterator 并

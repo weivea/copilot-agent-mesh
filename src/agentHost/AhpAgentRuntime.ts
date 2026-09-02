@@ -45,7 +45,7 @@ const offeredProtocolVersion = '1.0.0';
 export const AHP_PROTOCOL_OFFER: readonly ['1.0.0'] = Object.freeze(['1.0.0']);
 const sessionDefaultChatTimeoutMs = 60_000;
 const cancellationTimeoutMs = 15_000;
-const titleAcknowledgementTimeoutMs = 10_000;
+const actionAcknowledgementTimeoutMs = 10_000;
 const terminalSessionMaterializationTimeoutMs = 10_000;
 const connectionGracefulShutdownMs = 1_000;
 const connectionForcedShutdownMs = 5_000;
@@ -1195,6 +1195,7 @@ class AhpTask implements AgentTaskHandle {
 			readonly resolve: () => void;
 			readonly reject: (error: AgentRuntimeError) => void;
 		},
+		connection = this.connection,
 	): void {
 		const clientSeq = this.nextClientSeq;
 		this.nextClientSeq += 1;
@@ -1206,15 +1207,22 @@ class AhpTask implements AgentTaskHandle {
 			rejectAcknowledgement: acknowledgement?.reject,
 		});
 		try {
-			this.connection.dispatch(channel, action, clientSeq);
+			connection.dispatch(channel, action, clientSeq);
 		} catch (error) {
 			this.unacknowledgedDispatches.delete(clientSeq);
-			this.handleSubscriptionLoss();
+			if (connection === this.connection) {
+				this.handleSubscriptionLoss();
+			}
 			throw normalizeRuntimeError(error);
 		}
 	}
 
-	private dispatchAcknowledged(channel: string, action: unknown): Promise<void> {
+	private dispatchAcknowledged(
+		channel: string,
+		action: unknown,
+		timeoutMessage = 'The Agent Host did not acknowledge the delegated Session title.',
+		connection = this.connection,
+	): Promise<void> {
 		let resolveAcknowledgement!: () => void;
 		let rejectAcknowledgement!: (error: AgentRuntimeError) => void;
 		const acknowledgement = new Promise<void>((resolve, reject) => {
@@ -1224,11 +1232,11 @@ class AhpTask implements AgentTaskHandle {
 		this.dispatchTracked(channel, action, undefined, {
 			resolve: resolveAcknowledgement,
 			reject: rejectAcknowledgement,
-		});
+		}, connection);
 		return withTimeout(
 			acknowledgement,
-			titleAcknowledgementTimeoutMs,
-			'The Agent Host did not acknowledge the delegated Session title.',
+			actionAcknowledgementTimeoutMs,
+			timeoutMessage,
 		);
 	}
 
@@ -1455,6 +1463,7 @@ class AhpTask implements AgentTaskHandle {
 		envelope: ActionEnvelope,
 		subscribeRootTerminals = true,
 		terminalCatalogConnection = this.connection,
+		terminalSessionSubscription?: AhpSubscription,
 	): Promise<void> {
 		this.lastSeenServerSeq = Math.max(this.lastSeenServerSeq, envelope.serverSeq);
 		this.acknowledgeDispatch(envelope);
@@ -1521,7 +1530,10 @@ class AhpTask implements AgentTaskHandle {
 				// Optional lifecycle observation must not affect Agent execution.
 			}
 			try {
-				await this.prepareTerminalSessionHistory(terminalCatalogConnection);
+				await this.prepareTerminalSessionHistory(
+					terminalCatalogConnection,
+					terminalSessionSubscription,
+				);
 			} catch (error) {
 				this.fail(normalizeRuntimeError(error));
 				return;
@@ -1533,7 +1545,10 @@ class AhpTask implements AgentTaskHandle {
 		);
 	}
 
-	private async prepareTerminalSessionHistory(connection = this.connection): Promise<void> {
+	private async prepareTerminalSessionHistory(
+		connection = this.connection,
+		sessionSubscription?: AhpSubscription,
+	): Promise<void> {
 		if (this.host.preserveTerminalSession !== true) {
 			this.authoritativeTurnTerminal = true;
 			return;
@@ -1553,6 +1568,7 @@ class AhpTask implements AgentTaskHandle {
 			await this.detachTerminalSessionClient(
 				connection,
 				this.terminalPreparationAbort.signal,
+				sessionSubscription,
 			);
 		}
 		this.authoritativeTurnTerminal = true;
@@ -1561,11 +1577,22 @@ class AhpTask implements AgentTaskHandle {
 	private async detachTerminalSessionClient(
 		connection: AhpConnection,
 		signal: AbortSignal,
+		sessionSubscription?: AhpSubscription,
 	): Promise<void> {
 		if (this.terminalSessionUnsubscribedConnections.has(connection)) {
 			return;
 		}
 		this.terminalSessionDepartingConnections.add(connection);
+		try {
+			await this.dispatchTerminalClientRemoval(
+				connection,
+				signal,
+				sessionSubscription,
+			);
+		} catch (error: unknown) {
+			this.terminalSessionDepartingConnections.delete(connection);
+			throw error;
+		}
 		let unsubscribe: Promise<void>;
 		try {
 			unsubscribe = connection.unsubscribe(this.sessionUri);
@@ -1585,6 +1612,59 @@ class AhpTask implements AgentTaskHandle {
 			},
 		);
 		await abortableConfigurationResolution(trackedUnsubscribe, signal);
+	}
+
+	private async dispatchTerminalClientRemoval(
+		connection: AhpConnection,
+		signal: AbortSignal,
+		sessionSubscription?: AhpSubscription,
+	): Promise<void> {
+		let acknowledged = false;
+		const acknowledgement = this.dispatchAcknowledged(
+			this.sessionUri,
+			{
+				type: 'session/activeClientRemoved',
+				clientId: this.clientId,
+			},
+			'The Agent Host did not acknowledge the delegated active-client removal.',
+			connection,
+		);
+		void acknowledgement.then(
+			() => {
+				acknowledged = true;
+			},
+			() => undefined,
+		);
+		if (sessionSubscription === undefined) {
+			await abortableConfigurationResolution(acknowledgement, signal);
+			return;
+		}
+		const iterator = sessionSubscription[Symbol.asyncIterator]();
+		while (!acknowledged) {
+			const event = await Promise.race([
+				abortableConfigurationResolution(iterator.next(), signal),
+				acknowledgement.then<never>(
+					() => new Promise<never>(() => undefined),
+					(error: unknown) => Promise.reject(error),
+				),
+			]);
+			if (event.done) {
+				throw new AgentRuntimeError(
+					'TASK_EXECUTION_FAILED',
+					'The Agent Host closed the Session before acknowledging active-client removal.',
+				);
+			}
+			if (event.value.type === 'action') {
+				await this.handleEnvelope(event.value.params as ActionEnvelope, false, connection);
+			} else {
+				throw new AgentRuntimeError(
+					'TASK_EXECUTION_FAILED',
+					'The Agent Host requested authentication while removing the delegated active client.',
+				);
+			}
+			await Promise.resolve();
+		}
+		await acknowledgement;
 	}
 
 	private trackDeliveredResponseAction(action: ActionEnvelope['action']): void {
@@ -1711,6 +1791,7 @@ class AhpTask implements AgentTaskHandle {
 		snapshot: Snapshot,
 		subscribeRootTerminals = true,
 		terminalCatalogConnection = this.connection,
+		terminalSessionSubscription?: AhpSubscription,
 	): Promise<void> {
 		this.lastSeenServerSeq = Math.max(this.lastSeenServerSeq, snapshot.fromSeq);
 		if (snapshot.resource === this.sessionUri) {
@@ -1747,7 +1828,12 @@ class AhpTask implements AgentTaskHandle {
 			return;
 		}
 		if (snapshot.resource === this.chatUri) {
-			await this.applyChatSnapshot(snapshot.state, snapshot.resource, terminalCatalogConnection);
+			await this.applyChatSnapshot(
+				snapshot.state,
+				snapshot.resource,
+				terminalCatalogConnection,
+				terminalSessionSubscription,
+			);
 		}
 	}
 
@@ -1755,6 +1841,7 @@ class AhpTask implements AgentTaskHandle {
 		value: unknown,
 		chatUri: string,
 		terminalCatalogConnection: AhpConnection,
+		terminalSessionSubscription?: AhpSubscription,
 	): Promise<void> {
 		if (!isRecord(value)) {
 			throw new AgentRuntimeError('TASK_RECOVERY_UNAVAILABLE', 'The recovered Chat snapshot was invalid.');
@@ -1777,13 +1864,13 @@ class AhpTask implements AgentTaskHandle {
 			await this.restoreResponseParts(chatUri, turn.responseParts);
 		}
 		if (turn.state === 'complete') {
-			await this.prepareTerminalSessionHistory(terminalCatalogConnection);
+			await this.prepareTerminalSessionHistory(terminalCatalogConnection, terminalSessionSubscription);
 			await this.emitMappedEvents([{ type: 'completed' }], true);
 		} else if (turn.state === 'cancelled') {
-			await this.prepareTerminalSessionHistory(terminalCatalogConnection);
+			await this.prepareTerminalSessionHistory(terminalCatalogConnection, terminalSessionSubscription);
 			await this.emitMappedEvents([{ type: 'cancelled' }], true);
 		} else if (turn.state === 'error') {
-			await this.prepareTerminalSessionHistory(terminalCatalogConnection);
+			await this.prepareTerminalSessionHistory(terminalCatalogConnection, terminalSessionSubscription);
 			await this.emitMappedEvents([{
 				type: 'failed',
 				error: new AgentRuntimeError(
@@ -2199,7 +2286,12 @@ class AhpTask implements AgentTaskHandle {
 					if (action.channel === rootUri && action.action.type === 'root/terminalsChanged') {
 						recoveredTerminals = action.action.terminals;
 					}
-					await this.handleEnvelope(action, false, candidate);
+					await this.handleEnvelope(
+						action,
+						false,
+						candidate,
+						recoveredSubscriptions.get(this.sessionUri),
+					);
 				}
 				const missing = result.missing ?? [];
 				if (missing.some((uri) => requiredRecoveryResources.has(uri))) {
@@ -2234,7 +2326,12 @@ class AhpTask implements AgentTaskHandle {
 					if (snapshot.resource === rootUri) {
 						recoveredTerminals = parseRootState(snapshot).terminals ?? [];
 					}
-					await this.applySnapshot(snapshot, false, candidate);
+					await this.applySnapshot(
+						snapshot,
+						false,
+						candidate,
+						recoveredSubscriptions.get(this.sessionUri),
+					);
 				}
 			}
 			const session = await findSessionInCatalog(candidate, this.sessionUri, signal);
