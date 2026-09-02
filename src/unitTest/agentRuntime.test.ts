@@ -695,6 +695,42 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 		assert.equal((await handle.events[Symbol.asyncIterator]().next()).done, true);
 	});
 
+	test('recovery during terminal catalog polling does not reattach the departed Session client', async () => {
+		const catalog = new FakeAhpHostCatalog();
+		const first = new FakeAhpTransport(catalog);
+		const recovered = new FakeAhpTransport(catalog);
+		first.blockCatalogReads = true;
+		const launcher = new FakeLauncher();
+		launcher.host.preserveTerminalSession = true;
+		const runtime = createRuntime(
+			launcher,
+			new FakeConnectionFactory([first, recovered]),
+		);
+		const handle = await runtime.start({
+			...taskRequest(),
+			sourceWindowName: 'frontend',
+		});
+		await nextEvent(handle.events);
+		await first.emitChat({
+			type: 'chat/turnComplete',
+			turnId: currentTurnId(first),
+			duration: 0,
+		});
+		await first.catalogReadStarted;
+		first.failRoot();
+		await waitForCondition(() => recovered.reconnectRequests.length === 1);
+
+		assert.deepEqual(
+			recovered.reconnectRequests[0]?.subscriptions,
+			['ahp-root://', 'ahp-chat:/default'],
+		);
+		assert.equal(
+			recovered.reconnectRequests[0]?.subscriptions.includes(first.created!.sessionUri),
+			false,
+		);
+		await handle.dispose();
+	});
+
 	test('delegated runtime retries a transient terminal catalog read failure', async () => {
 		const catalog = new FakeAhpHostCatalog();
 		const transport = new FakeAhpTransport(catalog);
@@ -814,13 +850,13 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 			// Drain through the terminal event.
 		}
 		const sessionUri = transport.created!.sessionUri;
-		transport.unsubscribeFailures.set(sessionUri, 1);
+		transport.unsubscribeFailures.set('ahp-chat:/default', 1);
 
 		await assert.rejects(
 			handle.dispose(),
 			(error: unknown) => error instanceof AgentRuntimeError && error.cleanupFailed,
 		);
-		assert.equal(catalog.session(sessionUri)?.activeClientCount, 1);
+		assert.equal(catalog.session(sessionUri)?.activeClientCount, 0);
 		assert.equal(transport.shutdownCalls, 0);
 		assert.equal(
 			lifecycle.some(({ eventType }) => eventType === 'session/clientDetached'),
@@ -1994,6 +2030,41 @@ test('recovery subscribes newly owned terminals through the candidate connection
 	assert.equal((await nextEvent(handle.events)).type, 'progress');
 	assert.deepEqual(recovered.subscribedUris, ['ahp-terminal:/recovered']);
 	assert.deepEqual(first.subscribedUris, [handle.recovery.sessionUri, 'ahp-chat:/default']);
+	await handle.dispose();
+});
+
+test('recovery stops before subscribing terminals after replay completes the task', async () => {
+	const first = new FakeAhpTransport();
+	const recovered = new FakeAhpTransport();
+	const runtime = createRuntime(new FakeLauncher(), new FakeConnectionFactory([first, recovered]));
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+	recovered.created = first.created;
+	recovered.reconnectResult = {
+		type: 'replay',
+		actions: [
+			envelope('ahp-root://', {
+				type: 'root/terminalsChanged',
+				terminals: [{
+					resource: 'ahp-terminal:/late',
+					label: 'Late terminal',
+					claim: { kind: 'session', session: handle.recovery.sessionUri },
+				}],
+			}, 8),
+			envelope('ahp-chat:/default', {
+				type: 'chat/turnComplete',
+				turnId: currentTurnId(first),
+				duration: 0,
+			}, 9),
+		],
+		missing: [],
+	};
+
+	first.failChat();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	assert.equal((await nextEvent(handle.events)).type, 'completed');
+	await waitForCondition(() => recovered.shutdownCalls === 1);
+	assert.equal(recovered.subscribedUris.includes('ahp-terminal:/late'), false);
 	await handle.dispose();
 });
 
@@ -3180,7 +3251,7 @@ class FakeAhpHostCatalog {
 
 	list(): readonly { readonly resource: string; readonly status: number }[] {
 		return [...this.sessions]
-			.filter(([, session]) => session.materialized)
+			.filter(([, session]) => session.materialized && session.activeClients.size === 0)
 			.map(([resource, session]) => ({ resource, status: session.status }));
 	}
 
@@ -3673,33 +3744,68 @@ function currentTurnId(transport: FakeAhpTransport): string {
 }
 
 class FakeSubscription implements AhpSubscription {
-	private readonly queue = new AsyncEventQueue<AhpSubscriptionEvent>();
+	private readonly values: AhpSubscriptionEvent[] = [];
+	private readonly waiters: Array<{
+		resolve: (result: IteratorResult<AhpSubscriptionEvent>) => void;
+		reject: (error: Error) => void;
+	}> = [];
 	private failure: Error | undefined;
+	private closed = false;
 
 	push(event: AhpSubscriptionEvent): Promise<boolean> {
-		return this.queue.push(event);
+		if (this.closed) {
+			return Promise.resolve(false);
+		}
+		const waiter = this.waiters.shift();
+		if (waiter !== undefined) {
+			waiter.resolve({ done: false, value: event });
+		} else {
+			this.values.push(event);
+		}
+		return Promise.resolve(true);
 	}
 
 	fail(error: Error): void {
 		this.failure = error;
-		this.queue.close();
+		this.finish();
 	}
 
 	finish(): void {
-		this.queue.close();
+		if (this.closed) {
+			return;
+		}
+		this.closed = true;
+		for (const waiter of this.waiters.splice(0)) {
+			if (this.failure !== undefined) {
+				waiter.reject(this.failure);
+			} else {
+				waiter.resolve({ done: true, value: undefined });
+			}
+		}
 	}
 
 	async close(): Promise<void> {
 		this.finish();
 	}
 
-	async *[Symbol.asyncIterator](): AsyncIterator<AhpSubscriptionEvent> {
-		for await (const event of this.queue) {
-			yield event;
-		}
-		if (this.failure !== undefined) {
-			throw this.failure;
-		}
+	[Symbol.asyncIterator](): AsyncIterator<AhpSubscriptionEvent> {
+		return {
+			next: () => {
+				const value = this.values.shift();
+				if (value !== undefined) {
+					return Promise.resolve({ done: false, value });
+				}
+				if (this.failure !== undefined) {
+					return Promise.reject(this.failure);
+				}
+				if (this.closed) {
+					return Promise.resolve({ done: true, value: undefined });
+				}
+				return new Promise<IteratorResult<AhpSubscriptionEvent>>((resolve, reject) => {
+					this.waiters.push({ resolve, reject });
+				});
+			},
+		};
 	}
 }
 

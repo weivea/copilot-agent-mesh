@@ -676,6 +676,8 @@ class AhpTask implements AgentTaskHandle {
 	private connectionShutdown = false;
 	private hostDisposed = false;
 	private readonly shutdownConnections = new WeakSet<AhpConnection>();
+	private readonly terminalSessionDepartingConnections = new WeakSet<AhpConnection>();
+	private readonly terminalSessionUnsubscribedConnections = new WeakSet<AhpConnection>();
 	private readonly connectionShutdownOperations = new WeakMap<AhpConnection, Promise<void>>();
 	private readonly deliveredResponsePartLengths = new Map<string, number>();
 	private readonly deliveredResponsePartStates = new Set<string>();
@@ -918,7 +920,15 @@ class AhpTask implements AgentTaskHandle {
 
 		this.subscriptionCleanup ??= new Map([...this.subscriptions].map(([uri, subscription]) => [
 			uri,
-			{ subscription, closed: false, unsubscribed: this.shutdownConnections.has(this.connection) },
+			{
+				subscription,
+				closed: false,
+				unsubscribed: this.shutdownConnections.has(this.connection)
+					|| (
+						uri === this.sessionUri
+						&& this.terminalSessionUnsubscribedConnections.has(this.connection)
+					),
+			},
 		]));
 		await runCleanupPhase(
 			[...this.subscriptionCleanup]
@@ -1362,6 +1372,13 @@ class AhpTask implements AgentTaskHandle {
 				&& !this.terminal
 				&& this.isCurrentGeneration(generation)
 				&& generation.subscriptions.get(uri) === subscription
+				&& !(
+					uri === this.sessionUri
+					&& (
+						this.terminalSessionDepartingConnections.has(generation.connection)
+						|| this.terminalSessionUnsubscribedConnections.has(generation.connection)
+					)
+				)
 			) {
 				this.handleSubscriptionLoss();
 			}
@@ -1495,7 +1512,10 @@ class AhpTask implements AgentTaskHandle {
 			let session: AhpSessionSummary | undefined;
 			try {
 				session = await withAbortableTimeout(
-					(scanSignal) => findSessionInCatalog(connection, this.sessionUri, scanSignal),
+					async (scanSignal) => {
+						await this.detachTerminalSessionClient(connection, scanSignal);
+						return findSessionInCatalog(connection, this.sessionUri, scanSignal);
+					},
 					remaining,
 					'The editor Agent Host did not retain the terminal Session in its catalog.',
 					signal,
@@ -1526,6 +1546,34 @@ class AhpTask implements AgentTaskHandle {
 			'The editor Agent Host did not retain the terminal Session in its catalog.',
 			true,
 		);
+	}
+
+	private async detachTerminalSessionClient(
+		connection: AhpConnection,
+		signal: AbortSignal,
+	): Promise<void> {
+		if (this.terminalSessionUnsubscribedConnections.has(connection)) {
+			return;
+		}
+		this.terminalSessionDepartingConnections.add(connection);
+		let unsubscribe: Promise<void>;
+		try {
+			unsubscribe = connection.unsubscribe(this.sessionUri);
+		} catch (error: unknown) {
+			this.terminalSessionDepartingConnections.delete(connection);
+			throw error;
+		}
+		const trackedUnsubscribe = unsubscribe.then(
+			() => {
+				this.terminalSessionUnsubscribedConnections.add(connection);
+				this.terminalSessionDepartingConnections.delete(connection);
+			},
+			(error: unknown) => {
+				this.terminalSessionDepartingConnections.delete(connection);
+				throw error;
+			},
+		);
+		await abortableConfigurationResolution(trackedUnsubscribe, signal);
 	}
 
 	private trackDeliveredResponseAction(action: ActionEnvelope['action']): void {
@@ -2065,6 +2113,15 @@ class AhpTask implements AgentTaskHandle {
 		let abortCandidate: (() => void) | undefined;
 		const recoveredSubscriptions = new Map<string, AhpSubscription>();
 		let recoveredTerminals: readonly TerminalInfo[] = this.rootTerminals;
+		const recoverySubscriptionUris = [...this.subscriptions.keys()].filter((uri) =>
+			!(
+				uri === this.sessionUri
+				&& (
+					this.terminalSessionDepartingConnections.has(previousConnection)
+					|| this.terminalSessionUnsubscribedConnections.has(previousConnection)
+				)
+			));
+		const requiredRecoveryResources = new Set(recoverySubscriptionUris);
 		try {
 			candidate = await this.awaitRecoveryStep(
 				this.connectionFactory.connect(this.host, signal),
@@ -2084,7 +2141,7 @@ class AhpTask implements AgentTaskHandle {
 			};
 			signal.addEventListener('abort', abortCandidate, { once: true });
 			this.throwIfRecoveryStopped(signal);
-			for (const uri of this.subscriptions.keys()) {
+			for (const uri of recoverySubscriptionUris) {
 				this.throwIfRecoveryStopped(signal);
 				recoveredSubscriptions.set(uri, candidate.attachSubscription(uri));
 			}
@@ -2092,7 +2149,7 @@ class AhpTask implements AgentTaskHandle {
 				candidate.reconnect(
 					this.clientId,
 					this.lastSeenServerSeq,
-					[...this.subscriptions.keys()],
+					recoverySubscriptionUris,
 				),
 				signal,
 			);
@@ -2105,11 +2162,7 @@ class AhpTask implements AgentTaskHandle {
 					await this.handleEnvelope(action, false, candidate);
 				}
 				const missing = result.missing ?? [];
-				if (
-					missing.includes(rootUri)
-					|| missing.includes(this.sessionUri)
-					|| missing.includes(this.chatUri ?? '')
-				) {
+				if (missing.some((uri) => requiredRecoveryResources.has(uri))) {
 					throw new RecoveryUnavailableCause('The Agent Host no longer has the task session.');
 				}
 				for (const uri of missing) {
@@ -2122,8 +2175,7 @@ class AhpTask implements AgentTaskHandle {
 			} else {
 				const snapshots = result.snapshots ?? [];
 				const snapshotResources = new Set(snapshots.map(({ resource }) => resource));
-				const required = [rootUri, this.sessionUri, this.chatUri].filter((uri): uri is string => uri !== undefined);
-				if (required.some((uri) => !snapshotResources.has(uri))) {
+				if (recoverySubscriptionUris.some((uri) => !snapshotResources.has(uri))) {
 					throw new RecoveryUnavailableCause('The Agent Host no longer has the task session or active chat.');
 				}
 				for (const [uri, subscription] of recoveredSubscriptions) {
@@ -2141,6 +2193,7 @@ class AhpTask implements AgentTaskHandle {
 				}
 			}
 			const session = await findSessionInCatalog(candidate, this.sessionUri, signal);
+			this.throwIfRecoveryStopped(signal);
 			if (session === undefined) {
 				throw new RecoveryUnavailableCause('The Agent Host session is missing after reconnect.');
 			}
