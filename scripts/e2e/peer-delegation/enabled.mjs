@@ -1167,6 +1167,12 @@ async function recordCompletionScenario({
 			observation.taskId === completionTaskId
 			&& observation.eventType === 'session/clientDetached',
 	);
+	console.log(JSON.stringify({
+		type: 'sanitized-agent-host-cleanup',
+		events: completionObservations.ahp
+			.filter((observation) => observation.taskId === completionTaskId)
+			.map((observation) => observation.eventType),
+	}));
 	const catalogAfter = clientDetachedObserved
 		? await request(target, 'peer.session.catalog', {}, 60_000)
 		: { available: false, source: 'editor' };

@@ -81,6 +81,9 @@ export type AgentRuntimeLifecycleObservation =
 			| 'chat/turnComplete'
 			| 'chat/turnCancelled'
 			| 'chat/error'
+			| 'session/clientDetachStarted'
+			| 'session/subscriptionsClosed'
+			| 'session/connectionClosed'
 			| 'session/clientDetached';
 	};
 

@@ -23,6 +23,7 @@ import {
 	type AgentRuntimeApprovalCapabilityIssuer,
 	type AgentRuntime,
 	type AgentRuntimeEvent,
+	type AgentRuntimeLifecycleObservation,
 	type AgentRuntimeProbe,
 	type AgentRuntimeLifecycleObserver,
 	type AgentTaskAnswer,
@@ -893,6 +894,9 @@ class AhpTask implements AgentTaskHandle {
 
 	private async disposeResources(): Promise<void> {
 		this.disposed = true;
+		if (this.authoritativeTurnTerminal && this.host.preserveTerminalSession === true) {
+			this.observeLifecycleEvent('session/clientDetachStarted');
+		}
 		this.clearDelegatedToolInvocations();
 		const recovery = this.recoveryPromise;
 		this.recoveryAbort?.abort();
@@ -979,6 +983,9 @@ class AhpTask implements AgentTaskHandle {
 					})),
 		);
 		this.subscriptions.clear();
+		if (this.authoritativeTurnTerminal && this.host.preserveTerminalSession === true) {
+			this.observeLifecycleEvent('session/subscriptionsClosed');
+		}
 
 		if (!this.sessionDisposed && this.shutdownConnections.has(this.connection)) {
 			this.sessionDisposed = true;
@@ -1029,20 +1036,16 @@ class AhpTask implements AgentTaskHandle {
 			});
 		}
 		await runCleanupPhase(detachedCleanup);
+		if (this.authoritativeTurnTerminal && this.host.preserveTerminalSession === true) {
+			this.observeLifecycleEvent('session/connectionClosed');
+		}
 		if (
 			!this.terminalClientDetachedObserved
 			&& this.authoritativeTurnTerminal
 			&& this.host.preserveTerminalSession === true
 		) {
 			this.terminalClientDetachedObserved = true;
-			try {
-				this.lifecycleObserver?.observeLifecycle({
-					taskId: this.taskId,
-					eventType: 'session/clientDetached',
-				});
-			} catch {
-				// Optional lifecycle observation must not affect Agent cleanup.
-			}
+			this.observeLifecycleEvent('session/clientDetached');
 		}
 		this.didDispose();
 	}
@@ -1651,6 +1654,19 @@ class AhpTask implements AgentTaskHandle {
 			});
 		} catch {
 			// Optional lifecycle observation must not affect Agent execution.
+		}
+	}
+
+	private observeLifecycleEvent(
+		eventType: Exclude<AgentRuntimeLifecycleObservation['eventType'], 'session/hostObserved'>,
+	): void {
+		try {
+			this.lifecycleObserver?.observeLifecycle({
+				taskId: this.taskId,
+				eventType,
+			});
+		} catch {
+			// Optional lifecycle observation must not affect Agent execution or cleanup.
 		}
 	}
 
