@@ -1176,6 +1176,11 @@ async function recordCompletionScenario({
 	const catalogAfter = clientDetachedObserved
 		? await request(target, 'peer.session.catalog', {}, 60_000)
 		: { available: false, source: 'editor' };
+	console.log(JSON.stringify({
+		type: 'sanitized-agent-host-catalog',
+		available: catalogAfter.available === true,
+		...(catalogAfter.errorStage === undefined ? {} : { stage: catalogAfter.errorStage }),
+	}));
 	if (catalogAfter.errorCode === 'EDITOR_CATALOG_CLEANUP_FAILED') {
 		const error = new Error('Editor Session catalog cleanup failed.');
 		error.code = 'EDITOR_CATALOG_CLEANUP_FAILED';

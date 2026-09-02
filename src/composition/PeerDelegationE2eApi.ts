@@ -458,14 +458,19 @@ async function editorSessionCatalog(
 			readonly available: false;
 			readonly source: 'editor';
 			readonly errorCode: 'EDITOR_CATALOG_UNAVAILABLE';
+			readonly errorStage: 'launch' | 'connect' | 'initialize' | 'list';
 		};
+	let stage: 'launch' | 'connect' | 'initialize' | 'list' = 'launch';
 	try {
 		host = await launcher.launch();
+		stage = 'connect';
 		connection = await new SdkAhpConnectionFactory().connect(host);
+		stage = 'initialize';
 		const initialized = await connection.initialize(`mesh-peer-e2e-${randomUUID()}`);
 		if (!AHP_PROTOCOL_OFFER.includes(initialized.protocolVersion as '1.0.0')) {
 			throw new Error('The editor Agent Host selected an incompatible protocol.');
 		}
+		stage = 'list';
 		const sessions = await listSessionsBounded(connection);
 		result = {
 			available: true,
@@ -482,6 +487,7 @@ async function editorSessionCatalog(
 			available: false,
 			source: 'editor',
 			errorCode: 'EDITOR_CATALOG_UNAVAILABLE',
+			errorStage: stage,
 		};
 	}
 	const cleanup = await Promise.allSettled([
