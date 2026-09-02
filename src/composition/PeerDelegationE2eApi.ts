@@ -23,6 +23,9 @@ import type { BrokerLifecycle } from '../broker/BrokerLifecycle';
 import type { WindowNodeClient } from '../node/WindowNodeClient';
 import type { LocalIpcRemoteTaskAdapter } from '../node/LocalIpcRemoteTaskAdapter';
 import type { LocalIpcEndpoint } from '../ipc';
+
+const editorCatalogRetryTimeoutMs = 10_000;
+const editorCatalogRetryDelayMs = 100;
 import {
 	parseDelegateTaskInput,
 	TaskToolsCore,
@@ -473,7 +476,29 @@ async function editorSessionCatalog(
 			throw new Error('The editor Agent Host selected an incompatible protocol.');
 		}
 		stage = 'list';
-		const sessions = await listSessionsBounded(connection);
+		const deadline = Date.now() + editorCatalogRetryTimeoutMs;
+		let sessions;
+		while (true) {
+			const remaining = deadline - Date.now();
+			if (remaining <= 0) {
+				throw new Error('The editor Agent Host Session catalog remained unavailable.');
+			}
+			const attemptTimeout = new AbortController();
+			const timer = setTimeout(() => attemptTimeout.abort(), remaining);
+			try {
+				sessions = await listSessionsBounded(connection, attemptTimeout.signal);
+				break;
+			} catch (error: unknown) {
+				if (Date.now() >= deadline) {
+					throw error;
+				}
+				await new Promise<void>((resolve) => {
+					setTimeout(resolve, Math.min(editorCatalogRetryDelayMs, deadline - Date.now()));
+				});
+			} finally {
+				clearTimeout(timer);
+			}
+		}
 		result = {
 			available: true,
 			source: 'editor',
