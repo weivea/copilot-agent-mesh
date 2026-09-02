@@ -1007,7 +1007,6 @@ class AhpTask implements AgentTaskHandle {
 		if (
 			!this.terminalClientDetachedObserved
 			&& this.authoritativeTurnTerminal
-			&& this.terminalSessionClientLeft
 			&& this.host.preserveTerminalSession === true
 		) {
 			this.terminalClientDetachedObserved = true;
