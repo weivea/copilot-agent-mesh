@@ -117,7 +117,9 @@ until the connection itself is gone, so same-handle catalog visibility is not a 
 runtime readiness precondition. Mesh does not invent an `activeClientRemoved` action.
 Cleanup then closes the remaining subscriptions, client connection, socket, and timers
 without calling `disposeSession`, because that command removes the user-visible
-history. Session unsubscribe remains the protocol-defined Host boundary for removing
+history. Connection shutdown allows a bounded graceful WebSocket close before forcing
+the local socket closed, so a Host that does not complete the close handshake cannot
+hang task disposal. Session unsubscribe remains the protocol-defined Host boundary for removing
 the active client and its tools/customizations; Mesh does not modify read state.
 An unsubscribe failure fails closed and leaves disposal to remove the orphan.
 Standalone cleanup continues to dispose the Session and owned Host. Objective catalog

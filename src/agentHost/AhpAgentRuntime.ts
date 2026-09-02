@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
+import NodeWebSocket from 'ws';
+
 import type {
 	ActionEnvelope,
 	AgentInfo,
@@ -43,6 +45,8 @@ export const AHP_PROTOCOL_OFFER: readonly ['1.0.0'] = Object.freeze(['1.0.0']);
 const sessionDefaultChatTimeoutMs = 60_000;
 const cancellationTimeoutMs = 15_000;
 const titleAcknowledgementTimeoutMs = 10_000;
+const connectionGracefulShutdownMs = 1_000;
+const connectionForcedShutdownMs = 5_000;
 const sessionCatalogPageLimit = 200;
 const sessionCatalogMaxPages = 50;
 const sessionCatalogCursorMaxLength = 4_096;
@@ -413,12 +417,6 @@ export class AhpAgentRuntime implements AgentRuntime {
 
 export class SdkAhpConnectionFactory implements AhpConnectionFactory {
 	async connect(host: LaunchedAgentHost, signal?: AbortSignal): Promise<AhpConnection> {
-		if (host.openWebSocket === undefined && typeof globalThis.WebSocket !== 'function') {
-			throw new AgentRuntimeError(
-				'AGENT_UNAVAILABLE',
-				'The VS Code Extension Host does not provide the WebSocket transport required by AHP.',
-			);
-		}
 		const socket = host.openWebSocket === undefined
 			? await connectWebSocket(host.endpoint, 10_000, signal)
 			: await host.openWebSocket(signal);
@@ -427,15 +425,15 @@ export class SdkAhpConnectionFactory implements AhpConnectionFactory {
 			import('@microsoft/agent-host-protocol/ws'),
 		]);
 		if (signal?.aborted === true) {
-			socket.close();
+			socket.terminate();
 			throw new RecoveryStoppedCause();
 		}
 		const client = new AhpClient(
-			WebSocketTransport.fromSocket(socket as unknown as WebSocket),
+			WebSocketTransport.fromSocket(socket as unknown as globalThis.WebSocket),
 			{ requestTimeoutMs: 30_000 },
 		);
 		client.connect();
-		return new SdkAhpConnection(client, AHP_PROTOCOL_OFFER);
+		return new SdkAhpConnection(client, AHP_PROTOCOL_OFFER, () => socket.terminate());
 	}
 }
 
@@ -446,6 +444,7 @@ class SdkAhpConnection implements AhpConnection {
 			{ with: { 'resolution-mode': 'import' } }
 		).AhpClient,
 		private readonly supportedVersions: readonly string[],
+		private readonly forceClose: () => void,
 	) {}
 
 	async initialize(clientId: string): Promise<AhpInitializeResult> {
@@ -572,7 +571,28 @@ class SdkAhpConnection implements AhpConnection {
 	}
 
 	async shutdown(): Promise<void> {
-		await this.client.shutdown();
+		const operation = this.client.shutdown();
+		let forceTimer: NodeJS.Timeout | undefined;
+		const forcedCloseFailure = new Promise<never>((_resolve, reject) => {
+			forceTimer = setTimeout(() => {
+				try {
+					this.forceClose();
+				} catch (error: unknown) {
+					reject(error);
+				}
+			}, connectionGracefulShutdownMs);
+		});
+		try {
+			await withTimeout(
+				Promise.race([operation, forcedCloseFailure]),
+				connectionForcedShutdownMs,
+				'The Agent Host connection did not shut down after its socket was closed.',
+			);
+		} finally {
+			if (forceTimer !== undefined) {
+				clearTimeout(forceTimer);
+			}
+		}
 	}
 }
 
@@ -2713,16 +2733,16 @@ function stableJson(value: Readonly<Record<string, unknown>>): string {
 	return JSON.stringify(Object.fromEntries(entries));
 }
 
-function connectWebSocket(endpoint: URL, timeoutMs: number, signal?: AbortSignal): Promise<WebSocket> {
+function connectWebSocket(endpoint: URL, timeoutMs: number, signal?: AbortSignal): Promise<NodeWebSocket> {
 	return new Promise((resolveSocket, reject) => {
 		if (signal?.aborted === true) {
 			reject(new RecoveryStoppedCause());
 			return;
 		}
-		const socket = new globalThis.WebSocket(endpoint);
+		const socket = new NodeWebSocket(endpoint);
 		const timer = setTimeout(() => {
 			cleanup();
-			socket.close();
+			socket.terminate();
 			reject(new AgentRuntimeError('AGENT_UNAVAILABLE', 'Timed out connecting to the Agent Host.'));
 		}, timeoutMs);
 		const cleanup = () => {
@@ -2746,7 +2766,7 @@ function connectWebSocket(endpoint: URL, timeoutMs: number, signal?: AbortSignal
 		};
 		const handleAbort = () => {
 			cleanup();
-			socket.close();
+			socket.terminate();
 			reject(new RecoveryStoppedCause());
 		};
 		socket.addEventListener('open', handleOpen);
