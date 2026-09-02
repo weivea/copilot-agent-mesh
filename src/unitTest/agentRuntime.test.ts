@@ -458,12 +458,18 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 	assert.deepEqual(transport.completionQueries, ['test']);
 	assert.equal(transport.created?.provider, 'dynamic-provider');
 	assert.deepEqual(transport.created?.workingDirectories, [workspaceUri]);
-	assert.deepEqual(lifecycle, [{
-		taskId: 'task-1',
-		eventType: 'session/hostObserved',
-		sessionUri: handle.recovery.sessionUri,
-		source: 'standalone',
-	}]);
+	assert.deepEqual(lifecycle, [
+		{
+			taskId: 'task-1',
+			eventType: 'session/materialized',
+		},
+		{
+			taskId: 'task-1',
+			eventType: 'session/hostObserved',
+			sessionUri: handle.recovery.sessionUri,
+			source: 'standalone',
+		},
+	]);
 	assert.equal(transport.dispatched[0]?.action.type, 'chat/turnStarted');
 	assert.equal(
 		((transport.dispatched[0]?.action as Record<string, unknown>).message as Record<string, unknown>).text,
@@ -1356,6 +1362,31 @@ test('provisional Session dispatches its first turn before session/ready', async
 	assert.equal(transport.dispatched[0]?.action.type, 'chat/turnStarted');
 	assert.equal(transport.dispatched[0]?.channel, transport.sessionDefaultChat);
 	await handle.dispose();
+});
+
+test('terminal provisional Session waits for session/ready before leaving its active client', async () => {
+	const transport = new FakeAhpTransport();
+	transport.sessionStartsProvisional = true;
+	const launcher = new FakeLauncher();
+	launcher.host.preserveTerminalSession = true;
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+	const terminal = nextEvent(handle.events);
+
+	await transport.emitChat({
+		type: 'chat/turnComplete',
+		turnId: currentTurnId(transport),
+		duration: 0,
+	});
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(transport.unsubscribedUris.includes(transport.created!.sessionUri), false);
+
+	await transport.emitSession({ type: 'session/ready' });
+	assert.equal((await terminal).type, 'completed');
+	assert.equal(transport.unsubscribedUris.includes(transport.created!.sessionUri), true);
+	await handle.dispose();
+	assert.equal(transport.disposeSessionCalls, 0);
 });
 
 test('AHP 0.8 creationFailed Session snapshots fail with the reported error', async () => {
@@ -3617,6 +3648,11 @@ class FakeAhpTransport implements AhpConnection {
 
 	emitChat(action: Record<string, unknown>): Promise<boolean> {
 		return this.emit('ahp-chat:/default', action);
+	}
+
+	emitSession(action: Record<string, unknown>): Promise<boolean> {
+		assert.ok(this.created);
+		return this.emit(this.created.sessionUri, action);
 	}
 
 	emitRootAuth(resources: readonly ProtectedResource[]): Promise<boolean> {

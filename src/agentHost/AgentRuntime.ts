@@ -81,6 +81,7 @@ export type AgentRuntimeLifecycleObservation =
 			| 'chat/turnComplete'
 			| 'chat/turnCancelled'
 			| 'chat/error'
+			| 'session/materialized'
 			| 'session/clientDetachStarted'
 			| 'session/subscriptionIteratorsClosed'
 			| 'session/subscriptionPumpsSettled'

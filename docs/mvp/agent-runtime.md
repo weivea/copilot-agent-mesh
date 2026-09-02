@@ -110,8 +110,10 @@ Delegated Sessions use the exact target Workspace URI, publish no child Mesh too
 and receive the acknowledged title
 `Mesh · <safe source window name> → <safe bounded task summary>`. A rejected title
 removes the provisional Session. An authoritative editor-host terminal action must
-match the dispatched turn ID. Before publishing that terminal Mesh event, the runtime
-unsubscribes the Session channel so VS Code removes the delegated active client.
+match the dispatched turn ID. If its Session is still provisional, the runtime waits
+up to 10 seconds for the exact Session's protocol-defined `session/ready` materialization
+transition. Before publishing that terminal Mesh event, it then unsubscribes the Session
+channel so VS Code removes the delegated active client.
 VS Code 1.135.0 can keep returning an empty `listSessions` catalog on that same client
 until the connection itself is gone, so same-handle catalog visibility is not a valid
 runtime readiness precondition. Mesh does not invent an `activeClientRemoved` action.
@@ -124,7 +126,8 @@ the local socket closed, so a Host that does not complete the close handshake ca
 hang task disposal. Session unsubscribe remains the protocol-defined Host boundary for removing
 the active client and its tools/customizations; Mesh does not modify read state.
 An unsubscribe failure fails closed and leaves disposal to remove the orphan.
-Standalone cleanup continues to dispose the Session and owned Host. Objective catalog
+Missing materialization also fails retryably and disposal removes the orphan. Standalone
+cleanup continues to dispose the Session and owned Host. Objective catalog
 proof is instead collected only after handle cleanup by a fresh independent connection,
 using bounded cursor pagination and requiring the exact Session to be Idle/Error,
 non-InProgress, and non-Archived.

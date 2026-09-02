@@ -46,6 +46,7 @@ export const AHP_PROTOCOL_OFFER: readonly ['1.0.0'] = Object.freeze(['1.0.0']);
 const sessionDefaultChatTimeoutMs = 60_000;
 const cancellationTimeoutMs = 15_000;
 const titleAcknowledgementTimeoutMs = 10_000;
+const terminalSessionMaterializationTimeoutMs = 10_000;
 const connectionGracefulShutdownMs = 1_000;
 const connectionForcedShutdownMs = 5_000;
 const sessionCatalogPageLimit = 200;
@@ -658,6 +659,9 @@ class AhpTask implements AgentTaskHandle {
 	private authoritativeTurnTerminal = false;
 	private terminalSessionClientLeft = false;
 	private terminalClientDetachedObserved = false;
+	private sessionMaterialized = false;
+	private readonly sessionMaterializedPromise: Promise<void>;
+	private readonly resolveSessionMaterialized: () => void;
 	private disposed = false;
 	private recovering = false;
 	private defaultChatResolve: ((uri: string) => void) | undefined;
@@ -715,6 +719,11 @@ class AhpTask implements AgentTaskHandle {
 		private readonly lifecycleObserver: AgentRuntimeLifecycleObserver | undefined,
 		private readonly didDispose: () => void,
 	) {
+		let resolveSessionMaterialized!: () => void;
+		this.sessionMaterializedPromise = new Promise<void>((resolve) => {
+			resolveSessionMaterialized = resolve;
+		});
+		this.resolveSessionMaterialized = resolveSessionMaterialized;
 		this.taskId = request.taskId;
 		this.connection = connection;
 		this.generation = {
@@ -1472,6 +1481,9 @@ class AhpTask implements AgentTaskHandle {
 				this.fail(error);
 			} else {
 				this.observeHostSession(envelope.channel);
+				if (action.type === 'session/ready') {
+					this.markSessionMaterialized();
+				}
 				if (action.type === 'session/defaultChatChanged') {
 					this.updateSessionDefaultChat(action.defaultChat);
 				}
@@ -1524,6 +1536,17 @@ class AhpTask implements AgentTaskHandle {
 		if (this.host.preserveTerminalSession !== true) {
 			this.authoritativeTurnTerminal = true;
 			return;
+		}
+		if (!this.sessionMaterialized) {
+			await withAbortableTimeout(
+				(scanSignal) => abortableConfigurationResolution(
+					this.sessionMaterializedPromise,
+					scanSignal,
+				),
+				terminalSessionMaterializationTimeoutMs,
+				'The editor Agent Host did not materialize the terminal Session.',
+				this.terminalPreparationAbort.signal,
+			);
 		}
 		if (!this.terminalSessionClientLeft) {
 			await this.detachTerminalSessionClient(
@@ -1674,6 +1697,15 @@ class AhpTask implements AgentTaskHandle {
 		}
 	}
 
+	private markSessionMaterialized(): void {
+		if (this.sessionMaterialized) {
+			return;
+		}
+		this.sessionMaterialized = true;
+		this.resolveSessionMaterialized();
+		this.observeLifecycleEvent('session/materialized');
+	}
+
 	private async applySnapshot(
 		snapshot: Snapshot,
 		subscribeRootTerminals = true,
@@ -1688,6 +1720,9 @@ class AhpTask implements AgentTaskHandle {
 					'TASK_EXECUTION_FAILED',
 					safeMessage(state.creationError?.message ?? 'Agent session creation failed.'),
 				);
+			}
+			if (lifecycle === 'ready') {
+				this.markSessionMaterialized();
 			}
 			this.observeHostSession(snapshot.resource);
 			if (state.defaultChat !== undefined) {
@@ -2852,6 +2887,28 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: s
 		if (timer !== undefined) {
 			clearTimeout(timer);
 		}
+	}
+}
+
+async function withAbortableTimeout<T>(
+	operation: (signal: AbortSignal) => Promise<T>,
+	timeoutMs: number,
+	message: string,
+	parentSignal: AbortSignal,
+): Promise<T> {
+	const timeout = new AbortController();
+	const timeoutError = new AgentRuntimeError('TASK_EXECUTION_FAILED', message, true);
+	const signal = AbortSignal.any([parentSignal, timeout.signal]);
+	const timer = setTimeout(() => timeout.abort(), timeoutMs);
+	try {
+		return await operation(signal);
+	} catch (error) {
+		if (timeout.signal.aborted && !parentSignal.aborted) {
+			throw timeoutError;
+		}
+		throw error;
+	} finally {
+		clearTimeout(timer);
 	}
 }
 

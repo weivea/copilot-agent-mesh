@@ -306,8 +306,10 @@ provisional Session；`chat/turnComplete` 与 response 已可见时，provider �
 Host GC。仅跳过 `disposeSession` 因此不是 persistence proof。客户端现在只接受当前 `turnId`
 的终止 action。两次真实诊断分别证明保持 Session subscription、以及只
 `unsubscribe(session)` 但保留同一连接时，catalog 都可能继续为空；因此同一 handle 的
-`listSessions` 不能作为 terminal readiness barrier。客户端在权威终止后先 unsubscribe Session
-以移除 active client，再发布终止并由正常 handle disposal 关闭其余订阅和连接。不会伪造
+`listSessions` 不能作为 terminal readiness barrier。AHP 1.0 的 `session/ready` 是 provisional
+Session 完成 materialization 的明确生命周期信号；客户端在权威终止后有界等待 exact Session
+ready，再 unsubscribe Session 以移除 active client，随后发布终止并由正常 handle disposal
+关闭其余订阅和连接。不会伪造
 `session/activeClientRemoved`；unsubscribe 仍是 Host-managed active-client/tool cleanup 的协议
 边界，read/archive metadata 不由 Mesh 伪造。只有 disposal 完成后，诊断才从新的独立连接进行
 有界分页，并要求 exact Session 为 Idle/Error、非 InProgress、非 Archived。连接 shutdown
