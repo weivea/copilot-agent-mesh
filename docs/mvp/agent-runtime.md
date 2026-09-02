@@ -128,15 +128,19 @@ detaches its cursor without waking an already parked `next()`. Pump settlement h
 hard bound; timeout is reported as cleanup failure after connection/Host shutdown rather
 than hanging disposal. Cleanup then closes the client connection, socket, and timers
 without calling `disposeSession`, because that command removes the user-visible
-history. Connection shutdown allows a bounded graceful WebSocket close before forcing
+history. Before removing the delegated active client, Mesh dispatches
+`session/isArchivedChanged { isArchived: true }` and waits for the exact Host-origin
+acknowledgement. In VS Code 1.135, this is the AHP task-complete transition that moves
+the retained Session from Working to Done/history; it is not the user's manual
+**Mark as Done** action. Connection shutdown allows a bounded graceful WebSocket close before forcing
 the local socket closed, so a Host that does not complete the close handshake cannot
-hang task disposal. A rejected/unacknowledged active-client removal or unsubscribe failure
+hang task disposal. A rejected/unacknowledged archive, active-client removal, or unsubscribe failure
 fails closed and leaves disposal to remove the orphan; Mesh does not modify read state.
 Missing materialization also fails retryably and disposal removes the orphan. Standalone
 cleanup continues to dispose the Session and owned Host. Objective catalog
 proof is instead collected only after handle cleanup by a fresh independent connection,
 using bounded cursor pagination and requiring the exact Session to be Idle/Error,
-non-InProgress, and non-Archived. VS Code 1.135 may return RPC `-32603` when the
+non-InProgress, and Archived. VS Code 1.135 may return RPC `-32603` when the
 schema-optional page `limit` is present; the bounded scanner retries without that field
 while preserving its page, cursor-length, and cycle limits.
 
@@ -156,7 +160,8 @@ percent-encoded forms and are removed after the final borrowing task disposes.
 
 The P8 real harness may install a non-throwing, E2E-capability-only lifecycle
 observer. It records only the task UUID and one of
-`chat/turnComplete`/`chat/turnCancelled`/`chat/error`/`session/clientDetached`,
+`chat/turnComplete`/`chat/turnCancelled`/`chat/error`/`session/archived`/
+`session/activeClientRemoved`/`session/clientDetached`,
 allowing evidence to distinguish the authoritative AHP action, persisted Mesh
 terminal state, and successful original-handle detach.
 It never records an envelope, prompt, output, URI, endpoint, or token, and no
@@ -259,7 +264,7 @@ cross-check. If the Host never echoes the Session, AC-5.9 remains Unverified
 even when the task otherwise completes. A separate bounded post-task `listSessions`
 observation remains O1 catalog evidence. It opens a new editor connection only after
 the original handle emits `session/clientDetached` following successful subscription
-and connection cleanup, then hashes only terminal, non-archived entries. This proves the Session
+and connection cleanup, then hashes only terminal, archived entries. This proves the Session
 survived client detach/reconnect rather than merely existing in the completing
 connection. It does not open and close a pre-task catalog client because that
 borrowed-client lifecycle can perturb editor identity readiness. Only fingerprints

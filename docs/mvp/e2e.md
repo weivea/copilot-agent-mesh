@@ -77,15 +77,17 @@ independent Session-catalog probe.
 Only after those phases complete does the harness print
 `manualPostDetachObservationRequired` with a challenge-bound command and open a
 five-minute observation window. Check the target Chat Sessions list at that point,
-then record only the two boolean observations with that exact printed command:
+then record the exactly observed post-detach Session state with that exact printed command:
 
 ```sh
-node scripts/e2e/peer-delegation/attest.mjs <run-id> confirmation-once session-visible <post-detach-challenge>
+node scripts/e2e/peer-delegation/attest.mjs <run-id> confirmation-once retained-done <post-detach-challenge>
 ```
 
-Use `session-not-visible` when that is the observed result. An attestation created
+Use `retained-working` if the exact Session remains labeled Working, or `absent` if
+it is not retained. Only `retained-done` can satisfy UI evidence. An attestation created
 before the post-detach prompt cannot match its challenge. If objective detach is not
-observed, the harness never solicits or accepts UI evidence as Pass. Without the
+observed, or if the Host has not acknowledged the automatic terminal archive, the
+harness never solicits or accepts UI evidence as Pass. Without the
 post-detach phase, AC-5 item 5 and UI visibility remain `unverified`, and the
 command exits nonzero. Diagnostics-only `MANUAL_UI=0` behavior is unchanged.
 
@@ -190,7 +192,7 @@ produced a valid **Unverified** artifact rather than a false Pass:
   invocation was about 87 seconds, not a 60-minute Copilot UI call.
 - No user attestation was created. The full UI rerun still requires the exact
   enabled command, a signed-in dedicated profile, one visible Agent-mode Tool
-  confirmation, and an honest `session-visible`/`session-not-visible` attestation.
+  confirmation, and an honest `retained-done`/`retained-working`/`absent` attestation.
 
 The default `npm test` remains offline. The real test is explicit because it creates a
 public Dev Tunnel and may consume Copilot quota:

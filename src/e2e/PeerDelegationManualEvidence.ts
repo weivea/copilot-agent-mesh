@@ -3,15 +3,19 @@ const manualPostDetachObservationPollMs = 250;
 
 export interface ManualPostDetachAttestation {
 	readonly confirmationAcceptedOnce: boolean;
-	readonly targetSessionVisible: boolean;
+	readonly targetSessionState: 'retained-done' | 'retained-working' | 'absent';
 }
 
 export function canRequestManualPostDetachObservation(
 	manualUi: boolean,
+	sessionArchivedObserved: boolean,
 	clientDetachedObserved: boolean,
 	catalogProbeCompleted: boolean,
 ): boolean {
-	return manualUi && clientDetachedObserved && catalogProbeCompleted;
+	return manualUi
+		&& sessionArchivedObserved
+		&& clientDetachedObserved
+		&& catalogProbeCompleted;
 }
 
 export function parseManualPostDetachAttestation(
@@ -23,17 +27,21 @@ export function parseManualPostDetachAttestation(
 		return undefined;
 	}
 	if (
-		value.schemaVersion !== 2
+		value.schemaVersion !== 3
 		|| value.runId !== expectedRunId
 		|| value.postDetachChallenge !== expectedChallenge
 		|| typeof value.confirmationAcceptedOnce !== 'boolean'
-		|| typeof value.targetSessionVisible !== 'boolean'
+		|| (
+			value.targetSessionState !== 'retained-done'
+			&& value.targetSessionState !== 'retained-working'
+			&& value.targetSessionState !== 'absent'
+		)
 	) {
 		return undefined;
 	}
 	return {
 		confirmationAcceptedOnce: value.confirmationAcceptedOnce,
-		targetSessionVisible: value.targetSessionVisible,
+		targetSessionState: value.targetSessionState,
 	};
 }
 

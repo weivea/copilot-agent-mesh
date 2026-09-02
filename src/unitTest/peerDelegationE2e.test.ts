@@ -33,15 +33,16 @@ const postDetachChallenge = '00000000-0000-4000-8000-000000000005';
 
 test('manual UI evidence accepts only the challenge issued after objective detach and catalog probe', () => {
 	const attestation = {
-		schemaVersion: 2,
+		schemaVersion: 3,
 		runId,
 		postDetachChallenge,
 		confirmationAcceptedOnce: true,
-		targetSessionVisible: true,
+		targetSessionState: 'retained-done',
 	};
-	assert.equal(canRequestManualPostDetachObservation(true, false, false), false);
-	assert.equal(canRequestManualPostDetachObservation(true, true, false), false);
-	assert.equal(canRequestManualPostDetachObservation(false, true, true), false);
+	assert.equal(canRequestManualPostDetachObservation(true, false, true, true), false);
+	assert.equal(canRequestManualPostDetachObservation(true, true, false, true), false);
+	assert.equal(canRequestManualPostDetachObservation(true, true, true, false), false);
+	assert.equal(canRequestManualPostDetachObservation(false, true, true, true), false);
 	assert.equal(
 		parseManualPostDetachAttestation(
 			attestation,
@@ -51,22 +52,23 @@ test('manual UI evidence accepts only the challenge issued after objective detac
 		undefined,
 		'An attestation made before the post-detach challenge cannot pass.',
 	);
-	assert.equal(canRequestManualPostDetachObservation(true, true, true), true);
+	assert.equal(canRequestManualPostDetachObservation(true, true, true, true), true);
 	assert.deepEqual(
 		parseManualPostDetachAttestation(attestation, runId, postDetachChallenge),
-		{ confirmationAcceptedOnce: true, targetSessionVisible: true },
+		{ confirmationAcceptedOnce: true, targetSessionState: 'retained-done' },
 	);
 	assert.equal(manualPostDetachObservationTimeoutMs, 5 * 60_000);
 });
 
 test('manual UI evidence remains unverified without objective detach', () => {
-	assert.equal(canRequestManualPostDetachObservation(true, false, true), false);
+	assert.equal(canRequestManualPostDetachObservation(true, true, false, true), false);
 	assert.equal(
 		parseManualPostDetachAttestation({
-			schemaVersion: 1,
+			schemaVersion: 3,
 			runId,
+			postDetachChallenge,
 			confirmationAcceptedOnce: true,
-			targetSessionVisible: true,
+			targetSessionState: 'unobserved',
 		}, runId, postDetachChallenge),
 		undefined,
 	);
@@ -100,11 +102,11 @@ test('manual post-detach observation polling is bounded and accepts a later exac
 			reads += 1;
 			return reads === 2
 				? {
-					schemaVersion: 2,
+					schemaVersion: 3,
 					runId,
 					postDetachChallenge,
 					confirmationAcceptedOnce: true,
-					targetSessionVisible: false,
+					targetSessionState: 'retained-working',
 				}
 				: undefined;
 		},
@@ -116,7 +118,7 @@ test('manual post-detach observation polling is bounded and accepts a later exac
 	});
 	assert.deepEqual(observed, {
 		confirmationAcceptedOnce: true,
-		targetSessionVisible: false,
+		targetSessionState: 'retained-working',
 	});
 	assert.equal(reads, 2);
 });
@@ -301,12 +303,14 @@ test('peer-delegation passing evidence requires all real AC-5 conditions', () =>
 			sessionVisibility: {
 				...evidence.sessionVisibility,
 				status: 'pass',
+				sessionArchivedObserved: true,
 				clientDetachedObserved: true,
 				catalogAfterTerminalCleanup: false,
 				uiObserved: true,
+				uiObservation: 'retained-done',
 			},
 			experiments: evidence.experiments.map((experiment) => experiment.id === 'O1'
-				? { ...experiment, status: 'pass' as const, conclusion: 'editor-session-visible' as const }
+				? { ...experiment, status: 'pass' as const, conclusion: 'editor-session-retained-done' as const }
 				: experiment),
 		}),
 		/Passing O1 evidence requires editor catalog and objective UI observation/u,
@@ -526,8 +530,9 @@ test('0.4.0 release metadata keeps the real peer gate default-off and five-tool 
 	);
 	assert.match(
 		harness,
-		/canRequestManualPostDetachObservation\(\s*manualUi,\s*clientDetachedObserved,\s*catalogProbeCompleted/u,
+		/canRequestManualPostDetachObservation\(\s*manualUi,\s*sessionArchivedObserved,\s*clientDetachedObserved,\s*catalogProbeCompleted/u,
 	);
+	assert.match(harness, /targetSessionState:\s*'unobserved'/u);
 	assert.doesNotMatch(harness, /rm\(meshGlobalStorageDirectory/u);
 	assert.match(
 		application,
@@ -658,10 +663,12 @@ function unverifiedEvidence(): PeerDelegationEvidence {
 			catalogBefore: 0,
 			catalogAfter: 0,
 			hostSessionEchoObserved: false,
+			sessionArchivedObserved: false,
 			clientDetachedObserved: false,
 			catalogAfterTerminalCleanup: false,
 			catalogSessionHashMatched: false,
 			uiObserved: false,
+			uiObservation: 'unobserved',
 		},
 		transport: {
 			status: 'unverified',
@@ -855,10 +862,12 @@ function passingEvidence(): PeerDelegationEvidence {
 			hostSessionHash: '0123456789abcdef',
 			editorEndpointFingerprint: 'fedcba9876543210',
 			hostSessionEchoObserved: true,
+			sessionArchivedObserved: true,
 			clientDetachedObserved: true,
 			catalogAfterTerminalCleanup: true,
 			catalogSessionHashMatched: true,
 			uiObserved: false,
+			uiObservation: 'unobserved',
 		},
 		transport: {
 			status: 'pass',

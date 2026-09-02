@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 
 import NodeWebSocket from 'ws';
 
@@ -666,6 +667,7 @@ class AhpTask implements AgentTaskHandle {
 	private lastSeenServerSeq = 0;
 	private terminal = false;
 	private authoritativeTurnTerminal = false;
+	private terminalSessionArchived = false;
 	private terminalSessionClientLeft = false;
 	private terminalClientDetachedObserved = false;
 	private sessionMaterialized = false;
@@ -1243,15 +1245,16 @@ class AhpTask implements AgentTaskHandle {
 	): void {
 		const clientSeq = this.nextClientSeq;
 		this.nextClientSeq += 1;
+		const wireAction = JSON.parse(JSON.stringify(action)) as unknown;
 		this.unacknowledgedDispatches.set(clientSeq, {
 			channel,
-			action,
+			action: wireAction,
 			requestId,
 			resolveAcknowledgement: acknowledgement?.resolve,
 			rejectAcknowledgement: acknowledgement?.reject,
 		});
 		try {
-			connection.dispatch(channel, action, clientSeq);
+			connection.dispatch(channel, wireAction, clientSeq);
 		} catch (error) {
 			this.unacknowledgedDispatches.delete(clientSeq);
 			if (connection === this.connection) {
@@ -1290,6 +1293,12 @@ class AhpTask implements AgentTaskHandle {
 		}
 		const pending = this.unacknowledgedDispatches.get(envelope.origin.clientSeq);
 		if (pending === undefined) {
+			return;
+		}
+		if (
+			envelope.channel !== pending.channel
+			|| !isDeepStrictEqual(envelope.action, pending.action)
+		) {
 			return;
 		}
 		this.unacknowledgedDispatches.delete(envelope.origin.clientSeq);
@@ -1627,6 +1636,22 @@ class AhpTask implements AgentTaskHandle {
 				this.terminalPreparationAbort.signal,
 			);
 		}
+		if (!this.terminalSessionArchived) {
+			await this.dispatchTerminalSessionAction(
+				{
+					type: 'session/isArchivedChanged',
+					isArchived: true,
+				},
+				'The Agent Host did not acknowledge marking the completed delegated Session as done.',
+				'The Agent Host closed the Session before acknowledging its done state.',
+				'The Agent Host requested authentication while marking the delegated Session as done.',
+				connection,
+				this.terminalPreparationAbort.signal,
+				sessionSubscription,
+			);
+			this.terminalSessionArchived = true;
+			this.observeLifecycleEvent('session/archived');
+		}
 		if (!this.terminalSessionClientLeft) {
 			await this.detachTerminalSessionClient(
 				connection,
@@ -1682,14 +1707,35 @@ class AhpTask implements AgentTaskHandle {
 		signal: AbortSignal,
 		sessionSubscription?: AhpSubscription,
 	): Promise<void> {
-		let acknowledged = false;
-		const acknowledgement = this.dispatchAcknowledged(
-			this.sessionUri,
+		await this.dispatchTerminalSessionAction(
 			{
 				type: 'session/activeClientRemoved',
 				clientId: this.clientId,
 			},
 			'The Agent Host did not acknowledge the delegated active-client removal.',
+			'The Agent Host closed the Session before acknowledging active-client removal.',
+			'The Agent Host requested authentication while removing the delegated active client.',
+			connection,
+			signal,
+			sessionSubscription,
+		);
+		this.observeLifecycleEvent('session/activeClientRemoved');
+	}
+
+	private async dispatchTerminalSessionAction(
+		action: unknown,
+		timeoutMessage: string,
+		closedMessage: string,
+		authenticationMessage: string,
+		connection: AhpConnection,
+		signal: AbortSignal,
+		sessionSubscription?: AhpSubscription,
+	): Promise<void> {
+		let acknowledged = false;
+		const acknowledgement = this.dispatchAcknowledged(
+			this.sessionUri,
+			action,
+			timeoutMessage,
 			connection,
 		);
 		void acknowledgement.then(
@@ -1714,7 +1760,7 @@ class AhpTask implements AgentTaskHandle {
 			if (event.done) {
 				throw new AgentRuntimeError(
 					'TASK_EXECUTION_FAILED',
-					'The Agent Host closed the Session before acknowledging active-client removal.',
+					closedMessage,
 				);
 			}
 			if (event.value.type === 'action') {
@@ -1722,7 +1768,7 @@ class AhpTask implements AgentTaskHandle {
 			} else {
 				throw new AgentRuntimeError(
 					'TASK_EXECUTION_FAILED',
-					'The Agent Host requested authentication while removing the delegated active client.',
+					authenticationMessage,
 				);
 			}
 			await Promise.resolve();
@@ -3248,7 +3294,7 @@ export function isUsableTerminalSessionStatus(status: number): boolean {
 	const terminal = (status & (sessionStatusIdle | sessionStatusError)) !== 0;
 	return terminal
 		&& (status & sessionStatusInProgress) === 0
-		&& (status & sessionStatusArchived) === 0;
+		&& (status & sessionStatusArchived) !== 0;
 }
 
 function sleep(timeoutMs: number): Promise<void> {

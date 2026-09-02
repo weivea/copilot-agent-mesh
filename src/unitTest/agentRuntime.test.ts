@@ -16,6 +16,7 @@ import {
 	AHP_PROTOCOL_OFFER,
 	buildMeshSessionTitle,
 	DELEGATED_AGENT_CLIENT_TOOLS,
+	isUsableTerminalSessionStatus,
 	listSessionsBounded,
 	type AhpConnection,
 	type AhpConnectionFactory,
@@ -533,6 +534,11 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 		await handle.answer({ requestId: approvalEvent.request.requestId, outcome: 'accept' });
 	}
 	assert.equal(transport.dispatched.at(-1)?.action.type, 'chat/toolCallConfirmed');
+	assert.equal(
+		Object.hasOwn(transport.dispatched.at(-1)?.action ?? {}, 'selectedOptionId'),
+		false,
+		'Tracked actions must match their JSON wire representation.',
+	);
 
 	await handle.cancel();
 	assert.equal((await nextEvent(handle.events)).type, 'progress');
@@ -592,15 +598,16 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 		assert.equal(transport.listSessionsCalls, 0);
 		const sessionUri = transport.created!.sessionUri;
 		assert.deepEqual(catalog.session(sessionUri), {
-			status: 1,
+			status: 65,
 			activeClientCount: 0,
 			materialized: true,
+			historyState: 'done',
 		});
 
 		const reconnected = new FakeAhpTransport(catalog);
 		await reconnected.initialize('history-reader');
 		assert.deepEqual(await reconnected.listSessions(), {
-			items: [{ resource: sessionUri, status: 1 }],
+			items: [{ resource: sessionUri, status: 65 }],
 		});
 		await reconnected.shutdown();
 	});
@@ -620,6 +627,15 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 			{ resource: 'ahp-session:/older-3', status: 1 },
 		]);
 		assert.equal(transport.listSessionsCalls, 2);
+	});
+
+	test('terminal catalog evidence accepts only archived Idle/Error Sessions', () => {
+		assert.equal(isUsableTerminalSessionStatus(65), true);
+		assert.equal(isUsableTerminalSessionStatus(66), true);
+		assert.equal(isUsableTerminalSessionStatus(1), false);
+		assert.equal(isUsableTerminalSessionStatus(2), false);
+		assert.equal(isUsableTerminalSessionStatus(72), false);
+		assert.equal(isUsableTerminalSessionStatus(88), false);
 	});
 
 	test('bounded Session catalog listing omits optional limit after Host internal error', async () => {
@@ -808,8 +824,20 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 			await handle.dispose();
 
 			const session = catalog.session(transport.created!.sessionUri);
-			assert.equal(session?.status, terminal === 'chat/error' ? 2 : 1);
+			assert.equal(session?.status, terminal === 'chat/error' ? 66 : 65);
 			assert.equal(session?.activeClientCount, 0);
+			assert.deepEqual(
+				transport.dispatched.find(({ action }) => action.type === 'session/isArchivedChanged')?.action,
+				{
+					type: 'session/isArchivedChanged',
+					isArchived: true,
+				},
+			);
+			assert.ok(
+				transport.dispatched.findIndex(({ action }) => action.type === 'session/isArchivedChanged')
+				< transport.dispatched.findIndex(({ action }) => action.type === 'session/activeClientRemoved'),
+				'The Host must mark a materialized terminal Session done before removing the delegated client.',
+			);
 			assert.deepEqual(
 				transport.dispatched.find(({ action }) => action.type === 'session/activeClientRemoved')?.action,
 				{
@@ -913,6 +941,76 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 		assert.equal(catalog.session(transport.created!.sessionUri), undefined);
 	});
 
+	test('rejected terminal Session archive fails closed before active-client removal', async () => {
+		const catalog = new FakeAhpHostCatalog();
+		const transport = new FakeAhpTransport(catalog);
+		transport.rejectDispatchType = 'session/isArchivedChanged';
+		const launcher = new FakeLauncher();
+		launcher.host.preserveTerminalSession = true;
+		const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+		const handle = await runtime.start({
+			...taskRequest(),
+			sourceWindowName: 'frontend',
+		});
+		await nextEvent(handle.events);
+		await transport.emitChat({
+			type: 'chat/turnComplete',
+			turnId: currentTurnId(transport),
+			duration: 0,
+		});
+		assert.equal((await nextEvent(handle.events)).type, 'failed');
+		assert.equal(
+			transport.dispatched.some(({ action }) => action.type === 'session/activeClientRemoved'),
+			false,
+		);
+		assert.equal(transport.unsubscribedUris.includes(transport.created!.sessionUri), false);
+
+		await handle.dispose();
+		assert.equal(transport.disposeSessionCalls, 1);
+		assert.equal(catalog.session(transport.created!.sessionUri), undefined);
+	});
+
+	test('terminal archive waits for the exact Host echo before removing the client', async () => {
+		const transport = new FakeAhpTransport();
+		transport.ackDispatches = false;
+		const launcher = new FakeLauncher();
+		launcher.host.preserveTerminalSession = true;
+		const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+		const started = runtime.start({
+			...taskRequest(),
+			sourceWindowName: 'frontend',
+		});
+		await waitForCondition(() =>
+			transport.dispatched.some(({ action }) => action.type === 'session/titleChanged'));
+		await transport.acknowledgeDispatch('session/titleChanged');
+		const handle = await started;
+		await nextEvent(handle.events);
+		void transport.emitChat({
+			type: 'chat/turnComplete',
+			turnId: currentTurnId(transport),
+			duration: 0,
+		});
+		await waitForCondition(() =>
+			transport.dispatched.some(({ action }) => action.type === 'session/isArchivedChanged'));
+
+		await transport.acknowledgeDispatchAs(
+			'session/isArchivedChanged',
+			{ type: 'session/isReadChanged', isRead: true },
+		);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.equal(
+			transport.dispatched.some(({ action }) => action.type === 'session/activeClientRemoved'),
+			false,
+		);
+
+		await transport.acknowledgeDispatch('session/isArchivedChanged');
+		await waitForCondition(() =>
+			transport.dispatched.some(({ action }) => action.type === 'session/activeClientRemoved'));
+		await transport.acknowledgeDispatch('session/activeClientRemoved');
+		assert.equal((await nextEvent(handle.events)).type, 'completed');
+		await handle.dispose();
+	});
+
 	test('standalone terminal Sessions remain owned and are disposed', async () => {
 		const transport = new FakeAhpTransport();
 		transport.completeAfterTurnDispatch = true;
@@ -943,6 +1041,31 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 		assert.equal(transport.disposeSessionCalls, 1);
 		assert.equal(transport.shutdownCalls, 1);
 		assert.equal(launcher.host.disposed, true);
+	});
+
+	test('delegated needs-input Sessions remain active and are never archived', async () => {
+		const transport = new FakeAhpTransport();
+		const launcher = new FakeLauncher();
+		launcher.host.preserveTerminalSession = true;
+		const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+		const handle = await runtime.start(taskRequest());
+		await nextEvent(handle.events);
+		transport.emitChat({
+			type: 'chat/inputRequested',
+			request: {
+				id: 'input-1',
+				message: 'Choose a value',
+				questions: [{ id: 'name', message: 'Name', kind: 'text', required: true }],
+			},
+		});
+		assert.equal((await nextEvent(handle.events)).type, 'inputRequired');
+		assert.equal(
+			transport.dispatched.some(({ action }) => action.type === 'session/isArchivedChanged'),
+			false,
+		);
+
+		await handle.dispose();
+		assert.equal(transport.disposeSessionCalls, 1);
 	});
 
 	test('delegated title sanitizer removes raw, encoded, and credential-shaped values', () => {
@@ -1576,6 +1699,9 @@ test('exact authoritative terminals clear cancellation confirmation before slow 
 				duration: 0,
 			});
 		await waitForCondition(() =>
+			transport.dispatched.some(({ action }) => action.type === 'session/isArchivedChanged'));
+		await transport.acknowledgeDispatch('session/isArchivedChanged');
+		await waitForCondition(() =>
 			transport.dispatched.some(({ action }) => action.type === 'session/activeClientRemoved'));
 		await new Promise<void>((resolve) => setTimeout(resolve, 40));
 		await transport.acknowledgeDispatch('session/activeClientRemoved');
@@ -1627,6 +1753,9 @@ test('disposing an authoritative cancellation during detach wait removes the orp
 		turnId: currentTurnId(transport),
 		duration: 0,
 	});
+	await waitForCondition(() =>
+		transport.dispatched.some(({ action }) => action.type === 'session/isArchivedChanged'));
+	await transport.acknowledgeDispatch('session/isArchivedChanged');
 	await waitForCondition(() =>
 		transport.dispatched.some(({ action }) => action.type === 'session/activeClientRemoved'));
 
@@ -2298,6 +2427,14 @@ test('recovery applies replayed Session readiness before an earlier terminal act
 	first.failChat();
 	assert.equal((await nextEvent(handle.events)).type, 'progress');
 	assert.equal((await nextEvent(handle.events)).type, 'completed');
+	assert.deepEqual(
+		recovered.dispatched
+			.filter(({ action }) =>
+				action.type === 'session/isArchivedChanged'
+				|| action.type === 'session/activeClientRemoved')
+			.map(({ action }) => action.type),
+		['session/isArchivedChanged', 'session/activeClientRemoved'],
+	);
 	await handle.dispose();
 	assert.equal(recovered.disposeSessionCalls, 0);
 });
@@ -3597,6 +3734,15 @@ class FakeAhpHostCatalog {
 			return;
 		}
 		if (
+			action.type === 'session/isArchivedChanged'
+			&& typeof action.isArchived === 'boolean'
+		) {
+			session.status = action.isArchived
+				? session.status | 64
+				: session.status & ~64;
+			return;
+		}
+		if (
 			action.type === 'session/activeClientRemoved'
 			&& typeof action.clientId === 'string'
 		) {
@@ -3630,6 +3776,7 @@ class FakeAhpHostCatalog {
 		readonly status: number;
 		readonly activeClientCount: number;
 		readonly materialized: boolean;
+		readonly historyState: 'working' | 'done';
 	} | undefined {
 		const session = this.sessions.get(sessionUri);
 		return session === undefined
@@ -3638,6 +3785,7 @@ class FakeAhpHostCatalog {
 				status: session.status,
 				activeClientCount: session.activeClients.size,
 				materialized: session.materialized,
+				historyState: (session.status & 64) === 64 ? 'done' : 'working',
 			};
 	}
 }
@@ -4087,6 +4235,19 @@ class FakeAhpTransport implements AhpConnection {
 		const dispatched = [...this.dispatched].reverse().find(({ action }) => action.type === type);
 		assert.ok(dispatched, `Expected a dispatched ${type} action.`);
 		return this.emit(dispatched.channel, dispatched.action, {
+			clientId: this.initializedClientId,
+			clientSeq: dispatched.clientSeq,
+		});
+	}
+
+	acknowledgeDispatchAs(
+		type: string,
+		action: Record<string, unknown>,
+		channel?: string,
+	): Promise<boolean> {
+		const dispatched = [...this.dispatched].reverse().find(({ action: candidate }) => candidate.type === type);
+		assert.ok(dispatched, `Expected a dispatched ${type} action.`);
+		return this.emit(channel ?? dispatched.channel, action, {
 			clientId: this.initializedClientId,
 			clientSeq: dispatched.clientSeq,
 		});

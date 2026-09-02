@@ -1172,6 +1172,11 @@ async function recordCompletionScenario({
 			observation.taskId === completionTaskId
 			&& observation.eventType === 'session/clientDetached',
 	);
+	const sessionArchivedObserved = completionObservations.ahp.some(
+		(observation) =>
+			observation.taskId === completionTaskId
+			&& observation.eventType === 'session/archived',
+	);
 	console.log(JSON.stringify({
 		type: 'sanitized-agent-host-cleanup',
 		events: completionObservations.ahp
@@ -1193,10 +1198,11 @@ async function recordCompletionScenario({
 	}));
 	let uiAttestation = completionRun.uiAttestation ?? {
 		confirmationAcceptedOnce: false,
-		targetSessionVisible: false,
+		targetSessionState: 'unobserved',
 	};
 	if (canRequestManualPostDetachObservation(
 		manualUi,
+		sessionArchivedObserved,
 		clientDetachedObserved,
 		catalogProbeCompleted,
 	)) {
@@ -1208,7 +1214,7 @@ async function recordCompletionScenario({
 			targetWindowLabel,
 			observationWindowSeconds: manualPostDetachObservationTimeoutMs / 1_000,
 			attestationCommand:
-				`node scripts/e2e/peer-delegation/attest.mjs ${runId} confirmation-once session-visible ${postDetachChallenge}`,
+				`node scripts/e2e/peer-delegation/attest.mjs ${runId} confirmation-once retained-done ${postDetachChallenge}`,
 		}));
 		uiAttestation = await readUiAttestation(postDetachChallenge);
 	}
@@ -1319,9 +1325,14 @@ async function recordCompletionScenario({
 		? ['#/completion/source', '#/sessionVisibility/hostSessionEchoObserved']
 		: []);
 
-	const uiObserved = uiAttestation.targetSessionVisible === true;
+	const uiObservation = uiAttestation.targetSessionState;
+	const uiObserved = uiObservation === 'retained-done';
 	evidence.sessionVisibility = {
-		status: editorSessionObserved && catalogSessionHashMatched && uiObserved
+		status: editorSessionObserved
+			&& sessionArchivedObserved
+			&& clientDetachedObserved
+			&& catalogSessionHashMatched
+			&& uiObserved
 			? 'pass'
 			: 'unverified',
 		source: sourceKind,
@@ -1330,16 +1341,18 @@ async function recordCompletionScenario({
 		...(hostSessionHash === undefined ? {} : { hostSessionHash }),
 		...(editorEndpointFingerprint === undefined ? {} : { editorEndpointFingerprint }),
 		hostSessionEchoObserved,
+		sessionArchivedObserved,
 		clientDetachedObserved,
 		catalogAfterTerminalCleanup: clientDetachedObserved && catalogAfter.available === true,
 		catalogSessionHashMatched,
 		uiObserved,
+		uiObservation,
 	};
 	evidence.experiments[0] = {
 		id: 'O1',
 		status: evidence.sessionVisibility.status,
 		conclusion: evidence.sessionVisibility.status === 'pass'
-			? 'editor-session-visible'
+			? 'editor-session-retained-done'
 			: 'unverified',
 	};
 	if (evidence.sessionVisibility.status === 'pass') {
@@ -1392,7 +1405,7 @@ async function runProgrammaticCoreCompletion(source, targetInputBase) {
 		},
 		uiAttestation: {
 			confirmationAcceptedOnce: false,
-			targetSessionVisible: false,
+			targetSessionState: 'unobserved',
 		},
 	};
 }
@@ -1647,7 +1660,7 @@ async function readUiAttestation(postDetachChallenge) {
 	});
 	return attestation ?? {
 		confirmationAcceptedOnce: false,
-		targetSessionVisible: false,
+		targetSessionState: 'unobserved',
 	};
 }
 
@@ -2539,10 +2552,12 @@ function initialEvidence() {
 			catalogBefore: 0,
 			catalogAfter: 0,
 			hostSessionEchoObserved: false,
+			sessionArchivedObserved: false,
 			clientDetachedObserved: false,
 			catalogAfterTerminalCleanup: false,
 			catalogSessionHashMatched: false,
 			uiObserved: false,
+			uiObservation: 'unobserved',
 		},
 		transport: {
 			status: 'unverified',
