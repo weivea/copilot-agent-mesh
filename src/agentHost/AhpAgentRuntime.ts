@@ -1514,16 +1514,17 @@ class AhpTask implements AgentTaskHandle {
 	}
 
 	private async prepareTerminalSessionHistory(connection = this.connection): Promise<void> {
-		if (
-			this.terminalSessionClientLeft
-			|| this.host.preserveTerminalSession !== true
-		) {
+		if (this.host.preserveTerminalSession !== true) {
+			this.authoritativeTurnTerminal = true;
 			return;
 		}
-		await this.detachTerminalSessionClient(
-			connection,
-			this.terminalPreparationAbort.signal,
-		);
+		if (!this.terminalSessionClientLeft) {
+			await this.detachTerminalSessionClient(
+				connection,
+				this.terminalPreparationAbort.signal,
+			);
+		}
+		this.authoritativeTurnTerminal = true;
 	}
 
 	private async detachTerminalSessionClient(
