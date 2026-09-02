@@ -545,10 +545,6 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 			events.push(event);
 		}
 		assert.equal(events.at(-1)?.type, 'completed');
-		assert.equal(
-			lifecycle.some(({ eventType }) => eventType === 'session/clientDetached'),
-			false,
-		);
 		assert.deepEqual(transport.dispatched.slice(0, 2).map(({ channel, action }) => ({
 			channel,
 			action,

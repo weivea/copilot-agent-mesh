@@ -119,7 +119,9 @@ Cleanup then closes the remaining subscriptions, client connection, socket, and 
 without calling `disposeSession`, because that command removes the user-visible
 history. Connection shutdown allows a bounded graceful WebSocket close before forcing
 the local socket closed, so a Host that does not complete the close handshake cannot
-hang task disposal. Session unsubscribe remains the protocol-defined Host boundary for removing
+hang task disposal. A terminal handle starts this idempotent cleanup itself immediately
+after publishing its terminal event; its owner awaits the same retryable cleanup
+operation. Session unsubscribe remains the protocol-defined Host boundary for removing
 the active client and its tools/customizations; Mesh does not modify read state.
 An unsubscribe failure fails closed and leaves disposal to remove the orphan.
 Standalone cleanup continues to dispose the Session and owned Host. Objective catalog
