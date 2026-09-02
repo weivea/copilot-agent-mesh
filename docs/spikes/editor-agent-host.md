@@ -309,13 +309,19 @@ Host GC。仅跳过 `disposeSession` 因此不是 persistence proof。客户端�
 `listSessions` 不能作为 terminal readiness barrier。AHP 1.0 的 `session/ready` 是 provisional
 Session 完成 materialization 的明确生命周期信号；客户端在权威终止后有界等待 exact Session
 ready，再 dispatch 自身 `session/activeClientRemoved` 并等待 Host 权威 echo，之后
-unsubscribe Session，随后发布终止并由正常 handle disposal 关闭其余订阅和连接。这样不会依赖
+unsubscribe Session；completion 随后发布，权威 cancel/error 即使 preparation 失败也随后发布
+原 Host-confirmed 终态。任一 exact Host-authoritative terminal 都会先停止仍在运行的 cancellation
+timer。正常 handle disposal 关闭其余订阅和连接。这样不会依赖
 Host 对 unsubscribe/disconnect 的 SHOULD 级隐式清理，且 active-client tools/customizations
 明确移除；read/archive metadata 不由 Mesh 伪造。只有 disposal 完成后，诊断才从新的独立连接进行
 有界分页，并要求 exact Session 为 Idle/Error、非 InProgress、非 Archived。连接 shutdown
 只给 WebSocket 有界的 graceful-close 时间，随后强制关闭本地 socket，避免 Host close handshake
-不结束时永久卡住 handle disposal。清理必须先 unsubscribe 其余 channel，再关闭 iterator 并
-等待 pump；固定 SDK 的 iterator `return()` 不会唤醒已经等待中的 `next()`，反向顺序会死锁。
+不结束时永久卡住 handle disposal。所有已启动 pump 的清理路径（包括 Terminal prune 和 startup
+handoff）必须先 unsubscribe，再关闭 iterator；固定 SDK 的 iterator `return()` 会先 detach
+cursor 且不会唤醒已经等待中的 `next()`，反向顺序会永久死锁。pump settlement 另有硬上限，
+超时在 connection/Host shutdown 后显式失败。exact Host-authoritative terminal 会在 history
+preparation 前停止 cancellation timer；provisional never-ready 或 detach 失败会 dispose orphan
+并在 cleanup 报错，但不会把 Host-confirmed cancelled/error 改写成 failure/cancel-timeout。
 VS Code 1.135 在有真实 summary 时可能对带 schema-optional `limit` 的 `listSessions` 返回
 `-32603`；scanner 仅在这个精确错误上省略 `limit` 重试，cursor/page/cycle 上限保持不变。
 

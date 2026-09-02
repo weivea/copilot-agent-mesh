@@ -109,18 +109,24 @@ socket, and user-data paths never enter the ViewModel.
 Delegated Sessions use the exact target Workspace URI, publish no child Mesh tools,
 and receive the acknowledged title
 `Mesh · <safe source window name> → <safe bounded task summary>`. A rejected title
-removes the provisional Session. An authoritative editor-host terminal action must
-match the dispatched turn ID. If its Session is still provisional, the runtime waits
-up to 10 seconds for the exact Session's protocol-defined `session/ready` materialization
-transition. Before publishing that terminal Mesh event, it then unsubscribes the Session
-channel after dispatching its own AHP `session/activeClientRemoved` action and receiving
-the authoritative Host echo, so VS Code removes the delegated active client and tools.
+removes the provisional Session. An authoritative editor-host terminal action must match the dispatched turn ID.
+Any exact Host-authoritative terminal clears an outstanding cancellation-confirmation timer
+immediately before optional history preparation. If the Session is still provisional,
+preparation waits up to 10 seconds for the exact Session's
+protocol-defined `session/ready` transition. It then dispatches its own AHP
+`session/activeClientRemoved` action, receives the authoritative Host echo, and unsubscribes
+the Session channel so VS Code removes the delegated active client and tools. Cancellation
+or error is then published with the Host-confirmed semantic even if preparation failed;
+handle cleanup disposes that orphan and surfaces the retention failure without rewriting
+confirmed cancelled/failed into another terminal semantic.
 VS Code 1.135.0 can keep returning an empty `listSessions` catalog on that same client
 until the connection itself is gone, so same-handle catalog visibility is not a valid
 runtime readiness precondition.
-Cleanup unsubscribes remaining channels before closing their iterators and settling
-subscription pumps because the pinned SDK's iterator `return()` does not wake an
-already parked `next()`. It then closes the client connection, socket, and timers
+Every pumped-subscription removal, including startup handoff and Terminal pruning,
+unsubscribes before closing its iterator because the pinned SDK's iterator `return()`
+detaches its cursor without waking an already parked `next()`. Pump settlement has a
+hard bound; timeout is reported as cleanup failure after connection/Host shutdown rather
+than hanging disposal. Cleanup then closes the client connection, socket, and timers
 without calling `disposeSession`, because that command removes the user-visible
 history. Connection shutdown allows a bounded graceful WebSocket close before forcing
 the local socket closed, so a Host that does not complete the close handshake cannot

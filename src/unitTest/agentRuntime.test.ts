@@ -74,6 +74,23 @@ const initializationOnlyResource = {
 	scopes_supported: ['agent:initialize'],
 };
 
+test('pinned SDK iterator return does not wake an already parked next', async () => {
+	const { AsyncBroadcastQueue } = await import(
+		'../../third_party/agent-host-protocol/clients/typescript/src/client/async-queue.js'
+	);
+	const queue = new AsyncBroadcastQueue<number>();
+	const reader = queue.reader();
+	let settled = false;
+	void reader.next().then(() => {
+		settled = true;
+	});
+
+	await reader.return!();
+	queue.close();
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(settled, false);
+});
+
 test('agent event queue stays within count and byte bounds and preserves terminal events under output pressure', async () => {
 	const queue = createAgentRuntimeEventQueue({ maxItems: 8, maxBytes: 512 });
 	for (let index = 0; index < 20_000; index += 1) {
@@ -1449,6 +1466,175 @@ test('terminal provisional Session waits for session/ready before leaving its ac
 	assert.equal(transport.disposeSessionCalls, 0);
 });
 
+test('authoritative cancellation remains cancelled when a provisional Session never materializes', async () => {
+	const catalog = new FakeAhpHostCatalog();
+	const transport = new FakeAhpTransport(catalog);
+	transport.sessionStartsProvisional = true;
+	const launcher = new FakeLauncher();
+	launcher.host.preserveTerminalSession = true;
+	const runtime = createRuntime(
+		launcher,
+		new FakeConnectionFactory([transport]),
+		undefined,
+		undefined,
+		undefined,
+		{
+			cancellationTimeoutMs: 15,
+			terminalSessionMaterializationTimeoutMs: 30,
+		},
+	);
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+
+	await handle.cancel();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	assert.equal((await nextEvent(handle.events)).type, 'cancelled');
+	await new Promise<void>((resolve) => setTimeout(resolve, 40));
+	await assert.rejects(
+		handle.dispose(),
+		(error: unknown) =>
+			error instanceof AgentRuntimeError
+			&& error.cleanupFailed
+			&& error.code !== 'TASK_CANCELLATION_UNCONFIRMED',
+	);
+	assert.equal(transport.disposeSessionCalls, 1);
+	assert.equal(catalog.session(transport.created!.sessionUri), undefined);
+	await handle.dispose();
+});
+
+test('authoritative error remains failed when a provisional Session never materializes', async () => {
+	const catalog = new FakeAhpHostCatalog();
+	const transport = new FakeAhpTransport(catalog);
+	transport.sessionStartsProvisional = true;
+	const launcher = new FakeLauncher();
+	launcher.host.preserveTerminalSession = true;
+	const runtime = createRuntime(
+		launcher,
+		new FakeConnectionFactory([transport]),
+		undefined,
+		undefined,
+		undefined,
+		{ terminalSessionMaterializationTimeoutMs: 20 },
+	);
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+
+	await transport.emitChat({
+		type: 'chat/error',
+		turnId: currentTurnId(transport),
+		duration: 0,
+		part: { kind: 'error', error: { message: 'Confirmed failure.' } },
+	});
+	const event = await nextEvent(handle.events);
+	assert.equal(event.type, 'failed');
+	if (event.type === 'failed') {
+		assert.equal(event.error.message, 'Confirmed failure.');
+	}
+	await new Promise<void>((resolve) => setTimeout(resolve, 30));
+	await assert.rejects(
+		handle.dispose(),
+		(error: unknown) => error instanceof AgentRuntimeError && error.cleanupFailed,
+	);
+	assert.equal(transport.disposeSessionCalls, 1);
+	await handle.dispose();
+});
+
+test('exact authoritative terminals clear cancellation confirmation before slow history detach', async () => {
+	for (const [terminal, expected] of [
+		['chat/turnCancelled', 'cancelled'],
+		['chat/error', 'failed'],
+		['chat/turnComplete', 'completed'],
+	] as const) {
+		const catalog = new FakeAhpHostCatalog();
+		const transport = new FakeAhpTransport(catalog);
+		const launcher = new FakeLauncher();
+		launcher.host.preserveTerminalSession = true;
+		const runtime = createRuntime(
+			launcher,
+			new FakeConnectionFactory([transport]),
+			undefined,
+			undefined,
+			undefined,
+			{ cancellationTimeoutMs: 20 },
+		);
+		const handle = await runtime.start(taskRequest());
+		await nextEvent(handle.events);
+		transport.ackDispatches = false;
+
+		await handle.cancel();
+		assert.equal((await nextEvent(handle.events)).type, 'progress');
+		await transport.emitChat(terminal === 'chat/error'
+			? {
+				type: terminal,
+				turnId: currentTurnId(transport),
+				duration: 0,
+				part: { kind: 'error', error: { message: 'Confirmed failure.' } },
+			}
+			: {
+				type: terminal,
+				turnId: currentTurnId(transport),
+				duration: 0,
+			});
+		await waitForCondition(() =>
+			transport.dispatched.some(({ action }) => action.type === 'session/activeClientRemoved'));
+		await new Promise<void>((resolve) => setTimeout(resolve, 40));
+		await transport.acknowledgeDispatch('session/activeClientRemoved');
+		assert.equal((await nextEvent(handle.events)).type, expected);
+
+		await handle.dispose();
+		assert.equal(transport.disposeSessionCalls, 0);
+		assert.equal(catalog.session(transport.created!.sessionUri)?.activeClientCount, 0);
+	}
+});
+
+test('disposing an authoritative cancellation during materialization wait removes the orphan', async () => {
+	const catalog = new FakeAhpHostCatalog();
+	const transport = new FakeAhpTransport(catalog);
+	transport.sessionStartsProvisional = true;
+	const launcher = new FakeLauncher();
+	launcher.host.preserveTerminalSession = true;
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+
+	await handle.cancel();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	await transport.emitChat({
+		type: 'chat/turnCancelled',
+		turnId: currentTurnId(transport),
+		duration: 0,
+	});
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	await handle.dispose();
+	assert.equal(transport.disposeSessionCalls, 1);
+	assert.equal(catalog.session(transport.created!.sessionUri), undefined);
+});
+
+test('disposing an authoritative cancellation during detach wait removes the orphan', async () => {
+	const catalog = new FakeAhpHostCatalog();
+	const transport = new FakeAhpTransport(catalog);
+	const launcher = new FakeLauncher();
+	launcher.host.preserveTerminalSession = true;
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+	transport.ackDispatches = false;
+
+	await handle.cancel();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	await transport.emitChat({
+		type: 'chat/turnCancelled',
+		turnId: currentTurnId(transport),
+		duration: 0,
+	});
+	await waitForCondition(() =>
+		transport.dispatched.some(({ action }) => action.type === 'session/activeClientRemoved'));
+
+	await handle.dispose();
+	assert.equal(transport.disposeSessionCalls, 1);
+	assert.equal(catalog.session(transport.created!.sessionUri), undefined);
+});
+
 test('AHP 0.8 creationFailed Session snapshots fail with the reported error', async () => {
 	const transport = new FakeAhpTransport();
 	transport.sessionCreationFailed = true;
@@ -1651,6 +1837,7 @@ test('startup follows a changed default Chat when recovery occurs during Chat su
 
 	const handle = await started;
 	assert.equal(recovered.unsubscribedUris.includes('ahp-chat:/default'), true);
+	assertCleanupOrder(recovered, 'ahp-chat:/default');
 	assert.equal(recovered.subscribedUris.includes('ahp-chat:/recovered'), true);
 	assert.equal(recovered.dispatched[0]?.channel, 'ahp-chat:/recovered');
 	await handle.dispose();
@@ -2207,6 +2394,7 @@ test('intentional terminal removal does not trigger connection recovery', async 
 
 	transport.emitRootAction({ type: 'root/terminalsChanged', terminals: [] });
 	await waitForCondition(() => transport.unsubscribedUris.includes('ahp-terminal:/temporary'));
+	assertCleanupOrder(transport, 'ahp-terminal:/temporary');
 	assert.equal(connections.connectCalls, 1);
 	await handle.dispose();
 });
@@ -2312,7 +2500,47 @@ test('dispose cancels and awaits terminal subscription updates and cleans a late
 	transport.releaseSubscribe('ahp-terminal:/late');
 	await disposal;
 	assert.equal(transport.unsubscribedUris.includes('ahp-terminal:/late'), true);
+	assertCleanupOrder(transport, 'ahp-terminal:/late');
 	assert.equal(launcher.host.disposed, true);
+});
+
+test('dispose fails promptly and closes the connection when a subscription pump cannot settle', async () => {
+	const transport = new FakeAhpTransport();
+	const launcher = new FakeLauncher();
+	launcher.host.preserveTerminalSession = true;
+	const lifecycle: AgentRuntimeLifecycleObservation[] = [];
+	const runtime = createRuntime(
+		launcher,
+		new FakeConnectionFactory([transport]),
+		undefined,
+		undefined,
+		{ observeLifecycle: (observation) => lifecycle.push(observation) },
+		{ subscriptionPumpSettleTimeoutMs: 20 },
+	);
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+	await transport.emitChat({
+		type: 'chat/turnComplete',
+		turnId: currentTurnId(transport),
+		duration: 0,
+	});
+	assert.equal((await nextEvent(handle.events)).type, 'completed');
+	transport.unsubscribeDoesNotWake.add('ahp-chat:/default');
+
+	const startedAt = Date.now();
+	await assert.rejects(
+		handle.dispose(),
+		(error: unknown) =>
+			error instanceof AgentRuntimeError
+			&& error.cleanupFailed
+			&& /subscription pumps/u.test(error.message),
+	);
+	assert.ok(Date.now() - startedAt < 500);
+	assert.equal(transport.shutdownCalls, 1);
+	assert.equal(launcher.host.disposed, true);
+	await handle.dispose();
+	assert.equal(lifecycle.some(({ eventType }) => eventType === 'session/subscriptionPumpsSettled'), false);
+	assert.equal(lifecycle.some(({ eventType }) => eventType === 'session/clientDetached'), false);
 });
 
 test('runtime disposal can be retried after cleanup failure and retains task ownership', async () => {
@@ -3072,6 +3300,11 @@ function createRuntime(
 		authBroker: AuthBroker = new RecordingAuthBroker(),
 		delegatedToolInvocations?: DelegatedToolInvocationRegistry,
 		lifecycleObserver?: AgentRuntimeLifecycleObserver,
+		timeouts?: {
+			readonly cancellationTimeoutMs?: number;
+			readonly terminalSessionMaterializationTimeoutMs?: number;
+			readonly subscriptionPumpSettleTimeoutMs?: number;
+		},
 ): AhpAgentRuntime {
 		return new AhpAgentRuntime({
 			enabled: () => true,
@@ -3081,7 +3314,9 @@ function createRuntime(
 		confirmation: { confirm: async () => 'once' },
 		workspaceResolver: trustedWorkspaceResolver(),
 		configResolver: { resolve: async () => ({ model: 'test-model' }) },
-		cancellationTimeoutMs: 100,
+		cancellationTimeoutMs: timeouts?.cancellationTimeoutMs ?? 100,
+		terminalSessionMaterializationTimeoutMs: timeouts?.terminalSessionMaterializationTimeoutMs,
+		subscriptionPumpSettleTimeoutMs: timeouts?.subscriptionPumpSettleTimeoutMs,
 		delegatedToolInvocations,
 		lifecycleObserver,
 	});
@@ -3468,6 +3703,8 @@ class FakeAhpTransport implements AhpConnection {
 	readonly subscribedUris: string[] = [];
 	readonly completionQueries: string[] = [];
 	readonly unsubscribedUris: string[] = [];
+	readonly cleanupOperations: string[] = [];
+	readonly unsubscribeDoesNotWake = new Set<string>();
 	private readonly attachedUris = new Set<string>();
 	private readonly queues = new Map<string, FakeSubscription>();
 	private reconnectRelease: (() => void) | undefined;
@@ -3798,7 +4035,10 @@ class FakeAhpTransport implements AhpConnection {
 			throw new Error('synthetic unsubscribe failure');
 		}
 		this.unsubscribedUris.push(uri);
-		this.queue(uri).finish();
+		this.cleanupOperations.push(`unsubscribe:${uri}`);
+		if (!this.unsubscribeDoesNotWake.has(uri)) {
+			this.queue(uri).finish();
+		}
 	}
 
 	async disposeSession(uri: string): Promise<void> {
@@ -3843,6 +4083,15 @@ class FakeAhpTransport implements AhpConnection {
 		return this.emit('ahp-root://', action);
 	}
 
+	acknowledgeDispatch(type: string): Promise<boolean> {
+		const dispatched = [...this.dispatched].reverse().find(({ action }) => action.type === type);
+		assert.ok(dispatched, `Expected a dispatched ${type} action.`);
+		return this.emit(dispatched.channel, dispatched.action, {
+			clientId: this.initializedClientId,
+			clientSeq: dispatched.clientSeq,
+		});
+	}
+
 	failChat(): void {
 		this.queue('ahp-chat:/default').fail(new Error('transport closed'));
 	}
@@ -3870,7 +4119,9 @@ class FakeAhpTransport implements AhpConnection {
 	private queue(uri: string): FakeSubscription {
 		let queue = this.queues.get(uri);
 		if (queue === undefined) {
-			queue = new FakeSubscription();
+			queue = new FakeSubscription(() => {
+				this.cleanupOperations.push(`close:${uri}`);
+			});
 			this.queues.set(uri, queue);
 		}
 		return queue;
@@ -3887,19 +4138,23 @@ function currentTurnId(transport: FakeAhpTransport): string {
 
 class FakeSubscription implements AhpSubscription {
 	private readonly values: AhpSubscriptionEvent[] = [];
-	private readonly waiters: Array<{
+	private waiter: {
 		resolve: (result: IteratorResult<AhpSubscriptionEvent>) => void;
 		reject: (error: Error) => void;
-	}> = [];
+	} | undefined;
 	private failure: Error | undefined;
 	private closed = false;
+	private detached = false;
+
+	constructor(private readonly didClose: () => void) {}
 
 	push(event: AhpSubscriptionEvent): Promise<boolean> {
 		if (this.closed) {
 			return Promise.resolve(false);
 		}
-		const waiter = this.waiters.shift();
+		const waiter = this.waiter;
 		if (waiter !== undefined) {
+			this.waiter = undefined;
 			waiter.resolve({ done: false, value: event });
 		} else {
 			this.values.push(event);
@@ -3917,7 +4172,9 @@ class FakeSubscription implements AhpSubscription {
 			return;
 		}
 		this.closed = true;
-		for (const waiter of this.waiters.splice(0)) {
+		const waiter = this.waiter;
+		this.waiter = undefined;
+		if (waiter !== undefined && !this.detached) {
 			if (this.failure !== undefined) {
 				waiter.reject(this.failure);
 			} else {
@@ -3927,12 +4184,19 @@ class FakeSubscription implements AhpSubscription {
 	}
 
 	async close(): Promise<void> {
-		// The pinned SDK iterator return detaches without waking a parked next().
+		this.didClose();
+		this.detached = true;
+		// Match the pinned SDK: return() detaches the cursor without resolving
+		// an already parked next().
+		this.waiter = undefined;
 	}
 
 	[Symbol.asyncIterator](): AsyncIterator<AhpSubscriptionEvent> {
 		return {
 			next: () => {
+				if (this.detached) {
+					return Promise.resolve({ done: true, value: undefined });
+				}
 				const value = this.values.shift();
 				if (value !== undefined) {
 					return Promise.resolve({ done: false, value });
@@ -3944,11 +4208,19 @@ class FakeSubscription implements AhpSubscription {
 					return Promise.resolve({ done: true, value: undefined });
 				}
 				return new Promise<IteratorResult<AhpSubscriptionEvent>>((resolve, reject) => {
-					this.waiters.push({ resolve, reject });
+					this.waiter = { resolve, reject };
 				});
 			},
 		};
 	}
+}
+
+function assertCleanupOrder(transport: FakeAhpTransport, uri: string): void {
+	const unsubscribe = transport.cleanupOperations.indexOf(`unsubscribe:${uri}`);
+	const close = transport.cleanupOperations.indexOf(`close:${uri}`);
+	assert.notEqual(unsubscribe, -1, `Expected ${uri} to be unsubscribed.`);
+	assert.notEqual(close, -1, `Expected ${uri} iterator to be closed.`);
+	assert.ok(unsubscribe < close, `Expected ${uri} unsubscribe before iterator close.`);
 }
 
 function envelope(
