@@ -69,15 +69,25 @@ passing confirmation evidence.
 
 The harness prints one exact `#meshListWorkers` / `#meshDelegateTask` prompt. In
 the named source window, submit it in Copilot Agent mode and click **Continue**
-exactly once. After checking the target Chat Sessions list, record only the two
-boolean observations with the printed command:
+exactly once. Do not attest Session visibility yet. The harness first observes the
+same Tool invocation's terminal result, then waits for objective
+`session/clientDetached` cleanup from the original task handle and performs a fresh
+independent Session-catalog probe.
+
+Only after those phases complete does the harness print
+`manualPostDetachObservationRequired` with a challenge-bound command and open a
+five-minute observation window. Check the target Chat Sessions list at that point,
+then record only the two boolean observations with that exact printed command:
 
 ```sh
-node scripts/e2e/peer-delegation/attest.mjs <run-id> confirmation-once session-visible
+node scripts/e2e/peer-delegation/attest.mjs <run-id> confirmation-once session-visible <post-detach-challenge>
 ```
 
-Use `session-not-visible` when that is the observed result. Without this phase,
-AC-5 item 5 and UI visibility remain `unverified`, and the command exits nonzero.
+Use `session-not-visible` when that is the observed result. An attestation created
+before the post-detach prompt cannot match its challenge. If objective detach is not
+observed, the harness never solicits or accepts UI evidence as Pass. Without the
+post-detach phase, AC-5 item 5 and UI visibility remain `unverified`, and the
+command exits nonzero. Diagnostics-only `MANUAL_UI=0` behavior is unchanged.
 
 Sanitized JSON and a short summary are written to:
 

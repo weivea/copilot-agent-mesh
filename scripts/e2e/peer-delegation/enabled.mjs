@@ -59,6 +59,11 @@ const {
 const {
 	PeerDelegationProcessTracker,
 } = require(join(repositoryRoot, 'out/src/e2e/PeerDelegationProcessTracker.js'));
+const {
+	canRequestManualPostDetachObservation,
+	manualPostDetachObservationTimeoutMs,
+	waitForManualPostDetachAttestation,
+} = require(join(repositoryRoot, 'out/src/e2e/PeerDelegationManualEvidence.js'));
 
 class E2eRequestError extends Error {
 	constructor(action, code, message) {
@@ -1173,9 +1178,12 @@ async function recordCompletionScenario({
 			.filter((observation) => observation.taskId === completionTaskId)
 			.map((observation) => observation.eventType),
 	}));
-	const catalogAfter = clientDetachedObserved
-		? await request(target, 'peer.session.catalog', {}, 60_000)
-		: { available: false, source: 'editor' };
+	let catalogProbeCompleted = false;
+	let catalogAfter = { available: false, source: 'editor' };
+	if (clientDetachedObserved) {
+		catalogAfter = await request(target, 'peer.session.catalog', {}, 60_000);
+		catalogProbeCompleted = true;
+	}
 	console.log(JSON.stringify({
 		type: 'sanitized-agent-host-catalog',
 		available: catalogAfter.available === true,
@@ -1183,6 +1191,27 @@ async function recordCompletionScenario({
 		...(catalogAfter.errorKind === undefined ? {} : { kind: catalogAfter.errorKind }),
 		...(catalogAfter.rpcCode === undefined ? {} : { rpcCode: catalogAfter.rpcCode }),
 	}));
+	let uiAttestation = completionRun.uiAttestation ?? {
+		confirmationAcceptedOnce: false,
+		targetSessionVisible: false,
+	};
+	if (canRequestManualPostDetachObservation(
+		manualUi,
+		clientDetachedObserved,
+		catalogProbeCompleted,
+	)) {
+		const postDetachChallenge = randomUUID();
+		console.log(JSON.stringify({
+			manualPostDetachObservationRequired: true,
+			runId,
+			sourceWindowLabel,
+			targetWindowLabel,
+			observationWindowSeconds: manualPostDetachObservationTimeoutMs / 1_000,
+			attestationCommand:
+				`node scripts/e2e/peer-delegation/attest.mjs ${runId} confirmation-once session-visible ${postDetachChallenge}`,
+		}));
+		uiAttestation = await readUiAttestation(postDetachChallenge);
+	}
 	if (catalogAfter.errorCode === 'EDITOR_CATALOG_CLEANUP_FAILED') {
 		const error = new Error('Editor Session catalog cleanup failed.');
 		error.code = 'EDITOR_CATALOG_CLEANUP_FAILED';
@@ -1224,7 +1253,15 @@ async function recordCompletionScenario({
 		&& sourceKind === 'editor'
 		&& !degraded
 		&& sourceFailure === undefined;
-	evidence.confirmation = completionRun.confirmation;
+	evidence.confirmation = manualUi
+		? {
+			status: uiAttestation.confirmationAcceptedOnce ? 'pass' : 'unverified',
+			preparedCount: completionRun.confirmationObservation.preparedCount,
+			acceptedCount: completionRun.confirmationObservation.acceptedCount,
+			source: 'copilot-ui',
+			operatorAttested: uiAttestation.confirmationAcceptedOnce,
+		}
+		: completionRun.confirmation;
 	evidence.completion = {
 		status: completionPass ? 'pass' : 'unverified',
 		taskId: completionTaskId,
@@ -1282,7 +1319,7 @@ async function recordCompletionScenario({
 		? ['#/completion/source', '#/sessionVisibility/hostSessionEchoObserved']
 		: []);
 
-	const uiObserved = completionRun.uiAttestation?.targetSessionVisible === true;
+	const uiObserved = uiAttestation.targetSessionVisible === true;
 	evidence.sessionVisibility = {
 		status: editorSessionObserved && catalogSessionHashMatched && uiObserved
 			? 'pass'
@@ -1391,7 +1428,6 @@ async function waitForManualCompletion(source, targetInputBase) {
 		sourceWindowLabel,
 		targetWindowLabel,
 		prompt,
-		attestationCommand: `node scripts/e2e/peer-delegation/attest.mjs ${runId} confirmation-once session-visible`,
 	}));
 	const deadline = Date.now() + 15 * 60_000;
 	while (Date.now() < deadline) {
@@ -1401,17 +1437,18 @@ async function waitForManualCompletion(source, targetInputBase) {
 		);
 		const preparedCount = matching.filter(({ phase }) => phase === 'prepared').length;
 		const acceptedCount = matching.filter(({ phase }) => phase === 'invokeStarted').length;
-		const completed = matching.find(({ phase }) => phase === 'invokeCompleted');
-		if (completed !== undefined) {
+		const completedObservations = matching.filter(({ phase }) => phase === 'invokeCompleted');
+		if (completedObservations.length > 0) {
+			const completed = completedObservations[0];
 			if (
 				preparedCount !== 1
 				|| acceptedCount !== 1
+				|| completedObservations.length !== 1
 				|| completed.compactStatus !== 0
 				|| typeof completed.taskId !== 'string'
 			) {
 				throw new Error('The manual Copilot Tool route did not produce one confirmed completion.');
 			}
-			const uiAttestation = await readUiAttestation();
 			return {
 				result: {
 					s: completed.compactStatus,
@@ -1424,14 +1461,10 @@ async function waitForManualCompletion(source, targetInputBase) {
 					resultHash: completed.resultHash,
 				},
 				invocationSource: 'copilot-ui',
-				confirmation: {
-					status: uiAttestation.confirmationAcceptedOnce ? 'pass' : 'unverified',
+				confirmationObservation: {
 					preparedCount,
 					acceptedCount,
-					source: 'copilot-ui',
-					operatorAttested: uiAttestation.confirmationAcceptedOnce,
 				},
-				uiAttestation,
 			};
 		}
 		await delay(250);
@@ -1595,31 +1628,24 @@ async function waitForTaskTerminal(source, taskId, timeoutMs) {
 	throw new Error(`Task ${taskId} did not become terminal.`);
 }
 
-async function readUiAttestation() {
-	const deadline = Date.now() + 5 * 60_000;
-	while (Date.now() < deadline) {
-		try {
-			await revalidateEvidenceDestination([basename(attestationPath)]);
-			const value = JSON.parse(await readFile(attestationPath, 'utf8'));
-			if (
-				value.schemaVersion === 1
-				&& value.runId === runId
-				&& typeof value.confirmationAcceptedOnce === 'boolean'
-				&& typeof value.targetSessionVisible === 'boolean'
-			) {
-				return {
-					confirmationAcceptedOnce: value.confirmationAcceptedOnce,
-					targetSessionVisible: value.targetSessionVisible,
-				};
+async function readUiAttestation(postDetachChallenge) {
+	const attestation = await waitForManualPostDetachAttestation({
+		runId,
+		challenge: postDetachChallenge,
+		read: async () => {
+			try {
+				await revalidateEvidenceDestination([basename(attestationPath)]);
+				return JSON.parse(await readFile(attestationPath, 'utf8'));
+			} catch (error) {
+				if (error?.code !== 'ENOENT') {
+					throw error;
+				}
+				return undefined;
 			}
-		} catch (error) {
-			if (error?.code !== 'ENOENT') {
-				throw error;
-			}
-		}
-		await delay(250);
-	}
-	return {
+		},
+		delay,
+	});
+	return attestation ?? {
 		confirmationAcceptedOnce: false,
 		targetSessionVisible: false,
 	};
