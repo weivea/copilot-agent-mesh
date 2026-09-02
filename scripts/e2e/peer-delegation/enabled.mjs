@@ -1181,6 +1181,7 @@ async function recordCompletionScenario({
 		available: catalogAfter.available === true,
 		...(catalogAfter.errorStage === undefined ? {} : { stage: catalogAfter.errorStage }),
 		...(catalogAfter.errorKind === undefined ? {} : { kind: catalogAfter.errorKind }),
+		...(catalogAfter.rpcCode === undefined ? {} : { rpcCode: catalogAfter.rpcCode }),
 	}));
 	if (catalogAfter.errorCode === 'EDITOR_CATALOG_CLEANUP_FAILED') {
 		const error = new Error('Editor Session catalog cleanup failed.');

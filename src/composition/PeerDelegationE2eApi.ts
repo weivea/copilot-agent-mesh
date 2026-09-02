@@ -460,6 +460,7 @@ async function editorSessionCatalog(
 			readonly errorCode: 'EDITOR_CATALOG_UNAVAILABLE';
 			readonly errorStage: 'launch' | 'connect' | 'initialize' | 'list';
 			readonly errorKind: 'protocol' | 'timeout' | 'transport' | 'closed' | 'other';
+			readonly rpcCode?: number;
 		};
 	let stage: 'launch' | 'connect' | 'initialize' | 'list' = 'launch';
 	try {
@@ -485,6 +486,13 @@ async function editorSessionCatalog(
 		};
 	} catch (error: unknown) {
 		const errorName = error instanceof Error ? error.name : '';
+		const rpcCode = typeof error === 'object'
+			&& error !== null
+			&& 'code' in error
+			&& typeof error.code === 'number'
+			&& Number.isSafeInteger(error.code)
+			? error.code
+			: undefined;
 		result = {
 			available: false,
 			source: 'editor',
@@ -499,6 +507,7 @@ async function editorSessionCatalog(
 						: errorName.includes('Closed')
 							? 'closed'
 							: 'other',
+			...(rpcCode === undefined ? {} : { rpcCode }),
 		};
 	}
 	const cleanup = await Promise.allSettled([
