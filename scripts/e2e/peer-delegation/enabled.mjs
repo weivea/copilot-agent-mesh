@@ -1108,7 +1108,11 @@ async function recordCompletionScenario({
 	const completionTask = await request(source, 'peer.task.evidence', {
 		taskId: completionTaskId,
 	});
-	const completionObservations = await request(target, 'peer.observations');
+	const completionObservations = await waitForTaskClientDetach(
+		target,
+		completionTaskId,
+		60_000,
+	);
 	const turnCompleteObserved = completionObservations.ahp.some(
 		(observation) =>
 			observation.taskId === completionTaskId
@@ -1158,7 +1162,14 @@ async function recordCompletionScenario({
 				: {}),
 		}
 		: undefined;
-	const catalogAfter = await request(target, 'peer.session.catalog', {}, 60_000);
+	const clientDetachedObserved = completionObservations.ahp.some(
+		(observation) =>
+			observation.taskId === completionTaskId
+			&& observation.eventType === 'session/clientDetached',
+	);
+	const catalogAfter = clientDetachedObserved
+		? await request(target, 'peer.session.catalog', {}, 60_000)
+		: { available: false, source: 'editor' };
 	if (catalogAfter.errorCode === 'EDITOR_CATALOG_CLEANUP_FAILED') {
 		const error = new Error('Editor Session catalog cleanup failed.');
 		error.code = 'EDITOR_CATALOG_CLEANUP_FAILED';
@@ -1269,6 +1280,8 @@ async function recordCompletionScenario({
 		...(hostSessionHash === undefined ? {} : { hostSessionHash }),
 		...(editorEndpointFingerprint === undefined ? {} : { editorEndpointFingerprint }),
 		hostSessionEchoObserved,
+		clientDetachedObserved,
+		catalogAfterTerminalCleanup: clientDetachedObserved && catalogAfter.available === true,
 		catalogSessionHashMatched,
 		uiObserved,
 	};
@@ -1332,6 +1345,21 @@ async function runProgrammaticCoreCompletion(source, targetInputBase) {
 			targetSessionVisible: false,
 		},
 	};
+}
+
+async function waitForTaskClientDetach(controller, taskId, timeoutMs) {
+	const deadline = Date.now() + timeoutMs;
+	let latest = await request(controller, 'peer.observations');
+	while (
+		!latest.ahp.some((observation) =>
+			observation.taskId === taskId
+			&& observation.eventType === 'session/clientDetached')
+		&& Date.now() < deadline
+	) {
+		await delay(50);
+		latest = await request(controller, 'peer.observations');
+	}
+	return latest;
 }
 
 async function waitForManualCompletion(source, targetInputBase) {
@@ -2472,6 +2500,8 @@ function initialEvidence() {
 			catalogBefore: 0,
 			catalogAfter: 0,
 			hostSessionEchoObserved: false,
+			clientDetachedObserved: false,
+			catalogAfterTerminalCleanup: false,
 			catalogSessionHashMatched: false,
 			uiObserved: false,
 		},

@@ -109,9 +109,19 @@ socket, and user-data paths never enter the ViewModel.
 Delegated Sessions use the exact target Workspace URI, publish no child Mesh tools,
 and receive the acknowledged title
 `Mesh · <safe source window name> → <safe bounded task summary>`. A rejected title
-removes the provisional Session. After an authoritative editor-host turn terminal,
-cleanup closes subscriptions, client connection, socket, and timers but does not call
-`disposeSession`, because that command removes the user-visible history. Standalone
+removes the provisional Session. An authoritative editor-host terminal action must
+match the dispatched turn ID. Before publishing that terminal Mesh event, the runtime
+waits up to 10 seconds for a cursor-paginated `listSessions` scan containing the same
+Session with Idle/Error activity, no InProgress bit, and no Archived bit. The scan
+uses bounded page/cursor limits with cycle detection, and disposal aborts both the
+request wait and polling timer before subscription cleanup. This bounded
+materialization barrier prevents VS Code 1.135.0 from garbage-collecting a provisional
+Session whose Chat response and terminal action arrived before provider catalog
+metadata. Cleanup then closes subscriptions, client connection, socket, and timers
+without calling `disposeSession`, because that command removes the user-visible
+history. Session unsubscribe remains the protocol-defined Host boundary for removing
+the active client and its tools/customizations; Mesh does not modify read state.
+Missing/nonterminal catalog state fails closed and disposes the orphan. Standalone
 cleanup continues to dispose the Session and owned Host.
 
 Mapped events enter a queue bounded by both serialized UTF-8 bytes and event
@@ -130,8 +140,9 @@ percent-encoded forms and are removed after the final borrowing task disposes.
 
 The P8 real harness may install a non-throwing, E2E-capability-only lifecycle
 observer. It records only the task UUID and one of
-`chat/turnComplete`/`chat/turnCancelled`/`chat/error`, allowing evidence to
-distinguish the authoritative AHP action from the persisted Mesh terminal state.
+`chat/turnComplete`/`chat/turnCancelled`/`chat/error`/`session/clientDetached`,
+allowing evidence to distinguish the authoritative AHP action, persisted Mesh
+terminal state, and successful original-handle detach.
 It never records an envelope, prompt, output, URI, endpoint, or token, and no
 observer exists in production extension mode.
 
@@ -230,11 +241,14 @@ and a fingerprinted editor endpoint. Equality with a recovery descriptor that
 uses the same locally generated Session URI is not treated as an independent
 cross-check. If the Host never echoes the Session, AC-5.9 remains Unverified
 even when the task otherwise completes. A separate bounded post-task `listSessions`
-observation remains O1 catalog evidence; it does not open and close a pre-task
-catalog client because that borrowed-client lifecycle can perturb editor
-identity readiness. Only fingerprints and counts leave the Extension Host. A
-standalone fallback can demonstrate degraded execution but can never satisfy
-the editor Session claim.
+observation remains O1 catalog evidence. It opens a new editor connection only after
+the original handle emits `session/clientDetached` following successful subscription
+and connection cleanup, then hashes only terminal, non-archived entries. This proves the Session
+survived client detach/reconnect rather than merely existing in the completing
+connection. It does not open and close a pre-task catalog client because that
+borrowed-client lifecycle can perturb editor identity readiness. Only fingerprints
+and counts leave the Extension Host. A standalone fallback can demonstrate degraded
+execution but can never satisfy the editor Session claim.
 
 ## Verified result
 

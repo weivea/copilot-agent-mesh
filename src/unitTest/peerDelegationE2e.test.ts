@@ -186,6 +186,22 @@ test('peer-delegation passing evidence requires all real AC-5 conditions', () =>
 	assert.throws(
 		() => parsePeerDelegationEvidence({
 			...evidence,
+			sessionVisibility: {
+				...evidence.sessionVisibility,
+				status: 'pass',
+				clientDetachedObserved: true,
+				catalogAfterTerminalCleanup: false,
+				uiObserved: true,
+			},
+			experiments: evidence.experiments.map((experiment) => experiment.id === 'O1'
+				? { ...experiment, status: 'pass' as const, conclusion: 'editor-session-visible' as const }
+				: experiment),
+		}),
+		/Passing O1 evidence requires editor catalog and objective UI observation/u,
+	);
+	assert.throws(
+		() => parsePeerDelegationEvidence({
+			...evidence,
 			cleanup: {
 				...evidence.cleanup,
 				status: 'unverified',
@@ -243,6 +259,7 @@ test('peer-delegation recorder stores identities and hashes without prompt or ou
 		endpointFingerprint: '0123456789abcdef',
 	});
 	recorder.observeLifecycle({ taskId, eventType: 'chat/turnComplete' });
+	recorder.observeLifecycle({ taskId, eventType: 'session/clientDetached' });
 	const snapshot = recorder.snapshot();
 	assert.equal(snapshot.tools.length, 1);
 	assert.equal(snapshot.tools[0]?.taskId, taskId);
@@ -266,6 +283,12 @@ test('peer-delegation recorder stores identities and hashes without prompt or ou
 			at: snapshot.ahp[1]?.at,
 			taskId,
 			eventType: 'chat/turnComplete',
+		},
+		{
+			sequence: 4,
+			at: snapshot.ahp[2]?.at,
+			taskId,
+			eventType: 'session/clientDetached',
 		},
 	]);
 	assert.match(snapshot.ahp[0]?.sessionHash ?? '', /^[a-f0-9]{16}$/u);
@@ -500,6 +523,8 @@ function unverifiedEvidence(): PeerDelegationEvidence {
 			catalogBefore: 0,
 			catalogAfter: 0,
 			hostSessionEchoObserved: false,
+			clientDetachedObserved: false,
+			catalogAfterTerminalCleanup: false,
 			catalogSessionHashMatched: false,
 			uiObserved: false,
 		},
@@ -695,6 +720,8 @@ function passingEvidence(): PeerDelegationEvidence {
 			hostSessionHash: '0123456789abcdef',
 			editorEndpointFingerprint: 'fedcba9876543210',
 			hostSessionEchoObserved: true,
+			clientDetachedObserved: true,
+			catalogAfterTerminalCleanup: true,
 			catalogSessionHashMatched: true,
 			uiObserved: false,
 		},

@@ -293,8 +293,21 @@ P8 已实现可重复的两个普通窗口 Harness。它在窗口启动后用相
 observer 只记录 Host 在 subscribed Session snapshot 或 Session-channel action 中回显的
 created Session channel 事实及 Session/source/endpoint domain-separated 截断 Hash，作为
 AC-5.9 的客观 runtime 证据。与 recovery 共用同一本地 URI 的 hash 相等不算独立证据。另有 bounded
-post-task `listSessions` 只服务 O1 catalog/UI 可见性判断。任何路径都不保存 resource URI、
-socket 路径或 token。
+post-task `listSessions` 只服务 O1 catalog/UI 可见性判断；原始 task handle 只有在 subscription
+关闭、unsubscribe 与 AHP connection shutdown 成功后才记录 `session/clientDetached`，诊断收到
+该事件后才建立新连接，并且通过有页数上限、cursor 循环检测的分页扫描，只把 Idle/Error、
+非 InProgress、非 Archived 的 Session 纳入 hash 匹配。任何
+路径都不保存 resource URI、socket 路径或 token。
+
+VS Code 1.135.0 的 Host 会在 `createSession` 时先注册 Session，但 provider 可以返回
+provisional Session；`chat/turnComplete` 与 response 已可见时，provider 的
+`onDidMaterializeChat`/catalog metadata 仍可能尚未完成。此时立即 unsubscribe/disconnect
+会让 Chat Sessions UI 留在最后收到的 `Working…` 状态，并让未 materialize 的 draft 进入
+Host GC。仅跳过 `disposeSession` 因此不是 persistence proof。客户端现在只接受当前 `turnId`
+的终止 action，并在 detach 前有界等待 terminal/non-archived catalog entry；等待 RPC 与
+poll timer 均响应 task dispose，不会把清理拖到完整 deadline。unsubscribe
+仍是 Host-managed active-client/tool cleanup 的协议边界，read/archive metadata 不由 Mesh
+伪造。
 
 稳定 Extension API 不提供读取 Chat Sessions UI 或向内置 Copilot Agent 自动发送并确认
 消息的接口。P8 在 VS Code 1.135.0 观察到无 Chat context 的

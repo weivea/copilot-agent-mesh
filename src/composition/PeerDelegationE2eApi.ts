@@ -5,6 +5,8 @@ import type * as vscode from 'vscode';
 import {
 	AHP_PROTOCOL_OFFER,
 	SdkAhpConnectionFactory,
+	isUsableTerminalSessionStatus,
+	listSessionsBounded,
 	type AhpConnection,
 } from '../agentHost/AhpAgentRuntime';
 import type {
@@ -464,13 +466,14 @@ async function editorSessionCatalog(
 		if (!AHP_PROTOCOL_OFFER.includes(initialized.protocolVersion as '1.0.0')) {
 			throw new Error('The editor Agent Host selected an incompatible protocol.');
 		}
-		const sessions = await connection.listSessions(1);
+		const sessions = await listSessionsBounded(connection);
 		result = {
 			available: true,
 			source: 'editor',
 			protocolVersion: initialized.protocolVersion,
 			sessionCount: sessions.length,
 			sessionHashes: sessions
+				.filter(({ status }) => status !== undefined && isUsableTerminalSessionStatus(status))
 				.map(({ resource }) => fingerprint('agent-session', resource))
 				.sort(),
 		};

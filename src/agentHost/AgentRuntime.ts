@@ -77,7 +77,11 @@ export type AgentRuntimeLifecycleObservation =
 	}
 	| {
 		readonly taskId: string;
-		readonly eventType: 'chat/turnComplete' | 'chat/turnCancelled' | 'chat/error';
+		readonly eventType:
+			| 'chat/turnComplete'
+			| 'chat/turnCancelled'
+			| 'chat/error'
+			| 'session/clientDetached';
 	};
 
 export interface AgentRuntimeLifecycleObserver {
