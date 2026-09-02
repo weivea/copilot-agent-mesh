@@ -43,8 +43,6 @@ export const AHP_PROTOCOL_OFFER: readonly ['1.0.0'] = Object.freeze(['1.0.0']);
 const sessionDefaultChatTimeoutMs = 60_000;
 const cancellationTimeoutMs = 15_000;
 const titleAcknowledgementTimeoutMs = 10_000;
-const terminalSessionCatalogTimeoutMs = 10_000;
-const terminalSessionCatalogPollMs = 50;
 const sessionCatalogPageLimit = 200;
 const sessionCatalogMaxPages = 50;
 const sessionCatalogCursorMaxLength = 4_096;
@@ -161,7 +159,6 @@ export interface AhpAgentRuntimeOptions {
 	readonly workspaceResolver: WorkspaceResolver;
 	readonly configResolver?: SessionConfigurationResolver;
 	readonly cancellationTimeoutMs?: number;
-	readonly terminalSessionCatalogTimeoutMs?: number;
 	readonly delegatedToolInvocations?: DelegatedToolInvocationRegistry;
 	readonly lifecycleObserver?: AgentRuntimeLifecycleObserver;
 }
@@ -301,7 +298,6 @@ export class AhpAgentRuntime implements AgentRuntime {
 				this.options.authBroker,
 				this.options.configResolver ?? new DefaultSessionConfigurationResolver(),
 				this.options.cancellationTimeoutMs ?? cancellationTimeoutMs,
-				this.options.terminalSessionCatalogTimeoutMs ?? terminalSessionCatalogTimeoutMs,
 				this.options.delegatedToolInvocations,
 				this.options.lifecycleObserver,
 				() => this.tasks.delete(createdTask),
@@ -639,7 +635,7 @@ class AhpTask implements AgentTaskHandle {
 	private lastSeenServerSeq = 0;
 	private terminal = false;
 	private authoritativeTurnTerminal = false;
-	private terminalSessionCataloged = false;
+	private terminalSessionClientLeft = false;
 	private terminalClientDetachedObserved = false;
 	private disposed = false;
 	private recovering = false;
@@ -694,7 +690,6 @@ class AhpTask implements AgentTaskHandle {
 		private readonly authBroker: AuthBroker,
 		private readonly configResolver: SessionConfigurationResolver,
 		private readonly cancelTimeoutMs: number,
-		private readonly terminalCatalogTimeoutMs: number,
 		private readonly delegatedToolInvocations: DelegatedToolInvocationRegistry | undefined,
 		private readonly lifecycleObserver: AgentRuntimeLifecycleObserver | undefined,
 		private readonly didDispose: () => void,
@@ -1012,7 +1007,7 @@ class AhpTask implements AgentTaskHandle {
 		if (
 			!this.terminalClientDetachedObserved
 			&& this.authoritativeTurnTerminal
-			&& this.terminalSessionCataloged
+			&& this.terminalSessionClientLeft
 			&& this.host.preserveTerminalSession === true
 		) {
 			this.terminalClientDetachedObserved = true;
@@ -1496,55 +1491,14 @@ class AhpTask implements AgentTaskHandle {
 
 	private async prepareTerminalSessionHistory(connection = this.connection): Promise<void> {
 		if (
-			this.terminalSessionCataloged
+			this.terminalSessionClientLeft
 			|| this.host.preserveTerminalSession !== true
 		) {
 			return;
 		}
-		const deadline = Date.now() + this.terminalCatalogTimeoutMs;
-		const signal = this.terminalPreparationAbort.signal;
-		while (true) {
-			throwIfAborted(signal);
-			const remaining = deadline - Date.now();
-			if (remaining <= 0) {
-				break;
-			}
-			let session: AhpSessionSummary | undefined;
-			try {
-				session = await withAbortableTimeout(
-					async (scanSignal) => {
-						await this.detachTerminalSessionClient(connection, scanSignal);
-						return findSessionInCatalog(connection, this.sessionUri, scanSignal);
-					},
-					remaining,
-					'The editor Agent Host did not retain the terminal Session in its catalog.',
-					signal,
-				);
-			} catch (error) {
-				if (signal.aborted || error instanceof SessionCatalogPaginationError) {
-					throw error;
-				}
-				const retryDelay = Math.min(terminalSessionCatalogPollMs, deadline - Date.now());
-				if (retryDelay <= 0) {
-					break;
-				}
-				await abortableSleep(retryDelay, signal);
-				continue;
-			}
-			if (
-				session !== undefined
-				&& session.status !== undefined
-				&& isUsableTerminalSessionStatus(session.status)
-			) {
-				this.terminalSessionCataloged = true;
-				return;
-			}
-			await abortableSleep(Math.min(terminalSessionCatalogPollMs, remaining), signal);
-		}
-		throw new AgentRuntimeError(
-			'TASK_EXECUTION_FAILED',
-			'The editor Agent Host did not retain the terminal Session in its catalog.',
-			true,
+		await this.detachTerminalSessionClient(
+			connection,
+			this.terminalPreparationAbort.signal,
 		);
 	}
 
@@ -1567,6 +1521,7 @@ class AhpTask implements AgentTaskHandle {
 			() => {
 				this.terminalSessionUnsubscribedConnections.add(connection);
 				this.terminalSessionDepartingConnections.delete(connection);
+				this.terminalSessionClientLeft = true;
 			},
 			(error: unknown) => {
 				this.terminalSessionDepartingConnections.delete(connection);
@@ -2855,28 +2810,6 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: s
 	}
 }
 
-async function withAbortableTimeout<T>(
-	operation: (signal: AbortSignal) => Promise<T>,
-	timeoutMs: number,
-	message: string,
-	parentSignal: AbortSignal,
-): Promise<T> {
-	const timeout = new AbortController();
-	const timeoutError = new AgentRuntimeError('TASK_EXECUTION_FAILED', message, true);
-	const signal = AbortSignal.any([parentSignal, timeout.signal]);
-	const timer = setTimeout(() => timeout.abort(), timeoutMs);
-	try {
-		return await operation(signal);
-	} catch (error) {
-		if (timeout.signal.aborted && !parentSignal.aborted) {
-			throw timeoutError;
-		}
-		throw error;
-	} finally {
-		clearTimeout(timer);
-	}
-}
-
 async function findSessionInCatalog(
 	connection: AhpConnection,
 	resource: string,
@@ -2955,22 +2888,6 @@ export function isUsableTerminalSessionStatus(status: number): boolean {
 
 function sleep(timeoutMs: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, timeoutMs));
-}
-
-function abortableSleep(timeoutMs: number, signal: AbortSignal): Promise<void> {
-	throwIfAborted(signal);
-	return new Promise((resolve, reject) => {
-		const timer = setTimeout(() => {
-			signal.removeEventListener('abort', abort);
-			resolve();
-		}, timeoutMs);
-		const abort = () => {
-			clearTimeout(timer);
-			signal.removeEventListener('abort', abort);
-			reject(new RecoveryStoppedCause());
-		};
-		signal.addEventListener('abort', abort, { once: true });
-	});
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

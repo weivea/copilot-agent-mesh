@@ -16,6 +16,7 @@ import {
 	AHP_PROTOCOL_OFFER,
 	buildMeshSessionTitle,
 	DELEGATED_AGENT_CLIENT_TOOLS,
+	listSessionsBounded,
 	type AhpConnection,
 	type AhpConnectionFactory,
 	type AhpSubscription,
@@ -518,11 +519,11 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 	assert.equal(launcher.host.disposed, true);
 });
 
-	test('delegated runtime waits for terminal catalog materialization and preserves history after detach', async () => {
+	test('delegated runtime preserves history when the Host catalog appears only after disconnect', async () => {
 		const catalog = new FakeAhpHostCatalog();
 		const transport = new FakeAhpTransport(catalog);
 		transport.completeAfterTurnDispatch = true;
-		transport.catalogOmissionsRemaining = 1;
+		transport.hideCatalog = true;
 		const launcher = new FakeLauncher();
 		launcher.host.preserveTerminalSession = true;
 		const lifecycle: AgentRuntimeLifecycleObservation[] = [];
@@ -569,7 +570,7 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 		assert.equal(transport.disposeSessionCalls, 0);
 		assert.equal(transport.shutdownCalls, 1);
 		assert.equal(lifecycle.at(-1)?.eventType, 'session/clientDetached');
-		assert.equal(transport.listSessionsCalls, 2);
+		assert.equal(transport.listSessionsCalls, 0);
 		const sessionUri = transport.created!.sessionUri;
 		assert.deepEqual(catalog.session(sessionUri), {
 			status: 1,
@@ -585,91 +586,53 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 		await reconnected.shutdown();
 	});
 
-	test('delegated runtime finds its terminal Session beyond the first catalog page', async () => {
+	test('bounded Session catalog listing follows cursors beyond the first page', async () => {
 		const catalog = new FakeAhpHostCatalog();
 		catalog.addMaterialized('ahp-session:/older-1');
 		catalog.addMaterialized('ahp-session:/older-2');
+		catalog.addMaterialized('ahp-session:/older-3');
 		const transport = new FakeAhpTransport(catalog);
 		transport.catalogPageSize = 2;
-		transport.completeAfterTurnDispatch = true;
-		const launcher = new FakeLauncher();
-		launcher.host.preserveTerminalSession = true;
-		const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
-		const handle = await runtime.start({
-			...taskRequest(),
-			sourceWindowName: 'frontend',
-		});
-		for await (const _event of handle.events) {
-			// Drain through the terminal event.
-		}
+		await transport.initialize('catalog-reader');
 
+		assert.deepEqual(await listSessionsBounded(transport), [
+			{ resource: 'ahp-session:/older-1', status: 1 },
+			{ resource: 'ahp-session:/older-2', status: 1 },
+			{ resource: 'ahp-session:/older-3', status: 1 },
+		]);
 		assert.equal(transport.listSessionsCalls, 2);
-		await handle.dispose();
-		assert.equal(transport.disposeSessionCalls, 0);
 	});
 
-	test('delegated runtime rejects cyclic terminal catalog cursors and disposes the orphan', async () => {
+	test('bounded Session catalog listing rejects cyclic cursors', async () => {
 		const catalog = new FakeAhpHostCatalog();
 		catalog.addMaterialized('ahp-session:/older-1');
 		catalog.addMaterialized('ahp-session:/older-2');
 		const transport = new FakeAhpTransport(catalog);
-		transport.catalogPageSize = 2;
+		transport.catalogPageSize = 1;
 		transport.catalogCursorCycle = true;
-		const launcher = new FakeLauncher();
-		launcher.host.preserveTerminalSession = true;
-		const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
-		const handle = await runtime.start({
-			...taskRequest(),
-			sourceWindowName: 'frontend',
-		});
-		await nextEvent(handle.events);
-		await transport.emitChat({
-			type: 'chat/turnComplete',
-			turnId: currentTurnId(transport),
-			duration: 0,
-		});
+		await transport.initialize('catalog-reader');
 
-		const event = await nextEvent(handle.events);
-		assert.equal(event.type, 'failed');
-		if (event.type === 'failed') {
-			assert.equal(event.error.retryable, true);
-		}
+		await assert.rejects(listSessionsBounded(transport), /invalid Session catalog cursor/);
 		assert.equal(transport.listSessionsCalls, 2);
-		await handle.dispose();
-		assert.equal(transport.disposeSessionCalls, 1);
 	});
 
-	test('delegated runtime bounds terminal catalog pagination and disposes an unverified Session', async () => {
+	test('bounded Session catalog listing caps page requests', async () => {
 		const catalog = new FakeAhpHostCatalog();
-		for (let index = 0; index < 100; index += 1) {
+		for (let index = 0; index < 101; index += 1) {
 			catalog.addMaterialized(`ahp-session:/older-${index}`);
 		}
 		const transport = new FakeAhpTransport(catalog);
 		transport.catalogPageSize = 2;
-		const launcher = new FakeLauncher();
-		launcher.host.preserveTerminalSession = true;
-		const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
-		const handle = await runtime.start({
-			...taskRequest(),
-			sourceWindowName: 'frontend',
-		});
-		await nextEvent(handle.events);
-		await transport.emitChat({
-			type: 'chat/turnComplete',
-			turnId: currentTurnId(transport),
-			duration: 0,
-		});
+		await transport.initialize('catalog-reader');
 
-		const event = await nextEvent(handle.events);
-		assert.equal(event.type, 'failed');
+		await assert.rejects(listSessionsBounded(transport), /bounded pagination limit/);
 		assert.equal(transport.listSessionsCalls, 50);
-		await handle.dispose();
-		assert.equal(transport.disposeSessionCalls, 1);
 	});
 
-	test('disposing during terminal catalog polling aborts promptly without publishing a terminal', async () => {
+	test('disposing during terminal Session detach aborts promptly without publishing a terminal', async () => {
 		const catalog = new FakeAhpHostCatalog();
 		const transport = new FakeAhpTransport(catalog);
+		transport.blockNextSessionUnsubscribe = true;
 		const launcher = new FakeLauncher();
 		launcher.host.preserveTerminalSession = true;
 		const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
@@ -678,13 +641,12 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 			sourceWindowName: 'frontend',
 		});
 		await nextEvent(handle.events);
-		transport.blockCatalogReads = true;
 		void transport.emitChat({
 			type: 'chat/turnComplete',
 			turnId: currentTurnId(transport),
 			duration: 0,
 		});
-		await transport.catalogReadStarted;
+		await transport.sessionUnsubscribeStarted;
 
 		const startedAt = Date.now();
 		await handle.dispose();
@@ -695,11 +657,11 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 		assert.equal((await handle.events[Symbol.asyncIterator]().next()).done, true);
 	});
 
-	test('recovery during terminal catalog polling does not reattach the departed Session client', async () => {
+	test('recovery during terminal Session detach does not reattach the departing client', async () => {
 		const catalog = new FakeAhpHostCatalog();
 		const first = new FakeAhpTransport(catalog);
 		const recovered = new FakeAhpTransport(catalog);
-		first.blockCatalogReads = true;
+		first.blockNextSessionUnsubscribe = true;
 		const launcher = new FakeLauncher();
 		launcher.host.preserveTerminalSession = true;
 		const runtime = createRuntime(
@@ -716,7 +678,7 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 			turnId: currentTurnId(first),
 			duration: 0,
 		});
-		await first.catalogReadStarted;
+		await first.sessionUnsubscribeStarted;
 		first.failRoot();
 		await waitForCondition(() => recovered.reconnectRequests.length === 1);
 
@@ -729,29 +691,6 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 			false,
 		);
 		await handle.dispose();
-	});
-
-	test('delegated runtime retries a transient terminal catalog read failure', async () => {
-		const catalog = new FakeAhpHostCatalog();
-		const transport = new FakeAhpTransport(catalog);
-		transport.completeAfterTurnDispatch = true;
-		transport.catalogFailuresRemaining = 1;
-		const launcher = new FakeLauncher();
-		launcher.host.preserveTerminalSession = true;
-		const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
-		const handle = await runtime.start({
-			...taskRequest(),
-			sourceWindowName: 'frontend',
-		});
-		const events = [];
-		for await (const event of handle.events) {
-			events.push(event);
-		}
-
-		assert.equal(events.at(-1)?.type, 'completed');
-		assert.equal(transport.listSessionsCalls, 2);
-		await handle.dispose();
-		assert.equal(transport.disposeSessionCalls, 0);
 	});
 
 	test('delegated runtime ignores a terminal action for another turn', async () => {
@@ -869,28 +808,18 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 		assert.equal(lifecycle.at(-1)?.eventType, 'session/clientDetached');
 	});
 
-	test('missing terminal catalog entry fails closed and disposes the orphaned editor Session', async () => {
+	test('failed terminal Session detach fails closed and disposes the orphaned editor Session', async () => {
 		const catalog = new FakeAhpHostCatalog();
 		const transport = new FakeAhpTransport(catalog);
-		transport.catalogOmissionsRemaining = Number.MAX_SAFE_INTEGER;
 		const launcher = new FakeLauncher();
 		launcher.host.preserveTerminalSession = true;
-		const runtime = new AhpAgentRuntime({
-			enabled: () => true,
-			launcher,
-			connections: new FakeConnectionFactory([transport]),
-			authBroker: new RecordingAuthBroker(),
-			confirmation: { confirm: async () => 'once' },
-			workspaceResolver: trustedWorkspaceResolver(),
-			configResolver: { resolve: async () => ({ model: 'test-model' }) },
-			cancellationTimeoutMs: 100,
-			terminalSessionCatalogTimeoutMs: 5,
-		});
+		const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
 		const handle = await runtime.start({
 			...taskRequest(),
 			sourceWindowName: 'frontend',
 		});
 		await nextEvent(handle.events);
+		transport.unsubscribeFailures.set(transport.created!.sessionUri, 1);
 		await transport.emitChat({
 			type: 'chat/turnComplete',
 			turnId: currentTurnId(transport),
@@ -898,9 +827,6 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 		});
 		const event = await nextEvent(handle.events);
 		assert.equal(event.type, 'failed');
-		if (event.type === 'failed') {
-			assert.equal(event.error.retryable, true);
-		}
 
 		await handle.dispose();
 		assert.equal(transport.disposeSessionCalls, 1);
@@ -3326,10 +3252,11 @@ class FakeAhpTransport implements AhpConnection {
 	catalogFailuresRemaining = 0;
 	catalogPageSize = 200;
 	catalogCursorCycle = false;
-	blockCatalogReads = false;
-	private resolveCatalogReadStarted!: () => void;
-	readonly catalogReadStarted = new Promise<void>((resolve) => {
-		this.resolveCatalogReadStarted = resolve;
+	hideCatalog = false;
+	blockNextSessionUnsubscribe = false;
+	private resolveSessionUnsubscribeStarted!: () => void;
+	readonly sessionUnsubscribeStarted = new Promise<void>((resolve) => {
+		this.resolveSessionUnsubscribeStarted = resolve;
 	});
 	readonly unsubscribeFailures = new Map<string, number>();
 	failRootDuringConfig = false;
@@ -3590,10 +3517,6 @@ class FakeAhpTransport implements AhpConnection {
 	}> {
 		this.assertOpen();
 		this.listSessionsCalls += 1;
-		this.resolveCatalogReadStarted();
-		if (this.blockCatalogReads) {
-			await new Promise<void>(() => undefined);
-		}
 		if (this.catalogFailuresRemaining > 0) {
 			this.catalogFailuresRemaining -= 1;
 			throw new Error('synthetic catalog failure');
@@ -3602,7 +3525,9 @@ class FakeAhpTransport implements AhpConnection {
 			this.catalogOmissionsRemaining -= 1;
 			return { items: [] };
 		}
-		const sessions = this.hostCatalog !== undefined
+		const sessions = this.hideCatalog
+			? []
+			: this.hostCatalog !== undefined
 			? this.hostCatalog.list()
 			: this.created === undefined ? [] : [{ resource: this.created.sessionUri, status: 1 }];
 		const offset = cursor === undefined ? 0 : Number.parseInt(cursor, 10);
@@ -3654,6 +3579,12 @@ class FakeAhpTransport implements AhpConnection {
 
 	async unsubscribe(uri: string): Promise<void> {
 		this.assertOpen();
+		if (uri === this.created?.sessionUri && this.blockNextSessionUnsubscribe) {
+			this.blockNextSessionUnsubscribe = false;
+			this.queue(uri).finish();
+			this.resolveSessionUnsubscribeStarted();
+			await new Promise<void>(() => undefined);
+		}
 		const failures = this.unsubscribeFailures.get(uri) ?? 0;
 		if (failures > 0) {
 			this.unsubscribeFailures.set(uri, failures - 1);

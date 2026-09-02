@@ -304,11 +304,13 @@ provisional Session；`chat/turnComplete` 与 response 已可见时，provider �
 `onDidMaterializeChat`/catalog metadata 仍可能尚未完成。此时立即 unsubscribe/disconnect
 会让 Chat Sessions UI 留在最后收到的 `Working…` 状态，并让未 materialize 的 draft 进入
 Host GC。仅跳过 `disposeSession` 因此不是 persistence proof。客户端现在只接受当前 `turnId`
-的终止 action。真实诊断表明保持 Session subscription 时 catalog 仍为空；因此客户端先
-`unsubscribe(session)`，利用同一连接消息顺序让 Host 移除 active client，再通过仍打开的 root
-connection 有界等待 terminal/non-archived catalog entry。等待 RPC 与 poll timer 均响应 task
-dispose，不会把清理拖到完整 deadline。不会伪造 `session/activeClientRemoved`；unsubscribe
-仍是 Host-managed active-client/tool cleanup 的协议边界，read/archive metadata 不由 Mesh 伪造。
+的终止 action。两次真实诊断分别证明保持 Session subscription、以及只
+`unsubscribe(session)` 但保留同一连接时，catalog 都可能继续为空；因此同一 handle 的
+`listSessions` 不能作为 terminal readiness barrier。客户端在权威终止后先 unsubscribe Session
+以移除 active client，再发布终止并由正常 handle disposal 关闭其余订阅和连接。不会伪造
+`session/activeClientRemoved`；unsubscribe 仍是 Host-managed active-client/tool cleanup 的协议
+边界，read/archive metadata 不由 Mesh 伪造。只有 disposal 完成后，诊断才从新的独立连接进行
+有界分页，并要求 exact Session 为 Idle/Error、非 InProgress、非 Archived。
 
 稳定 Extension API 不提供读取 Chat Sessions UI 或向内置 Copilot Agent 自动发送并确认
 消息的接口。P8 在 VS Code 1.135.0 观察到无 Chat context 的
