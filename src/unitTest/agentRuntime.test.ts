@@ -605,6 +605,34 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 		assert.equal(transport.listSessionsCalls, 2);
 	});
 
+	test('bounded Session catalog listing omits optional limit after Host internal error', async () => {
+		const catalog = new FakeAhpHostCatalog();
+		catalog.addMaterialized('ahp-session:/retained');
+		const transport = new FakeAhpTransport(catalog);
+		transport.rejectCatalogLimit = true;
+		await transport.initialize('catalog-reader');
+
+		assert.deepEqual(await listSessionsBounded(transport), [
+			{ resource: 'ahp-session:/retained', status: 1 },
+		]);
+		assert.equal(transport.listSessionsCalls, 2);
+	});
+
+	test('bounded Session catalog listing rejects an oversized Host-selected page', async () => {
+		const catalog = new FakeAhpHostCatalog();
+		for (let index = 0; index <= 10_000; index += 1) {
+			catalog.addMaterialized(`ahp-session:/oversized-${index}`);
+		}
+		const transport = new FakeAhpTransport(catalog);
+		transport.rejectCatalogLimit = true;
+		transport.catalogPageSize = 10_001;
+		transport.catalogDefaultPageSize = 10_001;
+		await transport.initialize('catalog-reader');
+
+		await assert.rejects(listSessionsBounded(transport), /bounded entry limit/);
+		assert.equal(transport.listSessionsCalls, 2);
+	});
+
 	test('bounded Session catalog listing rejects cyclic cursors', async () => {
 		const catalog = new FakeAhpHostCatalog();
 		catalog.addMaterialized('ahp-session:/older-1');
@@ -2021,6 +2049,114 @@ test('recovery stops before subscribing terminals after replay completes the tas
 	await handle.dispose();
 });
 
+test('recovery applies replayed Session readiness before an earlier terminal action', async () => {
+	const catalog = new FakeAhpHostCatalog();
+	const first = new FakeAhpTransport(catalog);
+	first.sessionStartsProvisional = true;
+	const recovered = new FakeAhpTransport(catalog);
+	const launcher = new FakeLauncher();
+	launcher.host.preserveTerminalSession = true;
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([first, recovered]));
+	const handle = await runtime.start({
+		...taskRequest(),
+		sourceWindowName: 'frontend',
+	});
+	await nextEvent(handle.events);
+	recovered.created = first.created;
+	recovered.reconnectResult = {
+		type: 'replay',
+		actions: [
+			envelope('ahp-chat:/default', {
+				type: 'chat/turnComplete',
+				turnId: currentTurnId(first),
+				duration: 0,
+			}, 8),
+			envelope(first.created!.sessionUri, { type: 'session/ready' }, 9),
+		],
+		missing: [],
+	};
+
+	first.failChat();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	assert.equal((await nextEvent(handle.events)).type, 'completed');
+	await handle.dispose();
+	assert.equal(recovered.disposeSessionCalls, 0);
+});
+
+test('recovery applies Session readiness before an earlier terminal Chat snapshot', async () => {
+	const catalog = new FakeAhpHostCatalog();
+	const first = new FakeAhpTransport(catalog);
+	first.sessionStartsProvisional = true;
+	const recovered = new FakeAhpTransport(catalog);
+	const launcher = new FakeLauncher();
+	launcher.host.preserveTerminalSession = true;
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([first, recovered]));
+	const handle = await runtime.start({
+		...taskRequest(),
+		sourceWindowName: 'frontend',
+	});
+	await nextEvent(handle.events);
+	const turnId = currentTurnId(first);
+	recovered.created = first.created;
+	recovered.reconnectResult = {
+		type: 'snapshot',
+		snapshots: [
+			{
+				resource: 'ahp-chat:/default',
+				fromSeq: 8,
+				state: {
+					resource: 'ahp-chat:/default',
+					title: 'Recovered',
+					status: 1,
+					modifiedAt: new Date(0).toISOString(),
+					activeTurn: undefined,
+					turns: [{
+						id: turnId,
+						message: { text: 'safe', origin: { kind: 'user' } },
+						responseParts: [],
+						usage: undefined,
+						state: 'complete',
+					}],
+				},
+			} as Snapshot,
+			{
+				resource: first.created!.sessionUri,
+				fromSeq: 9,
+				state: {
+					resource: first.created!.sessionUri,
+					provider: 'dynamic-provider',
+					title: 'Task',
+					status: 1,
+					lifecycle: 'ready',
+					activeClients: [],
+					chats: [],
+					defaultChat: 'ahp-chat:/default',
+				},
+			} as Snapshot,
+			{
+				resource: 'ahp-root://',
+				fromSeq: 10,
+				state: {
+					agents: [{
+						provider: 'dynamic-provider',
+						displayName: 'Dynamic Provider',
+						description: 'Test provider',
+						models: [],
+						protectedResources: [protectedResource],
+					}],
+					terminals: [],
+				},
+			} as Snapshot,
+		],
+	};
+
+	first.failChat();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	assert.equal((await nextEvent(handle.events)).type, 'completed');
+	await handle.dispose();
+	assert.equal(recovered.disposeSessionCalls, 0);
+});
+
 test('intentional terminal removal does not trigger connection recovery', async () => {
 	const transport = new FakeAhpTransport();
 	const connections = new FakeConnectionFactory([transport]);
@@ -3278,7 +3414,9 @@ class FakeAhpTransport implements AhpConnection {
 	catalogOmissionsRemaining = 0;
 	catalogFailuresRemaining = 0;
 	catalogPageSize = 200;
+	catalogDefaultPageSize = 200;
 	catalogCursorCycle = false;
+	rejectCatalogLimit = false;
 	hideCatalog = false;
 	blockNextSessionUnsubscribe = false;
 	private resolveSessionUnsubscribeStarted!: () => void;
@@ -3535,7 +3673,7 @@ class FakeAhpTransport implements AhpConnection {
 		this.hostCatalog?.create(params.sessionUri, params.clientId);
 	}
 
-	async listSessions(limit = 200, cursor?: string): Promise<{
+	async listSessions(limit?: number, cursor?: string): Promise<{
 		readonly items: readonly {
 			readonly resource: string;
 			readonly status?: number;
@@ -3544,6 +3682,9 @@ class FakeAhpTransport implements AhpConnection {
 	}> {
 		this.assertOpen();
 		this.listSessionsCalls += 1;
+		if (this.rejectCatalogLimit && limit !== undefined) {
+			throw Object.assign(new Error('synthetic Host internal error'), { code: -32603 });
+		}
 		if (this.catalogFailuresRemaining > 0) {
 			this.catalogFailuresRemaining -= 1;
 			throw new Error('synthetic catalog failure');
@@ -3558,7 +3699,7 @@ class FakeAhpTransport implements AhpConnection {
 			? this.hostCatalog.list()
 			: this.created === undefined ? [] : [{ resource: this.created.sessionUri, status: 1 }];
 		const offset = cursor === undefined ? 0 : Number.parseInt(cursor, 10);
-		const pageSize = Math.min(limit, this.catalogPageSize);
+		const pageSize = Math.min(limit ?? this.catalogDefaultPageSize, this.catalogPageSize);
 		const items = sessions.slice(offset, offset + pageSize);
 		const nextOffset = offset + items.length;
 		return {

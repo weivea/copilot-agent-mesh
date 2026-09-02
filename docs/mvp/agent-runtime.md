@@ -130,7 +130,9 @@ Missing materialization also fails retryably and disposal removes the orphan. St
 cleanup continues to dispose the Session and owned Host. Objective catalog
 proof is instead collected only after handle cleanup by a fresh independent connection,
 using bounded cursor pagination and requiring the exact Session to be Idle/Error,
-non-InProgress, and non-Archived.
+non-InProgress, and non-Archived. VS Code 1.135 may return RPC `-32603` when the
+schema-optional page `limit` is present; the bounded scanner retries without that field
+while preserving its page, cursor-length, and cycle limits.
 
 Mapped events enter a queue bounded by both serialized UTF-8 bytes and event
 count. Progress coalesces to its latest queued value. Nonterminal output is

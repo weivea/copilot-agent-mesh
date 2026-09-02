@@ -14,11 +14,26 @@ import {
 	PeerDelegationE2eToolClock,
 	projectPeerTaskEvents,
 } from '../e2e/PeerDelegationE2eRecorder';
+import {
+	EditorCatalogProbeError,
+	classifyEditorCatalogError,
+} from '../composition/PeerDelegationE2eApi';
 
 const runId = '00000000-0000-4000-8000-000000000001';
 const taskId = '00000000-0000-4000-8000-000000000002';
 const inputId = '00000000-0000-4000-8000-000000000003';
 const delegationRequestId = '00000000-0000-4000-8000-000000000004';
+
+test('editor catalog diagnostics classify tagged protocol and timeout failures', () => {
+	assert.equal(
+		classifyEditorCatalogError(new EditorCatalogProbeError('protocol', 'synthetic protocol failure')),
+		'protocol',
+	);
+	assert.equal(
+		classifyEditorCatalogError(new EditorCatalogProbeError('timeout', 'synthetic timeout failure')),
+		'timeout',
+	);
+});
 
 test('peer-delegation evidence rejects unsafe persistent content', () => {
 	const base = unverifiedEvidence();

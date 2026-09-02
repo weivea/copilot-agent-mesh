@@ -26,6 +26,14 @@ import type { LocalIpcEndpoint } from '../ipc';
 
 const editorCatalogRetryTimeoutMs = 10_000;
 const editorCatalogRetryDelayMs = 100;
+type EditorCatalogErrorKind = 'protocol' | 'timeout' | 'transport' | 'closed' | 'other';
+
+export class EditorCatalogProbeError extends Error {
+	constructor(readonly kind: Extract<EditorCatalogErrorKind, 'protocol' | 'timeout'>, message: string) {
+		super(message);
+		this.name = 'EditorCatalogProbeError';
+	}
+}
 import {
 	parseDelegateTaskInput,
 	TaskToolsCore,
@@ -473,15 +481,22 @@ async function editorSessionCatalog(
 		stage = 'initialize';
 		const initialized = await connection.initialize(`mesh-peer-e2e-${randomUUID()}`);
 		if (!AHP_PROTOCOL_OFFER.includes(initialized.protocolVersion as '1.0.0')) {
-			throw new Error('The editor Agent Host selected an incompatible protocol.');
+			throw new EditorCatalogProbeError(
+				'protocol',
+				'The editor Agent Host selected an incompatible protocol.',
+			);
 		}
 		stage = 'list';
 		const deadline = Date.now() + editorCatalogRetryTimeoutMs;
 		let sessions;
+		let lastError: unknown;
 		while (true) {
 			const remaining = deadline - Date.now();
 			if (remaining <= 0) {
-				throw new Error('The editor Agent Host Session catalog remained unavailable.');
+				throw lastError ?? new EditorCatalogProbeError(
+					'timeout',
+					'The editor Agent Host Session catalog remained unavailable.',
+				);
 			}
 			const attemptTimeout = new AbortController();
 			const timer = setTimeout(() => attemptTimeout.abort(), remaining);
@@ -489,8 +504,14 @@ async function editorSessionCatalog(
 				sessions = await listSessionsBounded(connection, attemptTimeout.signal);
 				break;
 			} catch (error: unknown) {
+				if (!attemptTimeout.signal.aborted) {
+					lastError = error;
+				}
 				if (Date.now() >= deadline) {
-					throw error;
+					throw lastError ?? new EditorCatalogProbeError(
+						'timeout',
+						'The editor Agent Host Session catalog request timed out.',
+					);
 				}
 				await new Promise<void>((resolve) => {
 					setTimeout(resolve, Math.min(editorCatalogRetryDelayMs, deadline - Date.now()));
@@ -510,7 +531,7 @@ async function editorSessionCatalog(
 				.sort(),
 		};
 	} catch (error: unknown) {
-		const errorName = error instanceof Error ? error.name : '';
+		const errorKind = classifyEditorCatalogError(error);
 		const rpcCode = typeof error === 'object'
 			&& error !== null
 			&& 'code' in error
@@ -523,15 +544,7 @@ async function editorSessionCatalog(
 			source: 'editor',
 			errorCode: 'EDITOR_CATALOG_UNAVAILABLE',
 			errorStage: stage,
-			errorKind: errorName.includes('Protocol')
-				? 'protocol'
-				: errorName.includes('Timeout')
-					? 'timeout'
-					: errorName.includes('Transport')
-						? 'transport'
-						: errorName.includes('Closed')
-							? 'closed'
-							: 'other',
+			errorKind,
 			...(rpcCode === undefined ? {} : { rpcCode }),
 		};
 	}
@@ -548,6 +561,22 @@ async function editorSessionCatalog(
 		};
 	}
 	return result;
+}
+
+export function classifyEditorCatalogError(error: unknown): EditorCatalogErrorKind {
+	if (error instanceof EditorCatalogProbeError) {
+		return error.kind;
+	}
+	const errorName = error instanceof Error ? error.name : '';
+	return errorName.includes('Protocol')
+		? 'protocol'
+		: errorName.includes('Timeout')
+			? 'timeout'
+			: errorName.includes('Transport')
+				? 'transport'
+				: errorName.includes('Closed')
+					? 'closed'
+					: 'other';
 }
 
 function resourceMetrics(options: PeerDelegationE2eApiOptions): {

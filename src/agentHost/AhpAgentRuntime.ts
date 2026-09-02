@@ -51,6 +51,7 @@ const connectionGracefulShutdownMs = 1_000;
 const connectionForcedShutdownMs = 5_000;
 const sessionCatalogPageLimit = 200;
 const sessionCatalogMaxPages = 50;
+const sessionCatalogMaxEntries = sessionCatalogPageLimit * sessionCatalogMaxPages;
 const sessionCatalogCursorMaxLength = 4_096;
 const sessionStatusIdle = 1;
 const sessionStatusError = 1 << 1;
@@ -545,13 +546,13 @@ class SdkAhpConnection implements AhpConnection {
 		});
 	}
 
-	async listSessions(limit = sessionCatalogPageLimit, cursor?: string): Promise<AhpSessionPage> {
-		if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+	async listSessions(limit?: number, cursor?: string): Promise<AhpSessionPage> {
+		if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1 || limit > 200)) {
 			throw new TypeError('The Agent Host Session list limit is invalid.');
 		}
 		const result = await this.client.request('listSessions', {
 			channel: rootUri,
-			limit,
+			...(limit === undefined ? {} : { limit }),
 			...(cursor === undefined ? {} : { cursor }),
 		});
 		return {
@@ -2189,6 +2190,10 @@ class AhpTask implements AgentTaskHandle {
 				signal,
 			);
 			if (result.type === 'replay') {
+				if ((result.actions ?? []).some((action) =>
+					action.channel === this.sessionUri && action.action.type === 'session/ready')) {
+					this.markSessionMaterialized();
+				}
 				for (const action of result.actions ?? []) {
 					this.throwIfRecoveryStopped(signal);
 					if (action.channel === rootUri && action.action.type === 'root/terminalsChanged') {
@@ -2209,6 +2214,11 @@ class AhpTask implements AgentTaskHandle {
 				}
 			} else {
 				const snapshots = result.snapshots ?? [];
+				if (snapshots.some((snapshot) =>
+					snapshot.resource === this.sessionUri
+					&& String((snapshot.state as SessionState).lifecycle) === 'ready')) {
+					this.markSessionMaterialized();
+				}
 				const snapshotResources = new Set(snapshots.map(({ resource }) => resource));
 				if (recoverySubscriptionUris.some((uri) => !snapshotResources.has(uri))) {
 					throw new RecoveryUnavailableCause('The Agent Host no longer has the task session or active chat.');
@@ -2946,16 +2956,32 @@ async function scanSessionCatalog(
 	signal?: AbortSignal,
 ): Promise<void> {
 	let cursor: string | undefined;
+	let omitLimit = false;
+	let entryCount = 0;
 	const seenCursors = new Set<string>();
 	for (let pageNumber = 0; pageNumber < sessionCatalogMaxPages; pageNumber += 1) {
 		throwIfAborted(signal);
-		const page = signal === undefined
-			? await connection.listSessions(sessionCatalogPageLimit, cursor)
-			: await abortableConfigurationResolution(
-				connection.listSessions(sessionCatalogPageLimit, cursor),
-				signal,
-			);
+		let page: AhpSessionPage;
+		try {
+			const request = connection.listSessions(omitLimit ? undefined : sessionCatalogPageLimit, cursor);
+			page = signal === undefined
+				? await request
+				: await abortableConfigurationResolution(request, signal);
+		} catch (error: unknown) {
+			if (!omitLimit && isRpcInternalError(error)) {
+				omitLimit = true;
+				pageNumber -= 1;
+				continue;
+			}
+			throw error;
+		}
 		for (const session of page.items) {
+			entryCount += 1;
+			if (entryCount > sessionCatalogMaxEntries) {
+				throw new SessionCatalogPaginationError(
+					'The Agent Host Session catalog exceeded the bounded entry limit.',
+				);
+			}
 			if (visit(session)) {
 				return;
 			}
@@ -2973,12 +2999,20 @@ async function scanSessionCatalog(
 				'The Agent Host returned an invalid Session catalog cursor.',
 			);
 		}
+
 		seenCursors.add(page.nextCursor);
 		cursor = page.nextCursor;
 	}
 	throw new SessionCatalogPaginationError(
 		'The Agent Host Session catalog exceeded the bounded pagination limit.',
 	);
+}
+
+function isRpcInternalError(error: unknown): boolean {
+	return typeof error === 'object'
+		&& error !== null
+		&& 'code' in error
+		&& error.code === -32603;
 }
 
 export function isUsableTerminalSessionStatus(status: number): boolean {
