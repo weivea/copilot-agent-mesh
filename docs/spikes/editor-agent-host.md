@@ -312,7 +312,8 @@ Host GC。仅跳过 `disposeSession` 因此不是 persistence proof。客户端�
 边界，read/archive metadata 不由 Mesh 伪造。只有 disposal 完成后，诊断才从新的独立连接进行
 有界分页，并要求 exact Session 为 Idle/Error、非 InProgress、非 Archived。连接 shutdown
 只给 WebSocket 有界的 graceful-close 时间，随后强制关闭本地 socket，避免 Host close handshake
-不结束时永久卡住 handle disposal。
+不结束时永久卡住 handle disposal。清理必须先 unsubscribe 其余 channel，再关闭 iterator 并
+等待 pump；固定 SDK 的 iterator `return()` 不会唤醒已经等待中的 `next()`，反向顺序会死锁。
 
 稳定 Extension API 不提供读取 Chat Sessions UI 或向内置 Copilot Agent 自动发送并确认
 消息的接口。P8 在 VS Code 1.135.0 观察到无 Chat context 的

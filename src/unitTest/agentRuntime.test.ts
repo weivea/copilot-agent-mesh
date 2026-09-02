@@ -3712,7 +3712,7 @@ class FakeSubscription implements AhpSubscription {
 	}
 
 	async close(): Promise<void> {
-		this.finish();
+		// The pinned SDK iterator return detaches without waking a parked next().
 	}
 
 	[Symbol.asyncIterator](): AsyncIterator<AhpSubscriptionEvent> {

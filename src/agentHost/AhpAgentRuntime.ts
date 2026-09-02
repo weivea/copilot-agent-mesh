@@ -658,7 +658,6 @@ class AhpTask implements AgentTaskHandle {
 	private authoritativeTurnTerminal = false;
 	private terminalSessionClientLeft = false;
 	private terminalClientDetachedObserved = false;
-	private startupComplete = false;
 	private disposed = false;
 	private recovering = false;
 	private defaultChatResolve: ((uri: string) => void) | undefined;
@@ -839,10 +838,6 @@ class AhpTask implements AgentTaskHandle {
 		this.throwIfTerminalFailure();
 		await this.events.push({ type: 'progress', message: 'Agent turn started.' });
 		this.throwIfTerminalFailure();
-		this.startupComplete = true;
-		if (this.terminal) {
-			void this.dispose();
-		}
 	}
 
 	async cancel(): Promise<void> {
@@ -956,6 +951,20 @@ class AhpTask implements AgentTaskHandle {
 		]));
 		await runCleanupPhase(
 			[...this.subscriptionCleanup]
+				.filter(([, state]) => !state.unsubscribed)
+				.map(([uri, state]) => ({
+						label: `unsubscribe ${safeCleanupResource(uri)}`,
+						run: async () => {
+							await this.connection.unsubscribe(uri);
+							state.unsubscribed = true;
+						},
+					})),
+		);
+		if (this.authoritativeTurnTerminal && this.host.preserveTerminalSession === true) {
+			this.observeLifecycleEvent('session/channelsUnsubscribed');
+		}
+		await runCleanupPhase(
+			[...this.subscriptionCleanup]
 				.filter(([, state]) => !state.closed)
 				.map(([uri, state]) => ({
 						label: `close subscription ${safeCleanupResource(uri)}`,
@@ -976,20 +985,6 @@ class AhpTask implements AgentTaskHandle {
 		}]);
 		if (this.authoritativeTurnTerminal && this.host.preserveTerminalSession === true) {
 			this.observeLifecycleEvent('session/subscriptionPumpsSettled');
-		}
-		await runCleanupPhase(
-			[...this.subscriptionCleanup]
-				.filter(([, state]) => !state.unsubscribed)
-				.map(([uri, state]) => ({
-						label: `unsubscribe ${safeCleanupResource(uri)}`,
-						run: async () => {
-							await this.connection.unsubscribe(uri);
-							state.unsubscribed = true;
-						},
-					})),
-		);
-		if (this.authoritativeTurnTerminal && this.host.preserveTerminalSession === true) {
-			this.observeLifecycleEvent('session/channelsUnsubscribed');
 		}
 		this.subscriptions.clear();
 		if (this.authoritativeTurnTerminal && this.host.preserveTerminalSession === true) {
@@ -2346,9 +2341,6 @@ class AhpTask implements AgentTaskHandle {
 			clearTimeout(this.cancellationTimer);
 		}
 		this.events.close();
-		if (this.startupComplete) {
-			void this.dispose();
-		}
 	}
 
 	private trackDelegatedToolInvocation(envelope: ActionEnvelope): void {
