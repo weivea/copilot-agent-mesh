@@ -310,8 +310,9 @@ export class LocalIpcSession {
 		method: string,
 		params: JsonValue,
 		timeoutMs?: number,
+		onDispatched?: () => void,
 	): Promise<T> {
-		return this.peer.request(method, params, timeoutMs) as Promise<T>;
+		return this.peer.request(method, params, timeoutMs, onDispatched) as Promise<T>;
 	}
 
 	public notify(method: string, params: JsonValue): Promise<void> {
@@ -625,6 +626,8 @@ interface PendingRequest {
 	readonly resolve: (value: JsonValue) => void;
 	readonly reject: (error: Error) => void;
 	readonly timer: NodeJS.Timeout;
+	readonly onDispatched?: () => void;
+	dispatched: boolean;
 }
 
 interface PendingWrite {
@@ -755,7 +758,12 @@ class IpcPeer {
 		});
 	}
 
-	public request(method: string, params: JsonValue, timeoutMs?: number): Promise<JsonValue> {
+	public request(
+		method: string,
+		params: JsonValue,
+		timeoutMs?: number,
+		onDispatched?: () => void,
+	): Promise<JsonValue> {
 		if (this.state !== 'authenticated') {
 			return Promise.reject(new Error('Local IPC session is not authenticated.'));
 		}
@@ -777,13 +785,25 @@ class IpcPeer {
 					this.fail(new Error('Local IPC request timed out.'));
 				}
 			}, effectiveTimeoutMs);
-			this.pendingRequests.set(id, { resolve, reject, timer });
+			this.pendingRequests.set(id, {
+				resolve,
+				reject,
+				timer,
+				...(onDispatched === undefined ? {} : { onDispatched }),
+				dispatched: false,
+			});
 			void this.send({
 				kind: 'request',
 				jsonrpc: '2.0',
 				id,
 				method,
 				params,
+			}, () => {
+				const pending = this.pendingRequests.get(id);
+				if (pending !== undefined && !pending.dispatched) {
+					pending.dispatched = true;
+					pending.onDispatched?.();
+				}
 			}).catch((error: unknown) => {
 				const pending = this.pendingRequests.get(id);
 				if (pending !== undefined) {
@@ -1093,7 +1113,19 @@ class IpcPeer {
 		if (pending === undefined) {
 			throw new Error('Unexpected local IPC response.');
 		}
-		this.pendingRequests.delete(frame.id);
+		if (!pending.dispatched) {
+			pending.dispatched = true;
+			pending.onDispatched?.();
+		}
+		this.settleResponse(frame.id, pending, frame);
+	}
+
+	private settleResponse(
+		id: string,
+		pending: PendingRequest,
+		frame: ResultFrame | ErrorFrame,
+	): void {
+		this.pendingRequests.delete(id);
 		clearTimeout(pending.timer);
 		if (frame.kind === 'result') {
 			pending.resolve(frame.result);
@@ -1106,7 +1138,7 @@ class IpcPeer {
 		}
 	}
 
-	private send(frame: ExternalFrame): Promise<void> {
+	private send(frame: ExternalFrame, onAccepted?: () => void): Promise<void> {
 		if (this.state === 'closed' || this.socket.destroyed) {
 			return Promise.reject(new Error(SAFE_CLOSE_MESSAGE));
 		}
@@ -1142,6 +1174,7 @@ class IpcPeer {
 					pending.reject(new Error('Local IPC write failed.'));
 				}
 			});
+			onAccepted?.();
 			if (!writable && this.backpressureTimer === undefined) {
 				this.backpressureTimer = setTimeout(
 					() => this.fail(new Error('Local IPC backpressure deadline exceeded.')),

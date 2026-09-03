@@ -10,6 +10,7 @@ export interface ManualInvocationObservation {
 		| 'prepareFailed'
 		| 'prepared'
 		| 'invokeStarted'
+		| 'taskIdentified'
 		| 'taskAvailable'
 		| 'invokeCompleted';
 	readonly compactStatus?: number;

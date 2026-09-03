@@ -2180,14 +2180,29 @@ async function settleUnexpectedManualInvocations(
 			.filter(({ invocationId }) => !resolvedStartInvocationIds.has(invocationId));
 		const resolutions = await Promise.allSettled(unresolvedStarts.map(async (start) => {
 			const invocationId = requiredUuid(start.invocationId, 'Manual invocation identity');
+			const identified = postPrompt.delegateObservations.find(
+				(observation) =>
+					observation.invocationId === invocationId
+					&& observation.phase === 'taskIdentified',
+			);
 			const requestId = requiredUuid(
-				start.delegationRequestId,
+				identified?.delegationRequestId,
 				'Manual delegation request identity',
+			);
+			if (
+				start.delegationRequestId !== undefined
+				&& start.delegationRequestId !== requestId
+			) {
+				throw new Error('Manual delegation request identity changed during invocation.');
+			}
+			const sourceWorkspaceIdentity = requiredSourceWorkspaceIdentity(
+				identified?.sourceWorkspaceIdentity,
+				'Manual source Workspace identity',
 			);
 			const resolved = await request(
 				source,
 				'peer.manual.task.resolve',
-				{ delegationRequestId: requestId },
+				{ delegationRequestId: requestId, sourceWorkspaceIdentity },
 				remainingManualCleanupAttemptMs(settlementDeadline),
 			);
 			return {
@@ -2405,6 +2420,9 @@ function manualToolObservations(observations) {
 			: { compactStatus: observation.compactStatus }),
 		...(observation.errorCode === undefined ? {} : { errorCode: observation.errorCode }),
 		...(observation.taskId === undefined ? {} : { taskId: observation.taskId }),
+		...(observation.sourceWorkspaceIdentity === undefined
+			? {}
+			: { sourceWorkspaceIdentity: observation.sourceWorkspaceIdentity }),
 		...(observation.preparationSequence === undefined
 			? {}
 			: { preparationSequence: observation.preparationSequence }),
@@ -3369,6 +3387,16 @@ function requiredUuid(value, label) {
 	if (
 		typeof value !== 'string'
 		|| !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(value)
+	) {
+		throw new Error(`${label} was unavailable.`);
+	}
+	return value;
+}
+
+function requiredSourceWorkspaceIdentity(value, label) {
+	if (
+		typeof value !== 'string'
+		|| !/^sha256:[A-Za-z0-9_-]{43}$/u.test(value)
 	) {
 		throw new Error(`${label} was unavailable.`);
 	}

@@ -1,4 +1,7 @@
 import * as assert from 'node:assert/strict';
+import { mkdtemp, readdir, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 
 import {
@@ -8,7 +11,9 @@ import {
 	type TaskSnapshot,
 } from '../../shared/protocol';
 import type { DelegationIntentInput, TaskToolSnapshot } from '../../shared/toolProtocol';
+import { PeerDelegationE2eBindingRegistry } from '../e2e/PeerDelegationE2eBindingRegistry';
 import { LocalIpcRemoteError } from '../ipc';
+import type { TaskStartDispatchOutcome } from '../node/WindowNodeClient';
 import {
 	deterministicTaskId,
 	LocalBrokerTaskFacade,
@@ -30,6 +35,7 @@ const INPUT_ID = '00000000-0000-4000-8000-000000000008';
 const ANSWER_ID = '00000000-0000-4000-8000-000000000009';
 const SOURCE_IDENTITY_A = `sha256:${'A'.repeat(43)}`;
 const SOURCE_IDENTITY_B = `sha256:${'B'.repeat(43)}`;
+const RUN_ID = '00000000-0000-4000-8000-00000000000a';
 
 test('local facade lists this device and every broker-listed node opaquely', async () => {
 	const client = new FakeWindowNodeClient();
@@ -113,7 +119,6 @@ test('stable task IDs survive facade reload and changed retries surface broker c
 	const retry = await reloadedFacade.persistDelegationIntent(intent());
 
 	assert.equal(first.taskId, deterministicTaskId(DELEGATION_ID));
-	assert.equal(firstFacade.persistedTaskIdForDelegationRequest(DELEGATION_ID), first.taskId);
 	assert.equal(retry.taskId, first.taskId);
 	assert.equal(first.recovered, false);
 	assert.equal(retry.recovered, true);
@@ -177,82 +182,86 @@ test('source Workspace identity scopes stable delegation keys independently of d
 	const independent = await sourceB.persistDelegationIntent(intent());
 
 	assert.equal(first.taskId, deterministicTaskId(DELEGATION_ID, SOURCE_IDENTITY_A));
-	assert.equal(sourceA.persistedTaskIdForDelegationRequest(DELEGATION_ID), first.taskId);
 	assert.equal(retry.taskId, first.taskId);
 	assert.notEqual(independent.taskId, first.taskId);
 	assert.equal(independent.taskId, deterministicTaskId(DELEGATION_ID, SOURCE_IDENTITY_B));
 	assert.equal(client.lastStart?.sourceWorkspaceIdentity, SOURCE_IDENTITY_B);
 });
 
-test('persisted delegation resolution keeps the immutable source scope after it changes', async () => {
+test('run-scoped binding survives facade recreation and rejects a changed source scope', async (t) => {
+	const root = await temporaryRegistryRoot(t);
 	const client = new FakeWindowNodeClient();
 	let sourceIdentity = SOURCE_IDENTITY_A;
-	const facade = new LocalBrokerTaskFacade(client, {
+	const firstRegistry = new PeerDelegationE2eBindingRegistry(root, RUN_ID);
+	const firstFacade = new LocalBrokerTaskFacade(client, {
 		deviceName: 'Source',
 		sourceWorkspaceIdentity: () => sourceIdentity,
+		e2eDelegationBindings: firstRegistry,
 	});
-	const persisted = await facade.persistDelegationIntent(intent());
+	const first = await firstFacade.persistDelegationIntent(intent());
+
+	const recreatedRegistry = new PeerDelegationE2eBindingRegistry(
+		root,
+		RUN_ID,
+	);
+	const recreatedFacade = new LocalBrokerTaskFacade(client, {
+		deviceName: 'Renamed Source',
+		sourceWorkspaceIdentity: () => sourceIdentity,
+		e2eDelegationBindings: recreatedRegistry,
+	});
+	const retry = await recreatedFacade.persistDelegationIntent(intent());
+	assert.equal(await recreatedRegistry.resolve(DELEGATION_ID, SOURCE_IDENTITY_A), first.taskId);
+	assert.equal(retry.taskId, first.taskId);
 
 	sourceIdentity = SOURCE_IDENTITY_B;
-	const resolvedTaskId = facade.persistedTaskIdForDelegationRequest(DELEGATION_ID);
-	assert.equal(
-		resolvedTaskId,
-		persisted.taskId,
-	);
-	assert.notEqual(
-		persisted.taskId,
-		deterministicTaskId(DELEGATION_ID, SOURCE_IDENTITY_B),
-	);
-	assert.deepEqual(
-		await facade.cancelOwnedTask(
-			{ taskId: resolvedTaskId },
-			new AbortController().signal,
-		),
-		{ taskId: persisted.taskId, status: 'cancelled' },
-	);
-	assert.equal(client.tasks.get(persisted.taskId)?.snapshot.state, 'cancelled');
 	await assert.rejects(
-		facade.persistDelegationIntent(intent()),
+		recreatedFacade.persistDelegationIntent(intent()),
 		(error: unknown) =>
 			error instanceof TaskToolFacadeError
 			&& error.code === 'IDEMPOTENCY_CONFLICT',
 	);
-	assert.equal(facade.persistedTaskIdForDelegationRequest(DELEGATION_ID), persisted.taskId);
-	assert.throws(
-		() => facade.persistedTaskIdForDelegationRequest(
-			'00000000-0000-4000-8000-000000000099',
-		),
-		(error: unknown) =>
-			error instanceof TaskToolFacadeError
-			&& error.code === 'DELEGATION_NOT_FOUND',
-	);
+	assert.equal(await recreatedRegistry.resolve(DELEGATION_ID, SOURCE_IDENTITY_A), first.taskId);
 });
 
-test('explicit persisted source scope resolves without a facade scope callback', async () => {
-	const client = new FakeWindowNodeClient();
-	const facade = new LocalBrokerTaskFacade(client, { deviceName: 'Source' });
+test('explicit immutable source scope is durable without a facade scope callback', async (t) => {
+	const registry = new PeerDelegationE2eBindingRegistry(
+		await temporaryRegistryRoot(t),
+		RUN_ID,
+	);
+	const facade = new LocalBrokerTaskFacade(new FakeWindowNodeClient(), {
+		deviceName: 'Source',
+		e2eDelegationBindings: registry,
+	});
 	const persisted = await facade.persistDelegationIntent({
 		...intent(),
 		sourceWorkspaceIdentity: SOURCE_IDENTITY_A,
 	});
 
 	assert.equal(
-		facade.persistedTaskIdForDelegationRequest(DELEGATION_ID),
-		persisted.taskId,
-	);
-	assert.equal(
-		persisted.taskId,
+		await registry.resolve(DELEGATION_ID, SOURCE_IDENTITY_A),
 		deterministicTaskId(DELEGATION_ID, SOURCE_IDENTITY_A),
+	);
+	assert.equal(await registry.resolve(DELEGATION_ID, SOURCE_IDENTITY_A), persisted.taskId);
+	await assert.rejects(
+		registry.resolve(DELEGATION_ID, SOURCE_IDENTITY_B),
+		(error: unknown) =>
+			error instanceof TaskToolFacadeError
+			&& error.code === 'DELEGATION_NOT_FOUND',
 	);
 });
 
-test('ambiguous start failure retains the immutable request binding before dispatch returns', async () => {
+test('ambiguous post-dispatch failure retains the immutable binding', async (t) => {
+	const registry = new PeerDelegationE2eBindingRegistry(
+		await temporaryRegistryRoot(t),
+		RUN_ID,
+	);
 	const client = new FakeWindowNodeClient();
 	client.throwAfterStart = true;
 	let sourceIdentity = SOURCE_IDENTITY_A;
 	const facade = new LocalBrokerTaskFacade(client, {
 		deviceName: 'Source',
 		sourceWorkspaceIdentity: () => sourceIdentity,
+		e2eDelegationBindings: registry,
 	});
 	await assert.rejects(
 		facade.persistDelegationIntent(intent()),
@@ -260,8 +269,8 @@ test('ambiguous start failure retains the immutable request binding before dispa
 			error instanceof TaskToolFacadeError
 			&& error.code === 'INTERNAL_ERROR',
 	);
-	const originalTaskId = deterministicTaskId(DELEGATION_ID, SOURCE_IDENTITY_A);
-	assert.equal(facade.persistedTaskIdForDelegationRequest(DELEGATION_ID), originalTaskId);
+	const taskId = deterministicTaskId(DELEGATION_ID, SOURCE_IDENTITY_A);
+	assert.equal(await registry.resolve(DELEGATION_ID, SOURCE_IDENTITY_A), taskId);
 
 	sourceIdentity = SOURCE_IDENTITY_B;
 	await assert.rejects(
@@ -271,7 +280,94 @@ test('ambiguous start failure retains the immutable request binding before dispa
 			&& error.code === 'IDEMPOTENCY_CONFLICT',
 	);
 	assert.equal(client.startCalls, 1);
-	assert.equal(facade.persistedTaskIdForDelegationRequest(DELEGATION_ID), originalTaskId);
+	assert.equal(await registry.resolve(DELEGATION_ID, SOURCE_IDENTITY_A), taskId);
+});
+
+test('failed pre-dispatch validation leaves no E2E binding', async (t) => {
+	const registry = new PeerDelegationE2eBindingRegistry(
+		await temporaryRegistryRoot(t),
+		RUN_ID,
+	);
+	const client = new FakeWindowNodeClient();
+	client.throwBeforeStart = true;
+	const facade = new LocalBrokerTaskFacade(client, {
+		deviceName: 'Source',
+		e2eDelegationBindings: registry,
+	});
+	await assert.rejects(
+		facade.persistDelegationIntent(intent()),
+		(error: unknown) =>
+			error instanceof TaskToolFacadeError
+			&& error.code === 'INTERNAL_ERROR',
+	);
+	assert.equal(client.startCalls, 0);
+	assert.equal(await registry.size(), 0);
+});
+
+test('pre-dispatch retry failure cannot retire an existing active binding', async (t) => {
+	const root = await temporaryRegistryRoot(t);
+	const registry = new PeerDelegationE2eBindingRegistry(root, RUN_ID);
+	const originalClient = new FakeWindowNodeClient();
+	const original = await new LocalBrokerTaskFacade(originalClient, {
+		deviceName: 'Source',
+		sourceWorkspaceIdentity: () => SOURCE_IDENTITY_A,
+		e2eDelegationBindings: registry,
+	}).persistDelegationIntent(intent());
+
+	const retryClient = new FakeWindowNodeClient();
+	retryClient.throwBeforeStart = true;
+	await assert.rejects(
+		new LocalBrokerTaskFacade(retryClient, {
+			deviceName: 'Source',
+			sourceWorkspaceIdentity: () => SOURCE_IDENTITY_A,
+			e2eDelegationBindings: new PeerDelegationE2eBindingRegistry(root, RUN_ID),
+		}).persistDelegationIntent(intent()),
+	);
+	assert.equal(
+		await registry.resolve(DELEGATION_ID, SOURCE_IDENTITY_A),
+		original.taskId,
+	);
+});
+
+test('E2E binding capacity rejects before local task dispatch', async (t) => {
+	const registry = new PeerDelegationE2eBindingRegistry(
+		await temporaryRegistryRoot(t),
+		RUN_ID,
+	);
+	for (let index = 1; index <= 512; index += 1) {
+		const delegationRequestId = indexedUuid(index);
+		await registry.reserve({
+			delegationRequestId,
+			taskId: deterministicTaskId(delegationRequestId),
+		});
+	}
+	const client = new FakeWindowNodeClient();
+	const facade = new LocalBrokerTaskFacade(client, {
+		deviceName: 'Source',
+		e2eDelegationBindings: registry,
+	});
+	await assert.rejects(
+		facade.persistDelegationIntent({
+			...intent(),
+			delegationRequestId: indexedUuid(513),
+		}),
+		(error: unknown) =>
+			error instanceof TaskToolFacadeError
+			&& error.code === 'RATE_LIMITED',
+	);
+	assert.equal(client.startCalls, 0);
+	assert.equal(await registry.size(), 512);
+});
+
+test('normal facade attempts do not create or grow E2E binding state', async (t) => {
+	const root = await temporaryRegistryRoot(t);
+	const client = new FakeWindowNodeClient();
+	const facade = new LocalBrokerTaskFacade(client, { deviceName: 'Production' });
+	for (let attempt = 0; attempt < 513; attempt += 1) {
+		await facade.persistDelegationIntent(intent());
+	}
+	assert.equal(client.startCalls, 513);
+	assert.deepEqual(await readdir(root), []);
 });
 
 test('claimed Workspace-set scope is order-stable and changes only with membership', () => {
@@ -446,6 +542,7 @@ class FakeWindowNodeClient {
 	listError?: unknown;
 	directory?: NodeDirectoryResult;
 	throwAfterStart = false;
+	throwBeforeStart = false;
 
 	get stateListenerCount(): number {
 		return this.stateListeners.size;
@@ -506,8 +603,15 @@ class FakeWindowNodeClient {
 		};
 	}
 
-	async startTask(input: RoutedTaskStartParams): Promise<TaskSnapshot> {
+	async startTask(
+		input: RoutedTaskStartParams,
+		outcome?: TaskStartDispatchOutcome,
+	): Promise<TaskSnapshot> {
 		this.startCalls += 1;
+		if (this.throwBeforeStart) {
+			this.startCalls -= 1;
+			throw new Error('pre-dispatch failure');
+		}
 		this.lastStart = structuredClone(input);
 		const existing = this.tasks.get(input.taskId);
 		if (existing !== undefined) {
@@ -517,6 +621,9 @@ class FakeWindowNodeClient {
 			return existing.snapshot;
 		}
 		const snapshot = taskSnapshot(input);
+		if (outcome !== undefined) {
+			outcome.taskStartRequestAttempted = true;
+		}
 		this.tasks.set(input.taskId, { input: structuredClone(input), snapshot });
 		if (this.throwAfterStart) {
 			throw new Error('ambiguous start');
@@ -616,4 +723,14 @@ function meshError(reason: keyof typeof MESH_ERROR_CODES): LocalIpcRemoteError {
 		'Safe local broker error.',
 		{ reason, retryable: reason === 'TASK_NOT_FOUND' },
 	);
+}
+
+function indexedUuid(index: number): string {
+	return `10000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}`;
+}
+
+async function temporaryRegistryRoot(t: { after(cleanup: () => Promise<void>): void }): Promise<string> {
+	const root = await mkdtemp(join(tmpdir(), 'mesh-e2e-bindings-'));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	return root;
 }

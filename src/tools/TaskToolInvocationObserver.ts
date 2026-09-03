@@ -6,6 +6,7 @@ export type TaskToolInvocationPhase =
 	| 'prepareFailed'
 	| 'prepared'
 	| 'invokeStarted'
+	| 'taskIdentified'
 	| 'taskAvailable'
 	| 'invokeCompleted';
 

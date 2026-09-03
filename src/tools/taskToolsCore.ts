@@ -85,7 +85,10 @@ export interface TaskToolsCoreOptions {
 	readonly id?: () => string;
 	readonly delegatedToolInvocations?: DelegatedToolInvocationRegistry;
 	readonly onDelegationTaskAvailable?: (
-		identity: Readonly<Pick<DelegationIdentity, 'delegationRequestId' | 'taskId'>>,
+		identity: DelegationIdentity,
+	) => void;
+	readonly onDelegationIdentified?: (
+		identity: DelegationIdentity,
 	) => void;
 }
 
@@ -185,6 +188,8 @@ export class TaskToolsCore {
 	private readonly delegatedToolInvocations: DelegatedToolInvocationRegistry | undefined;
 	private readonly onDelegationTaskAvailable:
 		TaskToolsCoreOptions['onDelegationTaskAvailable'];
+	private readonly onDelegationIdentified:
+		TaskToolsCoreOptions['onDelegationIdentified'];
 
 	constructor(
 		private readonly facade: TaskToolFacade,
@@ -195,6 +200,7 @@ export class TaskToolsCore {
 		this.id = options.id ?? randomUUID;
 		this.delegatedToolInvocations = options.delegatedToolInvocations;
 		this.onDelegationTaskAvailable = options.onDelegationTaskAvailable;
+		this.onDelegationIdentified = options.onDelegationIdentified;
 		if (
 			!Number.isSafeInteger(this.outputByteLimit)
 			|| this.outputByteLimit < TASK_TOOL_LIMITS.minimumOutputBytes
@@ -332,6 +338,11 @@ export class TaskToolsCore {
 				...input,
 				sourceWorkspaceIdentity: identity.sourceWorkspaceIdentity,
 			};
+			try {
+				this.onDelegationIdentified?.(identity);
+			} catch {
+				// Diagnostics must never affect task execution.
+			}
 		} catch (error: unknown) {
 			return this.errorFromUnknown(error);
 		}
@@ -358,10 +369,7 @@ export class TaskToolsCore {
 					throw new TaskToolFacadeError('OUTPUT_INVALID');
 				}
 				try {
-					this.onDelegationTaskAvailable?.({
-						delegationRequestId: identity.delegationRequestId,
-						taskId: identity.taskId,
-					});
+					this.onDelegationTaskAvailable?.(identity);
 				} catch {
 					// Diagnostics must never affect task execution.
 				}

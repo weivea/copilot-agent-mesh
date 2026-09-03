@@ -197,12 +197,44 @@ export class MeshDelegateTaskTool extends TaskToolBase implements vscode.Languag
 		try {
 			value = await new TaskToolsCore(this.facade, {
 				...this.coreOptions,
-				onDelegationTaskAvailable: ({ delegationRequestId, taskId }) => {
+				onDelegationIdentified: ({
+					delegationRequestId,
+					sourceWorkspaceIdentity,
+					taskId,
+				}) => {
+					this.observe(
+						MESH_TOOL_NAMES.delegateTask,
+						'taskIdentified',
+						options.input,
+						{
+							d: delegationRequestId,
+							t: taskId,
+							...(sourceWorkspaceIdentity === undefined
+								? {}
+								: { w: sourceWorkspaceIdentity }),
+						},
+						undefined,
+						undefined,
+						invocationSequence,
+						invocationId,
+					);
+				},
+				onDelegationTaskAvailable: ({
+					delegationRequestId,
+					sourceWorkspaceIdentity,
+					taskId,
+				}) => {
 					this.observe(
 						MESH_TOOL_NAMES.delegateTask,
 						'taskAvailable',
 						options.input,
-						{ d: delegationRequestId, t: taskId },
+						{
+							d: delegationRequestId,
+							t: taskId,
+							...(sourceWorkspaceIdentity === undefined
+								? {}
+								: { w: sourceWorkspaceIdentity }),
+						},
 						undefined,
 						undefined,
 						invocationSequence,

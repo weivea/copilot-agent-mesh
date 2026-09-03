@@ -221,6 +221,10 @@ const defaultScheduler: WindowNodeScheduler = {
 /**
  * Reconnecting authenticated Window Node client and local broker facade.
  */
+export interface TaskStartDispatchOutcome {
+	taskStartRequestAttempted: boolean;
+}
+
 export class WindowNodeClient implements WorkspaceResolver {
 	public readonly eventSink: WindowNodeTaskEventSink = {
 		publish: (event) => this.publishTaskEvent(event),
@@ -534,22 +538,30 @@ export class WindowNodeClient implements WorkspaceResolver {
 	public startRemoteTask(
 		input: RoutedTaskStartParams,
 		peerId: string,
+		outcome?: TaskStartDispatchOutcome,
 	): Promise<TaskSnapshot> {
-		return this.startRemoteTaskCore(input, peerId);
+		return this.startRemoteTaskCore(input, peerId, undefined, outcome);
 	}
 
 	public startRemoteTaskFromDelegatedChild(
 		input: RoutedTaskStartParams,
 		peerId: string,
 		context: DelegatedExecutionContext,
+		outcome?: TaskStartDispatchOutcome,
 	): Promise<TaskSnapshot> {
-		return this.startRemoteTaskCore(input, peerId, delegatedExecutionContextSchema.parse(context));
+		return this.startRemoteTaskCore(
+			input,
+			peerId,
+			delegatedExecutionContextSchema.parse(context),
+			outcome,
+		);
 	}
 
 	private startRemoteTaskCore(
 		input: RoutedTaskStartParams,
 		peerId: string,
 		context?: DelegatedExecutionContext,
+		outcome?: TaskStartDispatchOutcome,
 	): Promise<TaskSnapshot> {
 		const parsed = routedTaskStartParamsSchema.parse(input);
 		if (parsed.sourceNodeId !== undefined && parsed.sourceNodeId !== this.nodeId) {
@@ -568,6 +580,7 @@ export class WindowNodeClient implements WorkspaceResolver {
 			LOCAL_BROKER_METHODS.remoteTaskStart,
 			toJsonValue(params),
 			taskSnapshotSchema,
+			outcome,
 		);
 	}
 
@@ -618,20 +631,25 @@ export class WindowNodeClient implements WorkspaceResolver {
 		).then((result) => result ?? undefined);
 	}
 
-	public startTask(input: RoutedTaskStartParams): Promise<TaskSnapshot> {
-		return this.startTaskCore(input);
+	public startTask(
+		input: RoutedTaskStartParams,
+		outcome?: TaskStartDispatchOutcome,
+	): Promise<TaskSnapshot> {
+		return this.startTaskCore(input, undefined, outcome);
 	}
 
 	public startTaskFromDelegatedChild(
 		input: RoutedTaskStartParams,
 		context: DelegatedExecutionContext,
+		outcome?: TaskStartDispatchOutcome,
 	): Promise<TaskSnapshot> {
-		return this.startTaskCore(input, delegatedExecutionContextSchema.parse(context));
+		return this.startTaskCore(input, delegatedExecutionContextSchema.parse(context), outcome);
 	}
 
 	private startTaskCore(
 		input: RoutedTaskStartParams,
 		context?: DelegatedExecutionContext,
+		outcome?: TaskStartDispatchOutcome,
 	): Promise<TaskSnapshot> {
 		const parsed = routedTaskStartParamsSchema.parse(input);
 		if (parsed.sourceNodeId !== undefined && parsed.sourceNodeId !== this.nodeId) {
@@ -649,6 +667,7 @@ export class WindowNodeClient implements WorkspaceResolver {
 			LOCAL_BROKER_METHODS.taskStart,
 			toJsonValue(params),
 			taskSnapshotSchema,
+			outcome,
 		);
 	}
 
@@ -1279,9 +1298,19 @@ export class WindowNodeClient implements WorkspaceResolver {
 		method: string,
 		params: JsonValue,
 		schema: z.ZodType<T>,
+		outcome?: TaskStartDispatchOutcome,
 	): Promise<T> {
 		const session = this.requireConnected();
-		return session.request(method, params).then((result) => schema.parse(result));
+		return session.request(
+			method,
+			params,
+			undefined,
+			outcome === undefined
+				? undefined
+				: () => {
+					outcome.taskStartRequestAttempted = true;
+				},
+		).then((result) => schema.parse(result));
 	}
 
 	private requireConnected(): LocalIpcSession {

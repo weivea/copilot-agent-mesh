@@ -320,7 +320,11 @@ suite('TaskToolsCore', () => {
 	});
 
 	test('reports the deterministic task identity as soon as delegation is persisted', async () => {
-		const available: Array<{ readonly delegationRequestId: string; readonly taskId: string }> = [];
+		const available: Array<{
+			readonly delegationRequestId: string;
+			readonly sourceWorkspaceIdentity: string;
+			readonly taskId: string;
+		}> = [];
 		const result = await new TaskToolsCore(new RecordingFacade(), {
 			onDelegationTaskAvailable: (identity) => available.push(identity),
 		}).delegateTask(delegationInput());
@@ -328,6 +332,7 @@ suite('TaskToolsCore', () => {
 		assert.equal(result.s, 0);
 		assert.deepEqual(available, [{
 			delegationRequestId: DELEGATION_ID,
+			sourceWorkspaceIdentity: SOURCE_WORKSPACE_IDENTITY,
 			taskId: TASK_ID,
 		}]);
 	});

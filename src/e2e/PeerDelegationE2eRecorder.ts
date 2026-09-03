@@ -29,6 +29,7 @@ export interface SafePeerToolObservation {
 	readonly phase: TaskToolInvocationObservation['phase'];
 	readonly delegationRequestId?: string;
 	readonly taskId?: string;
+	readonly sourceWorkspaceIdentity?: string;
 	readonly inputId?: string;
 	readonly compactStatus?: number;
 	readonly errorCode?: string;
@@ -115,6 +116,10 @@ export class PeerDelegationE2eRecorder implements
 				phase: observation.phase,
 				...optionalUuid('delegationRequestId', input?.delegationRequestId ?? result?.d),
 				...optionalUuid('taskId', input?.taskId ?? result?.t),
+				...(typeof result?.w === 'string'
+					&& /^sha256:[A-Za-z0-9_-]{43}$/u.test(result.w)
+					? { sourceWorkspaceIdentity: result.w }
+					: {}),
 				...optionalUuid('inputId', input?.inputId ?? result?.i),
 				...(typeof result?.s === 'number' && Number.isSafeInteger(result.s)
 					? { compactStatus: result.s }
@@ -218,7 +223,12 @@ export class PeerDelegationE2eRecorder implements
 		if (
 			observation.toolName !== 'mesh_delegate_task'
 			|| observation.invocationId === undefined
-			|| !['invokeStarted', 'taskAvailable', 'invokeCompleted'].includes(observation.phase)
+			|| ![
+				'invokeStarted',
+				'taskIdentified',
+				'taskAvailable',
+				'invokeCompleted',
+			].includes(observation.phase)
 		) {
 			return;
 		}

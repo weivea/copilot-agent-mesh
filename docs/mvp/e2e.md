@@ -124,7 +124,14 @@ non-terminal outcomes such as `needsInput` before requiring lease release.
 If persistence completed but its recorder callback is delayed, an authenticated
 E2E-only lookup resolves the task ID from the facade's immutable persisted
 delegation-request/source-scope binding; it never recomputes identity from the
-current mutable Workspace scope. Cleanup repeatedly attempts cancellation until
+current mutable Workspace scope. The resolver requires the same immutable source
+scope recorded at task identification, so an authenticated caller cannot resolve a
+different source scope merely by knowing its request ID. The binding lives in a
+512-entry, run-nonce-namespaced E2E file registry under the run control root, so it
+survives facade recreation without creating a production cache. Cross-window
+mutations use an exclusive filesystem lock and atomic replacement. The registry
+contains no prompt or Workspace path data, rejects capacity before task dispatch,
+and retires an entry only after terminal state plus lease release. Cleanup repeatedly attempts cancellation until
 terminal lease release is observed. Missing identity, observation failure, general-history truncation
 (including evicted preparations), or lookup failure remains a cleanup failure
 after every identifiable task has been settled.

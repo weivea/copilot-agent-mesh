@@ -1,4 +1,7 @@
 import * as assert from 'assert';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import * as vscode from 'vscode';
 
@@ -21,6 +24,7 @@ import {
 } from '../tools/toolManifest';
 import { DelegatedToolInvocationRegistry } from '../tools/DelegatedToolInvocationRegistry';
 import { TaskToolFacadeError } from '../tools/taskToolFacade';
+import { deterministicTaskId } from '../tools/LocalBrokerTaskFacade';
 import type { AgentMeshExtensionApi } from '../composition/createApplication';
 import { createPeerDelegationE2eApi } from '../composition/PeerDelegationE2eApi';
 import { E2eCapability } from '../composition/E2eCapability';
@@ -28,6 +32,7 @@ import {
 	PeerDelegationE2eRecorder,
 	PeerDelegationE2eToolClock,
 } from '../e2e/PeerDelegationE2eRecorder';
+import { PeerDelegationE2eBindingRegistry } from '../e2e/PeerDelegationE2eBindingRegistry';
 
 suite('Copilot Agent Mesh', () => {
 	test('cold host keeps contributed Tools unavailable while Preview is off', async () => {
@@ -353,8 +358,10 @@ suite('Copilot Agent Mesh', () => {
 			assert.strictEqual(JSON.parse(part.value).e, 'DELEGATION_RECURSION');
 			assert.deepStrictEqual(invocationObservations, [
 				{ phase: 'invokeStarted', invocationSequence: 1 },
+				{ phase: 'taskIdentified', invocationSequence: 1 },
 				{ phase: 'invokeCompleted', invocationSequence: 1 },
 				{ phase: 'invokeStarted', invocationSequence: 2 },
+				{ phase: 'taskIdentified', invocationSequence: 2 },
 				{ phase: 'invokeCompleted', invocationSequence: 2 },
 			]);
 		} finally {
@@ -366,9 +373,31 @@ suite('Copilot Agent Mesh', () => {
 	test('manual API freeze linearizes with the actual delegate Tool ingress gate', async () => {
 		const nonce = '00000000-0000-4000-8000-0000000000a1';
 		const delegationRequestId = '00000000-0000-4000-8000-0000000000a2';
-		const taskId = '00000000-0000-4000-8000-0000000000a3';
+		const sourceWorkspaceIdentity = `sha256:${'a'.repeat(43)}`;
+		const taskId = deterministicTaskId(delegationRequestId, sourceWorkspaceIdentity);
 		const inputId = '00000000-0000-4000-8000-0000000000a4';
 		const recorder = new PeerDelegationE2eRecorder();
+		const registryRoot = await mkdtemp(join(tmpdir(), 'mesh-extension-bindings-'));
+		const delegationBindings = new PeerDelegationE2eBindingRegistry(registryRoot, nonce);
+		const binding = {
+			delegationRequestId,
+			sourceWorkspaceIdentity,
+			taskId,
+		};
+		const bindingReservation = await delegationBindings.reserve(binding);
+		await delegationBindings.finalizeReservation(binding, bindingReservation);
+		const ownerRuntime = {
+			tasks: {
+				list: async () => [{
+					taskId,
+					state: leaseReleased ? 'cancelled' : 'needsInput',
+					workspaceLeaseKey: 'lease',
+					events: [],
+					eventsTruncated: false,
+				}],
+			},
+			leases: { isLeased: () => !leaseReleased },
+		};
 		const capability = E2eCapability.create({
 			mode: 'test',
 			environmentEnabled: true,
@@ -384,11 +413,12 @@ suite('Copilot Agent Mesh', () => {
 			localTasks: Object.create(null),
 			remoteTasks: Object.create(null),
 			runtime: Object.create(null),
-			lifecycle: Object.create(null),
-			ownerRuntime: () => undefined,
+			lifecycle: { snapshot: () => ({ state: 'running' }) } as never,
+			ownerRuntime: () => ownerRuntime as never,
 			capability,
 			recorder,
 			toolClock: new PeerDelegationE2eToolClock(500),
+			delegationBindings,
 		});
 		assert.ok(api);
 		let releasePersistence!: () => void;
@@ -405,7 +435,7 @@ suite('Copilot Agent Mesh', () => {
 			identifyDelegation: () => ({
 				delegationRequestId,
 				taskId,
-				sourceWorkspaceIdentity: `sha256:${'a'.repeat(43)}`,
+				sourceWorkspaceIdentity,
 			}),
 			listWorkers: async () => ({ devices: [], truncated: false }),
 			subscribeToTask: () => ({ dispose: () => undefined }),
@@ -467,13 +497,38 @@ suite('Copilot Agent Mesh', () => {
 			assert.strictEqual(JSON.parse(part.value).s, 1);
 			assert.deepStrictEqual(
 				recorder.snapshot().delegateInvocations.map(({ phase }) => phase),
-				['invokeStarted', 'taskAvailable', 'invokeCompleted'],
+				['invokeStarted', 'taskIdentified', 'taskAvailable', 'invokeCompleted'],
+			);
+			assert.deepStrictEqual(
+				await api.execute(
+					{ nonce, role: 'coordinator' },
+					'peer.manual.task.resolve',
+					{ delegationRequestId, sourceWorkspaceIdentity },
+				),
+				{ taskId },
+			);
+			await assert.rejects(
+				api.execute(
+					{ nonce, role: 'coordinator' },
+					'peer.manual.task.resolve',
+					{
+						delegationRequestId,
+						sourceWorkspaceIdentity: `sha256:${'b'.repeat(43)}`,
+					},
+				),
+				/DELEGATION_NOT_FOUND/u,
 			);
 			await new MeshCancelTaskTool(facade).invoke({
 				input: { taskId },
 				toolInvocationToken: undefined,
 			}, cancellation.token);
 			assert.strictEqual(leaseReleased, true);
+			await api.execute(
+				{ nonce, role: 'coordinator' },
+				'peer.task.evidence',
+				{ taskId },
+			);
+			assert.strictEqual(await delegationBindings.size(), 0);
 			await assert.rejects(
 				() => tool.invoke({
 					input,
@@ -484,6 +539,7 @@ suite('Copilot Agent Mesh', () => {
 			assert.strictEqual(persistCalls, 1);
 		} finally {
 			cancellation.dispose();
+			await rm(registryRoot, { recursive: true, force: true });
 		}
 	});
 
