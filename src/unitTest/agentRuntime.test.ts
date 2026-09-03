@@ -970,6 +970,65 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 		assert.equal(catalog.session(transport.created!.sessionUri), undefined);
 	});
 
+	for (const rejectedAction of [
+		'session/isArchivedChanged',
+		'session/activeClientRemoved',
+	] as const) {
+		for (const terminal of ['chat/turnCancelled', 'chat/error'] as const) {
+			test(`${rejectedAction} rejection preserves authoritative ${terminal}`, async () => {
+				const catalog = new FakeAhpHostCatalog();
+				const transport = new FakeAhpTransport(catalog);
+				transport.rejectDispatchType = rejectedAction;
+				const launcher = new FakeLauncher();
+				launcher.host.preserveTerminalSession = true;
+				const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+				const handle = await runtime.start({
+					...taskRequest(),
+					sourceWindowName: 'frontend',
+				});
+				await nextEvent(handle.events);
+				if (terminal === 'chat/turnCancelled') {
+					await handle.cancel();
+					assert.equal((await nextEvent(handle.events)).type, 'progress');
+				}
+
+				await transport.emitChat(terminal === 'chat/error'
+					? {
+						type: terminal,
+						turnId: currentTurnId(transport),
+						duration: 0,
+						part: { kind: 'error', error: { message: 'Confirmed failure.' } },
+					}
+					: {
+						type: terminal,
+						turnId: currentTurnId(transport),
+						duration: 0,
+					});
+				const terminalEvent = await nextEvent(handle.events);
+				if (terminal === 'chat/turnCancelled') {
+					assert.equal(terminalEvent.type, 'cancelled');
+				} else {
+					assert.equal(terminalEvent.type, 'failed');
+					assert.match(
+						terminalEvent.type === 'failed' ? terminalEvent.error.message : '',
+						/Confirmed failure/u,
+					);
+				}
+				assert.equal((await handle.events[Symbol.asyncIterator]().next()).done, true);
+
+				await assert.rejects(
+					handle.dispose(),
+					(error: unknown) =>
+						error instanceof AgentRuntimeError
+						&& error.cleanupFailed
+						&& /Session history could not be retained/u.test(error.message),
+				);
+				assert.equal(transport.disposeSessionCalls, 1);
+				assert.equal(catalog.session(transport.created!.sessionUri), undefined);
+			});
+		}
+	}
+
 	test('terminal archive waits for the exact Host echo before removing the client', async () => {
 		const transport = new FakeAhpTransport();
 		transport.ackDispatches = false;
@@ -2151,7 +2210,33 @@ test('dispose aborts and awaits in-flight recovery before releasing owned resour
 
 	first.failChat();
 	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	await assert.rejects(
+		handle.dispose(),
+		(error: unknown) => error instanceof AgentRuntimeError
+			&& error.cleanupFailed
+			&& error.message.includes('dispose AHP session'),
+	);
+	assert.equal(recovered.shutdownCalls, 1);
+	assert.equal(launcher.host.disposed, true);
+});
+
+test('dispose after reconnect resolves uses the candidate to remove the unretained Session', async () => {
+	const first = new FakeAhpTransport();
+	const recovered = new FakeAhpTransport();
+	recovered.blockReconnect();
+	recovered.reconnectResult = { type: 'replay', actions: [], missing: [] };
+	const launcher = new FakeLauncher();
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([first, recovered]));
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+	recovered.created = first.created;
+
+	first.failChat();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	await waitForCondition(() => recovered.reconnectRequests.length === 1);
+	recovered.releaseReconnect();
 	await handle.dispose();
+	assert.equal(recovered.disposeSessionCalls, 1);
 	assert.equal(recovered.shutdownCalls, 1);
 	assert.equal(launcher.host.disposed, true);
 });
@@ -2172,7 +2257,62 @@ test('dispose propagates abort to blocked recovery authentication and waits for 
 	await waitForCondition(() => broker.recoveryStarted);
 	await handle.dispose();
 	assert.equal(broker.recoveryAborted, true);
+	assert.equal(recovered.disposeSessionCalls, 1);
 	assert.equal(recovered.shutdownCalls, 1);
+	assert.equal(launcher.host.disposed, true);
+});
+
+test('candidate Session disposal failure still finalizes recovery and releases the owned Host', async () => {
+	const first = new FakeAhpTransport();
+	const recovered = new FakeAhpTransport();
+	recovered.reconnectResult = { type: 'replay', actions: [], missing: [] };
+	recovered.disposeSessionFailuresRemaining = 1;
+	const broker = new AbortableRecoveryAuthBroker();
+	const launcher = new FakeLauncher();
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([first, recovered]), broker);
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+	recovered.created = first.created;
+
+	first.failChat();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	await waitForCondition(() => broker.recoveryStarted);
+	await assert.rejects(
+		handle.dispose(),
+		(error: unknown) => error instanceof AgentRuntimeError
+			&& error.cleanupFailed
+			&& error.message.includes('recovery candidate'),
+	);
+	assert.equal(recovered.disposeSessionCalls, 1);
+	assert.equal(recovered.shutdownCalls, 1);
+	assert.equal(launcher.host.disposed, true);
+	await handle.dispose();
+	assert.equal(recovered.disposeSessionCalls, 1);
+});
+
+test('the next dispose retries a failed retained recovery candidate shutdown', async () => {
+	const first = new FakeAhpTransport();
+	const recovered = new FakeAhpTransport();
+	recovered.reconnectResult = { type: 'replay', actions: [], missing: [] };
+	recovered.shutdownFails = true;
+	const broker = new AbortableRecoveryAuthBroker();
+	const launcher = new FakeLauncher();
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([first, recovered]), broker);
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+	recovered.created = first.created;
+
+	first.failChat();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	await waitForCondition(() => broker.recoveryStarted);
+	await assert.rejects(
+		handle.dispose(),
+		(error: unknown) => error instanceof AgentRuntimeError && error.cleanupFailed,
+	);
+	assert.equal(launcher.host.disposed, false);
+	recovered.shutdownFails = false;
+	await handle.dispose();
+	assert.equal(recovered.shutdownCalls, 3);
 	assert.equal(launcher.host.disposed, true);
 });
 
@@ -2246,6 +2386,39 @@ test('recovery resends unacknowledged turn and input actions with their original
 	await handle.dispose();
 });
 
+test('recovery consumes replayed acknowledgements before resending pending actions', async () => {
+	const first = new FakeAhpTransport();
+	first.ackDispatches = false;
+	const recovered = new FakeAhpTransport();
+	const runtime = createRuntime(new FakeLauncher(), new FakeConnectionFactory([first, recovered]));
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+	recovered.created = first.created;
+	const turn = first.dispatched[0]!;
+	recovered.reconnectResult = {
+		type: 'replay',
+		actions: [envelope(
+			turn.channel,
+			turn.action,
+			8,
+			{
+				clientId: first.created!.clientId,
+				clientSeq: turn.clientSeq,
+			},
+		)],
+		missing: [],
+	};
+
+	first.failChat();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	assert.deepEqual(
+		await nextEvent(handle.events),
+		{ type: 'progress', message: 'Agent Host connection recovered.' },
+	);
+	assert.equal(recovered.dispatched.length, 0);
+	await handle.dispose();
+});
+
 test('recovery resends unacknowledged cancellation and rejects writes until candidate takeover', async () => {
 	const first = new FakeAhpTransport();
 	const recovered = new FakeAhpTransport();
@@ -2293,7 +2466,12 @@ test('runtime preserves non-missing recovery connection failures', async () => {
 	if (failed.type === 'failed') {
 		assert.equal(failed.error.code, 'AGENT_UNAVAILABLE');
 	}
-	await handle.dispose();
+	await assert.rejects(
+		handle.dispose(),
+		(error: unknown) => error instanceof AgentRuntimeError
+			&& error.cleanupFailed
+			&& error.message.includes('dispose AHP session'),
+	);
 });
 
 test('recovery fails rather than taking over without the root subscription', async () => {
@@ -2312,6 +2490,7 @@ test('recovery fails rather than taking over without the root subscription', asy
 	if (failed.type === 'failed') {
 		assert.equal(failed.error.code, 'TASK_RECOVERY_UNAVAILABLE');
 	}
+	assert.equal(recovered.dispatched.length, 0);
 	await handle.dispose();
 });
 
@@ -2691,6 +2870,184 @@ test('terminal Session preparation does not confuse an older connection with a l
 	await handle.dispose();
 	assert.equal(third.disposeSessionCalls, 0);
 });
+
+for (const terminal of [
+	'chat/turnComplete',
+	'chat/turnCancelled',
+	'chat/error',
+] as const) {
+	test(`terminal ${terminal} survives disconnect before active-client removal acknowledgement`, async () => {
+		await assertTerminalRemovalRecovery(terminal, terminal === 'chat/turnComplete' ? 2 : 1);
+	});
+}
+
+test('terminal snapshot recovery resends and acknowledges the pending active-client removal', async () => {
+	const catalog = new FakeAhpHostCatalog();
+	const first = new FakeAhpTransport(catalog);
+	const recovered = new FakeAhpTransport(catalog);
+	const launcher = new FakeLauncher();
+	launcher.host.preserveTerminalSession = true;
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([first, recovered]));
+	const handle = await runtime.start({
+		...taskRequest(),
+		sourceWindowName: 'frontend',
+	});
+	await nextEvent(handle.events);
+	const turnId = currentTurnId(first);
+	first.ackDispatches = false;
+	recovered.created = first.created;
+
+	void first.emitChat({
+		type: 'chat/turnComplete',
+		turnId,
+		duration: 0,
+	});
+	await waitForCondition(() =>
+		first.dispatched.some(({ action }) => action.type === 'session/isArchivedChanged'));
+	await first.acknowledgeDispatch('session/isArchivedChanged');
+	await waitForCondition(() =>
+		first.dispatched.some(({ action }) => action.type === 'session/activeClientRemoved'));
+	const removal = first.dispatched.find(({ action }) =>
+		action.type === 'session/activeClientRemoved')!;
+	recovered.reconnectResult = {
+		type: 'snapshot',
+		snapshots: [
+			{
+				resource: 'ahp-root://',
+				fromSeq: 10,
+				state: {
+					agents: [{
+						provider: 'dynamic-provider',
+						displayName: 'Dynamic Provider',
+						description: 'Test provider',
+						models: [],
+						protectedResources: [protectedResource],
+					}],
+					terminals: [],
+				},
+			} as Snapshot,
+			{
+				resource: first.created!.sessionUri,
+				fromSeq: 10,
+				state: {
+					resource: first.created!.sessionUri,
+					provider: 'dynamic-provider',
+					title: 'Task',
+					status: 1,
+					lifecycle: 'ready',
+					activeClients: [],
+					chats: [],
+					defaultChat: 'ahp-chat:/default',
+				},
+			} as Snapshot,
+			{
+				resource: 'ahp-chat:/default',
+				fromSeq: 10,
+				state: {
+					resource: 'ahp-chat:/default',
+					title: 'Recovered',
+					status: 1,
+					modifiedAt: new Date(0).toISOString(),
+					activeTurn: undefined,
+					turns: [{
+						id: turnId,
+						message: { text: 'safe', origin: { kind: 'user' } },
+						responseParts: [],
+						usage: undefined,
+						state: 'complete',
+					}],
+				},
+			} as Snapshot,
+		],
+	};
+
+	first.failRoot();
+	await waitForCondition(() => recovered.reconnectRequests.length === 1);
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	const terminalEvent = await nextEvent(handle.events);
+	if (terminalEvent.type === 'failed') {
+		throw terminalEvent.error;
+	}
+	assert.equal(terminalEvent.type, 'completed');
+	const recoveredRemoval = recovered.dispatched.find(({ action }) =>
+		action.type === 'session/activeClientRemoved');
+	assert.equal(recoveredRemoval?.clientSeq, removal.clientSeq);
+	assert.deepEqual(
+		recovered.dispatched.map(({ action }) => action.type),
+		['session/activeClientRemoved'],
+	);
+	assert.equal((await handle.events[Symbol.asyncIterator]().next()).done, true);
+	await handle.dispose();
+	assert.equal(recovered.disposeSessionCalls, 0);
+	assert.equal(catalog.session(first.created!.sessionUri)?.activeClientCount, 0);
+});
+
+for (const terminal of ['chat/turnCancelled', 'chat/error'] as const) {
+	test(`recovery failure preserves authoritative ${terminal} before removal acknowledgement`, async () => {
+		const catalog = new FakeAhpHostCatalog();
+		const first = new FakeAhpTransport(catalog);
+		let connectCalls = 0;
+		const launcher = new FakeLauncher();
+		launcher.host.preserveTerminalSession = true;
+		const runtime = createRuntime(launcher, {
+			connect: async () => {
+				connectCalls += 1;
+				if (connectCalls === 1) {
+					return first;
+				}
+				throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'Synthetic recovery failure.');
+			},
+		});
+		const handle = await runtime.start({
+			...taskRequest(),
+			sourceWindowName: 'frontend',
+		});
+		await nextEvent(handle.events);
+		first.ackDispatches = false;
+		if (terminal === 'chat/turnCancelled') {
+			await handle.cancel();
+			assert.equal((await nextEvent(handle.events)).type, 'progress');
+		}
+
+		void first.emitChat(terminal === 'chat/error'
+			? {
+				type: terminal,
+				turnId: currentTurnId(first),
+				duration: 0,
+				part: { kind: 'error', error: { message: 'Confirmed failure.' } },
+			}
+			: {
+				type: terminal,
+				turnId: currentTurnId(first),
+				duration: 0,
+			});
+		await waitForCondition(() =>
+			first.dispatched.some(({ action }) => action.type === 'session/isArchivedChanged'));
+		await first.acknowledgeDispatch('session/isArchivedChanged');
+		await waitForCondition(() =>
+			first.dispatched.some(({ action }) => action.type === 'session/activeClientRemoved'));
+		first.failRoot();
+		await waitForCondition(() => connectCalls === 2);
+		assert.equal((await nextEvent(handle.events)).type, 'progress');
+		const terminalEvent = await nextEvent(handle.events);
+		if (terminal === 'chat/turnCancelled') {
+			assert.equal(terminalEvent.type, 'cancelled');
+		} else {
+			assert.equal(terminalEvent.type, 'failed');
+			assert.match(
+				terminalEvent.type === 'failed' ? terminalEvent.error.message : '',
+				/Confirmed failure/u,
+			);
+		}
+		assert.equal((await handle.events[Symbol.asyncIterator]().next()).done, true);
+		await assert.rejects(
+			handle.dispose(),
+			(error: unknown) => error instanceof AgentRuntimeError && error.cleanupFailed,
+		);
+		assert.equal(launcher.host.disposed, true);
+		assert.equal(catalog.session(first.created!.sessionUri)?.activeClientCount, 1);
+	});
+}
 
 test('recovery applies Session readiness before an earlier terminal Chat snapshot', async () => {
 	const catalog = new FakeAhpHostCatalog();
@@ -4083,6 +4440,7 @@ class FakeAhpTransport implements AhpConnection {
 	notificationDuringInitialize: readonly ProtectedResource[] = [];
 	rootAttachedBeforeInitialize = false;
 	disposeSessionCalls = 0;
+	disposeSessionFailuresRemaining = 0;
 	shutdownCalls = 0;
 	shutdownFails = false;
 	listSessionsCalls = 0;
@@ -4451,6 +4809,10 @@ class FakeAhpTransport implements AhpConnection {
 	async disposeSession(uri: string): Promise<void> {
 		this.assertOpen();
 		this.disposeSessionCalls += 1;
+		if (this.disposeSessionFailuresRemaining > 0) {
+			this.disposeSessionFailuresRemaining -= 1;
+			throw new Error('synthetic Session disposal failure');
+		}
 		this.hostCatalog?.dispose(uri);
 	}
 
@@ -4655,6 +5017,140 @@ function envelope(
 		serverSeq,
 		origin,
 	} as unknown as ActionEnvelope;
+}
+
+async function assertTerminalRemovalRecovery(
+	terminal: 'chat/turnComplete' | 'chat/turnCancelled' | 'chat/error',
+	recoveryCount: 1 | 2,
+): Promise<void> {
+	const catalog = new FakeAhpHostCatalog();
+	const first = new FakeAhpTransport(catalog);
+	const intermediate = recoveryCount === 2 ? new FakeAhpTransport(catalog) : undefined;
+	if (intermediate !== undefined) {
+		intermediate.ackDispatches = false;
+		intermediate.reconnectResult = { type: 'replay', actions: [], missing: [] };
+	}
+	const recovered = new FakeAhpTransport(catalog);
+	const transports = intermediate === undefined
+		? [first, recovered]
+		: [first, intermediate, recovered];
+	const launcher = new FakeLauncher();
+	launcher.host.preserveTerminalSession = true;
+	const runtime = createRuntime(launcher, new FakeConnectionFactory(transports));
+	const handle = await runtime.start({
+		...taskRequest(),
+		sourceWindowName: 'frontend',
+	});
+	await nextEvent(handle.events);
+	first.ackDispatches = false;
+	if (intermediate !== undefined) {
+		intermediate.created = first.created;
+	}
+	recovered.created = first.created;
+	if (terminal === 'chat/turnCancelled') {
+		await handle.cancel();
+		assert.equal((await nextEvent(handle.events)).type, 'progress');
+	}
+
+	void first.emitChat(terminal === 'chat/error'
+		? {
+			type: terminal,
+			turnId: currentTurnId(first),
+			duration: 0,
+			part: { kind: 'error', error: { message: 'Confirmed failure.' } },
+		}
+		: {
+			type: terminal,
+			turnId: currentTurnId(first),
+			duration: 0,
+		});
+	await waitForCondition(() =>
+		first.dispatched.some(({ action }) => action.type === 'session/isArchivedChanged'));
+	await first.acknowledgeDispatch('session/isArchivedChanged');
+	await waitForCondition(() =>
+		first.dispatched.some(({ action }) => action.type === 'session/activeClientRemoved'));
+	const removal = first.dispatched.find(({ action }) =>
+		action.type === 'session/activeClientRemoved')!;
+	const removalEcho = envelope(
+		first.created!.sessionUri,
+		removal.action,
+		20,
+		{
+			clientId: first.created!.clientId,
+			clientSeq: removal.clientSeq,
+		},
+	);
+
+	if (intermediate !== undefined) {
+		first.failRoot();
+		assert.equal((await nextEvent(handle.events)).type, 'progress');
+		assert.deepEqual(
+			await nextEvent(handle.events),
+			{ type: 'progress', message: 'Agent Host connection recovered.' },
+		);
+		assert.equal(
+			intermediate.reconnectRequests[0]?.subscriptions.includes(first.created!.sessionUri),
+			true,
+		);
+		await waitForCondition(() =>
+			intermediate.dispatched.some(({ action }) =>
+				action.type === 'session/activeClientRemoved'));
+		catalog.removeClient(first.created!.sessionUri, first.created!.clientId);
+		recovered.reconnectResult = {
+			type: 'replay',
+			actions: [removalEcho],
+			missing: [],
+		};
+		intermediate.failRoot();
+	} else {
+		catalog.removeClient(first.created!.sessionUri, first.created!.clientId);
+		recovered.reconnectResult = {
+			type: 'replay',
+			actions: [removalEcho],
+			missing: [],
+		};
+		first.failRoot();
+	}
+
+	let terminalEvent: AgentRuntimeEvent | undefined;
+	while (terminalEvent === undefined) {
+		const event = await nextEvent(handle.events);
+		if (event.type === 'completed' || event.type === 'failed' || event.type === 'cancelled') {
+			terminalEvent = event;
+		}
+	}
+	if (terminal === 'chat/turnComplete') {
+		assert.equal(terminalEvent.type, 'completed');
+	} else if (terminal === 'chat/turnCancelled') {
+		assert.equal(terminalEvent.type, 'cancelled');
+	} else {
+		assert.equal(terminalEvent.type, 'failed');
+		assert.match(
+			terminalEvent.type === 'failed' ? terminalEvent.error.message : '',
+			/Confirmed failure/u,
+		);
+	}
+	assert.equal(
+		recovered.reconnectRequests[0]?.subscriptions.includes(first.created!.sessionUri),
+		true,
+	);
+	assert.equal(
+		recovered.dispatched.some(({ action }) => action.type === 'session/activeClientRemoved'),
+		false,
+	);
+	const removalDispatches = [first, intermediate, recovered]
+		.filter((transport): transport is FakeAhpTransport => transport !== undefined)
+		.flatMap((transport) =>
+		transport.dispatched.filter(({ action }) => action.type === 'session/activeClientRemoved'));
+	assert.deepEqual(
+		[...new Set(removalDispatches.map(({ clientSeq }) => clientSeq))],
+		[removal.clientSeq],
+	);
+	assert.equal((await handle.events[Symbol.asyncIterator]().next()).done, true);
+	await handle.dispose();
+	assert.equal(recovered.disposeSessionCalls, 0);
+	assert.equal(catalog.session(first.created!.sessionUri)?.historyState, 'done');
+	assert.equal(catalog.session(first.created!.sessionUri)?.activeClientCount, 0);
 }
 
 async function nextEvent(events: AsyncIterable<AgentRuntimeEvent>): Promise<AgentRuntimeEvent> {
