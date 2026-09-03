@@ -201,6 +201,15 @@ export class LocalBrokerTaskFacade implements TaskToolFacade {
 		const node = device?.nodes.find(({ nodeId, nodeInstanceId }) =>
 			nodeId === intent.nodeId && nodeInstanceId === intent.nodeInstanceId,
 		);
+		if (
+			node?.status === 'offline'
+			|| (
+				node === undefined
+				&& device?.nodes.some(({ nodeId }) => nodeId === intent.nodeId)
+			)
+		) {
+			throw new TaskToolFacadeError('PEER_OFFLINE', true);
+		}
 		const workspace = node?.workspaces.find(({ workspaceId }) =>
 			workspaceId === intent.workspaceId,
 		);

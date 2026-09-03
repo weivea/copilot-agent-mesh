@@ -24,6 +24,10 @@ import {
 	parseManualPostDetachAttestation,
 	waitForManualPostDetachAttestation,
 } from '../e2e/PeerDelegationManualEvidence';
+import {
+	assessExactTargetLiveness,
+	summarizeManualInvocation,
+} from '../e2e/PeerDelegationManualMonitor';
 
 const runId = '00000000-0000-4000-8000-000000000001';
 const taskId = '00000000-0000-4000-8000-000000000002';
@@ -137,6 +141,22 @@ test('editor catalog diagnostics classify tagged protocol and timeout failures',
 test('peer-delegation evidence rejects unsafe persistent content', () => {
 	const base = unverifiedEvidence();
 	assert.doesNotThrow(() => parsePeerDelegationEvidence(base));
+	assert.doesNotThrow(() => parsePeerDelegationEvidence({
+		...base,
+		outcome: 'fail',
+		failure: {
+			code: 'TARGET_WINDOW_CLOSED',
+			message: 'The exact target window controller closed before Tool invocation.',
+			manualInvocation: {
+				phase: 'target-liveness',
+				preparedCount: 0,
+				prepareFailedCount: 0,
+				invokeStartedCount: 0,
+				invokeCompletedCount: 0,
+				taskIdPresent: false,
+			},
+		},
+	}));
 	assert.throws(
 		() => parsePeerDelegationEvidence({
 			...base,
@@ -367,6 +387,90 @@ test('peer-delegation recorder stores identities and hashes without prompt or ou
 			r: 'do not persist this output',
 		},
 	});
+
+	test('manual monitor preserves a safe preparation failure without task identifiers', () => {
+		const recorder = new PeerDelegationE2eRecorder();
+		recorder.observe({
+			toolName: 'mesh_delegate_task',
+			phase: 'prepareFailed',
+			input: {
+				delegationRequestId,
+				nodeId: 'do-not-persist-node-id',
+				prompt: 'do not persist this prompt',
+			},
+			errorCode: 'PEER_OFFLINE',
+		});
+
+		const observation = recorder.snapshot().tools[0];
+		assert.equal(observation?.phase, 'prepareFailed');
+		assert.equal(observation?.errorCode, 'PEER_OFFLINE');
+		assert.equal(observation?.taskId, undefined);
+		assert.equal(JSON.stringify(observation).includes('do-not-persist'), false);
+		assert.deepEqual(summarizeManualInvocation([{
+			phase: observation!.phase,
+			errorCode: observation!.errorCode,
+			taskIdPresent: observation!.taskId !== undefined,
+		}]), {
+			preparedCount: 0,
+			prepareFailedCount: 1,
+			invokeStartedCount: 0,
+			invokeCompletedCount: 0,
+			errorCode: 'PEER_OFFLINE',
+			taskIdPresent: false,
+		});
+	});
+
+	test('manual monitor rejects a closed or replaced exact target and accepts the normal path', () => {
+		const target = {
+			nodeId: 'node-one',
+			nodeInstanceId: 'instance-one',
+			workspaceId: 'workspace-one',
+		};
+		const controllerState = {
+			node: {
+				nodeId: target.nodeId,
+				nodeInstanceId: target.nodeInstanceId,
+				state: 'online',
+				registered: true,
+				workspaceCount: 1,
+			},
+		};
+		const exactNode = {
+			nodeId: target.nodeId,
+			nodeInstanceId: target.nodeInstanceId,
+			status: 'online',
+			workspaces: [{
+				workspaceId: target.workspaceId,
+				claimStatus: 'claimed',
+				enabled: true,
+			}],
+		};
+
+		assert.deepEqual(
+			assessExactTargetLiveness(target, controllerState, { localNodes: [exactNode] }),
+			{ ok: true },
+		);
+		assert.deepEqual(
+			assessExactTargetLiveness(target, undefined, { localNodes: [exactNode] }),
+			{ ok: false, code: 'PEER_OFFLINE' },
+		);
+		assert.deepEqual(
+			assessExactTargetLiveness(target, controllerState, {
+				localNodes: [{ ...exactNode, nodeInstanceId: 'replacement-instance' }],
+			}),
+			{ ok: false, code: 'PEER_OFFLINE' },
+			'A replacement instance must not satisfy the exact target claim.',
+		);
+		assert.deepEqual(
+			assessExactTargetLiveness(target, controllerState, {
+				localNodes: [{
+					...exactNode,
+					workspaces: [{ ...exactNode.workspaces[0], workspaceId: 'replacement-workspace' }],
+				}],
+			}),
+			{ ok: false, code: 'PEER_OFFLINE' },
+		);
+	});
 	recorder.observeLifecycle({
 		taskId,
 		eventType: 'session/hostObserved',
@@ -521,6 +625,15 @@ test('0.4.0 release metadata keeps the real peer gate default-off and five-tool 
 		false,
 		'Manual completion must not read Session visibility before task-handle detach.',
 	);
+	assert.match(
+		harness.slice(manualCompletion, manualCompletionEnd),
+		/Promise\.allSettled\([\s\S]*controller\.state[\s\S]*peer\.dashboard\.snapshot/u,
+	);
+	assert.match(
+		harness.slice(manualCompletion, manualCompletionEnd),
+		/prepareFailedCount[\s\S]*TARGET_WINDOW_CLOSED[\s\S]*assessExactTargetLiveness/u,
+	);
+	assert.match(harness, /manualInvocation[\s\S]*taskIdPresent/u);
 	assert.ok(
 		detachWait >= 0
 			&& detachWait < catalogProbe

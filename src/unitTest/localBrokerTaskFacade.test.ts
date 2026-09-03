@@ -72,6 +72,39 @@ test('local facade lists this device and every broker-listed node opaquely', asy
 	assert.doesNotMatch(JSON.stringify(directory), /file:|Users|prompt|secret|output/u);
 });
 
+test('local facade reports the exact target offline instead of selecting a replacement instance', async () => {
+	const client = new FakeWindowNodeClient();
+	const online = await client.listNodes();
+	client.directory = {
+		...online,
+		nodes: online.nodes.map((node) => node.nodeId === NODE_ID
+			? { ...node, nodeInstanceId: OTHER_INSTANCE_ID }
+			: node),
+	};
+	const facade = new LocalBrokerTaskFacade(client, { deviceName: 'Local Device' });
+
+	await assert.rejects(
+		() => facade.describeDelegationTarget(intent(), new AbortController().signal),
+		(error: unknown) =>
+			error instanceof TaskToolFacadeError
+			&& error.code === 'PEER_OFFLINE'
+			&& error.retryable,
+	);
+
+	client.directory = {
+		...online,
+		nodes: online.nodes.map((node) => node.nodeId === NODE_ID
+			? { ...node, status: 'offline' as const }
+			: node),
+	};
+	await assert.rejects(
+		() => facade.describeDelegationTarget(intent(), new AbortController().signal),
+		(error: unknown) =>
+			error instanceof TaskToolFacadeError
+			&& error.code === 'PEER_OFFLINE',
+	);
+});
+
 test('stable task IDs survive facade reload and changed retries surface broker conflict', async () => {
 	const client = new FakeWindowNodeClient();
 	const firstFacade = new LocalBrokerTaskFacade(client, { deviceName: 'Local Device' });
@@ -319,6 +352,7 @@ class FakeWindowNodeClient {
 	startCalls = 0;
 	lastStart?: RoutedTaskStartParams;
 	listError?: unknown;
+	directory?: NodeDirectoryResult;
 
 	get stateListenerCount(): number {
 		return this.stateListeners.size;
@@ -344,7 +378,7 @@ class FakeWindowNodeClient {
 		if (this.listError !== undefined) {
 			throw this.listError;
 		}
-		return {
+		return this.directory ?? {
 			deviceId: DEVICE_ID,
 			truncated: false,
 			totalNodes: 2,

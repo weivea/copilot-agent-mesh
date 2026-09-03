@@ -273,6 +273,16 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 	failure: z.strictObject({
 		code: stableCode,
 		message: z.string().min(1).max(512),
+		manualInvocation: z.strictObject({
+			phase: z.enum(['target-liveness', 'prepare', 'invoke', 'timeout']),
+			preparedCount: nonNegativeInteger,
+			prepareFailedCount: nonNegativeInteger,
+			invokeStartedCount: nonNegativeInteger,
+			invokeCompletedCount: nonNegativeInteger,
+			compactStatus: z.number().int().min(0).max(3).optional(),
+			errorCode: stableCode.optional(),
+			taskIdPresent: z.boolean(),
+		}).optional(),
 	}).optional(),
 }).superRefine((evidence, context) => {
 	const itemNumbers = evidence.ac5.map(({ item }) => item);

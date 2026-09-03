@@ -84,6 +84,8 @@ export class PeerDelegationE2eRecorder implements
 					: {}),
 				...(typeof result?.e === 'string' && stableCodePattern.test(result.e)
 					? { errorCode: result.e }
+					: observation.errorCode !== undefined
+						? { errorCode: observation.errorCode }
 					: {}),
 				...(typeof result?.x === 'string' && /^(?:budget|peer|token)$/u.test(result.x)
 					? { cancellationReason: result.x }

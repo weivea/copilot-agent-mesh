@@ -91,6 +91,15 @@ harness never solicits or accepts UI evidence as Pass. Without the
 post-detach phase, AC-5 item 5 and UI visibility remain `unverified`, and the
 command exits nonzero. Diagnostics-only `MANUAL_UI=0` behavior is unchanged.
 
+Throughout the preceding 15-minute manual invocation window, the harness polls the
+Target controller and the Source view of the exact node instance and Workspace.
+A closed Target controller fails immediately as `TARGET_WINDOW_CLOSED`; an offline
+or replaced exact claim fails as `PEER_OFFLINE`. The harness never binds to a new
+instance. Preparation and invocation failures retain only bounded phase counts,
+compact status, a safe error code, and a task-ID-present boolean. These early
+failures still run the normal Profile Lock, Workspace lease, process, socket, and
+timer cleanup.
+
 Sanitized JSON and a short summary are written to:
 
 - `artifacts/peer-delegation-e2e/evidence.json`
@@ -339,6 +348,16 @@ The final authenticated run passed on VS Code `1.135.0`, macOS arm64:
 The evidence stores event kinds and booleans only; it contains no token, account,
 path, raw prompt, or raw output. Gate G0 is therefore **Go for the validated
 macOS arm64 Preview scope**.
+
+A later VS Code `1.136.0` manual run
+`8bbd94cb-0a8f-4471-8e5f-8500dcea0afa` confirmed that Agent Host advertised
+protocol versions including `1.0.0` and that both ordinary Window Nodes initially
+registered. The Target Extension Host then received a renderer termination request
+and exited cleanly three seconds before Tool preparation reported the selected
+target unavailable. This was a closed-window/offline-target diagnostic failure,
+not evidence of an AHP crash or incompatibility. The harness now reports that
+condition promptly and safely; retained-Done UI behavior on 1.136 still requires
+a fresh successful manual run.
 
 The real two-device v2 run also passed one-Tunnel pairing, explicit remote
 Device → Node → Workspace discovery, and durable task acceptance. The Worker

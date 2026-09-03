@@ -213,6 +213,18 @@ export class TaskToolsCore {
 			cancellation,
 		);
 		if (displayOutcome.kind !== 'success') {
+			if (
+				displayOutcome.kind === 'failure'
+				&& displayOutcome.error instanceof TaskToolFacadeError
+			) {
+				throw displayOutcome.error;
+			}
+			if (displayOutcome.kind === 'cancelled') {
+				throw new TaskToolFacadeError('CANCELLED', true);
+			}
+			if (displayOutcome.kind === 'timeout') {
+				throw new TaskToolFacadeError('TIMEOUT', true);
+			}
 			throw new Error('The selected delegation target is unavailable.');
 		}
 		const windowName = safeDelegationText(displayOutcome.value.windowName, 256);

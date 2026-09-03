@@ -10,7 +10,7 @@ import {
 	TaskToolsCoreOptions,
 	ToolJsonResult,
 } from './taskToolsCore';
-import { TaskToolFacade } from './taskToolFacade';
+import { TaskToolFacade, TaskToolFacadeError } from './taskToolFacade';
 import {
 	assertMeshToolNameParity,
 	MESH_RUNTIME_TOOL_NAMES,
@@ -34,12 +34,13 @@ abstract class TaskToolBase {
 
 	protected observe(
 		toolName: string,
-		phase: 'prepared' | 'invokeStarted' | 'invokeCompleted',
+		phase: 'prepareFailed' | 'prepared' | 'invokeStarted' | 'invokeCompleted',
 		input: unknown,
 		result?: ToolJsonResult,
+		errorCode?: TaskToolFacadeError['code'],
 	): void {
 		try {
-			this.observer?.observe({ toolName, phase, input, result });
+			this.observer?.observe({ toolName, phase, input, result, errorCode });
 		} catch {
 			// Diagnostics must never affect Tool execution.
 		}
@@ -104,7 +105,19 @@ export class MeshDelegateTaskTool extends TaskToolBase implements vscode.Languag
 		options: vscode.LanguageModelToolInvocationPrepareOptions<DelegateTaskInput>,
 		token: vscode.CancellationToken,
 	): Promise<vscode.PreparedToolInvocation> {
-		const preparation = await this.core().prepareDelegateInvocation(options.input, token);
+		let preparation;
+		try {
+			preparation = await this.core().prepareDelegateInvocation(options.input, token);
+		} catch (error: unknown) {
+			this.observe(
+				MESH_TOOL_NAMES.delegateTask,
+				'prepareFailed',
+				options.input,
+				undefined,
+				error instanceof TaskToolFacadeError ? error.code : 'INTERNAL_ERROR',
+			);
+			throw error;
+		}
 		this.observe(MESH_TOOL_NAMES.delegateTask, 'prepared', options.input);
 		return {
 			invocationMessage: preparation.invocationMessage,

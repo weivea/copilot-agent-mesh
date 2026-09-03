@@ -219,6 +219,45 @@ suite('Copilot Agent Mesh', () => {
 		}
 	});
 
+	test('delegate preparation reports a safe offline observation before rethrowing', async () => {
+		const facade = createTaskToolFacade();
+		facade.describeDelegationTarget = async () => {
+			throw new TaskToolFacadeError('PEER_OFFLINE', true);
+		};
+		const observations: Array<{ phase: string; errorCode?: string }> = [];
+		const tool = new MeshDelegateTaskTool(facade, {}, {
+			observe: (observation) => observations.push({
+				phase: observation.phase,
+				...(observation.errorCode === undefined ? {} : { errorCode: observation.errorCode }),
+			}),
+		});
+		const cancellation = new vscode.CancellationTokenSource();
+		try {
+			await assert.rejects(
+				() => tool.prepareInvocation({
+					input: {
+						delegationRequestId: '00000000-0000-4000-8000-000000000004',
+						deviceId: '00000000-0000-4000-8000-000000000001',
+						nodeId: '00000000-0000-4000-8000-000000000007',
+						nodeInstanceId: '00000000-0000-4000-8000-000000000008',
+						workspaceId: '00000000-0000-4000-8000-000000000002',
+						title: 'Offline preparation',
+						prompt: 'Verify safe preparation failure observation.',
+					},
+				}, cancellation.token),
+				(error: unknown) =>
+					error instanceof TaskToolFacadeError
+					&& error.code === 'PEER_OFFLINE',
+			);
+			assert.deepStrictEqual(observations, [{
+				phase: 'prepareFailed',
+				errorCode: 'PEER_OFFLINE',
+			}]);
+		} finally {
+			cancellation.dispose();
+		}
+	});
+
 	test('registered delegate tool carries an exact child correlation into its facade', async () => {
 		const delegatedToolInvocations = new DelegatedToolInvocationRegistry();
 		const executionContext = {
