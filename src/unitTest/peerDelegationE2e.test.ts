@@ -837,7 +837,7 @@ test('0.4.0 release metadata keeps the real peer gate default-off and five-tool 
 		'utf8',
 	);
 	assert.equal(manifest.version, '0.4.0');
-	assert.equal(lockfile.packages['node_modules/fast-uri'].version, '3.1.5');
+	assert.equal(lockfile.packages['node_modules/fast-uri'].version, '3.1.6');
 	assert.equal(
 		manifest.scripts['test:peer-delegation-real'],
 		'node scripts/e2e/peer-delegation/run.mjs',
