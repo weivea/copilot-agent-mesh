@@ -122,16 +122,22 @@ task persistence. Cleanup uses task IDs from that milestone or any retained
 completion, even when truncation evicted the matching start, and cancels
 non-terminal outcomes such as `needsInput` before requiring lease release.
 If persistence completed but its recorder callback is delayed, an authenticated
-E2E-only lookup derives the owner-scoped task ID from the delegation request and
-cleanup repeatedly attempts cancellation until terminal lease release is
-observed. Missing identity, observation failure, general-history truncation
+E2E-only lookup resolves the task ID from the facade's immutable persisted
+delegation-request/source-scope binding; it never recomputes identity from the
+current mutable Workspace scope. Cleanup repeatedly attempts cancellation until
+terminal lease release is observed. Missing identity, observation failure, general-history truncation
 (including evicted preparations), or lookup failure remains a cleanup failure
 after every identifiable task has been settled.
 Invocation pairing uses a per-invocation UUID rather than a tool-instance
 counter, so extension re-registration cannot pair unrelated starts and
-completions. A dedicated bounded invocation ledger retains starts, task
-identities, and completions independently of the general observation ring;
-ledger overflow fails cleanup closed.
+completions. Before task persistence, the production E2E ingress gate atomically
+reserves one of 512 dedicated invocation-ledger slots. Capacity exhaustion
+freezes and rejects the next invocation before it can create a task; occupied
+slots are never evicted merely because an invocation returned `needsInput`.
+The ledger retains starts, task identities, and completions independently of
+the general observation ring. A bounded emergency reconciliation slot retains
+the affected task identity if an impossible post-reservation overflow is
+observed, and ledger overflow still fails cleanup closed.
 Preparation and invocation failures retain only bounded phase counts, compact
 status, a safe error code, task-ID presence, and an unexpected-invocation count.
 Final timer evidence is always a fresh `peer.resources` observation immediately

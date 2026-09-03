@@ -975,6 +975,13 @@ test('recorder fails closed when bounded task-identity retention overflows', () 
 	assert.equal(snapshot.tools.length, 512);
 	assert.equal(snapshot.truncated, true);
 	assert.equal(snapshot.delegateInvocationsTruncated, true);
+	assert.equal(
+		snapshot.delegateInvocations.some(
+			({ taskId }) => taskId === '00000000-0000-4000-8000-000000000201',
+		),
+		true,
+		'The bounded overflow reconciliation slot must retain the affected task identity.',
+	);
 });
 
 test('manual monitor accounts for missing and wrong post-prompt correlation IDs', () => {

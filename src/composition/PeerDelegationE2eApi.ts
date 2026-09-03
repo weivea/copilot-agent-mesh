@@ -128,7 +128,7 @@ export function createPeerDelegationE2eApi(
 					return { frozen: true };
 				case 'peer.manual.task.resolve':
 					return {
-						taskId: options.localTasks.taskIdForDelegationRequest(
+						taskId: options.localTasks.persistedTaskIdForDelegationRequest(
 							requiredUuid(params, 'delegationRequestId'),
 						),
 					};

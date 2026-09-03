@@ -43,6 +43,10 @@ abstract class TaskToolBase {
 		this.invocationGate?.assertDelegateInvocationAllowed();
 	}
 
+	protected reserveDelegateInvocation(invocationId: string): void {
+		this.invocationGate?.reserveDelegateInvocation(invocationId);
+	}
+
 	protected observe(
 		toolName: string,
 		phase: TaskToolInvocationPhase,
@@ -176,9 +180,9 @@ export class MeshDelegateTaskTool extends TaskToolBase implements vscode.Languag
 		options: vscode.LanguageModelToolInvocationOptions<DelegateTaskInput>,
 		token: vscode.CancellationToken,
 	): Promise<vscode.LanguageModelToolResult> {
-		this.assertDelegateInvocationAllowed();
-		const invocationSequence = ++this.nextInvocationSequence;
 		const invocationId = randomUUID();
+		this.reserveDelegateInvocation(invocationId);
+		const invocationSequence = ++this.nextInvocationSequence;
 		this.observe(
 			MESH_TOOL_NAMES.delegateTask,
 			'invokeStarted',

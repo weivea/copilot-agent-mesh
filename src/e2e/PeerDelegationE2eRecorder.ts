@@ -66,6 +66,8 @@ export class PeerDelegationE2eRecorder implements
 	private sequence = 0;
 	private readonly tools: SafePeerToolObservation[] = [];
 	private readonly delegateInvocations = new Map<string, SafePeerToolObservation[]>();
+	private readonly overflowDelegateInvocations = new Map<string, SafePeerToolObservation[]>();
+	private readonly delegateInvocationReservations = new Set<string>();
 	private readonly ahp: SafePeerAhpObservation[] = [];
 	private truncated = false;
 	private delegateInvocationsTruncated = false;
@@ -79,6 +81,21 @@ export class PeerDelegationE2eRecorder implements
 
 	public freezeDelegateInvocations(): void {
 		this.delegateInvocationsFrozen = true;
+	}
+
+	public reserveDelegateInvocation(invocationId: string): void {
+		if (!uuidPattern.test(invocationId)) {
+			throw new TypeError('The delegate invocation identity is invalid.');
+		}
+		this.assertDelegateInvocationAllowed();
+		if (
+			!this.delegateInvocationReservations.has(invocationId)
+			&& this.delegateInvocationReservations.size >= maximumObservations
+		) {
+			this.delegateInvocationsFrozen = true;
+			throw new Error('Manual delegation invocation evidence capacity is exhausted.');
+		}
+		this.delegateInvocationReservations.add(invocationId);
 	}
 
 	public observe(observation: TaskToolInvocationObservation): void {
@@ -174,6 +191,7 @@ export class PeerDelegationE2eRecorder implements
 		return {
 			tools: this.tools.map((observation) => ({ ...observation })),
 			delegateInvocations: [...this.delegateInvocations.values()]
+				.concat([...this.overflowDelegateInvocations.values()])
 				.flat()
 				.sort((left, right) => left.sequence - right.sequence)
 				.map((observation) => ({ ...observation })),
@@ -205,18 +223,29 @@ export class PeerDelegationE2eRecorder implements
 			return;
 		}
 		const lifecycle = this.delegateInvocations.get(observation.invocationId) ?? [];
+		if (!this.delegateInvocationReservations.has(observation.invocationId)) {
+			try {
+				this.reserveDelegateInvocation(observation.invocationId);
+			} catch {
+				this.delegateInvocationsTruncated = true;
+				this.delegateInvocationsFrozen = true;
+				if (
+					this.overflowDelegateInvocations.size === 0
+					|| this.overflowDelegateInvocations.has(observation.invocationId)
+				) {
+					const overflow = this.overflowDelegateInvocations.get(observation.invocationId) ?? [];
+					overflow.push(observation);
+					this.overflowDelegateInvocations.set(observation.invocationId, overflow);
+				}
+				return;
+			}
+		}
 		lifecycle.push(observation);
 		this.delegateInvocations.set(observation.invocationId, lifecycle);
-		if (this.delegateInvocations.size <= maximumObservations) {
-			return;
+		if (this.delegateInvocations.size > maximumObservations) {
+			this.delegateInvocationsTruncated = true;
+			this.delegateInvocationsFrozen = true;
 		}
-		const completed = [...this.delegateInvocations].find(([, entries]) =>
-			entries.some(({ phase }) => phase === 'invokeCompleted'));
-		const evicted = completed ?? this.delegateInvocations.entries().next().value;
-		if (evicted !== undefined) {
-			this.delegateInvocations.delete(evicted[0]);
-		}
-		this.delegateInvocationsTruncated = true;
 	}
 }
 

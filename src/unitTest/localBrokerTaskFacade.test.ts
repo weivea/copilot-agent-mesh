@@ -113,7 +113,7 @@ test('stable task IDs survive facade reload and changed retries surface broker c
 	const retry = await reloadedFacade.persistDelegationIntent(intent());
 
 	assert.equal(first.taskId, deterministicTaskId(DELEGATION_ID));
-	assert.equal(reloadedFacade.taskIdForDelegationRequest(DELEGATION_ID), first.taskId);
+	assert.equal(firstFacade.persistedTaskIdForDelegationRequest(DELEGATION_ID), first.taskId);
 	assert.equal(retry.taskId, first.taskId);
 	assert.equal(first.recovered, false);
 	assert.equal(retry.recovered, true);
@@ -177,11 +177,101 @@ test('source Workspace identity scopes stable delegation keys independently of d
 	const independent = await sourceB.persistDelegationIntent(intent());
 
 	assert.equal(first.taskId, deterministicTaskId(DELEGATION_ID, SOURCE_IDENTITY_A));
-	assert.equal(sourceA.taskIdForDelegationRequest(DELEGATION_ID), first.taskId);
+	assert.equal(sourceA.persistedTaskIdForDelegationRequest(DELEGATION_ID), first.taskId);
 	assert.equal(retry.taskId, first.taskId);
 	assert.notEqual(independent.taskId, first.taskId);
 	assert.equal(independent.taskId, deterministicTaskId(DELEGATION_ID, SOURCE_IDENTITY_B));
 	assert.equal(client.lastStart?.sourceWorkspaceIdentity, SOURCE_IDENTITY_B);
+});
+
+test('persisted delegation resolution keeps the immutable source scope after it changes', async () => {
+	const client = new FakeWindowNodeClient();
+	let sourceIdentity = SOURCE_IDENTITY_A;
+	const facade = new LocalBrokerTaskFacade(client, {
+		deviceName: 'Source',
+		sourceWorkspaceIdentity: () => sourceIdentity,
+	});
+	const persisted = await facade.persistDelegationIntent(intent());
+
+	sourceIdentity = SOURCE_IDENTITY_B;
+	const resolvedTaskId = facade.persistedTaskIdForDelegationRequest(DELEGATION_ID);
+	assert.equal(
+		resolvedTaskId,
+		persisted.taskId,
+	);
+	assert.notEqual(
+		persisted.taskId,
+		deterministicTaskId(DELEGATION_ID, SOURCE_IDENTITY_B),
+	);
+	assert.deepEqual(
+		await facade.cancelOwnedTask(
+			{ taskId: resolvedTaskId },
+			new AbortController().signal,
+		),
+		{ taskId: persisted.taskId, status: 'cancelled' },
+	);
+	assert.equal(client.tasks.get(persisted.taskId)?.snapshot.state, 'cancelled');
+	await assert.rejects(
+		facade.persistDelegationIntent(intent()),
+		(error: unknown) =>
+			error instanceof TaskToolFacadeError
+			&& error.code === 'IDEMPOTENCY_CONFLICT',
+	);
+	assert.equal(facade.persistedTaskIdForDelegationRequest(DELEGATION_ID), persisted.taskId);
+	assert.throws(
+		() => facade.persistedTaskIdForDelegationRequest(
+			'00000000-0000-4000-8000-000000000099',
+		),
+		(error: unknown) =>
+			error instanceof TaskToolFacadeError
+			&& error.code === 'DELEGATION_NOT_FOUND',
+	);
+});
+
+test('explicit persisted source scope resolves without a facade scope callback', async () => {
+	const client = new FakeWindowNodeClient();
+	const facade = new LocalBrokerTaskFacade(client, { deviceName: 'Source' });
+	const persisted = await facade.persistDelegationIntent({
+		...intent(),
+		sourceWorkspaceIdentity: SOURCE_IDENTITY_A,
+	});
+
+	assert.equal(
+		facade.persistedTaskIdForDelegationRequest(DELEGATION_ID),
+		persisted.taskId,
+	);
+	assert.equal(
+		persisted.taskId,
+		deterministicTaskId(DELEGATION_ID, SOURCE_IDENTITY_A),
+	);
+});
+
+test('ambiguous start failure retains the immutable request binding before dispatch returns', async () => {
+	const client = new FakeWindowNodeClient();
+	client.throwAfterStart = true;
+	let sourceIdentity = SOURCE_IDENTITY_A;
+	const facade = new LocalBrokerTaskFacade(client, {
+		deviceName: 'Source',
+		sourceWorkspaceIdentity: () => sourceIdentity,
+	});
+	await assert.rejects(
+		facade.persistDelegationIntent(intent()),
+		(error: unknown) =>
+			error instanceof TaskToolFacadeError
+			&& error.code === 'INTERNAL_ERROR',
+	);
+	const originalTaskId = deterministicTaskId(DELEGATION_ID, SOURCE_IDENTITY_A);
+	assert.equal(facade.persistedTaskIdForDelegationRequest(DELEGATION_ID), originalTaskId);
+
+	sourceIdentity = SOURCE_IDENTITY_B;
+	await assert.rejects(
+		facade.persistDelegationIntent(intent()),
+		(error: unknown) =>
+			error instanceof TaskToolFacadeError
+			&& error.code === 'IDEMPOTENCY_CONFLICT',
+	);
+	assert.equal(client.startCalls, 1);
+	assert.equal(facade.persistedTaskIdForDelegationRequest(DELEGATION_ID), originalTaskId);
 });
 
 test('claimed Workspace-set scope is order-stable and changes only with membership', () => {
@@ -355,6 +445,7 @@ class FakeWindowNodeClient {
 	lastStart?: RoutedTaskStartParams;
 	listError?: unknown;
 	directory?: NodeDirectoryResult;
+	throwAfterStart = false;
 
 	get stateListenerCount(): number {
 		return this.stateListeners.size;
@@ -427,6 +518,9 @@ class FakeWindowNodeClient {
 		}
 		const snapshot = taskSnapshot(input);
 		this.tasks.set(input.taskId, { input: structuredClone(input), snapshot });
+		if (this.throwAfterStart) {
+			throw new Error('ambiguous start');
+		}
 		return snapshot;
 	}
 

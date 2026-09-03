@@ -26,4 +26,5 @@ export interface TaskToolInvocationObserver {
 
 export interface TaskToolInvocationGate {
 	assertDelegateInvocationAllowed(): void;
+	reserveDelegateInvocation(invocationId: string): void;
 }

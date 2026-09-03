@@ -99,6 +99,10 @@ export class LocalBrokerTaskFacade implements TaskToolFacade {
 	private readonly deviceName: () => string;
 	private readonly now: () => Date;
 	private persistenceQueue = Promise.resolve();
+	private readonly persistedDelegations = new Map<string, {
+		readonly sourceWorkspaceIdentity?: string;
+		readonly taskId: string;
+	}>();
 
 	public constructor(
 		private readonly client: WindowNodeFacadeClient,
@@ -192,9 +196,16 @@ export class LocalBrokerTaskFacade implements TaskToolFacade {
 		};
 	}
 
-	public taskIdForDelegationRequest(delegationRequestId: string): string {
-		const sourceWorkspaceIdentity = this.options.sourceWorkspaceIdentity?.();
-		return deterministicTaskId(delegationRequestId, sourceWorkspaceIdentity);
+	public persistedTaskIdForDelegationRequest(delegationRequestId: string): string {
+		const requestId = uuidSchema.parse(delegationRequestId);
+		const binding = this.persistedDelegations.get(requestId);
+		if (binding === undefined) {
+			throw new TaskToolFacadeError('DELEGATION_NOT_FOUND');
+		}
+		if (deterministicTaskId(requestId, binding.sourceWorkspaceIdentity) !== binding.taskId) {
+			throw new TaskToolFacadeError('OUTPUT_INVALID');
+		}
+		return binding.taskId;
 	}
 
 	public async describeDelegationTarget(
@@ -316,12 +327,34 @@ export class LocalBrokerTaskFacade implements TaskToolFacade {
 		try {
 			const identity = this.identifyDelegation(intent);
 			const { delegationRequestId, taskId, sourceWorkspaceIdentity } = identity;
+			const persistedSourceScope = (
+				intent.sourceWorkspaceIdentity !== undefined
+				|| this.options.sourceWorkspaceIdentity !== undefined
+			)
+				? sourceWorkspaceIdentity
+				: undefined;
+			const existingBinding = this.persistedDelegations.get(delegationRequestId);
+			if (
+				existingBinding !== undefined
+				&& (
+					existingBinding.taskId !== taskId
+					|| existingBinding.sourceWorkspaceIdentity !== persistedSourceScope
+				)
+			) {
+				throw new TaskToolFacadeError('IDEMPOTENCY_CONFLICT');
+			}
 			const target = {
 				deviceId: uuidSchema.parse(intent.deviceId),
 				nodeId: uuidSchema.parse(intent.nodeId),
 				nodeInstanceId: uuidSchema.parse(intent.nodeInstanceId),
 				workspaceId: uuidSchema.parse(intent.workspaceId),
 			};
+			this.persistedDelegations.set(delegationRequestId, {
+				...(persistedSourceScope === undefined
+					? {}
+					: { sourceWorkspaceIdentity: persistedSourceScope }),
+				taskId,
+			});
 			let existing: TaskSnapshot | TaskSnapshotAfterEventSeq | undefined;
 			let remote: RemoteTaskRouteAdapter | undefined;
 			let remotePeerId: string | undefined;
