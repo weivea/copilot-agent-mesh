@@ -580,6 +580,7 @@ export function classifyEditorCatalogError(error: unknown): EditorCatalogErrorKi
 }
 
 function resourceMetrics(options: PeerDelegationE2eApiOptions): {
+	readonly activeWorkspaceLeaseCount: number;
 	readonly listener: { readonly startAttempts: number };
 	readonly tunnel: {
 		readonly loadAttempts: number;
@@ -588,14 +589,11 @@ function resourceMetrics(options: PeerDelegationE2eApiOptions): {
 	};
 	readonly toolTimers: ReturnType<PeerDelegationE2eToolClock['snapshot']>;
 } {
-	const owner = options.ownerRuntime();
+	const owner = requireOwner(options);
 	return {
-		listener: owner?.listener.lifecycleMetrics() ?? { startAttempts: 0 },
-		tunnel: owner?.tunnel.lifecycleMetrics() ?? {
-			loadAttempts: 0,
-			probeAttempts: 0,
-			ensureHostedAttempts: 0,
-		},
+		activeWorkspaceLeaseCount: owner.leases.activeLeaseCount(),
+		listener: owner.listener.lifecycleMetrics(),
+		tunnel: owner.tunnel.lifecycleMetrics(),
 		toolTimers: options.toolClock.snapshot(),
 	};
 }

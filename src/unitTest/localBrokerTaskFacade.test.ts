@@ -72,6 +72,52 @@ test('local facade lists this device and every broker-listed node opaquely', asy
 	assert.doesNotMatch(JSON.stringify(directory), /file:|Users|prompt|secret|output/u);
 });
 
+test('target description distinguishes an offline exact instance from a missing Workspace', async () => {
+	const client = new FakeWindowNodeClient();
+	const facade = new LocalBrokerTaskFacade(
+		client,
+		{ deviceName: 'Local Device' },
+	);
+	const target = intent();
+
+	assert.deepStrictEqual(
+		await facade.describeDelegationTarget(target, new AbortController().signal),
+		{ windowName: 'This Window', workspaceName: 'Repository' },
+	);
+	await assert.rejects(
+		facade.describeDelegationTarget(
+			{ ...target, nodeInstanceId: OTHER_INSTANCE_ID },
+			new AbortController().signal,
+		),
+		(error: unknown) =>
+			error instanceof TaskToolFacadeError
+			&& error.code === 'PEER_OFFLINE'
+			&& error.retryable,
+	);
+	client.primaryStatus = 'offline';
+	await assert.rejects(
+		facade.describeDelegationTarget(target, new AbortController().signal),
+		(error: unknown) =>
+			error instanceof TaskToolFacadeError
+			&& error.code === 'PEER_OFFLINE'
+			&& error.retryable,
+	);
+	client.primaryStatus = 'online';
+	await assert.rejects(
+		facade.describeDelegationTarget(
+			{
+				...target,
+				nodeId: OTHER_NODE_ID,
+				nodeInstanceId: OTHER_INSTANCE_ID,
+			},
+			new AbortController().signal,
+		),
+		(error: unknown) =>
+			error instanceof TaskToolFacadeError
+			&& error.code === 'WORKSPACE_NOT_FOUND',
+	);
+});
+
 test('stable task IDs survive facade reload and changed retries surface broker conflict', async () => {
 	const client = new FakeWindowNodeClient();
 	const firstFacade = new LocalBrokerTaskFacade(client, { deviceName: 'Local Device' });
@@ -319,6 +365,7 @@ class FakeWindowNodeClient {
 	startCalls = 0;
 	lastStart?: RoutedTaskStartParams;
 	listError?: unknown;
+	primaryStatus: NodeDirectoryResult['nodes'][number]['status'] = 'online';
 
 	get stateListenerCount(): number {
 		return this.stateListeners.size;
@@ -352,11 +399,11 @@ class FakeWindowNodeClient {
 				nodeId: NODE_ID,
 				nodeInstanceId: NODE_INSTANCE_ID,
 				label: 'This Window',
-				status: 'online',
+				status: this.primaryStatus,
 				capabilities: ['tasks'],
 				startedAt: '2026-08-25T00:00:00.000Z',
 				lastHeartbeatAt: '2026-08-25T00:00:01.000Z',
-				workspaces: [{
+				workspaces: this.primaryStatus === 'offline' ? [] : [{
 					workspaceId: WORKSPACE_ID,
 					workspaceIdentity: `sha256:${'A'.repeat(43)}`,
 					name: 'Repository',

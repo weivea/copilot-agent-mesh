@@ -172,6 +172,7 @@ let cleanupOperation;
 let ownershipSampler;
 let ownershipSamplerStarted = false;
 let ownershipSamplerFailure;
+let resourceMetricController;
 let testDirtyTree = false;
 let testEvidencePersistenceAllowed = true;
 
@@ -215,6 +216,7 @@ try {
 
 	assert.equal(currentOwnedProcesses().length, 0, 'Fresh peer E2E markers matched an existing process.');
 	const source = await launchAndDiscover(sourceWorkspacePath);
+	resourceMetricController = source;
 	activeControllers.set(source.windowId, source);
 	await waitForControllerState(
 		source,
@@ -408,14 +410,7 @@ try {
 		localRouteOnly: transportPass,
 	};
 	setAc5(10, transportPass ? 'pass' : 'fail', transportPass ? ['#/transport'] : []);
-	cleanupLeaseReleased = completionAvailable
-		? [
-			evidence.completion.leaseReleased,
-			evidence.needsInput.leaseReleased,
-			evidence.cancellation.leaseReleased,
-			evidence.timeout.leaseReleased,
-		].every(Boolean)
-		: evidence.completion.leaseReleased;
+	cleanupLeaseReleased = latestResourceMetrics.activeWorkspaceLeaseCount === 0;
 	assert.equal(latestResourceMetrics.toolTimers.activeTimers, 0);
 	assert.equal(latestResourceMetrics.toolTimers.armedBudgetTimers, 0);
 	await assertProjectUnchanged(sourceWorkspacePath);
@@ -1448,6 +1443,15 @@ async function waitForManualCompletion(source, targetInputBase) {
 		const matching = observations.tools.filter(
 			(observation) => observation.delegationRequestId === delegationRequestId,
 		);
+		const preparationFailures = matching.filter(({ phase }) => phase === 'prepareFailed');
+		if (preparationFailures.length > 0) {
+			const failure = preparationFailures[0];
+			throw new E2eRequestError(
+				'mesh_delegate_task.prepare',
+				failure.errorCode ?? 'INTERNAL_ERROR',
+				'The manual delegation target became unavailable before invocation.',
+			);
+		}
 		const preparedCount = matching.filter(({ phase }) => phase === 'prepared').length;
 		const acceptedCount = matching.filter(({ phase }) => phase === 'invokeStarted').length;
 		const completedObservations = matching.filter(({ phase }) => phase === 'invokeCompleted');
@@ -1871,6 +1875,19 @@ async function performCleanupOnce() {
 			},
 		},
 		{ name: 'stop-ownership-sampler', run: async () => stopOwnershipSampler() },
+		{
+			name: 'observe-workspace-leases',
+			run: async () => {
+				if (resourceMetricController === undefined) {
+					throw new Error('The authoritative Broker lease metric is unavailable.');
+				}
+				latestResourceMetrics = await request(resourceMetricController, 'peer.resources');
+				cleanupLeaseReleased = latestResourceMetrics.activeWorkspaceLeaseCount === 0;
+				if (!cleanupLeaseReleased) {
+					throw new Error('The authoritative Broker reports an active Workspace lease.');
+				}
+			},
+		},
 		{ name: 'close-controllers', run: closeControllers },
 		{
 			name: 'owned-processes',

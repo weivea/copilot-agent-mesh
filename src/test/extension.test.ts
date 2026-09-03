@@ -22,6 +22,7 @@ import {
 import { DelegatedToolInvocationRegistry } from '../tools/DelegatedToolInvocationRegistry';
 import { TaskToolFacadeError } from '../tools/taskToolFacade';
 import type { AgentMeshExtensionApi } from '../composition/createApplication';
+import type { TaskToolInvocationObservation } from '../tools/TaskToolInvocationObserver';
 
 suite('Copilot Agent Mesh', () => {
 	test('cold host keeps contributed Tools unavailable while Preview is off', async () => {
@@ -146,6 +147,48 @@ suite('Copilot Agent Mesh', () => {
 
 	test('provides the global WebSocket required by the pinned AHP transport', () => {
 		assert.strictEqual(typeof globalThis.WebSocket, 'function');
+	});
+
+	test('delegate preparation records a safe exact failure without starting a task', async () => {
+		const facade = createTaskToolFacade();
+		let persistCalls = 0;
+		const observations: TaskToolInvocationObservation[] = [];
+		const tool = new MeshDelegateTaskTool({
+			...facade,
+			describeDelegationTarget: async () => {
+				throw new TaskToolFacadeError('PEER_OFFLINE', true);
+			},
+			persistDelegationIntent: async (...args) => {
+				persistCalls += 1;
+				return facade.persistDelegationIntent(...args);
+			},
+		}, {}, { observe: (observation) => observations.push(observation) });
+		const cancellation = new vscode.CancellationTokenSource();
+		try {
+			await assert.rejects(
+				tool.prepareInvocation({
+					input: {
+						deviceId: '00000000-0000-4000-8000-000000000001',
+						nodeId: '00000000-0000-4000-8000-000000000007',
+						nodeInstanceId: '00000000-0000-4000-8000-000000000008',
+						workspaceId: '00000000-0000-4000-8000-000000000002',
+						title: 'Offline target',
+						prompt: 'Do not start.',
+					},
+				}, cancellation.token),
+				(error: unknown) =>
+					error instanceof TaskToolFacadeError
+					&& error.code === 'PEER_OFFLINE'
+					&& error.retryable,
+			);
+		} finally {
+			cancellation.dispose();
+		}
+		assert.equal(persistCalls, 0);
+		assert.deepStrictEqual(
+			observations.map(({ phase, errorCode }) => ({ phase, errorCode })),
+			[{ phase: 'prepareFailed', errorCode: 'PEER_OFFLINE' }],
+		);
 	});
 
 	test('all production tools contain tokenizer failures without retrying the tokenizer', async () => {

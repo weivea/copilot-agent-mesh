@@ -144,6 +144,8 @@ for tests"_），因此现有 `WebSocketTransport.fromSocket(socket)` 可以直�
 submodule（`f19dd8b3942d029744a3bdd31d830f9428e8ea47`，TypeScript client 0.9.0，
 protocol offer 1.0.0）完全一致。这同时再次印证了不跟随 upstream `60706330`
 （AHP 0.9.0 offer）的既定决策：那会与 VS Code 1.135.0 的 `^1.0.0` 要求不兼容。
+VS Code 1.136.0 的后续诊断也接受同一 AHP 1.0 offer；运行 `8bbd…` 的失败发生在
+目标 renderer 关闭、Tool prepare 找不到 exact node instance 时，并非 AHP 协商失败。
 
 ## 5. Q4 — Session 可见性与 Provider 目录
 

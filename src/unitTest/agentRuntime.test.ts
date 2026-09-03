@@ -2439,6 +2439,259 @@ test('recovery applies replayed Session readiness before an earlier terminal act
 	assert.equal(recovered.disposeSessionCalls, 0);
 });
 
+test('candidate subscription loss during recovery handoff starts another recovery', async () => {
+	const first = new FakeAhpTransport();
+	first.sessionStartsProvisional = true;
+	const handoff = new FakeAhpTransport();
+	handoff.finishSubscriptionsOnReconnect = true;
+	handoff.reconnectResult = {
+		type: 'replay',
+		actions: [],
+		missing: [],
+	};
+	const recovered = new FakeAhpTransport();
+	recovered.reconnectResult = { type: 'replay', actions: [], missing: [] };
+	const factory = new FakeConnectionFactory([first, handoff, recovered]);
+	const launcher = new FakeLauncher();
+	launcher.host.preserveTerminalSession = true;
+	const runtime = createRuntime(launcher, factory);
+	const handle = await runtime.start({
+		...taskRequest(),
+		sourceWindowName: 'frontend',
+	});
+	await nextEvent(handle.events);
+	handoff.created = first.created;
+	recovered.created = first.created;
+	handoff.reconnectResult = {
+		type: 'replay',
+		actions: [envelope(
+			first.created!.sessionUri,
+			{ type: 'session/ready' },
+			12,
+		)],
+		missing: [],
+	};
+
+	void first.emitChat({
+		type: 'chat/turnComplete',
+		turnId: currentTurnId(first),
+		duration: 0,
+	});
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	first.failRoot();
+	await waitForCondition(() => recovered.reconnectRequests.length === 1);
+	assert.equal(factory.connectCalls, 3);
+
+	let terminalEvent: AgentRuntimeEvent | undefined;
+	while (terminalEvent === undefined) {
+		const event = await nextEvent(handle.events);
+		if (event.type === 'completed' || event.type === 'failed' || event.type === 'cancelled') {
+			terminalEvent = event;
+		}
+	}
+	if (terminalEvent.type === 'failed') {
+		throw terminalEvent.error;
+	}
+	assert.equal(terminalEvent.type, 'completed');
+	assert.deepEqual(
+		recovered.dispatched
+			.filter(({ action }) =>
+				action.type === 'session/isArchivedChanged'
+				|| action.type === 'session/activeClientRemoved')
+			.map(({ action }) => action.type),
+		['session/isArchivedChanged', 'session/activeClientRemoved'],
+	);
+	await handle.dispose();
+});
+
+test('terminal Session preparation continues on the recovered connection after archive acknowledgement', async () => {
+	const catalog = new FakeAhpHostCatalog();
+	const first = new FakeAhpTransport(catalog);
+	const recovered = new FakeAhpTransport(catalog);
+	recovered.reconnectResult = { type: 'replay', actions: [], missing: [] };
+	const launcher = new FakeLauncher();
+	launcher.host.preserveTerminalSession = true;
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([first, recovered]));
+	const handle = await runtime.start({
+		...taskRequest(),
+		sourceWindowName: 'frontend',
+	});
+	await nextEvent(handle.events);
+	first.ackDispatches = false;
+	recovered.created = first.created;
+
+	void first.emitChat({
+		type: 'chat/turnComplete',
+		turnId: currentTurnId(first),
+		duration: 0,
+	});
+	await waitForCondition(() =>
+		first.dispatched.some(({ action }) => action.type === 'session/isArchivedChanged'));
+	first.failRoot();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+
+	let terminalEvent: AgentRuntimeEvent | undefined;
+	while (terminalEvent === undefined) {
+		const event = await nextEvent(handle.events);
+		if (event.type === 'completed' || event.type === 'failed' || event.type === 'cancelled') {
+			terminalEvent = event;
+		}
+	}
+	if (terminalEvent.type === 'failed') {
+		throw terminalEvent.error;
+	}
+	assert.equal(terminalEvent.type, 'completed');
+	assert.deepEqual(
+		recovered.dispatched
+			.filter(({ action }) =>
+				action.type === 'session/isArchivedChanged'
+				|| action.type === 'session/activeClientRemoved')
+			.map(({ action }) => action.type),
+		['session/isArchivedChanged', 'session/activeClientRemoved'],
+	);
+	await handle.dispose();
+	assert.equal(recovered.disposeSessionCalls, 0);
+	assert.equal(catalog.session(first.created!.sessionUri)?.historyState, 'done');
+	assert.equal(catalog.session(first.created!.sessionUri)?.activeClientCount, 0);
+});
+
+test('terminal Session preparation rebinds after recovered provisional Session readiness', async () => {
+	const first = new FakeAhpTransport();
+	first.sessionStartsProvisional = true;
+	const recovered = new FakeAhpTransport();
+	const launcher = new FakeLauncher();
+	launcher.host.preserveTerminalSession = true;
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([first, recovered]));
+	const handle = await runtime.start({
+		...taskRequest(),
+		sourceWindowName: 'frontend',
+	});
+	await nextEvent(handle.events);
+	recovered.created = first.created;
+	recovered.reconnectResult = {
+		type: 'replay',
+		actions: [envelope(
+			first.created!.sessionUri,
+			{ type: 'session/ready' },
+			12,
+		)],
+		missing: [],
+	};
+
+	void first.emitChat({
+		type: 'chat/turnComplete',
+		turnId: currentTurnId(first),
+		duration: 0,
+	});
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(
+		first.dispatched.some(({ action }) => action.type === 'session/isArchivedChanged'),
+		false,
+	);
+	first.failRoot();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+
+	let terminalEvent: AgentRuntimeEvent | undefined;
+	while (terminalEvent === undefined) {
+		const event = await nextEvent(handle.events);
+		if (event.type === 'completed' || event.type === 'failed' || event.type === 'cancelled') {
+			terminalEvent = event;
+		}
+	}
+	if (terminalEvent.type === 'failed') {
+		throw terminalEvent.error;
+	}
+	assert.equal(terminalEvent.type, 'completed');
+	assert.deepEqual(
+		recovered.dispatched
+			.filter(({ action }) =>
+				action.type === 'session/isArchivedChanged'
+				|| action.type === 'session/activeClientRemoved')
+			.map(({ action }) => action.type),
+		['session/isArchivedChanged', 'session/activeClientRemoved'],
+	);
+	await handle.dispose();
+	assert.equal(recovered.disposeSessionCalls, 0);
+});
+
+test('terminal Session preparation does not confuse an older connection with a later recovery candidate', async () => {
+	const first = new FakeAhpTransport();
+	const second = new FakeAhpTransport();
+	second.ackDispatches = false;
+	second.reconnectResult = { type: 'replay', actions: [], missing: [] };
+	const third = new FakeAhpTransport();
+	const launcher = new FakeLauncher();
+	launcher.host.preserveTerminalSession = true;
+	const runtime = createRuntime(
+		launcher,
+		new FakeConnectionFactory([first, second, third]),
+	);
+	const handle = await runtime.start({
+		...taskRequest(),
+		sourceWindowName: 'frontend',
+	});
+	await nextEvent(handle.events);
+	first.ackDispatches = false;
+	second.created = first.created;
+	third.created = first.created;
+
+	void first.emitChat({
+		type: 'chat/turnComplete',
+		turnId: currentTurnId(first),
+		duration: 0,
+	});
+	await waitForCondition(() =>
+		first.dispatched.some(({ action }) => action.type === 'session/isArchivedChanged'));
+	const archive = first.dispatched.find(({ action }) =>
+		action.type === 'session/isArchivedChanged')!;
+	first.failRoot();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	assert.deepEqual(
+		await nextEvent(handle.events),
+		{ type: 'progress', message: 'Agent Host connection recovered.' },
+	);
+	await waitForCondition(() =>
+		second.dispatched.some(({ action }) => action.type === 'session/isArchivedChanged'));
+
+	third.reconnectResult = {
+		type: 'replay',
+		actions: [envelope(
+			first.created!.sessionUri,
+			archive.action,
+			12,
+			{
+				clientId: first.created!.clientId,
+				clientSeq: archive.clientSeq,
+			},
+		)],
+		missing: [],
+	};
+	second.failRoot();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+
+	let terminalEvent: AgentRuntimeEvent | undefined;
+	while (terminalEvent === undefined) {
+		const event = await nextEvent(handle.events);
+		if (event.type === 'completed' || event.type === 'failed' || event.type === 'cancelled') {
+			terminalEvent = event;
+		}
+	}
+	if (terminalEvent.type === 'failed') {
+		throw terminalEvent.error;
+	}
+	assert.equal(terminalEvent.type, 'completed');
+	assert.equal(
+		third.dispatched.some(({ action }) => action.type === 'session/activeClientRemoved'),
+		true,
+	);
+	assert.equal(
+		first.dispatched.some(({ action }) => action.type === 'session/activeClientRemoved'),
+		false,
+	);
+	await handle.dispose();
+	assert.equal(third.disposeSessionCalls, 0);
+});
+
 test('recovery applies Session readiness before an earlier terminal Chat snapshot', async () => {
 	const catalog = new FakeAhpHostCatalog();
 	const first = new FakeAhpTransport(catalog);
@@ -3865,6 +4118,7 @@ class FakeAhpTransport implements AhpConnection {
 	}>();
 	readonly subscribeAttempts: string[] = [];
 	private shutdownComplete = false;
+	finishSubscriptionsOnReconnect = false;
 
 	constructor(private readonly hostCatalog?: FakeAhpHostCatalog) {}
 
@@ -3908,6 +4162,11 @@ class FakeAhpTransport implements AhpConnection {
 		this.initializedClientId = clientId;
 		this.reconnectRequests.push({ clientId, lastSeenServerSeq, subscriptions: [...subscriptions] });
 		await this.reconnectBarrier;
+		if (this.finishSubscriptionsOnReconnect) {
+			for (const queue of this.queues.values()) {
+				queue.finish();
+			}
+		}
 		return this.reconnectResult;
 	}
 

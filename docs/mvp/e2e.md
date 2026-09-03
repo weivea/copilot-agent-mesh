@@ -194,6 +194,14 @@ produced a valid **Unverified** artifact rather than a false Pass:
   enabled command, a signed-in dedicated profile, one visible Agent-mode Tool
   confirmation, and an honest `retained-done`/`retained-working`/`absent` attestation.
 
+A later VS Code 1.136 diagnostic run (`8bbd…`) negotiated AHP 1.0 successfully
+but the target renderer closed before delegation preparation. That is a
+retryable `PEER_OFFLINE` diagnostic, not an AHP compatibility failure. The
+harness records the bounded `prepareFailed` code immediately and proves cleanup
+from the Broker owner's read-only active Workspace lease count; it does not
+infer lease release from Tool history. A fresh retained-Done manual run remains
+required.
+
 The default `npm test` remains offline. The real test is explicit because it creates a
 public Dev Tunnel and may consume Copilot quota:
 
