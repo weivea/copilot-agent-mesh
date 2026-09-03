@@ -276,9 +276,13 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 		manualInvocation: z.strictObject({
 			phase: z.enum(['target-liveness', 'prepare', 'invoke', 'timeout']),
 			preparedCount: nonNegativeInteger,
+			prepareStartedCount: nonNegativeInteger,
 			prepareFailedCount: nonNegativeInteger,
 			invokeStartedCount: nonNegativeInteger,
 			invokeCompletedCount: nonNegativeInteger,
+			unexpectedInvocationCount: nonNegativeInteger,
+			unexpectedActivityCount: nonNegativeInteger,
+			unresolvedPreparationCount: nonNegativeInteger,
 			compactStatus: z.number().int().min(0).max(3).optional(),
 			errorCode: stableCode.optional(),
 			taskIdPresent: z.boolean(),

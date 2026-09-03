@@ -123,6 +123,9 @@ export function createPeerDelegationE2eApi(
 					return invokeCoreDelegateAndCancelAfterEvents(options, requiredRecord(params, 'input'));
 				case 'peer.observations':
 					return options.recorder.snapshot();
+				case 'peer.manual.freeze':
+					options.recorder.freezeDelegateInvocations();
+					return { frozen: true };
 				case 'peer.budget.arm':
 					options.toolClock.armNextBudgetTimer();
 					return { armed: true };

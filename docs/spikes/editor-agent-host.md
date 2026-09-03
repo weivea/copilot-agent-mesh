@@ -149,8 +149,12 @@ VS Code 1.136 的后续日志同样公布了包含 `1.0.0` 的 `protocolVersions
 offer 与 pinned client 无需升级。一次手工 E2E 中 Target Extension Host 在
 Tool preparation 前收到 renderer terminate 并以 code 0 正常退出，随后精确 Node
 离线；这只能证明目标窗口已关闭，不能归因为 AHP crash。Harness 因此在手工等待期持续
-校验 Target controller、精确 `nodeId`/`nodeInstanceId` 和 Workspace claim，并以
-`TARGET_WINDOW_CLOSED` 或 `PEER_OFFLINE` 安全终止，不会改绑替代实例。
+校验 Target controller、精确 `nodeId`/`nodeInstanceId` 和 Workspace claim。Controller
+请求失败后会先对 Source Tool observations 作有界、序列化复查：一旦 invocation 已开始，
+继续等待权威 Tool/task 结果；只有精确 Extension Host 进程已不存在时才报告
+`TARGET_WINDOW_CLOSED`。精确 claim 离线或被替代时报告 `PEER_OFFLINE`，绝不改绑替代实例。
+Prompt 前的 observation checkpoint 还会覆盖所有随后出现的 `mesh_delegate_task` start；
+缺失/错误 correlation、历史截断或重复阶段都不能产生 exactly-once Pass。
 
 ## 5. Q4 — Session 可见性与 Provider 目录
 

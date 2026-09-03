@@ -224,11 +224,18 @@ suite('Copilot Agent Mesh', () => {
 		facade.describeDelegationTarget = async () => {
 			throw new TaskToolFacadeError('PEER_OFFLINE', true);
 		};
-		const observations: Array<{ phase: string; errorCode?: string }> = [];
+		const observations: Array<{
+			phase: string;
+			errorCode?: string;
+			preparationSequence?: number;
+		}> = [];
 		const tool = new MeshDelegateTaskTool(facade, {}, {
 			observe: (observation) => observations.push({
 				phase: observation.phase,
 				...(observation.errorCode === undefined ? {} : { errorCode: observation.errorCode }),
+				...(observation.preparationSequence === undefined
+					? {}
+					: { preparationSequence: observation.preparationSequence }),
 			}),
 		});
 		const cancellation = new vscode.CancellationTokenSource();
@@ -249,10 +256,14 @@ suite('Copilot Agent Mesh', () => {
 					error instanceof TaskToolFacadeError
 					&& error.code === 'PEER_OFFLINE',
 			);
-			assert.deepStrictEqual(observations, [{
-				phase: 'prepareFailed',
-				errorCode: 'PEER_OFFLINE',
-			}]);
+			assert.deepStrictEqual(observations, [
+				{ phase: 'prepareStarted', preparationSequence: 1 },
+				{
+					phase: 'prepareFailed',
+					errorCode: 'PEER_OFFLINE',
+					preparationSequence: 1,
+				},
+			]);
 		} finally {
 			cancellation.dispose();
 		}
@@ -307,10 +318,26 @@ suite('Copilot Agent Mesh', () => {
 			},
 		};
 		const cancellation = new vscode.CancellationTokenSource();
+		const invocationObservations: Array<{
+			phase: string;
+			invocationSequence?: number;
+		}> = [];
+		const tool = new MeshDelegateTaskTool(facade, {
+			delegatedToolInvocations,
+		}, {
+			observe: (observation) => invocationObservations.push({
+				phase: observation.phase,
+				...(observation.invocationSequence === undefined
+					? {}
+					: { invocationSequence: observation.invocationSequence }),
+			}),
+		});
 		try {
-			const result = await new MeshDelegateTaskTool(facade, {
-				delegatedToolInvocations,
-			}).invoke({
+			const result = await tool.invoke({
+				input,
+				toolInvocationToken: undefined,
+			}, cancellation.token);
+			await tool.invoke({
 				input,
 				toolInvocationToken: undefined,
 			}, cancellation.token);
@@ -318,6 +345,12 @@ suite('Copilot Agent Mesh', () => {
 			const [part] = result.content;
 			assert.ok(part instanceof vscode.LanguageModelTextPart);
 			assert.strictEqual(JSON.parse(part.value).e, 'DELEGATION_RECURSION');
+			assert.deepStrictEqual(invocationObservations, [
+				{ phase: 'invokeStarted', invocationSequence: 1 },
+				{ phase: 'invokeCompleted', invocationSequence: 1 },
+				{ phase: 'invokeStarted', invocationSequence: 2 },
+				{ phase: 'invokeCompleted', invocationSequence: 2 },
+			]);
 		} finally {
 			cancellation.dispose();
 			delegatedToolInvocations.dispose();

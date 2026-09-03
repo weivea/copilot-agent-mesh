@@ -7,6 +7,7 @@ import type {
 import type {
 	TaskToolInvocationObservation,
 	TaskToolInvocationObserver,
+	TaskToolInvocationGate,
 } from '../tools/TaskToolInvocationObserver';
 import type { ToolClock, ToolDeadlineTimer } from '../tools/taskToolsCore';
 
@@ -31,6 +32,8 @@ export interface SafePeerToolObservation {
 	readonly inputId?: string;
 	readonly compactStatus?: number;
 	readonly errorCode?: string;
+	readonly preparationSequence?: number;
+	readonly invocationSequence?: number;
 	readonly cancellationReason?: string;
 	readonly resultFields?: readonly string[];
 	readonly resultBytes?: number;
@@ -55,11 +58,23 @@ export interface PeerDelegationRecorderSnapshot {
 
 export class PeerDelegationE2eRecorder implements
 	TaskToolInvocationObserver,
+	TaskToolInvocationGate,
 	AgentRuntimeLifecycleObserver {
 	private sequence = 0;
 	private readonly tools: SafePeerToolObservation[] = [];
 	private readonly ahp: SafePeerAhpObservation[] = [];
 	private truncated = false;
+	private delegateInvocationsFrozen = false;
+
+	public assertDelegateInvocationAllowed(): void {
+		if (this.delegateInvocationsFrozen) {
+			throw new Error('Manual delegation invocation ingress is closed for final E2E evidence.');
+		}
+	}
+
+	public freezeDelegateInvocations(): void {
+		this.delegateInvocationsFrozen = true;
+	}
 
 	public observe(observation: TaskToolInvocationObservation): void {
 		try {
@@ -81,6 +96,14 @@ export class PeerDelegationE2eRecorder implements
 				...optionalUuid('inputId', input?.inputId ?? result?.i),
 				...(typeof result?.s === 'number' && Number.isSafeInteger(result.s)
 					? { compactStatus: result.s }
+					: {}),
+				...(Number.isSafeInteger(observation.invocationSequence)
+					&& (observation.invocationSequence ?? 0) > 0
+					? { invocationSequence: observation.invocationSequence }
+					: {}),
+				...(Number.isSafeInteger(observation.preparationSequence)
+					&& (observation.preparationSequence ?? 0) > 0
+					? { preparationSequence: observation.preparationSequence }
 					: {}),
 				...(typeof result?.e === 'string' && stableCodePattern.test(result.e)
 					? { errorCode: result.e }

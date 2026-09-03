@@ -425,6 +425,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 						delegatedToolInvocations,
 						clock: peerDelegationToolClock,
 						observer: peerDelegationRecorder,
+						invocationGate: peerDelegationRecorder,
 					});
 			} else if (!enabled && meshTools !== undefined) {
 				meshTools.dispose();

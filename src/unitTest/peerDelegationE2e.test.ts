@@ -25,8 +25,13 @@ import {
 	waitForManualPostDetachAttestation,
 } from '../e2e/PeerDelegationManualEvidence';
 import {
+	assertFinalPeerResourceMetrics,
 	assessExactTargetLiveness,
+	classifyTargetControllerRejection,
+	isSuccessfulManualInvocation,
+	latestManualObservationSequence,
 	summarizeManualInvocation,
+	summarizePostPromptDelegations,
 } from '../e2e/PeerDelegationManualMonitor';
 
 const runId = '00000000-0000-4000-8000-000000000001';
@@ -34,6 +39,26 @@ const taskId = '00000000-0000-4000-8000-000000000002';
 const inputId = '00000000-0000-4000-8000-000000000003';
 const delegationRequestId = '00000000-0000-4000-8000-000000000004';
 const postDetachChallenge = '00000000-0000-4000-8000-000000000005';
+
+function resourceMetrics(
+	toolTimers: { readonly activeTimers: number; readonly armedBudgetTimers: number },
+) {
+	return {
+		listener: { startAttempts: 0 },
+		tunnel: {
+			loadAttempts: 0,
+			probeAttempts: 0,
+			ensureHostedAttempts: 0,
+		},
+		toolTimers: {
+			timersCreated: toolTimers.activeTimers,
+			timersDisposed: 0,
+			activeTimers: toolTimers.activeTimers,
+			budgetTimersCreated: 0,
+			armedBudgetTimers: toolTimers.armedBudgetTimers,
+		},
+	};
+}
 
 test('manual UI evidence accepts only the challenge issued after objective detach and catalog probe', () => {
 	const attestation = {
@@ -150,9 +175,13 @@ test('peer-delegation evidence rejects unsafe persistent content', () => {
 			manualInvocation: {
 				phase: 'target-liveness',
 				preparedCount: 0,
+				prepareStartedCount: 0,
 				prepareFailedCount: 0,
 				invokeStartedCount: 0,
 				invokeCompletedCount: 0,
+				unexpectedInvocationCount: 0,
+				unexpectedActivityCount: 0,
+				unresolvedPreparationCount: 0,
 				taskIdPresent: false,
 			},
 		},
@@ -376,6 +405,7 @@ test('peer-delegation recorder stores identities and hashes without prompt or ou
 	recorder.observe({
 		toolName: 'mesh_delegate_task',
 		phase: 'invokeCompleted',
+		invocationSequence: 7,
 		input: {
 			delegationRequestId,
 			prompt: 'do not persist this prompt',
@@ -402,6 +432,7 @@ test('peer-delegation recorder stores identities and hashes without prompt or ou
 	assert.equal(snapshot.tools[0]?.taskId, taskId);
 	assert.equal(snapshot.tools[0]?.delegationRequestId, delegationRequestId);
 	assert.equal(snapshot.tools[0]?.compactStatus, 0);
+	assert.equal(snapshot.tools[0]?.invocationSequence, 7);
 	assert.deepEqual(snapshot.tools[0]?.resultFields, ['d', 'r', 's', 't']);
 	assert.match(snapshot.tools[0]?.resultHash ?? '', /^[a-f0-9]{64}$/u);
 	assert.equal(JSON.stringify(snapshot).includes('do not persist'), false);
@@ -432,6 +463,16 @@ test('peer-delegation recorder stores identities and hashes without prompt or ou
 	assert.equal(JSON.stringify(snapshot).includes('do-not-persist-this-identifier'), false);
 });
 
+test('peer-delegation recorder freezes new delegate ingress for final evidence', () => {
+	const recorder = new PeerDelegationE2eRecorder();
+	assert.doesNotThrow(() => recorder.assertDelegateInvocationAllowed());
+	recorder.freezeDelegateInvocations();
+	assert.throws(
+		() => recorder.assertDelegateInvocationAllowed(),
+		/invocation ingress is closed/u,
+	);
+});
+
 test('manual monitor preserves a safe preparation failure without task identifiers', () => {
 	const recorder = new PeerDelegationE2eRecorder();
 	recorder.observe({
@@ -456,12 +497,224 @@ test('manual monitor preserves a safe preparation failure without task identifie
 		taskIdPresent: observation!.taskId !== undefined,
 	}]), {
 		preparedCount: 0,
+		prepareStartedCount: 0,
 		prepareFailedCount: 1,
 		invokeStartedCount: 0,
 		invokeCompletedCount: 0,
+		unexpectedInvocationCount: 0,
+		unexpectedActivityCount: 0,
+		unresolvedPreparationCount: 0,
 		errorCode: 'PEER_OFFLINE',
 		taskIdPresent: false,
 	});
+});
+
+test('manual monitor rechecks source sequence and awaits a started invocation after controller timeout', () => {
+	const expectedRequestId = 'expected-request';
+	const observations = [{
+		sequence: 8,
+		toolName: 'mesh_delegate_task',
+		phase: 'invokeStarted' as const,
+		delegationRequestId: expectedRequestId,
+		taskIdPresent: false,
+	}];
+	assert.equal(latestManualObservationSequence(observations), 8);
+	const invocations = summarizePostPromptDelegations(observations, 7, expectedRequestId);
+	assert.equal(
+		classifyTargetControllerRejection(invocations, true, false),
+		'await-authoritative-outcome',
+		'A controller failure cannot rewrite an already-started invocation as a window-close failure.',
+	);
+});
+
+test('manual monitor accounts for missing and wrong post-prompt correlation IDs', () => {
+	const invocations = summarizePostPromptDelegations([
+		{
+			sequence: 3,
+			toolName: 'mesh_delegate_task',
+			phase: 'invokeStarted',
+			taskIdPresent: false,
+		},
+		{
+			sequence: 4,
+			toolName: 'mesh_delegate_task',
+			phase: 'invokeStarted',
+			delegationRequestId: 'wrong-request',
+			taskIdPresent: false,
+		},
+		{
+			sequence: 5,
+			toolName: 'mesh_delegate_task',
+			phase: 'invokeCompleted',
+			delegationRequestId: 'wrong-request',
+			taskId: taskId,
+			taskIdPresent: true,
+		},
+	], 2, delegationRequestId);
+	assert.equal(invocations.allInvokeStartedCount, 2);
+	assert.equal(invocations.unexpectedInvokeStartedCount, 2);
+	assert.equal(invocations.unexpectedActivityCount, 3);
+	assert.equal(invocations.expected.unexpectedInvocationCount, 2);
+	assert.equal(invocations.unsettledInvokeStartedCount, 2);
+	assert.equal(isSuccessfulManualInvocation(invocations, true), false);
+});
+
+test('post-prompt completion accounting cannot use a pre-checkpoint invocation', () => {
+	const invocations = summarizePostPromptDelegations([
+		{
+			sequence: 3,
+			toolName: 'mesh_delegate_task',
+			phase: 'invokeStarted',
+			delegationRequestId,
+			invocationSequence: 2,
+			taskIdPresent: false,
+		},
+		{
+			sequence: 4,
+			toolName: 'mesh_delegate_task',
+			phase: 'invokeCompleted',
+			delegationRequestId: 'older-request',
+			invocationSequence: 1,
+			taskId,
+			taskIdPresent: true,
+		},
+	], 2, delegationRequestId);
+	assert.equal(invocations.allInvokeStartedCount, 1);
+	assert.equal(invocations.allInvokeCompletedCount, 0);
+	assert.equal(invocations.unsettledInvokeStartedCount, 1);
+});
+
+test('unexpected pending preparation cannot certify no-task cleanup', () => {
+	const invocations = summarizePostPromptDelegations([{
+		sequence: 2,
+		toolName: 'mesh_delegate_task',
+		phase: 'prepareStarted',
+		delegationRequestId: 'wrong-request',
+		preparationSequence: 1,
+		taskIdPresent: false,
+	}], 1, delegationRequestId);
+	assert.equal(invocations.unexpectedActivityCount, 1);
+	assert.equal(invocations.allInvokeStartedCount, 0);
+	assert.equal(invocations.unresolvedPreparationCount, 1);
+	assert.equal(isSuccessfulManualInvocation(invocations, true), false);
+});
+
+test('settled invocation does not hide another pending unexpected preparation', () => {
+	const invocations = summarizePostPromptDelegations([
+		{
+			sequence: 2,
+			toolName: 'mesh_delegate_task',
+			phase: 'prepareStarted',
+			delegationRequestId,
+			preparationSequence: 1,
+			taskIdPresent: false,
+		},
+		{
+			sequence: 3,
+			toolName: 'mesh_delegate_task',
+			phase: 'prepared',
+			delegationRequestId,
+			preparationSequence: 1,
+			taskIdPresent: false,
+		},
+		{
+			sequence: 4,
+			toolName: 'mesh_delegate_task',
+			phase: 'invokeStarted',
+			delegationRequestId,
+			invocationSequence: 1,
+			taskIdPresent: false,
+		},
+		{
+			sequence: 5,
+			toolName: 'mesh_delegate_task',
+			phase: 'invokeCompleted',
+			delegationRequestId,
+			invocationSequence: 1,
+			taskId,
+			taskIdPresent: true,
+			compactStatus: 0,
+		},
+		{
+			sequence: 6,
+			toolName: 'mesh_delegate_task',
+			phase: 'prepareStarted',
+			delegationRequestId: 'wrong-request',
+			preparationSequence: 2,
+			taskIdPresent: false,
+		},
+	], 1, delegationRequestId);
+	assert.equal(invocations.unsettledInvokeStartedCount, 0);
+	assert.equal(invocations.unresolvedPreparationCount, 1);
+	assert.equal(invocations.unexpectedActivityCount, 1);
+});
+
+test('manual monitor cannot prove exactly-once success from truncated or duplicate phases', () => {
+	const exact = summarizePostPromptDelegations([
+		{
+			sequence: 2,
+			toolName: 'mesh_delegate_task',
+			phase: 'prepareStarted',
+			delegationRequestId,
+			preparationSequence: 1,
+			taskIdPresent: false,
+		},
+		{
+			sequence: 3,
+			toolName: 'mesh_delegate_task',
+			phase: 'prepared',
+			delegationRequestId,
+			preparationSequence: 1,
+			taskIdPresent: false,
+		},
+		{
+			sequence: 4,
+			toolName: 'mesh_delegate_task',
+			phase: 'invokeStarted',
+			delegationRequestId,
+			invocationSequence: 1,
+			taskIdPresent: false,
+		},
+		{
+			sequence: 5,
+			toolName: 'mesh_delegate_task',
+			phase: 'invokeCompleted',
+			delegationRequestId,
+			taskId,
+			invocationSequence: 1,
+			taskIdPresent: true,
+			compactStatus: 0,
+		},
+	], 1, delegationRequestId);
+	assert.equal(isSuccessfulManualInvocation(exact, true), true);
+	assert.equal(isSuccessfulManualInvocation(exact, false), false);
+	const duplicate = summarizePostPromptDelegations([
+		...exact.delegateObservations,
+		{
+			sequence: 6,
+			toolName: 'mesh_delegate_task',
+			phase: 'invokeStarted',
+			delegationRequestId,
+			invocationSequence: 2,
+			taskIdPresent: false,
+		},
+	], 1, delegationRequestId);
+	assert.equal(duplicate.unexpectedInvokeStartedCount, 1);
+	assert.equal(duplicate.unexpectedActivityCount, 1);
+	assert.equal(duplicate.expected.unexpectedInvocationCount, 1);
+	assert.equal(isSuccessfulManualInvocation(duplicate, true), false);
+});
+
+test('final resource validation rejects drift from a clean baseline', () => {
+	const baseline = resourceMetrics({ activeTimers: 0, armedBudgetTimers: 0 });
+	assert.doesNotThrow(() => assertFinalPeerResourceMetrics(baseline));
+	const final = resourceMetrics({ activeTimers: 1, armedBudgetTimers: 0 });
+	assert.throws(
+		() => assertFinalPeerResourceMetrics(final),
+		/live Tool timers/u,
+		'Cleanup must validate the refreshed final metrics rather than the clean baseline.',
+	);
+	assert.throws(() => assertFinalPeerResourceMetrics({ toolTimers: {} }), /malformed/u);
 });
 
 test('manual monitor rejects a closed or replaced exact target and accepts the normal path', () => {
@@ -562,6 +815,7 @@ test('peer-delegation Tool clock shortens only minute-scale budget timers', () =
 test('0.4.0 release metadata keeps the real peer gate default-off and five-tool parity', () => {
 	const root = resolve(__dirname, '../../..');
 	const manifest = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8'));
+	const lockfile = JSON.parse(readFileSync(resolve(root, 'package-lock.json'), 'utf8'));
 	const wrapper = readFileSync(
 		resolve(root, 'scripts/e2e/peer-delegation/run.mjs'),
 		'utf8',
@@ -583,6 +837,7 @@ test('0.4.0 release metadata keeps the real peer gate default-off and five-tool 
 		'utf8',
 	);
 	assert.equal(manifest.version, '0.4.0');
+	assert.equal(lockfile.packages['node_modules/fast-uri'].version, '3.1.5');
 	assert.equal(
 		manifest.scripts['test:peer-delegation-real'],
 		'node scripts/e2e/peer-delegation/run.mjs',
@@ -632,7 +887,37 @@ test('0.4.0 release metadata keeps the real peer gate default-off and five-tool 
 	);
 	assert.match(
 		harness.slice(manualCompletion, manualCompletionEnd),
-		/prepareFailedCount[\s\S]*TARGET_WINDOW_CLOSED[\s\S]*assessExactTargetLiveness/u,
+		/prepareFailedCount[\s\S]*classifyTargetControllerRejection[\s\S]*TARGET_WINDOW_CLOSED[\s\S]*assessExactTargetLiveness/u,
+	);
+	assert.match(
+		harness.slice(manualCompletion, manualCompletionEnd),
+		/observationCheckpoint[\s\S]*unexpectedActivityCount[\s\S]*settleUnexpectedManualInvocations/u,
+	);
+	assert.match(
+		harness.slice(manualCompletion, manualCompletionEnd),
+		/initialInvocations\.unresolvedPreparationCount[\s\S]*MANUAL_SOURCE_BUSY/u,
+	);
+	assert.match(
+		harness.slice(manualCompletion, manualCompletionEnd),
+		/waitForManualInvocationQuiescence[\s\S]*isSuccessfulManualInvocation/u,
+	);
+	assert.ok(
+		harness.indexOf('await freezeManualDelegateIngress(source,')
+			< harness.indexOf('await waitForManualInvocationQuiescence'),
+		'Delegate ingress must freeze before the final quiescence audit.',
+	);
+	assert.ok(
+		harness.indexOf('const controllerProcessAlive = isControllerProcessAlive(target)')
+			< harness.indexOf('const rechecked = await recheckManualInvocationAfterControllerFailure'),
+		'Verified process exit must be sampled before the final sequenced Source observation recheck.',
+	);
+	assert.match(
+		harness,
+		/name: 'observe-tool-resources'[\s\S]*const observedResourceMetrics = await request\([\s\S]*assertFinalPeerResourceMetrics\(observedResourceMetrics\)[\s\S]*finalResourceMetrics = observedResourceMetrics/u,
+	);
+	assert.match(
+		harness,
+		/evidence\.resources\.timer\.ownedPeak =\s*\(finalResourceMetrics\?\.toolTimers\.timersCreated \?\? 0\)/u,
 	);
 	assert.match(harness, /manualInvocation[\s\S]*taskIdPresent/u);
 	assert.ok(

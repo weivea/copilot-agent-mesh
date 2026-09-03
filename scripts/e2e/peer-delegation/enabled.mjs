@@ -65,8 +65,12 @@ const {
 	waitForManualPostDetachAttestation,
 } = require(join(repositoryRoot, 'out/src/e2e/PeerDelegationManualEvidence.js'));
 const {
+	assertFinalPeerResourceMetrics,
 	assessExactTargetLiveness,
-	summarizeManualInvocation,
+	classifyTargetControllerRejection,
+	isSuccessfulManualInvocation,
+	latestManualObservationSequence,
+	summarizePostPromptDelegations,
 } = require(join(repositoryRoot, 'out/src/e2e/PeerDelegationManualMonitor.js'));
 
 class E2eRequestError extends Error {
@@ -168,12 +172,15 @@ let sentinelDigest;
 let profileLockOwned = false;
 let primaryFailure;
 let cleanupFailure;
+let baselineResourceMetrics;
 let latestResourceMetrics;
+let finalResourceMetrics;
 let cleanupLeaseReleased = false;
 let evidence = initialEvidence();
 let canonicalUserDataDirectory = userDataDirectory;
 let signalCleanupStarted = false;
 let cleanupOperation;
+let manualIngressFreezeProof;
 let ownershipSampler;
 let ownershipSamplerStarted = false;
 let ownershipSamplerFailure;
@@ -297,9 +304,9 @@ try {
 		const socket = await lstat(localIpcEndpoint.address);
 		assert.equal(socket.isSocket(), true, 'The local Broker endpoint is not a Unix socket.');
 	}
-	const baselineResources = await request(source, 'peer.resources');
-	latestResourceMetrics = baselineResources;
-	assertAttemptMetricsZero(baselineResources);
+	baselineResourceMetrics = await request(source, 'peer.resources');
+	latestResourceMetrics = baselineResourceMetrics;
+	assertAttemptMetricsZero(baselineResourceMetrics);
 	assert.equal(await isAbsent(sentinelInvocationPath), true);
 
 	const catalogBeforeCount = 0;
@@ -382,19 +389,19 @@ try {
 
 	latestResourceMetrics = await request(source, 'peer.resources');
 	const listenerDelta = delta(
-		baselineResources.listener.startAttempts,
+		baselineResourceMetrics.listener.startAttempts,
 		latestResourceMetrics.listener.startAttempts,
 	);
 	const tunnelLoadDelta = delta(
-		baselineResources.tunnel.loadAttempts,
+		baselineResourceMetrics.tunnel.loadAttempts,
 		latestResourceMetrics.tunnel.loadAttempts,
 	);
 	const tunnelProbeDelta = delta(
-		baselineResources.tunnel.probeAttempts,
+		baselineResourceMetrics.tunnel.probeAttempts,
 		latestResourceMetrics.tunnel.probeAttempts,
 	);
 	const tunnelEnsureDelta = delta(
-		baselineResources.tunnel.ensureHostedAttempts,
+		baselineResourceMetrics.tunnel.ensureHostedAttempts,
 		latestResourceMetrics.tunnel.ensureHostedAttempts,
 	);
 	const transportPass = [
@@ -433,7 +440,7 @@ try {
 		&& typeof error === 'object'
 		&& 'manualInvocation' in error
 		&& isSafeManualInvocationFailure(error.manualInvocation)
-		&& error.noTaskLeaseObserved === true
+		&& (error.noTaskLeaseObserved === true || error.taskLeaseReleased === true)
 	) {
 		cleanupLeaseReleased = true;
 	}
@@ -1443,6 +1450,48 @@ async function waitForTaskClientDetach(controller, taskId, timeoutMs) {
 async function waitForManualCompletion(source, target, targetInputBase) {
 	const delegationRequestId = randomUUID();
 	const title = `P8 E2E completion ${runLabel}`;
+	const initialObservations = await request(source, 'peer.observations', {}, 2_000);
+	const emptySummary = {
+		preparedCount: 0,
+		prepareStartedCount: 0,
+		prepareFailedCount: 0,
+		invokeStartedCount: 0,
+		invokeCompletedCount: 0,
+		unexpectedInvocationCount: 0,
+		unexpectedActivityCount: 0,
+		unresolvedPreparationCount: 0,
+		taskIdPresent: false,
+	};
+	if (initialObservations.truncated) {
+		throw manualInvocationFailure(
+			'MANUAL_OBSERVATIONS_TRUNCATED',
+			'The Source Tool observation history was already truncated before the manual prompt.',
+			'invoke',
+			emptySummary,
+			false,
+		);
+	}
+	const initialInvocations = summarizePostPromptDelegations(
+		manualToolObservations(initialObservations),
+		0,
+		delegationRequestId,
+	);
+	if (
+		initialInvocations.unresolvedPreparationCount > 0
+		|| initialInvocations.unsettledInvokeStartedCount > 0
+	) {
+		throw manualInvocationFailure(
+			'MANUAL_SOURCE_BUSY',
+			'The Source already had an unresolved delegation before the manual prompt.',
+			'invoke',
+			initialInvocations.expected,
+			false,
+		);
+	}
+	const observationCheckpoint = latestManualObservationSequence([
+		...initialObservations.tools,
+		...initialObservations.ahp,
+	].sort((left, right) => left.sequence - right.sequence));
 	const prompt = [
 		`In Agent mode, use #meshListWorkers and then #meshDelegateTask to delegate to "${targetWindowLabel}".`,
 		`Use delegationRequestId ${delegationRequestId}.`,
@@ -1458,6 +1507,7 @@ async function waitForManualCompletion(source, target, targetInputBase) {
 		prompt,
 	}));
 	const deadline = Date.now() + 15 * 60_000;
+	let lastObservationSequence = observationCheckpoint;
 	while (Date.now() < deadline) {
 		const [observationsResult, targetStateResult, dashboardResult] = await Promise.allSettled([
 			request(source, 'peer.observations', {}, 2_000),
@@ -1468,18 +1518,51 @@ async function waitForManualCompletion(source, target, targetInputBase) {
 			throw observationsResult.reason;
 		}
 		const observations = observationsResult.value;
-		const matching = observations.tools.filter(
-			(observation) => observation.delegationRequestId === delegationRequestId,
+		const postPrompt = summarizePostPromptDelegations(
+			manualToolObservations(observations),
+			observationCheckpoint,
+			delegationRequestId,
 		);
-		const summary = summarizeManualInvocation(matching.map((observation) => ({
-			phase: observation.phase,
-			...(observation.compactStatus === undefined
-				? {}
-				: { compactStatus: observation.compactStatus }),
-			...(observation.errorCode === undefined ? {} : { errorCode: observation.errorCode }),
-			taskIdPresent: observation.taskId !== undefined,
-		})));
+		const matching = observations.tools.filter(
+			(observation) =>
+				observation.sequence > observationCheckpoint
+				&& observation.delegationRequestId === delegationRequestId,
+		);
+		const summary = postPrompt.expected;
+		lastObservationSequence = Math.max(
+			lastObservationSequence,
+			...observations.tools.map(({ sequence }) => sequence),
+		);
+		if (observations.truncated) {
+			await freezeManualDelegateIngress(source, observationCheckpoint, delegationRequestId);
+			throw manualInvocationFailure(
+				'MANUAL_OBSERVATIONS_TRUNCATED',
+				'The Source Tool observation history truncated during the manual invocation.',
+				'invoke',
+				summary,
+				false,
+			);
+		}
+		if (postPrompt.unexpectedActivityCount > 0) {
+			await freezeManualDelegateIngress(source, observationCheckpoint, delegationRequestId);
+			const unexpectedLeaseReleased = await settleUnexpectedManualInvocations(
+				source,
+				postPrompt,
+				observationCheckpoint,
+				delegationRequestId,
+				deadline,
+			);
+			throw manualInvocationFailure(
+				'UNEXPECTED_MANUAL_INVOCATION',
+				'An unexpected delegation invocation occurred after the manual prompt.',
+				'invoke',
+				summary,
+				true,
+				unexpectedLeaseReleased,
+			);
+		}
 		if (summary.prepareFailedCount > 0) {
+			await freezeManualDelegateIngress(source, observationCheckpoint, delegationRequestId);
 			throw manualInvocationFailure(
 				summary.errorCode ?? 'MANUAL_TOOL_PREPARATION_FAILED',
 				'The selected delegation target became unavailable during Tool preparation.',
@@ -1490,20 +1573,65 @@ async function waitForManualCompletion(source, target, targetInputBase) {
 		}
 		const completedObservations = matching.filter(({ phase }) => phase === 'invokeCompleted');
 		if (completedObservations.length > 0) {
-			const completed = completedObservations[0];
+			await freezeManualDelegateIngress(source, observationCheckpoint, delegationRequestId);
+			const quiescent = await waitForManualInvocationQuiescence(
+				source,
+				observationCheckpoint,
+				delegationRequestId,
+				deadline,
+				lastObservationSequence,
+			);
+			if (quiescent.observations.truncated) {
+				throw manualInvocationFailure(
+					'MANUAL_OBSERVATIONS_TRUNCATED',
+					'The Source Tool observation history truncated during the post-result audit.',
+					'invoke',
+					quiescent.postPrompt.expected,
+					false,
+				);
+			}
+			if (quiescent.postPrompt.unexpectedActivityCount > 0) {
+				const taskLeaseReleased = await settleUnexpectedManualInvocations(
+					source,
+					quiescent.postPrompt,
+					observationCheckpoint,
+					delegationRequestId,
+					deadline,
+				);
+				throw manualInvocationFailure(
+					'UNEXPECTED_MANUAL_INVOCATION',
+					'An unexpected delegation invocation occurred after the manual prompt.',
+					'invoke',
+					quiescent.postPrompt.expected,
+					true,
+					taskLeaseReleased,
+				);
+			}
+			if (!quiescent.complete) {
+				throw manualInvocationFailure(
+					'MANUAL_TOOL_TIMEOUT',
+					'The manual Tool result did not have a full bounded quiescence interval.',
+					'timeout',
+					quiescent.postPrompt.expected,
+					true,
+				);
+			}
+			const quiescentMatching = quiescent.observations.tools.filter(
+				(observation) =>
+					observation.sequence > observationCheckpoint
+					&& observation.delegationRequestId === delegationRequestId,
+			);
+			const completed = quiescentMatching.find(({ phase }) => phase === 'invokeCompleted');
 			if (
-				summary.preparedCount !== 1
-				|| summary.invokeStartedCount !== 1
-				|| summary.invokeCompletedCount !== 1
-				|| summary.compactStatus !== 0
-				|| !summary.taskIdPresent
+				completed === undefined
+				|| !isSuccessfulManualInvocation(quiescent.postPrompt, true)
 			) {
 				throw manualInvocationFailure(
-					summary.errorCode ?? 'MANUAL_TOOL_INVOCATION_FAILED',
+					quiescent.postPrompt.expected.errorCode ?? 'MANUAL_TOOL_INVOCATION_FAILED',
 					'The manual Copilot Tool route completed without one successful confirmed invocation.',
 					'invoke',
-					summary,
-					!observations.truncated,
+					quiescent.postPrompt.expected,
+					true,
 				);
 			}
 			return {
@@ -1519,29 +1647,91 @@ async function waitForManualCompletion(source, target, targetInputBase) {
 				},
 				invocationSource: 'copilot-ui',
 				confirmationObservation: {
-					preparedCount: summary.preparedCount,
-					acceptedCount: summary.invokeStartedCount,
+					preparedCount: quiescent.postPrompt.expected.preparedCount,
+					acceptedCount: quiescent.postPrompt.expected.invokeStartedCount,
 				},
 			};
 		}
 		if (targetStateResult.status === 'rejected') {
-			throw manualInvocationFailure(
-				'TARGET_WINDOW_CLOSED',
-				'The exact target window controller closed before Tool invocation.',
-				'target-liveness',
-				summary,
-				!observations.truncated,
+			const controllerProcessAlive = isControllerProcessAlive(target);
+			const rechecked = await recheckManualInvocationAfterControllerFailure(
+				source,
+				observationCheckpoint,
+				delegationRequestId,
+				lastObservationSequence,
 			);
+			const rejection = classifyTargetControllerRejection(
+				rechecked.postPrompt,
+				!rechecked.observations.truncated,
+				controllerProcessAlive,
+			);
+			if (rechecked.observations.truncated) {
+				await freezeManualDelegateIngress(source, observationCheckpoint, delegationRequestId);
+				throw manualInvocationFailure(
+					'MANUAL_OBSERVATIONS_TRUNCATED',
+					'The Source Tool observation history truncated while rechecking Target liveness.',
+					'target-liveness',
+					rechecked.postPrompt.expected,
+					false,
+				);
+			}
+			if (rechecked.postPrompt.unexpectedActivityCount > 0) {
+				await freezeManualDelegateIngress(source, observationCheckpoint, delegationRequestId);
+				const taskLeaseReleased = await settleUnexpectedManualInvocations(
+					source,
+					rechecked.postPrompt,
+					observationCheckpoint,
+					delegationRequestId,
+					deadline,
+				);
+				throw manualInvocationFailure(
+					'UNEXPECTED_MANUAL_INVOCATION',
+					'An unexpected delegation invocation occurred while rechecking Target liveness.',
+					'invoke',
+					rechecked.postPrompt.expected,
+					true,
+					taskLeaseReleased,
+				);
+			}
+			if (rechecked.postPrompt.expected.prepareFailedCount > 0) {
+				await freezeManualDelegateIngress(source, observationCheckpoint, delegationRequestId);
+				throw manualInvocationFailure(
+					rechecked.postPrompt.expected.errorCode ?? 'MANUAL_TOOL_PREPARATION_FAILED',
+					'The selected delegation target became unavailable during Tool preparation.',
+					'prepare',
+					rechecked.postPrompt.expected,
+					true,
+				);
+			}
+			if (rejection === 'await-authoritative-outcome') {
+				await delay(250);
+				continue;
+			}
+			assert.notEqual(rejection, 'observation-history-incomplete');
+			if (rejection === 'target-window-closed') {
+				await freezeManualDelegateIngress(source, observationCheckpoint, delegationRequestId);
+				throw manualInvocationFailure(
+					'TARGET_WINDOW_CLOSED',
+					'The exact target window process closed before Tool invocation.',
+					'target-liveness',
+					rechecked.postPrompt.expected,
+					true,
+				);
+			}
 		}
 		if (dashboardResult.status === 'rejected') {
-			throw dashboardResult.reason;
+			await delay(250);
+			continue;
 		}
-		const liveness = assessExactTargetLiveness(
-			targetInputBase,
-			targetStateResult.value,
-			dashboardResult.value,
-		);
-		if (!liveness.ok && summary.invokeStartedCount === 0) {
+		const liveness = targetStateResult.status === 'fulfilled'
+			? assessExactTargetLiveness(
+				targetInputBase,
+				targetStateResult.value,
+				dashboardResult.value,
+			)
+			: { ok: false, code: 'PEER_OFFLINE' };
+		if (!liveness.ok && summary.invokeStartedCount === 0 && targetStateResult.status === 'fulfilled') {
+			await freezeManualDelegateIngress(source, observationCheckpoint, delegationRequestId);
 			throw manualInvocationFailure(
 				liveness.code,
 				'The exact selected target instance became unavailable before Tool invocation.',
@@ -1553,34 +1743,265 @@ async function waitForManualCompletion(source, target, targetInputBase) {
 		await delay(250);
 	}
 	const observations = await request(source, 'peer.observations');
-	const summary = summarizeManualInvocation(observations.tools
-		.filter((observation) => observation.delegationRequestId === delegationRequestId)
-		.map((observation) => ({
-			phase: observation.phase,
-			...(observation.compactStatus === undefined
-				? {}
-				: { compactStatus: observation.compactStatus }),
-			...(observation.errorCode === undefined ? {} : { errorCode: observation.errorCode }),
-			taskIdPresent: observation.taskId !== undefined,
-		})));
+	const postPrompt = summarizePostPromptDelegations(
+		manualToolObservations(observations),
+		observationCheckpoint,
+		delegationRequestId,
+	);
+	await freezeManualDelegateIngress(source, observationCheckpoint, delegationRequestId);
 	throw manualInvocationFailure(
 		'MANUAL_TOOL_TIMEOUT',
 		'The manual Copilot Tool route did not complete within the bounded observation window.',
 		'timeout',
-		summary,
+		postPrompt.expected,
 		!observations.truncated,
 	);
 }
 
-function manualInvocationFailure(code, message, phase, summary, observationHistoryComplete) {
+async function freezeManualDelegateIngress(
+	source,
+	observationCheckpoint,
+	delegationRequestId,
+) {
+	const frozen = await request(source, 'peer.manual.freeze', {}, 2_000);
+	if (frozen.frozen !== true) {
+		throw new Error('The manual delegation invocation ingress did not freeze.');
+	}
+	const observations = await request(source, 'peer.observations', {}, 2_000);
+	manualIngressFreezeProof = {
+		complete: !observations.truncated,
+		postPrompt: summarizePostPromptDelegations(
+			manualToolObservations(observations),
+			observationCheckpoint,
+			delegationRequestId,
+		),
+	};
+}
+
+async function waitForManualInvocationQuiescence(
+	source,
+	observationCheckpoint,
+	delegationRequestId,
+	manualDeadline,
+	initialSequence,
+) {
+	const quiescenceMs = 5_000;
+	let quietDeadline = Date.now() + quiescenceMs;
+	let latestSequence = initialSequence;
+	let observations;
+	let postPrompt;
+	do {
+		await delay(100);
+		observations = await request(source, 'peer.observations', {}, 2_000);
+		postPrompt = summarizePostPromptDelegations(
+			manualToolObservations(observations),
+			observationCheckpoint,
+			delegationRequestId,
+		);
+		const observedSequence = observations.tools.at(-1)?.sequence ?? observationCheckpoint;
+		if (observedSequence > latestSequence) {
+			latestSequence = observedSequence;
+			quietDeadline = Date.now() + quiescenceMs;
+		}
+		if (observations.truncated || postPrompt.unexpectedActivityCount > 0) {
+			break;
+		}
+	} while (Date.now() < quietDeadline && Date.now() < manualDeadline);
+	return {
+		observations,
+		postPrompt,
+		complete: Date.now() >= quietDeadline && quietDeadline <= manualDeadline,
+	};
+}
+
+async function recheckManualInvocationAfterControllerFailure(
+	source,
+	observationCheckpoint,
+	delegationRequestId,
+	minimumSequence,
+) {
+	const deadline = Date.now() + 2_000;
+	let observations;
+	let postPrompt;
+	do {
+		observations = await request(source, 'peer.observations', {}, 2_000);
+		postPrompt = summarizePostPromptDelegations(
+			manualToolObservations(observations),
+			observationCheckpoint,
+			delegationRequestId,
+		);
+		const sequence = observations.tools.at(-1)?.sequence ?? observationCheckpoint;
+		if (sequence >= minimumSequence && postPrompt.expected.invokeStartedCount > 0) {
+			break;
+		}
+		await delay(100);
+	} while (Date.now() < deadline);
+	return { observations, postPrompt };
+}
+
+async function settleUnexpectedManualInvocations(
+	source,
+	postPrompt,
+	observationCheckpoint,
+	expectedDelegationRequestId,
+	deadline,
+) {
+	if (manualIngressFreezeProof?.complete === true) {
+		postPrompt = manualIngressFreezeProof.postPrompt;
+	}
+	if (
+		postPrompt.unexpectedActivityCount > 0
+		&& postPrompt.unresolvedPreparationCount > 0
+	) {
+		return false;
+	}
+	if (postPrompt.unsettledInvokeStartedCount > 0) {
+		while (Date.now() < deadline) {
+			await delay(100);
+			const observations = await request(source, 'peer.observations', {}, 2_000);
+			if (observations.truncated) {
+				return false;
+			}
+			postPrompt = summarizePostPromptDelegations(
+				manualToolObservations(observations),
+				observationCheckpoint,
+				expectedDelegationRequestId,
+			);
+			if (postPrompt.unresolvedPreparationCount > 0) {
+				return false;
+			}
+			if (postPrompt.unsettledInvokeStartedCount === 0) {
+				break;
+			}
+		}
+	}
+	if (postPrompt.unsettledInvokeStartedCount > 0) {
+		return false;
+	}
+	if (postPrompt.unresolvedPreparationCount > 0) {
+		return false;
+	}
+	const startedInvocationSequences = new Set(postPrompt.delegateObservations
+		.filter((observation) =>
+			observation.phase === 'invokeStarted'
+			&& Number.isSafeInteger(observation.invocationSequence))
+		.map(({ invocationSequence }) => invocationSequence));
+	const postPromptTaskIds = [...new Set(postPrompt.delegateObservations
+		.filter((observation) =>
+			observation.phase === 'invokeCompleted'
+			&& startedInvocationSequences.has(observation.invocationSequence)
+			&& observation.taskId !== undefined)
+		.map(({ taskId }) => taskId))];
+	for (const taskId of postPromptTaskIds) {
+		let task = await request(source, 'peer.task.evidence', { taskId });
+		assertCleanupTaskEvidence(task, taskId);
+		if (!['completed', 'failed', 'cancelled', 'timedOut'].includes(task.state)) {
+			await invokeCoreTool(source, 'mesh_cancel_task', { taskId }, 60_000);
+			task = await waitForTaskLeaseReleased(source, taskId, 60_000);
+		} else if (!task.leaseReleased) {
+			task = await waitForTaskLeaseReleased(source, taskId, 60_000);
+		}
+		if (
+			!['completed', 'failed', 'cancelled', 'timedOut'].includes(task.state)
+			|| !task.leaseReleased
+		) {
+			return false;
+		}
+	}
+	await delay(100);
+	const finalObservations = await request(source, 'peer.observations', {}, 2_000);
+	if (finalObservations.truncated) {
+		return false;
+	}
+	const finalPostPrompt = summarizePostPromptDelegations(
+		manualToolObservations(finalObservations),
+		observationCheckpoint,
+		expectedDelegationRequestId,
+	);
+	return finalPostPrompt.unresolvedPreparationCount === 0
+		&& finalPostPrompt.unsettledInvokeStartedCount === 0
+		&& finalPostPrompt.allInvokeStartedCount === postPrompt.allInvokeStartedCount;
+}
+
+async function waitForTaskLeaseReleased(source, taskId, timeoutMs) {
+	const deadline = Date.now() + timeoutMs;
+	let latest;
+	do {
+		latest = await request(source, 'peer.task.evidence', { taskId });
+		assertCleanupTaskEvidence(latest, taskId);
+		if (
+			['completed', 'failed', 'cancelled', 'timedOut'].includes(latest.state)
+			&& latest.leaseReleased
+		) {
+			return latest;
+		}
+		await delay(100);
+	} while (Date.now() < deadline);
+	throw new Error('An unexpected manual task did not become terminal with its lease released.');
+}
+
+function assertCleanupTaskEvidence(task, expectedTaskId) {
+	if (
+		task === null
+		|| typeof task !== 'object'
+		|| task.taskId !== expectedTaskId
+		|| typeof task.state !== 'string'
+		|| typeof task.leaseReleased !== 'boolean'
+	) {
+		throw new Error('Unexpected manual task cleanup evidence was invalid.');
+	}
+}
+
+function isControllerProcessAlive(controller) {
+	return Number.isSafeInteger(controller.extensionHostPid)
+		&& readProcessTable().some(({ pid }) => pid === controller.extensionHostPid);
+}
+
+function manualToolObservations(observations) {
+	return observations.tools.map((observation) => ({
+		sequence: observation.sequence,
+		toolName: observation.toolName,
+		...(observation.delegationRequestId === undefined
+			? {}
+			: { delegationRequestId: observation.delegationRequestId }),
+		phase: observation.phase,
+		...(observation.compactStatus === undefined
+			? {}
+			: { compactStatus: observation.compactStatus }),
+		...(observation.errorCode === undefined ? {} : { errorCode: observation.errorCode }),
+		...(observation.taskId === undefined ? {} : { taskId: observation.taskId }),
+		...(observation.preparationSequence === undefined
+			? {}
+			: { preparationSequence: observation.preparationSequence }),
+		...(observation.invocationSequence === undefined
+			? {}
+			: { invocationSequence: observation.invocationSequence }),
+		taskIdPresent: observation.taskId !== undefined,
+	}));
+}
+
+function manualInvocationFailure(
+	code,
+	message,
+	phase,
+	summary,
+	observationHistoryComplete,
+	taskLeaseReleased = false,
+) {
+	const frozenSummary = manualIngressFreezeProof?.complete === true
+		? manualIngressFreezeProof.postPrompt.expected
+		: undefined;
+	const finalSummary = frozenSummary ?? summary;
 	return Object.assign(new Error(message), {
 		code,
-		noTaskLeaseObserved: observationHistoryComplete
-			&& summary.invokeStartedCount === 0
-			&& !summary.taskIdPresent,
+		noTaskLeaseObserved: manualIngressFreezeProof?.complete === true
+			&& manualIngressFreezeProof.postPrompt.allInvokeStartedCount === 0
+			&& finalSummary.unresolvedPreparationCount === 0
+			&& !finalSummary.taskIdPresent,
+		taskLeaseReleased,
 		manualInvocation: {
 			phase,
-			...summary,
+			...finalSummary,
 		},
 	});
 }
@@ -1974,16 +2395,56 @@ async function performCleanupOnce() {
 		{
 			name: 'observe-tool-resources',
 			run: async () => {
-				if (latestResourceMetrics === undefined && sourceController !== undefined) {
-					latestResourceMetrics = await request(
-						sourceController,
-						'peer.resources',
-						{},
-						2_000,
-					);
+				if (sourceController === undefined) {
+					throw new Error('The Source controller was unavailable for final resource observation.');
 				}
-				assert.equal(latestResourceMetrics?.toolTimers.activeTimers ?? 0, 0);
-				assert.equal(latestResourceMetrics?.toolTimers.armedBudgetTimers ?? 0, 0);
+				const observedResourceMetrics = await request(
+					sourceController,
+					'peer.resources',
+					{},
+					2_000,
+				);
+				assertFinalPeerResourceMetrics(observedResourceMetrics);
+				finalResourceMetrics = observedResourceMetrics;
+				if (baselineResourceMetrics === undefined) {
+					throw new Error('The baseline peer resource metrics were unavailable.');
+				}
+				const listenerDelta = delta(
+					baselineResourceMetrics.listener.startAttempts,
+					finalResourceMetrics.listener.startAttempts,
+				);
+				const tunnelLoadDelta = delta(
+					baselineResourceMetrics.tunnel.loadAttempts,
+					finalResourceMetrics.tunnel.loadAttempts,
+				);
+				const tunnelProbeDelta = delta(
+					baselineResourceMetrics.tunnel.probeAttempts,
+					finalResourceMetrics.tunnel.probeAttempts,
+				);
+				const tunnelEnsureDelta = delta(
+					baselineResourceMetrics.tunnel.ensureHostedAttempts,
+					finalResourceMetrics.tunnel.ensureHostedAttempts,
+				);
+				const finalTransportPass = [
+					listenerDelta,
+					tunnelLoadDelta,
+					tunnelProbeDelta,
+					tunnelEnsureDelta,
+				].every(({ delta: difference }) => difference === 0);
+				evidence.transport = {
+					...evidence.transport,
+					status: finalTransportPass && evidence.transport.localRouteOnly
+						? 'pass'
+						: 'fail',
+					listenerStartAttempts: listenerDelta,
+					tunnelLoadAttempts: tunnelLoadDelta,
+					tunnelProbeAttempts: tunnelProbeDelta,
+					tunnelEnsureHostedAttempts: tunnelEnsureDelta,
+					localRouteOnly: finalTransportPass && evidence.transport.localRouteOnly,
+				};
+				if (!finalTransportPass) {
+					throw new Error('Final peer transport metrics changed after scenario observation.');
+				}
 			},
 		},
 		{ name: 'close-controllers', run: closeControllers },
@@ -2059,8 +2520,8 @@ async function performCleanupOnce() {
 	cleanupFailures.push(...observedCleanupFailures);
 	const ownedProcessesReleased = finalOwned !== undefined && finalOwned.length === 0;
 	const ownedSocketsReleased = localIpcRemoved && editorEndpointReleased;
-	const ownedTimersReleased =
-		(latestResourceMetrics?.toolTimers.activeTimers ?? 0) === 0
+	const ownedTimersReleased = finalResourceMetrics !== undefined
+		&& finalResourceMetrics.toolTimers.activeTimers === 0
 		&& ownershipSampler === undefined;
 	const complete = cleanupFailures.length === 0
 		&& profileLockReleased
@@ -2080,14 +2541,14 @@ async function performCleanupOnce() {
 		? 0
 		: 1 + (evidence.completion.source === 'editor' ? 1 : 0);
 	evidence.resources.timer.ownedPeak =
-		(latestResourceMetrics?.toolTimers.timersCreated ?? 0)
+		(finalResourceMetrics?.toolTimers.timersCreated ?? 0)
 		+ Number(ownershipSamplerStarted);
 	evidence.resources.vscode.finalOwned = finalOwned?.filter(isVscodeProcess).length ?? 1;
 	evidence.resources.agentHost.finalOwned = finalOwned?.filter(isAgentHostProcess).length ?? 1;
 	evidence.resources.tunnel.finalOwned = finalOwned?.filter(isDevTunnelProcess).length ?? 1;
 	evidence.resources.socket.finalOwned = Number(!localIpcRemoved) + Number(!editorEndpointReleased);
 	evidence.resources.timer.finalOwned =
-		(latestResourceMetrics?.toolTimers.activeTimers ?? 0)
+		(finalResourceMetrics?.toolTimers.activeTimers ?? 1)
 		+ Number(ownershipSampler !== undefined);
 	evidence.cleanup = {
 		status: complete ? 'pass' : 'fail',
@@ -2525,9 +2986,13 @@ function safeFailure(error) {
 		? {
 			phase: error.manualInvocation.phase,
 			preparedCount: error.manualInvocation.preparedCount,
+			prepareStartedCount: error.manualInvocation.prepareStartedCount,
 			prepareFailedCount: error.manualInvocation.prepareFailedCount,
 			invokeStartedCount: error.manualInvocation.invokeStartedCount,
 			invokeCompletedCount: error.manualInvocation.invokeCompletedCount,
+			unexpectedInvocationCount: error.manualInvocation.unexpectedInvocationCount,
+			unexpectedActivityCount: error.manualInvocation.unexpectedActivityCount,
+			unresolvedPreparationCount: error.manualInvocation.unresolvedPreparationCount,
 			...(error.manualInvocation.compactStatus === undefined
 				? {}
 				: { compactStatus: error.manualInvocation.compactStatus }),
@@ -2550,9 +3015,13 @@ function isSafeManualInvocationFailure(value) {
 		&& ['target-liveness', 'prepare', 'invoke', 'timeout'].includes(value.phase)
 		&& [
 			value.preparedCount,
+			value.prepareStartedCount,
 			value.prepareFailedCount,
 			value.invokeStartedCount,
 			value.invokeCompletedCount,
+			value.unexpectedInvocationCount,
+			value.unexpectedActivityCount,
+			value.unresolvedPreparationCount,
 		].every((count) => Number.isSafeInteger(count) && count >= 0)
 		&& (value.compactStatus === undefined
 			|| (Number.isSafeInteger(value.compactStatus)

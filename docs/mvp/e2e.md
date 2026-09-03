@@ -93,12 +93,30 @@ command exits nonzero. Diagnostics-only `MANUAL_UI=0` behavior is unchanged.
 
 Throughout the preceding 15-minute manual invocation window, the harness polls the
 Target controller and the Source view of the exact node instance and Workspace.
-A closed Target controller fails immediately as `TARGET_WINDOW_CLOSED`; an offline
-or replaced exact claim fails as `PEER_OFFLINE`. The harness never binds to a new
-instance. Preparation and invocation failures retain only bounded phase counts,
-compact status, a safe error code, and a task-ID-present boolean. These early
-failures still run the normal Profile Lock, Workspace lease, process, socket, and
-timer cleanup.
+A controller request failure first triggers a bounded, sequence-checked Source
+observation recheck. If invocation already started, the harness waits for its
+authoritative Tool/task outcome rather than misreporting a pre-invocation closure.
+Only an absent exact Extension Host process proves `TARGET_WINDOW_CLOSED`; a live
+process with a transiently unavailable controller remains under observation. An
+offline or replaced exact claim fails as `PEER_OFFLINE`, and the harness never
+binds to a new instance.
+
+The harness checkpoints Source observations before printing the prompt and accounts
+for every later `mesh_delegate_task` start, including omitted or mismatched
+correlation IDs. Any unexpected invocation fails closed and Cleanup can pass only
+after all observed task handles are terminal/cancelled with released Workspace
+leases. The first successful Tool result is followed by a bounded five-second
+Source-observation quiescence audit. Before that audit an E2E-only Source gate
+rejects new delegate preparation/invocation ingress, so a later Copilot Tool call
+cannot race the success decision. A pending unexpected confirmation cannot certify cleanup as lease-free,
+and start/completion pairs use a recorder-local monotonic invocation sequence so a
+pre-checkpoint completion cannot hide a post-prompt pending task. A truncated
+observation history can never prove exactly-once execution.
+Preparation and invocation failures retain only bounded phase counts, compact
+status, a safe error code, task-ID presence, and an unexpected-invocation count.
+Final timer evidence is always a fresh `peer.resources` observation immediately
+before controller shutdown; an unavailable, malformed, or nonzero final snapshot
+fails cleanup.
 
 Sanitized JSON and a short summary are written to:
 
