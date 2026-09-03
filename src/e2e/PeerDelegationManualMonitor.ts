@@ -74,6 +74,11 @@ export type TargetControllerRejection =
 	| 'transient-unavailable'
 	| 'observation-history-incomplete';
 
+export type FrozenManualDecision =
+	| 'authoritative-outcome'
+	| 'pre-invocation-failure'
+	| 'observation-history-incomplete';
+
 export type ExactTargetLiveness =
 	| { readonly ok: true }
 	| { readonly ok: false; readonly code: 'PEER_OFFLINE' };
@@ -216,6 +221,19 @@ export function classifyTargetControllerRejection(
 		return 'observation-history-incomplete';
 	}
 	return controllerProcessAlive ? 'transient-unavailable' : 'target-window-closed';
+}
+
+export function classifyFrozenManualDecision(
+	invocations: PostPromptManualInvocations,
+	observationHistoryComplete: boolean,
+): FrozenManualDecision {
+	if (invocations.allInvokeStartedCount > 0) {
+		return 'authoritative-outcome';
+	}
+	if (!observationHistoryComplete) {
+		return 'observation-history-incomplete';
+	}
+	return 'pre-invocation-failure';
 }
 
 export function isSuccessfulManualInvocation(

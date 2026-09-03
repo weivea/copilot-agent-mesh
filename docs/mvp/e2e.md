@@ -108,7 +108,12 @@ after all observed task handles are terminal/cancelled with released Workspace
 leases. The first successful Tool result is followed by a bounded five-second
 Source-observation quiescence audit. Before that audit an E2E-only Source gate
 rejects new delegate preparation/invocation ingress, so a later Copilot Tool call
-cannot race the success decision. A pending unexpected confirmation cannot certify cleanup as lease-free,
+cannot race the success decision. The same freeze is the linearization point for
+terminal manual failures: a Target-close, peer-offline, preparation-failure, or
+timeout result is reported only when the post-freeze snapshot proves that no
+invocation started after the prompt checkpoint. If an invocation crossed that
+barrier, the harness instead awaits its authoritative outcome and settles every
+unexpected invocation before evaluating cleanup. A pending unexpected confirmation cannot certify cleanup as lease-free,
 and start/completion pairs use a recorder-local monotonic invocation sequence so a
 pre-checkpoint completion cannot hide a post-prompt pending task. A truncated
 observation history can never prove exactly-once execution.

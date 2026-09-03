@@ -27,6 +27,7 @@ import {
 import {
 	assertFinalPeerResourceMetrics,
 	assessExactTargetLiveness,
+	classifyFrozenManualDecision,
 	classifyTargetControllerRejection,
 	isSuccessfulManualInvocation,
 	latestManualObservationSequence,
@@ -527,6 +528,87 @@ test('manual monitor rechecks source sequence and awaits a started invocation af
 	);
 });
 
+test('manual monitor linearizes a target-close decision at the frozen invocation snapshot', () => {
+	const expectedRequestId = 'expected-request';
+	const beforeFreeze = summarizePostPromptDelegations([], 7, expectedRequestId);
+	assert.equal(
+		classifyTargetControllerRejection(beforeFreeze, true, false),
+		'target-window-closed',
+		'The final liveness recheck can legitimately precede an accepted invocation.',
+	);
+
+	const crossingObservations = [
+		{
+			sequence: 8,
+			toolName: 'mesh_delegate_task',
+			phase: 'prepareStarted' as const,
+			delegationRequestId: expectedRequestId,
+			preparationSequence: 1,
+			taskIdPresent: false,
+		},
+		{
+			sequence: 9,
+			toolName: 'mesh_delegate_task',
+			phase: 'prepared' as const,
+			delegationRequestId: expectedRequestId,
+			preparationSequence: 1,
+			taskIdPresent: false,
+		},
+		{
+			sequence: 10,
+			toolName: 'mesh_delegate_task',
+			phase: 'invokeStarted' as const,
+			delegationRequestId: expectedRequestId,
+			invocationSequence: 1,
+			taskIdPresent: false,
+		},
+	];
+	const afterFreeze = summarizePostPromptDelegations(
+		crossingObservations,
+		7,
+		expectedRequestId,
+	);
+	assert.equal(
+		classifyFrozenManualDecision(afterFreeze, true),
+		'authoritative-outcome',
+		'An invocation accepted before freeze processing must supersede the stale close decision.',
+	);
+	assert.equal(
+		classifyFrozenManualDecision(afterFreeze, false),
+		'authoritative-outcome',
+		'Even incomplete history must not bypass settlement of an observed start.',
+	);
+	const afterAuthoritativeOutcome = summarizePostPromptDelegations([
+		...crossingObservations,
+		{
+			sequence: 11,
+			toolName: 'mesh_delegate_task',
+			phase: 'invokeCompleted',
+			delegationRequestId: expectedRequestId,
+			invocationSequence: 1,
+			compactStatus: 0,
+			taskIdPresent: true,
+		},
+	], 7, expectedRequestId);
+	assert.equal(
+		isSuccessfulManualInvocation(afterAuthoritativeOutcome, true),
+		true,
+		'The barrier-crossing invocation remains eligible only after its authoritative outcome.',
+	);
+});
+
+test('manual monitor reports a true pre-invocation close only from a complete frozen snapshot', () => {
+	const frozen = summarizePostPromptDelegations([], 7, 'expected-request');
+	assert.equal(
+		classifyFrozenManualDecision(frozen, true),
+		'pre-invocation-failure',
+	);
+	assert.equal(
+		classifyFrozenManualDecision(frozen, false),
+		'observation-history-incomplete',
+	);
+});
+
 test('manual monitor accounts for missing and wrong post-prompt correlation IDs', () => {
 	const invocations = summarizePostPromptDelegations([
 		{
@@ -905,6 +987,36 @@ test('0.4.0 release metadata keeps the real peer gate default-off and five-tool 
 		harness.indexOf('await freezeManualDelegateIngress(source,')
 			< harness.indexOf('await waitForManualInvocationQuiescence'),
 		'Delegate ingress must freeze before the final quiescence audit.',
+	);
+	const frozenDecision = harness.indexOf('async function resolveFrozenManualTerminalDecision');
+	const frozenDecisionEnd = harness.indexOf('async function waitForFrozenManualOutcome', frozenDecision);
+	const frozenDecisionBody = harness.slice(frozenDecision, frozenDecisionEnd);
+	assert.ok(frozenDecision >= 0 && frozenDecisionEnd > frozenDecision);
+	assert.ok(
+		frozenDecisionBody.indexOf('await freezeManualDelegateIngress(')
+			< frozenDecisionBody.indexOf('classifyFrozenManualDecision('),
+		'Terminal manual failures must be classified from the post-freeze snapshot.',
+	);
+	assert.match(
+		frozenDecisionBody,
+		/classifyFrozenManualDecision[\s\S]*waitForFrozenManualOutcome[\s\S]*settleUnexpectedManualInvocations/u,
+	);
+	assert.match(
+		frozenDecisionBody,
+		/authoritativeOutcomeDeadline[\s\S]*manualCompletionTimeoutMs/u,
+	);
+	const settleStart = harness.indexOf('async function settleUnexpectedManualInvocations');
+	const settleEnd = harness.indexOf('async function waitForTaskLeaseReleased', settleStart);
+	const settleBody = harness.slice(settleStart, settleEnd);
+	assert.ok(settleStart >= 0 && settleEnd > settleStart);
+	assert.ok(
+		settleBody.indexOf('const postPromptTaskIds')
+			< settleBody.indexOf('finalPostPrompt.unresolvedPreparationCount'),
+		'Observed task handles must be settled before pending preparations fail cleanup evidence.',
+	);
+	assert.match(
+		frozenDecisionBody,
+		/MANUAL_TOOL_INVOCATION_FAILED[\s\S]*resolved\.postPrompt\.expected[\s\S]*false/u,
 	);
 	assert.ok(
 		harness.indexOf('const controllerProcessAlive = isControllerProcessAlive(target)')

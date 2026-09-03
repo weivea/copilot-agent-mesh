@@ -67,6 +67,7 @@ const {
 const {
 	assertFinalPeerResourceMetrics,
 	assessExactTargetLiveness,
+	classifyFrozenManualDecision,
 	classifyTargetControllerRejection,
 	isSuccessfulManualInvocation,
 	latestManualObservationSequence,
@@ -135,6 +136,7 @@ const evidencePath = evidenceDestination.evidencePath;
 const summaryPath = evidenceDestination.summaryPath;
 const attestationPath = join(evidenceRoot, `attestation-${runId}.json`);
 const manualUi = process.env[`${environmentPrefix}_MANUAL_UI`] !== '0';
+const manualCompletionTimeoutMs = 15 * 60_000;
 const testTerminationLogPath = testMode
 	&& process.env[`${environmentPrefix}_TEST_TERMINATION_LOG`] !== undefined
 	? resolve(process.env[`${environmentPrefix}_TEST_TERMINATION_LOG`])
@@ -1506,7 +1508,7 @@ async function waitForManualCompletion(source, target, targetInputBase) {
 		targetWindowLabel,
 		prompt,
 	}));
-	const deadline = Date.now() + 15 * 60_000;
+	const deadline = Date.now() + manualCompletionTimeoutMs;
 	let lastObservationSequence = observationCheckpoint;
 	while (Date.now() < deadline) {
 		const [observationsResult, targetStateResult, dashboardResult] = await Promise.allSettled([
@@ -1534,42 +1536,43 @@ async function waitForManualCompletion(source, target, targetInputBase) {
 			...observations.tools.map(({ sequence }) => sequence),
 		);
 		if (observations.truncated) {
-			await freezeManualDelegateIngress(source, observationCheckpoint, delegationRequestId);
-			throw manualInvocationFailure(
-				'MANUAL_OBSERVATIONS_TRUNCATED',
-				'The Source Tool observation history truncated during the manual invocation.',
-				'invoke',
-				summary,
-				false,
-			);
-		}
-		if (postPrompt.unexpectedActivityCount > 0) {
-			await freezeManualDelegateIngress(source, observationCheckpoint, delegationRequestId);
-			const unexpectedLeaseReleased = await settleUnexpectedManualInvocations(
+			return resolveFrozenManualTerminalDecision({
 				source,
-				postPrompt,
 				observationCheckpoint,
 				delegationRequestId,
 				deadline,
-			);
-			throw manualInvocationFailure(
-				'UNEXPECTED_MANUAL_INVOCATION',
-				'An unexpected delegation invocation occurred after the manual prompt.',
-				'invoke',
-				summary,
-				true,
-				unexpectedLeaseReleased,
-			);
+				fallback: {
+					code: 'MANUAL_OBSERVATIONS_TRUNCATED',
+					message: 'The Source Tool observation history truncated during the manual invocation.',
+					phase: 'invoke',
+				},
+			});
+		}
+		if (postPrompt.unexpectedActivityCount > 0) {
+			return resolveFrozenManualTerminalDecision({
+				source,
+				observationCheckpoint,
+				delegationRequestId,
+				deadline,
+				fallback: {
+					code: 'UNEXPECTED_MANUAL_INVOCATION',
+					message: 'An unexpected delegation invocation occurred after the manual prompt.',
+					phase: 'invoke',
+				},
+			});
 		}
 		if (summary.prepareFailedCount > 0) {
-			await freezeManualDelegateIngress(source, observationCheckpoint, delegationRequestId);
-			throw manualInvocationFailure(
-				summary.errorCode ?? 'MANUAL_TOOL_PREPARATION_FAILED',
-				'The selected delegation target became unavailable during Tool preparation.',
-				'prepare',
-				summary,
-				!observations.truncated,
-			);
+			return resolveFrozenManualTerminalDecision({
+				source,
+				observationCheckpoint,
+				delegationRequestId,
+				deadline,
+				fallback: {
+					code: summary.errorCode ?? 'MANUAL_TOOL_PREPARATION_FAILED',
+					message: 'The selected delegation target became unavailable during Tool preparation.',
+					phase: 'prepare',
+				},
+			});
 		}
 		const completedObservations = matching.filter(({ phase }) => phase === 'invokeCompleted');
 		if (completedObservations.length > 0) {
@@ -1666,42 +1669,44 @@ async function waitForManualCompletion(source, target, targetInputBase) {
 				controllerProcessAlive,
 			);
 			if (rechecked.observations.truncated) {
-				await freezeManualDelegateIngress(source, observationCheckpoint, delegationRequestId);
-				throw manualInvocationFailure(
-					'MANUAL_OBSERVATIONS_TRUNCATED',
-					'The Source Tool observation history truncated while rechecking Target liveness.',
-					'target-liveness',
-					rechecked.postPrompt.expected,
-					false,
-				);
-			}
-			if (rechecked.postPrompt.unexpectedActivityCount > 0) {
-				await freezeManualDelegateIngress(source, observationCheckpoint, delegationRequestId);
-				const taskLeaseReleased = await settleUnexpectedManualInvocations(
+				return resolveFrozenManualTerminalDecision({
 					source,
-					rechecked.postPrompt,
 					observationCheckpoint,
 					delegationRequestId,
 					deadline,
-				);
-				throw manualInvocationFailure(
-					'UNEXPECTED_MANUAL_INVOCATION',
-					'An unexpected delegation invocation occurred while rechecking Target liveness.',
-					'invoke',
-					rechecked.postPrompt.expected,
-					true,
-					taskLeaseReleased,
-				);
+					fallback: {
+						code: 'MANUAL_OBSERVATIONS_TRUNCATED',
+						message: 'The Source Tool observation history truncated while rechecking Target liveness.',
+						phase: 'target-liveness',
+					},
+				});
+			}
+			if (rechecked.postPrompt.unexpectedActivityCount > 0) {
+				return resolveFrozenManualTerminalDecision({
+					source,
+					observationCheckpoint,
+					delegationRequestId,
+					deadline,
+					fallback: {
+						code: 'UNEXPECTED_MANUAL_INVOCATION',
+						message: 'An unexpected delegation invocation occurred while rechecking Target liveness.',
+						phase: 'invoke',
+					},
+				});
 			}
 			if (rechecked.postPrompt.expected.prepareFailedCount > 0) {
-				await freezeManualDelegateIngress(source, observationCheckpoint, delegationRequestId);
-				throw manualInvocationFailure(
-					rechecked.postPrompt.expected.errorCode ?? 'MANUAL_TOOL_PREPARATION_FAILED',
-					'The selected delegation target became unavailable during Tool preparation.',
-					'prepare',
-					rechecked.postPrompt.expected,
-					true,
-				);
+				return resolveFrozenManualTerminalDecision({
+					source,
+					observationCheckpoint,
+					delegationRequestId,
+					deadline,
+					fallback: {
+						code: rechecked.postPrompt.expected.errorCode
+							?? 'MANUAL_TOOL_PREPARATION_FAILED',
+						message: 'The selected delegation target became unavailable during Tool preparation.',
+						phase: 'prepare',
+					},
+				});
 			}
 			if (rejection === 'await-authoritative-outcome') {
 				await delay(250);
@@ -1709,14 +1714,17 @@ async function waitForManualCompletion(source, target, targetInputBase) {
 			}
 			assert.notEqual(rejection, 'observation-history-incomplete');
 			if (rejection === 'target-window-closed') {
-				await freezeManualDelegateIngress(source, observationCheckpoint, delegationRequestId);
-				throw manualInvocationFailure(
-					'TARGET_WINDOW_CLOSED',
-					'The exact target window process closed before Tool invocation.',
-					'target-liveness',
-					rechecked.postPrompt.expected,
-					true,
-				);
+				return resolveFrozenManualTerminalDecision({
+					source,
+					observationCheckpoint,
+					delegationRequestId,
+					deadline,
+					fallback: {
+						code: 'TARGET_WINDOW_CLOSED',
+						message: 'The exact target window process closed before Tool invocation.',
+						phase: 'target-liveness',
+					},
+				});
 			}
 		}
 		if (dashboardResult.status === 'rejected') {
@@ -1731,31 +1739,216 @@ async function waitForManualCompletion(source, target, targetInputBase) {
 			)
 			: { ok: false, code: 'PEER_OFFLINE' };
 		if (!liveness.ok && summary.invokeStartedCount === 0 && targetStateResult.status === 'fulfilled') {
-			await freezeManualDelegateIngress(source, observationCheckpoint, delegationRequestId);
-			throw manualInvocationFailure(
-				liveness.code,
-				'The exact selected target instance became unavailable before Tool invocation.',
-				'target-liveness',
-				summary,
-				!observations.truncated,
-			);
+			return resolveFrozenManualTerminalDecision({
+				source,
+				observationCheckpoint,
+				delegationRequestId,
+				deadline,
+				fallback: {
+					code: liveness.code,
+					message: 'The exact selected target instance became unavailable before Tool invocation.',
+					phase: 'target-liveness',
+				},
+			});
 		}
 		await delay(250);
 	}
-	const observations = await request(source, 'peer.observations');
-	const postPrompt = summarizePostPromptDelegations(
-		manualToolObservations(observations),
+	return resolveFrozenManualTerminalDecision({
+		source,
+		observationCheckpoint,
+		delegationRequestId,
+		deadline,
+		fallback: {
+			code: 'MANUAL_TOOL_TIMEOUT',
+			message: 'The manual Copilot Tool route did not complete within the bounded observation window.',
+			phase: 'timeout',
+		},
+	});
+}
+
+async function resolveFrozenManualTerminalDecision({
+	source,
+	observationCheckpoint,
+	delegationRequestId,
+	deadline,
+	fallback,
+}) {
+	const frozen = await freezeManualDelegateIngress(
+		source,
 		observationCheckpoint,
 		delegationRequestId,
 	);
-	await freezeManualDelegateIngress(source, observationCheckpoint, delegationRequestId);
-	throw manualInvocationFailure(
-		'MANUAL_TOOL_TIMEOUT',
-		'The manual Copilot Tool route did not complete within the bounded observation window.',
-		'timeout',
-		postPrompt.expected,
-		!observations.truncated,
+	const decision = classifyFrozenManualDecision(frozen.postPrompt, frozen.complete);
+	if (decision === 'observation-history-incomplete') {
+		throw manualInvocationFailure(
+			'MANUAL_OBSERVATIONS_TRUNCATED',
+			'The frozen Source Tool observation history was incomplete.',
+			fallback.phase,
+			frozen.postPrompt.expected,
+			false,
+		);
+	}
+	if (decision === 'pre-invocation-failure') {
+		throw manualInvocationFailure(
+			fallback.code,
+			fallback.message,
+			fallback.phase,
+			frozen.postPrompt.expected,
+			true,
+		);
+	}
+
+	const authoritativeOutcomeDeadline = Math.max(
+		deadline,
+		Date.now() + manualCompletionTimeoutMs,
 	);
+	const resolved = await waitForFrozenManualOutcome(
+		source,
+		observationCheckpoint,
+		delegationRequestId,
+		authoritativeOutcomeDeadline,
+		frozen,
+	);
+	if (!resolved.complete) {
+		const taskLeaseReleased = await settleUnexpectedManualInvocations(
+			source,
+			resolved.postPrompt,
+			observationCheckpoint,
+			delegationRequestId,
+			authoritativeOutcomeDeadline,
+		);
+		throw manualInvocationFailure(
+			'MANUAL_OBSERVATIONS_TRUNCATED',
+			'The frozen Source Tool observation history truncated before authoritative outcome.',
+			'invoke',
+			resolved.postPrompt.expected,
+			false,
+			taskLeaseReleased,
+			false,
+		);
+	}
+	if (resolved.postPrompt.unexpectedActivityCount > 0) {
+		const taskLeaseReleased = await settleUnexpectedManualInvocations(
+			source,
+			resolved.postPrompt,
+			observationCheckpoint,
+			delegationRequestId,
+			authoritativeOutcomeDeadline,
+		);
+		throw manualInvocationFailure(
+			'UNEXPECTED_MANUAL_INVOCATION',
+			'An unexpected delegation invocation crossed the terminal decision barrier.',
+			'invoke',
+			resolved.postPrompt.expected,
+			true,
+			taskLeaseReleased,
+			false,
+		);
+	}
+	const completed = resolved.toolObservations.find(
+		(observation) =>
+			observation.sequence > observationCheckpoint
+			&& observation.delegationRequestId === delegationRequestId
+			&& observation.phase === 'invokeCompleted',
+	);
+	if (
+		completed !== undefined
+		&& isSuccessfulManualInvocation(resolved.postPrompt, resolved.complete)
+	) {
+		return manualCompletionRun(completed, resolved.postPrompt.expected, delegationRequestId);
+	}
+	const taskLeaseReleased = await settleUnexpectedManualInvocations(
+		source,
+		resolved.postPrompt,
+		observationCheckpoint,
+		delegationRequestId,
+		authoritativeOutcomeDeadline,
+	);
+	throw manualInvocationFailure(
+		resolved.postPrompt.expected.errorCode ?? (
+			resolved.postPrompt.expected.invokeCompletedCount > 0
+				? 'MANUAL_TOOL_INVOCATION_FAILED'
+				: 'MANUAL_TASK_OUTCOME_UNRESOLVED'
+		),
+		resolved.postPrompt.expected.invokeCompletedCount > 0
+			? 'The barrier-crossing invocation completed without a successful authoritative outcome.'
+			: 'An invocation crossed the terminal decision barrier without an authoritative outcome.',
+		'invoke',
+		resolved.postPrompt.expected,
+		true,
+		taskLeaseReleased,
+		false,
+	);
+}
+
+async function waitForFrozenManualOutcome(
+	source,
+	observationCheckpoint,
+	delegationRequestId,
+	deadline,
+	frozen,
+) {
+	const collected = new Map(
+		frozen.observations.tools.map((observation) => [observation.sequence, observation]),
+	);
+	let observations = frozen.observations;
+	let postPrompt = frozen.postPrompt;
+	let complete = frozen.complete;
+	do {
+		observations = await request(source, 'peer.observations', {}, 2_000);
+		complete &&= !observations.truncated;
+		for (const observation of observations.tools) {
+			if (observation.sequence > observationCheckpoint) {
+				collected.set(observation.sequence, observation);
+			}
+		}
+		postPrompt = summarizePostPromptDelegations(
+			manualToolObservations({
+				tools: [...collected.values()].sort((left, right) => left.sequence - right.sequence),
+			}),
+			observationCheckpoint,
+			delegationRequestId,
+		);
+		if (
+			(
+				postPrompt.expected.invokeCompletedCount > 0
+				&& postPrompt.unsettledInvokeStartedCount === 0
+			)
+			|| (
+				postPrompt.allInvokeStartedCount > 0
+				&& postPrompt.unsettledInvokeStartedCount === 0
+			)
+		) {
+			break;
+		}
+		await delay(100);
+	} while (Date.now() < deadline);
+	return {
+		observations,
+		toolObservations: [...collected.values()],
+		postPrompt,
+		complete,
+	};
+}
+
+function manualCompletionRun(completed, summary, delegationRequestId) {
+	return {
+		result: {
+			s: completed.compactStatus,
+			t: completed.taskId,
+			d: delegationRequestId,
+		},
+		parentResultObservation: {
+			resultFields: completed.resultFields,
+			resultBytes: completed.resultBytes,
+			resultHash: completed.resultHash,
+		},
+		invocationSource: 'copilot-ui',
+		confirmationObservation: {
+			preparedCount: summary.preparedCount,
+			acceptedCount: summary.invokeStartedCount,
+		},
+	};
 }
 
 async function freezeManualDelegateIngress(
@@ -1770,12 +1963,14 @@ async function freezeManualDelegateIngress(
 	const observations = await request(source, 'peer.observations', {}, 2_000);
 	manualIngressFreezeProof = {
 		complete: !observations.truncated,
+		observations,
 		postPrompt: summarizePostPromptDelegations(
 			manualToolObservations(observations),
 			observationCheckpoint,
 			delegationRequestId,
 		),
 	};
+	return manualIngressFreezeProof;
 }
 
 async function waitForManualInvocationQuiescence(
@@ -1846,39 +2041,31 @@ async function settleUnexpectedManualInvocations(
 	expectedDelegationRequestId,
 	deadline,
 ) {
-	if (manualIngressFreezeProof?.complete === true) {
-		postPrompt = manualIngressFreezeProof.postPrompt;
-	}
-	if (
-		postPrompt.unexpectedActivityCount > 0
-		&& postPrompt.unresolvedPreparationCount > 0
-	) {
-		return false;
-	}
+	const collected = new Map(
+		postPrompt.delegateObservations.map((observation) => [observation.sequence, observation]),
+	);
+	let observationHistoryComplete = manualIngressFreezeProof?.complete === true;
 	if (postPrompt.unsettledInvokeStartedCount > 0) {
 		while (Date.now() < deadline) {
 			await delay(100);
 			const observations = await request(source, 'peer.observations', {}, 2_000);
-			if (observations.truncated) {
-				return false;
+			observationHistoryComplete &&= !observations.truncated;
+			for (const observation of manualToolObservations(observations)) {
+				if (observation.sequence > observationCheckpoint) {
+					collected.set(observation.sequence, observation);
+				}
 			}
 			postPrompt = summarizePostPromptDelegations(
-				manualToolObservations(observations),
+				[...collected.values()].sort((left, right) => left.sequence - right.sequence),
 				observationCheckpoint,
 				expectedDelegationRequestId,
 			);
-			if (postPrompt.unresolvedPreparationCount > 0) {
-				return false;
-			}
 			if (postPrompt.unsettledInvokeStartedCount === 0) {
 				break;
 			}
 		}
 	}
 	if (postPrompt.unsettledInvokeStartedCount > 0) {
-		return false;
-	}
-	if (postPrompt.unresolvedPreparationCount > 0) {
 		return false;
 	}
 	const startedInvocationSequences = new Set(postPrompt.delegateObservations
@@ -1908,17 +2095,24 @@ async function settleUnexpectedManualInvocations(
 			return false;
 		}
 	}
+	const allObservedStartsHaveTaskEvidence =
+		postPromptTaskIds.length === startedInvocationSequences.size;
 	await delay(100);
 	const finalObservations = await request(source, 'peer.observations', {}, 2_000);
-	if (finalObservations.truncated) {
-		return false;
+	observationHistoryComplete &&= !finalObservations.truncated;
+	for (const observation of manualToolObservations(finalObservations)) {
+		if (observation.sequence > observationCheckpoint) {
+			collected.set(observation.sequence, observation);
+		}
 	}
 	const finalPostPrompt = summarizePostPromptDelegations(
-		manualToolObservations(finalObservations),
+		[...collected.values()].sort((left, right) => left.sequence - right.sequence),
 		observationCheckpoint,
 		expectedDelegationRequestId,
 	);
-	return finalPostPrompt.unresolvedPreparationCount === 0
+	return observationHistoryComplete
+		&& allObservedStartsHaveTaskEvidence
+		&& finalPostPrompt.unresolvedPreparationCount === 0
 		&& finalPostPrompt.unsettledInvokeStartedCount === 0
 		&& finalPostPrompt.allInvokeStartedCount === postPrompt.allInvokeStartedCount;
 }
@@ -1987,8 +2181,9 @@ function manualInvocationFailure(
 	summary,
 	observationHistoryComplete,
 	taskLeaseReleased = false,
+	useFrozenSummary = true,
 ) {
-	const frozenSummary = manualIngressFreezeProof?.complete === true
+	const frozenSummary = useFrozenSummary && manualIngressFreezeProof?.complete === true
 		? manualIngressFreezeProof.postPrompt.expected
 		: undefined;
 	const finalSummary = frozenSummary ?? summary;
