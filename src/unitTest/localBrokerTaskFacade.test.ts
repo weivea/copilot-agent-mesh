@@ -113,6 +113,7 @@ test('stable task IDs survive facade reload and changed retries surface broker c
 	const retry = await reloadedFacade.persistDelegationIntent(intent());
 
 	assert.equal(first.taskId, deterministicTaskId(DELEGATION_ID));
+	assert.equal(reloadedFacade.taskIdForDelegationRequest(DELEGATION_ID), first.taskId);
 	assert.equal(retry.taskId, first.taskId);
 	assert.equal(first.recovered, false);
 	assert.equal(retry.recovered, true);
@@ -176,6 +177,7 @@ test('source Workspace identity scopes stable delegation keys independently of d
 	const independent = await sourceB.persistDelegationIntent(intent());
 
 	assert.equal(first.taskId, deterministicTaskId(DELEGATION_ID, SOURCE_IDENTITY_A));
+	assert.equal(sourceA.taskIdForDelegationRequest(DELEGATION_ID), first.taskId);
 	assert.equal(retry.taskId, first.taskId);
 	assert.notEqual(independent.taskId, first.taskId);
 	assert.equal(independent.taskId, deterministicTaskId(DELEGATION_ID, SOURCE_IDENTITY_B));

@@ -126,6 +126,12 @@ export function createPeerDelegationE2eApi(
 				case 'peer.manual.freeze':
 					options.recorder.freezeDelegateInvocations();
 					return { frozen: true };
+				case 'peer.manual.task.resolve':
+					return {
+						taskId: options.localTasks.taskIdForDelegationRequest(
+							requiredUuid(params, 'delegationRequestId'),
+						),
+					};
 				case 'peer.budget.arm':
 					options.toolClock.armNextBudgetTimer();
 					return { armed: true };

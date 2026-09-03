@@ -34,6 +34,7 @@ export interface SafePeerToolObservation {
 	readonly errorCode?: string;
 	readonly preparationSequence?: number;
 	readonly invocationSequence?: number;
+	readonly invocationId?: string;
 	readonly cancellationReason?: string;
 	readonly resultFields?: readonly string[];
 	readonly resultBytes?: number;
@@ -52,8 +53,10 @@ export interface SafePeerAhpObservation {
 
 export interface PeerDelegationRecorderSnapshot {
 	readonly tools: readonly SafePeerToolObservation[];
+	readonly delegateInvocations: readonly SafePeerToolObservation[];
 	readonly ahp: readonly SafePeerAhpObservation[];
 	readonly truncated: boolean;
+	readonly delegateInvocationsTruncated: boolean;
 }
 
 export class PeerDelegationE2eRecorder implements
@@ -62,8 +65,10 @@ export class PeerDelegationE2eRecorder implements
 	AgentRuntimeLifecycleObserver {
 	private sequence = 0;
 	private readonly tools: SafePeerToolObservation[] = [];
+	private readonly delegateInvocations = new Map<string, SafePeerToolObservation[]>();
 	private readonly ahp: SafePeerAhpObservation[] = [];
 	private truncated = false;
+	private delegateInvocationsTruncated = false;
 	private delegateInvocationsFrozen = false;
 
 	public assertDelegateInvocationAllowed(): void {
@@ -86,7 +91,7 @@ export class PeerDelegationE2eRecorder implements
 			const serializedResult = result === undefined
 				? undefined
 				: JSON.stringify(result);
-			this.push(this.tools, {
+			const safeObservation: SafePeerToolObservation = {
 				sequence: this.nextSequence(),
 				at: new Date().toISOString(),
 				toolName: observation.toolName,
@@ -101,6 +106,7 @@ export class PeerDelegationE2eRecorder implements
 					&& (observation.invocationSequence ?? 0) > 0
 					? { invocationSequence: observation.invocationSequence }
 					: {}),
+				...optionalUuid('invocationId', observation.invocationId),
 				...(Number.isSafeInteger(observation.preparationSequence)
 					&& (observation.preparationSequence ?? 0) > 0
 					? { preparationSequence: observation.preparationSequence }
@@ -118,7 +124,9 @@ export class PeerDelegationE2eRecorder implements
 					resultBytes: Buffer.byteLength(serializedResult, 'utf8'),
 					resultHash: digest('tool-result', serializedResult),
 				}),
-			});
+			};
+			this.push(this.tools, safeObservation);
+			this.trackDelegateInvocation(safeObservation);
 		} catch {
 			// E2E observation must never affect a production Tool invocation.
 		}
@@ -165,8 +173,13 @@ export class PeerDelegationE2eRecorder implements
 	public snapshot(): PeerDelegationRecorderSnapshot {
 		return {
 			tools: this.tools.map((observation) => ({ ...observation })),
+			delegateInvocations: [...this.delegateInvocations.values()]
+				.flat()
+				.sort((left, right) => left.sequence - right.sequence)
+				.map((observation) => ({ ...observation })),
 			ahp: this.ahp.map((observation) => ({ ...observation })),
 			truncated: this.truncated,
+			delegateInvocationsTruncated: this.delegateInvocationsTruncated,
 		};
 	}
 
@@ -181,6 +194,29 @@ export class PeerDelegationE2eRecorder implements
 			target.shift();
 			this.truncated = true;
 		}
+	}
+
+	private trackDelegateInvocation(observation: SafePeerToolObservation): void {
+		if (
+			observation.toolName !== 'mesh_delegate_task'
+			|| observation.invocationId === undefined
+			|| !['invokeStarted', 'taskAvailable', 'invokeCompleted'].includes(observation.phase)
+		) {
+			return;
+		}
+		const lifecycle = this.delegateInvocations.get(observation.invocationId) ?? [];
+		lifecycle.push(observation);
+		this.delegateInvocations.set(observation.invocationId, lifecycle);
+		if (this.delegateInvocations.size <= maximumObservations) {
+			return;
+		}
+		const completed = [...this.delegateInvocations].find(([, entries]) =>
+			entries.some(({ phase }) => phase === 'invokeCompleted'));
+		const evicted = completed ?? this.delegateInvocations.entries().next().value;
+		if (evicted !== undefined) {
+			this.delegateInvocations.delete(evicted[0]);
+		}
+		this.delegateInvocationsTruncated = true;
 	}
 }
 
@@ -323,7 +359,7 @@ export class PeerDelegationE2eToolClock implements ToolClock {
 	}
 }
 
-function optionalUuid<Key extends 'delegationRequestId' | 'taskId' | 'inputId'>(
+function optionalUuid<Key extends 'delegationRequestId' | 'taskId' | 'inputId' | 'invocationId'>(
 	key: Key,
 	value: unknown,
 ): Partial<Record<Key, string>> {

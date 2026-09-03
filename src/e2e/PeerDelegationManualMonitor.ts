@@ -10,6 +10,7 @@ export interface ManualInvocationObservation {
 		| 'prepareFailed'
 		| 'prepared'
 		| 'invokeStarted'
+		| 'taskAvailable'
 		| 'invokeCompleted';
 	readonly compactStatus?: number;
 	readonly errorCode?: string;
@@ -37,6 +38,7 @@ export interface SequencedManualToolObservation extends ManualInvocationObservat
 	readonly taskId?: string;
 	readonly preparationSequence?: number;
 	readonly invocationSequence?: number;
+	readonly invocationId?: string;
 }
 
 export interface PostPromptManualInvocations {
@@ -147,6 +149,7 @@ export function summarizePostPromptDelegations(
 		['prepareFailed', 1],
 		['prepared', 1],
 		['invokeStarted', 1],
+		['taskAvailable', 1],
 		['invokeCompleted', 1],
 	]);
 	const unexpectedActivityCount = delegateObservations.filter(
@@ -159,20 +162,20 @@ export function summarizePostPromptDelegations(
 		countPhase(expectedObservations, 'prepared') > 0
 		&& countPhase(expectedObservations, 'prepareFailed') > 0,
 	);
-	const startedSequences = new Set(delegateObservations
+	const startedIds = new Set(delegateObservations
 		.filter(({ phase }) => phase === 'invokeStarted')
-		.map(({ invocationSequence }) => invocationSequence)
-		.filter(isPositiveInteger));
-	const completedSequences = new Set(delegateObservations
+		.map(({ invocationId }) => invocationId)
+		.filter(isUuid));
+	const completedIds = new Set(delegateObservations
 		.filter(({ phase }) => phase === 'invokeCompleted')
-		.map(({ invocationSequence }) => invocationSequence)
-		.filter(isPositiveInteger));
+		.map(({ invocationId }) => invocationId)
+		.filter(isUuid));
 	const unsettledInvokeStartedCount = delegateObservations.filter(
-		({ phase, invocationSequence }) =>
+		({ phase, invocationId }) =>
 			phase === 'invokeStarted'
 			&& (
-				!isPositiveInteger(invocationSequence)
-				|| !completedSequences.has(invocationSequence)
+				!isUuid(invocationId)
+				|| !completedIds.has(invocationId)
 			),
 	).length;
 	const preparationCounts = new Map<string, { prepared: number; started: number }>();
@@ -201,8 +204,8 @@ export function summarizePostPromptDelegations(
 		unexpectedInvokeStartedCount,
 		unexpectedActivityCount,
 		allInvokeStartedCount,
-		allInvokeCompletedCount: [...completedSequences].filter(
-			(sequence) => startedSequences.has(sequence),
+		allInvokeCompletedCount: [...completedIds].filter(
+			(invocationId) => startedIds.has(invocationId),
 		).length,
 		unsettledInvokeStartedCount,
 		unresolvedPreparationCount,
@@ -234,6 +237,38 @@ export function classifyFrozenManualDecision(
 		return 'observation-history-incomplete';
 	}
 	return 'pre-invocation-failure';
+}
+
+export function manualSettlementTaskIds(
+	invocations: PostPromptManualInvocations,
+): readonly string[] {
+	return [...new Set(invocations.delegateObservations
+		.filter(({ phase, taskId }) =>
+			(phase === 'taskAvailable' || phase === 'invokeCompleted')
+			&& taskId !== undefined)
+		.map(({ taskId }) => taskId!))];
+}
+
+export function allManualStartsHaveTaskEvidence(
+	invocations: PostPromptManualInvocations,
+): boolean {
+	return manualStartsWithoutTaskEvidence(invocations).length === 0;
+}
+
+export function manualStartsWithoutTaskEvidence(
+	invocations: PostPromptManualInvocations,
+): readonly SequencedManualToolObservation[] {
+	const taskBearingInvocationIds = new Set(invocations.delegateObservations
+		.filter(({ phase, taskId, invocationId }) =>
+			(phase === 'taskAvailable' || phase === 'invokeCompleted')
+			&& taskId !== undefined
+			&& isUuid(invocationId))
+		.map(({ invocationId }) => invocationId));
+	return invocations.delegateObservations
+		.filter(({ phase }) => phase === 'invokeStarted')
+		.filter(({ invocationId }) =>
+			!isUuid(invocationId)
+			|| !taskBearingInvocationIds.has(invocationId));
 }
 
 export function isSuccessfulManualInvocation(
@@ -343,6 +378,11 @@ function isNonNegativeInteger(value: unknown): value is number {
 
 function isPositiveInteger(value: unknown): value is number {
 	return Number.isSafeInteger(value) && (value as number) > 0;
+}
+
+function isUuid(value: unknown): value is string {
+	return typeof value === 'string'
+		&& /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(value);
 }
 
 function countOpenPreparations(

@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 import * as vscode from 'vscode';
 
 import {
@@ -28,7 +30,7 @@ type EmptyInput = Record<string, never>;
 abstract class TaskToolBase {
 	constructor(
 		protected readonly facade: TaskToolFacade,
-		private readonly coreOptions: TaskToolsCoreOptions = {},
+		protected readonly coreOptions: TaskToolsCoreOptions = {},
 		private readonly observer?: TaskToolInvocationObserver,
 		private readonly invocationGate?: TaskToolInvocationGate,
 	) {}
@@ -49,6 +51,7 @@ abstract class TaskToolBase {
 		errorCode?: TaskToolFacadeError['code'],
 		preparationSequence?: number,
 		invocationSequence?: number,
+		invocationId?: string,
 	): void {
 		try {
 			this.observer?.observe({
@@ -59,6 +62,7 @@ abstract class TaskToolBase {
 				errorCode,
 				preparationSequence,
 				invocationSequence,
+				invocationId,
 			});
 		} catch {
 			// Diagnostics must never affect Tool execution.
@@ -174,6 +178,7 @@ export class MeshDelegateTaskTool extends TaskToolBase implements vscode.Languag
 	): Promise<vscode.LanguageModelToolResult> {
 		this.assertDelegateInvocationAllowed();
 		const invocationSequence = ++this.nextInvocationSequence;
+		const invocationId = randomUUID();
 		this.observe(
 			MESH_TOOL_NAMES.delegateTask,
 			'invokeStarted',
@@ -182,10 +187,25 @@ export class MeshDelegateTaskTool extends TaskToolBase implements vscode.Languag
 			undefined,
 			undefined,
 			invocationSequence,
+			invocationId,
 		);
 		let value: ToolJsonResult;
 		try {
-			value = await this.core().delegateTask(options.input, token);
+			value = await new TaskToolsCore(this.facade, {
+				...this.coreOptions,
+				onDelegationTaskAvailable: ({ delegationRequestId, taskId }) => {
+					this.observe(
+						MESH_TOOL_NAMES.delegateTask,
+						'taskAvailable',
+						options.input,
+						{ d: delegationRequestId, t: taskId },
+						undefined,
+						undefined,
+						invocationSequence,
+						invocationId,
+					);
+				},
+			}).delegateTask(options.input, token);
 		} catch {
 			value = internalErrorValue();
 		}
@@ -197,6 +217,7 @@ export class MeshDelegateTaskTool extends TaskToolBase implements vscode.Languag
 			undefined,
 			undefined,
 			invocationSequence,
+			invocationId,
 		);
 		try {
 			return await this.result(value, options);

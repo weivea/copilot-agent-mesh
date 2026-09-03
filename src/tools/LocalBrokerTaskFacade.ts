@@ -192,6 +192,11 @@ export class LocalBrokerTaskFacade implements TaskToolFacade {
 		};
 	}
 
+	public taskIdForDelegationRequest(delegationRequestId: string): string {
+		const sourceWorkspaceIdentity = this.options.sourceWorkspaceIdentity?.();
+		return deterministicTaskId(delegationRequestId, sourceWorkspaceIdentity);
+	}
+
 	public async describeDelegationTarget(
 		intent: DelegationIntentInput,
 		signal: AbortSignal,

@@ -84,6 +84,9 @@ export interface TaskToolsCoreOptions {
 	readonly outputByteLimit?: number;
 	readonly id?: () => string;
 	readonly delegatedToolInvocations?: DelegatedToolInvocationRegistry;
+	readonly onDelegationTaskAvailable?: (
+		identity: Readonly<Pick<DelegationIdentity, 'delegationRequestId' | 'taskId'>>,
+	) => void;
 }
 
 interface OperationSuccess<T> {
@@ -180,6 +183,8 @@ export class TaskToolsCore {
 	private readonly outputByteLimit: number;
 	private readonly id: () => string;
 	private readonly delegatedToolInvocations: DelegatedToolInvocationRegistry | undefined;
+	private readonly onDelegationTaskAvailable:
+		TaskToolsCoreOptions['onDelegationTaskAvailable'];
 
 	constructor(
 		private readonly facade: TaskToolFacade,
@@ -189,6 +194,7 @@ export class TaskToolsCore {
 		this.outputByteLimit = options.outputByteLimit ?? TASK_TOOL_LIMITS.defaultOutputBytes;
 		this.id = options.id ?? randomUUID;
 		this.delegatedToolInvocations = options.delegatedToolInvocations;
+		this.onDelegationTaskAvailable = options.onDelegationTaskAvailable;
 		if (
 			!Number.isSafeInteger(this.outputByteLimit)
 			|| this.outputByteLimit < TASK_TOOL_LIMITS.minimumOutputBytes
@@ -350,6 +356,14 @@ export class TaskToolsCore {
 					|| persisted.delegationRequestId !== identity.delegationRequestId
 				) {
 					throw new TaskToolFacadeError('OUTPUT_INVALID');
+				}
+				try {
+					this.onDelegationTaskAvailable?.({
+						delegationRequestId: identity.delegationRequestId,
+						taskId: identity.taskId,
+					});
+				} catch {
+					// Diagnostics must never affect task execution.
 				}
 				onTaskAvailable();
 				const read = await this.facade.getTask(

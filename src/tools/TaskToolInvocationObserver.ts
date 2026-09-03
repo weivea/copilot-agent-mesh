@@ -6,6 +6,7 @@ export type TaskToolInvocationPhase =
 	| 'prepareFailed'
 	| 'prepared'
 	| 'invokeStarted'
+	| 'taskAvailable'
 	| 'invokeCompleted';
 
 export interface TaskToolInvocationObservation {
@@ -16,6 +17,7 @@ export interface TaskToolInvocationObservation {
 	readonly errorCode?: TaskToolErrorCode;
 	readonly preparationSequence?: number;
 	readonly invocationSequence?: number;
+	readonly invocationId?: string;
 }
 
 export interface TaskToolInvocationObserver {

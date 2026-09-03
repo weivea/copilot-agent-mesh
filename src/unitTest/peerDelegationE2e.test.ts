@@ -25,12 +25,17 @@ import {
 	waitForManualPostDetachAttestation,
 } from '../e2e/PeerDelegationManualEvidence';
 import {
+	resolveManualTerminalBarrier,
+} from '../e2e/PeerDelegationManualBarrier';
+import {
+	allManualStartsHaveTaskEvidence,
 	assertFinalPeerResourceMetrics,
 	assessExactTargetLiveness,
 	classifyFrozenManualDecision,
 	classifyTargetControllerRejection,
 	isSuccessfulManualInvocation,
 	latestManualObservationSequence,
+	manualSettlementTaskIds,
 	summarizeManualInvocation,
 	summarizePostPromptDelegations,
 } from '../e2e/PeerDelegationManualMonitor';
@@ -40,6 +45,8 @@ const taskId = '00000000-0000-4000-8000-000000000002';
 const inputId = '00000000-0000-4000-8000-000000000003';
 const delegationRequestId = '00000000-0000-4000-8000-000000000004';
 const postDetachChallenge = '00000000-0000-4000-8000-000000000005';
+const invocationId = '00000000-0000-4000-8000-000000000006';
+const secondInvocationId = '00000000-0000-4000-8000-000000000007';
 
 function resourceMetrics(
 	toolTimers: { readonly activeTimers: number; readonly armedBudgetTimers: number },
@@ -407,6 +414,7 @@ test('peer-delegation recorder stores identities and hashes without prompt or ou
 		toolName: 'mesh_delegate_task',
 		phase: 'invokeCompleted',
 		invocationSequence: 7,
+		invocationId,
 		input: {
 			delegationRequestId,
 			prompt: 'do not persist this prompt',
@@ -560,6 +568,7 @@ test('manual monitor linearizes a target-close decision at the frozen invocation
 			phase: 'invokeStarted' as const,
 			delegationRequestId: expectedRequestId,
 			invocationSequence: 1,
+			invocationId,
 			taskIdPresent: false,
 		},
 	];
@@ -586,6 +595,7 @@ test('manual monitor linearizes a target-close decision at the frozen invocation
 			phase: 'invokeCompleted',
 			delegationRequestId: expectedRequestId,
 			invocationSequence: 1,
+			invocationId,
 			compactStatus: 0,
 			taskIdPresent: true,
 		},
@@ -607,6 +617,364 @@ test('manual monitor reports a true pre-invocation close only from a complete fr
 		classifyFrozenManualDecision(frozen, false),
 		'observation-history-incomplete',
 	);
+});
+
+test('manual barrier reports a true no-start closure without outcome or settlement work', async () => {
+	const observations: never[] = [];
+	const snapshot = {
+		complete: true,
+		observations,
+		postPrompt: summarizePostPromptDelegations(observations, 7, 'expected-request'),
+	};
+	let outcomeWaited = false;
+	let settlementAttempted = false;
+	const resolution = await resolveManualTerminalBarrier(
+		async () => snapshot,
+		async () => {
+			outcomeWaited = true;
+			return snapshot;
+		},
+		async () => {
+			settlementAttempted = true;
+			return true;
+		},
+	);
+
+	assert.equal(resolution.kind, 'pre-invocation-failure');
+	assert.equal(outcomeWaited, false);
+	assert.equal(settlementAttempted, false);
+});
+
+test('manual barrier resolves an invocation accepted while freeze processing is delayed', async () => {
+	const task = '00000000-0000-4000-8000-000000000099';
+	const recorder = new PeerDelegationE2eRecorder();
+	const monitorSnapshot = () => {
+		const observations = recorder.snapshot().delegateInvocations.map((observation) => ({
+			...observation,
+			taskIdPresent: observation.taskId !== undefined,
+		}));
+		return {
+			complete: true,
+			observations,
+			postPrompt: summarizePostPromptDelegations(observations, 0, delegationRequestId),
+		};
+	};
+	const preFreeze = summarizePostPromptDelegations([], 0, delegationRequestId);
+	assert.equal(
+		classifyTargetControllerRejection(preFreeze, true, false),
+		'target-window-closed',
+	);
+	let releaseFreeze!: () => void;
+	const freezeBarrier = new Promise<void>((resolveFreeze) => {
+		releaseFreeze = resolveFreeze;
+	});
+	const taskEvidence = { state: 'waitingInput', leaseReleased: false };
+	const resolutionPromise = resolveManualTerminalBarrier(
+		async () => {
+			await freezeBarrier;
+			recorder.freezeDelegateInvocations();
+			return monitorSnapshot();
+		},
+		async (frozen) => {
+			assert.equal(frozen.postPrompt.allInvokeStartedCount, 1);
+			recorder.observe({
+				toolName: 'mesh_delegate_task',
+				phase: 'taskAvailable',
+				input: { delegationRequestId },
+				result: { d: delegationRequestId, t: task },
+				invocationSequence: 1,
+				invocationId,
+			});
+			recorder.observe({
+				toolName: 'mesh_delegate_task',
+				phase: 'invokeCompleted',
+				input: { delegationRequestId },
+				result: { d: delegationRequestId, t: task, s: 1 },
+				invocationSequence: 1,
+				invocationId,
+			});
+			return monitorSnapshot();
+		},
+		async (snapshot) => {
+			assert.deepEqual(manualSettlementTaskIds(snapshot.postPrompt), [task]);
+			taskEvidence.state = 'cancelled';
+			taskEvidence.leaseReleased = true;
+			return taskEvidence.state === 'cancelled' && taskEvidence.leaseReleased;
+		},
+	);
+
+	recorder.observe({
+		toolName: 'mesh_delegate_task',
+		phase: 'invokeStarted',
+		input: { delegationRequestId },
+		invocationSequence: 1,
+		invocationId,
+	});
+	releaseFreeze();
+	const resolution = await resolutionPromise;
+	assert.throws(
+		() => recorder.assertDelegateInvocationAllowed(),
+		/invocation ingress is closed/u,
+	);
+	assert.equal(resolution.kind, 'failed-invocation');
+	assert.equal(resolution.taskLeaseReleased, true);
+	assert.deepEqual(taskEvidence, { state: 'cancelled', leaseReleased: true });
+	assert.equal(resolution.snapshot.postPrompt.expected.compactStatus, 1);
+});
+
+test('manual barrier settles the frozen task when authoritative outcome observation fails', async () => {
+	const observations = [
+		{
+			sequence: 1,
+			toolName: 'mesh_delegate_task',
+			phase: 'invokeStarted' as const,
+			delegationRequestId,
+			invocationId,
+			taskIdPresent: false,
+		},
+		{
+			sequence: 2,
+			toolName: 'mesh_delegate_task',
+			phase: 'taskAvailable' as const,
+			delegationRequestId,
+			invocationId,
+			taskId,
+			taskIdPresent: true,
+		},
+	];
+	const snapshot = {
+		complete: true,
+		observations,
+		postPrompt: summarizePostPromptDelegations(observations, 0, delegationRequestId),
+	};
+	let settlementAttempted = false;
+	const resolution = await resolveManualTerminalBarrier(
+		async () => snapshot,
+		async () => {
+			throw new Error('controller unavailable');
+		},
+		async (frozen) => {
+			settlementAttempted = true;
+			assert.deepEqual(manualSettlementTaskIds(frozen.postPrompt), [taskId]);
+			return true;
+		},
+	);
+
+	assert.equal(resolution.kind, 'outcome-observation-failed');
+	assert.equal(resolution.taskLeaseReleased, true);
+	assert.equal(settlementAttempted, true);
+});
+
+test('manual barrier settles a retained needs-input completion after its start was evicted', async () => {
+	const task = '00000000-0000-4000-8000-000000000098';
+	const retained = [{
+		sequence: 513,
+		toolName: 'mesh_delegate_task',
+		phase: 'invokeCompleted' as const,
+		delegationRequestId: 'expected-request',
+		invocationSequence: 1,
+		invocationId,
+		taskId: task,
+		taskIdPresent: true,
+		compactStatus: 1,
+	}];
+	const postPrompt = summarizePostPromptDelegations(retained, 7, 'expected-request');
+	assert.equal(postPrompt.allInvokeStartedCount, 0);
+	assert.deepEqual(manualSettlementTaskIds(postPrompt), [task]);
+	assert.equal(allManualStartsHaveTaskEvidence(postPrompt), true);
+	const taskEvidence = { state: 'waitingInput', leaseReleased: false };
+	let settledTaskIds: readonly string[] = [];
+	const resolution = await resolveManualTerminalBarrier(
+		async () => ({ complete: false, observations: retained, postPrompt }),
+		async () => assert.fail('Incomplete frozen history must fail closed before outcome waiting.'),
+		async (snapshot) => {
+			settledTaskIds = manualSettlementTaskIds(snapshot.postPrompt);
+			taskEvidence.state = 'cancelled';
+			taskEvidence.leaseReleased = true;
+			return taskEvidence.state === 'cancelled' && taskEvidence.leaseReleased;
+		},
+	);
+	assert.equal(resolution.kind, 'observation-history-incomplete');
+	assert.equal(resolution.taskLeaseReleased, true);
+	assert.deepEqual(settledTaskIds, [task]);
+	assert.deepEqual(taskEvidence, { state: 'cancelled', leaseReleased: true });
+});
+
+for (const compactStatus of [1, 2, 3] as const) {
+	test(`manual barrier settles an expected compact status ${compactStatus} task before failure`, async () => {
+		const task = `00000000-0000-4000-8000-00000000009${compactStatus}`;
+		const observations = [
+			{
+				sequence: 8,
+				toolName: 'mesh_delegate_task',
+				phase: 'invokeStarted' as const,
+				delegationRequestId: 'expected-request',
+				invocationSequence: 1,
+				invocationId,
+				taskIdPresent: false,
+			},
+			{
+				sequence: 9,
+				toolName: 'mesh_delegate_task',
+				phase: 'taskAvailable' as const,
+				delegationRequestId: 'expected-request',
+				invocationSequence: 1,
+				invocationId,
+				taskId: task,
+				taskIdPresent: true,
+			},
+			{
+				sequence: 10,
+				toolName: 'mesh_delegate_task',
+				phase: 'invokeCompleted' as const,
+				delegationRequestId: 'expected-request',
+				invocationSequence: 1,
+				invocationId,
+				taskId: task,
+				taskIdPresent: true,
+				compactStatus,
+			},
+		];
+		const snapshot = {
+			complete: true,
+			observations,
+			postPrompt: summarizePostPromptDelegations(observations, 7, 'expected-request'),
+		};
+		let leaseVerified = false;
+		const resolution = await resolveManualTerminalBarrier(
+			async () => snapshot,
+			async () => snapshot,
+			async (settled) => {
+				assert.deepEqual(manualSettlementTaskIds(settled.postPrompt), [task]);
+				leaseVerified = true;
+				return true;
+			},
+		);
+		assert.equal(resolution.kind, 'failed-invocation');
+		assert.equal(resolution.taskLeaseReleased, true);
+		assert.equal(leaseVerified, true);
+		assert.equal(resolution.snapshot.postPrompt.expected.compactStatus, compactStatus);
+	});
+}
+
+test('recorder retains only safe task identity at the task-available milestone', () => {
+	const recorder = new PeerDelegationE2eRecorder();
+	recorder.observe({
+		toolName: 'mesh_delegate_task',
+		phase: 'taskAvailable',
+		input: {
+			delegationRequestId,
+			prompt: 'do not persist this prompt',
+		},
+		result: {
+			d: delegationRequestId,
+			t: taskId,
+		},
+		invocationSequence: 1,
+		invocationId,
+	});
+	assert.deepEqual(recorder.snapshot().tools.map((observation) => ({
+		phase: observation.phase,
+		delegationRequestId: observation.delegationRequestId,
+		taskId: observation.taskId,
+		invocationSequence: observation.invocationSequence,
+		invocationId: observation.invocationId,
+	})), [{
+		phase: 'taskAvailable',
+		delegationRequestId,
+		taskId,
+		invocationSequence: 1,
+		invocationId,
+	}]);
+	assert.equal(JSON.stringify(recorder.snapshot()).includes('do not persist'), false);
+});
+
+test('recorder retains task-available evidence when bounded history evicts its start', () => {
+	const recorder = new PeerDelegationE2eRecorder();
+	recorder.observe({
+		toolName: 'mesh_delegate_task',
+		phase: 'invokeStarted',
+		input: { delegationRequestId },
+		invocationSequence: 1,
+		invocationId,
+	});
+	recorder.observe({
+		toolName: 'mesh_delegate_task',
+		phase: 'taskAvailable',
+		input: { delegationRequestId },
+		result: { d: delegationRequestId, t: taskId },
+		invocationSequence: 1,
+		invocationId,
+	});
+	for (let index = 0; index < 512; index += 1) {
+		recorder.observe({
+			toolName: 'mesh_list_workers',
+			phase: 'invokeCompleted',
+			input: {},
+			result: {},
+		});
+	}
+	const snapshot = recorder.snapshot();
+	assert.equal(snapshot.truncated, true);
+	assert.equal(snapshot.tools.some(({ phase }) => phase === 'invokeStarted'), false);
+	assert.deepEqual(snapshot.delegateInvocations.filter(({ phase }) => phase === 'taskAvailable'), [{
+		sequence: 2,
+		at: snapshot.delegateInvocations.find(({ phase }) => phase === 'taskAvailable')!.at,
+		toolName: 'mesh_delegate_task',
+		phase: 'taskAvailable',
+		delegationRequestId,
+		taskId,
+		invocationSequence: 1,
+		invocationId,
+		resultFields: ['d', 't'],
+		resultBytes: JSON.stringify({ d: delegationRequestId, t: taskId }).length,
+		resultHash: snapshot.delegateInvocations.find(({ phase }) => phase === 'taskAvailable')!.resultHash,
+	}]);
+});
+
+test('general history truncation remains explicit when a pending preparation is evicted', () => {
+	const recorder = new PeerDelegationE2eRecorder();
+	recorder.observe({
+		toolName: 'mesh_delegate_task',
+		phase: 'prepareStarted',
+		input: { delegationRequestId },
+		preparationSequence: 1,
+	});
+	for (let index = 0; index < 512; index += 1) {
+		recorder.observe({
+			toolName: 'mesh_list_workers',
+			phase: 'invokeCompleted',
+			input: {},
+			result: {},
+		});
+	}
+
+	const snapshot = recorder.snapshot();
+	assert.equal(snapshot.truncated, true);
+	assert.equal(snapshot.delegateInvocationsTruncated, false);
+	assert.equal(snapshot.tools.some(({ phase }) => phase === 'prepareStarted'), false);
+});
+
+test('recorder fails closed when bounded task-identity retention overflows', () => {
+	const recorder = new PeerDelegationE2eRecorder();
+	for (let index = 1; index <= 513; index += 1) {
+		const suffix = index.toString(16).padStart(12, '0');
+		recorder.observe({
+			toolName: 'mesh_delegate_task',
+			phase: 'taskAvailable',
+			input: { delegationRequestId },
+			result: {
+				d: delegationRequestId,
+				t: `00000000-0000-4000-8000-${suffix}`,
+			},
+			invocationSequence: index,
+			invocationId: `10000000-0000-4000-8000-${suffix}`,
+		});
+	}
+	const snapshot = recorder.snapshot();
+	assert.equal(snapshot.tools.length, 512);
+	assert.equal(snapshot.truncated, true);
+	assert.equal(snapshot.delegateInvocationsTruncated, true);
 });
 
 test('manual monitor accounts for missing and wrong post-prompt correlation IDs', () => {
@@ -649,6 +1017,7 @@ test('post-prompt completion accounting cannot use a pre-checkpoint invocation',
 			phase: 'invokeStarted',
 			delegationRequestId,
 			invocationSequence: 2,
+			invocationId: secondInvocationId,
 			taskIdPresent: false,
 		},
 		{
@@ -657,6 +1026,7 @@ test('post-prompt completion accounting cannot use a pre-checkpoint invocation',
 			phase: 'invokeCompleted',
 			delegationRequestId: 'older-request',
 			invocationSequence: 1,
+			invocationId,
 			taskId,
 			taskIdPresent: true,
 		},
@@ -664,6 +1034,34 @@ test('post-prompt completion accounting cannot use a pre-checkpoint invocation',
 	assert.equal(invocations.allInvokeStartedCount, 1);
 	assert.equal(invocations.allInvokeCompletedCount, 0);
 	assert.equal(invocations.unsettledInvokeStartedCount, 1);
+});
+
+test('invocation identity prevents sequence reuse from settling a newer tool registration', () => {
+	const invocations = summarizePostPromptDelegations([
+		{
+			sequence: 3,
+			toolName: 'mesh_delegate_task',
+			phase: 'invokeStarted',
+			delegationRequestId,
+			invocationSequence: 1,
+			invocationId: secondInvocationId,
+			taskIdPresent: false,
+		},
+		{
+			sequence: 4,
+			toolName: 'mesh_delegate_task',
+			phase: 'invokeCompleted',
+			delegationRequestId,
+			invocationSequence: 1,
+			invocationId,
+			taskId,
+			taskIdPresent: true,
+		},
+	], 2, delegationRequestId);
+	assert.equal(invocations.allInvokeStartedCount, 1);
+	assert.equal(invocations.allInvokeCompletedCount, 0);
+	assert.equal(invocations.unsettledInvokeStartedCount, 1);
+	assert.equal(allManualStartsHaveTaskEvidence(invocations), false);
 });
 
 test('unexpected pending preparation cannot certify no-task cleanup', () => {
@@ -705,6 +1103,7 @@ test('settled invocation does not hide another pending unexpected preparation', 
 			phase: 'invokeStarted',
 			delegationRequestId,
 			invocationSequence: 1,
+			invocationId,
 			taskIdPresent: false,
 		},
 		{
@@ -713,6 +1112,7 @@ test('settled invocation does not hide another pending unexpected preparation', 
 			phase: 'invokeCompleted',
 			delegationRequestId,
 			invocationSequence: 1,
+			invocationId,
 			taskId,
 			taskIdPresent: true,
 			compactStatus: 0,
@@ -755,6 +1155,7 @@ test('manual monitor cannot prove exactly-once success from truncated or duplica
 			phase: 'invokeStarted',
 			delegationRequestId,
 			invocationSequence: 1,
+			invocationId,
 			taskIdPresent: false,
 		},
 		{
@@ -764,6 +1165,7 @@ test('manual monitor cannot prove exactly-once success from truncated or duplica
 			delegationRequestId,
 			taskId,
 			invocationSequence: 1,
+			invocationId,
 			taskIdPresent: true,
 			compactStatus: 0,
 		},
@@ -778,6 +1180,7 @@ test('manual monitor cannot prove exactly-once success from truncated or duplica
 			phase: 'invokeStarted',
 			delegationRequestId,
 			invocationSequence: 2,
+			invocationId: secondInvocationId,
 			taskIdPresent: false,
 		},
 	], 1, delegationRequestId);
@@ -910,6 +1313,10 @@ test('0.4.0 release metadata keeps the real peer gate default-off and five-tool 
 		resolve(root, 'scripts/e2e/peer-delegation/enabled.mjs'),
 		'utf8',
 	);
+	const barrier = readFileSync(
+		resolve(root, 'src/e2e/PeerDelegationManualBarrier.ts'),
+		'utf8',
+	);
 	const application = readFileSync(
 		resolve(root, 'src/composition/createApplication.ts'),
 		'utf8',
@@ -988,31 +1395,46 @@ test('0.4.0 release metadata keeps the real peer gate default-off and five-tool 
 			< harness.indexOf('await waitForManualInvocationQuiescence'),
 		'Delegate ingress must freeze before the final quiescence audit.',
 	);
+	assert.match(
+		harness.slice(manualCompletion, manualCompletionEnd),
+		/const frozen = await freezeManualDelegateIngress[\s\S]*if \(!frozen\.complete\)[\s\S]*settleUnexpectedManualInvocations[\s\S]*waitForManualInvocationQuiescence/u,
+	);
 	const frozenDecision = harness.indexOf('async function resolveFrozenManualTerminalDecision');
 	const frozenDecisionEnd = harness.indexOf('async function waitForFrozenManualOutcome', frozenDecision);
 	const frozenDecisionBody = harness.slice(frozenDecision, frozenDecisionEnd);
 	assert.ok(frozenDecision >= 0 && frozenDecisionEnd > frozenDecision);
-	assert.ok(
-		frozenDecisionBody.indexOf('await freezeManualDelegateIngress(')
-			< frozenDecisionBody.indexOf('classifyFrozenManualDecision('),
-		'Terminal manual failures must be classified from the post-freeze snapshot.',
-	);
 	assert.match(
 		frozenDecisionBody,
-		/classifyFrozenManualDecision[\s\S]*waitForFrozenManualOutcome[\s\S]*settleUnexpectedManualInvocations/u,
+		/resolveManualTerminalBarrier[\s\S]*freezeManualDelegateIngress[\s\S]*waitForFrozenManualOutcome[\s\S]*settleUnexpectedManualInvocations/u,
+	);
+	assert.match(
+		barrier,
+		/const frozen = await freeze\(\)[\s\S]*classifyFrozenManualDecision\(frozen\.postPrompt, frozen\.complete\)/u,
 	);
 	assert.match(
 		frozenDecisionBody,
 		/authoritativeOutcomeDeadline[\s\S]*manualCompletionTimeoutMs/u,
+	);
+	assert.match(
+		harness,
+		/peer\.manual\.task\.resolve[\s\S]*cancelManualTaskAndWait/u,
 	);
 	const settleStart = harness.indexOf('async function settleUnexpectedManualInvocations');
 	const settleEnd = harness.indexOf('async function waitForTaskLeaseReleased', settleStart);
 	const settleBody = harness.slice(settleStart, settleEnd);
 	assert.ok(settleStart >= 0 && settleEnd > settleStart);
 	assert.ok(
-		settleBody.indexOf('const postPromptTaskIds')
+		settleBody.indexOf('await settleKnownTasks()')
 			< settleBody.indexOf('finalPostPrompt.unresolvedPreparationCount'),
 		'Observed task handles must be settled before pending preparations fail cleanup evidence.',
+	);
+	assert.match(
+		settleBody,
+		/manualIngressFreezeProof\?\.complete === true[\s\S]*!finalObservations\.truncated/u,
+	);
+	assert.match(
+		settleBody,
+		/catch \{[\s\S]*taskIdentitiesComplete = false;[\s\S]*resolveMissingTaskIdentities\(\)[\s\S]*settleKnownTasks\(\)[\s\S]*continue;/u,
 	);
 	assert.match(
 		frozenDecisionBody,
@@ -1020,7 +1442,7 @@ test('0.4.0 release metadata keeps the real peer gate default-off and five-tool 
 	);
 	assert.ok(
 		harness.indexOf('const controllerProcessAlive = isControllerProcessAlive(target)')
-			< harness.indexOf('const rechecked = await recheckManualInvocationAfterControllerFailure'),
+			< harness.indexOf('rechecked = await recheckManualInvocationAfterControllerFailure'),
 		'Verified process exit must be sampled before the final sequenced Source observation recheck.',
 	);
 	assert.match(
