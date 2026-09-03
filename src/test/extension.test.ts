@@ -1,7 +1,4 @@
 import * as assert from 'assert';
-import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 
 import * as vscode from 'vscode';
 
@@ -24,15 +21,7 @@ import {
 } from '../tools/toolManifest';
 import { DelegatedToolInvocationRegistry } from '../tools/DelegatedToolInvocationRegistry';
 import { TaskToolFacadeError } from '../tools/taskToolFacade';
-import { deterministicTaskId } from '../tools/LocalBrokerTaskFacade';
 import type { AgentMeshExtensionApi } from '../composition/createApplication';
-import { createPeerDelegationE2eApi } from '../composition/PeerDelegationE2eApi';
-import { E2eCapability } from '../composition/E2eCapability';
-import {
-	PeerDelegationE2eRecorder,
-	PeerDelegationE2eToolClock,
-} from '../e2e/PeerDelegationE2eRecorder';
-import { PeerDelegationE2eBindingRegistry } from '../e2e/PeerDelegationE2eBindingRegistry';
 
 suite('Copilot Agent Mesh', () => {
 	test('cold host keeps contributed Tools unavailable while Preview is off', async () => {
@@ -235,18 +224,11 @@ suite('Copilot Agent Mesh', () => {
 		facade.describeDelegationTarget = async () => {
 			throw new TaskToolFacadeError('PEER_OFFLINE', true);
 		};
-		const observations: Array<{
-			phase: string;
-			errorCode?: string;
-			preparationSequence?: number;
-		}> = [];
+		const observations: Array<{ phase: string; errorCode?: string }> = [];
 		const tool = new MeshDelegateTaskTool(facade, {}, {
 			observe: (observation) => observations.push({
 				phase: observation.phase,
 				...(observation.errorCode === undefined ? {} : { errorCode: observation.errorCode }),
-				...(observation.preparationSequence === undefined
-					? {}
-					: { preparationSequence: observation.preparationSequence }),
 			}),
 		});
 		const cancellation = new vscode.CancellationTokenSource();
@@ -267,14 +249,10 @@ suite('Copilot Agent Mesh', () => {
 					error instanceof TaskToolFacadeError
 					&& error.code === 'PEER_OFFLINE',
 			);
-			assert.deepStrictEqual(observations, [
-				{ phase: 'prepareStarted', preparationSequence: 1 },
-				{
-					phase: 'prepareFailed',
-					errorCode: 'PEER_OFFLINE',
-					preparationSequence: 1,
-				},
-			]);
+			assert.deepStrictEqual(observations, [{
+				phase: 'prepareFailed',
+				errorCode: 'PEER_OFFLINE',
+			}]);
 		} finally {
 			cancellation.dispose();
 		}
@@ -329,26 +307,10 @@ suite('Copilot Agent Mesh', () => {
 			},
 		};
 		const cancellation = new vscode.CancellationTokenSource();
-		const invocationObservations: Array<{
-			phase: string;
-			invocationSequence?: number;
-		}> = [];
-		const tool = new MeshDelegateTaskTool(facade, {
-			delegatedToolInvocations,
-		}, {
-			observe: (observation) => invocationObservations.push({
-				phase: observation.phase,
-				...(observation.invocationSequence === undefined
-					? {}
-					: { invocationSequence: observation.invocationSequence }),
-			}),
-		});
 		try {
-			const result = await tool.invoke({
-				input,
-				toolInvocationToken: undefined,
-			}, cancellation.token);
-			await tool.invoke({
+			const result = await new MeshDelegateTaskTool(facade, {
+				delegatedToolInvocations,
+			}).invoke({
 				input,
 				toolInvocationToken: undefined,
 			}, cancellation.token);
@@ -356,259 +318,9 @@ suite('Copilot Agent Mesh', () => {
 			const [part] = result.content;
 			assert.ok(part instanceof vscode.LanguageModelTextPart);
 			assert.strictEqual(JSON.parse(part.value).e, 'DELEGATION_RECURSION');
-			assert.deepStrictEqual(invocationObservations, [
-				{ phase: 'invokeStarted', invocationSequence: 1 },
-				{ phase: 'taskIdentified', invocationSequence: 1 },
-				{ phase: 'invokeCompleted', invocationSequence: 1 },
-				{ phase: 'invokeStarted', invocationSequence: 2 },
-				{ phase: 'taskIdentified', invocationSequence: 2 },
-				{ phase: 'invokeCompleted', invocationSequence: 2 },
-			]);
 		} finally {
 			cancellation.dispose();
 			delegatedToolInvocations.dispose();
-		}
-	});
-
-	test('manual API freeze linearizes with the actual delegate Tool ingress gate', async () => {
-		const nonce = '00000000-0000-4000-8000-0000000000a1';
-		const delegationRequestId = '00000000-0000-4000-8000-0000000000a2';
-		const sourceWorkspaceIdentity = `sha256:${'a'.repeat(43)}`;
-		const taskId = deterministicTaskId(delegationRequestId, sourceWorkspaceIdentity);
-		const inputId = '00000000-0000-4000-8000-0000000000a4';
-		const recorder = new PeerDelegationE2eRecorder();
-		const registryRoot = await mkdtemp(join(tmpdir(), 'mesh-extension-bindings-'));
-		const delegationBindings = new PeerDelegationE2eBindingRegistry(registryRoot, nonce);
-		const binding = {
-			delegationRequestId,
-			sourceWorkspaceIdentity,
-			taskId,
-		};
-		const bindingReservation = await delegationBindings.reserve(binding);
-		await delegationBindings.finalizeReservation(binding, bindingReservation);
-		const ownerRuntime = {
-			tasks: {
-				list: async () => [{
-					taskId,
-					state: leaseReleased ? 'cancelled' : 'needsInput',
-					workspaceLeaseKey: 'lease',
-					events: [],
-					eventsTruncated: false,
-				}],
-			},
-			leases: { isLeased: () => !leaseReleased },
-		};
-		const capability = E2eCapability.create({
-			mode: 'test',
-			environmentEnabled: true,
-			environmentNonce: nonce,
-			environmentRole: 'coordinator',
-			profileNonce: nonce,
-			profileRole: 'coordinator',
-		});
-		const api = createPeerDelegationE2eApi({
-			vscodeApi: vscode,
-			bindings: Object.create(null),
-			node: Object.create(null),
-			localTasks: Object.create(null),
-			remoteTasks: Object.create(null),
-			runtime: Object.create(null),
-			lifecycle: { snapshot: () => ({ state: 'running' }) } as never,
-			ownerRuntime: () => ownerRuntime as never,
-			capability,
-			recorder,
-			toolClock: new PeerDelegationE2eToolClock(500),
-			delegationBindings,
-		});
-		assert.ok(api);
-		let releasePersistence!: () => void;
-		const persistenceBarrier = new Promise<void>((resolve) => {
-			releasePersistence = resolve;
-		});
-		let persistenceStarted!: () => void;
-		const persistenceStart = new Promise<void>((resolve) => {
-			persistenceStarted = resolve;
-		});
-		let persistCalls = 0;
-		let leaseReleased = false;
-		const facade: TaskToolFacade = {
-			identifyDelegation: () => ({
-				delegationRequestId,
-				taskId,
-				sourceWorkspaceIdentity,
-			}),
-			listWorkers: async () => ({ devices: [], truncated: false }),
-			subscribeToTask: () => ({ dispose: () => undefined }),
-			persistDelegationIntent: async () => {
-				persistCalls += 1;
-				persistenceStarted();
-				await persistenceBarrier;
-				return { delegationRequestId, taskId, recovered: false };
-			},
-			waitForDelegationAcceptance: async () => ({ status: 'accepted' }),
-			getTask: async () => ({
-				snapshot: {
-					taskId,
-					status: leaseReleased ? 'cancelled' : 'needsInput',
-					title: 'Freeze barrier',
-					updatedAt: '2026-09-03T00:00:00.000Z',
-					...(leaseReleased ? {} : {
-						pendingInput: {
-							inputId,
-							prompt: 'Continue?',
-						},
-					}),
-				},
-				eventCursor: 0,
-				events: [],
-				truncated: false,
-			}),
-			cancelOwnedTask: async () => {
-				leaseReleased = true;
-				return { taskId, status: 'cancelled' };
-			},
-			answerOwnedTask: async () => ({ taskId, status: 'needsInput' }),
-		};
-		const tool = new MeshDelegateTaskTool(facade, {}, recorder, recorder);
-		const cancellation = new vscode.CancellationTokenSource();
-		const input = {
-			delegationRequestId,
-			deviceId: '00000000-0000-4000-8000-0000000000a5',
-			nodeId: '00000000-0000-4000-8000-0000000000a6',
-			nodeInstanceId: '00000000-0000-4000-8000-0000000000a7',
-			workspaceId: '00000000-0000-4000-8000-0000000000a8',
-			title: 'Freeze barrier',
-			prompt: 'Return one acknowledgement.',
-		};
-		try {
-			const invocation = tool.invoke({
-				input,
-				toolInvocationToken: undefined,
-			}, cancellation.token);
-			await persistenceStart;
-			await api.execute(
-				{ nonce, role: 'coordinator' },
-				'peer.manual.freeze',
-			);
-			releasePersistence();
-			const result = await invocation;
-			const [part] = result.content;
-			assert.ok(part instanceof vscode.LanguageModelTextPart);
-			assert.strictEqual(JSON.parse(part.value).s, 1);
-			assert.deepStrictEqual(
-				recorder.snapshot().delegateInvocations.map(({ phase }) => phase),
-				['invokeStarted', 'taskIdentified', 'taskAvailable', 'invokeCompleted'],
-			);
-			assert.deepStrictEqual(
-				await api.execute(
-					{ nonce, role: 'coordinator' },
-					'peer.manual.task.resolve',
-					{ delegationRequestId, sourceWorkspaceIdentity },
-				),
-				{ taskId },
-			);
-			await assert.rejects(
-				api.execute(
-					{ nonce, role: 'coordinator' },
-					'peer.manual.task.resolve',
-					{
-						delegationRequestId,
-						sourceWorkspaceIdentity: `sha256:${'b'.repeat(43)}`,
-					},
-				),
-				/DELEGATION_NOT_FOUND/u,
-			);
-			await new MeshCancelTaskTool(facade).invoke({
-				input: { taskId },
-				toolInvocationToken: undefined,
-			}, cancellation.token);
-			assert.strictEqual(leaseReleased, true);
-			await api.execute(
-				{ nonce, role: 'coordinator' },
-				'peer.task.evidence',
-				{ taskId },
-			);
-			assert.strictEqual(await delegationBindings.size(), 0);
-			await assert.rejects(
-				() => tool.invoke({
-					input,
-					toolInvocationToken: undefined,
-				}, cancellation.token),
-				/invocation ingress is closed/u,
-			);
-			assert.strictEqual(persistCalls, 1);
-		} finally {
-			cancellation.dispose();
-			await rm(registryRoot, { recursive: true, force: true });
-		}
-	});
-
-	test('delegate evidence capacity rejects the 513th needs-input invocation before persistence', async () => {
-		const recorder = new PeerDelegationE2eRecorder();
-		for (let index = 1; index <= 512; index += 1) {
-			const suffix = index.toString(16).padStart(12, '0');
-			const invocationId = `10000000-0000-4000-8000-${suffix}`;
-			const taskId = `20000000-0000-4000-8000-${suffix}`;
-			recorder.reserveDelegateInvocation(invocationId);
-			recorder.observe({
-				toolName: MESH_TOOL_NAMES.delegateTask,
-				phase: 'invokeStarted',
-				input: { delegationRequestId: `30000000-0000-4000-8000-${suffix}` },
-				invocationId,
-			});
-			recorder.observe({
-				toolName: MESH_TOOL_NAMES.delegateTask,
-				phase: 'taskAvailable',
-				input: { delegationRequestId: `30000000-0000-4000-8000-${suffix}` },
-				result: { t: taskId },
-				invocationId,
-			});
-			recorder.observe({
-				toolName: MESH_TOOL_NAMES.delegateTask,
-				phase: 'invokeCompleted',
-				input: { delegationRequestId: `30000000-0000-4000-8000-${suffix}` },
-				result: { s: 1, t: taskId },
-				invocationId,
-			});
-		}
-		let persisted = false;
-		const facade = createTaskToolFacade();
-		facade.persistDelegationIntent = async () => {
-			persisted = true;
-			throw new Error('The 513th invocation must not persist.');
-		};
-		const tool = new MeshDelegateTaskTool(facade, {}, recorder, recorder);
-		const cancellation = new vscode.CancellationTokenSource();
-		try {
-			await assert.rejects(
-				() => tool.invoke({
-					input: {
-						delegationRequestId: '40000000-0000-4000-8000-000000000001',
-						deviceId: '40000000-0000-4000-8000-000000000002',
-						nodeId: '40000000-0000-4000-8000-000000000003',
-						nodeInstanceId: '40000000-0000-4000-8000-000000000004',
-						workspaceId: '40000000-0000-4000-8000-000000000005',
-						title: 'Capacity boundary',
-						prompt: 'Do not start.',
-					},
-					toolInvocationToken: undefined,
-				}, cancellation.token),
-				/evidence capacity is exhausted/u,
-			);
-			assert.strictEqual(persisted, false);
-			const snapshot = recorder.snapshot();
-			assert.strictEqual(snapshot.delegateInvocationsTruncated, false);
-			assert.strictEqual(
-				snapshot.delegateInvocations.filter(({ phase }) => phase === 'taskAvailable').length,
-				512,
-			);
-			assert.strictEqual(new Set(
-				snapshot.delegateInvocations
-					.filter(({ phase }) => phase === 'taskAvailable')
-					.map(({ taskId }) => taskId),
-			).size, 512);
-		} finally {
-			cancellation.dispose();
 		}
 	});
 });

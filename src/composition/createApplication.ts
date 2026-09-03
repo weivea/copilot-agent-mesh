@@ -38,7 +38,6 @@ import {
 	VscodeSecretStore,
 } from '../storage/VscodeStorageAdapters';
 import { PeerDelegationE2eStateStore } from '../storage/PeerDelegationE2eStateStore';
-import { PeerDelegationE2eBindingRegistry } from '../e2e/PeerDelegationE2eBindingRegistry';
 import {
 	writeMultiWindowStartupDiagnostic,
 	type MultiWindowStartupDiagnosticCode,
@@ -179,12 +178,6 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		const peerDelegationRecorder = peerDelegationRun !== undefined
 			? new PeerDelegationE2eRecorder()
 			: undefined;
-		const peerDelegationBindings = peerDelegationRun === undefined
-			? undefined
-			: new PeerDelegationE2eBindingRegistry(
-				peerDelegationRun.controlRoot,
-				peerDelegationRun.nonce,
-			);
 		const peerDelegationToolClock = peerDelegationRecorder === undefined
 			? undefined
 			: new PeerDelegationE2eToolClock(peerDelegationBudgetMs());
@@ -348,7 +341,6 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 				?? sharedProfile.name,
 			remoteAdapter: remoteTasks,
 			sourceWorkspaceIdentity: () => node.delegationSourceScopeIdentity(),
-			e2eDelegationBindings: peerDelegationBindings,
 		});
 		const bindings = new ProductionDashboardBindings({
 			vscodeApi: vscode,
@@ -405,7 +397,6 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			&& peerDelegationRun !== undefined
 			&& peerDelegationRecorder !== undefined
 			&& peerDelegationToolClock !== undefined
-			&& peerDelegationBindings !== undefined
 			? createPeerDelegationE2eApi({
 				vscodeApi: vscode,
 				bindings,
@@ -419,7 +410,6 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 				localIpcEndpoint: deriveLocalIpcEndpoint(nodeIdentity),
 				recorder: peerDelegationRecorder,
 				toolClock: peerDelegationToolClock,
-				delegationBindings: peerDelegationBindings,
 				editorProxyRoot: join(peerDelegationRun.controlRoot, 'editor-proxy'),
 				editorProxyNodeExecutable: peerDelegationRun.nodeExecutable,
 			})
@@ -435,7 +425,6 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 						delegatedToolInvocations,
 						clock: peerDelegationToolClock,
 						observer: peerDelegationRecorder,
-						invocationGate: peerDelegationRecorder,
 					});
 			} else if (!enabled && meshTools !== undefined) {
 				meshTools.dispose();

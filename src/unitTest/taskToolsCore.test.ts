@@ -319,24 +319,6 @@ suite('TaskToolsCore', () => {
 		assert.equal(clock.activeTimers, 0);
 	});
 
-	test('reports the deterministic task identity as soon as delegation is persisted', async () => {
-		const available: Array<{
-			readonly delegationRequestId: string;
-			readonly sourceWorkspaceIdentity: string;
-			readonly taskId: string;
-		}> = [];
-		const result = await new TaskToolsCore(new RecordingFacade(), {
-			onDelegationTaskAvailable: (identity) => available.push(identity),
-		}).delegateTask(delegationInput());
-
-		assert.equal(result.s, 0);
-		assert.deepEqual(available, [{
-			delegationRequestId: DELEGATION_ID,
-			sourceWorkspaceIdentity: SOURCE_WORKSPACE_IDENTITY,
-			taskId: TASK_ID,
-		}]);
-	});
-
 	test('preserves safe multiline delegation text while removing sensitive spans', async () => {
 		const raw = [
 			'First safe line\r\nSecond safe line\twith details.',

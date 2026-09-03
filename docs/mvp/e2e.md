@@ -93,63 +93,12 @@ command exits nonzero. Diagnostics-only `MANUAL_UI=0` behavior is unchanged.
 
 Throughout the preceding 15-minute manual invocation window, the harness polls the
 Target controller and the Source view of the exact node instance and Workspace.
-A controller request failure first triggers a bounded, sequence-checked Source
-observation recheck. If invocation already started, the harness waits for its
-authoritative Tool/task outcome rather than misreporting a pre-invocation closure.
-Only an absent exact Extension Host process proves `TARGET_WINDOW_CLOSED`; a live
-process with a transiently unavailable controller remains under observation. An
-offline or replaced exact claim fails as `PEER_OFFLINE`, and the harness never
-binds to a new instance.
-
-The harness checkpoints Source observations before printing the prompt and accounts
-for every later `mesh_delegate_task` start, including omitted or mismatched
-correlation IDs. Any unexpected invocation fails closed and Cleanup can pass only
-after all observed task handles are terminal/cancelled with released Workspace
-leases. The first successful Tool result is followed by a bounded five-second
-Source-observation quiescence audit. Before that audit an E2E-only Source gate
-rejects new delegate preparation/invocation ingress, so a later Copilot Tool call
-cannot race the success decision. The same freeze is the linearization point for
-terminal manual failures: a Target-close, peer-offline, preparation-failure, or
-timeout result is reported only when the post-freeze snapshot proves that no
-invocation started after the prompt checkpoint. If an invocation crossed that
-barrier, the harness instead awaits its authoritative outcome and settles every
-unexpected invocation before evaluating cleanup. A pending unexpected confirmation cannot certify cleanup as lease-free,
-and start/completion pairs use a recorder-local monotonic invocation sequence so a
-pre-checkpoint completion cannot hide a post-prompt pending task. A truncated
-observation history can never prove exactly-once execution. The E2E recorder
-also records a sanitized `taskAvailable` milestone immediately after durable
-task persistence. Cleanup uses task IDs from that milestone or any retained
-completion, even when truncation evicted the matching start, and cancels
-non-terminal outcomes such as `needsInput` before requiring lease release.
-If persistence completed but its recorder callback is delayed, an authenticated
-E2E-only lookup resolves the task ID from the facade's immutable persisted
-delegation-request/source-scope binding; it never recomputes identity from the
-current mutable Workspace scope. The resolver requires the same immutable source
-scope recorded at task identification, so an authenticated caller cannot resolve a
-different source scope merely by knowing its request ID. The binding lives in a
-512-entry, run-nonce-namespaced E2E file registry under the run control root, so it
-survives facade recreation without creating a production cache. Cross-window
-mutations use an exclusive filesystem lock and atomic replacement. The registry
-contains no prompt or Workspace path data, rejects capacity before task dispatch,
-and retires an entry only after terminal state plus lease release. Cleanup repeatedly attempts cancellation until
-terminal lease release is observed. Missing identity, observation failure, general-history truncation
-(including evicted preparations), or lookup failure remains a cleanup failure
-after every identifiable task has been settled.
-Invocation pairing uses a per-invocation UUID rather than a tool-instance
-counter, so extension re-registration cannot pair unrelated starts and
-completions. Before task persistence, the production E2E ingress gate atomically
-reserves one of 512 dedicated invocation-ledger slots. Capacity exhaustion
-freezes and rejects the next invocation before it can create a task; occupied
-slots are never evicted merely because an invocation returned `needsInput`.
-The ledger retains starts, task identities, and completions independently of
-the general observation ring. A bounded emergency reconciliation slot retains
-the affected task identity if an impossible post-reservation overflow is
-observed, and ledger overflow still fails cleanup closed.
-Preparation and invocation failures retain only bounded phase counts, compact
-status, a safe error code, task-ID presence, and an unexpected-invocation count.
-Final timer evidence is always a fresh `peer.resources` observation immediately
-before controller shutdown; an unavailable, malformed, or nonzero final snapshot
-fails cleanup.
+A closed Target controller fails immediately as `TARGET_WINDOW_CLOSED`; an offline
+or replaced exact claim fails as `PEER_OFFLINE`. The harness never binds to a new
+instance. Preparation and invocation failures retain only bounded phase counts,
+compact status, a safe error code, and a task-ID-present boolean. These early
+failures still run the normal Profile Lock, Workspace lease, process, socket, and
+timer cleanup.
 
 Sanitized JSON and a short summary are written to:
 

@@ -1,5 +1,3 @@
-import { randomUUID } from 'node:crypto';
-
 import * as vscode from 'vscode';
 
 import {
@@ -19,55 +17,30 @@ import {
 	MESH_TOOL_MANIFEST_DESCRIPTORS,
 	MESH_TOOL_NAMES,
 } from './toolManifest';
-import type {
-	TaskToolInvocationObserver,
-	TaskToolInvocationPhase,
-	TaskToolInvocationGate,
-} from './TaskToolInvocationObserver';
+import type { TaskToolInvocationObserver } from './TaskToolInvocationObserver';
 
 type EmptyInput = Record<string, never>;
 
 abstract class TaskToolBase {
 	constructor(
 		protected readonly facade: TaskToolFacade,
-		protected readonly coreOptions: TaskToolsCoreOptions = {},
+		private readonly coreOptions: TaskToolsCoreOptions = {},
 		private readonly observer?: TaskToolInvocationObserver,
-		private readonly invocationGate?: TaskToolInvocationGate,
 	) {}
 
 	protected core(): TaskToolsCore {
 		return new TaskToolsCore(this.facade, this.coreOptions);
 	}
 
-	protected assertDelegateInvocationAllowed(): void {
-		this.invocationGate?.assertDelegateInvocationAllowed();
-	}
-
-	protected reserveDelegateInvocation(invocationId: string): void {
-		this.invocationGate?.reserveDelegateInvocation(invocationId);
-	}
-
 	protected observe(
 		toolName: string,
-		phase: TaskToolInvocationPhase,
+		phase: 'prepareFailed' | 'prepared' | 'invokeStarted' | 'invokeCompleted',
 		input: unknown,
 		result?: ToolJsonResult,
 		errorCode?: TaskToolFacadeError['code'],
-		preparationSequence?: number,
-		invocationSequence?: number,
-		invocationId?: string,
 	): void {
 		try {
-			this.observer?.observe({
-				toolName,
-				phase,
-				input,
-				result,
-				errorCode,
-				preparationSequence,
-				invocationSequence,
-				invocationId,
-			});
+			this.observer?.observe({ toolName, phase, input, result, errorCode });
 		} catch {
 			// Diagnostics must never affect Tool execution.
 		}
@@ -128,23 +101,10 @@ export class MeshListWorkersTool extends TaskToolBase implements vscode.Language
 }
 
 export class MeshDelegateTaskTool extends TaskToolBase implements vscode.LanguageModelTool<DelegateTaskInput> {
-	private nextPreparationSequence = 0;
-	private nextInvocationSequence = 0;
-
 	async prepareInvocation(
 		options: vscode.LanguageModelToolInvocationPrepareOptions<DelegateTaskInput>,
 		token: vscode.CancellationToken,
 	): Promise<vscode.PreparedToolInvocation> {
-		this.assertDelegateInvocationAllowed();
-		const preparationSequence = ++this.nextPreparationSequence;
-		this.observe(
-			MESH_TOOL_NAMES.delegateTask,
-			'prepareStarted',
-			options.input,
-			undefined,
-			undefined,
-			preparationSequence,
-		);
 		let preparation;
 		try {
 			preparation = await this.core().prepareDelegateInvocation(options.input, token);
@@ -155,18 +115,10 @@ export class MeshDelegateTaskTool extends TaskToolBase implements vscode.Languag
 				options.input,
 				undefined,
 				error instanceof TaskToolFacadeError ? error.code : 'INTERNAL_ERROR',
-				preparationSequence,
 			);
 			throw error;
 		}
-		this.observe(
-			MESH_TOOL_NAMES.delegateTask,
-			'prepared',
-			options.input,
-			undefined,
-			undefined,
-			preparationSequence,
-		);
+		this.observe(MESH_TOOL_NAMES.delegateTask, 'prepared', options.input);
 		return {
 			invocationMessage: preparation.invocationMessage,
 			confirmationMessages: {
@@ -180,81 +132,14 @@ export class MeshDelegateTaskTool extends TaskToolBase implements vscode.Languag
 		options: vscode.LanguageModelToolInvocationOptions<DelegateTaskInput>,
 		token: vscode.CancellationToken,
 	): Promise<vscode.LanguageModelToolResult> {
-		const invocationId = randomUUID();
-		this.reserveDelegateInvocation(invocationId);
-		const invocationSequence = ++this.nextInvocationSequence;
-		this.observe(
-			MESH_TOOL_NAMES.delegateTask,
-			'invokeStarted',
-			options.input,
-			undefined,
-			undefined,
-			undefined,
-			invocationSequence,
-			invocationId,
-		);
+		this.observe(MESH_TOOL_NAMES.delegateTask, 'invokeStarted', options.input);
 		let value: ToolJsonResult;
 		try {
-			value = await new TaskToolsCore(this.facade, {
-				...this.coreOptions,
-				onDelegationIdentified: ({
-					delegationRequestId,
-					sourceWorkspaceIdentity,
-					taskId,
-				}) => {
-					this.observe(
-						MESH_TOOL_NAMES.delegateTask,
-						'taskIdentified',
-						options.input,
-						{
-							d: delegationRequestId,
-							t: taskId,
-							...(sourceWorkspaceIdentity === undefined
-								? {}
-								: { w: sourceWorkspaceIdentity }),
-						},
-						undefined,
-						undefined,
-						invocationSequence,
-						invocationId,
-					);
-				},
-				onDelegationTaskAvailable: ({
-					delegationRequestId,
-					sourceWorkspaceIdentity,
-					taskId,
-				}) => {
-					this.observe(
-						MESH_TOOL_NAMES.delegateTask,
-						'taskAvailable',
-						options.input,
-						{
-							d: delegationRequestId,
-							t: taskId,
-							...(sourceWorkspaceIdentity === undefined
-								? {}
-								: { w: sourceWorkspaceIdentity }),
-						},
-						undefined,
-						undefined,
-						invocationSequence,
-						invocationId,
-					);
-				},
-			}).delegateTask(options.input, token);
+			value = await this.core().delegateTask(options.input, token);
 		} catch {
 			value = internalErrorValue();
 		}
-		this.observe(
-			MESH_TOOL_NAMES.delegateTask,
-			'invokeCompleted',
-			options.input,
-			value,
-			undefined,
-			undefined,
-			invocationSequence,
-			invocationId,
-		);
+		this.observe(MESH_TOOL_NAMES.delegateTask, 'invokeCompleted', options.input, value);
 		try {
 			return await this.result(value, options);
 		} catch {
@@ -358,7 +243,6 @@ export class MeshAnswerTaskTool extends TaskToolBase implements vscode.LanguageM
 
 export interface RegisterMeshTaskToolsOptions extends TaskToolsCoreOptions {
 	readonly observer?: TaskToolInvocationObserver;
-	readonly invocationGate?: TaskToolInvocationGate;
 }
 
 export function registerMeshTaskTools(
@@ -371,10 +255,7 @@ export function registerMeshTaskTools(
 	);
 	return vscode.Disposable.from(
 		vscode.lm.registerTool(MESH_TOOL_NAMES.listWorkers, new MeshListWorkersTool(facade, options, options.observer)),
-		vscode.lm.registerTool(
-			MESH_TOOL_NAMES.delegateTask,
-			new MeshDelegateTaskTool(facade, options, options.observer, options.invocationGate),
-		),
+		vscode.lm.registerTool(MESH_TOOL_NAMES.delegateTask, new MeshDelegateTaskTool(facade, options, options.observer)),
 		vscode.lm.registerTool(MESH_TOOL_NAMES.getTask, new MeshGetTaskTool(facade, options, options.observer)),
 		vscode.lm.registerTool(MESH_TOOL_NAMES.cancelTask, new MeshCancelTaskTool(facade, options, options.observer)),
 		vscode.lm.registerTool(MESH_TOOL_NAMES.answerTask, new MeshAnswerTaskTool(facade, options, options.observer)),

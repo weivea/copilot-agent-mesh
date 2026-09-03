@@ -57,7 +57,6 @@ import {
 	type TwoDeviceE2eApi,
 } from './TwoDeviceE2eApi';
 import type { E2eCapability } from './E2eCapability';
-import type { PeerDelegationE2eBindingRegistry } from '../e2e/PeerDelegationE2eBindingRegistry';
 
 const taskTerminalStates = new Set(['completed', 'failed', 'cancelled', 'timedOut']);
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
@@ -76,7 +75,6 @@ export interface PeerDelegationE2eApiOptions {
 	readonly localIpcEndpoint?: LocalIpcEndpoint;
 	readonly recorder: PeerDelegationE2eRecorder;
 	readonly toolClock: PeerDelegationE2eToolClock;
-	readonly delegationBindings: PeerDelegationE2eBindingRegistry;
 	readonly editorProxyRoot?: string;
 	readonly editorProxyNodeExecutable?: string;
 }
@@ -125,16 +123,6 @@ export function createPeerDelegationE2eApi(
 					return invokeCoreDelegateAndCancelAfterEvents(options, requiredRecord(params, 'input'));
 				case 'peer.observations':
 					return options.recorder.snapshot();
-				case 'peer.manual.freeze':
-					options.recorder.freezeDelegateInvocations();
-					return { frozen: true };
-				case 'peer.manual.task.resolve':
-					return {
-						taskId: await options.delegationBindings.resolve(
-							requiredUuid(params, 'delegationRequestId'),
-							requiredSourceWorkspaceIdentity(params, 'sourceWorkspaceIdentity'),
-						),
-					};
 				case 'peer.budget.arm':
 					options.toolClock.armNextBudgetTimer();
 					return { armed: true };
@@ -425,7 +413,7 @@ async function taskEvidence(
 		.filter(({ type, summary }) => type === 'output' && summary !== undefined)
 		.map(({ summary }) => summary!);
 	const projectedEvents = projectPeerTaskEvents(record.events);
-	const evidence = {
+	return {
 		taskId: record.taskId,
 		state: record.state,
 		eventTypes: projectedEvents.events.map(({ type }) => type),
@@ -436,10 +424,6 @@ async function taskEvidence(
 		...(output.length === 0 ? {} : { outputHash: fingerprint('task-output', output.join('\0')) }),
 		leaseReleased: !owner.leases.isLeased(record.workspaceLeaseKey),
 	};
-	if (taskTerminalStates.has(evidence.state) && evidence.leaseReleased) {
-		await options.delegationBindings.retire(evidence.taskId);
-	}
-	return evidence;
 }
 
 async function editorSessionCatalog(
@@ -636,17 +620,6 @@ function requiredUuid(params: Record<string, unknown>, key: string): string {
 	const value = requiredString(params, key);
 	if (!uuidPattern.test(value)) {
 		throw new TypeError(`${key} must be a canonical UUID.`);
-	}
-	return value;
-}
-
-function requiredSourceWorkspaceIdentity(
-	params: Record<string, unknown>,
-	key: string,
-): string {
-	const value = requiredString(params, key);
-	if (!/^sha256:[A-Za-z0-9_-]{43}$/u.test(value)) {
-		throw new TypeError(`${key} must be a scoped Workspace identity.`);
 	}
 	return value;
 }

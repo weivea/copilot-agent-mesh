@@ -65,18 +65,8 @@ const {
 	waitForManualPostDetachAttestation,
 } = require(join(repositoryRoot, 'out/src/e2e/PeerDelegationManualEvidence.js'));
 const {
-	resolveManualTerminalBarrier,
-} = require(join(repositoryRoot, 'out/src/e2e/PeerDelegationManualBarrier.js'));
-const {
-	assertFinalPeerResourceMetrics,
-	allManualStartsHaveTaskEvidence,
 	assessExactTargetLiveness,
-	classifyTargetControllerRejection,
-	isSuccessfulManualInvocation,
-	latestManualObservationSequence,
-	manualSettlementTaskIds,
-	manualStartsWithoutTaskEvidence,
-	summarizePostPromptDelegations,
+	summarizeManualInvocation,
 } = require(join(repositoryRoot, 'out/src/e2e/PeerDelegationManualMonitor.js'));
 
 class E2eRequestError extends Error {
@@ -141,7 +131,6 @@ const evidencePath = evidenceDestination.evidencePath;
 const summaryPath = evidenceDestination.summaryPath;
 const attestationPath = join(evidenceRoot, `attestation-${runId}.json`);
 const manualUi = process.env[`${environmentPrefix}_MANUAL_UI`] !== '0';
-const manualCompletionTimeoutMs = 15 * 60_000;
 const testTerminationLogPath = testMode
 	&& process.env[`${environmentPrefix}_TEST_TERMINATION_LOG`] !== undefined
 	? resolve(process.env[`${environmentPrefix}_TEST_TERMINATION_LOG`])
@@ -179,16 +168,12 @@ let sentinelDigest;
 let profileLockOwned = false;
 let primaryFailure;
 let cleanupFailure;
-let baselineResourceMetrics;
 let latestResourceMetrics;
-let finalResourceMetrics;
 let cleanupLeaseReleased = false;
 let evidence = initialEvidence();
 let canonicalUserDataDirectory = userDataDirectory;
 let signalCleanupStarted = false;
 let cleanupOperation;
-let manualIngressFreezeProof;
-let latestManualPostPrompt;
 let ownershipSampler;
 let ownershipSamplerStarted = false;
 let ownershipSamplerFailure;
@@ -312,9 +297,9 @@ try {
 		const socket = await lstat(localIpcEndpoint.address);
 		assert.equal(socket.isSocket(), true, 'The local Broker endpoint is not a Unix socket.');
 	}
-	baselineResourceMetrics = await request(source, 'peer.resources');
-	latestResourceMetrics = baselineResourceMetrics;
-	assertAttemptMetricsZero(baselineResourceMetrics);
+	const baselineResources = await request(source, 'peer.resources');
+	latestResourceMetrics = baselineResources;
+	assertAttemptMetricsZero(baselineResources);
 	assert.equal(await isAbsent(sentinelInvocationPath), true);
 
 	const catalogBeforeCount = 0;
@@ -397,19 +382,19 @@ try {
 
 	latestResourceMetrics = await request(source, 'peer.resources');
 	const listenerDelta = delta(
-		baselineResourceMetrics.listener.startAttempts,
+		baselineResources.listener.startAttempts,
 		latestResourceMetrics.listener.startAttempts,
 	);
 	const tunnelLoadDelta = delta(
-		baselineResourceMetrics.tunnel.loadAttempts,
+		baselineResources.tunnel.loadAttempts,
 		latestResourceMetrics.tunnel.loadAttempts,
 	);
 	const tunnelProbeDelta = delta(
-		baselineResourceMetrics.tunnel.probeAttempts,
+		baselineResources.tunnel.probeAttempts,
 		latestResourceMetrics.tunnel.probeAttempts,
 	);
 	const tunnelEnsureDelta = delta(
-		baselineResourceMetrics.tunnel.ensureHostedAttempts,
+		baselineResources.tunnel.ensureHostedAttempts,
 		latestResourceMetrics.tunnel.ensureHostedAttempts,
 	);
 	const transportPass = [
@@ -448,7 +433,7 @@ try {
 		&& typeof error === 'object'
 		&& 'manualInvocation' in error
 		&& isSafeManualInvocationFailure(error.manualInvocation)
-		&& (error.noTaskLeaseObserved === true || error.taskLeaseReleased === true)
+		&& error.noTaskLeaseObserved === true
 	) {
 		cleanupLeaseReleased = true;
 	}
@@ -1458,48 +1443,6 @@ async function waitForTaskClientDetach(controller, taskId, timeoutMs) {
 async function waitForManualCompletion(source, target, targetInputBase) {
 	const delegationRequestId = randomUUID();
 	const title = `P8 E2E completion ${runLabel}`;
-	const initialObservations = await request(source, 'peer.observations', {}, 2_000);
-	const emptySummary = {
-		preparedCount: 0,
-		prepareStartedCount: 0,
-		prepareFailedCount: 0,
-		invokeStartedCount: 0,
-		invokeCompletedCount: 0,
-		unexpectedInvocationCount: 0,
-		unexpectedActivityCount: 0,
-		unresolvedPreparationCount: 0,
-		taskIdPresent: false,
-	};
-	if (initialObservations.truncated) {
-		throw manualInvocationFailure(
-			'MANUAL_OBSERVATIONS_TRUNCATED',
-			'The Source Tool observation history was already truncated before the manual prompt.',
-			'invoke',
-			emptySummary,
-			false,
-		);
-	}
-	const initialInvocations = summarizePostPromptDelegations(
-		manualToolObservations(initialObservations),
-		0,
-		delegationRequestId,
-	);
-	if (
-		initialInvocations.unresolvedPreparationCount > 0
-		|| initialInvocations.unsettledInvokeStartedCount > 0
-	) {
-		throw manualInvocationFailure(
-			'MANUAL_SOURCE_BUSY',
-			'The Source already had an unresolved delegation before the manual prompt.',
-			'invoke',
-			initialInvocations.expected,
-			false,
-		);
-	}
-	const observationCheckpoint = latestManualObservationSequence([
-		...initialObservations.tools,
-		...initialObservations.ahp,
-	].sort((left, right) => left.sequence - right.sequence));
 	const prompt = [
 		`In Agent mode, use #meshListWorkers and then #meshDelegateTask to delegate to "${targetWindowLabel}".`,
 		`Use delegationRequestId ${delegationRequestId}.`,
@@ -1514,13 +1457,7 @@ async function waitForManualCompletion(source, target, targetInputBase) {
 		targetWindowLabel,
 		prompt,
 	}));
-	const deadline = Date.now() + manualCompletionTimeoutMs;
-	let lastObservationSequence = observationCheckpoint;
-	latestManualPostPrompt = summarizePostPromptDelegations(
-		[],
-		observationCheckpoint,
-		delegationRequestId,
-	);
+	const deadline = Date.now() + 15 * 60_000;
 	while (Date.now() < deadline) {
 		const [observationsResult, targetStateResult, dashboardResult] = await Promise.allSettled([
 			request(source, 'peer.observations', {}, 2_000),
@@ -1528,204 +1465,45 @@ async function waitForManualCompletion(source, target, targetInputBase) {
 			request(source, 'peer.dashboard.snapshot', {}, 2_000),
 		]);
 		if (observationsResult.status === 'rejected') {
-			return resolveFrozenManualTerminalDecision({
-				source,
-				observationCheckpoint,
-				delegationRequestId,
-				deadline,
-				fallback: {
-					code: 'MANUAL_OBSERVATION_FAILED',
-					message: 'The Source Tool observations became unavailable during manual invocation.',
-					phase: 'invoke',
-				},
-			});
+			throw observationsResult.reason;
 		}
 		const observations = observationsResult.value;
-		const postPrompt = summarizePostPromptDelegations(
-			manualToolObservations(observations),
-			observationCheckpoint,
-			delegationRequestId,
-		);
 		const matching = observations.tools.filter(
-			(observation) =>
-				observation.sequence > observationCheckpoint
-				&& observation.delegationRequestId === delegationRequestId,
+			(observation) => observation.delegationRequestId === delegationRequestId,
 		);
-		const summary = postPrompt.expected;
-		latestManualPostPrompt = postPrompt;
-		lastObservationSequence = Math.max(
-			lastObservationSequence,
-			...observations.tools.map(({ sequence }) => sequence),
-		);
-		if (observations.truncated) {
-			return resolveFrozenManualTerminalDecision({
-				source,
-				observationCheckpoint,
-				delegationRequestId,
-				deadline,
-				fallback: {
-					code: 'MANUAL_OBSERVATIONS_TRUNCATED',
-					message: 'The Source Tool observation history truncated during the manual invocation.',
-					phase: 'invoke',
-				},
-			});
-		}
-		if (postPrompt.unexpectedActivityCount > 0) {
-			return resolveFrozenManualTerminalDecision({
-				source,
-				observationCheckpoint,
-				delegationRequestId,
-				deadline,
-				fallback: {
-					code: 'UNEXPECTED_MANUAL_INVOCATION',
-					message: 'An unexpected delegation invocation occurred after the manual prompt.',
-					phase: 'invoke',
-				},
-			});
-		}
+		const summary = summarizeManualInvocation(matching.map((observation) => ({
+			phase: observation.phase,
+			...(observation.compactStatus === undefined
+				? {}
+				: { compactStatus: observation.compactStatus }),
+			...(observation.errorCode === undefined ? {} : { errorCode: observation.errorCode }),
+			taskIdPresent: observation.taskId !== undefined,
+		})));
 		if (summary.prepareFailedCount > 0) {
-			return resolveFrozenManualTerminalDecision({
-				source,
-				observationCheckpoint,
-				delegationRequestId,
-				deadline,
-				fallback: {
-					code: summary.errorCode ?? 'MANUAL_TOOL_PREPARATION_FAILED',
-					message: 'The selected delegation target became unavailable during Tool preparation.',
-					phase: 'prepare',
-				},
-			});
+			throw manualInvocationFailure(
+				summary.errorCode ?? 'MANUAL_TOOL_PREPARATION_FAILED',
+				'The selected delegation target became unavailable during Tool preparation.',
+				'prepare',
+				summary,
+				!observations.truncated,
+			);
 		}
 		const completedObservations = matching.filter(({ phase }) => phase === 'invokeCompleted');
 		if (completedObservations.length > 0) {
-			const frozen = await freezeManualDelegateIngress(
-				source,
-				observationCheckpoint,
-				delegationRequestId,
-			);
-			if (!frozen.complete) {
-				const taskLeaseReleased = await settleUnexpectedManualInvocations(
-					source,
-					frozen.postPrompt,
-					observationCheckpoint,
-					delegationRequestId,
-					freshManualCleanupDeadline(deadline),
-				);
-				throw manualInvocationFailure(
-					'MANUAL_OBSERVATIONS_TRUNCATED',
-					'The final manual invocation audit could not confirm a complete ingress freeze.',
-					'invoke',
-					frozen.postPrompt.expected,
-					false,
-					taskLeaseReleased,
-					false,
-				);
-			}
-			let quiescent;
-			try {
-				quiescent = await waitForManualInvocationQuiescence(
-					source,
-					observationCheckpoint,
-					delegationRequestId,
-					freshManualCleanupDeadline(deadline),
-					lastObservationSequence,
-				);
-			} catch {
-				const taskLeaseReleased = await settleUnexpectedManualInvocations(
-					source,
-					latestManualPostPrompt ?? manualIngressFreezeProof.postPrompt,
-					observationCheckpoint,
-					delegationRequestId,
-					freshManualCleanupDeadline(deadline),
-				);
-				throw manualInvocationFailure(
-					'MANUAL_OBSERVATION_FAILED',
-					'The frozen Source Tool observations became unavailable during the final audit.',
-					'invoke',
-					(latestManualPostPrompt ?? manualIngressFreezeProof.postPrompt).expected,
-					false,
-					taskLeaseReleased,
-					false,
-				);
-			}
-			if (quiescent.observations.truncated) {
-				const taskLeaseReleased = await settleUnexpectedManualInvocations(
-					source,
-					quiescent.postPrompt,
-					observationCheckpoint,
-					delegationRequestId,
-					freshManualCleanupDeadline(deadline),
-				);
-				throw manualInvocationFailure(
-					'MANUAL_OBSERVATIONS_TRUNCATED',
-					'The Source Tool observation history truncated during the post-result audit.',
-					'invoke',
-					quiescent.postPrompt.expected,
-					false,
-					taskLeaseReleased,
-					false,
-				);
-			}
-			if (quiescent.postPrompt.unexpectedActivityCount > 0) {
-				const taskLeaseReleased = await settleUnexpectedManualInvocations(
-					source,
-					quiescent.postPrompt,
-					observationCheckpoint,
-					delegationRequestId,
-					freshManualCleanupDeadline(deadline),
-				);
-				throw manualInvocationFailure(
-					'UNEXPECTED_MANUAL_INVOCATION',
-					'An unexpected delegation invocation occurred after the manual prompt.',
-					'invoke',
-					quiescent.postPrompt.expected,
-					true,
-					taskLeaseReleased,
-				);
-			}
-			if (!quiescent.complete) {
-				const taskLeaseReleased = await settleUnexpectedManualInvocations(
-					source,
-					quiescent.postPrompt,
-					observationCheckpoint,
-					delegationRequestId,
-					freshManualCleanupDeadline(deadline),
-				);
-				throw manualInvocationFailure(
-					'MANUAL_TOOL_TIMEOUT',
-					'The manual Tool result did not have a full bounded quiescence interval.',
-					'timeout',
-					quiescent.postPrompt.expected,
-					true,
-					taskLeaseReleased,
-					false,
-				);
-			}
-			const quiescentMatching = quiescent.observations.tools.filter(
-				(observation) =>
-					observation.sequence > observationCheckpoint
-					&& observation.delegationRequestId === delegationRequestId,
-			);
-			const completed = quiescentMatching.find(({ phase }) => phase === 'invokeCompleted');
+			const completed = completedObservations[0];
 			if (
-				completed === undefined
-				|| !isSuccessfulManualInvocation(quiescent.postPrompt, true)
+				summary.preparedCount !== 1
+				|| summary.invokeStartedCount !== 1
+				|| summary.invokeCompletedCount !== 1
+				|| summary.compactStatus !== 0
+				|| !summary.taskIdPresent
 			) {
-				const taskLeaseReleased = await settleUnexpectedManualInvocations(
-					source,
-					quiescent.postPrompt,
-					observationCheckpoint,
-					delegationRequestId,
-					freshManualCleanupDeadline(deadline),
-				);
 				throw manualInvocationFailure(
-					quiescent.postPrompt.expected.errorCode ?? 'MANUAL_TOOL_INVOCATION_FAILED',
+					summary.errorCode ?? 'MANUAL_TOOL_INVOCATION_FAILED',
 					'The manual Copilot Tool route completed without one successful confirmed invocation.',
 					'invoke',
-					quiescent.postPrompt.expected,
-					true,
-					taskLeaseReleased,
-					false,
+					summary,
+					!observations.truncated,
 				);
 			}
 			return {
@@ -1741,735 +1519,68 @@ async function waitForManualCompletion(source, target, targetInputBase) {
 				},
 				invocationSource: 'copilot-ui',
 				confirmationObservation: {
-					preparedCount: quiescent.postPrompt.expected.preparedCount,
-					acceptedCount: quiescent.postPrompt.expected.invokeStartedCount,
+					preparedCount: summary.preparedCount,
+					acceptedCount: summary.invokeStartedCount,
 				},
 			};
 		}
 		if (targetStateResult.status === 'rejected') {
-			let controllerProcessAlive;
-			let rechecked;
-			try {
-				controllerProcessAlive = isControllerProcessAlive(target);
-				rechecked = await recheckManualInvocationAfterControllerFailure(
-					source,
-					observationCheckpoint,
-					delegationRequestId,
-					lastObservationSequence,
-				);
-			} catch {
-				return resolveFrozenManualTerminalDecision({
-					source,
-					observationCheckpoint,
-					delegationRequestId,
-					deadline,
-					fallback: {
-						code: 'MANUAL_OBSERVATION_FAILED',
-						message: 'The Source Tool observations became unavailable while rechecking Target liveness.',
-						phase: 'target-liveness',
-					},
-				});
-			}
-			const rejection = classifyTargetControllerRejection(
-				rechecked.postPrompt,
-				!rechecked.observations.truncated,
-				controllerProcessAlive,
+			throw manualInvocationFailure(
+				'TARGET_WINDOW_CLOSED',
+				'The exact target window controller closed before Tool invocation.',
+				'target-liveness',
+				summary,
+				!observations.truncated,
 			);
-			if (rechecked.observations.truncated) {
-				return resolveFrozenManualTerminalDecision({
-					source,
-					observationCheckpoint,
-					delegationRequestId,
-					deadline,
-					fallback: {
-						code: 'MANUAL_OBSERVATIONS_TRUNCATED',
-						message: 'The Source Tool observation history truncated while rechecking Target liveness.',
-						phase: 'target-liveness',
-					},
-				});
-			}
-			if (rechecked.postPrompt.unexpectedActivityCount > 0) {
-				return resolveFrozenManualTerminalDecision({
-					source,
-					observationCheckpoint,
-					delegationRequestId,
-					deadline,
-					fallback: {
-						code: 'UNEXPECTED_MANUAL_INVOCATION',
-						message: 'An unexpected delegation invocation occurred while rechecking Target liveness.',
-						phase: 'invoke',
-					},
-				});
-			}
-			if (rechecked.postPrompt.expected.prepareFailedCount > 0) {
-				return resolveFrozenManualTerminalDecision({
-					source,
-					observationCheckpoint,
-					delegationRequestId,
-					deadline,
-					fallback: {
-						code: rechecked.postPrompt.expected.errorCode
-							?? 'MANUAL_TOOL_PREPARATION_FAILED',
-						message: 'The selected delegation target became unavailable during Tool preparation.',
-						phase: 'prepare',
-					},
-				});
-			}
-			if (rejection === 'await-authoritative-outcome') {
-				await delay(250);
-				continue;
-			}
-			assert.notEqual(rejection, 'observation-history-incomplete');
-			if (rejection === 'target-window-closed') {
-				return resolveFrozenManualTerminalDecision({
-					source,
-					observationCheckpoint,
-					delegationRequestId,
-					deadline,
-					fallback: {
-						code: 'TARGET_WINDOW_CLOSED',
-						message: 'The exact target window process closed before Tool invocation.',
-						phase: 'target-liveness',
-					},
-				});
-			}
 		}
 		if (dashboardResult.status === 'rejected') {
-			await delay(250);
-			continue;
+			throw dashboardResult.reason;
 		}
-		const liveness = targetStateResult.status === 'fulfilled'
-			? assessExactTargetLiveness(
-				targetInputBase,
-				targetStateResult.value,
-				dashboardResult.value,
-			)
-			: { ok: false, code: 'PEER_OFFLINE' };
-		if (!liveness.ok && summary.invokeStartedCount === 0 && targetStateResult.status === 'fulfilled') {
-			return resolveFrozenManualTerminalDecision({
-				source,
-				observationCheckpoint,
-				delegationRequestId,
-				deadline,
-				fallback: {
-					code: liveness.code,
-					message: 'The exact selected target instance became unavailable before Tool invocation.',
-					phase: 'target-liveness',
-				},
-			});
+		const liveness = assessExactTargetLiveness(
+			targetInputBase,
+			targetStateResult.value,
+			dashboardResult.value,
+		);
+		if (!liveness.ok && summary.invokeStartedCount === 0) {
+			throw manualInvocationFailure(
+				liveness.code,
+				'The exact selected target instance became unavailable before Tool invocation.',
+				'target-liveness',
+				summary,
+				!observations.truncated,
+			);
 		}
 		await delay(250);
 	}
-	return resolveFrozenManualTerminalDecision({
-		source,
-		observationCheckpoint,
-		delegationRequestId,
-		deadline,
-		fallback: {
-			code: 'MANUAL_TOOL_TIMEOUT',
-			message: 'The manual Copilot Tool route did not complete within the bounded observation window.',
-			phase: 'timeout',
-		},
-	});
-}
-
-async function resolveFrozenManualTerminalDecision({
-	source,
-	observationCheckpoint,
-	delegationRequestId,
-	deadline,
-	fallback,
-}) {
-	const authoritativeOutcomeDeadline = Math.max(
-		deadline,
-		Date.now() + manualCompletionTimeoutMs,
-	);
-	const resolution = await resolveManualTerminalBarrier(
-		() => freezeManualDelegateIngress(
-			source,
-			observationCheckpoint,
-			delegationRequestId,
-		),
-		(frozen) => waitForFrozenManualOutcome(
-			source,
-			observationCheckpoint,
-			delegationRequestId,
-			authoritativeOutcomeDeadline,
-			frozen,
-		),
-		(snapshot) => settleUnexpectedManualInvocations(
-			source,
-			snapshot.postPrompt,
-			observationCheckpoint,
-			delegationRequestId,
-			freshManualCleanupDeadline(authoritativeOutcomeDeadline),
-		),
-	);
-	const resolved = resolution.snapshot;
-	if (resolution.kind === 'observation-history-incomplete') {
-		throw manualInvocationFailure(
-			'MANUAL_OBSERVATIONS_TRUNCATED',
-			'The frozen Source Tool observation history was incomplete.',
-			fallback.phase,
-			resolved.postPrompt.expected,
-			false,
-			resolution.taskLeaseReleased,
-			false,
-		);
-	}
-	if (resolution.kind === 'pre-invocation-failure') {
-		throw manualInvocationFailure(
-			fallback.code,
-			fallback.message,
-			fallback.phase,
-			resolved.postPrompt.expected,
-			true,
-		);
-	}
-	if (resolution.kind === 'unexpected-invocation') {
-		throw manualInvocationFailure(
-			'UNEXPECTED_MANUAL_INVOCATION',
-			'An unexpected delegation invocation crossed the terminal decision barrier.',
-			'invoke',
-			resolved.postPrompt.expected,
-			true,
-			resolution.taskLeaseReleased,
-			false,
-		);
-	}
-	if (resolution.kind === 'outcome-observation-failed') {
-		throw manualInvocationFailure(
-			'MANUAL_OBSERVATION_FAILED',
-			'The frozen Source Tool observations became unavailable before authoritative outcome.',
-			'invoke',
-			resolved.postPrompt.expected,
-			false,
-			resolution.taskLeaseReleased,
-			false,
-		);
-	}
-	const completed = resolved.observations.find(
-		(observation) =>
-			observation.sequence > observationCheckpoint
-			&& observation.delegationRequestId === delegationRequestId
-			&& observation.phase === 'invokeCompleted',
-	);
-	if (resolution.kind === 'successful-invocation' && completed !== undefined) {
-		return manualCompletionRun(completed, resolved.postPrompt.expected, delegationRequestId);
-	}
+	const observations = await request(source, 'peer.observations');
+	const summary = summarizeManualInvocation(observations.tools
+		.filter((observation) => observation.delegationRequestId === delegationRequestId)
+		.map((observation) => ({
+			phase: observation.phase,
+			...(observation.compactStatus === undefined
+				? {}
+				: { compactStatus: observation.compactStatus }),
+			...(observation.errorCode === undefined ? {} : { errorCode: observation.errorCode }),
+			taskIdPresent: observation.taskId !== undefined,
+		})));
 	throw manualInvocationFailure(
-		resolved.postPrompt.expected.errorCode ?? (
-			resolved.postPrompt.expected.invokeCompletedCount > 0
-				? 'MANUAL_TOOL_INVOCATION_FAILED'
-				: 'MANUAL_TASK_OUTCOME_UNRESOLVED'
-		),
-		resolved.postPrompt.expected.invokeCompletedCount > 0
-			? 'The barrier-crossing invocation completed without a successful authoritative outcome.'
-			: 'An invocation crossed the terminal decision barrier without an authoritative outcome.',
-		'invoke',
-		resolved.postPrompt.expected,
-		true,
-		resolution.taskLeaseReleased,
-		false,
+		'MANUAL_TOOL_TIMEOUT',
+		'The manual Copilot Tool route did not complete within the bounded observation window.',
+		'timeout',
+		summary,
+		!observations.truncated,
 	);
 }
 
-async function waitForFrozenManualOutcome(
-	source,
-	observationCheckpoint,
-	delegationRequestId,
-	deadline,
-	frozen,
-) {
-	const collected = new Map(
-		frozen.observations.map((observation) => [observation.sequence, observation]),
-	);
-	let observations = frozen.observations;
-	let postPrompt = frozen.postPrompt;
-	let complete = frozen.complete;
-	do {
-		try {
-			observations = await request(source, 'peer.observations', {}, 2_000);
-		} catch {
-			complete = false;
-			break;
-		}
-		complete &&= !observations.truncated && !observations.delegateInvocationsTruncated;
-		for (const observation of manualToolObservationRecords(observations)) {
-			if (observation.sequence > observationCheckpoint) {
-				collected.set(observation.sequence, observation);
-			}
-		}
-		postPrompt = summarizePostPromptDelegations(
-			manualToolObservations({
-				tools: [...collected.values()].sort((left, right) => left.sequence - right.sequence),
-			}),
-			observationCheckpoint,
-			delegationRequestId,
-		);
-		latestManualPostPrompt = postPrompt;
-		if (
-			postPrompt.allInvokeStartedCount > 0
-			&& postPrompt.unsettledInvokeStartedCount === 0
-		) {
-			break;
-		}
-		await delay(100);
-	} while (Date.now() < deadline);
-	return {
-		observations: [...collected.values()],
-		postPrompt,
-		complete,
-	};
-}
-
-function manualCompletionRun(completed, summary, delegationRequestId) {
-	return {
-		result: {
-			s: completed.compactStatus,
-			t: completed.taskId,
-			d: delegationRequestId,
-		},
-		parentResultObservation: {
-			resultFields: completed.resultFields,
-			resultBytes: completed.resultBytes,
-			resultHash: completed.resultHash,
-		},
-		invocationSource: 'copilot-ui',
-		confirmationObservation: {
-			preparedCount: summary.preparedCount,
-			acceptedCount: summary.invokeStartedCount,
-		},
-	};
-}
-
-async function freezeManualDelegateIngress(
-	source,
-	observationCheckpoint,
-	delegationRequestId,
-) {
-	let ingressFrozen = false;
-	try {
-		const frozen = await request(source, 'peer.manual.freeze', {}, 2_000);
-		ingressFrozen = frozen.frozen === true;
-	} catch {
-		ingressFrozen = false;
-	}
-	let observations;
-	try {
-		observations = await request(source, 'peer.observations', {}, 2_000);
-	} catch {
-		observations = undefined;
-	}
-	if (observations === undefined) {
-		const fallbackPostPrompt = latestManualPostPrompt ?? summarizePostPromptDelegations(
-			[],
-			observationCheckpoint,
-			delegationRequestId,
-		);
-		manualIngressFreezeProof = {
-			complete: false,
-			taskIdentitiesComplete: false,
-			observations: fallbackPostPrompt.delegateObservations,
-			postPrompt: fallbackPostPrompt,
-		};
-		return manualIngressFreezeProof;
-	}
-	const postPrompt = summarizePostPromptDelegations(
-		manualToolObservations(observations),
-		observationCheckpoint,
-		delegationRequestId,
-	);
-	manualIngressFreezeProof = {
-		complete:
-			ingressFrozen
-			&& !observations.truncated
-			&& !observations.delegateInvocationsTruncated,
-		taskIdentitiesComplete:
-			ingressFrozen
-			&& !observations.truncated
-			&& !observations.delegateInvocationsTruncated,
-		observations: manualToolObservationRecords(observations),
-		postPrompt,
-	};
-	latestManualPostPrompt = postPrompt;
-	return manualIngressFreezeProof;
-}
-
-async function waitForManualInvocationQuiescence(
-	source,
-	observationCheckpoint,
-	delegationRequestId,
-	manualDeadline,
-	initialSequence,
-) {
-	const quiescenceMs = 5_000;
-	let quietDeadline = Date.now() + quiescenceMs;
-	let latestSequence = initialSequence;
-	let observations;
-	let postPrompt;
-	do {
-		await delay(100);
-		observations = await request(source, 'peer.observations', {}, 2_000);
-		postPrompt = summarizePostPromptDelegations(
-			manualToolObservations(observations),
-			observationCheckpoint,
-			delegationRequestId,
-		);
-		latestManualPostPrompt = postPrompt;
-		const observedSequence = observations.tools.at(-1)?.sequence ?? observationCheckpoint;
-		if (observedSequence > latestSequence) {
-			latestSequence = observedSequence;
-			quietDeadline = Date.now() + quiescenceMs;
-		}
-		if (observations.truncated || postPrompt.unexpectedActivityCount > 0) {
-			break;
-		}
-	} while (Date.now() < quietDeadline && Date.now() < manualDeadline);
-	return {
-		observations,
-		postPrompt,
-		complete: Date.now() >= quietDeadline && quietDeadline <= manualDeadline,
-	};
-}
-
-async function recheckManualInvocationAfterControllerFailure(
-	source,
-	observationCheckpoint,
-	delegationRequestId,
-	minimumSequence,
-) {
-	const deadline = Date.now() + 2_000;
-	let observations;
-	let postPrompt;
-	do {
-		observations = await request(source, 'peer.observations', {}, 2_000);
-		postPrompt = summarizePostPromptDelegations(
-			manualToolObservations(observations),
-			observationCheckpoint,
-			delegationRequestId,
-		);
-		latestManualPostPrompt = postPrompt;
-		const sequence = observations.tools.at(-1)?.sequence ?? observationCheckpoint;
-		if (sequence >= minimumSequence && postPrompt.expected.invokeStartedCount > 0) {
-			break;
-		}
-		await delay(100);
-	} while (Date.now() < deadline);
-	return { observations, postPrompt };
-}
-
-async function settleUnexpectedManualInvocations(
-	source,
-	postPrompt,
-	observationCheckpoint,
-	expectedDelegationRequestId,
-	deadline,
-) {
-	const frozenInvokeStartedCount = postPrompt.allInvokeStartedCount;
-	const collected = new Map(
-		postPrompt.delegateObservations.map((observation) => [observation.sequence, observation]),
-	);
-	let taskIdentitiesComplete = manualIngressFreezeProof?.complete === true;
-	const settledTaskIds = new Set();
-	const candidateTaskIds = new Set(manualSettlementTaskIds(postPrompt));
-	const resolvedStartInvocationIds = new Set();
-	const settlementDeadline = Math.min(deadline, Date.now() + 60_000);
-	const resolveMissingTaskIdentities = async () => {
-		const unresolvedStarts = manualStartsWithoutTaskEvidence(postPrompt)
-			.filter(({ invocationId }) => !resolvedStartInvocationIds.has(invocationId));
-		const resolutions = await Promise.allSettled(unresolvedStarts.map(async (start) => {
-			const invocationId = requiredUuid(start.invocationId, 'Manual invocation identity');
-			const identified = postPrompt.delegateObservations.find(
-				(observation) =>
-					observation.invocationId === invocationId
-					&& observation.phase === 'taskIdentified',
-			);
-			const requestId = requiredUuid(
-				identified?.delegationRequestId,
-				'Manual delegation request identity',
-			);
-			if (
-				start.delegationRequestId !== undefined
-				&& start.delegationRequestId !== requestId
-			) {
-				throw new Error('Manual delegation request identity changed during invocation.');
-			}
-			const sourceWorkspaceIdentity = requiredSourceWorkspaceIdentity(
-				identified?.sourceWorkspaceIdentity,
-				'Manual source Workspace identity',
-			);
-			const resolved = await request(
-				source,
-				'peer.manual.task.resolve',
-				{ delegationRequestId: requestId, sourceWorkspaceIdentity },
-				remainingManualCleanupAttemptMs(settlementDeadline),
-			);
-			return {
-				invocationId,
-				taskId: requiredUuid(resolved.taskId, 'Resolved manual task identity'),
-			};
-		}));
-		for (const resolution of resolutions) {
-			if (resolution.status === 'fulfilled') {
-				resolvedStartInvocationIds.add(resolution.value.invocationId);
-				candidateTaskIds.add(resolution.value.taskId);
-			}
-		}
-	};
-	const settleKnownTasks = async () => {
-		for (const taskId of manualSettlementTaskIds(postPrompt)) {
-			candidateTaskIds.add(taskId);
-		}
-		const pendingTaskIds = [...candidateTaskIds]
-			.filter((taskId) => !settledTaskIds.has(taskId));
-		const settlements = await Promise.allSettled(pendingTaskIds.map(async (taskId) => {
-			let task;
-			try {
-				task = await request(
-					source,
-					'peer.task.evidence',
-					{ taskId },
-					remainingManualCleanupAttemptMs(settlementDeadline),
-				);
-				assertCleanupTaskEvidence(task, taskId);
-			} catch {
-				task = undefined;
-			}
-			if (
-				task === undefined
-				|| !['completed', 'failed', 'cancelled', 'timedOut'].includes(task.state)
-			) {
-				task = await cancelManualTaskAndWait(
-					source,
-					taskId,
-					remainingManualCleanupMs(settlementDeadline),
-				);
-			} else if (!task.leaseReleased) {
-				task = await waitForTaskLeaseReleased(
-					source,
-					taskId,
-					remainingManualCleanupMs(settlementDeadline),
-				);
-			}
-			if (
-				!['completed', 'failed', 'cancelled', 'timedOut'].includes(task.state)
-				|| !task.leaseReleased
-			) {
-				throw new Error('A manual task did not become terminal with its lease released.');
-			}
-			return taskId;
-		}));
-		let complete = true;
-		for (const settlement of settlements) {
-			if (settlement.status === 'fulfilled') {
-				settledTaskIds.add(settlement.value);
-			} else {
-				complete = false;
-			}
-		}
-		return complete;
-	};
-	await resolveMissingTaskIdentities();
-	await settleKnownTasks();
-	let finalPostPrompt = postPrompt;
-	do {
-		await delay(100);
-		let finalObservations;
-		try {
-			finalObservations = await request(source, 'peer.observations', {}, 2_000);
-		} catch {
-			taskIdentitiesComplete = false;
-			await resolveMissingTaskIdentities();
-			await settleKnownTasks();
-			continue;
-		}
-		taskIdentitiesComplete &&=
-			!finalObservations.truncated && !finalObservations.delegateInvocationsTruncated;
-		for (const observation of manualToolObservations(finalObservations)) {
-			if (observation.sequence > observationCheckpoint) {
-				collected.set(observation.sequence, observation);
-			}
-		}
-		finalPostPrompt = summarizePostPromptDelegations(
-			[...collected.values()].sort((left, right) => left.sequence - right.sequence),
-			observationCheckpoint,
-			expectedDelegationRequestId,
-		);
-		postPrompt = finalPostPrompt;
-		await resolveMissingTaskIdentities();
-		const settlementSucceeded = await settleKnownTasks();
-		if (
-			allManualStartsResolved(finalPostPrompt, resolvedStartInvocationIds)
-			&& finalPostPrompt.unresolvedPreparationCount === 0
-			&& finalPostPrompt.unsettledInvokeStartedCount === 0
-			&& settlementSucceeded
-			&& [...candidateTaskIds].every((taskId) => settledTaskIds.has(taskId))
-		) {
-			break;
-		}
-	} while (Date.now() < settlementDeadline);
-	return taskIdentitiesComplete
-		&& allManualStartsResolved(finalPostPrompt, resolvedStartInvocationIds)
-		&& [...candidateTaskIds].every((taskId) => settledTaskIds.has(taskId))
-		&& finalPostPrompt.unresolvedPreparationCount === 0
-		&& finalPostPrompt.unsettledInvokeStartedCount === 0
-		&& finalPostPrompt.allInvokeStartedCount === frozenInvokeStartedCount;
-}
-
-function allManualStartsResolved(postPrompt, resolvedStartInvocationIds) {
-	return allManualStartsHaveTaskEvidence(postPrompt)
-		|| manualStartsWithoutTaskEvidence(postPrompt).every(
-			({ invocationId }) => resolvedStartInvocationIds.has(invocationId),
-		);
-}
-
-function remainingManualCleanupMs(deadline) {
-	return Math.max(1, Math.min(60_000, deadline - Date.now()));
-}
-
-function remainingManualCleanupAttemptMs(deadline) {
-	return Math.min(2_000, remainingManualCleanupMs(deadline));
-}
-
-function freshManualCleanupDeadline(deadline) {
-	return Math.max(deadline, Date.now() + 60_000);
-}
-
-async function cancelManualTaskAndWait(source, taskId, timeoutMs) {
-	const deadline = Date.now() + timeoutMs;
-	let lastTask;
-	do {
-		await invokeCoreTool(
-			source,
-			'mesh_cancel_task',
-			{ taskId },
-			remainingManualCleanupAttemptMs(deadline),
-		);
-		try {
-			lastTask = await request(
-				source,
-				'peer.task.evidence',
-				{ taskId },
-				remainingManualCleanupAttemptMs(deadline),
-			);
-			assertCleanupTaskEvidence(lastTask, taskId);
-			if (
-				['completed', 'failed', 'cancelled', 'timedOut'].includes(lastTask.state)
-				&& lastTask.leaseReleased
-			) {
-				return lastTask;
-			}
-		} catch {
-			lastTask = undefined;
-		}
-		await delay(100);
-	} while (Date.now() < deadline);
-	throw new Error('A manual task could not be cancelled with its lease released.');
-}
-
-async function waitForTaskLeaseReleased(source, taskId, timeoutMs) {
-	const deadline = Date.now() + timeoutMs;
-	let latest;
-	do {
-		latest = await request(
-			source,
-			'peer.task.evidence',
-			{ taskId },
-			remainingManualCleanupAttemptMs(deadline),
-		);
-		assertCleanupTaskEvidence(latest, taskId);
-		if (
-			['completed', 'failed', 'cancelled', 'timedOut'].includes(latest.state)
-			&& latest.leaseReleased
-		) {
-			return latest;
-		}
-		await delay(100);
-	} while (Date.now() < deadline);
-	throw new Error('An unexpected manual task did not become terminal with its lease released.');
-}
-
-function assertCleanupTaskEvidence(task, expectedTaskId) {
-	if (
-		task === null
-		|| typeof task !== 'object'
-		|| task.taskId !== expectedTaskId
-		|| typeof task.state !== 'string'
-		|| typeof task.leaseReleased !== 'boolean'
-	) {
-		throw new Error('Unexpected manual task cleanup evidence was invalid.');
-	}
-}
-
-function isControllerProcessAlive(controller) {
-	return Number.isSafeInteger(controller.extensionHostPid)
-		&& readProcessTable().some(({ pid }) => pid === controller.extensionHostPid);
-}
-
-function manualToolObservations(observations) {
-	return manualToolObservationRecords(observations).map((observation) => ({
-		sequence: observation.sequence,
-		toolName: observation.toolName,
-		...(observation.delegationRequestId === undefined
-			? {}
-			: { delegationRequestId: observation.delegationRequestId }),
-		phase: observation.phase,
-		...(observation.compactStatus === undefined
-			? {}
-			: { compactStatus: observation.compactStatus }),
-		...(observation.errorCode === undefined ? {} : { errorCode: observation.errorCode }),
-		...(observation.taskId === undefined ? {} : { taskId: observation.taskId }),
-		...(observation.sourceWorkspaceIdentity === undefined
-			? {}
-			: { sourceWorkspaceIdentity: observation.sourceWorkspaceIdentity }),
-		...(observation.preparationSequence === undefined
-			? {}
-			: { preparationSequence: observation.preparationSequence }),
-		...(observation.invocationSequence === undefined
-			? {}
-			: { invocationSequence: observation.invocationSequence }),
-		...(observation.invocationId === undefined
-			? {}
-			: { invocationId: observation.invocationId }),
-		taskIdPresent: observation.taskId !== undefined,
-	}));
-}
-
-function manualToolObservationRecords(observations) {
-	const bySequence = new Map();
-	for (const observation of [
-		...observations.tools,
-		...(observations.delegateInvocations ?? []),
-	]) {
-		bySequence.set(observation.sequence, observation);
-	}
-	return [...bySequence.values()].sort((left, right) => left.sequence - right.sequence);
-}
-
-function manualInvocationFailure(
-	code,
-	message,
-	phase,
-	summary,
-	observationHistoryComplete,
-	taskLeaseReleased = false,
-	useFrozenSummary = true,
-) {
-	const frozenSummary = useFrozenSummary && manualIngressFreezeProof?.complete === true
-		? manualIngressFreezeProof.postPrompt.expected
-		: undefined;
-	const finalSummary = frozenSummary ?? summary;
+function manualInvocationFailure(code, message, phase, summary, observationHistoryComplete) {
 	return Object.assign(new Error(message), {
 		code,
-		noTaskLeaseObserved: manualIngressFreezeProof?.complete === true
-			&& manualIngressFreezeProof.postPrompt.allInvokeStartedCount === 0
-			&& finalSummary.unresolvedPreparationCount === 0
-			&& !finalSummary.taskIdPresent,
-		taskLeaseReleased,
+		noTaskLeaseObserved: observationHistoryComplete
+			&& summary.invokeStartedCount === 0
+			&& !summary.taskIdPresent,
 		manualInvocation: {
 			phase,
-			...finalSummary,
+			...summary,
 		},
 	});
 }
@@ -2863,56 +1974,16 @@ async function performCleanupOnce() {
 		{
 			name: 'observe-tool-resources',
 			run: async () => {
-				if (sourceController === undefined) {
-					throw new Error('The Source controller was unavailable for final resource observation.');
+				if (latestResourceMetrics === undefined && sourceController !== undefined) {
+					latestResourceMetrics = await request(
+						sourceController,
+						'peer.resources',
+						{},
+						2_000,
+					);
 				}
-				const observedResourceMetrics = await request(
-					sourceController,
-					'peer.resources',
-					{},
-					2_000,
-				);
-				assertFinalPeerResourceMetrics(observedResourceMetrics);
-				finalResourceMetrics = observedResourceMetrics;
-				if (baselineResourceMetrics === undefined) {
-					throw new Error('The baseline peer resource metrics were unavailable.');
-				}
-				const listenerDelta = delta(
-					baselineResourceMetrics.listener.startAttempts,
-					finalResourceMetrics.listener.startAttempts,
-				);
-				const tunnelLoadDelta = delta(
-					baselineResourceMetrics.tunnel.loadAttempts,
-					finalResourceMetrics.tunnel.loadAttempts,
-				);
-				const tunnelProbeDelta = delta(
-					baselineResourceMetrics.tunnel.probeAttempts,
-					finalResourceMetrics.tunnel.probeAttempts,
-				);
-				const tunnelEnsureDelta = delta(
-					baselineResourceMetrics.tunnel.ensureHostedAttempts,
-					finalResourceMetrics.tunnel.ensureHostedAttempts,
-				);
-				const finalTransportPass = [
-					listenerDelta,
-					tunnelLoadDelta,
-					tunnelProbeDelta,
-					tunnelEnsureDelta,
-				].every(({ delta: difference }) => difference === 0);
-				evidence.transport = {
-					...evidence.transport,
-					status: finalTransportPass && evidence.transport.localRouteOnly
-						? 'pass'
-						: 'fail',
-					listenerStartAttempts: listenerDelta,
-					tunnelLoadAttempts: tunnelLoadDelta,
-					tunnelProbeAttempts: tunnelProbeDelta,
-					tunnelEnsureHostedAttempts: tunnelEnsureDelta,
-					localRouteOnly: finalTransportPass && evidence.transport.localRouteOnly,
-				};
-				if (!finalTransportPass) {
-					throw new Error('Final peer transport metrics changed after scenario observation.');
-				}
+				assert.equal(latestResourceMetrics?.toolTimers.activeTimers ?? 0, 0);
+				assert.equal(latestResourceMetrics?.toolTimers.armedBudgetTimers ?? 0, 0);
 			},
 		},
 		{ name: 'close-controllers', run: closeControllers },
@@ -2988,8 +2059,8 @@ async function performCleanupOnce() {
 	cleanupFailures.push(...observedCleanupFailures);
 	const ownedProcessesReleased = finalOwned !== undefined && finalOwned.length === 0;
 	const ownedSocketsReleased = localIpcRemoved && editorEndpointReleased;
-	const ownedTimersReleased = finalResourceMetrics !== undefined
-		&& finalResourceMetrics.toolTimers.activeTimers === 0
+	const ownedTimersReleased =
+		(latestResourceMetrics?.toolTimers.activeTimers ?? 0) === 0
 		&& ownershipSampler === undefined;
 	const complete = cleanupFailures.length === 0
 		&& profileLockReleased
@@ -3009,14 +2080,14 @@ async function performCleanupOnce() {
 		? 0
 		: 1 + (evidence.completion.source === 'editor' ? 1 : 0);
 	evidence.resources.timer.ownedPeak =
-		(finalResourceMetrics?.toolTimers.timersCreated ?? 0)
+		(latestResourceMetrics?.toolTimers.timersCreated ?? 0)
 		+ Number(ownershipSamplerStarted);
 	evidence.resources.vscode.finalOwned = finalOwned?.filter(isVscodeProcess).length ?? 1;
 	evidence.resources.agentHost.finalOwned = finalOwned?.filter(isAgentHostProcess).length ?? 1;
 	evidence.resources.tunnel.finalOwned = finalOwned?.filter(isDevTunnelProcess).length ?? 1;
 	evidence.resources.socket.finalOwned = Number(!localIpcRemoved) + Number(!editorEndpointReleased);
 	evidence.resources.timer.finalOwned =
-		(finalResourceMetrics?.toolTimers.activeTimers ?? 1)
+		(latestResourceMetrics?.toolTimers.activeTimers ?? 0)
 		+ Number(ownershipSampler !== undefined);
 	evidence.cleanup = {
 		status: complete ? 'pass' : 'fail',
@@ -3393,16 +2464,6 @@ function requiredUuid(value, label) {
 	return value;
 }
 
-function requiredSourceWorkspaceIdentity(value, label) {
-	if (
-		typeof value !== 'string'
-		|| !/^sha256:[A-Za-z0-9_-]{43}$/u.test(value)
-	) {
-		throw new Error(`${label} was unavailable.`);
-	}
-	return value;
-}
-
 function runGit(args) {
 	const result = spawnSync('git', args, {
 		cwd: repositoryRoot,
@@ -3464,13 +2525,9 @@ function safeFailure(error) {
 		? {
 			phase: error.manualInvocation.phase,
 			preparedCount: error.manualInvocation.preparedCount,
-			prepareStartedCount: error.manualInvocation.prepareStartedCount,
 			prepareFailedCount: error.manualInvocation.prepareFailedCount,
 			invokeStartedCount: error.manualInvocation.invokeStartedCount,
 			invokeCompletedCount: error.manualInvocation.invokeCompletedCount,
-			unexpectedInvocationCount: error.manualInvocation.unexpectedInvocationCount,
-			unexpectedActivityCount: error.manualInvocation.unexpectedActivityCount,
-			unresolvedPreparationCount: error.manualInvocation.unresolvedPreparationCount,
 			...(error.manualInvocation.compactStatus === undefined
 				? {}
 				: { compactStatus: error.manualInvocation.compactStatus }),
@@ -3493,13 +2550,9 @@ function isSafeManualInvocationFailure(value) {
 		&& ['target-liveness', 'prepare', 'invoke', 'timeout'].includes(value.phase)
 		&& [
 			value.preparedCount,
-			value.prepareStartedCount,
 			value.prepareFailedCount,
 			value.invokeStartedCount,
 			value.invokeCompletedCount,
-			value.unexpectedInvocationCount,
-			value.unexpectedActivityCount,
-			value.unresolvedPreparationCount,
 		].every((count) => Number.isSafeInteger(count) && count >= 0)
 		&& (value.compactStatus === undefined
 			|| (Number.isSafeInteger(value.compactStatus)

@@ -6,7 +6,7 @@ import type {
 } from '../../shared/protocol';
 import type { MeshRemoteDirectorySnapshot } from '../../shared/toolProtocol';
 import type { RemoteTaskRouteAdapter } from '../tools/LocalBrokerTaskFacade';
-import type { TaskStartDispatchOutcome, WindowNodeClient } from './WindowNodeClient';
+import type { WindowNodeClient } from './WindowNodeClient';
 
 /**
  * Per-window remote task facade. Cancellation only stops waiting for the local
@@ -37,18 +37,16 @@ export class LocalIpcRemoteTaskAdapter implements RemoteTaskRouteAdapter {
 			readonly peerId?: string;
 			readonly delegatedExecutionContext?: DelegatedExecutionContext;
 		},
-		outcome?: TaskStartDispatchOutcome,
 	): Promise<TaskSnapshot> {
 		if (route.peerId === undefined) {
 			throw new TypeError('An explicit remote peer route is required.');
 		}
 		const snapshot = route.delegatedExecutionContext === undefined
-			? await this.client.startRemoteTask(input, route.peerId, outcome)
+			? await this.client.startRemoteTask(input, route.peerId)
 			: await this.client.startRemoteTaskFromDelegatedChild(
 				input,
 				route.peerId,
 				route.delegatedExecutionContext,
-				outcome,
 			);
 		this.remember(snapshot);
 		return snapshot;

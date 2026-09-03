@@ -28,10 +28,7 @@ import {
 	type TaskToolSnapshot,
 } from '../../shared/toolProtocol';
 import { LocalIpcRemoteError } from '../ipc';
-import type {
-	TaskStartDispatchOutcome,
-	WindowNodeClient,
-} from '../node/WindowNodeClient';
+import type { WindowNodeClient } from '../node/WindowNodeClient';
 import {
 	TaskToolFacadeError,
 	type DelegationTargetDisplay,
@@ -86,37 +83,15 @@ export interface RemoteTaskRouteAdapter {
 	): Promise<TaskSnapshot | undefined>;
 }
 
-export type RemoteTaskStartOutcome = TaskStartDispatchOutcome;
+export interface RemoteTaskStartOutcome {
+	taskStartRequestAttempted: boolean;
+}
 
 export interface LocalBrokerTaskFacadeOptions {
 	readonly deviceName: string | (() => string);
 	readonly remoteAdapter?: RemoteTaskRouteAdapter;
 	readonly now?: () => Date;
 	readonly sourceWorkspaceIdentity?: () => string;
-	readonly e2eDelegationBindings?: {
-		reserve(binding: {
-			readonly delegationRequestId: string;
-			readonly sourceWorkspaceIdentity?: string;
-			readonly taskId: string;
-		}): Promise<{ readonly token?: string }>;
-		finalizeReservation(
-			binding: {
-				readonly delegationRequestId: string;
-				readonly sourceWorkspaceIdentity?: string;
-				readonly taskId: string;
-			},
-			reservation: { readonly token?: string },
-		): Promise<void>;
-		retire(taskId: string): Promise<void>;
-		retireReservation(
-			binding: {
-				readonly delegationRequestId: string;
-				readonly sourceWorkspaceIdentity?: string;
-				readonly taskId: string;
-			},
-			reservation: { readonly token?: string },
-		): Promise<void>;
-	};
 }
 
 export class LocalBrokerTaskFacade implements TaskToolFacade {
@@ -336,24 +311,11 @@ export class LocalBrokerTaskFacade implements TaskToolFacade {
 		try {
 			const identity = this.identifyDelegation(intent);
 			const { delegationRequestId, taskId, sourceWorkspaceIdentity } = identity;
-			const persistedSourceScope = (
-				intent.sourceWorkspaceIdentity !== undefined
-				|| this.options.sourceWorkspaceIdentity !== undefined
-			)
-				? sourceWorkspaceIdentity
-				: undefined;
 			const target = {
 				deviceId: uuidSchema.parse(intent.deviceId),
 				nodeId: uuidSchema.parse(intent.nodeId),
 				nodeInstanceId: uuidSchema.parse(intent.nodeInstanceId),
 				workspaceId: uuidSchema.parse(intent.workspaceId),
-			};
-			const e2eBinding = {
-				delegationRequestId,
-				...(persistedSourceScope === undefined
-					? {}
-					: { sourceWorkspaceIdentity: persistedSourceScope }),
-				taskId,
 			};
 			let existing: TaskSnapshot | TaskSnapshotAfterEventSeq | undefined;
 			let remote: RemoteTaskRouteAdapter | undefined;
@@ -394,84 +356,26 @@ export class LocalBrokerTaskFacade implements TaskToolFacade {
 			let snapshot: TaskSnapshot;
 			if (remote === undefined) {
 				if (context === undefined) {
-					snapshot = await this.startWithBinding(
-						e2eBinding,
-						taskId,
-						(outcome) => this.client.startTask(input, outcome),
-					);
+					snapshot = await this.client.startTask(input);
 				} else {
 					const childStart = this.client.startTaskFromDelegatedChild?.bind(this.client);
 					if (childStart === undefined) {
 						throw new TaskToolFacadeError('OUTPUT_INVALID');
 					}
-					snapshot = await this.startWithBinding(
-						e2eBinding,
-						taskId,
-						(outcome) => childStart(input, context, outcome),
-					);
+					snapshot = await childStart(input, context);
 				}
 			} else {
-				snapshot = await this.startWithBinding(
-					e2eBinding,
-					taskId,
-					(outcome) => remote.startTask(input, {
-						peerId: remotePeerId,
-						...(context === undefined ? {} : { delegatedExecutionContext: context }),
-					}, outcome),
-				);
+				snapshot = await remote.startTask(input, {
+					peerId: remotePeerId,
+					...(context === undefined ? {} : { delegatedExecutionContext: context }),
+				});
 			}
 			if (snapshot.taskId !== taskId) {
 				throw new TaskToolFacadeError('OUTPUT_INVALID');
 			}
-
 			return { delegationRequestId, taskId, recovered: existing !== undefined };
 		} catch (error: unknown) {
 			throw toFacadeError(error);
-		}
-	}
-
-	private async startWithBinding(
-		binding: {
-			readonly delegationRequestId: string;
-			readonly sourceWorkspaceIdentity?: string;
-			readonly taskId: string;
-		},
-		taskId: string,
-		start: (outcome: TaskStartDispatchOutcome) => Promise<TaskSnapshot>,
-	): Promise<TaskSnapshot> {
-		const reservation = await this.options.e2eDelegationBindings?.reserve(binding);
-		const outcome: TaskStartDispatchOutcome = { taskStartRequestAttempted: false };
-		try {
-			const snapshot = await start(outcome);
-			await this.options.e2eDelegationBindings?.finalizeReservation(binding, reservation ?? {});
-			return snapshot;
-		} catch (error: unknown) {
-			if (outcome.taskStartRequestAttempted) {
-				try {
-					await this.options.e2eDelegationBindings?.finalizeReservation(
-						binding,
-						reservation ?? {},
-					);
-				} catch (finalizationError: unknown) {
-					throw new AggregateError(
-						[error, finalizationError],
-						'Task start and dispatched binding finalization both failed.',
-					);
-				}
-			} else {
-				try {
-					await this.options.e2eDelegationBindings?.retireReservation(
-						binding,
-						reservation ?? {},
-					);
-				} catch (retirementError: unknown) {
-					throw new AggregateError(
-						[error, retirementError],
-						'Task start and pre-dispatch binding retirement both failed.',
-					);
-				}
-			}
-			throw error;
 		}
 	}
 

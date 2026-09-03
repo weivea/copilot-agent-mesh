@@ -7,7 +7,6 @@ import type {
 import type {
 	TaskToolInvocationObservation,
 	TaskToolInvocationObserver,
-	TaskToolInvocationGate,
 } from '../tools/TaskToolInvocationObserver';
 import type { ToolClock, ToolDeadlineTimer } from '../tools/taskToolsCore';
 
@@ -29,13 +28,9 @@ export interface SafePeerToolObservation {
 	readonly phase: TaskToolInvocationObservation['phase'];
 	readonly delegationRequestId?: string;
 	readonly taskId?: string;
-	readonly sourceWorkspaceIdentity?: string;
 	readonly inputId?: string;
 	readonly compactStatus?: number;
 	readonly errorCode?: string;
-	readonly preparationSequence?: number;
-	readonly invocationSequence?: number;
-	readonly invocationId?: string;
 	readonly cancellationReason?: string;
 	readonly resultFields?: readonly string[];
 	readonly resultBytes?: number;
@@ -54,50 +49,17 @@ export interface SafePeerAhpObservation {
 
 export interface PeerDelegationRecorderSnapshot {
 	readonly tools: readonly SafePeerToolObservation[];
-	readonly delegateInvocations: readonly SafePeerToolObservation[];
 	readonly ahp: readonly SafePeerAhpObservation[];
 	readonly truncated: boolean;
-	readonly delegateInvocationsTruncated: boolean;
 }
 
 export class PeerDelegationE2eRecorder implements
 	TaskToolInvocationObserver,
-	TaskToolInvocationGate,
 	AgentRuntimeLifecycleObserver {
 	private sequence = 0;
 	private readonly tools: SafePeerToolObservation[] = [];
-	private readonly delegateInvocations = new Map<string, SafePeerToolObservation[]>();
-	private readonly overflowDelegateInvocations = new Map<string, SafePeerToolObservation[]>();
-	private readonly delegateInvocationReservations = new Set<string>();
 	private readonly ahp: SafePeerAhpObservation[] = [];
 	private truncated = false;
-	private delegateInvocationsTruncated = false;
-	private delegateInvocationsFrozen = false;
-
-	public assertDelegateInvocationAllowed(): void {
-		if (this.delegateInvocationsFrozen) {
-			throw new Error('Manual delegation invocation ingress is closed for final E2E evidence.');
-		}
-	}
-
-	public freezeDelegateInvocations(): void {
-		this.delegateInvocationsFrozen = true;
-	}
-
-	public reserveDelegateInvocation(invocationId: string): void {
-		if (!uuidPattern.test(invocationId)) {
-			throw new TypeError('The delegate invocation identity is invalid.');
-		}
-		this.assertDelegateInvocationAllowed();
-		if (
-			!this.delegateInvocationReservations.has(invocationId)
-			&& this.delegateInvocationReservations.size >= maximumObservations
-		) {
-			this.delegateInvocationsFrozen = true;
-			throw new Error('Manual delegation invocation evidence capacity is exhausted.');
-		}
-		this.delegateInvocationReservations.add(invocationId);
-	}
 
 	public observe(observation: TaskToolInvocationObservation): void {
 		try {
@@ -109,29 +71,16 @@ export class PeerDelegationE2eRecorder implements
 			const serializedResult = result === undefined
 				? undefined
 				: JSON.stringify(result);
-			const safeObservation: SafePeerToolObservation = {
+			this.push(this.tools, {
 				sequence: this.nextSequence(),
 				at: new Date().toISOString(),
 				toolName: observation.toolName,
 				phase: observation.phase,
 				...optionalUuid('delegationRequestId', input?.delegationRequestId ?? result?.d),
 				...optionalUuid('taskId', input?.taskId ?? result?.t),
-				...(typeof result?.w === 'string'
-					&& /^sha256:[A-Za-z0-9_-]{43}$/u.test(result.w)
-					? { sourceWorkspaceIdentity: result.w }
-					: {}),
 				...optionalUuid('inputId', input?.inputId ?? result?.i),
 				...(typeof result?.s === 'number' && Number.isSafeInteger(result.s)
 					? { compactStatus: result.s }
-					: {}),
-				...(Number.isSafeInteger(observation.invocationSequence)
-					&& (observation.invocationSequence ?? 0) > 0
-					? { invocationSequence: observation.invocationSequence }
-					: {}),
-				...optionalUuid('invocationId', observation.invocationId),
-				...(Number.isSafeInteger(observation.preparationSequence)
-					&& (observation.preparationSequence ?? 0) > 0
-					? { preparationSequence: observation.preparationSequence }
 					: {}),
 				...(typeof result?.e === 'string' && stableCodePattern.test(result.e)
 					? { errorCode: result.e }
@@ -146,9 +95,7 @@ export class PeerDelegationE2eRecorder implements
 					resultBytes: Buffer.byteLength(serializedResult, 'utf8'),
 					resultHash: digest('tool-result', serializedResult),
 				}),
-			};
-			this.push(this.tools, safeObservation);
-			this.trackDelegateInvocation(safeObservation);
+			});
 		} catch {
 			// E2E observation must never affect a production Tool invocation.
 		}
@@ -195,14 +142,8 @@ export class PeerDelegationE2eRecorder implements
 	public snapshot(): PeerDelegationRecorderSnapshot {
 		return {
 			tools: this.tools.map((observation) => ({ ...observation })),
-			delegateInvocations: [...this.delegateInvocations.values()]
-				.concat([...this.overflowDelegateInvocations.values()])
-				.flat()
-				.sort((left, right) => left.sequence - right.sequence)
-				.map((observation) => ({ ...observation })),
 			ahp: this.ahp.map((observation) => ({ ...observation })),
 			truncated: this.truncated,
-			delegateInvocationsTruncated: this.delegateInvocationsTruncated,
 		};
 	}
 
@@ -216,45 +157,6 @@ export class PeerDelegationE2eRecorder implements
 		if (target.length > maximumObservations) {
 			target.shift();
 			this.truncated = true;
-		}
-	}
-
-	private trackDelegateInvocation(observation: SafePeerToolObservation): void {
-		if (
-			observation.toolName !== 'mesh_delegate_task'
-			|| observation.invocationId === undefined
-			|| ![
-				'invokeStarted',
-				'taskIdentified',
-				'taskAvailable',
-				'invokeCompleted',
-			].includes(observation.phase)
-		) {
-			return;
-		}
-		const lifecycle = this.delegateInvocations.get(observation.invocationId) ?? [];
-		if (!this.delegateInvocationReservations.has(observation.invocationId)) {
-			try {
-				this.reserveDelegateInvocation(observation.invocationId);
-			} catch {
-				this.delegateInvocationsTruncated = true;
-				this.delegateInvocationsFrozen = true;
-				if (
-					this.overflowDelegateInvocations.size === 0
-					|| this.overflowDelegateInvocations.has(observation.invocationId)
-				) {
-					const overflow = this.overflowDelegateInvocations.get(observation.invocationId) ?? [];
-					overflow.push(observation);
-					this.overflowDelegateInvocations.set(observation.invocationId, overflow);
-				}
-				return;
-			}
-		}
-		lifecycle.push(observation);
-		this.delegateInvocations.set(observation.invocationId, lifecycle);
-		if (this.delegateInvocations.size > maximumObservations) {
-			this.delegateInvocationsTruncated = true;
-			this.delegateInvocationsFrozen = true;
 		}
 	}
 }
@@ -398,7 +300,7 @@ export class PeerDelegationE2eToolClock implements ToolClock {
 	}
 }
 
-function optionalUuid<Key extends 'delegationRequestId' | 'taskId' | 'inputId' | 'invocationId'>(
+function optionalUuid<Key extends 'delegationRequestId' | 'taskId' | 'inputId'>(
 	key: Key,
 	value: unknown,
 ): Partial<Record<Key, string>> {

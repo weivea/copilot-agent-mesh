@@ -84,12 +84,6 @@ export interface TaskToolsCoreOptions {
 	readonly outputByteLimit?: number;
 	readonly id?: () => string;
 	readonly delegatedToolInvocations?: DelegatedToolInvocationRegistry;
-	readonly onDelegationTaskAvailable?: (
-		identity: DelegationIdentity,
-	) => void;
-	readonly onDelegationIdentified?: (
-		identity: DelegationIdentity,
-	) => void;
 }
 
 interface OperationSuccess<T> {
@@ -186,10 +180,6 @@ export class TaskToolsCore {
 	private readonly outputByteLimit: number;
 	private readonly id: () => string;
 	private readonly delegatedToolInvocations: DelegatedToolInvocationRegistry | undefined;
-	private readonly onDelegationTaskAvailable:
-		TaskToolsCoreOptions['onDelegationTaskAvailable'];
-	private readonly onDelegationIdentified:
-		TaskToolsCoreOptions['onDelegationIdentified'];
 
 	constructor(
 		private readonly facade: TaskToolFacade,
@@ -199,8 +189,6 @@ export class TaskToolsCore {
 		this.outputByteLimit = options.outputByteLimit ?? TASK_TOOL_LIMITS.defaultOutputBytes;
 		this.id = options.id ?? randomUUID;
 		this.delegatedToolInvocations = options.delegatedToolInvocations;
-		this.onDelegationTaskAvailable = options.onDelegationTaskAvailable;
-		this.onDelegationIdentified = options.onDelegationIdentified;
 		if (
 			!Number.isSafeInteger(this.outputByteLimit)
 			|| this.outputByteLimit < TASK_TOOL_LIMITS.minimumOutputBytes
@@ -338,11 +326,6 @@ export class TaskToolsCore {
 				...input,
 				sourceWorkspaceIdentity: identity.sourceWorkspaceIdentity,
 			};
-			try {
-				this.onDelegationIdentified?.(identity);
-			} catch {
-				// Diagnostics must never affect task execution.
-			}
 		} catch (error: unknown) {
 			return this.errorFromUnknown(error);
 		}
@@ -367,11 +350,6 @@ export class TaskToolsCore {
 					|| persisted.delegationRequestId !== identity.delegationRequestId
 				) {
 					throw new TaskToolFacadeError('OUTPUT_INVALID');
-				}
-				try {
-					this.onDelegationTaskAvailable?.(identity);
-				} catch {
-					// Diagnostics must never affect task execution.
 				}
 				onTaskAvailable();
 				const read = await this.facade.getTask(
