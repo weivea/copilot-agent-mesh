@@ -388,89 +388,6 @@ test('peer-delegation recorder stores identities and hashes without prompt or ou
 		},
 	});
 
-	test('manual monitor preserves a safe preparation failure without task identifiers', () => {
-		const recorder = new PeerDelegationE2eRecorder();
-		recorder.observe({
-			toolName: 'mesh_delegate_task',
-			phase: 'prepareFailed',
-			input: {
-				delegationRequestId,
-				nodeId: 'do-not-persist-node-id',
-				prompt: 'do not persist this prompt',
-			},
-			errorCode: 'PEER_OFFLINE',
-		});
-
-		const observation = recorder.snapshot().tools[0];
-		assert.equal(observation?.phase, 'prepareFailed');
-		assert.equal(observation?.errorCode, 'PEER_OFFLINE');
-		assert.equal(observation?.taskId, undefined);
-		assert.equal(JSON.stringify(observation).includes('do-not-persist'), false);
-		assert.deepEqual(summarizeManualInvocation([{
-			phase: observation!.phase,
-			errorCode: observation!.errorCode,
-			taskIdPresent: observation!.taskId !== undefined,
-		}]), {
-			preparedCount: 0,
-			prepareFailedCount: 1,
-			invokeStartedCount: 0,
-			invokeCompletedCount: 0,
-			errorCode: 'PEER_OFFLINE',
-			taskIdPresent: false,
-		});
-	});
-
-	test('manual monitor rejects a closed or replaced exact target and accepts the normal path', () => {
-		const target = {
-			nodeId: 'node-one',
-			nodeInstanceId: 'instance-one',
-			workspaceId: 'workspace-one',
-		};
-		const controllerState = {
-			node: {
-				nodeId: target.nodeId,
-				nodeInstanceId: target.nodeInstanceId,
-				state: 'online',
-				registered: true,
-				workspaceCount: 1,
-			},
-		};
-		const exactNode = {
-			nodeId: target.nodeId,
-			nodeInstanceId: target.nodeInstanceId,
-			status: 'online',
-			workspaces: [{
-				workspaceId: target.workspaceId,
-				claimStatus: 'claimed',
-				enabled: true,
-			}],
-		};
-
-		assert.deepEqual(
-			assessExactTargetLiveness(target, controllerState, { localNodes: [exactNode] }),
-			{ ok: true },
-		);
-		assert.deepEqual(
-			assessExactTargetLiveness(target, undefined, { localNodes: [exactNode] }),
-			{ ok: false, code: 'PEER_OFFLINE' },
-		);
-		assert.deepEqual(
-			assessExactTargetLiveness(target, controllerState, {
-				localNodes: [{ ...exactNode, nodeInstanceId: 'replacement-instance' }],
-			}),
-			{ ok: false, code: 'PEER_OFFLINE' },
-			'A replacement instance must not satisfy the exact target claim.',
-		);
-		assert.deepEqual(
-			assessExactTargetLiveness(target, controllerState, {
-				localNodes: [{
-					...exactNode,
-					workspaces: [{ ...exactNode.workspaces[0], workspaceId: 'replacement-workspace' }],
-				}],
-			}),
-			{ ok: false, code: 'PEER_OFFLINE' },
-		);
-	});
 	recorder.observeLifecycle({
 		taskId,
 		eventType: 'session/hostObserved',
@@ -513,6 +430,90 @@ test('peer-delegation recorder stores identities and hashes without prompt or ou
 	]);
 	assert.match(snapshot.ahp[0]?.sessionHash ?? '', /^[a-f0-9]{16}$/u);
 	assert.equal(JSON.stringify(snapshot).includes('do-not-persist-this-identifier'), false);
+});
+
+test('manual monitor preserves a safe preparation failure without task identifiers', () => {
+	const recorder = new PeerDelegationE2eRecorder();
+	recorder.observe({
+		toolName: 'mesh_delegate_task',
+		phase: 'prepareFailed',
+		input: {
+			delegationRequestId,
+			nodeId: 'do-not-persist-node-id',
+			prompt: 'do not persist this prompt',
+		},
+		errorCode: 'PEER_OFFLINE',
+	});
+
+	const observation = recorder.snapshot().tools[0];
+	assert.equal(observation?.phase, 'prepareFailed');
+	assert.equal(observation?.errorCode, 'PEER_OFFLINE');
+	assert.equal(observation?.taskId, undefined);
+	assert.equal(JSON.stringify(observation).includes('do-not-persist'), false);
+	assert.deepEqual(summarizeManualInvocation([{
+		phase: observation!.phase,
+		errorCode: observation!.errorCode,
+		taskIdPresent: observation!.taskId !== undefined,
+	}]), {
+		preparedCount: 0,
+		prepareFailedCount: 1,
+		invokeStartedCount: 0,
+		invokeCompletedCount: 0,
+		errorCode: 'PEER_OFFLINE',
+		taskIdPresent: false,
+	});
+});
+
+test('manual monitor rejects a closed or replaced exact target and accepts the normal path', () => {
+	const target = {
+		nodeId: 'node-one',
+		nodeInstanceId: 'instance-one',
+		workspaceId: 'workspace-one',
+	};
+	const controllerState = {
+		node: {
+			nodeId: target.nodeId,
+			nodeInstanceId: target.nodeInstanceId,
+			state: 'online',
+			registered: true,
+			workspaceCount: 1,
+		},
+	};
+	const exactNode = {
+		nodeId: target.nodeId,
+		nodeInstanceId: target.nodeInstanceId,
+		status: 'online',
+		workspaces: [{
+			workspaceId: target.workspaceId,
+			claimStatus: 'claimed',
+			enabled: true,
+		}],
+	};
+
+	assert.deepEqual(
+		assessExactTargetLiveness(target, controllerState, { localNodes: [exactNode] }),
+		{ ok: true },
+	);
+	assert.deepEqual(
+		assessExactTargetLiveness(target, undefined, { localNodes: [exactNode] }),
+		{ ok: false, code: 'PEER_OFFLINE' },
+	);
+	assert.deepEqual(
+		assessExactTargetLiveness(target, controllerState, {
+			localNodes: [{ ...exactNode, nodeInstanceId: 'replacement-instance' }],
+		}),
+		{ ok: false, code: 'PEER_OFFLINE' },
+		'A replacement instance must not satisfy the exact target claim.',
+	);
+	assert.deepEqual(
+		assessExactTargetLiveness(target, controllerState, {
+			localNodes: [{
+				...exactNode,
+				workspaces: [{ ...exactNode.workspaces[0], workspaceId: 'replacement-workspace' }],
+			}],
+		}),
+		{ ok: false, code: 'PEER_OFFLINE' },
+	);
 });
 
 test('peer task evidence projection bounds verbose journals without inventing milestones', () => {
