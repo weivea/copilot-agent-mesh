@@ -145,13 +145,6 @@ submodule（`f19dd8b3942d029744a3bdd31d830f9428e8ea47`，TypeScript client 0.9.0
 protocol offer 1.0.0）完全一致。这同时再次印证了不跟随 upstream `60706330`
 （AHP 0.9.0 offer）的既定决策：那会与 VS Code 1.135.0 的 `^1.0.0` 要求不兼容。
 
-VS Code 1.136 的后续日志同样公布了包含 `1.0.0` 的 `protocolVersions`，现有精确
-offer 与 pinned client 无需升级。一次手工 E2E 中 Target Extension Host 在
-Tool preparation 前收到 renderer terminate 并以 code 0 正常退出，随后精确 Node
-离线；这只能证明目标窗口已关闭，不能归因为 AHP crash。Harness 因此在手工等待期持续
-校验 Target controller、精确 `nodeId`/`nodeInstanceId` 和 Workspace claim，并以
-`TARGET_WINDOW_CLOSED` 或 `PEER_OFFLINE` 安全终止，不会改绑替代实例。
-
 ## 5. Q4 — Session 可见性与 Provider 目录
 
 ### 5.1 `listSessions` 返回的是用户真实会话

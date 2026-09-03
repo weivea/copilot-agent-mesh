@@ -50,19 +50,13 @@ unfiltered candidate RPC and never weakens `mesh_list_workers` filtering.
 
 The P8 real harness invokes these same registrations through
 `vscode.lm.invokeTool`; it does not call the Broker start method as a substitute.
-On VS Code 1.135.0 and 1.136.0, a programmatic invocation without Chat context still runs
+On VS Code 1.135.0, a programmatic invocation without Chat context still runs
 `prepareInvocation` and shows a separate modal. That proves neither a parent
 Copilot Chat route nor a sidebar confirmation. Only the visible Agent-mode phase
 may mark the one parent confirmation as Pass. Because an unauthorized target is
 intentionally absent from the display directory, the two direct-address rejection
 codes are collected through the gated E2E control API against the same production
 Broker start route; they are not counted as task completion evidence.
-
-Preparation preserves safe facade codes such as `WORKSPACE_NOT_FOUND`,
-`PEER_OFFLINE`, `PEER_NOT_ALLOWED`, and `PEER_NOT_ACCEPTING`; timeout and
-cancellation are also explicit. Unknown failures retain the generic safe message.
-The manual harness records only the phase counts, compact status, safe code, and
-whether a task ID existed.
 
 Policy configuration uses a separate authenticated RPC surface. A multi-root
 window may pass one of its own claimed `workspaceIdentity` values to

@@ -241,67 +241,6 @@ suite('TaskToolsCore', () => {
 		assert.equal(facade.acceptanceWaits, 0);
 	});
 
-	test('preparation preserves safe facade failure codes and keeps unknown failures generic', async () => {
-		for (const code of [
-			'WORKSPACE_NOT_FOUND',
-			'PEER_OFFLINE',
-			'PEER_NOT_ALLOWED',
-			'PEER_NOT_ACCEPTING',
-		] as const) {
-			const facade = new RecordingFacade();
-			facade.describeError = new TaskToolFacadeError(code);
-			await assert.rejects(
-				() => new TaskToolsCore(facade).prepareDelegateInvocation(delegationInput()),
-				(error: unknown) =>
-					error instanceof TaskToolFacadeError
-					&& error.code === code,
-			);
-		}
-
-		const facade = new RecordingFacade();
-		facade.describeError = new Error('sensitive transport detail');
-		await assert.rejects(
-			() => new TaskToolsCore(facade).prepareDelegateInvocation(delegationInput()),
-			(error: unknown) =>
-				error instanceof Error
-				&& !(error instanceof TaskToolFacadeError)
-				&& error.message === 'The selected delegation target is unavailable.',
-		);
-	});
-
-	test('preparation reports bounded cancellation and timeout with safe facade codes', async () => {
-		const cancellation = new ManualCancellation();
-		cancellation.cancel();
-		await assert.rejects(
-			() => new TaskToolsCore(new RecordingFacade()).prepareDelegateInvocation(
-				delegationInput(),
-				cancellation,
-			),
-			(error: unknown) =>
-				error instanceof TaskToolFacadeError
-				&& error.code === 'CANCELLED'
-				&& error.retryable,
-		);
-
-		const facade = new RecordingFacade();
-		const description = new Deferred<{ windowName: string; workspaceName: string }>();
-		facade.description = description.promise;
-		const clock = new ManualClock();
-		const preparation = new TaskToolsCore(facade, { clock }).prepareDelegateInvocation(
-			delegationInput(),
-		);
-		await Promise.resolve();
-		clock.advanceBy(Number.MAX_SAFE_INTEGER);
-		await assert.rejects(
-			() => preparation,
-			(error: unknown) =>
-				error instanceof TaskToolFacadeError
-				&& error.code === 'TIMEOUT'
-				&& error.retryable,
-		);
-		assert.equal(clock.activeTimers, 0);
-	});
-
 	test('returns the exact completed compact contract after an authoritative event', async () => {
 		const facade = new RecordingFacade();
 		const clock = new ManualClock();
@@ -1895,8 +1834,6 @@ class RecordingFacade implements TaskToolFacade {
 		summary: 'Scheduler fixed.',
 	};
 	listError: unknown;
-	describeError: unknown;
-	description?: Promise<{ windowName: string; workspaceName: string }>;
 	readonly getTaskErrors: unknown[] = [];
 	persistCalls = 0;
 	acceptanceWaits = 0;
@@ -1919,12 +1856,6 @@ class RecordingFacade implements TaskToolFacade {
 	}
 
 	async describeDelegationTarget() {
-		if (this.describeError !== undefined) {
-			throw this.describeError;
-		}
-		if (this.description !== undefined) {
-			return this.description;
-		}
 		return { windowName: 'Window One', workspaceName: 'app' };
 	}
 

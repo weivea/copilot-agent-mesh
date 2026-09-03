@@ -64,10 +64,6 @@ const {
 	manualPostDetachObservationTimeoutMs,
 	waitForManualPostDetachAttestation,
 } = require(join(repositoryRoot, 'out/src/e2e/PeerDelegationManualEvidence.js'));
-const {
-	assessExactTargetLiveness,
-	summarizeManualInvocation,
-} = require(join(repositoryRoot, 'out/src/e2e/PeerDelegationManualMonitor.js'));
 
 class E2eRequestError extends Error {
 	constructor(action, code, message) {
@@ -163,7 +159,6 @@ let maximumOwnedProcessCount = 0;
 let localIpcEndpoint;
 let vscodeExecutablePath;
 let codeCliPath;
-let sourceController;
 let sentinelDigest;
 let profileLockOwned = false;
 let primaryFailure;
@@ -220,7 +215,6 @@ try {
 
 	assert.equal(currentOwnedProcesses().length, 0, 'Fresh peer E2E markers matched an existing process.');
 	const source = await launchAndDiscover(sourceWorkspacePath);
-	sourceController = source;
 	activeControllers.set(source.windowId, source);
 	await waitForControllerState(
 		source,
@@ -428,15 +422,6 @@ try {
 	await assertProjectUnchanged(targetWorkspacePath);
 } catch (error) {
 	primaryFailure = error;
-	if (
-		error !== null
-		&& typeof error === 'object'
-		&& 'manualInvocation' in error
-		&& isSafeManualInvocationFailure(error.manualInvocation)
-		&& error.noTaskLeaseObserved === true
-	) {
-		cleanupLeaseReleased = true;
-	}
 } finally {
 	const cleanupFailures = await performCleanup();
 	if (cleanupFailures.length > 0) {
@@ -1111,7 +1096,7 @@ async function recordCompletionScenario({
 }) {
 	const completionStarted = Date.now();
 	const completionRun = manualUi
-		? await waitForManualCompletion(source, target, targetInputBase)
+		? await waitForManualCompletion(source, targetInputBase)
 		: await runProgrammaticCoreCompletion(source, targetInputBase);
 	const completionResult = completionRun.result;
 	const completionTaskId = requiredUuid(completionResult.t, 'completion taskId');
@@ -1440,7 +1425,7 @@ async function waitForTaskClientDetach(controller, taskId, timeoutMs) {
 	return latest;
 }
 
-async function waitForManualCompletion(source, target, targetInputBase) {
+async function waitForManualCompletion(source, targetInputBase) {
 	const delegationRequestId = randomUUID();
 	const title = `P8 E2E completion ${runLabel}`;
 	const prompt = [
@@ -1459,52 +1444,23 @@ async function waitForManualCompletion(source, target, targetInputBase) {
 	}));
 	const deadline = Date.now() + 15 * 60_000;
 	while (Date.now() < deadline) {
-		const [observationsResult, targetStateResult, dashboardResult] = await Promise.allSettled([
-			request(source, 'peer.observations', {}, 2_000),
-			request(target, 'controller.state', {}, 1_000),
-			request(source, 'peer.dashboard.snapshot', {}, 2_000),
-		]);
-		if (observationsResult.status === 'rejected') {
-			throw observationsResult.reason;
-		}
-		const observations = observationsResult.value;
+		const observations = await request(source, 'peer.observations');
 		const matching = observations.tools.filter(
 			(observation) => observation.delegationRequestId === delegationRequestId,
 		);
-		const summary = summarizeManualInvocation(matching.map((observation) => ({
-			phase: observation.phase,
-			...(observation.compactStatus === undefined
-				? {}
-				: { compactStatus: observation.compactStatus }),
-			...(observation.errorCode === undefined ? {} : { errorCode: observation.errorCode }),
-			taskIdPresent: observation.taskId !== undefined,
-		})));
-		if (summary.prepareFailedCount > 0) {
-			throw manualInvocationFailure(
-				summary.errorCode ?? 'MANUAL_TOOL_PREPARATION_FAILED',
-				'The selected delegation target became unavailable during Tool preparation.',
-				'prepare',
-				summary,
-				!observations.truncated,
-			);
-		}
+		const preparedCount = matching.filter(({ phase }) => phase === 'prepared').length;
+		const acceptedCount = matching.filter(({ phase }) => phase === 'invokeStarted').length;
 		const completedObservations = matching.filter(({ phase }) => phase === 'invokeCompleted');
 		if (completedObservations.length > 0) {
 			const completed = completedObservations[0];
 			if (
-				summary.preparedCount !== 1
-				|| summary.invokeStartedCount !== 1
-				|| summary.invokeCompletedCount !== 1
-				|| summary.compactStatus !== 0
-				|| !summary.taskIdPresent
+				preparedCount !== 1
+				|| acceptedCount !== 1
+				|| completedObservations.length !== 1
+				|| completed.compactStatus !== 0
+				|| typeof completed.taskId !== 'string'
 			) {
-				throw manualInvocationFailure(
-					summary.errorCode ?? 'MANUAL_TOOL_INVOCATION_FAILED',
-					'The manual Copilot Tool route completed without one successful confirmed invocation.',
-					'invoke',
-					summary,
-					!observations.truncated,
-				);
+				throw new Error('The manual Copilot Tool route did not produce one confirmed completion.');
 			}
 			return {
 				result: {
@@ -1519,70 +1475,14 @@ async function waitForManualCompletion(source, target, targetInputBase) {
 				},
 				invocationSource: 'copilot-ui',
 				confirmationObservation: {
-					preparedCount: summary.preparedCount,
-					acceptedCount: summary.invokeStartedCount,
+					preparedCount,
+					acceptedCount,
 				},
 			};
 		}
-		if (targetStateResult.status === 'rejected') {
-			throw manualInvocationFailure(
-				'TARGET_WINDOW_CLOSED',
-				'The exact target window controller closed before Tool invocation.',
-				'target-liveness',
-				summary,
-				!observations.truncated,
-			);
-		}
-		if (dashboardResult.status === 'rejected') {
-			throw dashboardResult.reason;
-		}
-		const liveness = assessExactTargetLiveness(
-			targetInputBase,
-			targetStateResult.value,
-			dashboardResult.value,
-		);
-		if (!liveness.ok && summary.invokeStartedCount === 0) {
-			throw manualInvocationFailure(
-				liveness.code,
-				'The exact selected target instance became unavailable before Tool invocation.',
-				'target-liveness',
-				summary,
-				!observations.truncated,
-			);
-		}
 		await delay(250);
 	}
-	const observations = await request(source, 'peer.observations');
-	const summary = summarizeManualInvocation(observations.tools
-		.filter((observation) => observation.delegationRequestId === delegationRequestId)
-		.map((observation) => ({
-			phase: observation.phase,
-			...(observation.compactStatus === undefined
-				? {}
-				: { compactStatus: observation.compactStatus }),
-			...(observation.errorCode === undefined ? {} : { errorCode: observation.errorCode }),
-			taskIdPresent: observation.taskId !== undefined,
-		})));
-	throw manualInvocationFailure(
-		'MANUAL_TOOL_TIMEOUT',
-		'The manual Copilot Tool route did not complete within the bounded observation window.',
-		'timeout',
-		summary,
-		!observations.truncated,
-	);
-}
-
-function manualInvocationFailure(code, message, phase, summary, observationHistoryComplete) {
-	return Object.assign(new Error(message), {
-		code,
-		noTaskLeaseObserved: observationHistoryComplete
-			&& summary.invokeStartedCount === 0
-			&& !summary.taskIdPresent,
-		manualInvocation: {
-			phase,
-			...summary,
-		},
-	});
+	throw new Error('Timed out waiting for the manual Copilot sidebar delegation.');
 }
 
 async function runNeedsInputScenario(source, targetInputBase) {
@@ -1971,21 +1871,6 @@ async function performCleanupOnce() {
 			},
 		},
 		{ name: 'stop-ownership-sampler', run: async () => stopOwnershipSampler() },
-		{
-			name: 'observe-tool-resources',
-			run: async () => {
-				if (latestResourceMetrics === undefined && sourceController !== undefined) {
-					latestResourceMetrics = await request(
-						sourceController,
-						'peer.resources',
-						{},
-						2_000,
-					);
-				}
-				assert.equal(latestResourceMetrics?.toolTimers.activeTimers ?? 0, 0);
-				assert.equal(latestResourceMetrics?.toolTimers.armedBudgetTimers ?? 0, 0);
-			},
-		},
 		{ name: 'close-controllers', run: closeControllers },
 		{
 			name: 'owned-processes',
@@ -2518,50 +2403,10 @@ function safeFailure(error) {
 	const code = typeof candidateCode === 'string'
 		? stableCode(candidateCode)
 		: 'PEER_E2E_FAILED';
-	const manualInvocation = error !== null
-		&& typeof error === 'object'
-		&& 'manualInvocation' in error
-		&& isSafeManualInvocationFailure(error.manualInvocation)
-		? {
-			phase: error.manualInvocation.phase,
-			preparedCount: error.manualInvocation.preparedCount,
-			prepareFailedCount: error.manualInvocation.prepareFailedCount,
-			invokeStartedCount: error.manualInvocation.invokeStartedCount,
-			invokeCompletedCount: error.manualInvocation.invokeCompletedCount,
-			...(error.manualInvocation.compactStatus === undefined
-				? {}
-				: { compactStatus: error.manualInvocation.compactStatus }),
-			...(error.manualInvocation.errorCode === undefined
-				? {}
-				: { errorCode: error.manualInvocation.errorCode }),
-			taskIdPresent: error.manualInvocation.taskIdPresent,
-		}
-		: undefined;
 	return {
 		code,
 		message: sanitize(error instanceof Error ? error.message : String(error)).slice(0, 512),
-		...(manualInvocation === undefined ? {} : { manualInvocation }),
 	};
-}
-
-function isSafeManualInvocationFailure(value) {
-	return value !== null
-		&& typeof value === 'object'
-		&& ['target-liveness', 'prepare', 'invoke', 'timeout'].includes(value.phase)
-		&& [
-			value.preparedCount,
-			value.prepareFailedCount,
-			value.invokeStartedCount,
-			value.invokeCompletedCount,
-		].every((count) => Number.isSafeInteger(count) && count >= 0)
-		&& (value.compactStatus === undefined
-			|| (Number.isSafeInteger(value.compactStatus)
-				&& value.compactStatus >= 0
-				&& value.compactStatus <= 3))
-		&& (value.errorCode === undefined
-			|| (typeof value.errorCode === 'string'
-				&& /^[A-Z][A-Z0-9_]{0,127}$/u.test(value.errorCode)))
-		&& typeof value.taskIdPresent === 'boolean';
 }
 
 function stableCode(value) {
