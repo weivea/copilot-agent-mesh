@@ -578,7 +578,10 @@ function isDestinationOccupied(error: unknown): boolean {
 	return typeof error === 'object'
 		&& error !== null
 		&& 'code' in error
-		&& ['EEXIST', 'ENOTEMPTY'].includes(String(error.code));
+		&& (
+			['EEXIST', 'ENOTEMPTY'].includes(String(error.code))
+			|| (process.platform === 'win32' && error.code === 'EPERM')
+		);
 }
 
 function isFileNotFound(error: unknown): boolean {
