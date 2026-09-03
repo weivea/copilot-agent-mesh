@@ -2241,6 +2241,107 @@ test('dispose after reconnect resolves uses the candidate to remove the unretain
 	assert.equal(launcher.host.disposed, true);
 });
 
+test('dispose immediately after recovery progress owns one blocked Session cleanup', async () => {
+	const first = new FakeAhpTransport();
+	const recovered = new FakeAhpTransport();
+	recovered.reconnectResult = { type: 'replay', actions: [], missing: [] };
+	recovered.blockNextSessionDispose = true;
+	const launcher = new FakeLauncher();
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([first, recovered]));
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+	recovered.created = first.created;
+
+	first.failChat();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	assert.deepEqual(
+		await nextEvent(handle.events),
+		{ type: 'progress', message: 'Agent Host connection recovered.' },
+	);
+	const disposal = handle.dispose();
+	await recovered.sessionDisposeStarted;
+	assert.equal(recovered.disposeSessionCalls, 1);
+	assert.equal(recovered.shutdownCalls, 0);
+	recovered.releaseSessionDispose();
+	await disposal;
+	assert.equal(recovered.disposeSessionCalls, 1);
+	assert.equal(recovered.shutdownCalls, 1);
+	assert.equal(launcher.host.disposed, true);
+});
+
+test('post-handoff cleanup failure is surfaced and the next dispose retries without deleting twice', async () => {
+	const first = new FakeAhpTransport();
+	const recovered = new FakeAhpTransport();
+	recovered.reconnectResult = { type: 'replay', actions: [], missing: [] };
+	recovered.blockNextSessionDispose = true;
+	recovered.shutdownFails = true;
+	const launcher = new FakeLauncher();
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([first, recovered]));
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+	recovered.created = first.created;
+
+	first.failChat();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	assert.deepEqual(
+		await nextEvent(handle.events),
+		{ type: 'progress', message: 'Agent Host connection recovered.' },
+	);
+	const disposal = handle.dispose();
+	await recovered.sessionDisposeStarted;
+	recovered.releaseSessionDispose();
+	await assert.rejects(
+		disposal,
+		(error: unknown) => error instanceof AgentRuntimeError && error.cleanupFailed,
+	);
+	assert.equal(recovered.disposeSessionCalls, 1);
+	assert.equal(recovered.shutdownCalls, 1);
+	recovered.shutdownFails = false;
+	await handle.dispose();
+	assert.equal(recovered.disposeSessionCalls, 1);
+	assert.equal(recovered.shutdownCalls, 2);
+	assert.equal(launcher.host.disposed, true);
+});
+
+test('retained terminal cleanup after recovery progress never disposes the Session', async () => {
+	const first = new FakeAhpTransport();
+	const recovered = new FakeAhpTransport();
+	recovered.reconnectResult = { type: 'replay', actions: [], missing: [] };
+	const launcher = new FakeLauncher();
+	launcher.host.preserveTerminalSession = true;
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([first, recovered]));
+	const handle = await runtime.start({
+		...taskRequest(),
+		sourceWindowName: 'frontend',
+	});
+	await nextEvent(handle.events);
+	recovered.created = first.created;
+
+	first.failChat();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	assert.deepEqual(
+		await nextEvent(handle.events),
+		{ type: 'progress', message: 'Agent Host connection recovered.' },
+	);
+	await recovered.emitChat({
+		type: 'chat/turnComplete',
+		turnId: currentTurnId(first),
+		duration: 0,
+	});
+	assert.equal((await nextEvent(handle.events)).type, 'completed');
+	await handle.dispose();
+	assert.equal(recovered.disposeSessionCalls, 0);
+	assert.equal(recovered.shutdownCalls, 1);
+	assert.deepEqual(
+		recovered.dispatched
+			.filter(({ action }) =>
+				action.type === 'session/isArchivedChanged'
+				|| action.type === 'session/activeClientRemoved')
+			.map(({ action }) => action.type),
+		['session/isArchivedChanged', 'session/activeClientRemoved'],
+	);
+});
+
 test('dispose propagates abort to blocked recovery authentication and waits for it to settle', async () => {
 	const first = new FakeAhpTransport();
 	const recovered = new FakeAhpTransport();
@@ -4441,6 +4542,15 @@ class FakeAhpTransport implements AhpConnection {
 	rootAttachedBeforeInitialize = false;
 	disposeSessionCalls = 0;
 	disposeSessionFailuresRemaining = 0;
+	blockNextSessionDispose = false;
+	private resolveSessionDisposeStarted!: () => void;
+	readonly sessionDisposeStarted = new Promise<void>((resolve) => {
+		this.resolveSessionDisposeStarted = resolve;
+	});
+	private resolveSessionDispose!: () => void;
+	private readonly sessionDisposeBarrier = new Promise<void>((resolve) => {
+		this.resolveSessionDispose = resolve;
+	});
 	shutdownCalls = 0;
 	shutdownFails = false;
 	listSessionsCalls = 0;
@@ -4809,11 +4919,20 @@ class FakeAhpTransport implements AhpConnection {
 	async disposeSession(uri: string): Promise<void> {
 		this.assertOpen();
 		this.disposeSessionCalls += 1;
+		if (this.blockNextSessionDispose) {
+			this.blockNextSessionDispose = false;
+			this.resolveSessionDisposeStarted();
+			await this.sessionDisposeBarrier;
+		}
 		if (this.disposeSessionFailuresRemaining > 0) {
 			this.disposeSessionFailuresRemaining -= 1;
 			throw new Error('synthetic Session disposal failure');
 		}
 		this.hostCatalog?.dispose(uri);
+	}
+
+	releaseSessionDispose(): void {
+		this.resolveSessionDispose();
 	}
 
 	async shutdown(): Promise<void> {

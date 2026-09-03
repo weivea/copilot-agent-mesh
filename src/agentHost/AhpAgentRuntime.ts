@@ -2610,6 +2610,7 @@ class AhpTask implements AgentTaskHandle {
 		let candidate: AhpConnection | undefined;
 		let candidateGeneration: ConnectionGeneration | undefined;
 		let candidateSessionAvailable = false;
+		let candidateHandedOff = false;
 		const candidateShutdownState: RecoveryCandidateShutdownState = {};
 		let abortCandidate: (() => void) | undefined;
 		const recoveredSubscriptions = new Map<string, AhpSubscription>();
@@ -2637,11 +2638,17 @@ class AhpTask implements AgentTaskHandle {
 				valid: true,
 			};
 			abortCandidate = () => {
+				if (candidateHandedOff) {
+					return;
+				}
 				candidateGeneration!.valid = false;
 				candidateGeneration!.abort.abort();
 				candidateShutdownState.operation ??= new Promise<void>((resolve) => {
 					setImmediate(resolve);
 				}).then(async () => {
+					if (candidateHandedOff) {
+						return {};
+					}
 					if (candidateSessionAvailable && this.shouldDisposeSession()) {
 						return this.disposeSessionThenShutdownRecoveryCandidate(candidate!);
 					}
@@ -2788,7 +2795,6 @@ class AhpTask implements AgentTaskHandle {
 				),
 				signal,
 			);
-			this.throwIfRecoveryStopped(signal			);
 			this.throwIfRecoveryStopped(signal);
 			this.resendUnacknowledged(candidate);
 			try {
@@ -2804,6 +2810,11 @@ class AhpTask implements AgentTaskHandle {
 				await this.awaitRecoveryStep(previousTerminalUpdates, signal);
 			}
 			this.throwIfRecoveryStopped(signal);
+			candidateHandedOff = true;
+			if (abortCandidate !== undefined) {
+				signal.removeEventListener('abort', abortCandidate);
+				abortCandidate = undefined;
+			}
 			this.connection = candidate;
 			this.subscriptions = recoveredSubscriptions;
 			this.generation = candidateGeneration;
