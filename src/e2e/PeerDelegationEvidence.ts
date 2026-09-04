@@ -17,6 +17,11 @@ const terminalStateValues = [
 	'not-observed',
 ] as const;
 const terminalState = z.enum(terminalStateValues);
+const protocolVersion = z.enum(['1.0.0', '0.9.0']);
+const protocolOffer = z.union([
+	z.tuple([z.literal('1.0.0')]),
+	z.tuple([z.literal('1.0.0'), z.literal('0.9.0')]),
+]);
 
 const statusCount = z.strictObject({
 	status,
@@ -60,7 +65,8 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 		vscode: z.string().min(1).max(64),
 		ahpCommit: z.literal('f19dd8b3942d029744a3bdd31d830f9428e8ea47'),
 		ahpClient: z.literal('0.9.0'),
-		protocolOffer: z.tuple([z.literal('1.0.0')]),
+		protocolOffer,
+		selectedProtocolVersion: protocolVersion.optional(),
 	}),
 	startedAt: timestamp,
 	finishedAt: timestamp,
@@ -273,6 +279,48 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 		message: z.string().min(1).max(512),
 	}).optional(),
 }).superRefine((evidence, context) => {
+	if (
+		evidence.versions.selectedProtocolVersion !== undefined
+		&& !evidence.versions.protocolOffer.some(
+			(version) => version === evidence.versions.selectedProtocolVersion,
+		)
+	) {
+		context.addIssue({
+			code: 'custom',
+			path: ['versions', 'selectedProtocolVersion'],
+			message: 'The selected protocol version must be present in the exact protocol offer.',
+		});
+	}
+	if (
+		evidence.versions.selectedProtocolVersion === '0.9.0'
+		&& evidence.versions.protocolOffer.length !== 2
+	) {
+		context.addIssue({
+			code: 'custom',
+			path: ['versions', 'protocolOffer'],
+			message: 'Protocol 0.9.0 may only be selected from the editor registry 0.9 dual offer.',
+		});
+	}
+	if (
+		evidence.versions.protocolOffer.length === 2
+		&& evidence.versions.selectedProtocolVersion === undefined
+	) {
+		context.addIssue({
+			code: 'custom',
+			path: ['versions', 'selectedProtocolVersion'],
+			message: 'The dual protocol offer requires an explicitly recorded selected version.',
+		});
+	}
+	if (
+		evidence.outcome === 'pass'
+		&& evidence.versions.selectedProtocolVersion === undefined
+	) {
+		context.addIssue({
+			code: 'custom',
+			path: ['versions', 'selectedProtocolVersion'],
+			message: 'Passing evidence requires an explicitly observed selected protocol version.',
+		});
+	}
 	const itemNumbers = evidence.ac5.map(({ item }) => item);
 	if (new Set(itemNumbers).size !== 12 || itemNumbers.some((item, index) => item !== index + 1)) {
 		context.addIssue({

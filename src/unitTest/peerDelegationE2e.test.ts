@@ -178,6 +178,29 @@ test('peer-delegation evidence requires resolvable AC-5 references and honest ou
 	);
 });
 
+test('peer-delegation evidence preserves exact protocol offers and validates selection', () => {
+	const base = unverifiedEvidence();
+	assert.doesNotThrow(() => parsePeerDelegationEvidence({
+		...base,
+		versions: {
+			...base.versions,
+			protocolOffer: ['1.0.0', '0.9.0'],
+			selectedProtocolVersion: '0.9.0',
+		},
+	}));
+	assert.throws(
+		() => parsePeerDelegationEvidence({
+			...base,
+			versions: {
+				...base.versions,
+				protocolOffer: ['1.0.0'],
+				selectedProtocolVersion: '0.9.0',
+			},
+		}),
+		/must be present in the exact protocol offer/u,
+	);
+});
+
 test('peer evidence maps every active task state to not-observed', () => {
 	for (const status of [
 		'accepted',
@@ -369,6 +392,8 @@ test('peer-delegation recorder stores identities and hashes without prompt or ou
 		sessionUri: 'session:do-not-persist-this-identifier',
 		source: 'editor',
 		endpointFingerprint: '0123456789abcdef',
+		protocolOffer: ['1.0.0', '0.9.0'],
+		selectedProtocolVersion: '0.9.0',
 	});
 	recorder.observeLifecycle({ taskId, eventType: 'chat/turnComplete' });
 	recorder.observeLifecycle({ taskId, eventType: 'session/clientDetached' });
@@ -389,6 +414,8 @@ test('peer-delegation recorder stores identities and hashes without prompt or ou
 			source: 'editor',
 			sessionHash: snapshot.ahp[0]?.sessionHash,
 			endpointFingerprint: '0123456789abcdef',
+			protocolOffer: ['1.0.0', '0.9.0'],
+			selectedProtocolVersion: '0.9.0',
 		},
 		{
 			sequence: 3,
@@ -750,6 +777,10 @@ function passingEvidence(): PeerDelegationEvidence {
 	return {
 		...base,
 		outcome: 'pass',
+		versions: {
+			...base.versions,
+			selectedProtocolVersion: '1.0.0',
+		},
 		topology: {
 			ordinaryWindows: {
 				status: 'pass',

@@ -13,12 +13,16 @@ import type {
 
 import {
 	AhpAgentRuntime,
+	AHP_EDITOR_0_9_PROTOCOL_OFFER,
 	AHP_PROTOCOL_OFFER,
+	ahpProtocolPolicyForHost,
+	assertOutboundAhpActionSupported,
 	buildMeshSessionTitle,
 	DELEGATED_AGENT_CLIENT_TOOLS,
 	listSessionsBounded,
 	type AhpConnection,
 	type AhpConnectionFactory,
+	type AhpProtocolPolicy,
 	type AhpSubscription,
 	type AhpSubscriptionEvent,
 } from '../agentHost/AhpAgentRuntime';
@@ -485,6 +489,8 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 			eventType: 'session/hostObserved',
 			sessionUri: handle.recovery.sessionUri,
 			source: 'standalone',
+			protocolOffer: ['1.0.0'],
+			selectedProtocolVersion: '1.0.0',
 		},
 	]);
 	assert.equal(transport.dispatched[0]?.action.type, 'chat/turnStarted');
@@ -971,6 +977,93 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 			assert.equal(transport.disposeSessionCalls, 0);
 			assert.equal(transport.shutdownCalls, 1);
 		}
+	});
+
+	test('protocol policy preserves exact 1.0 for standalone and registry 1.0 editors', () => {
+		assert.deepEqual(ahpProtocolPolicyForHost({
+			source: 'standalone',
+			registryProtocolVersion: '0.9.0',
+		}).offer, ['1.0.0']);
+		assert.deepEqual(ahpProtocolPolicyForHost({
+			source: 'editor',
+			registryProtocolVersion: '1.0.0',
+		}).offer, ['1.0.0']);
+		assert.throws(
+			() => ahpProtocolPolicyForHost({
+				source: 'editor',
+				registryProtocolVersion: '0.8.0',
+			}),
+			(error: unknown) => error instanceof AgentRuntimeError
+				&& error.code === 'AGENT_UNAVAILABLE',
+		);
+	});
+
+	test('registry 0.9 editor completes the current Session and turn path with the dual offer', async () => {
+		const transport = new FakeAhpTransport();
+		transport.protocolPolicy = { offer: AHP_EDITOR_0_9_PROTOCOL_OFFER };
+		transport.selectedProtocolVersion = '0.9.0';
+		transport.completeAfterTurnDispatch = true;
+		const launcher = new FakeLauncher();
+		launcher.host.source = 'editor';
+		launcher.host.registryProtocolVersion = '0.9.0';
+		launcher.host.preserveTerminalSession = true;
+		const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+
+		const handle = await runtime.start({
+			...taskRequest(),
+			sourceWindowName: 'source',
+		});
+		const events = [];
+		for await (const event of handle.events) {
+			events.push(event);
+		}
+
+		assert.deepEqual(transport.protocolPolicy.offer, ['1.0.0', '0.9.0']);
+		assert.equal(transport.selectedProtocolVersion, '0.9.0');
+		assert.equal(transport.createSessionCalls, 1);
+		assert.deepEqual(
+			transport.dispatched.slice(0, 2).map(({ action }) => action.type),
+			['session/titleChanged', 'chat/turnStarted'],
+		);
+		assert.equal(events.at(-1)?.type, 'completed');
+		await handle.dispose();
+		assert.equal(transport.shutdownCalls, 1);
+	});
+
+	test('registry 1.0 editor completes the current Session and turn path with the exact offer', async () => {
+		const transport = new FakeAhpTransport();
+		transport.completeAfterTurnDispatch = true;
+		const launcher = new FakeLauncher();
+		launcher.host.source = 'editor';
+		launcher.host.registryProtocolVersion = '1.0.0';
+		launcher.host.preserveTerminalSession = true;
+		const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+
+		const handle = await runtime.start(taskRequest());
+		const events = [];
+		for await (const event of handle.events) {
+			events.push(event);
+		}
+
+		assert.deepEqual(transport.protocolPolicy.offer, ['1.0.0']);
+		assert.equal(transport.selectedProtocolVersion, '1.0.0');
+		assert.equal(transport.createSessionCalls, 1);
+		assert.equal(events.at(-1)?.type, 'completed');
+		await handle.dispose();
+		assert.equal(transport.shutdownCalls, 1);
+	});
+
+	test('outbound action guard rejects 1.0-only actions under 0.9 without weakening 1.0', async () => {
+		const action = { type: 'chat/turnResume', turnId: 'turn-1' };
+		const { isActionKnownToVersion } = await import('@microsoft/agent-host-protocol');
+		assert.throws(
+			() => assertOutboundAhpActionSupported(action, '0.9.0', isActionKnownToVersion),
+			(error: unknown) => error instanceof AgentRuntimeError
+				&& error.code === 'AGENT_UNAVAILABLE',
+		);
+		assert.doesNotThrow(
+			() => assertOutboundAhpActionSupported(action, '1.0.0', isActionKnownToVersion),
+		);
 	});
 
 	test('real selector runtimes never prompt target for validated peer approval across source outcomes', async () => {
@@ -3520,7 +3613,8 @@ class FailingLauncher implements AgentHostLauncherLike {
 class FakeHost implements LaunchedAgentHost {
 	readonly endpoint = new URL('ws://127.0.0.1:1234/?tkn=not-a-real-token');
 	readonly version = '1.134.0';
-	readonly registryProtocolVersion = '0.1.0';
+	registryProtocolVersion = '0.1.0';
+	source: 'editor' | 'standalone' | undefined;
 	preserveTerminalSession = false;
 	disposed = false;
 	disposeFailuresRemaining = 0;
@@ -3645,6 +3739,7 @@ class FakeAhpHostCatalog {
 }
 
 class FakeAhpTransport implements AhpConnection {
+	protocolPolicy: AhpProtocolPolicy = { offer: AHP_PROTOCOL_OFFER };
 	initialized = false;
 	initializedClientId = '';
 	ackDispatches = true;
@@ -3685,6 +3780,18 @@ class FakeAhpTransport implements AhpConnection {
 	rootAttachedBeforeInitialize = false;
 	disposeSessionCalls = 0;
 	shutdownCalls = 0;
+
+	assertActionSupported(action: unknown, selected: '1.0.0' | '0.9.0'): void {
+		assertOutboundAhpActionSupported(
+			action,
+			selected,
+			(_action, version) => version === '1.0.0'
+				|| (typeof action === 'object'
+					&& action !== null
+					&& 'type' in action
+					&& action.type !== 'chat/turnResume'),
+		);
+	}
 	shutdownFails = false;
 	listSessionsCalls = 0;
 	catalogOmissionsRemaining = 0;

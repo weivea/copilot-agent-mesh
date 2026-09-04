@@ -3,7 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import type * as vscode from 'vscode';
 
 import {
-	AHP_PROTOCOL_OFFER,
+	requireSelectedAhpProtocol,
 	SdkAhpConnectionFactory,
 	isUsableTerminalSessionStatus,
 	listSessionsBounded,
@@ -431,7 +431,8 @@ async function editorSessionCatalog(
 ): Promise<{
 	readonly available: boolean;
 	readonly source: 'editor';
-	readonly protocolVersion?: string;
+	readonly protocolOffer?: readonly string[];
+	readonly selectedProtocolVersion?: string;
 	readonly sessionCount?: number;
 	readonly sessionHashes?: readonly string[];
 	readonly errorCode?: 'EDITOR_CATALOG_UNAVAILABLE' | 'EDITOR_CATALOG_CLEANUP_FAILED';
@@ -461,7 +462,8 @@ async function editorSessionCatalog(
 		| {
 			readonly available: true;
 			readonly source: 'editor';
-			readonly protocolVersion: string;
+			readonly protocolOffer: readonly string[];
+			readonly selectedProtocolVersion: string;
 			readonly sessionCount: number;
 			readonly sessionHashes: readonly string[];
 		}
@@ -480,12 +482,10 @@ async function editorSessionCatalog(
 		connection = await new SdkAhpConnectionFactory().connect(host);
 		stage = 'initialize';
 		const initialized = await connection.initialize(`mesh-peer-e2e-${randomUUID()}`);
-		if (!AHP_PROTOCOL_OFFER.includes(initialized.protocolVersion as '1.0.0')) {
-			throw new EditorCatalogProbeError(
-				'protocol',
-				'The editor Agent Host selected an incompatible protocol.',
-			);
-		}
+		const selectedProtocolVersion = requireSelectedAhpProtocol(
+			connection.protocolPolicy,
+			initialized.protocolVersion,
+		);
 		stage = 'list';
 		const deadline = Date.now() + editorCatalogRetryTimeoutMs;
 		let sessions;
@@ -523,7 +523,8 @@ async function editorSessionCatalog(
 		result = {
 			available: true,
 			source: 'editor',
-			protocolVersion: initialized.protocolVersion,
+			protocolOffer: connection.protocolPolicy.offer,
+			selectedProtocolVersion,
 			sessionCount: sessions.length,
 			sessionHashes: sessions
 				.filter(({ status }) => status !== undefined && isUsableTerminalSessionStatus(status))

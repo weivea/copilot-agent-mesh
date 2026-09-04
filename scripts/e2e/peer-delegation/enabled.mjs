@@ -1236,6 +1236,19 @@ async function recordCompletionScenario({
 	const hostSessionEchoObserved = hostSessionHash !== undefined
 		&& editorEndpointFingerprint !== undefined
 		&& hostSessionObservation?.source === 'editor';
+	const observedProtocolOffer = hostSessionObservation?.protocolOffer;
+	const observedSelectedProtocol = hostSessionObservation?.selectedProtocolVersion;
+	const protocolNegotiationObserved =
+		(Array.isArray(observedProtocolOffer)
+			&& (
+				JSON.stringify(observedProtocolOffer) === JSON.stringify(['1.0.0'])
+				|| JSON.stringify(observedProtocolOffer) === JSON.stringify(['1.0.0', '0.9.0'])
+			))
+		&& observedProtocolOffer.includes(observedSelectedProtocol);
+	if (protocolNegotiationObserved) {
+		evidence.versions.protocolOffer = observedProtocolOffer;
+		evidence.versions.selectedProtocolVersion = observedSelectedProtocol;
+	}
 	const editorSessionObserved = sourceKind === 'editor'
 		&& !degraded
 		&& sourceFailure === undefined
@@ -1252,7 +1265,8 @@ async function recordCompletionScenario({
 		&& completionTask.leaseReleased
 		&& sourceKind === 'editor'
 		&& !degraded
-		&& sourceFailure === undefined;
+		&& sourceFailure === undefined
+		&& protocolNegotiationObserved;
 	evidence.confirmation = manualUi
 		? {
 			status: uiAttestation.confirmationAcceptedOnce ? 'pass' : 'unverified',

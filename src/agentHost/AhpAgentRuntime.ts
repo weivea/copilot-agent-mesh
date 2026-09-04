@@ -26,6 +26,8 @@ import {
 	type AgentRuntimeLifecycleObservation,
 	type AgentRuntimeProbe,
 	type AgentRuntimeLifecycleObserver,
+	type AhpProtocolOffer,
+	type AhpProtocolVersion,
 	type AgentTaskAnswer,
 	type AgentTaskHandle,
 	type AgentTaskRequest,
@@ -41,8 +43,9 @@ import type { AgentHostLauncherLike, LaunchedAgentHost } from './AgentHostLaunch
 import type { AuthBroker, ProtectedResource } from './AuthBroker';
 
 const rootUri = 'ahp-root://';
-const offeredProtocolVersion = '1.0.0';
 export const AHP_PROTOCOL_OFFER: readonly ['1.0.0'] = Object.freeze(['1.0.0']);
+export const AHP_EDITOR_0_9_PROTOCOL_OFFER: readonly ['1.0.0', '0.9.0'] =
+	Object.freeze(['1.0.0', '0.9.0']);
 const sessionDefaultChatTimeoutMs = 60_000;
 const cancellationTimeoutMs = 15_000;
 const actionAcknowledgementTimeoutMs = 10_000;
@@ -100,6 +103,8 @@ export interface AhpSessionPage {
 }
 
 export interface AhpConnection {
+	readonly protocolPolicy: AhpProtocolPolicy;
+	assertActionSupported(action: unknown, selected: AhpProtocolVersion): void;
 	initialize(clientId: string): Promise<AhpInitializeResult>;
 	reconnect(clientId: string, lastSeenServerSeq: number, subscriptions: readonly string[]): Promise<{
 		readonly type: 'replay' | 'snapshot';
@@ -133,6 +138,63 @@ export interface AhpConnection {
 	unsubscribe(uri: string): Promise<void>;
 	disposeSession(uri: string): Promise<void>;
 	shutdown(): Promise<void>;
+}
+
+export interface AhpProtocolPolicy {
+	readonly offer: AhpProtocolOffer;
+}
+
+export function ahpProtocolPolicyForHost(
+	host: Pick<LaunchedAgentHost, 'registryProtocolVersion' | 'source'>,
+): AhpProtocolPolicy {
+	if (host.source !== 'editor') {
+		return { offer: AHP_PROTOCOL_OFFER };
+	}
+	switch (host.registryProtocolVersion) {
+		case '1.0.0':
+			return { offer: AHP_PROTOCOL_OFFER };
+		case '0.9.0':
+			return { offer: AHP_EDITOR_0_9_PROTOCOL_OFFER };
+		default:
+			throw new AgentRuntimeError(
+				'AGENT_UNAVAILABLE',
+				'The editor Agent Host registry protocol version is unsupported.',
+			);
+	}
+}
+
+export function requireSelectedAhpProtocol(
+	policy: AhpProtocolPolicy,
+	selected: string,
+): AhpProtocolVersion {
+	if (!policy.offer.some((version) => version === selected)) {
+		throw new AgentRuntimeError(
+			'AGENT_UNAVAILABLE',
+			'The Agent Host selected an incompatible protocol version.',
+		);
+	}
+	return selected as AhpProtocolVersion;
+}
+
+export function assertOutboundAhpActionSupported(
+	action: unknown,
+	selected: AhpProtocolVersion,
+	isActionKnownToVersion: (action: StateAction, version: string) => boolean,
+): void {
+	let supported = false;
+	if (isRecord(action) && typeof action.type === 'string') {
+		try {
+			supported = isActionKnownToVersion(action as unknown as StateAction, selected);
+		} catch {
+			supported = false;
+		}
+	}
+	if (!supported) {
+		throw new AgentRuntimeError(
+			'AGENT_UNAVAILABLE',
+			'The outbound Agent Host action is incompatible with the negotiated protocol version.',
+		);
+	}
 }
 
 export interface AhpConnectionFactory {
@@ -428,9 +490,10 @@ export class SdkAhpConnectionFactory implements AhpConnectionFactory {
 		const socket = host.openWebSocket === undefined
 			? await connectWebSocket(host.endpoint, 10_000, signal)
 			: await host.openWebSocket(signal);
-		const [{ AhpClient }, { WebSocketTransport }] = await Promise.all([
+		const [{ AhpClient }, { WebSocketTransport }, { isActionKnownToVersion }] = await Promise.all([
 			import('@microsoft/agent-host-protocol/client'),
 			import('@microsoft/agent-host-protocol/ws'),
+			import('@microsoft/agent-host-protocol'),
 		]);
 		if (signal?.aborted === true) {
 			socket.terminate();
@@ -441,7 +504,12 @@ export class SdkAhpConnectionFactory implements AhpConnectionFactory {
 			{ requestTimeoutMs: 30_000 },
 		);
 		client.connect();
-		return new SdkAhpConnection(client, AHP_PROTOCOL_OFFER, () => socket.terminate());
+		return new SdkAhpConnection(
+			client,
+			ahpProtocolPolicyForHost(host),
+			isActionKnownToVersion,
+			() => socket.terminate(),
+		);
 	}
 }
 
@@ -451,14 +519,22 @@ class SdkAhpConnection implements AhpConnection {
 			'@microsoft/agent-host-protocol/client',
 			{ with: { 'resolution-mode': 'import' } }
 		).AhpClient,
-		private readonly supportedVersions: readonly string[],
+		readonly protocolPolicy: AhpProtocolPolicy,
+		private readonly isActionKnownToVersion: (
+			action: StateAction,
+			version: string,
+		) => boolean,
 		private readonly forceClose: () => void,
 	) {}
+
+	assertActionSupported(action: unknown, selected: AhpProtocolVersion): void {
+		assertOutboundAhpActionSupported(action, selected, this.isActionKnownToVersion);
+	}
 
 	async initialize(clientId: string): Promise<AhpInitializeResult> {
 		return this.client.initialize({
 			clientId,
-			protocolVersions: this.supportedVersions,
+			protocolVersions: this.protocolPolicy.offer,
 			initialSubscriptions: [rootUri],
 			locale: 'en-US',
 		});
@@ -695,6 +771,7 @@ class AhpTask implements AgentTaskHandle {
 		readonly rejectAcknowledgement?: (error: AgentRuntimeError) => void;
 	}>();
 	private nextClientSeq = 1;
+	private negotiatedProtocolVersion: AhpProtocolVersion | undefined;
 	private recoveryAbort: AbortController | undefined;
 	private recoveryPromise: Promise<void> | undefined;
 	private generation: ConnectionGeneration;
@@ -771,12 +848,10 @@ class AhpTask implements AgentTaskHandle {
 			);
 		}
 		this.throwIfTerminalError();
-		if (initialized.protocolVersion !== offeredProtocolVersion) {
-			throw new AgentRuntimeError(
-				'AGENT_UNAVAILABLE',
-				'The Agent Host selected an incompatible protocol version.',
-			);
-		}
+		this.negotiatedProtocolVersion = requireSelectedAhpProtocol(
+			this.connection.protocolPolicy,
+			initialized.protocolVersion,
+		);
 		this.lastSeenServerSeq = initialized.serverSeq;
 		const rootSnapshot = initialized.snapshots.find(({ resource }) => resource === rootUri);
 		if (rootSnapshot === undefined) {
@@ -1251,6 +1326,7 @@ class AhpTask implements AgentTaskHandle {
 			rejectAcknowledgement: acknowledgement?.reject,
 		});
 		try {
+			this.assertActionSupported(action, connection);
 			connection.dispatch(channel, action, clientSeq);
 		} catch (error) {
 			this.unacknowledgedDispatches.delete(clientSeq);
@@ -1308,8 +1384,19 @@ class AhpTask implements AgentTaskHandle {
 
 	private resendUnacknowledged(connection: AhpConnection): void {
 		for (const [clientSeq, pending] of this.unacknowledgedDispatches) {
+			this.assertActionSupported(pending.action, connection);
 			connection.dispatch(pending.channel, pending.action, clientSeq);
 		}
+	}
+
+	private assertActionSupported(action: unknown, connection = this.connection): void {
+		if (this.negotiatedProtocolVersion === undefined) {
+			throw new AgentRuntimeError(
+				'AGENT_UNAVAILABLE',
+				'The Agent Host protocol has not been negotiated.',
+			);
+		}
+		connection.assertActionSupported(action, this.negotiatedProtocolVersion);
 	}
 
 	private assertWritable(): void {
@@ -1819,6 +1906,8 @@ class AhpTask implements AgentTaskHandle {
 				eventType: 'session/hostObserved',
 				sessionUri,
 				source: this.host.source ?? 'standalone',
+				protocolOffer: this.connection.protocolPolicy.offer,
+				selectedProtocolVersion: this.negotiatedProtocolVersion!,
 				...(this.host.endpointFingerprint === undefined
 					? {}
 					: { endpointFingerprint: this.host.endpointFingerprint }),

@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 
 import type {
+	AhpProtocolOffer,
+	AhpProtocolVersion,
 	AgentRuntimeLifecycleObservation,
 	AgentRuntimeLifecycleObserver,
 } from '../agentHost/AgentRuntime';
@@ -45,6 +47,8 @@ export interface SafePeerAhpObservation {
 	readonly source?: 'editor' | 'standalone';
 	readonly sessionHash?: string;
 	readonly endpointFingerprint?: string;
+	readonly protocolOffer?: AhpProtocolOffer;
+	readonly selectedProtocolVersion?: AhpProtocolVersion;
 }
 
 export interface PeerDelegationRecorderSnapshot {
@@ -124,6 +128,8 @@ export class PeerDelegationE2eRecorder implements
 					: {
 						sessionHash: digest('agent-session', observation.sessionUri).slice(0, 16),
 						source: observation.source,
+						protocolOffer: observation.protocolOffer,
+						selectedProtocolVersion: observation.selectedProtocolVersion,
 						...(
 							observation.endpointFingerprint === undefined
 							|| !/^[a-f0-9]{16}$/u.test(observation.endpointFingerprint)
