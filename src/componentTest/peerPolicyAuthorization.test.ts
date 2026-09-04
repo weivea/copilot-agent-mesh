@@ -189,7 +189,7 @@ test('default-off Tool listing stays empty while the safe Dashboard directory re
 });
 
 test('retains an offline allowlist entry with a removable one-time handle', async (t) => {
-	const fixture = await createFixture();
+	const fixture = await createFixture({ includeNodeC: true });
 	t.after(() => fixture.dispose());
 	await fixture.nodeB.setPeerPolicy({
 		workspaceIdentity: IDENTITY_B,
@@ -206,7 +206,48 @@ test('retains an offline allowlist entry with a removable one-time handle', asyn
 	assert.equal(offline?.windowLabel, 'Backend');
 	assert.equal(offline?.gateState, 'offline');
 	assert.ok(offline?.actionHandle);
-	await fixture.nodeA.setPeerPolicyCandidate(IDENTITY_A, offline.actionHandle, false);
+	assert.deepEqual((await fixture.nodeA.listNodes()).nodes, []);
+	assert.deepEqual((await fixture.nodeA.getPeerPolicy(IDENTITY_A)).allowlist, [IDENTITY_B]);
+	assert.ok(fixture.nodeC);
+	await fixture.nodeC.dispose();
+	await assert.rejects(
+		fixture.nodeA.setPeerPolicyCandidate(IDENTITY_A, offline.actionHandle, false),
+		(error: unknown) =>
+			error instanceof LocalIpcRemoteError
+			&& errorReason(error) === 'POLICY_FORBIDDEN',
+	);
+	const refreshed = (await fixture.nodeA.listPeerPolicyCandidates(IDENTITY_A))
+		.candidates.find(({ online, allowlisted }) => !online && allowlisted);
+	assert.ok(refreshed?.actionHandle);
+	await fixture.nodeA.setPeerPolicyCandidate(IDENTITY_A, refreshed.actionHandle, false);
+	assert.deepEqual((await fixture.nodeA.getPeerPolicy(IDENTITY_A)).allowlist, []);
+});
+
+test('removes all 32 offline saved authorizations to recover allowlist capacity', async (t) => {
+	const fixture = await createFixture();
+	t.after(() => fixture.dispose());
+	const offlineIdentities = Array.from(
+		{ length: PROTOCOL_LIMITS.workspaceListCount },
+		(_, index) => createOpaqueWorkspaceIdentity(`offline-authorization-${index}`),
+	);
+	await fixture.nodeA.setPeerPolicy({
+		workspaceIdentity: IDENTITY_A,
+		allowlist: offlineIdentities,
+	});
+
+	const candidates = await fixture.nodeA.listPeerPolicyCandidates(IDENTITY_A);
+	const saved = candidates.candidates.filter(({ online, allowlisted }) => !online && allowlisted);
+	assert.equal(saved.length, PROTOCOL_LIMITS.workspaceListCount);
+	assert.equal(saved.every(({ actionHandle, canToggle }) => actionHandle !== undefined && canToggle), true);
+	assert.deepEqual((await fixture.nodeA.listNodes()).nodes, []);
+	assert.deepEqual((await fixture.nodeA.getPeerPolicy(IDENTITY_A)).allowlist, offlineIdentities);
+	for (let remaining = PROTOCOL_LIMITS.workspaceListCount; remaining > 0; remaining -= 1) {
+		const refreshed = await fixture.nodeA.listPeerPolicyCandidates(IDENTITY_A);
+		const candidate = refreshed.candidates.find(({ online, allowlisted }) => !online && allowlisted);
+		assert.ok(candidate);
+		assert.ok(candidate.actionHandle);
+		await fixture.nodeA.setPeerPolicyCandidate(IDENTITY_A, candidate.actionHandle, false);
+	}
 	assert.deepEqual((await fixture.nodeA.getPeerPolicy(IDENTITY_A)).allowlist, []);
 });
 

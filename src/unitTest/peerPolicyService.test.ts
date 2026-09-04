@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
+import { PROTOCOL_LIMITS } from '../../shared/protocol';
 import {
 	NodeRegistry,
 	PeerPolicyService,
@@ -212,21 +213,127 @@ test('retains offline allowlist identities and rebinds them to a new exact node 
 	assert.equal(fixture.service.listAuthorized(identityParams(NODE_A, INSTANCE_A)).nodes.length, 0);
 	await assert.rejects(fixture.registry.validateTaskRoute(route()), hasReason('PEER_OFFLINE'));
 
-	fixture.registry.register(registration(NODE_B, INSTANCE_B2, 'Window B'), new FakeSession().route());
+	fixture.registry.register(registration(NODE_C, INSTANCE_C, 'Window C'), new FakeSession().route());
 	await fixture.registry.claimWorkspace(claim(
-		NODE_B,
-		INSTANCE_B2,
+		NODE_C,
+		INSTANCE_C,
 		WORKSPACE_B,
 		IDENTITY_B,
 		'Repository B',
 	));
 	assert.equal(
+		fixture.service.listAuthorized(identityParams(NODE_A, INSTANCE_A)).nodes[0]?.nodeId,
+		NODE_C,
+	);
+	assert.equal(
 		fixture.service.listAuthorized(identityParams(NODE_A, INSTANCE_A)).nodes[0]?.nodeInstanceId,
-		INSTANCE_B2,
+		INSTANCE_C,
 	);
 	assert.equal(
 		fixture.service.listAuthorized(identityParams(NODE_A, INSTANCE_A)).nodes[0]?.label,
 		'Persistent Backend',
+	);
+	const reboundCandidates = fixture.service.listCandidates({
+		...identityParams(NODE_A, INSTANCE_A),
+		workspaceIdentity: IDENTITY_A,
+	}).filter(({ targetWorkspaceIdentity }) => targetWorkspaceIdentity === IDENTITY_B);
+	assert.equal(reboundCandidates.length, 1);
+	assert.equal(reboundCandidates[0]?.candidate.online, true);
+});
+
+test('orders every online candidate ahead of saved offline entries at the transport limit', async (t) => {
+	const fixture = await createFixture();
+	t.after(() => fixture.registry.dispose());
+	for (let index = 0; index < PROTOCOL_LIMITS.nodeListCount - 2; index += 1) {
+		fixture.registry.register(
+			registration(uuid(1_000 + index), uuid(2_000 + index), `Window ${index}`),
+			new FakeSession().route(),
+		);
+	}
+	const offlineIdentities = Array.from(
+		{ length: PROTOCOL_LIMITS.workspaceListCount },
+		(_, index) => createOpaqueWorkspaceIdentity(`offline-workspace-${index}`),
+	);
+	await fixture.service.setPolicy(identityParams(NODE_A, INSTANCE_A), {
+		...identityParams(NODE_A, INSTANCE_A),
+		workspaceIdentity: IDENTITY_A,
+		allowlist: offlineIdentities,
+	});
+
+	const candidates = fixture.service.listCandidates({
+		...identityParams(NODE_A, INSTANCE_A),
+		workspaceIdentity: IDENTITY_A,
+	});
+	assert.equal(
+		candidates.length,
+		PROTOCOL_LIMITS.nodeListCount + PROTOCOL_LIMITS.workspaceListCount,
+	);
+	assert.equal(
+		candidates.slice(0, PROTOCOL_LIMITS.nodeListCount).every(({ candidate }) => candidate.online),
+		true,
+	);
+	assert.equal(
+		candidates.slice(PROTOCOL_LIMITS.nodeListCount).every(({ candidate }) => !candidate.online),
+		true,
+	);
+});
+
+test('serializes concurrent saved-authorization removals without restoring either entry', async (t) => {
+	const fixture = await createFixture();
+	t.after(() => fixture.registry.dispose());
+	const offlineIdentities = [
+		createOpaqueWorkspaceIdentity('offline-concurrent-a'),
+		createOpaqueWorkspaceIdentity('offline-concurrent-b'),
+	];
+	await fixture.service.setPolicy(identityParams(NODE_A, INSTANCE_A), {
+		...identityParams(NODE_A, INSTANCE_A),
+		workspaceIdentity: IDENTITY_A,
+		allowlist: offlineIdentities,
+	});
+	const bindings = fixture.service.listCandidates({
+		...identityParams(NODE_A, INSTANCE_A),
+		workspaceIdentity: IDENTITY_A,
+	}).filter(({ candidate }) => !candidate.online && candidate.allowlisted);
+	assert.equal(bindings.length, 2);
+
+	await Promise.all(bindings.map((binding) =>
+		fixture.service.setCandidateAllowed(
+			identityParams(NODE_A, INSTANCE_A),
+			binding,
+			false,
+		)
+	));
+	assert.deepEqual(
+		fixture.service.getPolicy({
+			...identityParams(NODE_A, INSTANCE_A),
+			workspaceIdentity: IDENTITY_A,
+		}).allowlist,
+		[],
+	);
+});
+
+test('does not synthesize saved authorization for a Workspace on an online multi-root node', async (t) => {
+	const fixture = await createFixture();
+	t.after(() => fixture.registry.dispose());
+	await setGate(fixture, true, true);
+	await fixture.registry.claimWorkspace(claim(
+		NODE_B,
+		INSTANCE_B,
+		WORKSPACE_C,
+		IDENTITY_C,
+		'Repository C',
+	));
+
+	const candidates = fixture.service.listCandidates({
+		...identityParams(NODE_A, INSTANCE_A),
+		workspaceIdentity: IDENTITY_A,
+	});
+	const target = candidates.find(({ candidate }) => !candidate.self);
+	assert.equal(target?.candidate.online, true);
+	assert.equal(target?.candidate.claimState, 'multiWorkspace');
+	assert.equal(
+		candidates.some(({ candidate }) => !candidate.online && candidate.allowlisted),
+		false,
 	);
 });
 
@@ -495,8 +602,7 @@ test('rejects credential-shaped names and forgets explicitly released workspaces
 		...identityParams(NODE_A, INSTANCE_A),
 		workspaceIdentity: IDENTITY_A,
 	}).find(({ candidate: entry }) => !entry.self)?.candidate;
-	assert.equal(candidate?.workspaceName, 'No Workspace');
-	assert.equal(candidate?.gateState, 'offline');
+	assert.equal(candidate, undefined);
 });
 
 test('keeps peer visibility and receiving disabled behind the Preview flag', async (t) => {

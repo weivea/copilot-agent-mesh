@@ -21,6 +21,7 @@ import { DashboardPresenter, type DashboardViewModel } from './DashboardPresente
 interface ScopedDashboardAction {
 	readonly action: DashboardAction;
 	readonly brokerHandle: string;
+	readonly requiredEnabled?: boolean;
 }
 
 interface ViewInstance {
@@ -164,7 +165,14 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 			}
 			case 'setPeerAllowed': {
 				const action = this.consumeAction(instance, message);
-				await this.facade.setPeerAllowed(action.brokerHandle, requireEnabled(message));
+				const enabled = requireEnabled(message);
+				if (action.requiredEnabled !== undefined && action.requiredEnabled !== enabled) {
+					throw new DashboardActionError(
+						'POLICY_FORBIDDEN',
+						'An offline saved authorization can only be removed.',
+					);
+				}
+				await this.facade.setPeerAllowed(action.brokerHandle, enabled);
 				return;
 			}
 			case 'cancelOutgoingTask': {
@@ -279,12 +287,15 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 		const scope = (
 			action: DashboardAction,
 			brokerHandle: string | undefined,
-			stable = false,
+			options: {
+				readonly stable?: boolean;
+				readonly requiredEnabled?: boolean;
+			} = {},
 		): string | undefined => {
 			if (brokerHandle === undefined) {
 				return undefined;
 			}
-			let handle = stable
+			let handle = options.stable
 				? stableTaskAliases.get(`${action}:${brokerHandle}`)
 				: undefined;
 			if (handle === undefined) {
@@ -292,7 +303,13 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 					handle = randomBytes(24).toString('base64url');
 				} while (instance.actions.has(handle));
 			}
-			instance.actions.set(handle, { action, brokerHandle });
+			instance.actions.set(handle, {
+				action,
+				brokerHandle,
+				...(options.requiredEnabled === undefined
+					? {}
+					: { requiredEnabled: options.requiredEnabled }),
+			});
 			return handle;
 		};
 		return {
@@ -308,13 +325,21 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 				...candidate,
 				actionHandle: scope('setPeerAllowed', candidate.actionHandle),
 			})),
+			savedAuthorizations: model.savedAuthorizations.map((authorization) => ({
+				...authorization,
+				actionHandle: scope(
+					'setPeerAllowed',
+					authorization.actionHandle,
+					{ requiredEnabled: false },
+				)!,
+			})),
 			outgoingTasks: model.outgoingTasks.map((task) => ({
 				...task,
-				actionHandle: scope('cancelOutgoingTask', task.actionHandle, true),
+				actionHandle: scope('cancelOutgoingTask', task.actionHandle, { stable: true }),
 			})),
 			incomingTasks: model.incomingTasks.map((task) => ({
 				...task,
-				actionHandle: scope('cancelIncomingTask', task.actionHandle, true),
+				actionHandle: scope('cancelIncomingTask', task.actionHandle, { stable: true }),
 			})),
 		};
 	}
@@ -363,6 +388,7 @@ export function createDashboardHtml(
 		<section aria-labelledby="accept-heading"><h2 id="accept-heading">Accept Incoming Tasks</h2><div id="acceptIncoming" class="card loading">Loading...</div></section>
 		<section aria-labelledby="listener-heading"><h2 id="listener-heading">Listener</h2><div id="listener" class="card loading">Loading...</div></section>
 		<section aria-labelledby="nodes-heading"><h2 id="nodes-heading">Local Window Nodes</h2><p class="detail">A checked box authorizes only this Workspace to delegate to that target. The target must also accept incoming tasks and have one claimed Workspace before it appears to Mesh Tools.</p><div id="localNodes" class="stack loading">Loading...</div></section>
+		<section aria-labelledby="saved-authorizations-heading"><h2 id="saved-authorizations-heading">Saved Authorizations</h2><p class="detail">Offline Workspaces are not live Window Nodes. Remove a saved authorization here, or reopen that Workspace to manage it under Local Window Nodes.</p><div id="savedAuthorizations" class="stack loading">Loading...</div></section>
 		<section aria-labelledby="outgoing-heading"><h2 id="outgoing-heading">Outgoing Tasks</h2><div id="outgoingTasks" class="stack loading">Loading...</div></section>
 		<section aria-labelledby="incoming-heading"><h2 id="incoming-heading">Incoming Tasks</h2><div id="incomingTasks" class="stack loading">Loading...</div></section>
 		<section aria-labelledby="errors-heading"><h2 id="errors-heading">Errors</h2><div id="errors" class="stack"></div></section>

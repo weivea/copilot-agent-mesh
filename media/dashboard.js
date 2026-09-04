@@ -3,7 +3,7 @@
 
 	const vscode = acquireVsCodeApi();
 	const uiInstanceId = document.body.dataset.uiInstanceId;
-	const version = 5;
+	const version = 6;
 	const controls = new Set();
 	let pending = false;
 
@@ -43,6 +43,12 @@
 		renderAcceptIncoming(model.thisWindow);
 		renderListener(model.listener);
 		renderCollection('localNodes', model.localNodes, renderLocalNode, peerEmptyMessage(model.thisWindow));
+		renderCollection(
+			'savedAuthorizations',
+			model.savedAuthorizations,
+			renderSavedAuthorization,
+			'No saved offline authorizations.',
+		);
 		renderCollection(
 			'outgoingTasks',
 			model.outgoingTasks,
@@ -188,6 +194,26 @@
 			label.append(checkbox, textElement('span', 'Allow this Workspace as a target'));
 			card.append(label);
 		}
+		return card;
+	}
+
+	function renderSavedAuthorization(authorization) {
+		const card = itemCard(authorization.windowLabel, 'Saved');
+		card.append(
+			definition('Workspace', authorization.workspaceName),
+			textElement(
+				'p',
+				'This Workspace is offline. This saved policy does not represent a live Window Node.',
+				'detail',
+			),
+			actionButton(
+				'Remove saved authorization',
+				'setPeerAllowed',
+				{ actionHandle: authorization.actionHandle, enabled: false },
+				false,
+				true,
+			),
+		);
 		return card;
 	}
 

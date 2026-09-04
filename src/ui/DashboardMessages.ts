@@ -2,7 +2,7 @@ import { DashboardViewModel } from './DashboardPresenter';
 import { containsUnsafeDashboardText } from './DashboardRedaction';
 import { TASK_STATUSES, utf8ByteLength } from '../../shared/protocol';
 
-export const DASHBOARD_MESSAGE_VERSION = 5 as const;
+export const DASHBOARD_MESSAGE_VERSION = 6 as const;
 
 export const DASHBOARD_ACTIONS = [
 	'configureDevice',
@@ -155,6 +155,7 @@ function assertDashboardViewModel(model: unknown): asserts model is DashboardVie
 			'broker',
 			'thisWindow',
 			'localNodes',
+			'savedAuthorizations',
 			'outgoingTasks',
 			'incomingTasks',
 			'errors',
@@ -283,6 +284,17 @@ function assertDashboardViewModel(model: unknown): asserts model is DashboardVie
 		} else if (candidate.actionHandle !== undefined) {
 			throw new Error('A non-actionable candidate cannot expose an action handle.');
 		}
+	}
+
+	assertArray(model.savedAuthorizations, 32);
+	for (const authorization of model.savedAuthorizations) {
+		assertExactRecord(
+			authorization,
+			['actionHandle', 'windowLabel', 'workspaceName'],
+			[],
+		);
+		assertActionHandle(authorization.actionHandle);
+		assertStrings(authorization, ['windowLabel', 'workspaceName']);
 	}
 
 	assertDashboardTasks(model.outgoingTasks);

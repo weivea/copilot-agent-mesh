@@ -359,9 +359,13 @@ export const peerPolicyCandidateSchema = z.strictObject({
 });
 
 export const peerPolicyCandidateListResultSchema = z.strictObject({
-	candidates: z.array(peerPolicyCandidateSchema).max(PROTOCOL_LIMITS.nodeListCount),
+	candidates: z.array(peerPolicyCandidateSchema).max(
+		PROTOCOL_LIMITS.nodeListCount + PROTOCOL_LIMITS.workspaceListCount,
+	),
 	truncated: z.boolean(),
-	totalCandidates: z.number().int().nonnegative().max(PROTOCOL_LIMITS.nodeListCount + 32),
+	totalCandidates: z.number().int().nonnegative().max(
+		PROTOCOL_LIMITS.nodeListCount + PROTOCOL_LIMITS.workspaceListCount,
+	),
 });
 
 export const peerPolicyCandidateMutationParamsSchema = nodeIdentityParamsSchema.extend({
