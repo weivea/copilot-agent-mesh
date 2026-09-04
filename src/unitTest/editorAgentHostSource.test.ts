@@ -102,7 +102,7 @@ test('derives Stable, Insiders, Linux, Windows, and override user-data directori
 	});
 });
 
-test('strict locator selects one live compatible editor socket and invokes the bounded command without a shell', async () => {
+test('strict locator accepts a VS Code 1.135 registry 1.0 editor socket and invokes the bounded command without a shell', async () => {
 	const expected = '/safe/user-data';
 	const socketPath = '/safe/editor.sock';
 	const token = 'sensitive-connection-token';
@@ -128,6 +128,27 @@ test('strict locator selects one live compatible editor socket and invokes the b
 			args: ['agent', 'endpoints', '--user-data-dir', expected],
 		},
 	]);
+	assert.doesNotMatch(JSON.stringify(located), /sensitive|editor\.sock/u);
+	located.dispose();
+});
+
+test('strict locator accepts VS Code 1.136 registry 0.9 without treating it as the negotiated runtime version', async () => {
+	const expected = '/safe/user-data';
+	const socketPath = '/safe/editor.sock';
+	const token = 'sensitive-connection-token';
+	const locator = createLocator(endpointDocument(expected, [
+		editorEndpoint({ protocolVersion: '0.9.0', socketPath, token }),
+	]), {
+		runCommand: async (_executable, args) => args[0] === '--version'
+			? '1.136.1\ncommit\narm64\n'
+			: endpointDocument(expected, [
+				editorEndpoint({ protocolVersion: '0.9.0', socketPath, token }),
+			]),
+	});
+
+	const located = await locator.locate();
+	assert.equal(located.version, '1.136.1');
+	assert.equal(located.registryProtocolVersion, '0.9.0');
 	assert.doesNotMatch(JSON.stringify(located), /sensitive|editor\.sock/u);
 	located.dispose();
 });
@@ -229,7 +250,12 @@ test('locator fails closed for canonical mismatch, strict schema, no endpoint, m
 			code: 'UNSUPPORTED_TRANSPORT',
 		},
 		{
-			name: 'protocol',
+			name: 'older unsupported registry protocol',
+			document: endpointDocument(expected, [editorEndpoint({ protocolVersion: '0.8.0' })]),
+			code: 'INCOMPATIBLE_PROTOCOL',
+		},
+		{
+			name: 'arbitrary future registry protocol',
 			document: endpointDocument(expected, [editorEndpoint({ protocolVersion: '2.0.0' })]),
 			code: 'INCOMPATIBLE_PROTOCOL',
 		},

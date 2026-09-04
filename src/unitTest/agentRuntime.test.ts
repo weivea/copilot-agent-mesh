@@ -955,20 +955,22 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 		assert.ok(Buffer.byteLength(title, 'utf8') <= 256);
 	});
 
-	test('runtime rejects an incompatible selected protocol before Session creation', async () => {
+	test('runtime requires the Agent Host to select exact protocol 1.0 before Session creation', async () => {
 		assert.deepEqual(AHP_PROTOCOL_OFFER, ['1.0.0']);
-		const transport = new FakeAhpTransport();
-		transport.selectedProtocolVersion = '0.9.0';
-		const runtime = createRuntime(new FakeLauncher(), new FakeConnectionFactory([transport]));
-		await assert.rejects(
-			runtime.start(taskRequest()),
-			(error: unknown) => error instanceof AgentRuntimeError
-				&& error.code === 'AGENT_UNAVAILABLE'
-				&& error.message === 'The Agent Host selected an incompatible protocol version.',
-		);
-		assert.equal(transport.created, undefined);
-		assert.equal(transport.disposeSessionCalls, 0);
-		assert.equal(transport.shutdownCalls, 1);
+		for (const selectedProtocolVersion of ['0.9.0', '1.1.0']) {
+			const transport = new FakeAhpTransport();
+			transport.selectedProtocolVersion = selectedProtocolVersion;
+			const runtime = createRuntime(new FakeLauncher(), new FakeConnectionFactory([transport]));
+			await assert.rejects(
+				runtime.start(taskRequest()),
+				(error: unknown) => error instanceof AgentRuntimeError
+					&& error.code === 'AGENT_UNAVAILABLE'
+					&& error.message === 'The Agent Host selected an incompatible protocol version.',
+			);
+			assert.equal(transport.created, undefined);
+			assert.equal(transport.disposeSessionCalls, 0);
+			assert.equal(transport.shutdownCalls, 1);
+		}
 	});
 
 	test('real selector runtimes never prompt target for validated peer approval across source outcomes', async () => {

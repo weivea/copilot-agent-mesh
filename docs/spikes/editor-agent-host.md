@@ -277,6 +277,20 @@ Sessions 是同一份数据。因此**在该 endpoint 上创建的 Session 有�
 | Tool 长时调用在真实 Copilot UI 下的表现 | ⛔ 未验证，须 0.4.0 真实 E2E |
 | 非 macOS / Insiders / 便携模式的 endpoint 发现 | ⛔ 未验证，超出当前支持范围 |
 
+### VS Code 1.136.1 兼容性复核（2026-09-04）
+
+macOS arm64 上使用专用 Profile 进行了受控只读探测。`code agent endpoints` 仍返回
+`schemaVersion: 2`、`type: "editor"` 和 Unix socket，但注册表字段
+`protocolVersion` 从 VS Code 1.135.0 观察到的 `1.0.0` 变为 `0.9.0`。该字段是 endpoint
+注册表元数据，不等同于 AHP `initialize` 最终协商的运行时协议。
+
+Agent Host 服务端日志公布的版本集合包含 `1.0.0`、`0.9.0`、`0.8.0` 等版本。通过该
+endpoint 的 Unix socket 完成 WebSocket Upgrade 后，客户端继续只 offer
+`protocolVersions: ["1.0.0"]`，服务端精确选择 `1.0.0`。因此 locator 只接受已观察到的
+注册表值 `1.0.0` 与 `0.9.0`，实际兼容性的权威边界仍是 runtime initialize 必须返回
+`1.0.0`；不接受任意注册表版本，也不降低 AHP offer。探测没有创建 Session、派发 Turn、
+调用模型或记录 token、socket、user-data 路径。
+
 ### P6 后续实验（2026-08-31）
 
 P6 使用实现中的严格 locator 在另一台 macOS arm64 开发环境执行了相同只读发现边界。
