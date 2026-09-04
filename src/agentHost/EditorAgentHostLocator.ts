@@ -27,7 +27,7 @@ import {
 
 const endpointCommandTimeoutMs = 10_000;
 const endpointOutputLimitBytes = 1024 * 1024;
-const supportedProtocolVersion = '1.0.0';
+const supportedRegistryProtocolVersions = new Set(['1.0.0', '0.9.0']);
 
 export type EditorAgentHostLocatorErrorCode =
 	| 'CANCELLED'
@@ -103,7 +103,7 @@ interface ParsedEndpoint {
 
 export class LocatedEditorAgentHost {
 	readonly version: string;
-	readonly registryProtocolVersion = supportedProtocolVersion;
+	readonly registryProtocolVersion: string;
 	readonly endpointFingerprint: string;
 	#connectionToken: string;
 	#socketPath: string;
@@ -111,6 +111,7 @@ export class LocatedEditorAgentHost {
 
 	public constructor(options: {
 		readonly connectionToken: string;
+		readonly registryProtocolVersion: string;
 		readonly socketPath: string;
 		readonly version: string;
 		readonly sensitiveValues: readonly string[];
@@ -118,6 +119,7 @@ export class LocatedEditorAgentHost {
 		this.#connectionToken = options.connectionToken;
 		this.#socketPath = options.socketPath;
 		this.version = options.version;
+		this.registryProtocolVersion = options.registryProtocolVersion;
 		this.endpointFingerprint = editorEndpointFingerprint(
 			options.socketPath,
 			options.connectionToken,
@@ -239,6 +241,7 @@ export class EditorAgentHostLocator {
 		const endpoint = selectEditorEndpoint(document, this.dependencies.isProcessAlive);
 		return new LocatedEditorAgentHost({
 			connectionToken: endpoint.connectionToken,
+			registryProtocolVersion: endpoint.protocolVersion,
 			socketPath: endpoint.endpoint.path!,
 			version: code.version,
 			sensitiveValues: [
@@ -448,11 +451,12 @@ function selectEditorEndpoint(
 			'The editor Agent Host does not expose a supported socket endpoint.',
 		);
 	}
-	const compatible = socket.filter((endpoint) => endpoint.protocolVersion === supportedProtocolVersion);
+	const compatible = socket.filter((endpoint) =>
+		supportedRegistryProtocolVersions.has(endpoint.protocolVersion));
 	if (compatible.length === 0) {
 		throw new EditorAgentHostLocatorError(
 			'INCOMPATIBLE_PROTOCOL',
-			'The editor Agent Host protocol is incompatible with the client offer.',
+			'The editor Agent Host registry protocol version is unsupported.',
 		);
 	}
 	const live = compatible.filter((endpoint) => isProcessAlive(endpoint.pid));

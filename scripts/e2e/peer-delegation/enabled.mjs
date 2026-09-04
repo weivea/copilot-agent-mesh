@@ -1222,6 +1222,11 @@ async function recordCompletionScenario({
 		.find((observation) =>
 			observation.taskId === completionTaskId
 			&& observation.eventType === 'session/hostObserved');
+	const protocolObservation = [...completionObservations.ahp]
+		.reverse()
+		.find((observation) =>
+			observation.taskId === completionTaskId
+			&& observation.eventType === 'protocol/negotiated');
 	const hostSessionHash = typeof hostSessionObservation?.sessionHash === 'string'
 		&& /^[a-f0-9]{16}$/u.test(hostSessionObservation.sessionHash)
 		? hostSessionObservation.sessionHash
@@ -1236,6 +1241,19 @@ async function recordCompletionScenario({
 	const hostSessionEchoObserved = hostSessionHash !== undefined
 		&& editorEndpointFingerprint !== undefined
 		&& hostSessionObservation?.source === 'editor';
+	const observedProtocolOffer = protocolObservation?.protocolOffer;
+	const observedSelectedProtocol = protocolObservation?.selectedProtocolVersion;
+	const protocolNegotiationObserved =
+		(Array.isArray(observedProtocolOffer)
+			&& (
+				JSON.stringify(observedProtocolOffer) === JSON.stringify(['1.0.0'])
+				|| JSON.stringify(observedProtocolOffer) === JSON.stringify(['1.0.0', '0.9.0'])
+			))
+		&& observedProtocolOffer.includes(observedSelectedProtocol);
+	if (protocolNegotiationObserved) {
+		evidence.versions.protocolOffer = observedProtocolOffer;
+		evidence.versions.selectedProtocolVersion = observedSelectedProtocol;
+	}
 	const editorSessionObserved = sourceKind === 'editor'
 		&& !degraded
 		&& sourceFailure === undefined
@@ -1252,7 +1270,8 @@ async function recordCompletionScenario({
 		&& completionTask.leaseReleased
 		&& sourceKind === 'editor'
 		&& !degraded
-		&& sourceFailure === undefined;
+		&& sourceFailure === undefined
+		&& protocolNegotiationObserved;
 	evidence.confirmation = manualUi
 		? {
 			status: uiAttestation.confirmationAcceptedOnce ? 'pass' : 'unverified',

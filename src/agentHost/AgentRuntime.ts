@@ -11,6 +11,10 @@ export const AGENT_RUNTIME_ERROR_CODES = [
 export type AgentRuntimeErrorCode = typeof AGENT_RUNTIME_ERROR_CODES[number];
 
 export type AgentHostSource = 'editor' | 'standalone';
+export type AhpProtocolVersion = '1.0.0' | '0.9.0';
+export type AhpProtocolOffer =
+	| readonly ['1.0.0']
+	| readonly ['1.0.0', '0.9.0'];
 export type AgentHostSourceFailureStage =
 	| 'discovery'
 	| 'connection'
@@ -70,10 +74,20 @@ export interface AgentHostSourceStatusProvider {
 export type AgentRuntimeLifecycleObservation =
 	| {
 		readonly taskId: string;
+		readonly eventType: 'protocol/negotiated';
+		readonly source: AgentHostSource;
+		readonly endpointFingerprint?: string;
+		readonly protocolOffer: AhpProtocolOffer;
+		readonly selectedProtocolVersion: AhpProtocolVersion;
+	}
+	| {
+		readonly taskId: string;
 		readonly eventType: 'session/hostObserved';
 		readonly sessionUri: string;
 		readonly source: AgentHostSource;
 		readonly endpointFingerprint?: string;
+		readonly protocolOffer: AhpProtocolOffer;
+		readonly selectedProtocolVersion: AhpProtocolVersion;
 	}
 	| {
 		readonly taskId: string;

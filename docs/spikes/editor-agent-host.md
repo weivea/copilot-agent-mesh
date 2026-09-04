@@ -277,6 +277,26 @@ Sessions 是同一份数据。因此**在该 endpoint 上创建的 Session 有�
 | Tool 长时调用在真实 Copilot UI 下的表现 | ⛔ 未验证，须 0.4.0 真实 E2E |
 | 非 macOS / Insiders / 便携模式的 endpoint 发现 | ⛔ 未验证，超出当前支持范围 |
 
+### VS Code 1.136.1 兼容性复核（2026-09-04）
+
+macOS arm64 上使用专用 Profile 进行了受控兼容性探测（仓库保持只读）。`code agent endpoints` 仍返回
+`schemaVersion: 2`、`type: "editor"` 和 Unix socket，但注册表字段
+`protocolVersion` 从 VS Code 1.135.0 观察到的 `1.0.0` 变为 `0.9.0`。该字段是 endpoint
+注册表元数据，不等同于 AHP `initialize` 最终协商的运行时协议。
+
+Agent Host 服务端对精确 `["1.0.0"]` offer 返回 RPC `-32005`，并声明
+`supportedVersions: ["^0.9.0"]`。使用同一 pinned f19 TypeScript client，经 endpoint 的
+Unix socket 完成 WebSocket Upgrade 后，`["1.0.0","0.9.0"]` offer 选择 `0.9.0`；随后
+root/provider/auth/config、`createSession`、Session/Chat 订阅、标题、短 no-tool Turn 均成功，
+并收到权威 `chat/turnComplete`。
+
+实现因此从同一个 typed policy 派生 offer 与 selected-version 校验：standalone 及注册表
+`1.0.0` editor 只 offer `["1.0.0"]`，注册表 `0.9.0` editor 按偏好 offer
+`["1.0.0","0.9.0"]`，selected 必须属于该精确 offer。locator 仍只接受已观察到的注册表值
+`1.0.0` 与 `0.9.0`，不接受任意降级。协商 `0.9.0` 后，所有 outbound action 还会通过 pinned
+版本注册表校验；生产路径使用的 action 均为 `0.9.0` 已知，唯一 `1.0.0`-only 的
+`chat/turnResume` 未被使用。证据不记录 token、socket、user-data 路径或原始 prompt/output。
+
 ### P6 后续实验（2026-08-31）
 
 P6 使用实现中的严格 locator 在另一台 macOS arm64 开发环境执行了相同只读发现边界。

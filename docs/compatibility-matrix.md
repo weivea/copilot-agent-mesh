@@ -1,7 +1,7 @@
 # Compatibility Matrix
 
 > Status: 0.4.0 Preview implemented; Peer Window Delegation objective gate 8/12, full gate Unverified<br>
-> Evidence date: 2026-08-31<br>
+> Evidence date: 2026-09-04<br>
 > Mesh protocol: v2; v1 peers incompatible
 
 This document is the release gate for external platform compatibility. Installed
@@ -23,14 +23,14 @@ extend Worker support beyond macOS arm64 or authorize publication.
 | Package | `0.4.0` Preview VSIX | Package/version documentation and implementation-time package checks | Preview; not published |
 | Mesh protocol | v2 | Local Broker/Node and remote routing schemas | v2 only; v1 peers incompatible |
 | VS Code minimum | `1.103.0` in `package.json` | Offline API/build coverage | Preview range; real minimum not yet proven |
-| VS Code tested | `1.135.0`, macOS arm64 | Real ordinary same-user-data windows and authenticated production AHP turn | Pass for scoped Preview |
+| VS Code tested | `1.135.0` and `1.136.1`, macOS arm64 | 1.135.0: real ordinary same-user-data windows and authenticated production AHP turn with offer/selection `["1.0.0"]`/`1.0.0`. 1.136.1: dedicated-profile editor discovery, Unix-socket WebSocket upgrade, dual offer `["1.0.0","0.9.0"]`, selected `0.9.0`, and authoritative short no-tool `chat/turnComplete` | 1.135.0 Pass for scoped Preview; 1.136.1 editor/AHP compatibility Pass |
 | Window Nodes | Ordinary VS Code windows with random process-lifetime `nodeId`/`nodeInstanceId` | Two nodes observed in 133 ms in the final authenticated run | Pass on tested build |
 | Device Broker | One owner, generation-fenced takeover, authenticated local IPC | Exactly one Broker; takeover changed generation in 1878 ms | Pass on tested build |
 | Workspace claims | Canonical identity hash, one claim per physical workspace | Duplicate repo conflict; node loss and same-`workspaceId` reclaim | Pass on tested build |
 | Local routing | Window A → Broker → Window B → real AHP → Broker store → Window A; no Tunnel | Authenticated start/output/cancel passed without touching Tunnel | Pass on tested build |
-| AHP package | TypeScript package `0.9.0` from pinned upstream commit `f19dd8b3942d029744a3bdd31d830f9428e8ea47`; negotiates AHP `1.0.0` | Current VS Code 1.135.0 Agent Host handshake and real turn passed | Pass; upstream revision is not yet tagged or npm-published |
+| AHP package | TypeScript package `0.9.0` from pinned upstream commit `f19dd8b3942d029744a3bdd31d830f9428e8ea47`; standalone and registry-1.0 editors offer exact `["1.0.0"]`, registry-0.9 editors offer `["1.0.0","0.9.0"]` | VS Code 1.135.0 selected `1.0.0`; VS Code 1.136.1 selected `0.9.0` and completed a real turn with the same generated client | Pass; upstream revision is not yet tagged or npm-published |
 | AHP authentication | `https://api.github.com` → provider `github`, scopes `read:user`, `user:email` | Dedicated profile exposed a silent session accepted by Agent Host | Pass on tested profile |
-| Editor Agent Host source (0.4.0 P6) | schema-v2 editor endpoint, Unix socket WebSocket, AHP offer `1.0.0`; standalone fallback | Offline strict parser/socket/selector/lifecycle coverage plus a live authenticated VS Code 1.135.0 editor completion through the owned loopback bridge. The Host subscription objectively echoed the created Session channel | Live execution Pass on tested profile; Chat Sessions UI visibility remains Unverified |
+| Editor Agent Host source (0.4.0 P6) | schema-v2 editor endpoint, known registry metadata `1.0.0` or `0.9.0`, Unix socket WebSocket, registry-derived exact protocol policy, selected-version membership validation, and per-action version guards; standalone fallback | Offline strict parser/socket/selector/lifecycle coverage plus live authenticated editor completions on VS Code 1.135.0 (`1.0.0`) and 1.136.1 (`0.9.0`) | Live execution Pass on both versions; Chat Sessions UI visibility remains Unverified |
 | Peer Window Delegation (0.4.0) | Five registered LM Tools, directional allowlist plus target receive gate, one Broker/two ordinary windows, editor-first AHP | Real VS Code 1.135.0/macOS arm64 objective run passed AC-5 1-4, 6, 8-12, needs-input resume, token cancellation, short-budget cancellation, and cleanup against the existing full-Catalog authenticated profile | 10/12 objective items Pass; Copilot confirmation/same-Chat UI items Unverified |
 | Dev Tunnel CLI | Exact macOS arm64 build `1.0.2030+fc9273aa0f` | Existing exact-build lifecycle evidence; multi-window local route kept Listener/Tunnel stopped | Pass on macOS arm64 only |
 | Remote v2 route | One device Gateway/Tunnel → Broker → explicit Window Node | Historical two-device pairing/discovery and durable acceptance passed; its disposable Worker profile then stopped at `AGENT_AUTH_REQUIRED` | Transport/routing pass; authenticated two-device execution not yet run |
@@ -53,7 +53,7 @@ the listener and execute real AHP tasks remains platform-gated.
 
 | OS | Architecture | Evidence | Preview support |
 | --- | --- | --- | --- |
-| macOS | arm64 | Authenticated same-user-data production AHP start/output/cancel on VS Code 1.135.0; existing exact-build Tunnel evidence | Worker candidate and active Window Node; G0 Go for scoped Preview |
+| macOS | arm64 | Authenticated production AHP execution on VS Code 1.135.0 and dedicated-profile production-path Session/Turn completion on VS Code 1.136.1; existing exact-build Tunnel evidence | Worker candidate and active Window Node; G0 Go for scoped Preview |
 | macOS | x64 | No owned Worker lifecycle evidence | Active client Window Node; Worker host unsupported |
 | Windows | x64 | Named-pipe and offline coverage; no Job Object-based real Agent Host/Tunnel gate | Active client Window Node; Worker host unsupported |
 | Linux | x64 | Unix IPC and offline coverage; no validated real Tunnel/Worker gate | Active client Window Node; Worker host unsupported |
