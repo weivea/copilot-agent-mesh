@@ -8,6 +8,7 @@ import {
 const runId = process.argv[2];
 const confirmation = process.argv[3];
 const observation = process.argv[4];
+const postDetachChallenge = process.argv[5];
 if (
 	typeof runId !== 'string'
 	|| !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(runId)
@@ -19,6 +20,12 @@ if (confirmation !== 'confirmation-once') {
 }
 if (observation !== 'session-visible' && observation !== 'session-not-visible') {
 	throw new Error('Observation must be session-visible or session-not-visible.');
+}
+if (
+	typeof postDetachChallenge !== 'string'
+	|| !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(postDetachChallenge)
+) {
+	throw new Error('Provide the post-detach observation challenge printed by the harness.');
 }
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptDirectory, '../../..');
@@ -46,8 +53,9 @@ try {
 	await writeFile(
 		temporaryPath,
 		`${JSON.stringify({
-			schemaVersion: 1,
+			schemaVersion: 2,
 			runId,
+			postDetachChallenge,
 			confirmationAcceptedOnce: true,
 			targetSessionVisible: observation === 'session-visible',
 		})}\n`,

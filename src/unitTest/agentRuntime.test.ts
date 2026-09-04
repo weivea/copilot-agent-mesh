@@ -16,6 +16,7 @@ import {
 	AHP_PROTOCOL_OFFER,
 	buildMeshSessionTitle,
 	DELEGATED_AGENT_CLIENT_TOOLS,
+	listSessionsBounded,
 	type AhpConnection,
 	type AhpConnectionFactory,
 	type AhpSubscription,
@@ -41,6 +42,7 @@ import {
 	createAgentRuntimeEventQueue,
 	type AgentRuntimeEvent,
 	type AgentRuntimeErrorCode,
+	type AgentRuntimeLifecycleObserver,
 	type AgentRuntimeLifecycleObservation,
 	type AgentTaskRequest,
 	type FirstTaskConfirmation,
@@ -71,6 +73,23 @@ const initializationOnlyResource = {
 	resource_name: 'Initialization Agent',
 	scopes_supported: ['agent:initialize'],
 };
+
+test('pinned SDK iterator return does not wake an already parked next', async () => {
+	const { AsyncBroadcastQueue } = await import(
+		'../../third_party/agent-host-protocol/clients/typescript/src/client/async-queue.js'
+	);
+	const queue = new AsyncBroadcastQueue<number>();
+	const reader = queue.reader();
+	let settled = false;
+	void reader.next().then(() => {
+		settled = true;
+	});
+
+	await reader.return!();
+	queue.close();
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(settled, false);
+});
 
 test('agent event queue stays within count and byte bounds and preserves terminal events under output pressure', async () => {
 	const queue = createAgentRuntimeEventQueue({ maxItems: 8, maxBytes: 512 });
@@ -456,12 +475,18 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 	assert.deepEqual(transport.completionQueries, ['test']);
 	assert.equal(transport.created?.provider, 'dynamic-provider');
 	assert.deepEqual(transport.created?.workingDirectories, [workspaceUri]);
-	assert.deepEqual(lifecycle, [{
-		taskId: 'task-1',
-		eventType: 'session/hostObserved',
-		sessionUri: handle.recovery.sessionUri,
-		source: 'standalone',
-	}]);
+	assert.deepEqual(lifecycle, [
+		{
+			taskId: 'task-1',
+			eventType: 'session/materialized',
+		},
+		{
+			taskId: 'task-1',
+			eventType: 'session/hostObserved',
+			sessionUri: handle.recovery.sessionUri,
+			source: 'standalone',
+		},
+	]);
 	assert.equal(transport.dispatched[0]?.action.type, 'chat/turnStarted');
 	assert.equal(
 		((transport.dispatched[0]?.action as Record<string, unknown>).message as Record<string, unknown>).text,
@@ -517,12 +542,21 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 	assert.equal(launcher.host.disposed, true);
 });
 
-	test('delegated runtime sets the exact safe Session title and preserves terminal editor history', async () => {
-		const transport = new FakeAhpTransport();
+	test('delegated runtime preserves history when the Host catalog appears only after disconnect', async () => {
+		const catalog = new FakeAhpHostCatalog();
+		const transport = new FakeAhpTransport(catalog);
 		transport.completeAfterTurnDispatch = true;
+		transport.hideCatalog = true;
 		const launcher = new FakeLauncher();
 		launcher.host.preserveTerminalSession = true;
-		const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+		const lifecycle: AgentRuntimeLifecycleObservation[] = [];
+		const runtime = createRuntime(
+			launcher,
+			new FakeConnectionFactory([transport]),
+			undefined,
+			undefined,
+			{ observeLifecycle: (observation) => lifecycle.push(observation) },
+		);
 
 		const handle = await runtime.start({
 			...taskRequest(),
@@ -554,6 +588,341 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 		await handle.dispose();
 		assert.equal(transport.disposeSessionCalls, 0);
 		assert.equal(transport.shutdownCalls, 1);
+		assert.equal(lifecycle.at(-1)?.eventType, 'session/clientDetached');
+		assert.equal(transport.listSessionsCalls, 0);
+		const sessionUri = transport.created!.sessionUri;
+		assert.deepEqual(catalog.session(sessionUri), {
+			status: 1,
+			activeClientCount: 0,
+			materialized: true,
+		});
+
+		const reconnected = new FakeAhpTransport(catalog);
+		await reconnected.initialize('history-reader');
+		assert.deepEqual(await reconnected.listSessions(), {
+			items: [{ resource: sessionUri, status: 1 }],
+		});
+		await reconnected.shutdown();
+	});
+
+	test('bounded Session catalog listing follows cursors beyond the first page', async () => {
+		const catalog = new FakeAhpHostCatalog();
+		catalog.addMaterialized('ahp-session:/older-1');
+		catalog.addMaterialized('ahp-session:/older-2');
+		catalog.addMaterialized('ahp-session:/older-3');
+		const transport = new FakeAhpTransport(catalog);
+		transport.catalogPageSize = 2;
+		await transport.initialize('catalog-reader');
+
+		assert.deepEqual(await listSessionsBounded(transport), [
+			{ resource: 'ahp-session:/older-1', status: 1 },
+			{ resource: 'ahp-session:/older-2', status: 1 },
+			{ resource: 'ahp-session:/older-3', status: 1 },
+		]);
+		assert.equal(transport.listSessionsCalls, 2);
+	});
+
+	test('bounded Session catalog listing omits optional limit after Host internal error', async () => {
+		const catalog = new FakeAhpHostCatalog();
+		catalog.addMaterialized('ahp-session:/retained');
+		const transport = new FakeAhpTransport(catalog);
+		transport.rejectCatalogLimit = true;
+		await transport.initialize('catalog-reader');
+
+		assert.deepEqual(await listSessionsBounded(transport), [
+			{ resource: 'ahp-session:/retained', status: 1 },
+		]);
+		assert.equal(transport.listSessionsCalls, 2);
+	});
+
+	test('bounded Session catalog listing rejects an oversized Host-selected page', async () => {
+		const catalog = new FakeAhpHostCatalog();
+		for (let index = 0; index <= 10_000; index += 1) {
+			catalog.addMaterialized(`ahp-session:/oversized-${index}`);
+		}
+		const transport = new FakeAhpTransport(catalog);
+		transport.rejectCatalogLimit = true;
+		transport.catalogPageSize = 10_001;
+		transport.catalogDefaultPageSize = 10_001;
+		await transport.initialize('catalog-reader');
+
+		await assert.rejects(listSessionsBounded(transport), /bounded entry limit/);
+		assert.equal(transport.listSessionsCalls, 2);
+	});
+
+	test('bounded Session catalog listing rejects cyclic cursors', async () => {
+		const catalog = new FakeAhpHostCatalog();
+		catalog.addMaterialized('ahp-session:/older-1');
+		catalog.addMaterialized('ahp-session:/older-2');
+		const transport = new FakeAhpTransport(catalog);
+		transport.catalogPageSize = 1;
+		transport.catalogCursorCycle = true;
+		await transport.initialize('catalog-reader');
+
+		await assert.rejects(listSessionsBounded(transport), /invalid Session catalog cursor/);
+		assert.equal(transport.listSessionsCalls, 2);
+	});
+
+	test('bounded Session catalog listing caps page requests', async () => {
+		const catalog = new FakeAhpHostCatalog();
+		for (let index = 0; index < 101; index += 1) {
+			catalog.addMaterialized(`ahp-session:/older-${index}`);
+		}
+		const transport = new FakeAhpTransport(catalog);
+		transport.catalogPageSize = 2;
+		await transport.initialize('catalog-reader');
+
+		await assert.rejects(listSessionsBounded(transport), /bounded pagination limit/);
+		assert.equal(transport.listSessionsCalls, 50);
+	});
+
+	test('disposing during terminal Session detach aborts promptly without publishing a terminal', async () => {
+		const catalog = new FakeAhpHostCatalog();
+		const transport = new FakeAhpTransport(catalog);
+		transport.blockNextSessionUnsubscribe = true;
+		const launcher = new FakeLauncher();
+		launcher.host.preserveTerminalSession = true;
+		const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+		const handle = await runtime.start({
+			...taskRequest(),
+			sourceWindowName: 'frontend',
+		});
+		await nextEvent(handle.events);
+		void transport.emitChat({
+			type: 'chat/turnComplete',
+			turnId: currentTurnId(transport),
+			duration: 0,
+		});
+		await transport.sessionUnsubscribeStarted;
+
+		const startedAt = Date.now();
+		await handle.dispose();
+		assert.ok(Date.now() - startedAt < 500);
+		assert.equal(transport.disposeSessionCalls, 1);
+		assert.equal(transport.shutdownCalls, 1);
+		assert.equal(catalog.session(transport.created!.sessionUri), undefined);
+		assert.equal((await handle.events[Symbol.asyncIterator]().next()).done, true);
+	});
+
+	test('recovery during terminal Session detach does not reattach the departing client', async () => {
+		const catalog = new FakeAhpHostCatalog();
+		const first = new FakeAhpTransport(catalog);
+		const recovered = new FakeAhpTransport(catalog);
+		first.blockNextSessionUnsubscribe = true;
+		const launcher = new FakeLauncher();
+		launcher.host.preserveTerminalSession = true;
+		const runtime = createRuntime(
+			launcher,
+			new FakeConnectionFactory([first, recovered]),
+		);
+		const handle = await runtime.start({
+			...taskRequest(),
+			sourceWindowName: 'frontend',
+		});
+		await nextEvent(handle.events);
+		await first.emitChat({
+			type: 'chat/turnComplete',
+			turnId: currentTurnId(first),
+			duration: 0,
+		});
+		await first.sessionUnsubscribeStarted;
+		first.failRoot();
+		await waitForCondition(() => recovered.reconnectRequests.length === 1);
+
+		assert.deepEqual(
+			recovered.reconnectRequests[0]?.subscriptions,
+			['ahp-root://', 'ahp-chat:/default'],
+		);
+		assert.equal(
+			recovered.reconnectRequests[0]?.subscriptions.includes(first.created!.sessionUri),
+			false,
+		);
+		await handle.dispose();
+	});
+
+	test('delegated runtime ignores a terminal action for another turn', async () => {
+		const catalog = new FakeAhpHostCatalog();
+		const transport = new FakeAhpTransport(catalog);
+		const launcher = new FakeLauncher();
+		launcher.host.preserveTerminalSession = true;
+		const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+		const handle = await runtime.start({
+			...taskRequest(),
+			sourceWindowName: 'frontend',
+		});
+		await nextEvent(handle.events);
+
+		await transport.emitChat({
+			type: 'chat/turnComplete',
+			turnId: 'stale-turn',
+			duration: 0,
+		});
+		await transport.emitChat({
+			type: 'chat/delta',
+			turnId: currentTurnId(transport),
+			partId: 'part-1',
+			content: 'current output',
+		});
+		assert.deepEqual(await nextEvent(handle.events), { type: 'output', text: 'current output' });
+
+		await transport.emitChat({
+			type: 'chat/turnComplete',
+			turnId: currentTurnId(transport),
+			duration: 0,
+		});
+		assert.deepEqual(await nextEvent(handle.events), { type: 'completed' });
+		await handle.dispose();
+		assert.equal(transport.disposeSessionCalls, 0);
+	});
+
+	test('delegated runtime preserves completed, cancelled, and failed terminal Sessions', async () => {
+		for (const terminal of ['chat/turnComplete', 'chat/turnCancelled', 'chat/error'] as const) {
+			const catalog = new FakeAhpHostCatalog();
+			const transport = new FakeAhpTransport(catalog);
+			const launcher = new FakeLauncher();
+			launcher.host.preserveTerminalSession = true;
+			const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+			const handle = await runtime.start({
+				...taskRequest(),
+				taskId: `task-${terminal}`,
+				sourceWindowName: 'frontend',
+			});
+			await nextEvent(handle.events);
+
+			await transport.emitChat(terminal === 'chat/error'
+				? {
+					type: terminal,
+					turnId: currentTurnId(transport),
+					duration: 0,
+					part: { kind: 'error', error: { message: 'Synthetic failure.' } },
+				}
+				: {
+					type: terminal,
+					turnId: currentTurnId(transport),
+					duration: 0,
+				});
+			const event = await nextEvent(handle.events);
+			assert.equal(event.type, terminal === 'chat/turnComplete'
+				? 'completed'
+				: terminal === 'chat/turnCancelled' ? 'cancelled' : 'failed');
+			await handle.dispose();
+
+			const session = catalog.session(transport.created!.sessionUri);
+			assert.equal(session?.status, terminal === 'chat/error' ? 2 : 1);
+			assert.equal(session?.activeClientCount, 0);
+			assert.deepEqual(
+				transport.dispatched.find(({ action }) => action.type === 'session/activeClientRemoved')?.action,
+				{
+					type: 'session/activeClientRemoved',
+					clientId: transport.created!.clientId,
+				},
+			);
+			assert.equal(transport.disposeSessionCalls, 0);
+		}
+	});
+
+	test('terminal Session cleanup retries a failed active-client unsubscribe', async () => {
+		const catalog = new FakeAhpHostCatalog();
+		const transport = new FakeAhpTransport(catalog);
+		transport.completeAfterTurnDispatch = true;
+		const launcher = new FakeLauncher();
+		launcher.host.preserveTerminalSession = true;
+		const lifecycle: AgentRuntimeLifecycleObservation[] = [];
+		const runtime = createRuntime(
+			launcher,
+			new FakeConnectionFactory([transport]),
+			undefined,
+			undefined,
+			{ observeLifecycle: (observation) => lifecycle.push(observation) },
+		);
+		const handle = await runtime.start({
+			...taskRequest(),
+			sourceWindowName: 'frontend',
+		});
+		for await (const _event of handle.events) {
+			// Drain through the terminal event.
+		}
+		const sessionUri = transport.created!.sessionUri;
+		transport.unsubscribeFailures.set('ahp-chat:/default', 1);
+
+		await assert.rejects(
+			handle.dispose(),
+			(error: unknown) => error instanceof AgentRuntimeError && error.cleanupFailed,
+		);
+		assert.equal(catalog.session(sessionUri)?.activeClientCount, 0);
+		assert.equal(transport.shutdownCalls, 0);
+		assert.equal(
+			lifecycle.some(({ eventType }) => eventType === 'session/clientDetached'),
+			false,
+		);
+
+		await handle.dispose();
+		assert.equal(catalog.session(sessionUri)?.activeClientCount, 0);
+		assert.equal(transport.shutdownCalls, 1);
+		assert.equal(lifecycle.at(-1)?.eventType, 'session/clientDetached');
+	});
+
+	test('failed terminal Session detach fails closed and disposes the orphaned editor Session', async () => {
+		const catalog = new FakeAhpHostCatalog();
+		const transport = new FakeAhpTransport(catalog);
+		const launcher = new FakeLauncher();
+		launcher.host.preserveTerminalSession = true;
+		const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+		const handle = await runtime.start({
+			...taskRequest(),
+			sourceWindowName: 'frontend',
+		});
+		await nextEvent(handle.events);
+		transport.unsubscribeFailures.set(transport.created!.sessionUri, 1);
+		await transport.emitChat({
+			type: 'chat/turnComplete',
+			turnId: currentTurnId(transport),
+			duration: 0,
+		});
+		const event = await nextEvent(handle.events);
+		assert.equal(event.type, 'failed');
+
+		await handle.dispose();
+		assert.equal(transport.disposeSessionCalls, 1);
+		assert.equal(catalog.session(transport.created!.sessionUri), undefined);
+		assert.equal(transport.shutdownCalls, 1);
+	});
+
+	test('rejected active-client removal fails closed before Session unsubscribe', async () => {
+		const catalog = new FakeAhpHostCatalog();
+		const transport = new FakeAhpTransport(catalog);
+		transport.rejectDispatchType = 'session/activeClientRemoved';
+		const launcher = new FakeLauncher();
+		launcher.host.preserveTerminalSession = true;
+		const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+		const handle = await runtime.start({
+			...taskRequest(),
+			sourceWindowName: 'frontend',
+		});
+		await nextEvent(handle.events);
+		await transport.emitChat({
+			type: 'chat/turnComplete',
+			turnId: currentTurnId(transport),
+			duration: 0,
+		});
+		assert.equal((await nextEvent(handle.events)).type, 'failed');
+		assert.equal(transport.unsubscribedUris.includes(transport.created!.sessionUri), false);
+
+		await handle.dispose();
+		assert.equal(transport.disposeSessionCalls, 1);
+		assert.equal(catalog.session(transport.created!.sessionUri), undefined);
+	});
+
+	test('standalone terminal Sessions remain owned and are disposed', async () => {
+		const transport = new FakeAhpTransport();
+		transport.completeAfterTurnDispatch = true;
+		const runtime = createRuntime(new FakeLauncher(), new FakeConnectionFactory([transport]));
+		const handle = await runtime.start(taskRequest());
+		for await (const _event of handle.events) {
+			// Drain through the terminal event.
+		}
+		await handle.dispose();
+		assert.equal(transport.disposeSessionCalls, 1);
 	});
 
 	test('delegated title rejection removes the provisional Session and leaves no running orphan', async () => {
@@ -720,7 +1089,7 @@ test('AHP subscription pump applies bounded output pressure before accepting ter
 	}
 	await transport.emitChat({
 		type: 'chat/turnComplete',
-		turnId: 'turn-1',
+		turnId: currentTurnId(transport),
 		duration: 1,
 	});
 
@@ -857,6 +1226,12 @@ test('runtime correlates an observed child AHP Mesh call and clears it on cancel
 		confirmed: 'not-needed',
 	});
 	await nextEvent(handle.events);
+	assert.equal(delegatedToolInvocations.size, 2);
+	await transport.emitChat({
+		type: 'chat/turnComplete',
+		turnId: 'foreign-turn',
+		duration: 0,
+	});
 	assert.equal(delegatedToolInvocations.size, 2);
 	await handle.cancel();
 	assert.equal(delegatedToolInvocations.size, 0);
@@ -1066,6 +1441,200 @@ test('provisional Session dispatches its first turn before session/ready', async
 	await handle.dispose();
 });
 
+test('terminal provisional Session waits for session/ready before leaving its active client', async () => {
+	const transport = new FakeAhpTransport();
+	transport.sessionStartsProvisional = true;
+	const launcher = new FakeLauncher();
+	launcher.host.preserveTerminalSession = true;
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+	const terminal = nextEvent(handle.events);
+
+	await transport.emitChat({
+		type: 'chat/turnComplete',
+		turnId: currentTurnId(transport),
+		duration: 0,
+	});
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(transport.unsubscribedUris.includes(transport.created!.sessionUri), false);
+
+	await transport.emitSession({ type: 'session/ready' });
+	assert.equal((await terminal).type, 'completed');
+	assert.equal(transport.unsubscribedUris.includes(transport.created!.sessionUri), true);
+	await handle.dispose();
+	assert.equal(transport.disposeSessionCalls, 0);
+});
+
+test('authoritative cancellation remains cancelled when a provisional Session never materializes', async () => {
+	const catalog = new FakeAhpHostCatalog();
+	const transport = new FakeAhpTransport(catalog);
+	transport.sessionStartsProvisional = true;
+	const launcher = new FakeLauncher();
+	launcher.host.preserveTerminalSession = true;
+	const runtime = createRuntime(
+		launcher,
+		new FakeConnectionFactory([transport]),
+		undefined,
+		undefined,
+		undefined,
+		{
+			cancellationTimeoutMs: 15,
+			terminalSessionMaterializationTimeoutMs: 30,
+		},
+	);
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+
+	await handle.cancel();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	assert.equal((await nextEvent(handle.events)).type, 'cancelled');
+	await new Promise<void>((resolve) => setTimeout(resolve, 40));
+	await assert.rejects(
+		handle.dispose(),
+		(error: unknown) =>
+			error instanceof AgentRuntimeError
+			&& error.cleanupFailed
+			&& error.code !== 'TASK_CANCELLATION_UNCONFIRMED',
+	);
+	assert.equal(transport.disposeSessionCalls, 1);
+	assert.equal(catalog.session(transport.created!.sessionUri), undefined);
+	await handle.dispose();
+});
+
+test('authoritative error remains failed when a provisional Session never materializes', async () => {
+	const catalog = new FakeAhpHostCatalog();
+	const transport = new FakeAhpTransport(catalog);
+	transport.sessionStartsProvisional = true;
+	const launcher = new FakeLauncher();
+	launcher.host.preserveTerminalSession = true;
+	const runtime = createRuntime(
+		launcher,
+		new FakeConnectionFactory([transport]),
+		undefined,
+		undefined,
+		undefined,
+		{ terminalSessionMaterializationTimeoutMs: 20 },
+	);
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+
+	await transport.emitChat({
+		type: 'chat/error',
+		turnId: currentTurnId(transport),
+		duration: 0,
+		part: { kind: 'error', error: { message: 'Confirmed failure.' } },
+	});
+	const event = await nextEvent(handle.events);
+	assert.equal(event.type, 'failed');
+	if (event.type === 'failed') {
+		assert.equal(event.error.message, 'Confirmed failure.');
+	}
+	await new Promise<void>((resolve) => setTimeout(resolve, 30));
+	await assert.rejects(
+		handle.dispose(),
+		(error: unknown) => error instanceof AgentRuntimeError && error.cleanupFailed,
+	);
+	assert.equal(transport.disposeSessionCalls, 1);
+	await handle.dispose();
+});
+
+test('exact authoritative terminals clear cancellation confirmation before slow history detach', async () => {
+	for (const [terminal, expected] of [
+		['chat/turnCancelled', 'cancelled'],
+		['chat/error', 'failed'],
+		['chat/turnComplete', 'completed'],
+	] as const) {
+		const catalog = new FakeAhpHostCatalog();
+		const transport = new FakeAhpTransport(catalog);
+		const launcher = new FakeLauncher();
+		launcher.host.preserveTerminalSession = true;
+		const runtime = createRuntime(
+			launcher,
+			new FakeConnectionFactory([transport]),
+			undefined,
+			undefined,
+			undefined,
+			{ cancellationTimeoutMs: 20 },
+		);
+		const handle = await runtime.start(taskRequest());
+		await nextEvent(handle.events);
+		transport.ackDispatches = false;
+
+		await handle.cancel();
+		assert.equal((await nextEvent(handle.events)).type, 'progress');
+		await transport.emitChat(terminal === 'chat/error'
+			? {
+				type: terminal,
+				turnId: currentTurnId(transport),
+				duration: 0,
+				part: { kind: 'error', error: { message: 'Confirmed failure.' } },
+			}
+			: {
+				type: terminal,
+				turnId: currentTurnId(transport),
+				duration: 0,
+			});
+		await waitForCondition(() =>
+			transport.dispatched.some(({ action }) => action.type === 'session/activeClientRemoved'));
+		await new Promise<void>((resolve) => setTimeout(resolve, 40));
+		await transport.acknowledgeDispatch('session/activeClientRemoved');
+		assert.equal((await nextEvent(handle.events)).type, expected);
+
+		await handle.dispose();
+		assert.equal(transport.disposeSessionCalls, 0);
+		assert.equal(catalog.session(transport.created!.sessionUri)?.activeClientCount, 0);
+	}
+});
+
+test('disposing an authoritative cancellation during materialization wait removes the orphan', async () => {
+	const catalog = new FakeAhpHostCatalog();
+	const transport = new FakeAhpTransport(catalog);
+	transport.sessionStartsProvisional = true;
+	const launcher = new FakeLauncher();
+	launcher.host.preserveTerminalSession = true;
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+
+	await handle.cancel();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	await transport.emitChat({
+		type: 'chat/turnCancelled',
+		turnId: currentTurnId(transport),
+		duration: 0,
+	});
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	await handle.dispose();
+	assert.equal(transport.disposeSessionCalls, 1);
+	assert.equal(catalog.session(transport.created!.sessionUri), undefined);
+});
+
+test('disposing an authoritative cancellation during detach wait removes the orphan', async () => {
+	const catalog = new FakeAhpHostCatalog();
+	const transport = new FakeAhpTransport(catalog);
+	const launcher = new FakeLauncher();
+	launcher.host.preserveTerminalSession = true;
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+	transport.ackDispatches = false;
+
+	await handle.cancel();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	await transport.emitChat({
+		type: 'chat/turnCancelled',
+		turnId: currentTurnId(transport),
+		duration: 0,
+	});
+	await waitForCondition(() =>
+		transport.dispatched.some(({ action }) => action.type === 'session/activeClientRemoved'));
+
+	await handle.dispose();
+	assert.equal(transport.disposeSessionCalls, 1);
+	assert.equal(catalog.session(transport.created!.sessionUri), undefined);
+});
+
 test('AHP 0.8 creationFailed Session snapshots fail with the reported error', async () => {
 	const transport = new FakeAhpTransport();
 	transport.sessionCreationFailed = true;
@@ -1268,6 +1837,7 @@ test('startup follows a changed default Chat when recovery occurs during Chat su
 
 	const handle = await started;
 	assert.equal(recovered.unsubscribedUris.includes('ahp-chat:/default'), true);
+	assertCleanupOrder(recovered, 'ahp-chat:/default');
 	assert.equal(recovered.subscribedUris.includes('ahp-chat:/recovered'), true);
 	assert.equal(recovered.dispatched[0]?.channel, 'ahp-chat:/recovered');
 	await handle.dispose();
@@ -1663,6 +2233,149 @@ test('recovery subscribes newly owned terminals through the candidate connection
 	await handle.dispose();
 });
 
+test('recovery stops before subscribing terminals after replay completes the task', async () => {
+	const first = new FakeAhpTransport();
+	const recovered = new FakeAhpTransport();
+	const runtime = createRuntime(new FakeLauncher(), new FakeConnectionFactory([first, recovered]));
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+	recovered.created = first.created;
+	recovered.reconnectResult = {
+		type: 'replay',
+		actions: [
+			envelope('ahp-root://', {
+				type: 'root/terminalsChanged',
+				terminals: [{
+					resource: 'ahp-terminal:/late',
+					label: 'Late terminal',
+					claim: { kind: 'session', session: handle.recovery.sessionUri },
+				}],
+			}, 8),
+			envelope('ahp-chat:/default', {
+				type: 'chat/turnComplete',
+				turnId: currentTurnId(first),
+				duration: 0,
+			}, 9),
+		],
+		missing: [],
+	};
+
+	first.failChat();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	assert.equal((await nextEvent(handle.events)).type, 'completed');
+	await waitForCondition(() => recovered.shutdownCalls === 1);
+	assert.equal(recovered.subscribedUris.includes('ahp-terminal:/late'), false);
+	await handle.dispose();
+});
+
+test('recovery applies replayed Session readiness before an earlier terminal action', async () => {
+	const catalog = new FakeAhpHostCatalog();
+	const first = new FakeAhpTransport(catalog);
+	first.sessionStartsProvisional = true;
+	const recovered = new FakeAhpTransport(catalog);
+	const launcher = new FakeLauncher();
+	launcher.host.preserveTerminalSession = true;
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([first, recovered]));
+	const handle = await runtime.start({
+		...taskRequest(),
+		sourceWindowName: 'frontend',
+	});
+	await nextEvent(handle.events);
+	recovered.created = first.created;
+	recovered.reconnectResult = {
+		type: 'replay',
+		actions: [
+			envelope('ahp-chat:/default', {
+				type: 'chat/turnComplete',
+				turnId: currentTurnId(first),
+				duration: 0,
+			}, 8),
+			envelope(first.created!.sessionUri, { type: 'session/ready' }, 9),
+		],
+		missing: [],
+	};
+
+	first.failChat();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	assert.equal((await nextEvent(handle.events)).type, 'completed');
+	await handle.dispose();
+	assert.equal(recovered.disposeSessionCalls, 0);
+});
+
+test('recovery applies Session readiness before an earlier terminal Chat snapshot', async () => {
+	const catalog = new FakeAhpHostCatalog();
+	const first = new FakeAhpTransport(catalog);
+	first.sessionStartsProvisional = true;
+	const recovered = new FakeAhpTransport(catalog);
+	const launcher = new FakeLauncher();
+	launcher.host.preserveTerminalSession = true;
+	const runtime = createRuntime(launcher, new FakeConnectionFactory([first, recovered]));
+	const handle = await runtime.start({
+		...taskRequest(),
+		sourceWindowName: 'frontend',
+	});
+	await nextEvent(handle.events);
+	const turnId = currentTurnId(first);
+	recovered.created = first.created;
+	recovered.reconnectResult = {
+		type: 'snapshot',
+		snapshots: [
+			{
+				resource: 'ahp-chat:/default',
+				fromSeq: 8,
+				state: {
+					resource: 'ahp-chat:/default',
+					title: 'Recovered',
+					status: 1,
+					modifiedAt: new Date(0).toISOString(),
+					activeTurn: undefined,
+					turns: [{
+						id: turnId,
+						message: { text: 'safe', origin: { kind: 'user' } },
+						responseParts: [],
+						usage: undefined,
+						state: 'complete',
+					}],
+				},
+			} as Snapshot,
+			{
+				resource: first.created!.sessionUri,
+				fromSeq: 9,
+				state: {
+					resource: first.created!.sessionUri,
+					provider: 'dynamic-provider',
+					title: 'Task',
+					status: 1,
+					lifecycle: 'ready',
+					activeClients: [],
+					chats: [],
+					defaultChat: 'ahp-chat:/default',
+				},
+			} as Snapshot,
+			{
+				resource: 'ahp-root://',
+				fromSeq: 10,
+				state: {
+					agents: [{
+						provider: 'dynamic-provider',
+						displayName: 'Dynamic Provider',
+						description: 'Test provider',
+						models: [],
+						protectedResources: [protectedResource],
+					}],
+					terminals: [],
+				},
+			} as Snapshot,
+		],
+	};
+
+	first.failChat();
+	assert.equal((await nextEvent(handle.events)).type, 'progress');
+	assert.equal((await nextEvent(handle.events)).type, 'completed');
+	await handle.dispose();
+	assert.equal(recovered.disposeSessionCalls, 0);
+});
+
 test('intentional terminal removal does not trigger connection recovery', async () => {
 	const transport = new FakeAhpTransport();
 	const connections = new FakeConnectionFactory([transport]);
@@ -1681,6 +2394,7 @@ test('intentional terminal removal does not trigger connection recovery', async 
 
 	transport.emitRootAction({ type: 'root/terminalsChanged', terminals: [] });
 	await waitForCondition(() => transport.unsubscribedUris.includes('ahp-terminal:/temporary'));
+	assertCleanupOrder(transport, 'ahp-terminal:/temporary');
 	assert.equal(connections.connectCalls, 1);
 	await handle.dispose();
 });
@@ -1786,7 +2500,47 @@ test('dispose cancels and awaits terminal subscription updates and cleans a late
 	transport.releaseSubscribe('ahp-terminal:/late');
 	await disposal;
 	assert.equal(transport.unsubscribedUris.includes('ahp-terminal:/late'), true);
+	assertCleanupOrder(transport, 'ahp-terminal:/late');
 	assert.equal(launcher.host.disposed, true);
+});
+
+test('dispose fails promptly and closes the connection when a subscription pump cannot settle', async () => {
+	const transport = new FakeAhpTransport();
+	const launcher = new FakeLauncher();
+	launcher.host.preserveTerminalSession = true;
+	const lifecycle: AgentRuntimeLifecycleObservation[] = [];
+	const runtime = createRuntime(
+		launcher,
+		new FakeConnectionFactory([transport]),
+		undefined,
+		undefined,
+		{ observeLifecycle: (observation) => lifecycle.push(observation) },
+		{ subscriptionPumpSettleTimeoutMs: 20 },
+	);
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+	await transport.emitChat({
+		type: 'chat/turnComplete',
+		turnId: currentTurnId(transport),
+		duration: 0,
+	});
+	assert.equal((await nextEvent(handle.events)).type, 'completed');
+	transport.unsubscribeDoesNotWake.add('ahp-chat:/default');
+
+	const startedAt = Date.now();
+	await assert.rejects(
+		handle.dispose(),
+		(error: unknown) =>
+			error instanceof AgentRuntimeError
+			&& error.cleanupFailed
+			&& /subscription pumps/u.test(error.message),
+	);
+	assert.ok(Date.now() - startedAt < 500);
+	assert.equal(transport.shutdownCalls, 1);
+	assert.equal(launcher.host.disposed, true);
+	await handle.dispose();
+	assert.equal(lifecycle.some(({ eventType }) => eventType === 'session/subscriptionPumpsSettled'), false);
+	assert.equal(lifecycle.some(({ eventType }) => eventType === 'session/clientDetached'), false);
 });
 
 test('runtime disposal can be retried after cleanup failure and retains task ownership', async () => {
@@ -2545,6 +3299,12 @@ function createRuntime(
 		connections: AhpConnectionFactory,
 		authBroker: AuthBroker = new RecordingAuthBroker(),
 		delegatedToolInvocations?: DelegatedToolInvocationRegistry,
+		lifecycleObserver?: AgentRuntimeLifecycleObserver,
+		timeouts?: {
+			readonly cancellationTimeoutMs?: number;
+			readonly terminalSessionMaterializationTimeoutMs?: number;
+			readonly subscriptionPumpSettleTimeoutMs?: number;
+		},
 ): AhpAgentRuntime {
 		return new AhpAgentRuntime({
 			enabled: () => true,
@@ -2554,8 +3314,11 @@ function createRuntime(
 		confirmation: { confirm: async () => 'once' },
 		workspaceResolver: trustedWorkspaceResolver(),
 		configResolver: { resolve: async () => ({ model: 'test-model' }) },
-		cancellationTimeoutMs: 100,
+		cancellationTimeoutMs: timeouts?.cancellationTimeoutMs ?? 100,
+		terminalSessionMaterializationTimeoutMs: timeouts?.terminalSessionMaterializationTimeoutMs,
+		subscriptionPumpSettleTimeoutMs: timeouts?.subscriptionPumpSettleTimeoutMs,
 		delegatedToolInvocations,
+		lifecycleObserver,
 	});
 }
 
@@ -2794,6 +3557,91 @@ class FakeConnectionFactory implements AhpConnectionFactory {
 	}
 }
 
+class FakeAhpHostCatalog {
+	private readonly sessions = new Map<string, {
+		status: number;
+		activeClients: Set<string>;
+		materialized: boolean;
+		activeTurnId?: string;
+	}>();
+
+	create(sessionUri: string, clientId: string): void {
+		this.sessions.set(sessionUri, {
+			status: 1,
+			activeClients: new Set([clientId]),
+			materialized: false,
+		});
+	}
+
+	record(sessionUri: string, action: Record<string, unknown>): void {
+		const session = this.sessions.get(sessionUri);
+		if (session === undefined) {
+			return;
+		}
+		if (action.type === 'chat/turnStarted' && typeof action.turnId === 'string') {
+			session.activeTurnId = action.turnId;
+			session.status = 8;
+			return;
+		}
+		if (
+			(
+				action.type === 'chat/turnComplete'
+				|| action.type === 'chat/turnCancelled'
+				|| action.type === 'chat/error'
+			)
+			&& action.turnId === session.activeTurnId
+		) {
+			session.activeTurnId = undefined;
+			session.status = action.type === 'chat/error' ? 2 : 1;
+			session.materialized = true;
+			return;
+		}
+		if (
+			action.type === 'session/activeClientRemoved'
+			&& typeof action.clientId === 'string'
+		) {
+			session.activeClients.delete(action.clientId);
+		}
+	}
+
+	removeClient(sessionUri: string, clientId: string): void {
+		this.sessions.get(sessionUri)?.activeClients.delete(clientId);
+	}
+
+	dispose(sessionUri: string): void {
+		this.sessions.delete(sessionUri);
+	}
+
+	list(): readonly { readonly resource: string; readonly status: number }[] {
+		return [...this.sessions]
+			.filter(([, session]) => session.materialized && session.activeClients.size === 0)
+			.map(([resource, session]) => ({ resource, status: session.status }));
+	}
+
+	addMaterialized(resource: string, status = 1): void {
+		this.sessions.set(resource, {
+			status,
+			activeClients: new Set(),
+			materialized: true,
+		});
+	}
+
+	session(sessionUri: string): {
+		readonly status: number;
+		readonly activeClientCount: number;
+		readonly materialized: boolean;
+	} | undefined {
+		const session = this.sessions.get(sessionUri);
+		return session === undefined
+			? undefined
+			: {
+				status: session.status,
+				activeClientCount: session.activeClients.size,
+				materialized: session.materialized,
+			};
+	}
+}
+
 class FakeAhpTransport implements AhpConnection {
 	initialized = false;
 	initializedClientId = '';
@@ -2836,11 +3684,27 @@ class FakeAhpTransport implements AhpConnection {
 	disposeSessionCalls = 0;
 	shutdownCalls = 0;
 	shutdownFails = false;
+	listSessionsCalls = 0;
+	catalogOmissionsRemaining = 0;
+	catalogFailuresRemaining = 0;
+	catalogPageSize = 200;
+	catalogDefaultPageSize = 200;
+	catalogCursorCycle = false;
+	rejectCatalogLimit = false;
+	hideCatalog = false;
+	blockNextSessionUnsubscribe = false;
+	private resolveSessionUnsubscribeStarted!: () => void;
+	readonly sessionUnsubscribeStarted = new Promise<void>((resolve) => {
+		this.resolveSessionUnsubscribeStarted = resolve;
+	});
+	readonly unsubscribeFailures = new Map<string, number>();
 	failRootDuringConfig = false;
 	resolveConfigCalls = 0;
 	readonly subscribedUris: string[] = [];
 	readonly completionQueries: string[] = [];
 	readonly unsubscribedUris: string[] = [];
+	readonly cleanupOperations: string[] = [];
+	readonly unsubscribeDoesNotWake = new Set<string>();
 	private readonly attachedUris = new Set<string>();
 	private readonly queues = new Map<string, FakeSubscription>();
 	private reconnectRelease: (() => void) | undefined;
@@ -2853,6 +3717,8 @@ class FakeAhpTransport implements AhpConnection {
 	}>();
 	readonly subscribeAttempts: string[] = [];
 	private shutdownComplete = false;
+
+	constructor(private readonly hostCatalog?: FakeAhpHostCatalog) {}
 
 	async initialize(clientId: string): Promise<Awaited<ReturnType<AhpConnection['initialize']>>> {
 		this.assertOpen();
@@ -3080,11 +3946,44 @@ class FakeAhpTransport implements AhpConnection {
 			});
 		}
 		this.created = params;
+		this.hostCatalog?.create(params.sessionUri, params.clientId);
 	}
 
-	async listSessions(_limit?: number): Promise<readonly { readonly resource: string }[]> {
+	async listSessions(limit?: number, cursor?: string): Promise<{
+		readonly items: readonly {
+			readonly resource: string;
+			readonly status?: number;
+		}[];
+		readonly nextCursor?: string;
+	}> {
 		this.assertOpen();
-		return this.created === undefined ? [] : [{ resource: this.created.sessionUri }];
+		this.listSessionsCalls += 1;
+		if (this.rejectCatalogLimit && limit !== undefined) {
+			throw Object.assign(new Error('synthetic Host internal error'), { code: -32603 });
+		}
+		if (this.catalogFailuresRemaining > 0) {
+			this.catalogFailuresRemaining -= 1;
+			throw new Error('synthetic catalog failure');
+		}
+		if (this.catalogOmissionsRemaining > 0) {
+			this.catalogOmissionsRemaining -= 1;
+			return { items: [] };
+		}
+		const sessions = this.hideCatalog
+			? []
+			: this.hostCatalog !== undefined
+			? this.hostCatalog.list()
+			: this.created === undefined ? [] : [{ resource: this.created.sessionUri, status: 1 }];
+		const offset = cursor === undefined ? 0 : Number.parseInt(cursor, 10);
+		const pageSize = Math.min(limit ?? this.catalogDefaultPageSize, this.catalogPageSize);
+		const items = sessions.slice(offset, offset + pageSize);
+		const nextOffset = offset + items.length;
+		return {
+			items,
+			...(nextOffset < sessions.length
+				? { nextCursor: this.catalogCursorCycle ? cursor ?? '0' : String(nextOffset) }
+				: {}),
+		};
 	}
 
 	dispatch(channel: string, action: unknown, clientSeq?: number): number {
@@ -3124,13 +4023,28 @@ class FakeAhpTransport implements AhpConnection {
 
 	async unsubscribe(uri: string): Promise<void> {
 		this.assertOpen();
+		if (uri === this.created?.sessionUri && this.blockNextSessionUnsubscribe) {
+			this.blockNextSessionUnsubscribe = false;
+			this.queue(uri).finish();
+			this.resolveSessionUnsubscribeStarted();
+			await new Promise<void>(() => undefined);
+		}
+		const failures = this.unsubscribeFailures.get(uri) ?? 0;
+		if (failures > 0) {
+			this.unsubscribeFailures.set(uri, failures - 1);
+			throw new Error('synthetic unsubscribe failure');
+		}
 		this.unsubscribedUris.push(uri);
-		this.queue(uri).finish();
+		this.cleanupOperations.push(`unsubscribe:${uri}`);
+		if (!this.unsubscribeDoesNotWake.has(uri)) {
+			this.queue(uri).finish();
+		}
 	}
 
-	async disposeSession(): Promise<void> {
+	async disposeSession(uri: string): Promise<void> {
 		this.assertOpen();
 		this.disposeSessionCalls += 1;
+		this.hostCatalog?.dispose(uri);
 	}
 
 	async shutdown(): Promise<void> {
@@ -3153,6 +4067,11 @@ class FakeAhpTransport implements AhpConnection {
 		return this.emit('ahp-chat:/default', action);
 	}
 
+	emitSession(action: Record<string, unknown>): Promise<boolean> {
+		assert.ok(this.created);
+		return this.emit(this.created.sessionUri, action);
+	}
+
 	emitRootAuth(resources: readonly ProtectedResource[]): Promise<boolean> {
 		return this.queue('ahp-root://').push({
 			type: 'authRequired',
@@ -3162,6 +4081,15 @@ class FakeAhpTransport implements AhpConnection {
 
 	emitRootAction(action: Record<string, unknown>): Promise<boolean> {
 		return this.emit('ahp-root://', action);
+	}
+
+	acknowledgeDispatch(type: string): Promise<boolean> {
+		const dispatched = [...this.dispatched].reverse().find(({ action }) => action.type === type);
+		assert.ok(dispatched, `Expected a dispatched ${type} action.`);
+		return this.emit(dispatched.channel, dispatched.action, {
+			clientId: this.initializedClientId,
+			clientSeq: dispatched.clientSeq,
+		});
 	}
 
 	failChat(): void {
@@ -3177,6 +4105,11 @@ class FakeAhpTransport implements AhpConnection {
 		action: Record<string, unknown>,
 		origin?: { readonly clientId: string; readonly clientSeq: number },
 	): Promise<boolean> {
+		if (channel.startsWith('ahp-chat:') && this.created !== undefined) {
+			this.hostCatalog?.record(this.created.sessionUri, action);
+		} else if (channel === this.created?.sessionUri) {
+			this.hostCatalog?.record(channel, action);
+		}
 		return this.queue(channel).push({
 			type: 'action',
 			params: envelope(channel, action, 4, origin),
@@ -3186,42 +4119,108 @@ class FakeAhpTransport implements AhpConnection {
 	private queue(uri: string): FakeSubscription {
 		let queue = this.queues.get(uri);
 		if (queue === undefined) {
-			queue = new FakeSubscription();
+			queue = new FakeSubscription(() => {
+				this.cleanupOperations.push(`close:${uri}`);
+			});
 			this.queues.set(uri, queue);
 		}
 		return queue;
 	}
 }
 
+function currentTurnId(transport: FakeAhpTransport): string {
+	const turnStarted = transport.dispatched.find(({ action }) => action.type === 'chat/turnStarted');
+	if (typeof turnStarted?.action.turnId !== 'string') {
+		assert.fail('Expected a dispatched Agent Host turn.');
+	}
+	return turnStarted.action.turnId;
+}
+
 class FakeSubscription implements AhpSubscription {
-	private readonly queue = new AsyncEventQueue<AhpSubscriptionEvent>();
+	private readonly values: AhpSubscriptionEvent[] = [];
+	private waiter: {
+		resolve: (result: IteratorResult<AhpSubscriptionEvent>) => void;
+		reject: (error: Error) => void;
+	} | undefined;
 	private failure: Error | undefined;
+	private closed = false;
+	private detached = false;
+
+	constructor(private readonly didClose: () => void) {}
 
 	push(event: AhpSubscriptionEvent): Promise<boolean> {
-		return this.queue.push(event);
+		if (this.closed) {
+			return Promise.resolve(false);
+		}
+		const waiter = this.waiter;
+		if (waiter !== undefined) {
+			this.waiter = undefined;
+			waiter.resolve({ done: false, value: event });
+		} else {
+			this.values.push(event);
+		}
+		return Promise.resolve(true);
 	}
 
 	fail(error: Error): void {
 		this.failure = error;
-		this.queue.close();
-	}
-
-	finish(): void {
-		this.queue.close();
-	}
-
-	async close(): Promise<void> {
 		this.finish();
 	}
 
-	async *[Symbol.asyncIterator](): AsyncIterator<AhpSubscriptionEvent> {
-		for await (const event of this.queue) {
-			yield event;
+	finish(): void {
+		if (this.closed) {
+			return;
 		}
-		if (this.failure !== undefined) {
-			throw this.failure;
+		this.closed = true;
+		const waiter = this.waiter;
+		this.waiter = undefined;
+		if (waiter !== undefined && !this.detached) {
+			if (this.failure !== undefined) {
+				waiter.reject(this.failure);
+			} else {
+				waiter.resolve({ done: true, value: undefined });
+			}
 		}
 	}
+
+	async close(): Promise<void> {
+		this.didClose();
+		this.detached = true;
+		// Match the pinned SDK: return() detaches the cursor without resolving
+		// an already parked next().
+		this.waiter = undefined;
+	}
+
+	[Symbol.asyncIterator](): AsyncIterator<AhpSubscriptionEvent> {
+		return {
+			next: () => {
+				if (this.detached) {
+					return Promise.resolve({ done: true, value: undefined });
+				}
+				const value = this.values.shift();
+				if (value !== undefined) {
+					return Promise.resolve({ done: false, value });
+				}
+				if (this.failure !== undefined) {
+					return Promise.reject(this.failure);
+				}
+				if (this.closed) {
+					return Promise.resolve({ done: true, value: undefined });
+				}
+				return new Promise<IteratorResult<AhpSubscriptionEvent>>((resolve, reject) => {
+					this.waiter = { resolve, reject };
+				});
+			},
+		};
+	}
+}
+
+function assertCleanupOrder(transport: FakeAhpTransport, uri: string): void {
+	const unsubscribe = transport.cleanupOperations.indexOf(`unsubscribe:${uri}`);
+	const close = transport.cleanupOperations.indexOf(`close:${uri}`);
+	assert.notEqual(unsubscribe, -1, `Expected ${uri} to be unsubscribed.`);
+	assert.notEqual(close, -1, `Expected ${uri} iterator to be closed.`);
+	assert.ok(unsubscribe < close, `Expected ${uri} unsubscribe before iterator close.`);
 }
 
 function envelope(

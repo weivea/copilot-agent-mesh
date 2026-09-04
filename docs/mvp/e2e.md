@@ -69,15 +69,25 @@ passing confirmation evidence.
 
 The harness prints one exact `#meshListWorkers` / `#meshDelegateTask` prompt. In
 the named source window, submit it in Copilot Agent mode and click **Continue**
-exactly once. After checking the target Chat Sessions list, record only the two
-boolean observations with the printed command:
+exactly once. Do not attest Session visibility yet. The harness first observes the
+same Tool invocation's terminal result, then waits for objective
+`session/clientDetached` cleanup from the original task handle and performs a fresh
+independent Session-catalog probe.
+
+Only after those phases complete does the harness print
+`manualPostDetachObservationRequired` with a challenge-bound command and open a
+five-minute observation window. Check the target Chat Sessions list at that point,
+then record only the two boolean observations with that exact printed command:
 
 ```sh
-node scripts/e2e/peer-delegation/attest.mjs <run-id> confirmation-once session-visible
+node scripts/e2e/peer-delegation/attest.mjs <run-id> confirmation-once session-visible <post-detach-challenge>
 ```
 
-Use `session-not-visible` when that is the observed result. Without this phase,
-AC-5 item 5 and UI visibility remain `unverified`, and the command exits nonzero.
+Use `session-not-visible` when that is the observed result. An attestation created
+before the post-detach prompt cannot match its challenge. If objective detach is not
+observed, the harness never solicits or accepts UI evidence as Pass. Without the
+post-detach phase, AC-5 item 5 and UI visibility remain `unverified`, and the
+command exits nonzero. Diagnostics-only `MANUAL_UI=0` behavior is unchanged.
 
 Sanitized JSON and a short summary are written to:
 
@@ -133,9 +143,16 @@ directory, records the actual process OS/architecture with `testMode: true`, and
 emits only a `test-diagnostic` artifact. Both release validator modes reject that
 artifact, and test mode cannot replace the stable release evidence file.
 
-O1 is Pass only when the task Session hash appears in the editor `listSessions`
-catalog and the target UI is visibly observed. O2 is Pass only after a genuine
-60-minute Copilot Tool call; shorter runs are recorded as shorter-duration-only.
+O1 is Pass only when, after Task terminal cleanup, a new editor connection sees the
+task Session hash in `listSessions` with Idle/Error activity, no InProgress bit, and
+no Archived bit, and the target UI is visibly observed. UI visibility remains a
+separate user attestation and is never inferred from the catalog. The evidence records
+`session/clientDetached` only after the original task handle has successfully closed
+its subscriptions and AHP connection. Only then may a fresh independent connection
+populate `catalogAfterTerminalCleanup`; Workspace lease release is not treated as
+proof of Agent Host cleanup. O2 is Pass only
+after a genuine 60-minute Copilot Tool call; shorter runs are recorded as
+shorter-duration-only.
 O3 remains non-guaranteed Tool choice, O4 remains undetectable concurrent user
 Copilot edits, and O5 remains unsupported/unverified outside macOS arm64.
 AC-5 item 9 is narrower than O1 but still cannot rely on source status alone:
@@ -167,7 +184,9 @@ produced a valid **Unverified** artifact rather than a false Pass:
   passed real needs-input answer/resume, authoritative token cancellation, and
   the 10-second harness-budget cancellation. The post-task editor catalog
   remained empty and no user UI attestation was supplied, so AC-5 5 and 7 plus
-  O1 remain Unverified. O2 also remains Unverified because the observed editor
+  O1 for that pre-fix run remain Unverified. It exposed a lifecycle race: a
+  terminal Chat could precede provisional Session materialization, so skipping
+  `disposeSession` alone did not prove retention. O2 also remains Unverified because the observed editor
   invocation was about 87 seconds, not a 60-minute Copilot UI call.
 - No user attestation was created. The full UI rerun still requires the exact
   enabled command, a signed-in dedicated profile, one visible Agent-mode Tool

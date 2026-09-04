@@ -14,11 +14,123 @@ import {
 	PeerDelegationE2eToolClock,
 	projectPeerTaskEvents,
 } from '../e2e/PeerDelegationE2eRecorder';
+import {
+	EditorCatalogProbeError,
+	classifyEditorCatalogError,
+} from '../composition/PeerDelegationE2eApi';
+import {
+	canRequestManualPostDetachObservation,
+	manualPostDetachObservationTimeoutMs,
+	parseManualPostDetachAttestation,
+	waitForManualPostDetachAttestation,
+} from '../e2e/PeerDelegationManualEvidence';
 
 const runId = '00000000-0000-4000-8000-000000000001';
 const taskId = '00000000-0000-4000-8000-000000000002';
 const inputId = '00000000-0000-4000-8000-000000000003';
 const delegationRequestId = '00000000-0000-4000-8000-000000000004';
+const postDetachChallenge = '00000000-0000-4000-8000-000000000005';
+
+test('manual UI evidence accepts only the challenge issued after objective detach and catalog probe', () => {
+	const attestation = {
+		schemaVersion: 2,
+		runId,
+		postDetachChallenge,
+		confirmationAcceptedOnce: true,
+		targetSessionVisible: true,
+	};
+	assert.equal(canRequestManualPostDetachObservation(true, false, false), false);
+	assert.equal(canRequestManualPostDetachObservation(true, true, false), false);
+	assert.equal(canRequestManualPostDetachObservation(false, true, true), false);
+	assert.equal(
+		parseManualPostDetachAttestation(
+			attestation,
+			runId,
+			'00000000-0000-4000-8000-000000000006',
+		),
+		undefined,
+		'An attestation made before the post-detach challenge cannot pass.',
+	);
+	assert.equal(canRequestManualPostDetachObservation(true, true, true), true);
+	assert.deepEqual(
+		parseManualPostDetachAttestation(attestation, runId, postDetachChallenge),
+		{ confirmationAcceptedOnce: true, targetSessionVisible: true },
+	);
+	assert.equal(manualPostDetachObservationTimeoutMs, 5 * 60_000);
+});
+
+test('manual UI evidence remains unverified without objective detach', () => {
+	assert.equal(canRequestManualPostDetachObservation(true, false, true), false);
+	assert.equal(
+		parseManualPostDetachAttestation({
+			schemaVersion: 1,
+			runId,
+			confirmationAcceptedOnce: true,
+			targetSessionVisible: true,
+		}, runId, postDetachChallenge),
+		undefined,
+	);
+});
+
+test('manual post-detach observation polling is bounded and accepts a later exact challenge', async () => {
+	let now = 1_000;
+	let reads = 0;
+	const timedOut = await waitForManualPostDetachAttestation({
+		runId,
+		challenge: postDetachChallenge,
+		read: async () => {
+			reads += 1;
+			return undefined;
+		},
+		delay: async (milliseconds) => {
+			now += milliseconds;
+		},
+		now: () => now,
+		timeoutMs: 500,
+	});
+	assert.equal(timedOut, undefined);
+	assert.equal(reads, 2);
+
+	reads = 0;
+	now = 2_000;
+	const observed = await waitForManualPostDetachAttestation({
+		runId,
+		challenge: postDetachChallenge,
+		read: async () => {
+			reads += 1;
+			return reads === 2
+				? {
+					schemaVersion: 2,
+					runId,
+					postDetachChallenge,
+					confirmationAcceptedOnce: true,
+					targetSessionVisible: false,
+				}
+				: undefined;
+		},
+		delay: async (milliseconds) => {
+			now += milliseconds;
+		},
+		now: () => now,
+		timeoutMs: 1_000,
+	});
+	assert.deepEqual(observed, {
+		confirmationAcceptedOnce: true,
+		targetSessionVisible: false,
+	});
+	assert.equal(reads, 2);
+});
+
+test('editor catalog diagnostics classify tagged protocol and timeout failures', () => {
+	assert.equal(
+		classifyEditorCatalogError(new EditorCatalogProbeError('protocol', 'synthetic protocol failure')),
+		'protocol',
+	);
+	assert.equal(
+		classifyEditorCatalogError(new EditorCatalogProbeError('timeout', 'synthetic timeout failure')),
+		'timeout',
+	);
+});
 
 test('peer-delegation evidence rejects unsafe persistent content', () => {
 	const base = unverifiedEvidence();
@@ -186,6 +298,22 @@ test('peer-delegation passing evidence requires all real AC-5 conditions', () =>
 	assert.throws(
 		() => parsePeerDelegationEvidence({
 			...evidence,
+			sessionVisibility: {
+				...evidence.sessionVisibility,
+				status: 'pass',
+				clientDetachedObserved: true,
+				catalogAfterTerminalCleanup: false,
+				uiObserved: true,
+			},
+			experiments: evidence.experiments.map((experiment) => experiment.id === 'O1'
+				? { ...experiment, status: 'pass' as const, conclusion: 'editor-session-visible' as const }
+				: experiment),
+		}),
+		/Passing O1 evidence requires editor catalog and objective UI observation/u,
+	);
+	assert.throws(
+		() => parsePeerDelegationEvidence({
+			...evidence,
 			cleanup: {
 				...evidence.cleanup,
 				status: 'unverified',
@@ -243,6 +371,7 @@ test('peer-delegation recorder stores identities and hashes without prompt or ou
 		endpointFingerprint: '0123456789abcdef',
 	});
 	recorder.observeLifecycle({ taskId, eventType: 'chat/turnComplete' });
+	recorder.observeLifecycle({ taskId, eventType: 'session/clientDetached' });
 	const snapshot = recorder.snapshot();
 	assert.equal(snapshot.tools.length, 1);
 	assert.equal(snapshot.tools[0]?.taskId, taskId);
@@ -266,6 +395,12 @@ test('peer-delegation recorder stores identities and hashes without prompt or ou
 			at: snapshot.ahp[1]?.at,
 			taskId,
 			eventType: 'chat/turnComplete',
+		},
+		{
+			sequence: 4,
+			at: snapshot.ahp[2]?.at,
+			taskId,
+			eventType: 'session/clientDetached',
 		},
 	]);
 	assert.match(snapshot.ahp[0]?.sessionHash ?? '', /^[a-f0-9]{16}$/u);
@@ -369,6 +504,29 @@ test('0.4.0 release metadata keeps the real peer gate default-off and five-tool 
 	assert.match(
 		harness,
 		/async function installEvidenceTemporary[\s\S]*revalidateEvidenceDestination[\s\S]*await rename/u,
+	);
+	const manualCompletion = harness.indexOf('async function waitForManualCompletion');
+	const manualCompletionEnd = harness.indexOf('async function runNeedsInputScenario', manualCompletion);
+	const detachWait = harness.indexOf('const completionObservations = await waitForTaskClientDetach');
+	const catalogProbe = harness.indexOf("await request(target, 'peer.session.catalog'");
+	const postDetachPrompt = harness.indexOf('manualPostDetachObservationRequired: true');
+	const attestationRead = harness.indexOf('uiAttestation = await readUiAttestation(postDetachChallenge)');
+	assert.ok(manualCompletion >= 0 && manualCompletionEnd > manualCompletion);
+	assert.equal(
+		harness.slice(manualCompletion, manualCompletionEnd).includes('readUiAttestation'),
+		false,
+		'Manual completion must not read Session visibility before task-handle detach.',
+	);
+	assert.ok(
+		detachWait >= 0
+			&& detachWait < catalogProbe
+			&& catalogProbe < postDetachPrompt
+			&& postDetachPrompt < attestationRead,
+		'Post-detach attestation must follow objective detach and the fresh catalog probe.',
+	);
+	assert.match(
+		harness,
+		/canRequestManualPostDetachObservation\(\s*manualUi,\s*clientDetachedObserved,\s*catalogProbeCompleted/u,
 	);
 	assert.doesNotMatch(harness, /rm\(meshGlobalStorageDirectory/u);
 	assert.match(
@@ -500,6 +658,8 @@ function unverifiedEvidence(): PeerDelegationEvidence {
 			catalogBefore: 0,
 			catalogAfter: 0,
 			hostSessionEchoObserved: false,
+			clientDetachedObserved: false,
+			catalogAfterTerminalCleanup: false,
 			catalogSessionHashMatched: false,
 			uiObserved: false,
 		},
@@ -695,6 +855,8 @@ function passingEvidence(): PeerDelegationEvidence {
 			hostSessionHash: '0123456789abcdef',
 			editorEndpointFingerprint: 'fedcba9876543210',
 			hostSessionEchoObserved: true,
+			clientDetachedObserved: true,
+			catalogAfterTerminalCleanup: true,
 			catalogSessionHashMatched: true,
 			uiObserved: false,
 		},

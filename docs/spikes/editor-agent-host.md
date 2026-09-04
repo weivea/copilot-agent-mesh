@@ -293,8 +293,37 @@ P8 已实现可重复的两个普通窗口 Harness。它在窗口启动后用相
 observer 只记录 Host 在 subscribed Session snapshot 或 Session-channel action 中回显的
 created Session channel 事实及 Session/source/endpoint domain-separated 截断 Hash，作为
 AC-5.9 的客观 runtime 证据。与 recovery 共用同一本地 URI 的 hash 相等不算独立证据。另有 bounded
-post-task `listSessions` 只服务 O1 catalog/UI 可见性判断。任何路径都不保存 resource URI、
-socket 路径或 token。
+post-task `listSessions` 只服务 O1 catalog/UI 可见性判断；原始 task handle 只有在 subscription
+关闭、unsubscribe 与 AHP connection shutdown 成功后才记录 `session/clientDetached`，诊断收到
+该事件后才建立新连接，并且通过有页数上限、cursor 循环检测的分页扫描，只把 Idle/Error、
+非 InProgress、非 Archived 的 Session 纳入 hash 匹配。任何
+路径都不保存 resource URI、socket 路径或 token。
+
+VS Code 1.135.0 的 Host 会在 `createSession` 时先注册 Session，但 provider 可以返回
+provisional Session；`chat/turnComplete` 与 response 已可见时，provider 的
+`onDidMaterializeChat`/catalog metadata 仍可能尚未完成。此时立即 unsubscribe/disconnect
+会让 Chat Sessions UI 留在最后收到的 `Working…` 状态，并让未 materialize 的 draft 进入
+Host GC。仅跳过 `disposeSession` 因此不是 persistence proof。客户端现在只接受当前 `turnId`
+的终止 action。两次真实诊断分别证明保持 Session subscription、以及只
+`unsubscribe(session)` 但保留同一连接时，catalog 都可能继续为空；因此同一 handle 的
+`listSessions` 不能作为 terminal readiness barrier。AHP 1.0 的 `session/ready` 是 provisional
+Session 完成 materialization 的明确生命周期信号；客户端在权威终止后有界等待 exact Session
+ready，再 dispatch 自身 `session/activeClientRemoved` 并等待 Host 权威 echo，之后
+unsubscribe Session；completion 随后发布，权威 cancel/error 即使 preparation 失败也随后发布
+原 Host-confirmed 终态。任一 exact Host-authoritative terminal 都会先停止仍在运行的 cancellation
+timer。正常 handle disposal 关闭其余订阅和连接。这样不会依赖
+Host 对 unsubscribe/disconnect 的 SHOULD 级隐式清理，且 active-client tools/customizations
+明确移除；read/archive metadata 不由 Mesh 伪造。只有 disposal 完成后，诊断才从新的独立连接进行
+有界分页，并要求 exact Session 为 Idle/Error、非 InProgress、非 Archived。连接 shutdown
+只给 WebSocket 有界的 graceful-close 时间，随后强制关闭本地 socket，避免 Host close handshake
+不结束时永久卡住 handle disposal。所有已启动 pump 的清理路径（包括 Terminal prune 和 startup
+handoff）必须先 unsubscribe，再关闭 iterator；固定 SDK 的 iterator `return()` 会先 detach
+cursor 且不会唤醒已经等待中的 `next()`，反向顺序会永久死锁。pump settlement 另有硬上限，
+超时在 connection/Host shutdown 后显式失败。exact Host-authoritative terminal 会在 history
+preparation 前停止 cancellation timer；provisional never-ready 或 detach 失败会 dispose orphan
+并在 cleanup 报错，但不会把 Host-confirmed cancelled/error 改写成 failure/cancel-timeout。
+VS Code 1.135 在有真实 summary 时可能对带 schema-optional `limit` 的 `listSessions` 返回
+`-32603`；scanner 仅在这个精确错误上省略 `limit` 重试，cursor/page/cycle 上限保持不变。
 
 稳定 Extension API 不提供读取 Chat Sessions UI 或向内置 Copilot Agent 自动发送并确认
 消息的接口。P8 在 VS Code 1.135.0 观察到无 Chat context 的

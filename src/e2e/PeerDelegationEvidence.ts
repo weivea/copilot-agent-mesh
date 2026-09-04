@@ -189,6 +189,8 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 		hostSessionHash: fingerprint.optional(),
 		editorEndpointFingerprint: fingerprint.optional(),
 		hostSessionEchoObserved: z.boolean(),
+		clientDetachedObserved: z.boolean(),
+		catalogAfterTerminalCleanup: z.boolean(),
 		catalogSessionHashMatched: z.boolean(),
 		uiObserved: z.boolean(),
 	}),
@@ -814,6 +816,8 @@ function validateAc5Correspondence(
 		&& (
 			evidence.sessionVisibility.source !== 'editor'
 			|| !evidence.sessionVisibility.hostSessionEchoObserved
+			|| !evidence.sessionVisibility.clientDetachedObserved
+			|| !evidence.sessionVisibility.catalogAfterTerminalCleanup
 			|| !evidence.sessionVisibility.catalogSessionHashMatched
 			|| !evidence.sessionVisibility.uiObserved
 			|| evidence.sessionVisibility.catalogAfter < 1

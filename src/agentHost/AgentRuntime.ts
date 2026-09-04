@@ -77,7 +77,18 @@ export type AgentRuntimeLifecycleObservation =
 	}
 	| {
 		readonly taskId: string;
-		readonly eventType: 'chat/turnComplete' | 'chat/turnCancelled' | 'chat/error';
+		readonly eventType:
+			| 'chat/turnComplete'
+			| 'chat/turnCancelled'
+			| 'chat/error'
+			| 'session/materialized'
+			| 'session/clientDetachStarted'
+			| 'session/subscriptionIteratorsClosed'
+			| 'session/subscriptionPumpsSettled'
+			| 'session/channelsUnsubscribed'
+			| 'session/subscriptionsClosed'
+			| 'session/connectionClosed'
+			| 'session/clientDetached';
 	};
 
 export interface AgentRuntimeLifecycleObserver {

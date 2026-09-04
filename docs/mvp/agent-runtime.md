@@ -109,10 +109,36 @@ socket, and user-data paths never enter the ViewModel.
 Delegated Sessions use the exact target Workspace URI, publish no child Mesh tools,
 and receive the acknowledged title
 `Mesh · <safe source window name> → <safe bounded task summary>`. A rejected title
-removes the provisional Session. After an authoritative editor-host turn terminal,
-cleanup closes subscriptions, client connection, socket, and timers but does not call
-`disposeSession`, because that command removes the user-visible history. Standalone
-cleanup continues to dispose the Session and owned Host.
+removes the provisional Session. An authoritative editor-host terminal action must match the dispatched turn ID.
+Any exact Host-authoritative terminal clears an outstanding cancellation-confirmation timer
+immediately before optional history preparation. If the Session is still provisional,
+preparation waits up to 10 seconds for the exact Session's
+protocol-defined `session/ready` transition. It then dispatches its own AHP
+`session/activeClientRemoved` action, receives the authoritative Host echo, and unsubscribes
+the Session channel so VS Code removes the delegated active client and tools. Cancellation
+or error is then published with the Host-confirmed semantic even if preparation failed;
+handle cleanup disposes that orphan and surfaces the retention failure without rewriting
+confirmed cancelled/failed into another terminal semantic.
+VS Code 1.135.0 can keep returning an empty `listSessions` catalog on that same client
+until the connection itself is gone, so same-handle catalog visibility is not a valid
+runtime readiness precondition.
+Every pumped-subscription removal, including startup handoff and Terminal pruning,
+unsubscribes before closing its iterator because the pinned SDK's iterator `return()`
+detaches its cursor without waking an already parked `next()`. Pump settlement has a
+hard bound; timeout is reported as cleanup failure after connection/Host shutdown rather
+than hanging disposal. Cleanup then closes the client connection, socket, and timers
+without calling `disposeSession`, because that command removes the user-visible
+history. Connection shutdown allows a bounded graceful WebSocket close before forcing
+the local socket closed, so a Host that does not complete the close handshake cannot
+hang task disposal. A rejected/unacknowledged active-client removal or unsubscribe failure
+fails closed and leaves disposal to remove the orphan; Mesh does not modify read state.
+Missing materialization also fails retryably and disposal removes the orphan. Standalone
+cleanup continues to dispose the Session and owned Host. Objective catalog
+proof is instead collected only after handle cleanup by a fresh independent connection,
+using bounded cursor pagination and requiring the exact Session to be Idle/Error,
+non-InProgress, and non-Archived. VS Code 1.135 may return RPC `-32603` when the
+schema-optional page `limit` is present; the bounded scanner retries without that field
+while preserving its page, cursor-length, and cycle limits.
 
 Mapped events enter a queue bounded by both serialized UTF-8 bytes and event
 count. Progress coalesces to its latest queued value. Nonterminal output is
@@ -130,8 +156,9 @@ percent-encoded forms and are removed after the final borrowing task disposes.
 
 The P8 real harness may install a non-throwing, E2E-capability-only lifecycle
 observer. It records only the task UUID and one of
-`chat/turnComplete`/`chat/turnCancelled`/`chat/error`, allowing evidence to
-distinguish the authoritative AHP action from the persisted Mesh terminal state.
+`chat/turnComplete`/`chat/turnCancelled`/`chat/error`/`session/clientDetached`,
+allowing evidence to distinguish the authoritative AHP action, persisted Mesh
+terminal state, and successful original-handle detach.
 It never records an envelope, prompt, output, URI, endpoint, or token, and no
 observer exists in production extension mode.
 
@@ -230,11 +257,14 @@ and a fingerprinted editor endpoint. Equality with a recovery descriptor that
 uses the same locally generated Session URI is not treated as an independent
 cross-check. If the Host never echoes the Session, AC-5.9 remains Unverified
 even when the task otherwise completes. A separate bounded post-task `listSessions`
-observation remains O1 catalog evidence; it does not open and close a pre-task
-catalog client because that borrowed-client lifecycle can perturb editor
-identity readiness. Only fingerprints and counts leave the Extension Host. A
-standalone fallback can demonstrate degraded execution but can never satisfy
-the editor Session claim.
+observation remains O1 catalog evidence. It opens a new editor connection only after
+the original handle emits `session/clientDetached` following successful subscription
+and connection cleanup, then hashes only terminal, non-archived entries. This proves the Session
+survived client detach/reconnect rather than merely existing in the completing
+connection. It does not open and close a pre-task catalog client because that
+borrowed-client lifecycle can perturb editor identity readiness. Only fingerprints
+and counts leave the Extension Host. A standalone fallback can demonstrate degraded
+execution but can never satisfy the editor Session claim.
 
 ## Verified result
 

@@ -5,6 +5,8 @@ import type * as vscode from 'vscode';
 import {
 	AHP_PROTOCOL_OFFER,
 	SdkAhpConnectionFactory,
+	isUsableTerminalSessionStatus,
+	listSessionsBounded,
 	type AhpConnection,
 } from '../agentHost/AhpAgentRuntime';
 import type {
@@ -21,6 +23,17 @@ import type { BrokerLifecycle } from '../broker/BrokerLifecycle';
 import type { WindowNodeClient } from '../node/WindowNodeClient';
 import type { LocalIpcRemoteTaskAdapter } from '../node/LocalIpcRemoteTaskAdapter';
 import type { LocalIpcEndpoint } from '../ipc';
+
+const editorCatalogRetryTimeoutMs = 10_000;
+const editorCatalogRetryDelayMs = 100;
+type EditorCatalogErrorKind = 'protocol' | 'timeout' | 'transport' | 'closed' | 'other';
+
+export class EditorCatalogProbeError extends Error {
+	constructor(readonly kind: Extract<EditorCatalogErrorKind, 'protocol' | 'timeout'>, message: string) {
+		super(message);
+		this.name = 'EditorCatalogProbeError';
+	}
+}
 import {
 	parseDelegateTaskInput,
 	TaskToolsCore,
@@ -456,29 +469,83 @@ async function editorSessionCatalog(
 			readonly available: false;
 			readonly source: 'editor';
 			readonly errorCode: 'EDITOR_CATALOG_UNAVAILABLE';
+			readonly errorStage: 'launch' | 'connect' | 'initialize' | 'list';
+			readonly errorKind: 'protocol' | 'timeout' | 'transport' | 'closed' | 'other';
+			readonly rpcCode?: number;
 		};
+	let stage: 'launch' | 'connect' | 'initialize' | 'list' = 'launch';
 	try {
 		host = await launcher.launch();
+		stage = 'connect';
 		connection = await new SdkAhpConnectionFactory().connect(host);
+		stage = 'initialize';
 		const initialized = await connection.initialize(`mesh-peer-e2e-${randomUUID()}`);
 		if (!AHP_PROTOCOL_OFFER.includes(initialized.protocolVersion as '1.0.0')) {
-			throw new Error('The editor Agent Host selected an incompatible protocol.');
+			throw new EditorCatalogProbeError(
+				'protocol',
+				'The editor Agent Host selected an incompatible protocol.',
+			);
 		}
-		const sessions = await connection.listSessions(1);
+		stage = 'list';
+		const deadline = Date.now() + editorCatalogRetryTimeoutMs;
+		let sessions;
+		let lastError: unknown;
+		while (true) {
+			const remaining = deadline - Date.now();
+			if (remaining <= 0) {
+				throw lastError ?? new EditorCatalogProbeError(
+					'timeout',
+					'The editor Agent Host Session catalog remained unavailable.',
+				);
+			}
+			const attemptTimeout = new AbortController();
+			const timer = setTimeout(() => attemptTimeout.abort(), remaining);
+			try {
+				sessions = await listSessionsBounded(connection, attemptTimeout.signal);
+				break;
+			} catch (error: unknown) {
+				if (!attemptTimeout.signal.aborted) {
+					lastError = error;
+				}
+				if (Date.now() >= deadline) {
+					throw lastError ?? new EditorCatalogProbeError(
+						'timeout',
+						'The editor Agent Host Session catalog request timed out.',
+					);
+				}
+				await new Promise<void>((resolve) => {
+					setTimeout(resolve, Math.min(editorCatalogRetryDelayMs, deadline - Date.now()));
+				});
+			} finally {
+				clearTimeout(timer);
+			}
+		}
 		result = {
 			available: true,
 			source: 'editor',
 			protocolVersion: initialized.protocolVersion,
 			sessionCount: sessions.length,
 			sessionHashes: sessions
+				.filter(({ status }) => status !== undefined && isUsableTerminalSessionStatus(status))
 				.map(({ resource }) => fingerprint('agent-session', resource))
 				.sort(),
 		};
-	} catch {
+	} catch (error: unknown) {
+		const errorKind = classifyEditorCatalogError(error);
+		const rpcCode = typeof error === 'object'
+			&& error !== null
+			&& 'code' in error
+			&& typeof error.code === 'number'
+			&& Number.isSafeInteger(error.code)
+			? error.code
+			: undefined;
 		result = {
 			available: false,
 			source: 'editor',
 			errorCode: 'EDITOR_CATALOG_UNAVAILABLE',
+			errorStage: stage,
+			errorKind,
+			...(rpcCode === undefined ? {} : { rpcCode }),
 		};
 	}
 	const cleanup = await Promise.allSettled([
@@ -494,6 +561,22 @@ async function editorSessionCatalog(
 		};
 	}
 	return result;
+}
+
+export function classifyEditorCatalogError(error: unknown): EditorCatalogErrorKind {
+	if (error instanceof EditorCatalogProbeError) {
+		return error.kind;
+	}
+	const errorName = error instanceof Error ? error.name : '';
+	return errorName.includes('Protocol')
+		? 'protocol'
+		: errorName.includes('Timeout')
+			? 'timeout'
+			: errorName.includes('Transport')
+				? 'transport'
+				: errorName.includes('Closed')
+					? 'closed'
+					: 'other';
 }
 
 function resourceMetrics(options: PeerDelegationE2eApiOptions): {
