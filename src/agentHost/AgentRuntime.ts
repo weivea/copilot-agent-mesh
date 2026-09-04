@@ -74,6 +74,14 @@ export interface AgentHostSourceStatusProvider {
 export type AgentRuntimeLifecycleObservation =
 	| {
 		readonly taskId: string;
+		readonly eventType: 'protocol/negotiated';
+		readonly source: AgentHostSource;
+		readonly endpointFingerprint?: string;
+		readonly protocolOffer: AhpProtocolOffer;
+		readonly selectedProtocolVersion: AhpProtocolVersion;
+	}
+	| {
+		readonly taskId: string;
 		readonly eventType: 'session/hostObserved';
 		readonly sessionUri: string;
 		readonly source: AgentHostSource;

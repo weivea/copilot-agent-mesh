@@ -388,6 +388,14 @@ test('peer-delegation recorder stores identities and hashes without prompt or ou
 	});
 	recorder.observeLifecycle({
 		taskId,
+		eventType: 'protocol/negotiated',
+		source: 'editor',
+		endpointFingerprint: '0123456789abcdef',
+		protocolOffer: ['1.0.0', '0.9.0'],
+		selectedProtocolVersion: '0.9.0',
+	});
+	recorder.observeLifecycle({
+		taskId,
 		eventType: 'session/hostObserved',
 		sessionUri: 'session:do-not-persist-this-identifier',
 		source: 'editor',
@@ -410,9 +418,8 @@ test('peer-delegation recorder stores identities and hashes without prompt or ou
 			sequence: 2,
 			at: snapshot.ahp[0]?.at,
 			taskId,
-			eventType: 'session/hostObserved',
+			eventType: 'protocol/negotiated',
 			source: 'editor',
-			sessionHash: snapshot.ahp[0]?.sessionHash,
 			endpointFingerprint: '0123456789abcdef',
 			protocolOffer: ['1.0.0', '0.9.0'],
 			selectedProtocolVersion: '0.9.0',
@@ -421,16 +428,27 @@ test('peer-delegation recorder stores identities and hashes without prompt or ou
 			sequence: 3,
 			at: snapshot.ahp[1]?.at,
 			taskId,
-			eventType: 'chat/turnComplete',
+			eventType: 'session/hostObserved',
+			source: 'editor',
+			sessionHash: snapshot.ahp[1]?.sessionHash,
+			endpointFingerprint: '0123456789abcdef',
+			protocolOffer: ['1.0.0', '0.9.0'],
+			selectedProtocolVersion: '0.9.0',
 		},
 		{
 			sequence: 4,
 			at: snapshot.ahp[2]?.at,
 			taskId,
+			eventType: 'chat/turnComplete',
+		},
+		{
+			sequence: 5,
+			at: snapshot.ahp[3]?.at,
+			taskId,
 			eventType: 'session/clientDetached',
 		},
 	]);
-	assert.match(snapshot.ahp[0]?.sessionHash ?? '', /^[a-f0-9]{16}$/u);
+	assert.match(snapshot.ahp[1]?.sessionHash ?? '', /^[a-f0-9]{16}$/u);
 	assert.equal(JSON.stringify(snapshot).includes('do-not-persist-this-identifier'), false);
 });
 

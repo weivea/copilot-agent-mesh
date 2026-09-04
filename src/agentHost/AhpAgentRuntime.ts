@@ -852,6 +852,16 @@ class AhpTask implements AgentTaskHandle {
 			this.connection.protocolPolicy,
 			initialized.protocolVersion,
 		);
+		this.lifecycleObserver?.observeLifecycle({
+			taskId: this.request.taskId,
+			eventType: 'protocol/negotiated',
+			source: this.host.source ?? 'standalone',
+			protocolOffer: this.connection.protocolPolicy.offer,
+			selectedProtocolVersion: this.negotiatedProtocolVersion,
+			...(this.host.endpointFingerprint === undefined
+				? {}
+				: { endpointFingerprint: this.host.endpointFingerprint }),
+		});
 		this.lastSeenServerSeq = initialized.serverSeq;
 		const rootSnapshot = initialized.snapshots.find(({ resource }) => resource === rootUri);
 		if (rootSnapshot === undefined) {
@@ -1918,7 +1928,10 @@ class AhpTask implements AgentTaskHandle {
 	}
 
 	private observeLifecycleEvent(
-		eventType: Exclude<AgentRuntimeLifecycleObservation['eventType'], 'session/hostObserved'>,
+		eventType: Exclude<
+			AgentRuntimeLifecycleObservation['eventType'],
+			'protocol/negotiated' | 'session/hostObserved'
+		>,
 	): void {
 		try {
 			this.lifecycleObserver?.observeLifecycle({

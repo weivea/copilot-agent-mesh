@@ -109,6 +109,7 @@ export class PeerDelegationE2eRecorder implements
 				return;
 			}
 			const observesSession = observation.eventType === 'session/hostObserved';
+			const observesProtocol = observation.eventType === 'protocol/negotiated';
 			if (
 				observesSession
 				&& (
@@ -123,13 +124,17 @@ export class PeerDelegationE2eRecorder implements
 				at: new Date().toISOString(),
 				taskId: observation.taskId,
 				eventType: observation.eventType,
-				...(!observesSession
+				...(!observesSession && !observesProtocol
 					? {}
 					: {
-						sessionHash: digest('agent-session', observation.sessionUri).slice(0, 16),
 						source: observation.source,
 						protocolOffer: observation.protocolOffer,
 						selectedProtocolVersion: observation.selectedProtocolVersion,
+						...(observesSession
+							? {
+								sessionHash: digest('agent-session', observation.sessionUri).slice(0, 16),
+							}
+							: {}),
 						...(
 							observation.endpointFingerprint === undefined
 							|| !/^[a-f0-9]{16}$/u.test(observation.endpointFingerprint)

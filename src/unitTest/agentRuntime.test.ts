@@ -482,6 +482,13 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 	assert.deepEqual(lifecycle, [
 		{
 			taskId: 'task-1',
+			eventType: 'protocol/negotiated',
+			source: 'standalone',
+			protocolOffer: ['1.0.0'],
+			selectedProtocolVersion: '1.0.0',
+		},
+		{
+			taskId: 'task-1',
 			eventType: 'session/materialized',
 		},
 		{
@@ -1770,7 +1777,14 @@ test('runtime rejects a mismatched Host-echoed Session without recording local i
 			&& error.code === 'TASK_EXECUTION_FAILED'
 			&& /mismatched resource/u.test(error.message),
 	);
-	assert.deepEqual(lifecycle, []);
+	assert.equal(
+		lifecycle.some(({ eventType }) => eventType === 'session/hostObserved'),
+		false,
+	);
+	assert.equal(
+		lifecycle.filter(({ eventType }) => eventType === 'protocol/negotiated').length,
+		1,
+	);
 	assert.equal(transport.unsubscribedUris.includes(transport.created?.sessionUri ?? ''), true);
 	assert.equal(launcher.host.disposed, true);
 });

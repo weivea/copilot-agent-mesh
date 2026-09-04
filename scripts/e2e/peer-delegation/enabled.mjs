@@ -1222,6 +1222,11 @@ async function recordCompletionScenario({
 		.find((observation) =>
 			observation.taskId === completionTaskId
 			&& observation.eventType === 'session/hostObserved');
+	const protocolObservation = [...completionObservations.ahp]
+		.reverse()
+		.find((observation) =>
+			observation.taskId === completionTaskId
+			&& observation.eventType === 'protocol/negotiated');
 	const hostSessionHash = typeof hostSessionObservation?.sessionHash === 'string'
 		&& /^[a-f0-9]{16}$/u.test(hostSessionObservation.sessionHash)
 		? hostSessionObservation.sessionHash
@@ -1236,8 +1241,8 @@ async function recordCompletionScenario({
 	const hostSessionEchoObserved = hostSessionHash !== undefined
 		&& editorEndpointFingerprint !== undefined
 		&& hostSessionObservation?.source === 'editor';
-	const observedProtocolOffer = hostSessionObservation?.protocolOffer;
-	const observedSelectedProtocol = hostSessionObservation?.selectedProtocolVersion;
+	const observedProtocolOffer = protocolObservation?.protocolOffer;
+	const observedSelectedProtocol = protocolObservation?.selectedProtocolVersion;
 	const protocolNegotiationObserved =
 		(Array.isArray(observedProtocolOffer)
 			&& (

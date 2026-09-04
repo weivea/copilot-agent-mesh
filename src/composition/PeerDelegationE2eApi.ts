@@ -482,10 +482,18 @@ async function editorSessionCatalog(
 		connection = await new SdkAhpConnectionFactory().connect(host);
 		stage = 'initialize';
 		const initialized = await connection.initialize(`mesh-peer-e2e-${randomUUID()}`);
-		const selectedProtocolVersion = requireSelectedAhpProtocol(
-			connection.protocolPolicy,
-			initialized.protocolVersion,
-		);
+		let selectedProtocolVersion;
+		try {
+			selectedProtocolVersion = requireSelectedAhpProtocol(
+				connection.protocolPolicy,
+				initialized.protocolVersion,
+			);
+		} catch {
+			throw new EditorCatalogProbeError(
+				'protocol',
+				'The editor Agent Host selected an incompatible protocol.',
+			);
+		}
 		stage = 'list';
 		const deadline = Date.now() + editorCatalogRetryTimeoutMs;
 		let sessions;
