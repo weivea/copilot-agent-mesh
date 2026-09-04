@@ -144,8 +144,6 @@ for tests"_），因此现有 `WebSocketTransport.fromSocket(socket)` 可以直�
 submodule（`f19dd8b3942d029744a3bdd31d830f9428e8ea47`，TypeScript client 0.9.0，
 protocol offer 1.0.0）完全一致。这同时再次印证了不跟随 upstream `60706330`
 （AHP 0.9.0 offer）的既定决策：那会与 VS Code 1.135.0 的 `^1.0.0` 要求不兼容。
-VS Code 1.136.0 的后续诊断也接受同一 AHP 1.0 offer；运行 `8bbd…` 的失败发生在
-目标 renderer 关闭、Tool prepare 找不到 exact node instance 时，并非 AHP 协商失败。
 
 ## 5. Q4 — Session 可见性与 Provider 目录
 
@@ -298,7 +296,7 @@ AC-5.9 的客观 runtime 证据。与 recovery 共用同一本地 URI 的 hash �
 post-task `listSessions` 只服务 O1 catalog/UI 可见性判断；原始 task handle 只有在 subscription
 关闭、unsubscribe 与 AHP connection shutdown 成功后才记录 `session/clientDetached`，诊断收到
 该事件后才建立新连接，并且通过有页数上限、cursor 循环检测的分页扫描，只把 Idle/Error、
-非 InProgress、Archived 的 Session 纳入 hash 匹配。任何
+非 InProgress、非 Archived 的 Session 纳入 hash 匹配。任何
 路径都不保存 resource URI、socket 路径或 token。
 
 VS Code 1.135.0 的 Host 会在 `createSession` 时先注册 Session，但 provider 可以返回
@@ -310,14 +308,13 @@ Host GC。仅跳过 `disposeSession` 因此不是 persistence proof。客户端�
 `unsubscribe(session)` 但保留同一连接时，catalog 都可能继续为空；因此同一 handle 的
 `listSessions` 不能作为 terminal readiness barrier。AHP 1.0 的 `session/ready` 是 provisional
 Session 完成 materialization 的明确生命周期信号；客户端在权威终止后有界等待 exact Session
-ready，再依次 dispatch `session/isArchivedChanged { isArchived: true }` 和自身
-`session/activeClientRemoved`，分别等待 Host 权威 echo，之后 unsubscribe Session；completion
-随后发布，权威 cancel/error 即使 preparation 失败也随后发布
+ready，再 dispatch 自身 `session/activeClientRemoved` 并等待 Host 权威 echo，之后
+unsubscribe Session；completion 随后发布，权威 cancel/error 即使 preparation 失败也随后发布
 原 Host-confirmed 终态。任一 exact Host-authoritative terminal 都会先停止仍在运行的 cancellation
 timer。正常 handle disposal 关闭其余订阅和连接。这样不会依赖
 Host 对 unsubscribe/disconnect 的 SHOULD 级隐式清理，且 active-client tools/customizations
-明确移除；read metadata 不由 Mesh 伪造。只有 disposal 完成后，诊断才从新的独立连接进行
-有界分页，并要求 exact Session 为 Idle/Error、非 InProgress、Archived。连接 shutdown
+明确移除；read/archive metadata 不由 Mesh 伪造。只有 disposal 完成后，诊断才从新的独立连接进行
+有界分页，并要求 exact Session 为 Idle/Error、非 InProgress、非 Archived。连接 shutdown
 只给 WebSocket 有界的 graceful-close 时间，随后强制关闭本地 socket，避免 Host close handshake
 不结束时永久卡住 handle disposal。所有已启动 pump 的清理路径（包括 Terminal prune 和 startup
 handoff）必须先 unsubscribe，再关闭 iterator；固定 SDK 的 iterator `return()` 会先 detach
@@ -325,15 +322,6 @@ cursor 且不会唤醒已经等待中的 `next()`，反向顺序会永久死锁�
 超时在 connection/Host shutdown 后显式失败。exact Host-authoritative terminal 会在 history
 preparation 前停止 cancellation timer；provisional never-ready 或 detach 失败会 dispose orphan
 并在 cleanup 报错，但不会把 Host-confirmed cancelled/error 改写成 failure/cancel-timeout。
-
-真实运行 `1cf32269…` 进一步否定了“ready + active-client removal 足以结束 UI 状态”的假设：
-该运行在 post-detach window 已有 exact `chat/turnComplete`、Host Session echo、
-`session/clientDetached` 和全零资源清理，但用户仍看到 exact row 长期显示 `Working…`。
-VS Code 1.135 的 Chat Sessions controller 将 archive flag 映射到 Done/history；AHP 1.0 又明确将
-`session/isArchivedChanged` 定义为客户端在 task complete 时触发的 action。因此 Mesh 只在 exact
-authoritative terminal 且 materialized 后自动 archive，等待同源 acknowledgement 后才移除
-active client。`needsInput`、startup/provisional/orphan 路径不会 archive；后者仍由
-`disposeSession` 清除。最终 UI 证据区分 `retained-done`、`retained-working` 与 `absent`。
 VS Code 1.135 在有真实 summary 时可能对带 schema-optional `limit` 的 `listSessions` 返回
 `-32603`；scanner 仅在这个精确错误上省略 `limit` 重试，cursor/page/cycle 上限保持不变。
 

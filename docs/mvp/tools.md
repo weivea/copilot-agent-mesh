@@ -242,10 +242,3 @@ installs the five production descriptors and calls
 `registerMeshTaskTools(realFacade)`. Do not register the spike alongside the
 production tools: it owns an in-memory simulated task lifecycle and is retained
 only as isolated Phase 0 evidence under the spike-specific source and docs.
-
-Delegate preparation resolves the exact target instance before confirmation. If
-that instance has disappeared, the Facade returns retryable `PEER_OFFLINE`;
-safe Facade, cancellation, and timeout codes remain intact through preparation.
-The E2E observer records only a bounded `prepareFailed` phase and stable code,
-never target paths, prompts, or output. Preparation failure happens before
-intent persistence, task creation, or Workspace lease acquisition.

@@ -18,12 +18,8 @@ if (
 if (confirmation !== 'confirmation-once') {
 	throw new Error('Confirmation observation must be confirmation-once.');
 }
-if (
-	observation !== 'retained-done'
-	&& observation !== 'retained-working'
-	&& observation !== 'absent'
-) {
-	throw new Error('Observation must be retained-done, retained-working, or absent.');
+if (observation !== 'session-visible' && observation !== 'session-not-visible') {
+	throw new Error('Observation must be session-visible or session-not-visible.');
 }
 if (
 	typeof postDetachChallenge !== 'string'
@@ -57,11 +53,11 @@ try {
 	await writeFile(
 		temporaryPath,
 		`${JSON.stringify({
-			schemaVersion: 3,
+			schemaVersion: 2,
 			runId,
 			postDetachChallenge,
 			confirmationAcceptedOnce: true,
-			targetSessionState: observation,
+			targetSessionVisible: observation === 'session-visible',
 		})}\n`,
 		{ encoding: 'utf8', mode: 0o600, flag: 'wx' },
 	);

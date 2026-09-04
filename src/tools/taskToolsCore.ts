@@ -201,12 +201,7 @@ export class TaskToolsCore {
 		rawInput: unknown,
 		cancellation: ToolCancellation = neverCancelled,
 	): Promise<DelegateInvocationPreparation> {
-		let input: DelegationIntentInput;
-		try {
-			input = parseDelegateTaskInput(rawInput);
-		} catch {
-			throw new TaskToolFacadeError('INVALID_INPUT');
-		}
+		const input = parseDelegateTaskInput(rawInput);
 		const displayOutcome = await this.runBounded(
 			(signal) => {
 				if (this.facade.describeDelegationTarget === undefined) {
@@ -218,17 +213,7 @@ export class TaskToolsCore {
 			cancellation,
 		);
 		if (displayOutcome.kind !== 'success') {
-			switch (displayOutcome.kind) {
-				case 'cancelled':
-					throw new TaskToolFacadeError('CANCELLED', true);
-				case 'timeout':
-					throw new TaskToolFacadeError('TIMEOUT', true);
-				case 'failure':
-					throw displayOutcome.error instanceof TaskToolFacadeError
-						&& TASK_TOOL_ERROR_CODES.includes(displayOutcome.error.code)
-						? displayOutcome.error
-						: new TaskToolFacadeError('INTERNAL_ERROR');
-			}
+			throw new Error('The selected delegation target is unavailable.');
 		}
 		const windowName = safeDelegationText(displayOutcome.value.windowName, 256);
 		const workspaceName = safeDelegationText(displayOutcome.value.workspaceName, 256);

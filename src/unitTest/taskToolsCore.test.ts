@@ -7,7 +7,6 @@ import type {
 	MeshDirectorySnapshot,
 	PersistedDelegationIntent,
 	TaskActionReceipt,
-	TaskToolErrorCode,
 	TaskToolReadResult,
 	TaskToolSnapshot,
 } from '../../shared/toolProtocol';
@@ -240,42 +239,6 @@ suite('TaskToolsCore', () => {
 		assert.ok(!first.confirmationMessage.includes(input.prompt));
 		assert.equal(facade.persistCalls, 0);
 		assert.equal(facade.acceptanceWaits, 0);
-	});
-
-	test('preparation preserves safe offline, cancellation, timeout, and containment codes', async () => {
-		const facade = new RecordingFacade();
-		facade.describeError = new TaskToolFacadeError('PEER_OFFLINE', true);
-		await assert.rejects(
-			new TaskToolsCore(facade).prepareDelegateInvocation(delegationInput()),
-			hasFacadeError('PEER_OFFLINE', true),
-		);
-
-		facade.describeError = new Error('unsafe target detail');
-		await assert.rejects(
-			new TaskToolsCore(facade).prepareDelegateInvocation(delegationInput()),
-			hasFacadeError('INTERNAL_ERROR', false),
-		);
-
-		facade.describeError = undefined;
-		const cancellation = new ManualCancellation();
-		cancellation.cancel();
-		await assert.rejects(
-			new TaskToolsCore(facade).prepareDelegateInvocation(delegationInput(), cancellation),
-			hasFacadeError('CANCELLED', true),
-		);
-
-		facade.describeTarget = new Promise(() => undefined);
-		const clock = new ManualClock();
-		const pending = new TaskToolsCore(facade, { clock })
-			.prepareDelegateInvocation(delegationInput());
-		await settleMicrotasks();
-		clock.advanceBy(10_000);
-		await assert.rejects(pending, hasFacadeError('TIMEOUT', true));
-
-		await assert.rejects(
-			new TaskToolsCore(new RecordingFacade()).prepareDelegateInvocation({}),
-			hasFacadeError('INVALID_INPUT', false),
-		);
 	});
 
 	test('returns the exact completed compact contract after an authoritative event', async () => {
@@ -1811,16 +1774,6 @@ async function settleMicrotasks(): Promise<void> {
 	}
 }
 
-function hasFacadeError(
-	code: TaskToolErrorCode,
-	retryable: boolean,
-): (error: unknown) => boolean {
-	return (error: unknown) =>
-		error instanceof TaskToolFacadeError
-		&& error.code === code
-		&& error.retryable === retryable;
-}
-
 class RecordingFacade implements TaskToolFacade {
 	readonly sourceNodeId = SOURCE_NODE_ID;
 	workers: MeshDirectorySnapshot = {
@@ -1881,8 +1834,6 @@ class RecordingFacade implements TaskToolFacade {
 		summary: 'Scheduler fixed.',
 	};
 	listError: unknown;
-	describeError: unknown;
-	describeTarget?: Promise<{ readonly windowName: string; readonly workspaceName: string }>;
 	readonly getTaskErrors: unknown[] = [];
 	persistCalls = 0;
 	acceptanceWaits = 0;
@@ -1905,12 +1856,6 @@ class RecordingFacade implements TaskToolFacade {
 	}
 
 	async describeDelegationTarget() {
-		if (this.describeError !== undefined) {
-			throw this.describeError;
-		}
-		if (this.describeTarget !== undefined) {
-			return this.describeTarget;
-		}
 		return { windowName: 'Window One', workspaceName: 'app' };
 	}
 

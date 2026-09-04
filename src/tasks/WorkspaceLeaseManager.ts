@@ -41,10 +41,6 @@ export class WorkspaceLeaseManager {
 		return this.leases.has(workspaceId);
 	}
 
-	public activeLeaseCount(): number {
-		return this.leases.size;
-	}
-
 	public owner(workspaceId: string): WorkspaceLeaseOwner | undefined {
 		const owner = this.leases.get(workspaceId);
 		return owner === undefined ? undefined : { ...owner };

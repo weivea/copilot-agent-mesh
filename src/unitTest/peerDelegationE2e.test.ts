@@ -18,7 +18,6 @@ import {
 	EditorCatalogProbeError,
 	classifyEditorCatalogError,
 } from '../composition/PeerDelegationE2eApi';
-import { WorkspaceLeaseManager } from '../tasks/WorkspaceLeaseManager';
 import {
 	canRequestManualPostDetachObservation,
 	manualPostDetachObservationTimeoutMs,
@@ -34,16 +33,15 @@ const postDetachChallenge = '00000000-0000-4000-8000-000000000005';
 
 test('manual UI evidence accepts only the challenge issued after objective detach and catalog probe', () => {
 	const attestation = {
-		schemaVersion: 3,
+		schemaVersion: 2,
 		runId,
 		postDetachChallenge,
 		confirmationAcceptedOnce: true,
-		targetSessionState: 'retained-done',
+		targetSessionVisible: true,
 	};
-	assert.equal(canRequestManualPostDetachObservation(true, false, true, true), false);
-	assert.equal(canRequestManualPostDetachObservation(true, true, false, true), false);
-	assert.equal(canRequestManualPostDetachObservation(true, true, true, false), false);
-	assert.equal(canRequestManualPostDetachObservation(false, true, true, true), false);
+	assert.equal(canRequestManualPostDetachObservation(true, false, false), false);
+	assert.equal(canRequestManualPostDetachObservation(true, true, false), false);
+	assert.equal(canRequestManualPostDetachObservation(false, true, true), false);
 	assert.equal(
 		parseManualPostDetachAttestation(
 			attestation,
@@ -53,23 +51,22 @@ test('manual UI evidence accepts only the challenge issued after objective detac
 		undefined,
 		'An attestation made before the post-detach challenge cannot pass.',
 	);
-	assert.equal(canRequestManualPostDetachObservation(true, true, true, true), true);
+	assert.equal(canRequestManualPostDetachObservation(true, true, true), true);
 	assert.deepEqual(
 		parseManualPostDetachAttestation(attestation, runId, postDetachChallenge),
-		{ confirmationAcceptedOnce: true, targetSessionState: 'retained-done' },
+		{ confirmationAcceptedOnce: true, targetSessionVisible: true },
 	);
 	assert.equal(manualPostDetachObservationTimeoutMs, 5 * 60_000);
 });
 
 test('manual UI evidence remains unverified without objective detach', () => {
-	assert.equal(canRequestManualPostDetachObservation(true, true, false, true), false);
+	assert.equal(canRequestManualPostDetachObservation(true, false, true), false);
 	assert.equal(
 		parseManualPostDetachAttestation({
-			schemaVersion: 3,
+			schemaVersion: 1,
 			runId,
-			postDetachChallenge,
 			confirmationAcceptedOnce: true,
-			targetSessionState: 'unobserved',
+			targetSessionVisible: true,
 		}, runId, postDetachChallenge),
 		undefined,
 	);
@@ -103,11 +100,11 @@ test('manual post-detach observation polling is bounded and accepts a later exac
 			reads += 1;
 			return reads === 2
 				? {
-					schemaVersion: 3,
+					schemaVersion: 2,
 					runId,
 					postDetachChallenge,
 					confirmationAcceptedOnce: true,
-					targetSessionState: 'retained-working',
+					targetSessionVisible: false,
 				}
 				: undefined;
 		},
@@ -119,7 +116,7 @@ test('manual post-detach observation polling is bounded and accepts a later exac
 	});
 	assert.deepEqual(observed, {
 		confirmationAcceptedOnce: true,
-		targetSessionState: 'retained-working',
+		targetSessionVisible: false,
 	});
 	assert.equal(reads, 2);
 });
@@ -304,14 +301,12 @@ test('peer-delegation passing evidence requires all real AC-5 conditions', () =>
 			sessionVisibility: {
 				...evidence.sessionVisibility,
 				status: 'pass',
-				sessionArchivedObserved: true,
 				clientDetachedObserved: true,
 				catalogAfterTerminalCleanup: false,
 				uiObserved: true,
-				uiObservation: 'retained-done',
 			},
 			experiments: evidence.experiments.map((experiment) => experiment.id === 'O1'
-				? { ...experiment, status: 'pass' as const, conclusion: 'editor-session-retained-done' as const }
+				? { ...experiment, status: 'pass' as const, conclusion: 'editor-session-visible' as const }
 				: experiment),
 		}),
 		/Passing O1 evidence requires editor catalog and objective UI observation/u,
@@ -356,15 +351,6 @@ test('peer-delegation recorder stores identities and hashes without prompt or ou
 	const recorder = new PeerDelegationE2eRecorder();
 	recorder.observe({
 		toolName: 'mesh_delegate_task',
-		phase: 'prepareFailed',
-		input: {
-			delegationRequestId,
-			prompt: 'do not persist this preparation prompt',
-		},
-		errorCode: 'PEER_OFFLINE',
-	});
-	recorder.observe({
-		toolName: 'mesh_delegate_task',
 		phase: 'invokeCompleted',
 		input: {
 			delegationRequestId,
@@ -387,24 +373,16 @@ test('peer-delegation recorder stores identities and hashes without prompt or ou
 	recorder.observeLifecycle({ taskId, eventType: 'chat/turnComplete' });
 	recorder.observeLifecycle({ taskId, eventType: 'session/clientDetached' });
 	const snapshot = recorder.snapshot();
-	assert.equal(snapshot.tools.length, 2);
-	assert.deepEqual(snapshot.tools[0], {
-		sequence: 1,
-		at: snapshot.tools[0]?.at,
-		toolName: 'mesh_delegate_task',
-		phase: 'prepareFailed',
-		delegationRequestId,
-		errorCode: 'PEER_OFFLINE',
-	});
-	assert.equal(snapshot.tools[1]?.taskId, taskId);
+	assert.equal(snapshot.tools.length, 1);
+	assert.equal(snapshot.tools[0]?.taskId, taskId);
 	assert.equal(snapshot.tools[0]?.delegationRequestId, delegationRequestId);
-	assert.equal(snapshot.tools[1]?.compactStatus, 0);
-	assert.deepEqual(snapshot.tools[1]?.resultFields, ['d', 'r', 's', 't']);
-	assert.match(snapshot.tools[1]?.resultHash ?? '', /^[a-f0-9]{64}$/u);
+	assert.equal(snapshot.tools[0]?.compactStatus, 0);
+	assert.deepEqual(snapshot.tools[0]?.resultFields, ['d', 'r', 's', 't']);
+	assert.match(snapshot.tools[0]?.resultHash ?? '', /^[a-f0-9]{64}$/u);
 	assert.equal(JSON.stringify(snapshot).includes('do not persist'), false);
 	assert.deepEqual(snapshot.ahp, [
 		{
-			sequence: 3,
+			sequence: 2,
 			at: snapshot.ahp[0]?.at,
 			taskId,
 			eventType: 'session/hostObserved',
@@ -413,13 +391,13 @@ test('peer-delegation recorder stores identities and hashes without prompt or ou
 			endpointFingerprint: '0123456789abcdef',
 		},
 		{
-			sequence: 4,
+			sequence: 3,
 			at: snapshot.ahp[1]?.at,
 			taskId,
 			eventType: 'chat/turnComplete',
 		},
 		{
-			sequence: 5,
+			sequence: 4,
 			at: snapshot.ahp[2]?.at,
 			taskId,
 			eventType: 'session/clientDetached',
@@ -427,19 +405,6 @@ test('peer-delegation recorder stores identities and hashes without prompt or ou
 	]);
 	assert.match(snapshot.ahp[0]?.sessionHash ?? '', /^[a-f0-9]{16}$/u);
 	assert.equal(JSON.stringify(snapshot).includes('do-not-persist-this-identifier'), false);
-});
-
-test('authoritative Workspace lease count reaches zero only after exact release', () => {
-	const leases = new WorkspaceLeaseManager();
-	const workspaceId = 'workspace-lease-key';
-	const peerId = '00000000-0000-4000-8000-000000000010';
-	const leasedTaskId = '00000000-0000-4000-8000-000000000011';
-
-	assert.equal(leases.activeLeaseCount(), 0);
-	leases.acquire(workspaceId, peerId, leasedTaskId);
-	assert.equal(leases.activeLeaseCount(), 1);
-	leases.release(workspaceId, peerId, leasedTaskId);
-	assert.equal(leases.activeLeaseCount(), 0);
 });
 
 test('peer task evidence projection bounds verbose journals without inventing milestones', () => {
@@ -488,7 +453,6 @@ test('peer-delegation Tool clock shortens only minute-scale budget timers', () =
 test('0.4.0 release metadata keeps the real peer gate default-off and five-tool parity', () => {
 	const root = resolve(__dirname, '../../..');
 	const manifest = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8'));
-	const lockfile = JSON.parse(readFileSync(resolve(root, 'package-lock.json'), 'utf8'));
 	const wrapper = readFileSync(
 		resolve(root, 'scripts/e2e/peer-delegation/run.mjs'),
 		'utf8',
@@ -510,7 +474,6 @@ test('0.4.0 release metadata keeps the real peer gate default-off and five-tool 
 		'utf8',
 	);
 	assert.equal(manifest.version, '0.4.0');
-	assert.equal(lockfile.packages['node_modules/fast-uri'].version, '3.1.6');
 	assert.equal(
 		manifest.scripts['test:peer-delegation-real'],
 		'node scripts/e2e/peer-delegation/run.mjs',
@@ -563,20 +526,8 @@ test('0.4.0 release metadata keeps the real peer gate default-off and five-tool 
 	);
 	assert.match(
 		harness,
-		/canRequestManualPostDetachObservation\(\s*manualUi,\s*sessionArchivedObserved,\s*clientDetachedObserved,\s*catalogProbeCompleted/u,
+		/canRequestManualPostDetachObservation\(\s*manualUi,\s*clientDetachedObserved,\s*catalogProbeCompleted/u,
 	);
-	const leaseObservation = harness.indexOf("name: 'observe-workspace-leases'");
-	const controllerClose = harness.indexOf("name: 'close-controllers'");
-	assert.ok(leaseObservation >= 0 && leaseObservation < controllerClose);
-	assert.match(
-		harness.slice(manualCompletion, manualCompletionEnd),
-		/phase === 'prepareFailed'[\s\S]*new E2eRequestError\([\s\S]*failure\.errorCode/u,
-	);
-	assert.match(
-		harness,
-		/cleanupLeaseReleased = latestResourceMetrics\.activeWorkspaceLeaseCount === 0/u,
-	);
-	assert.match(harness, /targetSessionState:\s*'unobserved'/u);
 	assert.doesNotMatch(harness, /rm\(meshGlobalStorageDirectory/u);
 	assert.match(
 		application,
@@ -707,12 +658,10 @@ function unverifiedEvidence(): PeerDelegationEvidence {
 			catalogBefore: 0,
 			catalogAfter: 0,
 			hostSessionEchoObserved: false,
-			sessionArchivedObserved: false,
 			clientDetachedObserved: false,
 			catalogAfterTerminalCleanup: false,
 			catalogSessionHashMatched: false,
 			uiObserved: false,
-			uiObservation: 'unobserved',
 		},
 		transport: {
 			status: 'unverified',
@@ -906,12 +855,10 @@ function passingEvidence(): PeerDelegationEvidence {
 			hostSessionHash: '0123456789abcdef',
 			editorEndpointFingerprint: 'fedcba9876543210',
 			hostSessionEchoObserved: true,
-			sessionArchivedObserved: true,
 			clientDetachedObserved: true,
 			catalogAfterTerminalCleanup: true,
 			catalogSessionHashMatched: true,
 			uiObserved: false,
-			uiObservation: 'unobserved',
 		},
 		transport: {
 			status: 'pass',

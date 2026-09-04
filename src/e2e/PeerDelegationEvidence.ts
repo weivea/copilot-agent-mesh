@@ -189,12 +189,10 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 		hostSessionHash: fingerprint.optional(),
 		editorEndpointFingerprint: fingerprint.optional(),
 		hostSessionEchoObserved: z.boolean(),
-		sessionArchivedObserved: z.boolean(),
 		clientDetachedObserved: z.boolean(),
 		catalogAfterTerminalCleanup: z.boolean(),
 		catalogSessionHashMatched: z.boolean(),
 		uiObserved: z.boolean(),
-		uiObservation: z.enum(['retained-done', 'retained-working', 'absent', 'unobserved']),
 	}),
 	transport: z.strictObject({
 		status,
@@ -227,7 +225,7 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 		z.strictObject({
 			id: z.literal('O1'),
 			status: experimentStatus,
-			conclusion: z.enum(['editor-session-retained-done', 'dashboard-only', 'unverified']),
+			conclusion: z.enum(['editor-session-visible', 'dashboard-only', 'unverified']),
 		}),
 		z.strictObject({
 			id: z.literal('O2'),
@@ -818,12 +816,10 @@ function validateAc5Correspondence(
 		&& (
 			evidence.sessionVisibility.source !== 'editor'
 			|| !evidence.sessionVisibility.hostSessionEchoObserved
-			|| !evidence.sessionVisibility.sessionArchivedObserved
 			|| !evidence.sessionVisibility.clientDetachedObserved
 			|| !evidence.sessionVisibility.catalogAfterTerminalCleanup
 			|| !evidence.sessionVisibility.catalogSessionHashMatched
 			|| !evidence.sessionVisibility.uiObserved
-			|| evidence.sessionVisibility.uiObservation !== 'retained-done'
 			|| evidence.sessionVisibility.catalogAfter < 1
 		)
 	) {
@@ -833,7 +829,7 @@ function validateAc5Correspondence(
 		evidence.experiments[0].status !== evidence.sessionVisibility.status
 		|| (
 			evidence.experiments[0].status === 'pass'
-			&& evidence.experiments[0].conclusion !== 'editor-session-retained-done'
+			&& evidence.experiments[0].conclusion !== 'editor-session-visible'
 		)
 	) {
 		addInvariantIssue(context, ['experiments', 0], 'O1 must match the recorded editor Session visibility evidence.');

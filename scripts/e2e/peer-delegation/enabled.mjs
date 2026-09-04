@@ -172,7 +172,6 @@ let cleanupOperation;
 let ownershipSampler;
 let ownershipSamplerStarted = false;
 let ownershipSamplerFailure;
-let resourceMetricController;
 let testDirtyTree = false;
 let testEvidencePersistenceAllowed = true;
 
@@ -216,7 +215,6 @@ try {
 
 	assert.equal(currentOwnedProcesses().length, 0, 'Fresh peer E2E markers matched an existing process.');
 	const source = await launchAndDiscover(sourceWorkspacePath);
-	resourceMetricController = source;
 	activeControllers.set(source.windowId, source);
 	await waitForControllerState(
 		source,
@@ -410,7 +408,14 @@ try {
 		localRouteOnly: transportPass,
 	};
 	setAc5(10, transportPass ? 'pass' : 'fail', transportPass ? ['#/transport'] : []);
-	cleanupLeaseReleased = latestResourceMetrics.activeWorkspaceLeaseCount === 0;
+	cleanupLeaseReleased = completionAvailable
+		? [
+			evidence.completion.leaseReleased,
+			evidence.needsInput.leaseReleased,
+			evidence.cancellation.leaseReleased,
+			evidence.timeout.leaseReleased,
+		].every(Boolean)
+		: evidence.completion.leaseReleased;
 	assert.equal(latestResourceMetrics.toolTimers.activeTimers, 0);
 	assert.equal(latestResourceMetrics.toolTimers.armedBudgetTimers, 0);
 	await assertProjectUnchanged(sourceWorkspacePath);
@@ -1167,11 +1172,6 @@ async function recordCompletionScenario({
 			observation.taskId === completionTaskId
 			&& observation.eventType === 'session/clientDetached',
 	);
-	const sessionArchivedObserved = completionObservations.ahp.some(
-		(observation) =>
-			observation.taskId === completionTaskId
-			&& observation.eventType === 'session/archived',
-	);
 	console.log(JSON.stringify({
 		type: 'sanitized-agent-host-cleanup',
 		events: completionObservations.ahp
@@ -1193,11 +1193,10 @@ async function recordCompletionScenario({
 	}));
 	let uiAttestation = completionRun.uiAttestation ?? {
 		confirmationAcceptedOnce: false,
-		targetSessionState: 'unobserved',
+		targetSessionVisible: false,
 	};
 	if (canRequestManualPostDetachObservation(
 		manualUi,
-		sessionArchivedObserved,
 		clientDetachedObserved,
 		catalogProbeCompleted,
 	)) {
@@ -1209,7 +1208,7 @@ async function recordCompletionScenario({
 			targetWindowLabel,
 			observationWindowSeconds: manualPostDetachObservationTimeoutMs / 1_000,
 			attestationCommand:
-				`node scripts/e2e/peer-delegation/attest.mjs ${runId} confirmation-once retained-done ${postDetachChallenge}`,
+				`node scripts/e2e/peer-delegation/attest.mjs ${runId} confirmation-once session-visible ${postDetachChallenge}`,
 		}));
 		uiAttestation = await readUiAttestation(postDetachChallenge);
 	}
@@ -1320,14 +1319,9 @@ async function recordCompletionScenario({
 		? ['#/completion/source', '#/sessionVisibility/hostSessionEchoObserved']
 		: []);
 
-	const uiObservation = uiAttestation.targetSessionState;
-	const uiObserved = uiObservation === 'retained-done';
+	const uiObserved = uiAttestation.targetSessionVisible === true;
 	evidence.sessionVisibility = {
-		status: editorSessionObserved
-			&& sessionArchivedObserved
-			&& clientDetachedObserved
-			&& catalogSessionHashMatched
-			&& uiObserved
+		status: editorSessionObserved && catalogSessionHashMatched && uiObserved
 			? 'pass'
 			: 'unverified',
 		source: sourceKind,
@@ -1336,18 +1330,16 @@ async function recordCompletionScenario({
 		...(hostSessionHash === undefined ? {} : { hostSessionHash }),
 		...(editorEndpointFingerprint === undefined ? {} : { editorEndpointFingerprint }),
 		hostSessionEchoObserved,
-		sessionArchivedObserved,
 		clientDetachedObserved,
 		catalogAfterTerminalCleanup: clientDetachedObserved && catalogAfter.available === true,
 		catalogSessionHashMatched,
 		uiObserved,
-		uiObservation,
 	};
 	evidence.experiments[0] = {
 		id: 'O1',
 		status: evidence.sessionVisibility.status,
 		conclusion: evidence.sessionVisibility.status === 'pass'
-			? 'editor-session-retained-done'
+			? 'editor-session-visible'
 			: 'unverified',
 	};
 	if (evidence.sessionVisibility.status === 'pass') {
@@ -1400,7 +1392,7 @@ async function runProgrammaticCoreCompletion(source, targetInputBase) {
 		},
 		uiAttestation: {
 			confirmationAcceptedOnce: false,
-			targetSessionState: 'unobserved',
+			targetSessionVisible: false,
 		},
 	};
 }
@@ -1443,15 +1435,6 @@ async function waitForManualCompletion(source, targetInputBase) {
 		const matching = observations.tools.filter(
 			(observation) => observation.delegationRequestId === delegationRequestId,
 		);
-		const preparationFailures = matching.filter(({ phase }) => phase === 'prepareFailed');
-		if (preparationFailures.length > 0) {
-			const failure = preparationFailures[0];
-			throw new E2eRequestError(
-				'mesh_delegate_task.prepare',
-				failure.errorCode ?? 'INTERNAL_ERROR',
-				'The manual delegation target became unavailable before invocation.',
-			);
-		}
 		const preparedCount = matching.filter(({ phase }) => phase === 'prepared').length;
 		const acceptedCount = matching.filter(({ phase }) => phase === 'invokeStarted').length;
 		const completedObservations = matching.filter(({ phase }) => phase === 'invokeCompleted');
@@ -1664,7 +1647,7 @@ async function readUiAttestation(postDetachChallenge) {
 	});
 	return attestation ?? {
 		confirmationAcceptedOnce: false,
-		targetSessionState: 'unobserved',
+		targetSessionVisible: false,
 	};
 }
 
@@ -1875,19 +1858,6 @@ async function performCleanupOnce() {
 			},
 		},
 		{ name: 'stop-ownership-sampler', run: async () => stopOwnershipSampler() },
-		{
-			name: 'observe-workspace-leases',
-			run: async () => {
-				if (resourceMetricController === undefined) {
-					throw new Error('The authoritative Broker lease metric is unavailable.');
-				}
-				latestResourceMetrics = await request(resourceMetricController, 'peer.resources');
-				cleanupLeaseReleased = latestResourceMetrics.activeWorkspaceLeaseCount === 0;
-				if (!cleanupLeaseReleased) {
-					throw new Error('The authoritative Broker reports an active Workspace lease.');
-				}
-			},
-		},
 		{ name: 'close-controllers', run: closeControllers },
 		{
 			name: 'owned-processes',
@@ -2569,12 +2539,10 @@ function initialEvidence() {
 			catalogBefore: 0,
 			catalogAfter: 0,
 			hostSessionEchoObserved: false,
-			sessionArchivedObserved: false,
 			clientDetachedObserved: false,
 			catalogAfterTerminalCleanup: false,
 			catalogSessionHashMatched: false,
 			uiObserved: false,
-			uiObservation: 'unobserved',
 		},
 		transport: {
 			status: 'unverified',
