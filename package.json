@@ -432,6 +432,24 @@
           "scope": "machine",
           "markdownDescription": "Enable Preview same-device peer window discovery, policy configuration, and incoming task routing. Authorization remains default-deny."
         },
+        "copilotAgentMesh.experimental.crossDeviceDiscovery": {
+          "type": "boolean",
+          "default": false,
+          "scope": "machine",
+          "markdownDescription": "Enable Broker-owned Microsoft Dev Tunnels account discovery. Authorize an exact account and separately allow Mesh advertisement updates from the Dashboard. This does not start hosting, pair devices, or authorize tasks."
+        },
+        "copilotAgentMesh.experimental.crossDeviceDelegation": {
+          "type": "boolean",
+          "default": false,
+          "scope": "machine",
+          "markdownDescription": "Enable strict cross-device delegation: source Workspace allowlists, target receive plus incoming device grants, and the target's existing editor Host. Activation is durable; turning this off blocks new remote tasks rather than restoring legacy authorization. Target per-task confirmation remains required."
+        },
+        "copilotAgentMesh.experimental.devTunnelSdkHosting": {
+          "type": "boolean",
+          "default": false,
+          "scope": "machine",
+          "markdownDescription": "Allow the optional Dev Tunnels SDK private hosting backend on macOS arm64. Select and migrate explicitly in the Dashboard; this flag does not replace a running CLI host. No anonymous ACE or automatic legacy fallback is used."
+        },
         "copilotAgentMesh.agentHost.userDataDir": {
           "type": "string",
           "default": "",
@@ -536,6 +554,7 @@
     "@types/mocha": "^10.0.10",
     "@types/node": "22.x",
     "@types/vscode": "^1.103.0",
+    "@types/websocket": "1.0.10",
     "@types/ws": "8.18.1",
     "@vscode/test-cli": "^0.0.15",
     "@vscode/test-electron": "^3.0.0",
@@ -554,6 +573,13 @@
   },
   "dependencies": {
     "@microsoft/agent-host-protocol": "file:third_party/agent-host-protocol/clients/typescript",
+    "@microsoft/dev-tunnels-connections": "1.3.56",
+    "@microsoft/dev-tunnels-contracts": "1.3.56",
+    "@microsoft/dev-tunnels-management": "1.3.56",
+    "@microsoft/dev-tunnels-ssh": "3.12.42",
+    "axios": "1.20.0",
+    "node-rsa": "1.1.1",
+    "vscode-jsonrpc": "4.0.0",
     "ws": "8.21.3",
     "zod": "4.1.11"
   }

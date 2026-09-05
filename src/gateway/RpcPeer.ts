@@ -24,6 +24,7 @@ const TOTAL_OUTBOX_MAX_EVENTS = ORDINARY_OUTBOX_MAX_EVENTS + PRESSURE_MARKER_MAX
 const OUTPUT_PRESSURE_MARKER = 'Output truncated due to outbound backpressure.';
 
 export interface RpcPeerOptions {
+	readonly admissionReady?: () => boolean;
 	readonly preAuthMaxBytes?: number;
 	readonly preAuthRateCount?: number;
 	readonly preAuthRateWindowMs?: number;
@@ -84,6 +85,7 @@ export class RpcPeer {
 	private authenticationFailures = 0;
 	private sending = false;
 	private disposed = false;
+	private readonly admissionReady: (() => boolean) | undefined;
 
 	public constructor(
 		private readonly socket: WebSocket,
@@ -94,6 +96,7 @@ export class RpcPeer {
 		options: RpcPeerOptions = {},
 	) {
 		this.preAuthMaxBytes = options.preAuthMaxBytes ?? 64 * 1024;
+		this.admissionReady = options.admissionReady;
 		this.preAuthRateCount = options.preAuthRateCount ?? 8;
 		this.preAuthRateWindowMs = options.preAuthRateWindowMs ?? 10_000;
 		this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 10_000;
@@ -143,7 +146,20 @@ export class RpcPeer {
 		if (this.authenticatedPeerId !== peerId || this.disposed) {
 			return Promise.resolve();
 		}
+		try {
+			this.pairing.assertPeerAllowed(peerId);
+		} catch {
+			this.revokePeer(peerId);
+			return Promise.resolve();
+		}
 		return this.send({ jsonrpc: '2.0', method, params });
+	}
+
+	public revokePeer(peerId: string): void {
+		if (this.authenticatedPeerId === peerId || this.pairing.connectionHasPeer(this.connectionId, peerId)) {
+			this.socket.terminate();
+			this.dispose();
+		}
 	}
 
 	public dispose(): void {
@@ -211,6 +227,9 @@ export class RpcPeer {
 	}
 
 	private async dispatch(request: RpcRequest): Promise<unknown> {
+		if (this.admissionReady?.() === false) {
+			throw new MeshDomainError('WORKER_DRAINING', 'The remote listener is not accepting requests.', true);
+		}
 		if (request.method === 'mesh.hello') {
 			if (this.authenticatedPeerId !== undefined) {
 				throw new RpcFailure(1001, 'Authentication failed.', 'AUTH_FAILED');
@@ -253,6 +272,7 @@ export class RpcPeer {
 		if (this.authenticatedPeerId === undefined) {
 			throw new RpcFailure(1000, 'Authentication is required.', 'AUTH_REQUIRED');
 		}
+		await this.pairing.assertActivePeer(this.authenticatedPeerId);
 		if (request.method === 'mesh.ping') {
 			assertExactParams(request.params, ['sentAt']);
 			if (typeof request.params.sentAt !== 'number'
@@ -268,6 +288,7 @@ export class RpcPeer {
 	}
 
 	private markAuthenticated(peerId: string): void {
+		this.pairing.assertPeerAllowed(peerId);
 		if (this.authenticatedPeerId !== undefined
 			|| this.disposed
 			|| this.socket.readyState !== WebSocket.OPEN) {

@@ -69,7 +69,24 @@ test('local facade lists this device and every broker-listed node opaquely', asy
 		}],
 		truncated: false,
 	});
+
 	assert.doesNotMatch(JSON.stringify(directory), /file:|Users|prompt|secret|output/u);
+});
+
+test('describing and starting an explicit same-device target never touches the remote adapter', async () => {
+	const client = new FakeWindowNodeClient();
+	let requests = 0;
+	const unavailable = async (): Promise<never> => { requests += 1; throw new Error('No remote request is permitted.'); };
+	const facade = new LocalBrokerTaskFacade(client, {
+		deviceName: 'Local Device',
+		remoteAdapter: {
+			listDevices: unavailable, startTask: unavailable, getTask: unavailable,
+			cancelTask: unavailable, answerTask: unavailable,
+		},
+	});
+	await facade.describeDelegationTarget(intent(), new AbortController().signal);
+	await facade.persistDelegationIntent(intent());
+	assert.equal(requests, 0);
 });
 
 test('stable task IDs survive facade reload and changed retries surface broker conflict', async () => {

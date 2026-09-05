@@ -2,6 +2,7 @@ import * as assert from 'node:assert/strict';
 import type { Server } from 'node:http';
 import { test } from 'node:test';
 import type * as vscode from 'vscode';
+import { DISABLED_CONNECTIVITY_SNAPSHOT } from '../../shared/protocol';
 
 import { ListenerService, type ListenerGateway, type ListenerPairing } from '../application/ListenerService';
 import { LocalDesktopWorkspaceGuard } from '../application/LocalDesktopWorkspaceGuard';
@@ -264,6 +265,8 @@ test('production dashboard uses the safe unfiltered directory for self, conflict
 		node: {
 			nodeId: thisNodeId,
 			onDidChange: () => disposable,
+			connectivitySnapshot: async () => DISABLED_CONNECTIVITY_SNAPSHOT,
+			cachedRemoteDevices: async () => ({ devices: [], truncated: false, totalDevices: 0 }),
 			selectPeerPolicyWorkspace: () => ({
 				kind: 'selected',
 				workspaceIdentity: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
@@ -851,7 +854,7 @@ class RecordingTunnel implements DevTunnelProvider {
 			status: 'ready',
 			tunnelAlias: request.tunnelAlias,
 			tunnelExpiresAt: '2099-01-01T00:00:00.000Z',
-			tunnelId: 'test',
+			tunnelId: 'test.use2',
 		};
 		this.status = { state: 'ready', tunnel: hosted };
 		return hosted;

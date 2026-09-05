@@ -5,9 +5,13 @@ import { z } from 'zod';
 
 import {
 	ACTIVE_TASK_STATUSES,
+	connectivitySnapshotSchema,
+	DISABLED_CONNECTIVITY_SNAPSHOT,
 	JSON_RPC_ERROR_CODES,
 	PROTOCOL_LIMITS,
 	utf8String,
+	type ConnectivityAction,
+	type ConnectivitySnapshot,
 	type DashboardTaskDirection,
 } from '../../shared/protocol';
 import type {
@@ -137,22 +141,35 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 		);
 		const thisWindowBase = await this.thisWindowSnapshot(localNodes, errors, policySelection);
 
+		let connectivity: ConnectivitySnapshot;
+		try {
+			connectivity = connectivitySnapshotSchema.parse(await this.options.node.connectivitySnapshot());
+		} catch {
+			connectivity = {
+				...DISABLED_CONNECTIVITY_SNAPSHOT,
+				state: 'error',
+				error: 'DISCOVERY_UNAVAILABLE',
+			};
+			errors.push({
+				code: 'CONNECTIVITY_UNAVAILABLE',
+				message: 'Cross-device settings could not be read from the local Device Broker.',
+				action: 'Refresh local status after Broker reconnection. Local Window Node controls remain separate.',
+			});
+		}
+
 		let remoteDirectory: MeshRemoteDirectorySnapshot = {
 			devices: [],
 			truncated: false,
 			totalDevices: 0,
 		};
-		const remoteController = deadlineSignal(2_000);
 		try {
-			remoteDirectory = await this.options.remoteTasks.listDevices(remoteController.signal);
+			remoteDirectory = await this.options.node.cachedRemoteDevices();
 		} catch {
 			errors.push({
 				code: 'REMOTE_DIRECTORY_UNAVAILABLE',
-				message: 'Remote Device and Node status could not be refreshed.',
-				action: 'Check the peer connection and refresh.',
+				message: 'Cached remote Device and Node status is unavailable.',
+				action: 'Refresh local status after Broker reconnection. Use Mesh Tools for an explicit worker refresh.',
 			});
-		} finally {
-			remoteController.abort();
 		}
 		if (
 			remoteDirectory.truncated
@@ -188,8 +205,11 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 			}),
 		);
 
-		const runtimeProbe: AgentRuntimeProbe = thisWindowBase.previewEnabled
-			? await this.options.runtime().probe().catch(() => ({
+		const runtimePreviewEnabled = thisWindowBase.previewEnabled || connectivity.delegationEnabled;
+		const runtimeProbe: AgentRuntimeProbe = runtimePreviewEnabled
+			? await this.options.runtime().probe(
+				!thisWindowBase.previewEnabled && connectivity.delegationEnabled ? { requireEditor: true } : undefined,
+			).catch(() => ({
 				available: false,
 				featureEnabled: false,
 				reason: 'AGENT_UNAVAILABLE' as const,
@@ -202,6 +222,11 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 		const listener = listenerSnapshot(owner, runtimeProbe, this.options.workerPlatform);
 		const thisWindow: DashboardSnapshot['thisWindow'] = {
 			...thisWindowBase,
+			acceptsIncoming: !thisWindowBase.previewEnabled
+				&& thisWindowBase.claimStatus === 'claimed'
+				&& connectivity.claimedWorkspaceCount === 1
+				? connectivity.receivingWorkspaceCount === 1
+				: thisWindowBase.acceptsIncoming,
 			...(thisWindowBase.canSetAcceptIncoming && policySelection.kind === 'selected'
 				? {
 					acceptActionHandle: this.issueBindingHandle(this.acceptActions, {
@@ -210,11 +235,11 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 					}),
 				}
 				: {}),
-			agentHost: !thisWindowBase.previewEnabled ? {
+			agentHost: !runtimePreviewEnabled ? {
 				source: 'unavailable',
 				label: 'Unavailable (Preview off)',
 				degraded: false,
-				detail: 'Enable Peer Delegation Preview before an Agent Host source is selected.',
+				detail: 'Enable local or cross-device delegation before an Agent Host source is selected.',
 			} : {
 				source: runtimeProbe.source === 'editor'
 					? 'editor'
@@ -363,6 +388,7 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 			},
 			broker,
 			thisWindow,
+			connectivity,
 			policyCandidates,
 			outgoingTasks,
 			incomingTasks,
@@ -518,6 +544,12 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 		} catch (error: unknown) {
 			throw toDashboardPolicyError(error);
 		}
+		this.options.changed.fire();
+	}
+
+	public async connectivityAction(action: ConnectivityAction, actionHandle?: string): Promise<void> {
+		this.options.guard.assertAllowed({ requireWorkspace: false });
+		await this.options.node.connectivityAction(action, actionHandle);
 		this.options.changed.fire();
 	}
 

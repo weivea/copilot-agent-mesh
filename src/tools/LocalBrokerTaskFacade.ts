@@ -56,6 +56,10 @@ type WindowNodeFacadeClient = Pick<
 
 export interface RemoteTaskRouteAdapter {
 	listDevices(signal: AbortSignal): Promise<MeshRemoteDirectorySnapshot>;
+	cachedDevices?(): MeshRemoteDirectorySnapshot;
+	lookupTarget?(
+		profileId: string, target: RoutedTaskStartParams['target'],
+	): import('../broker/RemotePeerPolicyService').AuthenticatedRemoteTarget | undefined;
 	prevalidateStartTask?(
 		input: RoutedTaskStartParams,
 		route: { readonly peerId?: string },
@@ -65,6 +69,7 @@ export interface RemoteTaskRouteAdapter {
 		route: {
 			readonly peerId?: string;
 			readonly delegatedExecutionContext?: DelegatedExecutionContext;
+			readonly assertAuthorized?: () => Promise<void>;
 		},
 		outcome?: RemoteTaskStartOutcome,
 	): Promise<TaskSnapshot>;
@@ -196,6 +201,17 @@ export class LocalBrokerTaskFacade implements TaskToolFacade {
 		intent: DelegationIntentInput,
 		signal: AbortSignal,
 	): Promise<DelegationTargetDisplay> {
+		if (intent.deviceId === this.client.deviceId) {
+			const local = await raceAbort(this.client.listNodes(), signal);
+			this.assertLocalDirectory(local);
+			const node = local.nodes.find((candidate) =>
+				candidate.nodeId === intent.nodeId && candidate.nodeInstanceId === intent.nodeInstanceId);
+			const workspace = node?.workspaces.find((candidate) => candidate.workspaceId === intent.workspaceId);
+			if (node === undefined || workspace === undefined) {
+				throw new TaskToolFacadeError('WORKSPACE_NOT_FOUND');
+			}
+			return { windowName: node.label, workspaceName: workspace.name };
+		}
 		const directory = await this.listWorkers(signal);
 		const device = directory.devices.find(({ deviceId }) => deviceId === intent.deviceId);
 		const node = device?.nodes.find(({ nodeId, nodeInstanceId }) =>

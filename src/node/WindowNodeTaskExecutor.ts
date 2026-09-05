@@ -328,7 +328,7 @@ export class WindowNodeTaskExecutor {
 		const grant = assertDelegationGrantBinding(params, workspace);
 		this.assertRecordWithinWorkerDeadline(record, params.workerDeadline);
 		const probe = await abortablePreStartOperation(
-			this.options.runtime.probe(),
+			this.options.runtime.probe(params.requireEditor ? { requireEditor: true } : undefined),
 			record.preStartAbort.signal,
 		);
 		if (!probe.featureEnabled || (!probe.available && probe.canStart !== true)) {
@@ -339,7 +339,7 @@ export class WindowNodeTaskExecutor {
 			);
 		}
 		await abortablePreStartOperation(
-			this.options.runtime.prepareStart?.() ?? Promise.resolve(),
+			this.options.runtime.prepareStart?.(params.requireEditor ? { requireEditor: true } : undefined) ?? Promise.resolve(),
 			record.preStartAbort.signal,
 		);
 		this.assertRecordWithinWorkerDeadline(record, params.workerDeadline);
@@ -351,6 +351,7 @@ export class WindowNodeTaskExecutor {
 			acceptanceCriteria: [...params.acceptanceCriteria],
 			workspaceId: workspace.workspaceId,
 			sourceWindowName: params.sourceLabel,
+			...(params.requireEditor ? { requireEditor: true as const } : {}),
 			allowInteractiveAuthentication: true,
 			delegatedExecutionContext: { ...params.delegatedExecutionContext },
 			approvalContext: {
@@ -382,7 +383,7 @@ export class WindowNodeTaskExecutor {
 
 		const handle = await this.withRuntimeStartGate(record, async () => {
 			await abortablePreStartOperation(
-				this.options.runtime.prepareStart?.() ?? Promise.resolve(),
+				this.options.runtime.prepareStart?.(params.requireEditor ? { requireEditor: true } : undefined) ?? Promise.resolve(),
 				record.preStartAbort.signal,
 			);
 			this.assertRecordWithinWorkerDeadline(record, params.workerDeadline);

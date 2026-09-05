@@ -477,7 +477,10 @@ export class DevTunnelCliProvider implements DevTunnelProvider {
 		if (!isE2eCapabilityEnabled(capability)) {
 			throw new Error('Owned Tunnel deletion is available only to the opted-in two-device E2E.');
 		}
+		return this.deleteOwnedResource();
+	}
 
+	async deleteOwnedResource(): Promise<'deleted' | 'already-absent'> {
 		await this.stop();
 		const metadata = await this.stateStore.load();
 		if (metadata === undefined) {

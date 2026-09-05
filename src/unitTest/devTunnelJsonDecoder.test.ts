@@ -34,6 +34,20 @@ const hostedFixturePath = resolve(
 );
 
 suite('DevTunnelJsonDecoder', () => {
+	test('preserves strict CLI ownership checks when SDK discovery adds opaque application labels', () => {
+		const fixture = createHostedFixture();
+		fixture.tunnel.labels = [
+			'copilot-agent-mesh-owner', 'copilot-agent-mesh', 'mesh-discovery-v1', 'mesh-protocol-v2',
+			'mesh-ad-00000000-0000-4000-8000-000000000001',
+		];
+		decodeDevTunnelShowForBuild(SUPPORTED_DEVTUNNEL_BUILD, JSON.stringify(fixture), {
+			expectedTunnelId, expectedPort, expectedOwnershipLabel: 'copilot-agent-mesh-owner',
+		});
+		assert.throws(() => decodeDevTunnelShowForBuild(SUPPORTED_DEVTUNNEL_BUILD, JSON.stringify(fixture), {
+			expectedTunnelId, expectedPort, expectedOwnershipLabel: 'different-owner',
+		}));
+	});
+
 	test('decodes one validated HTTPS forwarding origin', () => {
 		const result = decodeDevTunnelShowJson(JSON.stringify(createHostedFixture()), {
 			expectedTunnelId,

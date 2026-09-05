@@ -1,8 +1,8 @@
 import { DashboardViewModel } from './DashboardPresenter';
 import { containsUnsafeDashboardText } from './DashboardRedaction';
-import { TASK_STATUSES, utf8ByteLength } from '../../shared/protocol';
+import { CONNECTIVITY_ACTIONS, TASK_STATUSES, utf8ByteLength } from '../../shared/protocol';
 
-export const DASHBOARD_MESSAGE_VERSION = 6 as const;
+export const DASHBOARD_MESSAGE_VERSION = 7 as const;
 
 export const DASHBOARD_ACTIONS = [
 	'configureDevice',
@@ -14,6 +14,7 @@ export const DASHBOARD_ACTIONS = [
 	'setPeerAllowed',
 	'cancelOutgoingTask',
 	'cancelIncomingTask',
+	...CONNECTIVITY_ACTIONS,
 	'refresh',
 ] as const;
 
@@ -52,6 +53,7 @@ export type DashboardOutboundMessage =
 		readonly uiInstanceId: string;
 		readonly type: 'dashboard.snapshot';
 		readonly model: DashboardViewModel;
+		readonly pendingActions?: readonly DashboardAction[];
 	}
 	| {
 		readonly version: typeof DASHBOARD_MESSAGE_VERSION;
@@ -59,6 +61,7 @@ export type DashboardOutboundMessage =
 		readonly type: 'dashboard.error';
 		readonly code: DashboardOutboundErrorCode;
 		readonly message: string;
+		readonly pendingActions?: readonly DashboardAction[];
 	};
 
 const actions = new Set<string>(DASHBOARD_ACTIONS);
@@ -68,6 +71,8 @@ const handleActions = new Set<DashboardAction>([
 	'setPeerAllowed',
 	'cancelOutgoingTask',
 	'cancelIncomingTask',
+	'pairDiscoveredPeer',
+	'revokeIncomingPeer',
 ]);
 
 export function parseDashboardInboundMessage(value: unknown): DashboardInboundMessage | undefined {
@@ -124,10 +129,10 @@ export function assertSafeDashboardOutboundMessage(value: DashboardOutboundMessa
 		throw new Error('Invalid dashboard outbound message.');
 	}
 	if (value.type === 'dashboard.snapshot') {
-		assertExactRecord(value, ['version', 'uiInstanceId', 'type', 'model'], []);
+		assertExactRecord(value, ['version', 'uiInstanceId', 'type', 'model'], ['pendingActions']);
 		assertDashboardViewModel(value.model);
 	} else {
-		assertExactRecord(value, ['version', 'uiInstanceId', 'type', 'code', 'message'], []);
+		assertExactRecord(value, ['version', 'uiInstanceId', 'type', 'code', 'message'], ['pendingActions']);
 		if (![
 			'INVALID_MESSAGE',
 			'ACTION_FAILED',
@@ -143,6 +148,13 @@ export function assertSafeDashboardOutboundMessage(value: DashboardOutboundMessa
 			throw new Error('Invalid dashboard error code.');
 		}
 	}
+	if (value.pendingActions !== undefined) {
+		assertArray(value.pendingActions, DASHBOARD_ACTIONS.length);
+		if (new Set(value.pendingActions).size !== value.pendingActions.length
+			|| value.pendingActions.some((action) => !actions.has(action))) {
+			throw new Error('Invalid pending Dashboard actions.');
+		}
+	}
 	assertSafeValue(value, '$');
 }
 
@@ -154,6 +166,7 @@ function assertDashboardViewModel(model: unknown): asserts model is DashboardVie
 			'listener',
 			'broker',
 			'thisWindow',
+			'connectivity',
 			'localNodes',
 			'savedAuthorizations',
 			'outgoingTasks',
@@ -248,6 +261,8 @@ function assertDashboardViewModel(model: unknown): asserts model is DashboardVie
 	}
 	assertOptionalString(model.thisWindow.agentHost.detail);
 
+	assertConnectivity(model.connectivity);
+
 	assertArray(model.localNodes, 128);
 	for (const candidate of model.localNodes) {
 		assertExactRecord(
@@ -302,6 +317,74 @@ function assertDashboardViewModel(model: unknown): asserts model is DashboardVie
 
 	assertArray(model.errors, 100);
 	model.errors.forEach(assertDashboardError);
+}
+
+function assertConnectivity(value: unknown): void {
+	assertExactRecord(
+		value,
+		[
+			'discoveryEnabled',
+			'delegationEnabled',
+			'strictPolicyActivated',
+			'publishEnabled',
+			'hostingBackend',
+			'migrationPending',
+			'accountProvider',
+			'claimedWorkspaceCount',
+			'receivingWorkspaceCount',
+			'state',
+			'truncated',
+			'candidates',
+			'incomingPeers',
+		],
+		['error'],
+	);
+	for (const key of [
+		'discoveryEnabled', 'delegationEnabled', 'strictPolicyActivated',
+		'publishEnabled', 'migrationPending', 'truncated',
+	]) {
+		assertBoolean(value[key]);
+	}
+	assertEnum(value.hostingBackend, ['cli', 'sdk']);
+	assertEnum(value.accountProvider, ['none', 'github', 'microsoft']);
+	assertEnum(value.state, ['disabled', 'authRequired', 'discovering', 'ready', 'error']);
+	for (const key of ['claimedWorkspaceCount', 'receivingWorkspaceCount']) {
+		const count = value[key];
+		if (typeof count !== 'number' || !Number.isInteger(count) || count < 0 || count > 32) {
+			throw new Error('Dashboard Workspace count is outside its safe bound.');
+		}
+	}
+	if (value.error !== undefined) {
+		assertEnum(value.error, [
+			'DISABLED', 'AUTH_REQUIRED', 'ACCOUNT_CHANGED', 'SCOPES_CHANGED', 'OFFLINE',
+			'DISCOVERY_UNAVAILABLE', 'RATE_LIMITED', 'TIMEOUT', 'CANCELLED', 'INVALID_ENDPOINT',
+			'BINDING_CHANGED', 'POLICY_DENIED', 'PRIVATE_ACCESS_REQUIRED', 'CLEANUP_FAILED',
+			'MIGRATION_REQUIRED', 'PROTOCOL_INCOMPATIBLE',
+		]);
+	}
+	assertArray(value.candidates, 10);
+	for (const candidate of value.candidates) {
+		assertExactRecord(candidate, ['actionHandle', 'label', 'hostHint', 'stale', 'admission'], []);
+		assertActionHandle(candidate.actionHandle);
+		assertString(candidate.label);
+		if (!/^Candidate [0-9a-f]{8}$/u.test(candidate.label)) {
+			throw new Error('Dashboard candidate label is invalid.');
+		}
+		assertEnum(candidate.hostHint, ['online', 'offline', 'unknown']);
+		assertBoolean(candidate.stale);
+		assertEnum(candidate.admission, ['legacy-mesh-auth', 'private-port-token']);
+	}
+	assertArray(value.incomingPeers, 256);
+	for (const peer of value.incomingPeers) {
+		assertExactRecord(peer, ['actionHandle', 'label', 'state', 'cleanupPending'], []);
+		assertActionHandle(peer.actionHandle);
+		assertString(peer.label);
+		if (!/^Peer [0-9a-f]{8}$/u.test(peer.label)) {
+			throw new Error('Dashboard incoming peer label is invalid.');
+		}
+		assertEnum(peer.state, ['active', 'pending', 'revoked']);
+		assertBoolean(peer.cleanupPending);
+	}
 }
 
 function assertDashboardTasks(value: unknown): void {

@@ -2,7 +2,7 @@ import * as assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { test } from 'node:test';
 
-import { WebSocketServer } from 'ws';
+import WebSocket, { WebSocketServer } from 'ws';
 
 import { encodeBase64Url } from '../gateway/PairingCrypto';
 import {
@@ -308,7 +308,10 @@ test('PeerConnectionManager dispose aborts a real handshake before the request d
 		'coordinator',
 		profiles,
 		secrets,
-		new WebSocketPeerTransport({ requestTimeoutMs: 5_000 }),
+		new WebSocketPeerTransport({
+			requestTimeoutMs: 5_000,
+			webSocketFactory: (url) => new WebSocket(url),
+		}),
 	);
 
 	try {

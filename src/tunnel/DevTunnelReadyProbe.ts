@@ -10,6 +10,7 @@ export const DEVTUNNEL_SKIP_ANTIPHISHING_HEADER = 'X-Tunnel-Skip-AntiPhishing-Pa
 export interface ReadyProbeOptions {
 	readonly signal?: AbortSignal;
 	readonly timeoutMs?: number;
+	readonly tunnelAccessToken?: string;
 }
 
 export async function probeLoopbackHealth(
@@ -48,6 +49,9 @@ export function probeDevTunnelWss(
 			headers: {
 				Accept: 'application/json',
 				[DEVTUNNEL_SKIP_ANTIPHISHING_HEADER]: 'true',
+				...(options.tunnelAccessToken === undefined ? {} : {
+					'X-Tunnel-Authorization': `tunnel ${options.tunnelAccessToken}`,
+				}),
 			},
 			rejectUnauthorized: true,
 		});
@@ -121,6 +125,9 @@ function probeHttp204(
 			headers: {
 				Accept: 'application/json',
 				...(publicTunnel ? { [DEVTUNNEL_SKIP_ANTIPHISHING_HEADER]: 'true' } : {}),
+				...(publicTunnel && options.tunnelAccessToken !== undefined ? {
+					'X-Tunnel-Authorization': `tunnel ${options.tunnelAccessToken}`,
+				} : {}),
 			},
 			method: 'GET',
 			rejectUnauthorized: true,

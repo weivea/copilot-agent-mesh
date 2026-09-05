@@ -1,20 +1,14 @@
 import type { StateStore } from '../domain/ports';
 import type {
 	DevTunnelProvider,
-	DevTunnelRuntimeStatus,
-	HostedTunnel,
 } from '../tunnel/DevTunnelProvider';
+import { CliDevTunnelExposureAdapter } from '../tunnel/CliDevTunnelExposureAdapter';
+import type { RemoteExposure, RemoteExposureProvider, RemoteExposureStatus } from '../tunnel/RemoteExposureProvider';
 import type { LocalDesktopWorkspaceGuard } from './LocalDesktopWorkspaceGuard';
 import type { WorkerPlatformSupport } from './WorkerPlatformSupport';
 import type { WorkerOwnership } from '../storage/WorkerOwnerLock';
 
 const listenerStateKey = 'copilotAgentMesh.listener';
-const probeRequest = 'mesh-readiness-probe';
-const probeResponse = JSON.stringify({
-	jsonrpc: '2.0',
-	id: null,
-	error: { code: -32700, message: 'Parse error.' },
-});
 
 interface PersistedListenerState {
 	readonly schemaVersion: 1;
@@ -28,7 +22,7 @@ export interface ListenerSnapshot {
 	readonly state: ListenerLifecycleState;
 	readonly port?: number;
 	readonly forwardingOrigin?: string;
-	readonly tunnel: DevTunnelRuntimeStatus;
+	readonly tunnel: RemoteExposureStatus;
 	readonly error?: { readonly code: string; readonly message: string };
 }
 
@@ -45,6 +39,7 @@ export interface ListenerServiceOptions {
 }
 
 export interface ListenerGateway {
+	closePeer?(peerId: string): void;
 	start(preferredPort?: number): Promise<{ readonly port: number }>;
 	dispose(): Promise<void>;
 	notifyPeer(
@@ -62,7 +57,8 @@ export interface ListenerPairing {
 export class ListenerService {
 	private readonly listeners = new Set<() => void>();
 	private gateway: ListenerGateway | undefined;
-	private hosted: HostedTunnel | undefined;
+	private hosted: RemoteExposure | undefined;
+	private readonly tunnel: RemoteExposureProvider;
 	private state: ListenerLifecycleState = 'stopped';
 	private operation: Promise<void> = Promise.resolve();
 	private lastError: ListenerSnapshot['error'];
@@ -78,13 +74,14 @@ export class ListenerService {
 	public constructor(
 		private readonly deviceId: string,
 		private readonly pairing: ListenerPairing,
-		private readonly tunnel: DevTunnelProvider,
+		tunnel: DevTunnelProvider | RemoteExposureProvider,
 		private readonly createGateway: () => ListenerGateway,
 		private readonly metadata: StateStore,
 		private readonly guard: LocalDesktopWorkspaceGuard,
 		private readonly options: ListenerServiceOptions = {},
 	) {
-		this.tunnelSubscription = tunnel.onDidChange?.(() => this.tunnelChanged());
+		this.tunnel = 'providerId' in tunnel ? tunnel : new CliDevTunnelExposureAdapter(tunnel, options);
+		this.tunnelSubscription = this.tunnel.onDidChange(() => this.tunnelChanged());
 	}
 
 	public async restore(): Promise<void> {
@@ -106,6 +103,7 @@ export class ListenerService {
 
 	public stop(): Promise<void> {
 		this.guard.assertAllowed({ requireWorkspace: false });
+		this.tunnel.cancel?.();
 		return this.serialize(async () => {
 			if (!this.ownsResources) {
 				await this.options.ownership?.assertOwner();
@@ -162,6 +160,10 @@ export class ListenerService {
 		return this.gateway?.notifyPeer(peerId, method, params) ?? Promise.resolve();
 	}
 
+	public closePeer(peerId: string): void {
+		this.gateway?.closePeer?.(peerId);
+	}
+
 	public onDidChange(listener: () => void): { dispose(): void } {
 		this.listeners.add(listener);
 		return { dispose: () => this.listeners.delete(listener) };
@@ -175,6 +177,7 @@ export class ListenerService {
 			return this.disposal;
 		}
 		this.disposeRequested = true;
+		this.tunnel.cancel?.();
 		const skipOwnedResources = !this.ownsResources
 			&& this.options.ownership?.isOwner() === false;
 		let disposal!: Promise<void>;
@@ -216,7 +219,7 @@ export class ListenerService {
 			this.state = 'error';
 			this.lastError = {
 				code: capability.reason ?? 'TUNNEL_UNAVAILABLE',
-				message: 'The exact supported Dev Tunnel CLI build is unavailable.',
+				message: 'The selected Microsoft Dev Tunnels hosting backend is unavailable.',
 			};
 			this.changed();
 			throw new Error(this.lastError.message);
@@ -233,19 +236,11 @@ export class ListenerService {
 				enabled: true,
 				preferredPort: address.port,
 			});
-			const compactDeviceId = this.deviceId.replaceAll('-', '');
-			const suffix = compactDeviceId.slice(0, 18);
-			this.hosted = await this.tunnel.ensureHosted({
-				accessDuration: this.options.accessDuration ?? '1d',
-				healthPath: '/healthz',
+			this.hosted = await this.tunnel.start({
 				localPort: address.port,
-				ownershipLabel: `copilot-agent-mesh-${compactDeviceId.slice(0, 31)}`,
-				tunnelAlias: `cam${suffix}`,
-				tunnelExpiration: this.options.tunnelExpiration ?? '30d',
-				wssExpectedResponse: probeResponse,
-				wssPath: '/agent-mesh/rpc',
-				wssProbeRequest: probeRequest,
+				deviceId: this.deviceId,
 			});
+			await this.options.ownership?.assertOwner();
 			this.state = 'running';
 			this.changed();
 		} catch (error) {

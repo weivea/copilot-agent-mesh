@@ -1,6 +1,11 @@
 import { DashboardSnapshot } from './DashboardFacade';
 import { redactRemoteText } from './DashboardRedaction';
-import { timestampSchema } from '../../shared/protocol';
+import {
+	connectivitySnapshotSchema,
+	DISABLED_CONNECTIVITY_SNAPSHOT,
+	timestampSchema,
+	type ConnectivitySnapshot,
+} from '../../shared/protocol';
 
 const dashboardStringBytes = 2 * 1_024;
 
@@ -9,11 +14,17 @@ export interface DashboardViewModel {
 	readonly listener: DashboardSnapshot['listener'];
 	readonly broker: NonNullable<DashboardSnapshot['broker']>;
 	readonly thisWindow: DashboardSnapshot['thisWindow'];
+	readonly connectivity: DashboardConnectivityViewModel;
 	readonly localNodes: readonly DashboardLocalNodeViewModel[];
 	readonly savedAuthorizations: readonly DashboardSavedAuthorizationViewModel[];
 	readonly outgoingTasks: readonly NonNullable<DashboardSnapshot['outgoingTasks']>[number][];
 	readonly incomingTasks: readonly NonNullable<DashboardSnapshot['incomingTasks']>[number][];
 	readonly errors: DashboardSnapshot['errors'];
+}
+
+export interface DashboardConnectivityViewModel extends Omit<ConnectivitySnapshot, 'candidates' | 'incomingPeers'> {
+	readonly candidates: readonly Readonly<ConnectivitySnapshot['candidates'][number]>[];
+	readonly incomingPeers: readonly Readonly<ConnectivitySnapshot['incomingPeers'][number]>[];
 }
 
 type DashboardLocalNodeViewModel =
@@ -64,6 +75,7 @@ export class DashboardPresenter {
 					detail: optionalRedacted(snapshot.thisWindow.agentHost.detail),
 				},
 			},
+			connectivity: presentConnectivity(snapshot.connectivity ?? DISABLED_CONNECTIVITY_SNAPSHOT),
 			localNodes: policyCandidates
 				.filter(isOnlinePolicyCandidate)
 				.map((candidate) => ({
@@ -79,6 +91,38 @@ export class DashboardPresenter {
 			errors: snapshot.errors.map(redactError),
 		};
 	}
+}
+
+function presentConnectivity(snapshot: ConnectivitySnapshot): DashboardConnectivityViewModel {
+	// Validate Broker UUID handles before the provider replaces them with Webview aliases.
+	const value = connectivitySnapshotSchema.parse(snapshot);
+	return {
+		discoveryEnabled: value.discoveryEnabled,
+		delegationEnabled: value.delegationEnabled,
+		strictPolicyActivated: value.strictPolicyActivated,
+		publishEnabled: value.publishEnabled,
+		hostingBackend: value.hostingBackend,
+		migrationPending: value.migrationPending,
+		accountProvider: value.accountProvider,
+		claimedWorkspaceCount: value.claimedWorkspaceCount,
+		receivingWorkspaceCount: value.receivingWorkspaceCount,
+		state: value.state,
+		...(value.error === undefined ? {} : { error: value.error }),
+		truncated: value.truncated,
+		candidates: value.candidates.map((candidate) => ({
+			actionHandle: candidate.actionHandle,
+			label: redactRemoteText(candidate.label),
+			hostHint: candidate.hostHint,
+			stale: candidate.stale,
+			admission: candidate.admission,
+		})),
+		incomingPeers: value.incomingPeers.map((peer) => ({
+			actionHandle: peer.actionHandle,
+			label: redactRemoteText(peer.label),
+			state: peer.state,
+			cleanupPending: peer.cleanupPending,
+		})),
+	};
 }
 
 function isOnlinePolicyCandidate(

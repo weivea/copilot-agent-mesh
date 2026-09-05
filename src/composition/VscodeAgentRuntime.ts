@@ -255,7 +255,9 @@ export function createVscodeAgentRuntime(
 		enabled: common.enabled,
 		preferEditor: () => vscodeApi.workspace
 			.getConfiguration(configurationSection)
-			.get<boolean>('experimental.peerDelegation', false),
+			.get<boolean>('experimental.peerDelegation', false)
+			|| vscodeApi.workspace.getConfiguration(configurationSection)
+				.get<boolean>('experimental.crossDeviceDelegation', false),
 		editor,
 		standalone,
 		confirmation: approval,
@@ -273,7 +275,7 @@ class GuardedAgentRuntime implements AgentRuntime, AgentHostSourceStatusProvider
 		private readonly workerPlatform: WorkerPlatformSupport,
 	) {}
 
-	public async probe(): Promise<AgentRuntimeProbe> {
+	public async probe(request?: Pick<AgentTaskRequest, 'requireEditor'>): Promise<AgentRuntimeProbe> {
 		this.guard.assertAllowed({ requireWorkspace: false });
 		if (!this.workerPlatform.supported) {
 			return {
@@ -282,10 +284,10 @@ class GuardedAgentRuntime implements AgentRuntime, AgentHostSourceStatusProvider
 				reason: this.workerPlatform.agentCode,
 			};
 		}
-		return this.delegate.probe();
+		return this.delegate.probe(request);
 	}
 
-	public async prepareStart(): Promise<void> {
+	public async prepareStart(request?: Pick<AgentTaskRequest, 'requireEditor'>): Promise<void> {
 		this.guard.assertAllowed({ requireWorkspace: false });
 		if (!this.workerPlatform.supported) {
 			throw new AgentRuntimeError(
@@ -294,7 +296,7 @@ class GuardedAgentRuntime implements AgentRuntime, AgentHostSourceStatusProvider
 			);
 		}
 		this.guard.assertAllowed();
-		await this.delegate.prepareStart?.();
+		await this.delegate.prepareStart?.(request);
 	}
 
 	public async start(request: AgentTaskRequest): Promise<AgentTaskHandle> {

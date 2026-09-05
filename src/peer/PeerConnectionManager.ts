@@ -19,6 +19,7 @@ export interface PeerConnectionManagerOptions {
 	readonly random?: () => number;
 	readonly id?: () => string;
 	readonly ownership?: WorkerOwnership;
+	readonly onProfileRemoved?: (profile: PeerProfile) => Promise<void>;
 }
 
 interface ManagedPeer {
@@ -51,6 +52,7 @@ export class PeerConnectionManager {
 	private disposed = false;
 	private disposeComplete = false;
 	private disposing: Promise<void> | undefined;
+	private readonly onProfileRemoved: PeerConnectionManagerOptions['onProfileRemoved'];
 
 	public constructor(
 		private readonly coordinatorDeviceId: string,
@@ -65,17 +67,24 @@ export class PeerConnectionManager {
 		this.random = options.random ?? Math.random;
 		this.id = options.id ?? randomUUID;
 		this.ownership = options.ownership;
+		this.onProfileRemoved = options.onProfileRemoved;
 	}
 
-	public async add(connectionUrl: string): Promise<PeerConnection> {
+	public async add(
+		connectionUrl: string,
+		prepare?: (profile: PeerProfile) => Promise<void>,
+	): Promise<PeerConnection> {
 		if (this.ownership !== undefined) {
 			await this.ownership.assertOwner();
 		}
 		this.assertActive();
-		return this.track(this.addCore(connectionUrl));
+		return this.track(this.addCore(connectionUrl, prepare));
 	}
 
-	private async addCore(connectionUrl: string): Promise<PeerConnection> {
+	private async addCore(
+		connectionUrl: string,
+		prepare?: (profile: PeerProfile) => Promise<void>,
+	): Promise<PeerConnection> {
 		const parsed = parseConnectionUrl(connectionUrl);
 		const id = this.id();
 		const pairingSecretKeyRef = `mesh.remoteInvitation.${id}`;
@@ -92,6 +101,7 @@ export class PeerConnectionManager {
 			this.assertActive();
 			await this.profiles.store(profile);
 			this.assertActive();
+			await prepare?.(profile);
 			const managed = this.createManaged(id, true, pairingSecretKeyRef, profile.generation);
 			this.peers.set(id, managed);
 			await managed.connection.connect();
@@ -598,6 +608,7 @@ export class PeerConnectionManager {
 		if (deleted === false) {
 			throw new Error('Peer cleanup metadata changed unexpectedly.');
 		}
+		await this.onProfileRemoved?.(current);
 	}
 
 	private async replaceProfile(

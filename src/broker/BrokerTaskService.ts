@@ -107,6 +107,8 @@ export interface BrokerTaskNotificationSink {
 }
 
 export interface BrokerTaskServiceOptions {
+	readonly requiresEditorForRemote?: () => boolean;
+	readonly assertRemotePeer?: (peerId: string) => Promise<void>;
 	readonly notificationSink?: BrokerTaskNotificationSink;
 	readonly onTaskSnapshot?: (
 		snapshot: TaskSnapshot,
@@ -545,7 +547,7 @@ export class BrokerTaskService {
 			nodeId: params.target.nodeId,
 			nodeInstanceId: params.target.nodeInstanceId,
 			workspaceId: params.target.workspaceId,
-			...(sourceNode === undefined ? {} : {
+			...(sourceNode === undefined ? { remotePeerId: ownerId } : {
 				sourceNodeId: sourceNode.nodeId,
 				sourceNodeInstanceId: sourceNode.nodeInstanceId,
 			}),
@@ -557,6 +559,8 @@ export class BrokerTaskService {
 			workspaceLeaseKey: route.workspaceLeaseKey,
 			delegatedExecutionContext: route.delegatedExecutionContext,
 			session: route.session,
+			...(sourceNode === undefined && this.options.requiresEditorForRemote?.()
+				? { requireEditor: true as const } : {}),
 		};
 		const request: OwnedRoutedTaskStart = {
 			...params,
@@ -655,11 +659,15 @@ export class BrokerTaskService {
 	): Promise<void> {
 		let result: z.infer<typeof nodeTaskStartedResultSchema>;
 		try {
+			if (params.sourceNodeId === undefined) {
+				await this.options.assertRemotePeer?.(ownerId);
+			}
 			const rawResult = await route.session.request(
 				LOCAL_BROKER_METHODS.taskStart,
 				toJsonValue({
 					...params,
 					authenticatedOwnerId: ownerId,
+					...(route.requireEditor ? { requireEditor: true } : {}),
 					sourceLabel: sourceLabel ?? params.sourceNodeId ?? ownerId,
 					delegationGrant: createDelegationGrant({
 						taskId: params.taskId,
@@ -765,7 +773,7 @@ export class BrokerTaskService {
 			nodeId: params.target.nodeId,
 			nodeInstanceId: params.target.nodeInstanceId,
 			workspaceId: params.target.workspaceId,
-			...(sourceNode === undefined ? {} : {
+			...(sourceNode === undefined ? { remotePeerId: ownerId } : {
 				sourceNodeId: sourceNode.nodeId,
 				sourceNodeInstanceId: sourceNode.nodeInstanceId,
 			}),

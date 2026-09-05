@@ -120,10 +120,14 @@ export class AtomicFileStore {
 		}
 	}
 
-	public writeJson(relativePath: string, value: unknown): Promise<void> {
+	public writeJson(
+		relativePath: string,
+		value: unknown,
+		assertCurrent?: () => Promise<void>,
+	): Promise<void> {
 		const operation = this.writeQueue.then(
-			() => this.writeJsonExclusive(relativePath, value),
-			() => this.writeJsonExclusive(relativePath, value),
+			() => this.writeJsonExclusive(relativePath, value, assertCurrent),
+			() => this.writeJsonExclusive(relativePath, value, assertCurrent),
 		);
 		this.writeQueue = operation.then(
 			() => undefined,
@@ -144,7 +148,11 @@ export class AtomicFileStore {
 		}
 	}
 
-	private async writeJsonExclusive(relativePath: string, value: unknown): Promise<void> {
+	private async writeJsonExclusive(
+		relativePath: string,
+		value: unknown,
+		assertCurrent?: () => Promise<void>,
+	): Promise<void> {
 		const target = this.resolve(relativePath);
 		const directory = dirname(target);
 		const id = this.ids.next();
@@ -158,6 +166,7 @@ export class AtomicFileStore {
 		try {
 			await this.fileSystem.writeFile(temporary, contents);
 			await this.fileSystem.syncFile(temporary);
+			await assertCurrent?.();
 			await this.fileSystem.rename(temporary, target);
 			await this.fileSystem.syncDirectory(directory);
 		} catch (error) {

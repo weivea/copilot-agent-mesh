@@ -971,6 +971,27 @@ test('source selector does not fallback while editor cleanup remains failed', as
 	await selector.dispose();
 });
 
+test('strict remote tasks require the editor even when local preference is off and never fall back', async () => {
+	const editor = new FakeRuntime();
+	const standalone = new FakeRuntime();
+	editor.startError = new AgentRuntimeError('AGENT_UNAVAILABLE', 'editor unavailable');
+	const selector = new AgentHostSourceSelector(selectorOptions({
+		preferEditor: () => false, editor, standalone,
+	}));
+	try {
+		await selector.probe({ requireEditor: true });
+		await selector.prepareStart({ requireEditor: true });
+		assert.equal(standalone.probes, 0);
+		assert.equal(standalone.prepareCalls, 0);
+		await assert.rejects(selector.start({ ...taskRequest(), requireEditor: true }), { code: 'AGENT_UNAVAILABLE' });
+		assert.equal(editor.starts, 1);
+		assert.equal(standalone.starts, 0);
+		editor.startError = undefined;
+		await selector.start({ ...taskRequest(), requireEditor: true });
+		assert.equal(standalone.starts, 0);
+	} finally { await selector.dispose(); }
+});
+
 test('source selector retries failed runtime disposal', async () => {
 	const editor = new FakeRuntime();
 	const standalone = new FakeRuntime();

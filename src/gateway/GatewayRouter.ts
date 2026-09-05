@@ -42,6 +42,7 @@ export interface TaskService {
 
 export interface BrokerRoutingService {
 	listNodes(): unknown;
+	listNodesForPeer?(authenticatedPeerId: string): Promise<unknown>;
 	startRemote(authenticatedPeerId: string, params: RoutedTaskStartParams): Promise<unknown>;
 	getRemote(authenticatedPeerId: string, taskId: string, afterEventSeq?: number): Promise<unknown>;
 	cancelRemote(authenticatedPeerId: string, taskId: string): Promise<unknown>;
@@ -159,7 +160,9 @@ export class GatewayRouter {
 				return this.deviceService.getInfo(peerId);
 			case 'node.list':
 				assertObject(params, []);
-				return Promise.resolve(nodeDirectoryResultSchema.parse(broker.listNodes()));
+				return broker.listNodesForPeer === undefined
+					? Promise.resolve(nodeDirectoryResultSchema.parse(broker.listNodes()))
+					: broker.listNodesForPeer(peerId).then((value) => nodeDirectoryResultSchema.parse(value));
 			case 'task.start': {
 				const input = parseV2(routedTaskStartParamsSchema, params);
 				if (input.sourceNodeId !== undefined) {

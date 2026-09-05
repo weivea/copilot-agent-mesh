@@ -69,6 +69,29 @@ export class PeerPolicyService implements PeerRouteAuthorizer {
 		);
 	}
 
+	public acceptsIncoming(workspaceIdentity: string): boolean {
+		return this.store.get(workspaceIdentity)?.acceptsIncoming === true;
+	}
+
+	public async setRemoteReceive(
+		caller: NodeIdentityParams,
+		workspaceIdentity: string,
+		enabled: boolean,
+	): Promise<void> {
+		const owned = this.requireOwnedWorkspace(caller, workspaceIdentity);
+		const names = this.effectiveWorkspaceNames();
+		await this.store.update(workspaceIdentity, (current) => {
+			this.requireOwnedWorkspace(caller, workspaceIdentity);
+			return {
+				windowName: current?.windowName ?? names.get(workspaceIdentity)
+					?? resolveWindowDisplayName(undefined, owned.name, caller.nodeId),
+				acceptsIncoming: enabled,
+				allowlist: [...(current?.allowlist ?? [])],
+			};
+		}, [...names].map(([identity, windowName]) => ({ workspaceIdentity: identity, windowName })));
+		this.changed();
+	}
+
 	public async setPolicy(
 		caller: NodeIdentityParams,
 		params: NodePolicySetParams,

@@ -32,10 +32,11 @@ function helloRequest(): object {
 		id: 'request-1',
 		method: GATEWAY_METHODS.hello,
 		params: {
-			protocolMin: 1,
-			protocolMax: 1,
-			deviceId: IDS.device,
-			nonce: 'abcdefghijklmnopqrstuvwxyzABCDEF',
+			protocolMin: 2,
+			protocolMax: 2,
+			coordinatorDeviceId: IDS.device,
+			clientNonce: 'A'.repeat(43),
+			invitationId: IDS.device,
 		},
 	};
 }

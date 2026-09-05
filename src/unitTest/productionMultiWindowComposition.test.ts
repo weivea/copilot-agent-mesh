@@ -339,6 +339,7 @@ test('production runtime retries failed resources without disposing successful r
 	const listener = new RuntimeResource(1);
 	const peers = new RuntimePeerResource();
 	const broker = new RuntimeResource(1);
+	const connectivity = new RuntimeResource(0);
 	const subscriptions = [
 		new RuntimeSubscription(),
 		new RuntimeSubscription(),
@@ -375,6 +376,10 @@ test('production runtime retries failed resources without disposing successful r
 				onDidChange: () => subscriptions[subscriptionIndex++]!,
 			}),
 			tunnel: {},
+			connectivity: Object.assign(connectivity, {
+				beginShutdown: () => undefined,
+				exposureChanged: () => undefined,
+			}),
 		},
 	]) as ProductionBrokerRuntime;
 
@@ -383,6 +388,7 @@ test('production runtime retries failed resources without disposing successful r
 	);
 	assert.equal(listener.disposeCalls, 1);
 	assert.equal(peers.disposeCalls, 1);
+	assert.equal(connectivity.disposeCalls, 1);
 	assert.equal(broker.disposeCalls, 1);
 	assert.deepEqual(subscriptions.map(({ disposeCalls }) => disposeCalls), [1, 1, 1]);
 	assert.equal(disposedNotifications, 0);

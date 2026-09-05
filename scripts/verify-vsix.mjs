@@ -13,6 +13,7 @@ const expected = [
 	'extension/NOTICE',
 	'extension/changelog.md',
 	'extension/dist/extension.js',
+	'extension/dist/THIRD_PARTY_NOTICES.txt',
 	'extension/docs/mvp/release.md',
 	'extension/media/agent-mesh.svg',
 	'extension/media/dashboard.css',

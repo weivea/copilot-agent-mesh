@@ -16,6 +16,10 @@ import {
 	dashboardNodeDirectoryResultSchema,
 	JSON_RPC_ERROR_CODES,
 	LOCAL_BROKER_METHODS,
+	connectivitySnapshotSchema,
+	type ConnectivityAction,
+	type ConnectivitySnapshot,
+	type BrokerRemoteListResult,
 	LOCAL_BROKER_NOTIFICATIONS,
 	PROTOCOL_LIMITS,
 	nodeDirectoryResultSchema,
@@ -399,6 +403,23 @@ export class WindowNodeClient implements WorkspaceResolver {
 			}),
 			dashboardNodeDirectoryResultSchema,
 		);
+	}
+
+	public connectivitySnapshot(): Promise<ConnectivitySnapshot> {
+		return this.request(LOCAL_BROKER_METHODS.connectivitySnapshot, {
+			nodeId: this.nodeId, nodeInstanceId: this.nodeInstanceId,
+		}, connectivitySnapshotSchema);
+	}
+
+	public async connectivityAction(action: ConnectivityAction, actionHandle?: string): Promise<void> {
+		await this.requireConnected().request(LOCAL_BROKER_METHODS.connectivityAction, {
+			nodeId: this.nodeId, nodeInstanceId: this.nodeInstanceId, action,
+			...(actionHandle === undefined ? {} : { actionHandle }),
+		}, 180_000);
+	}
+
+	public cachedRemoteDevices(): Promise<BrokerRemoteListResult> {
+		return this.request(LOCAL_BROKER_METHODS.remoteCachedList, {}, brokerRemoteListResultSchema);
 	}
 
 	public getPeerPolicy(workspaceIdentity?: string): Promise<NodePolicyResult> {

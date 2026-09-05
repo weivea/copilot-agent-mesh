@@ -1,8 +1,11 @@
 import * as vscode from 'vscode';
 
 import {
+	DISABLED_CONNECTIVITY_SNAPSHOT,
 	PROTOCOL_LIMITS,
 	utf8ByteLength,
+	type ConnectivityAction,
+	type ConnectivitySnapshot,
 	type DashboardTaskDirection,
 	type TaskStatus,
 } from '../../shared/protocol';
@@ -71,6 +74,7 @@ export interface DashboardSnapshot {
 		};
 		readonly detail?: string;
 	};
+	readonly connectivity?: ConnectivitySnapshot;
 	readonly policyCandidates?: readonly DashboardPolicyCandidateSnapshot[];
 	readonly outgoingTasks?: readonly DashboardTaskSummarySnapshot[];
 	readonly incomingTasks?: readonly DashboardTaskSummarySnapshot[];
@@ -196,6 +200,7 @@ export interface DashboardFacade {
 	renameCurrentWindow(): Promise<void>;
 	setAcceptIncoming(actionHandle: string, enabled: boolean): Promise<void>;
 	setPeerAllowed(actionHandle: string, allowed: boolean): Promise<void>;
+	connectivityAction(action: ConnectivityAction, actionHandle?: string): Promise<void>;
 	cancelDashboardTask(actionHandle: string, direction: DashboardTaskDirection): Promise<void>;
 	registerCurrentWorkspace(): Promise<void>;
 	removeWorkspace(workspaceId: string): Promise<void>;
@@ -215,6 +220,7 @@ export interface DashboardServiceBindings {
 	prepareWindowRename(): Promise<DashboardWindowRenameSession>;
 	setAcceptIncoming(actionHandle: string, enabled: boolean): Promise<void>;
 	setPeerAllowed(actionHandle: string, allowed: boolean): Promise<void>;
+	connectivityAction(action: ConnectivityAction, actionHandle?: string): Promise<void>;
 	prepareDashboardTaskCancellation(
 		actionHandle: string,
 		direction: DashboardTaskDirection,
@@ -297,6 +303,10 @@ export class ServiceDashboardFacade implements DashboardFacade {
 
 	public setPeerAllowed(actionHandle: string, allowed: boolean): Promise<void> {
 		return this.services.setPeerAllowed(actionHandle, allowed);
+	}
+
+	public connectivityAction(action: ConnectivityAction, actionHandle?: string): Promise<void> {
+		return this.services.connectivityAction(action, actionHandle);
 	}
 
 	public async cancelDashboardTask(
@@ -458,6 +468,11 @@ export class UnavailableDashboardFacade implements DashboardFacade {
 				},
 				detail: 'Peer window delegation is unavailable.',
 			},
+			connectivity: {
+				...DISABLED_CONNECTIVITY_SNAPSHOT,
+				state: 'error',
+				error: 'DISCOVERY_UNAVAILABLE',
+			},
 			policyCandidates: [],
 			outgoingTasks: [],
 			incomingTasks: [],
@@ -500,6 +515,10 @@ export class UnavailableDashboardFacade implements DashboardFacade {
 
 	public setPeerAllowed(_actionHandle: string, _allowed: boolean): Promise<void> {
 		return this.unavailable('Peer allowlist service');
+	}
+
+	public async connectivityAction(_action: ConnectivityAction, _actionHandle?: string): Promise<void> {
+		throw new Error('Cross-device connectivity is unavailable. No action was performed.');
 	}
 
 	public cancelDashboardTask(

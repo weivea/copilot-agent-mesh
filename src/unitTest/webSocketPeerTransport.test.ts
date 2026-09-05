@@ -2,7 +2,7 @@ import * as assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { test } from 'node:test';
 
-import { WebSocketServer } from 'ws';
+import WebSocket, { WebSocketServer } from 'ws';
 
 import {
 	encodeBase64Url,
@@ -51,7 +51,10 @@ test('WebSocketPeerTransport rejects a malformed JSON-RPC error response', async
 		pairingSecretKeyRef: 'pairing-key',
 	};
 	await profiles.store(profile);
-	const transport = new WebSocketPeerTransport({ requestTimeoutMs: 200 });
+	const transport = new WebSocketPeerTransport({
+		requestTimeoutMs: 200,
+		webSocketFactory: (url) => new WebSocket(url),
+	});
 
 	try {
 		await assert.rejects(
@@ -150,6 +153,7 @@ test('WebSocketPeerTransport closes on a malformed heartbeat result', async () =
 	const transport = new WebSocketPeerTransport({
 		requestTimeoutMs: 200,
 		heartbeatIntervalMs: 5,
+		webSocketFactory: (url) => new WebSocket(url),
 	});
 	const session = await transport.connect(
 		profile,
@@ -265,6 +269,7 @@ test('WebSocketPeerTransport rejects a socket closed while persisting an authent
 	const transport = new WebSocketPeerTransport({
 		requestTimeoutMs: 200,
 		heartbeatIntervalMs: 5,
+		webSocketFactory: (url) => new WebSocket(url),
 	});
 
 	try {

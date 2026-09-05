@@ -8,6 +8,8 @@ import {
 	ACTIVE_TASK_STATUSES,
 	PROTOCOL_LIMITS,
 	brokerRemoteListResultSchema,
+	connectivitySnapshotParamsSchema,
+	connectivityActionParamsSchema,
 	brokerRemoteTaskAnswerParamsSchema,
 	brokerRemoteTaskCancelParamsSchema,
 	brokerRemoteTaskGetParamsSchema,
@@ -56,6 +58,8 @@ import {
 	type LocalIpcSessionOptions,
 } from '../ipc';
 import type { BrokerOwnership } from '../storage/BrokerOwnerLock';
+import type { BrokerConnectivity } from '../connectivity/BrokerConnectivity';
+import type { RemotePeerPolicyService } from './RemotePeerPolicyService';
 import type {
 	RemoteTaskRouteAdapter,
 	RemoteTaskStartOutcome,
@@ -108,6 +112,9 @@ export interface DeviceBrokerOptions extends LocalIpcSessionOptions {
 	readonly peerPolicies: PeerPolicyService;
 	readonly taskService: BrokerTaskService;
 	readonly remoteTaskService?: RemoteTaskRouteAdapter;
+	readonly remotePolicies?: RemotePeerPolicyService;
+	readonly connectivity?: BrokerConnectivity;
+	readonly assertRemotePeer?: (peerId: string) => Promise<void>;
 	readonly taskRoutes?: TaskRouteCatalog;
 	readonly handshakeTimeoutMs?: number;
 	readonly onError?: (error: Error) => void;
@@ -194,6 +201,10 @@ export class DeviceBroker {
 		};
 	}
 
+	public connectivityChanged(): void {
+		this.notifyDashboardChanged(undefined, false);
+	}
+
 	public async start(): Promise<void> {
 		if (this.disposeRequested || this.disposed) {
 			throw new Error('Device Broker is disposed.');
@@ -211,12 +222,19 @@ export class DeviceBroker {
 		return this.options.registry.list();
 	}
 
+	public async listNodesForPeer(peerId: string): Promise<NodeDirectoryResult> {
+		this.assertActive();
+		await this.options.assertRemotePeer?.(peerId);
+		return this.options.remotePolicies?.listIncoming(peerId) ?? this.listNodes();
+	}
+
 	public async startRemote(
 		authenticatedPeerId: string,
 		input: RoutedTaskStartParams,
 	): Promise<TaskSnapshot> {
 		this.assertActive();
 		const params = routedTaskStartParamsSchema.parse(input);
+		await this.options.assertRemotePeer?.(authenticatedPeerId);
 		return this.startLocalRoute(
 			params,
 			{ peerId: authenticatedPeerId },
@@ -520,6 +538,28 @@ export class DeviceBroker {
 
 		const binding = this.requireRegistration(session);
 		switch (method) {
+			case LOCAL_BROKER_METHODS.connectivitySnapshot: {
+				const input = connectivitySnapshotParamsSchema.parse(params);
+				this.assertIdentity(binding, input);
+				if (this.options.connectivity === undefined) {
+					throw new MeshDomainError('POLICY_FORBIDDEN', 'Remote connectivity is unavailable.');
+				}
+				return toJsonValue(await this.options.connectivity.snapshot(binding, session));
+			}
+			case LOCAL_BROKER_METHODS.connectivityAction: {
+				const input = connectivityActionParamsSchema.parse(params);
+				this.assertIdentity(binding, input);
+				if (this.options.connectivity === undefined) {
+					throw new MeshDomainError('POLICY_FORBIDDEN', 'Remote connectivity is unavailable.');
+				}
+				await this.options.connectivity.act(binding, input, session);
+				this.notifyDashboardChanged();
+				return null;
+			}
+			case LOCAL_BROKER_METHODS.remoteCachedList:
+				emptyParamsSchema.parse(params);
+				return toJsonValue(this.options.remoteTaskService?.cachedDevices?.()
+					?? { devices: [], truncated: false, totalDevices: 0 });
 			case LOCAL_BROKER_METHODS.heartbeat: {
 				const input = nodeHeartbeatParamsSchema.parse(params);
 				this.assertIdentity(binding, input);
@@ -745,13 +785,23 @@ export class DeviceBroker {
 			}
 			case LOCAL_BROKER_METHODS.remoteList: {
 				emptyParamsSchema.parse(params);
+				if (this.options.remotePolicies?.remoteDirectoryAvailable() === false) {
+					return { devices: [], truncated: false, totalDevices: 0 };
+				}
 				const directory = await this.requireRemoteTaskService().listDevices(
 					new AbortController().signal,
 				);
-				return toJsonValue(brokerRemoteListResultSchema.parse(directory));
+				const remote = this.requireRemoteTaskService();
+				const filtered = this.options.remotePolicies?.filterOutgoing(
+					binding, directory, (profileId, target) => remote.lookupTarget?.(profileId, target),
+				) ?? directory;
+				return toJsonValue(brokerRemoteListResultSchema.parse(filtered));
 			}
 			case LOCAL_BROKER_METHODS.remoteTaskStart: {
 				const input = brokerRemoteTaskStartParamsSchema.parse(params);
+				if (input.target.deviceId === this.options.identity.deviceId) {
+					throw new MeshDomainError('TASK_ID_CONFLICT', 'Same-device tasks must use the authenticated local route.');
+				}
 				if (
 					input.sourceNodeId !== undefined
 					&& input.sourceNodeId !== binding.nodeId
@@ -766,12 +816,17 @@ export class DeviceBroker {
 					binding,
 					input.delegationPrincipal,
 				);
+				const strict = this.options.remotePolicies?.strict() === true;
+				const sourceScope = strict ? this.options.remotePolicies!.sourceScope(binding) : input.sourceWorkspaceIdentity;
+				if (strict && input.sourceWorkspaceIdentity !== undefined && input.sourceWorkspaceIdentity !== sourceScope) {
+					throw new MeshDomainError('AUTH_FAILED', 'The source workspace scope does not match the authenticated window.');
+				}
 				const routeInput: RoutedTaskStartParams = {
 					delegationRequestId: input.delegationRequestId,
 					taskId: input.taskId,
 					target: input.target,
-					sourceNodeId: input.sourceNodeId,
-					sourceWorkspaceIdentity: input.sourceWorkspaceIdentity,
+					sourceNodeId: strict ? binding.nodeId : input.sourceNodeId,
+					sourceWorkspaceIdentity: sourceScope,
 					title: input.title,
 					prompt: input.prompt,
 					acceptanceCriteria: input.acceptanceCriteria,
@@ -785,6 +840,29 @@ export class DeviceBroker {
 					remoteInput,
 					{ peerId: input.peerId },
 				);
+				if (this.taskRoutes.get(input.taskId) !== undefined) {
+					const existing = await remoteTasks.getTask(input.taskId, undefined, new AbortController().signal);
+					if (existing !== undefined) {
+						await this.taskRoutes.markSnapshot(existing);
+						return toJsonValue(taskSnapshotSchema.parse(existing));
+					}
+				}
+				this.options.remotePolicies?.assertNotDraining();
+				const assertAuthorized = async (): Promise<void> => {
+					if (!strict) {
+						return;
+					}
+					this.assertIdentity(this.requireRegistration(session), binding);
+					if (this.options.remotePolicies!.sourceScope(binding) !== sourceScope) {
+						throw new MeshDomainError('PEER_NOT_ALLOWED', 'The source workspace claims changed.');
+					}
+					await this.options.remotePolicies!.assertOutgoing(
+						binding,
+						input.peerId === undefined ? undefined : remoteTasks.lookupTarget?.(input.peerId, input.target),
+						input.target.workspaceId,
+					);
+				};
+				await assertAuthorized();
 				const reservation = await this.taskRoutes.reserveRemoteAttempt(
 					routeInput,
 					input.peerId,
@@ -797,7 +875,7 @@ export class DeviceBroker {
 				try {
 					snapshot = await remoteTasks.startTask(
 						remoteInput,
-						{ peerId: input.peerId },
+						{ peerId: input.peerId, assertAuthorized },
 						outcome,
 					);
 					await this.taskRoutes.markSnapshot(snapshot);

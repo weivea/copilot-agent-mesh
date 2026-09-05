@@ -1,10 +1,12 @@
 # 跨设备发现与通信实现方案
 
-> 状态：建议稿，尚未实施；本文不授权自动创建隧道、登录账号或执行模型任务。<br>
+> 状态：D1/D2 生产代码已实施，默认关闭；已获准通过单机 GitHub 原生账号/只读目录，以及单机 D2 真实私有接入、Mesh 双向认证和 100 次 ping，并确认精确资源清理。前次配对失败记录保留，根因尚未确定。Entra/MSA、跨 Profile、两台物理设备、真实续期/迁移和 Agent/Chat Gate 仍需独立验证，详见[实现与验证记录](./cross-device-connectivity-validation.md)。本文不授权自动创建隧道、登录账号或执行模型任务。<br>
 > 日期：2026-09-05。<br>
 > 源码基线：`536982f4251a4a841de561cb4220a4d10e107338`，Mesh 0.4.0 Preview，protocol v2。<br>
 > 调研依据：[跨设备连接方案调研](./spikes/cross-device-connectivity-options.md)。<br>
 > 实施方式：按能力 Gate 推进，不承诺未经验证的发布日期，不预设下一版本号。
+
+本文保留 M0–M5 的设计要求作为验收规范，而不是第二份待批准计划。当前实现同时包含 D1 和 D2；“可选”仅指用户运行时选择 CLI 或 SDK 后端。已固定 contracts/management/connections `1.3.56`、SSH `3.12.42`，并按生产 `RpcPeer`/`PairingService` 收敛 hello/authenticate/commit 与数值 ping 的共享声明。实现入口、离线证据和未获准真实 Gate 的复现条件以验证记录为准。
 
 ## 1. 实施决策
 
@@ -21,7 +23,7 @@
 
 D1 的新增 SDK 主要负责管理查询；不同时改写 CLI hosting 生命周期。D2 是可选后端，不删除 CLI 实现，不以伪造 CLI build/access-index 字段的方式强行实现旧接口。
 
-D1生产依赖只增加需要的management/contracts包；connections及其SSH依赖先用于隔离的M0实验，D2通过Gate后才纳入正式hosting路径。以VS Code `1.136.1`作为首个真实验收版本；不因manifest声明最低版本就宣称所有旧版已经通过。
+D1 发现使用 management/contracts；本次明确要求同时交付 D2，因此 connections 及其 SSH 依赖也已锁定并接入默认关闭、延迟加载的私有 hosting 路径。真实 Gate 未获准不等于省略 D2 实现，也不等于可以宣称它已完成真实两设备验收。以 VS Code `1.136.1` 作为首个真实验收版本；不因 manifest 声明最低版本就宣称所有旧版已经通过。
 
 Dev Tunnels 仍是开发测试用途、Public Preview、无 SLA。若产品要求长期常驻、商业可用性承诺或 relay 无权读取任务内容，应启动独立的 WSS 中继/加密通道方案，不靠继续叠加 CLI/SDK 适配解决。
 
@@ -111,7 +113,7 @@ flowchart TB
     PEERS <-->|"远端 WSS / JSON-RPC"| DATA
 ```
 
-CLI 和 SDK 两个 hosting 方框表示**互斥后端选择**，不是同时启动两个 host。图中的所有新模块都是计划，不是当前已存在的类型/API。
+CLI 和 SDK 两个 hosting 方框表示**互斥后端选择**，不是同时启动两个 host。当前生产组合使用 `ProductionConnectivity`、`SelectedExposureProvider` 与对应的发现、binding、policy、revocation 模块实现这些职责；图中的名称属于职责示意，实际类型见验证记录。
 
 所有权规则：
 

@@ -1,7 +1,7 @@
 # Compatibility Matrix
 
 > Status: 0.4.0 Preview implemented; Peer Window Delegation objective gate 8/12, full gate Unverified<br>
-> Evidence date: 2026-09-04<br>
+> Evidence date: 2026-09-05 (cross-device implementation); earlier live Agent evidence retains its original scope<br>
 > Mesh protocol: v2; v1 peers incompatible
 
 This document is the release gate for external platform compatibility. Installed
@@ -34,8 +34,18 @@ extend Worker support beyond macOS arm64 or authorize publication.
 | Editor Session identity/workspace policy | Provider-scoped new Session URI, schema-supported folder isolation, and authoritative snapshot re-reads | VS Code 1.136.1 source compatibility plus offline Runtime/SDK coverage; earlier live execution evidence predates this policy | Real target Chat visibility remains Unverified; no history migration |
 | Peer Window Delegation (0.4.0) | Five registered LM Tools, directional allowlist plus target receive gate, one Broker/two ordinary windows, editor-first AHP | Real VS Code 1.135.0/macOS arm64 objective run passed AC-5 1-4, 6, 8-12, needs-input resume, token cancellation, short-budget cancellation, and cleanup against the existing full-Catalog authenticated profile | 10/12 objective items Pass; Copilot confirmation/same-Chat UI items Unverified |
 | Dev Tunnel CLI | Exact macOS arm64 build `1.0.2030+fc9273aa0f` | Existing exact-build lifecycle evidence; multi-window local route kept Listener/Tunnel stopped | Pass on macOS arm64 only |
-| Remote v2 route | One device Gateway/Tunnel → Broker → explicit Window Node | Historical two-device pairing/discovery and durable acceptance passed; its disposable Worker profile then stopped at `AGENT_AUTH_REQUIRED` | Transport/routing pass; authenticated two-device execution not yet run |
+| Remote v2 route | One device Gateway/Tunnel → Broker → explicit Window Node | Historical two logical instances on one host passed public-relay pairing/routing and durable acceptance; their disposable Worker profile stopped at `AGENT_AUTH_REQUIRED` | Transport/routing evidence only; not physical-device or authenticated cross-device execution evidence |
+| D1 discovery/binding/policy | Public Dev Tunnels management/contracts `1.3.56`, production v2 mutual proof, owner-only IPC, source allowlists, target grants and durable revocation | Offline production-startup/IPC, real loopback sockets, strict schema, endpoint/profile/owner races and revocation recovery; explicitly authorized GitHub native session and real read-only directory on one Mac returned `ready`, zero candidates | GitHub account/query Pass only on VS Code 1.136.1 `a44adf7...` macOS arm64; Entra/MSA, CLI account alignment, cross-profile and two-physical-device gates remain Blocked/Unverified |
+| D2 private hosting | Connections `1.3.56`, SSH `3.12.42`, provider-neutral selection, actual SDK host, scoped capabilities, no anonymous ACE | Authorized single-Mac production SDK host/Gateway reached ready; real no-anonymous ACLs, missing/invalid/wrong-port capability refusal, Mesh mutual authentication/device proof and 100 pings; exact cleanup confirmed | Pass for this bounded private admission/Mesh-ping run on VS Code 1.136.1 `a44adf7...`, macOS arm64. Original enrollment failure retained; live expiry/renewal, active CLI migration, physical-device/Agent/UI gates Unverified |
+| Cross-device Dashboard | v7 safe DTOs, per-view one-use aliases, native owner actions over authenticated IPC; no cloud refresh on render | Extension Host/UI automation is tracked in the implementation evidence below | Does not establish Copilot same-Chat or target Chat Sessions visibility |
 | Artifact Store | Immutable bounded JSON with producer/consumer ownership, length, SHA-256, and revision | Size/count/media/hash/ownership/corruption/path/secret tests plus exact 153-byte contract handoff passed | Same-device Broker scope only; not arbitrary file transfer |
+
+The D1/D2 code paths, setup, commands, gate evidence, migration and cleanup
+conditions are recorded in [Cross-device implementation and validation](./cross-device-connectivity-validation.md).
+The single-Mac GitHub and D2 rows are separate explicitly authorized results,
+not extensions of G0. They establish only their stated account/query and
+private-service/Mesh-ping scopes, not two-device or cross-profile SSO, real
+cross-device Agent execution, live expiry/renewal, or ordinary Chat UI.
 
 ## Real multi-window evidence
 

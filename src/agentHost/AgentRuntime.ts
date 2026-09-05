@@ -137,6 +137,7 @@ export interface AgentTaskRequest {
 	readonly acceptanceCriteria?: readonly string[];
 	readonly workspaceId: string;
 	readonly sourceWindowName?: string;
+	readonly requireEditor?: true;
 	readonly approvalCapability?: AgentRuntimeApprovalCapability;
 	readonly providerId?: string;
 	readonly allowInteractiveAuthentication?: boolean;
@@ -266,8 +267,8 @@ export interface AgentTaskHandle {
 }
 
 export interface AgentRuntime {
-	probe(): Promise<AgentRuntimeProbe>;
-	prepareStart?(): Promise<void>;
+	probe(request?: Pick<AgentTaskRequest, 'requireEditor'>): Promise<AgentRuntimeProbe>;
+	prepareStart?(request?: Pick<AgentTaskRequest, 'requireEditor'>): Promise<void>;
 	start(request: AgentTaskRequest): Promise<AgentTaskHandle>;
 	dispose(): Promise<void>;
 }
@@ -751,6 +752,7 @@ function approvalFingerprint(request: AgentTaskRequest): string {
 			: [...request.acceptanceCriteria],
 		workspaceId: request.workspaceId,
 		sourceWindowName: request.sourceWindowName,
+		requireEditor: request.requireEditor,
 		providerId: request.providerId,
 		allowInteractiveAuthentication: request.allowInteractiveAuthentication,
 		delegatedExecutionContext: request.delegatedExecutionContext,

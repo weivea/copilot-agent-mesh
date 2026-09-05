@@ -165,6 +165,12 @@ export class GatewayServer {
 		);
 	}
 
+	public closePeer(peerId: string): void {
+		for (const peer of [...this.peers]) {
+			peer.revokePeer(peerId);
+		}
+	}
+
 	private async stop(): Promise<void> {
 		await this.starting?.catch(() => undefined);
 		for (const peer of [...this.peers]) {

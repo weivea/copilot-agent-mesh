@@ -17,6 +17,9 @@ import {
 	parseDashboardInboundMessage,
 } from './DashboardMessages';
 import { DashboardPresenter, type DashboardViewModel } from './DashboardPresenter';
+import { CONNECTIVITY_ACTIONS } from '../../shared/protocol';
+
+const connectivityActions = new Set<string>(CONNECTIVITY_ACTIONS);
 
 interface ScopedDashboardAction {
 	readonly action: DashboardAction;
@@ -29,6 +32,7 @@ interface ViewInstance {
 	readonly view: vscode.WebviewView;
 	readonly subscriptions: vscode.Disposable[];
 	disposed: boolean;
+	readonly pendingActions: Set<DashboardAction>;
 	requestedRevision: number;
 	publishedRevision: number;
 	publication: Promise<void> | undefined;
@@ -65,6 +69,7 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 			view: webviewView,
 			subscriptions: [],
 			disposed: false,
+			pendingActions: new Set(),
 			requestedRevision: 0,
 			publishedRevision: 0,
 			publication: undefined,
@@ -119,21 +124,27 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 			await this.publish(instance);
 			return;
 		}
-
+		if (instance.pendingActions.has(message.action)
+			|| (connectivityActions.has(message.action)
+				&& [...instance.pendingActions].some((action) => connectivityActions.has(action)))) {
+			await this.postError(instance, 'ACTION_FAILED', 'This Dashboard action is already in progress. Task cancellation remains available.');
+			return;
+		}
+		instance.pendingActions.add(message.action);
 		try {
 			await this.dispatch(instance, message);
-			await this.publish(instance);
 		} catch (error: unknown) {
 			if (error instanceof DashboardActionError) {
 				await this.postError(instance, error.code, error.message);
-				await this.publish(instance);
-				return;
+			} else {
+				await this.postError(
+					instance,
+					'ACTION_FAILED',
+					'The dashboard action failed. Refresh for the latest service error and suggested action.',
+				);
 			}
-			await this.postError(
-				instance,
-				'ACTION_FAILED',
-				'The dashboard action failed. Refresh for the latest service error and suggested action.',
-			);
+		} finally {
+			instance.pendingActions.delete(message.action);
 			await this.publish(instance);
 		}
 	}
@@ -183,6 +194,18 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 			case 'cancelIncomingTask': {
 				const action = this.consumeAction(instance, message);
 				await this.facade.cancelDashboardTask(action.brokerHandle, 'incoming');
+				return;
+			}
+			case 'configureConnectivity':
+			case 'refreshDiscovery':
+			case 'configureRemotePolicy':
+			case 'retryConnectivityCleanup':
+				await this.facade.connectivityAction(message.action);
+				return;
+			case 'pairDiscoveredPeer':
+			case 'revokeIncomingPeer': {
+				const action = this.consumeAction(instance, message);
+				await this.facade.connectivityAction(message.action, action.brokerHandle);
 				return;
 			}
 			case 'refresh':
@@ -257,8 +280,9 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 		if (instance.disposed) {
 			return;
 		}
-		assertSafeDashboardOutboundMessage(message);
-		await instance.view.webview.postMessage(message);
+		const outbound: DashboardOutboundMessage = { ...message, pendingActions: [...instance.pendingActions] };
+		assertSafeDashboardOutboundMessage(outbound);
+		await instance.view.webview.postMessage(outbound);
 	}
 
 	private disposeInstance(instance: ViewInstance): void {
@@ -321,6 +345,17 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 					model.thisWindow.acceptActionHandle,
 				),
 			},
+			connectivity: {
+				...model.connectivity,
+				candidates: model.connectivity.candidates.map((candidate) => ({
+					...candidate,
+					actionHandle: scope('pairDiscoveredPeer', candidate.actionHandle)!,
+				})),
+				incomingPeers: model.connectivity.incomingPeers.map((peer) => ({
+					...peer,
+					actionHandle: scope('revokeIncomingPeer', peer.actionHandle)!,
+				})),
+			},
 			localNodes: model.localNodes.map((candidate) => ({
 				...candidate,
 				actionHandle: scope('setPeerAllowed', candidate.actionHandle),
@@ -381,12 +416,24 @@ export function createDashboardHtml(
 	<title>Copilot Agent Mesh</title>
 </head>
 <body data-ui-instance-id="${uiInstanceId}">
-	<header><h1>Copilot Agent Mesh</h1><button data-action="refresh" title="Refresh">Refresh</button></header>
+	<header><h1>Copilot Agent Mesh</h1><button data-action="refresh" title="Refresh local status without account discovery">Refresh</button></header>
+	<p id="operationStatus" class="detail"></p>
 	<main>
 		<section aria-labelledby="device-heading"><h2 id="device-heading">This Device</h2><div id="device" class="card loading">Loading...</div></section>
 		<section aria-labelledby="this-window-heading"><h2 id="this-window-heading">This Window</h2><div id="thisWindow" class="card loading">Loading...</div></section>
 		<section aria-labelledby="accept-heading"><h2 id="accept-heading">Accept Incoming Tasks</h2><div id="acceptIncoming" class="card loading">Loading...</div></section>
 		<section aria-labelledby="listener-heading"><h2 id="listener-heading">Listener</h2><div id="listener" class="card loading">Loading...</div></section>
+		<section class="connectivity" aria-labelledby="connectivity-heading">
+			<h2 id="connectivity-heading">Cross-device</h2>
+			<p class="detail">Microsoft Dev Tunnels account discovery is off by default. Rendering or refreshing this Dashboard reads local status only; it does not sign in, discover devices, or start hosting.</p>
+			<div id="connectivity" class="card loading">Loading...</div>
+			<h3 id="candidates-heading">Discovery candidates — not workers</h3>
+			<p class="detail">Discovery is not pairing or permission to run tasks. Pair explicitly, configure directional Workspace grants, and enable the target receive gate before using Mesh Tools. Host hints do not establish worker readiness.</p>
+			<div id="discoveryCandidates" class="stack loading" aria-labelledby="candidates-heading">Loading...</div>
+			<h3 id="incoming-peers-heading">Incoming peers on this device</h3>
+			<p class="detail">Revoke a peer here to withdraw this device's incoming admission. Source Workspace grants are managed separately in remote policy.</p>
+			<div id="incomingPeers" class="stack loading" aria-labelledby="incoming-peers-heading">Loading...</div>
+		</section>
 		<section aria-labelledby="nodes-heading"><h2 id="nodes-heading">Local Window Nodes</h2><p class="detail">A checked box authorizes only this Workspace to delegate to that target. The target must also accept incoming tasks and have one claimed Workspace before it appears to Mesh Tools.</p><div id="localNodes" class="stack loading">Loading...</div></section>
 		<section aria-labelledby="saved-authorizations-heading"><h2 id="saved-authorizations-heading">Saved Authorizations</h2><p class="detail">Offline Workspaces are not live Window Nodes. Remove a saved authorization here, or reopen that Workspace to manage it under Local Window Nodes.</p><div id="savedAuthorizations" class="stack loading">Loading...</div></section>
 		<section aria-labelledby="outgoing-heading"><h2 id="outgoing-heading">Outgoing Tasks</h2><div id="outgoingTasks" class="stack loading">Loading...</div></section>

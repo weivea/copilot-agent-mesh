@@ -41,11 +41,34 @@ import { WebSocketPeerTransport } from '../peer/WebSocketPeerTransport';
 import {
 	GATEWAY_METHODS,
 	PROTOCOL_LIMITS,
+	methodParamsSchemas,
 	methodResultSchemas,
 	utf8ByteLength,
 } from '../../shared/protocol';
 
 suite('Gateway pairing component', { concurrency: 1 }, () => {
+	test('matches the production v2 enrollment, reconnect and numeric ping wire contract', async () => {
+		const fixture = await createFixture();
+		const first = await RawClient.open(fixture.endpoint);
+		let second: RawClient | undefined;
+		try {
+			const enrollment = await pairAndCommit(first, await fixture.invitation(), 'wire-coordinator');
+			const sentAt = Date.now();
+			const pong = await contractRequest(first, 'mesh.ping', { sentAt });
+			assert.equal((pong as { sentAt: number }).sentAt, sentAt);
+			await assert.rejects(first.request('mesh.ping', { sentAt, unknown: true }));
+			await assert.rejects(first.request('mesh.ping', { sentAt: new Date().toISOString() }));
+			await first.close();
+			second = await RawClient.open(fixture.endpoint);
+			await reconnect(second, enrollment.peerId, enrollment.rootKey, 'wire-coordinator');
+			await contractRequest(second, 'mesh.ping', { sentAt });
+		} finally {
+			await first.close();
+			await second?.close();
+			await fixture.dispose();
+		}
+	});
+
 	test('serves an exact private health check and rejects other HTTP routes', async () => {
 		const fixture = await createFixture();
 		try {
@@ -1183,7 +1206,7 @@ async function beginEnrollment(
 	coordinatorDeviceId: string,
 ): Promise<Enrollment> {
 	const clientNonce = randomBase64Url(NONCE_BYTES);
-	const hello = await client.request('mesh.hello', {
+	const hello = await contractRequest(client, 'mesh.hello', {
 		protocolMin: 2,
 		protocolMax: 2,
 		coordinatorDeviceId,
@@ -1203,7 +1226,7 @@ async function beginEnrollment(
 		decodeFixedBase64Url(hello.serverProof, 32, 'server proof'),
 		enrollmentProof(secret, 'mesh/server-proof/v1', transcript),
 	);
-	const authenticated = await client.request('mesh.authenticate', {
+	const authenticated = await contractRequest(client, 'mesh.authenticate', {
 		sessionId: transcript.sessionId,
 		proof: encodeBase64Url(enrollmentProof(secret, 'mesh/client-proof/v1', transcript)),
 	}) as Record<string, string>;
@@ -1232,7 +1255,7 @@ async function pairAndCommit(
 }
 
 async function commitEnrollment(client: RawClient, enrollment: Enrollment): Promise<void> {
-	await client.request('mesh.enrollmentCommit', {
+	await contractRequest(client, 'mesh.enrollmentCommit', {
 		sessionId: enrollment.transcript.sessionId,
 		enrollmentId: enrollment.enrollmentId,
 		peerId: enrollment.peerId,
@@ -1252,7 +1275,7 @@ async function reconnect(
 	coordinatorDeviceId: string,
 ): Promise<void> {
 	const clientNonce = randomBase64Url(NONCE_BYTES);
-	const hello = await client.request('mesh.hello', {
+	const hello = await contractRequest(client, 'mesh.hello', {
 		protocolMin: 2,
 		protocolMax: 2,
 		coordinatorDeviceId,
@@ -1272,7 +1295,7 @@ async function reconnect(
 		decodeFixedBase64Url(hello.serverProof, 32, 'server proof'),
 		reconnectProof(rootKey, 'mesh/reconnect-server-proof/v1', transcript),
 	);
-	await client.request('mesh.authenticate', {
+	await contractRequest(client, 'mesh.authenticate', {
 		sessionId: transcript.sessionId,
 		proof: encodeBase64Url(reconnectProof(
 			rootKey,
@@ -1280,6 +1303,17 @@ async function reconnect(
 			transcript,
 		)),
 	});
+}
+
+async function contractRequest(
+	client: RawClient,
+	method: 'mesh.hello' | 'mesh.authenticate' | 'mesh.enrollmentCommit' | 'mesh.ping',
+	params: Record<string, unknown>,
+): Promise<unknown> {
+	methodParamsSchemas[method].parse(params);
+	const result = await client.request(method, params);
+	methodResultSchemas[method].parse(result);
+	return result;
 }
 
 class RawClient {

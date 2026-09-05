@@ -1,6 +1,7 @@
 import { z } from 'zod';
 
 import { PROTOCOL_LIMITS, utf8ByteLength, utf8String } from './limits';
+import { connectivityActionParamsSchema, connectivitySnapshotParamsSchema } from './connectivity';
 import {
 	deviceInfoSchema,
 	recoveryDescriptorSchema,
@@ -402,6 +403,7 @@ export const dashboardTaskReservationResultSchema = z.strictObject({
 });
 
 export const nodeTaskStartParamsSchema = routedTaskStartParamsSchema.extend({
+	requireEditor: z.literal(true).optional(),
 	authenticatedOwnerId: uuidSchema,
 	sourceLabel: utf8String(PROTOCOL_LIMITS.nameBytes, 'task source label', 1),
 	delegationGrant: delegationGrantSchema,
@@ -527,6 +529,9 @@ export const LOCAL_BROKER_METHODS = {
 	taskAnswer: 'node.task.answer',
 	taskEvent: 'node.task.event',
 	remoteList: 'broker.remote.list',
+	remoteCachedList: 'broker.remote.cachedList',
+	connectivitySnapshot: 'broker.connectivity.snapshot',
+	connectivityAction: 'broker.connectivity.action',
 	remoteTaskStart: 'broker.remote.task.start',
 	remoteTaskGet: 'broker.remote.task.get',
 	remoteTaskCancel: 'broker.remote.task.cancel',
@@ -570,6 +575,9 @@ export const localBrokerMethodParamsSchemas = {
 	[LOCAL_BROKER_METHODS.taskAnswer]: nodeTaskAnswerParamsSchema,
 	[LOCAL_BROKER_METHODS.taskEvent]: nodeTaskEventParamsSchema,
 	[LOCAL_BROKER_METHODS.remoteList]: z.strictObject({}),
+	[LOCAL_BROKER_METHODS.remoteCachedList]: z.strictObject({}),
+	[LOCAL_BROKER_METHODS.connectivitySnapshot]: connectivitySnapshotParamsSchema,
+	[LOCAL_BROKER_METHODS.connectivityAction]: connectivityActionParamsSchema,
 	[LOCAL_BROKER_METHODS.remoteTaskStart]: brokerRemoteTaskStartParamsSchema,
 	[LOCAL_BROKER_METHODS.remoteTaskGet]: brokerRemoteTaskGetParamsSchema,
 	[LOCAL_BROKER_METHODS.remoteTaskCancel]: brokerRemoteTaskCancelParamsSchema,

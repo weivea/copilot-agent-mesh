@@ -30,6 +30,11 @@ h2 {
 	text-transform: uppercase;
 }
 
+h3 {
+	margin: 16px 0 8px;
+	font-size: 12px;
+}
+
 .card,
 .error {
 	padding: 10px 12px;
@@ -83,6 +88,21 @@ h2 {
 	grid-template-columns: minmax(72px, max-content) 1fr;
 	gap: 8px;
 	margin: 4px 0;
+}
+
+.connectivity .definition {
+	grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr);
+}
+
+.connectivity .definition span,
+.connectivity .item strong {
+	overflow-wrap: anywhere;
+}
+
+.notice {
+	margin: 10px 0;
+	padding-left: 8px;
+	border-left: 2px solid var(--vscode-notificationsWarningIcon-foreground);
 }
 
 .label,
@@ -181,4 +201,8 @@ button.danger {
 	height: 1px;
 	overflow: hidden;
 	clip: rect(0, 0, 0, 0);
+}
+
+#operationStatus:empty {
+	display: none;
 }

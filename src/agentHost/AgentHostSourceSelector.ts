@@ -76,17 +76,18 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 		this.waitForEditorRetry = options.waitForEditorRetry ?? waitForEditorRetry;
 	}
 
-	public async probe(): Promise<AgentRuntimeProbe> {
+	public async probe(request?: Pick<AgentTaskRequest, 'requireEditor'>): Promise<AgentRuntimeProbe> {
 		this.assertActive();
+		const preferEditor = request?.requireEditor === true || this.options.preferEditor();
 		if (this.options.enabled?.() === false) {
 			return {
 				available: false,
 				featureEnabled: false,
 				reason: 'AGENT_UNAVAILABLE',
-				source: this.options.preferEditor() ? 'editor' : 'standalone',
+				source: preferEditor ? 'editor' : 'standalone',
 			};
 		}
-		if (!this.options.preferEditor()) {
+		if (!preferEditor) {
 			const probe = await this.options.standalone.probe();
 			this.sourceSelected = true;
 			this.setStatus({ source: 'standalone', degraded: false });
@@ -101,7 +102,7 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 				source: 'editor',
 			};
 		}
-		if (this.sourceSelected) {
+		if (this.sourceSelected && (request?.requireEditor !== true || this.status.source === 'editor')) {
 			const selected = this.status.source === 'editor'
 				? {
 					available: this.status.failure === undefined,
@@ -127,7 +128,7 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 		};
 	}
 
-	public async prepareStart(): Promise<void> {
+	public async prepareStart(request?: Pick<AgentTaskRequest, 'requireEditor'>): Promise<void> {
 		this.assertActive();
 		if (this.options.enabled?.() === false) {
 			throw new AgentRuntimeError(
@@ -135,7 +136,7 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 				'The experimental Agent Host runtime is disabled.',
 			);
 		}
-		const runtimes = this.options.preferEditor()
+		const runtimes = request?.requireEditor === true ? [this.options.editor] : this.options.preferEditor()
 			? [this.options.editor, this.options.standalone]
 			: [this.options.standalone];
 		for (const runtime of runtimes) {
@@ -189,7 +190,7 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 		request: AgentTaskRequest,
 		signal: AbortSignal,
 	): Promise<AgentTaskHandle> {
-		if (!this.options.preferEditor()) {
+		if (!this.options.preferEditor() && request.requireEditor !== true) {
 			const handle = await this.options.standalone.start(request);
 			this.sourceSelected = true;
 			this.setStatus({ source: 'standalone', degraded: false });
@@ -235,6 +236,14 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 			}
 		}
 
+		if (request.requireEditor) {
+			this.sourceSelected = true;
+			this.setStatus(editorFailureStatus(editorFailure!));
+			throw new AgentRuntimeError(
+				'AGENT_UNAVAILABLE',
+				'Strict cross-device tasks require the existing editor Agent Host. Standalone fallback is disabled.',
+			);
+		}
 		const status = degradedStatus('EDITOR_START_FAILED', editorFailure);
 		this.sourceSelected = true;
 		this.setStatus(status);

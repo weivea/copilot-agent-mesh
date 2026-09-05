@@ -113,6 +113,7 @@ export interface TaskRouteRequest {
 	readonly taskId: string;
 	readonly sourceNodeId?: string;
 	readonly sourceNodeInstanceId?: string;
+	readonly remotePeerId?: string;
 }
 
 export interface TaskRoute {
@@ -121,7 +122,9 @@ export interface TaskRoute {
 	readonly delegatedExecutionContext: DelegatedExecutionContext;
 }
 
-export interface ResolvedTaskRoute extends TaskRoute, NodeTaskBinding {}
+export interface ResolvedTaskRoute extends TaskRoute, NodeTaskBinding {
+	readonly requireEditor?: true;
+}
 
 export interface NodeTaskBinding extends TaskRouteRequest {
 	readonly workspaceLeaseKey: string;
@@ -1155,7 +1158,12 @@ const taskRouteRequestSchema = z.strictObject({
 	taskId: uuidSchema,
 	sourceNodeId: uuidSchema.optional(),
 	sourceNodeInstanceId: uuidSchema.optional(),
+	remotePeerId: uuidSchema.optional(),
 }).superRefine((request, context) => {
+	if (request.remotePeerId !== undefined
+		&& (request.remotePeerId !== request.ownerId || request.sourceNodeId !== undefined)) {
+		context.addIssue({ code: 'custom', message: 'Invalid server-bound remote peer principal' });
+	}
 	if ((request.sourceNodeId === undefined) !== (request.sourceNodeInstanceId === undefined)) {
 		context.addIssue({
 			code: 'custom',

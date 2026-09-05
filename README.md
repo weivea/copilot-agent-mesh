@@ -7,6 +7,15 @@ task, wait for its authoritative result, answer input, or cancel it. Mesh protoc
 v2 remains in use; v1 peers are explicitly incompatible. This is an evaluation
 build, not a cross-device, cross-platform Worker, or general-availability claim.
 
+The repository also implements default-off **D1 account discovery and strict
+cross-device authorization**, plus **D2 optional SDK private hosting**. These
+are production code paths. An explicitly authorized single-Mac GitHub native
+account and read-only directory query has passed. A separately authorized
+single-Mac D2 run also passed private ingress, Mesh authentication and 100 pings,
+with exact cleanup. Entra/MSA, cross-profile, physical-device, live renewal and
+real cross-device Agent/Chat gates remain separate and unverified. See
+[cross-device setup and evidence](./docs/cross-device-connectivity-validation.md).
+
 One stable **Device Broker** owns pairing, peer roots, the Gateway, one Dev Tunnel,
 the peer manager, global task/delegation persistence, reducer/event log, remote
 routing, and the node registry. Every ordinary VS Code window under the same User
@@ -24,7 +33,7 @@ Preview. Other platforms fail closed with `CLI_UNSUPPORTED` or
 - VS Code 1.103 or newer is required.
 - Real Worker execution is experimental, disabled by default, and may consume Copilot quota.
 - Enable `copilotAgentMesh.experimental.agentHost` only after reviewing the first-task confirmation and process ownership behavior.
-- Enable `copilotAgentMesh.experimental.peerDelegation` in every participating
+- For same-device delegation, enable `copilotAgentMesh.experimental.peerDelegation` in every participating
   window. The directional source allowlist and the target's **Accept Incoming
   Tasks** switch are both default-off.
 - Use Copilot Chat in Agent mode with tools enabled. Copilot tool choice is not
@@ -38,7 +47,7 @@ Preview. Other platforms fail closed with `CLI_UNSUPPORTED` or
   authorization-server URL must map to an installed VS Code authentication
   provider and exact scopes. Missing standalone mappings fail with
   `AGENT_AUTH_REQUIRED`.
-- Tunnel hosting requires a user-supplied `copilotAgentMesh.devTunnelPath` pointing to the exact validated macOS arm64 CLI build `1.0.2030+fc9273aa0f`. The extension does not search `PATH`, download, install, or upgrade Dev Tunnel.
+- The **CLI hosting backend** requires a user-supplied `copilotAgentMesh.devTunnelPath` pointing to the exact validated macOS arm64 CLI build `1.0.2030+fc9273aa0f`. The extension does not search `PATH`, download, install, or upgrade Dev Tunnel. The separately selected SDK private backend does not use CLI credentials.
 - A fresh shared profile has no authentication session by default. Real AHP E2E
   uses an explicitly configured, dedicated persistent test profile; it never
   defaults to the developer's normal VS Code profile.
@@ -73,6 +82,15 @@ See [Preview release and installation](./docs/mvp/release.md) for packaging, ins
   remote nodes, listener, peers, and tasks from the Activity Bar Dashboard.
 - Persist shared task/delegation state and bounded reducer events behind
   generation-fenced Broker writes.
+- Discover only caller-owned Mesh Dev Tunnels using pinned public SDK packages;
+  keep unpaired candidates out of executable worker directories.
+- Bind locators to authenticated peer/profile generations, recover pending
+  enrollment, and re-resolve endpoints without changing task identities.
+- Enforce A's real local-source allowlists and B's independent paired-device
+  grants/receive switch; revoke incoming peers durably and close their sockets.
+- Select exactly one CLI or SDK private host. SDK hosting uses Host and
+  port-specific Connect capabilities, never creates anonymous ACEs, and never
+  silently falls back to the CLI's legacy outer admission.
 
 Local tasks take the full direct route Window A → local Broker → Window B → real
 AHP → Broker store → Window A and never touch Dev Tunnel. Remote v2 traffic uses
@@ -83,9 +101,10 @@ The final ordinary-window run passed on VS Code 1.135.0, macOS arm64, using a
 dedicated authenticated profile. It observed two Window Nodes in 133 ms, five
 real output events, authoritative start/get/cancel, `cancelled`, Broker takeover
 in 1878 ms, workspace reclaim/conflict, and exact zero-residue cleanup. The
-earlier two-device v2 run remains transport/routing evidence only because its
+earlier two-instance public-relay v2 run remains transport/routing evidence only because its
 disposable Worker profile stopped at `AGENT_AUTH_REQUIRED`. See
-[the E2E evidence](./docs/mvp/e2e.md).
+[the E2E evidence](./docs/mvp/e2e.md). Two logical instances on one host are not
+two physical devices.
 
 The 0.4.0 Peer Delegation objective run on the same VS Code/platform verified
 two ordinary windows, exactly one Broker, two distinct claims, both double-gate
@@ -102,6 +121,31 @@ visibility: its provider and actual working directory must also match the target
 window. Normal terminal cleanup retains Editor history without keeping the Mesh
 connection alive. Old `ahp-session:` resources are not renamed or migrated by the
 new-session policy.
+
+## Cross-device opt-in
+
+Use **Dashboard -> Cross-device -> Configure discovery and hosting**. Authorize
+an exact GitHub or Microsoft account and separately allow Mesh advertisement
+updates. D1 keeps the CLI's independent login; D2 is selected through the explicit
+SDK private-host migration action. Merely opening the Dashboard does not query
+the cloud or start hosting.
+
+Import B's one-time invitation through A's candidate action and native password
+input. Then activate strict cross-device delegation on both devices. In
+**Configure strict remote policy**, B grants the paired device its target
+Workspace and enables receive; A allowlists that authenticated remote Workspace
+from every claimed source root. Use the existing five Mesh Tools with explicit
+Device/Node/Workspace IDs. Strict remote tasks retain B's per-task confirmation
+and require B's existing editor Host, without standalone fallback.
+
+The three settings `experimental.crossDeviceDiscovery`,
+`experimental.crossDeviceDelegation`, and `experimental.devTunnelSdkHosting`
+all default to `false` under `copilotAgentMesh`. Strict activation is latched:
+disabling delegation blocks new remote tasks rather than restoring legacy
+authorization. Receive/grant removal does not cancel accepted tasks; **Revoke
+incoming peer** additionally closes connections and requests authoritative
+target-side cancellation. Cleanup failure remains visible and never restores
+permission.
 
 ## Install the local Preview
 

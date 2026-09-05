@@ -23,11 +23,9 @@ import {
 import { systemClock, type StateStore } from '../domain/ports';
 import { GatewayRouter } from '../gateway/GatewayRouter';
 import { GatewayServer } from '../gateway/GatewayServer';
-import { PairingService } from '../gateway/PairingService';
 import type { LocalIpcIdentity } from '../ipc';
 import type { StructuredLogger } from '../logging/StructuredLogger';
-import { PeerConnectionManager } from '../peer/PeerConnectionManager';
-import { WebSocketPeerTransport } from '../peer/WebSocketPeerTransport';
+import type { PeerConnectionManager } from '../peer/PeerConnectionManager';
 import {
 	AtomicFileStore,
 	NodeAtomicFileSystem,
@@ -53,6 +51,7 @@ import { LazyVscodeDevTunnelProvider } from './LazyVscodeDevTunnelProvider';
 import { createTaskNotificationSink } from './TaskNotificationPublisher';
 import { ProductionRemoteTaskAdapter } from './ProductionRemoteTaskAdapter';
 import { ensureOwnedBrokerKey } from './SharedBrokerIdentity';
+import { ProductionConnectivity } from './ProductionConnectivity';
 
 export interface ProductionBrokerRuntimeOptions {
 	readonly vscodeApi: typeof vscode;
@@ -86,6 +85,7 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 	public readonly remoteTasks: ProductionRemoteTaskAdapter;
 	public readonly listener: ListenerService;
 	public readonly tunnel: LazyVscodeDevTunnelProvider;
+	public readonly connectivity: ProductionConnectivity;
 
 	private started = false;
 	private disposed = false;
@@ -93,6 +93,7 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 	private disposal: Promise<void> | undefined;
 	private listenerDisposed = false;
 	private peersDisposed = false;
+	private connectivityDisposed = false;
 	private brokerDisposed = false;
 	private disposedNotificationSent = false;
 	private changeNotificationSent = false;
@@ -116,6 +117,7 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 			readonly remoteTasks: ProductionRemoteTaskAdapter;
 			readonly listener: ListenerService;
 			readonly tunnel: LazyVscodeDevTunnelProvider;
+			readonly connectivity: ProductionConnectivity;
 		},
 	) {
 		this.device = components.device;
@@ -133,8 +135,12 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 		this.remoteTasks = components.remoteTasks;
 		this.listener = components.listener;
 		this.tunnel = components.tunnel;
+		this.connectivity = components.connectivity;
 		for (const subscription of [
-			this.listener.onDidChange(this.options.onDidChange),
+			this.listener.onDidChange(() => {
+				this.options.onDidChange();
+				this.connectivity.exposureChanged();
+			}),
 			{
 				dispose: this.peers.onDidChange(() => {
 					this.options.onDidChange();
@@ -251,15 +257,17 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 				.get<boolean>('experimental.peerDelegation', false),
 			onDidChange: options.onDidChange,
 		});
-		registry.setPeerRouteAuthorizer(peerPolicies);
 		const taskRoutes = new TaskRouteCatalog(fencedState);
 		let listener: ListenerService | undefined;
+		let connectivity: ProductionConnectivity | undefined;
 		brokerTasks = new BrokerTaskService(
 			profile.deviceId,
 			registry,
 			tasks,
 			systemClock,
 			{
+				requiresEditorForRemote: () => connectivity?.strict() === true,
+				assertRemotePeer: (peerId) => connectivity!.pairing.assertActivePeer(peerId),
 				onDidChange: options.onDidChange,
 				onTaskSnapshot: async (snapshot, sourceNodeId) => {
 					if (taskRoutes.get(snapshot.taskId) !== undefined) {
@@ -279,18 +287,30 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 		);
 		const pairingRecords = new VscodePairingRecordStore(fencedState);
 		const peerProfiles = new VscodePeerProfileStore(fencedState);
-		const pairing = new PairingService(
-			profile.deviceId,
-			options.secrets,
-			pairingRecords,
-		);
-		const peers = new PeerConnectionManager(
-			profile.deviceId,
-			peerProfiles,
-			options.secrets,
-			new WebSocketPeerTransport(),
-			{ ownership: options.ownership },
-		);
+		const tunnelPath = configuration.get<string>('devTunnelPath', '').trim();
+		const tunnel = new LazyVscodeDevTunnelProvider({
+			executable: tunnelPath || undefined,
+			reportStatusListenerError: (error: unknown) =>
+				options.logger.error('listener', 'A Dev Tunnel status listener failed.', error),
+			stateStore: new VscodeDevTunnelStateStore(fencedState),
+		});
+		let remoteTasks: ProductionRemoteTaskAdapter;
+		connectivity = new ProductionConnectivity({
+			vscodeApi: options.vscodeApi, files,
+			fence: { ownership: options.ownership, generation: options.generation },
+			deviceId: profile.deviceId, profiles: peerProfiles, records: pairingRecords,
+			secrets: options.secrets, registry, localPolicies: peerPolicies, tasks,
+			cancelTask: (peerId, taskId) => brokerTasks!.cancel(peerId, taskId),
+			listener: () => listener, remoteTasks: () => remoteTasks, cli: tunnel,
+			changed: () => {
+				options.onDidChange();
+				broker?.connectivityChanged();
+			},
+			report: (code) => options.logger.log('warn', 'connectivity', 'Remote connectivity requires attention.', { code }),
+		});
+		registry.setPeerRouteAuthorizer(connectivity.remotePolicies);
+		const pairing = connectivity.pairing;
+		const peers = connectivity.peers;
 		const coordinator = new TaskCoordinator(
 			peers,
 			peerProfiles,
@@ -300,7 +320,7 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 			() => new Date(),
 			options.ownership,
 		);
-		const remoteTasks = new ProductionRemoteTaskAdapter(
+		remoteTasks = new ProductionRemoteTaskAdapter(
 			peers,
 			peerProfiles,
 			fencedState,
@@ -313,19 +333,15 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 			peerPolicies,
 			taskService: brokerTasks,
 			remoteTaskService: remoteTasks,
+			remotePolicies: connectivity.remotePolicies,
+			connectivity,
+			assertRemotePeer: (peerId) => pairing.assertActivePeer(peerId),
 			taskRoutes,
 			onError: (error) => options.logger.error(
 				'local-ipc',
 				'The local Device Broker reported a transport failure.',
 				error,
 			),
-		});
-		const tunnelPath = configuration.get<string>('devTunnelPath', '').trim();
-		const tunnel = new LazyVscodeDevTunnelProvider({
-			executable: tunnelPath || undefined,
-			reportStatusListenerError: (error: unknown) =>
-				options.logger.error('listener', 'A Dev Tunnel status listener failed.', error),
-			stateStore: new VscodeDevTunnelStateStore(fencedState),
 		});
 		const router = new GatewayRouter(device, broker);
 		const configuredPort = (): number | undefined => {
@@ -337,8 +353,12 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 		listener = new ListenerService(
 			profile.deviceId,
 			pairing,
-			tunnel,
-			() => new GatewayServer(pairing, router),
+			connectivity.exposure,
+			() => new GatewayServer(pairing, router, {
+				admissionReady: () => connectivity!.isReady()
+					&& (connectivity!.settings.snapshot().hostingBackend !== 'sdk'
+						|| connectivity!.sdkExposure.getStatus().state === 'ready'),
+			}),
 			fencedState,
 			options.guard,
 			{
@@ -363,6 +383,7 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 			remoteTasks,
 			listener,
 			tunnel,
+			connectivity,
 		});
 	}
 
@@ -386,7 +407,12 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 			}
 		}
 		await this.broker.start();
-		await this.peers.restore();
+		await this.connectivity.initialize();
+		if (this.connectivity.isReady()) {
+			await this.peers.restore().catch((error: unknown) => {
+				this.options.logger.error('connectivity', 'Remote peers could not be restored; local nodes remain available.', error);
+			});
+		}
 		await this.restoreListener();
 		await this.coordinator.refreshKnownTasks().catch((error: unknown) => {
 			this.options.logger.error(
@@ -405,6 +431,7 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 			return this.disposal;
 		}
 		this.disposeRequested = true;
+		this.connectivity.beginShutdown();
 		let disposal!: Promise<void>;
 		disposal = this.disposeOnce().finally(() => {
 			if (!this.disposed && this.disposal === disposal) {
@@ -450,6 +477,13 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 				dispose: () => this.peers.dispose(),
 				complete: () => {
 					this.peersDisposed = true;
+				},
+			},
+			{
+				pending: () => !this.connectivityDisposed,
+				dispose: () => this.connectivity.dispose(),
+				complete: () => {
+					this.connectivityDisposed = true;
 				},
 			},
 			{

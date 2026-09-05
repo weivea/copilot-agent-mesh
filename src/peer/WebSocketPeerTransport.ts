@@ -18,6 +18,7 @@ import {
 	type ReconnectTranscript,
 } from '../gateway/PairingCrypto';
 import type { SecretStore } from '../gateway/SecretStore';
+import { WebSocketPeerSocketConnector, type PeerSocketConnector } from './PeerSocketConnector';
 import {
 	isUsablePeerProfile,
 	type PeerProfile,
@@ -99,6 +100,7 @@ export interface WebSocketPeerTransportOptions {
 	readonly requestTimeoutMs?: number;
 	readonly heartbeatIntervalMs?: number;
 	readonly webSocketFactory?: (url: string) => WebSocket;
+	readonly connector?: PeerSocketConnector;
 	readonly now?: () => number;
 }
 
@@ -159,16 +161,15 @@ async function retryPendingCommit(
 export class WebSocketPeerTransport implements PeerTransport {
 	private readonly requestTimeoutMs: number;
 	private readonly heartbeatIntervalMs: number;
-	private readonly factory: (url: string) => WebSocket;
+	private readonly connector: PeerSocketConnector;
 	private readonly now: () => number;
 
 	public constructor(options: WebSocketPeerTransportOptions = {}) {
 		this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
 		this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 10_000;
-		this.factory = options.webSocketFactory ?? ((url) => new WebSocket(url, {
-			perMessageDeflate: false,
-			maxPayload: 1_048_576,
-		}));
+		this.connector = options.connector ?? (options.webSocketFactory === undefined
+			? new WebSocketPeerSocketConnector()
+			: { connect: async (url) => options.webSocketFactory!(url) });
 		this.now = options.now ?? Date.now;
 	}
 
@@ -398,7 +399,7 @@ export class WebSocketPeerTransport implements PeerTransport {
 	private async open(endpoint: string, signal: AbortSignal): Promise<RpcWebSocketClient> {
 		let socket: WebSocket;
 		try {
-			socket = this.factory(endpoint);
+			socket = await this.connector.connect(endpoint, signal);
 		} catch {
 			throw new PeerTransportError('CONNECTION_FAILED', 'Unable to open peer connection.');
 		}
@@ -513,6 +514,7 @@ class RpcWebSocketClient {
 			const cleanup = (): void => {
 				socket.off('open', opened);
 				socket.off('error', fail);
+				socket.off('close', fail);
 				signal.removeEventListener('abort', abort);
 			};
 			if (signal.aborted) {
@@ -521,7 +523,13 @@ class RpcWebSocketClient {
 			}
 			socket.once('open', opened);
 			socket.once('error', fail);
+			socket.once('close', fail);
 			signal.addEventListener('abort', abort, { once: true });
+			if (socket.readyState === WebSocket.OPEN) {
+				opened();
+			} else if (socket.readyState === WebSocket.CLOSED) {
+				fail();
+			}
 		});
 	}
 
@@ -740,9 +748,11 @@ function assertHello(
 		'mode', 'version', 'workerDeviceId', 'sessionId', 'serverNonce', 'serverProof',
 	]);
 	if (value.mode !== mode
-		|| value.version !== MESH_PROTOCOL_VERSION
-		|| value.workerDeviceId !== workerDeviceId) {
+		|| value.version !== MESH_PROTOCOL_VERSION) {
 		throw new PeerTransportError('PROTOCOL_INCOMPATIBLE', 'Peer protocol response is incompatible.');
+	}
+	if (value.workerDeviceId !== workerDeviceId) {
+		throw new PeerTransportError('AUTH_FAILED', 'The Mesh device identity does not match the approved peer.');
 	}
 	stringField(value, 'sessionId');
 	stringField(value, 'serverNonce');

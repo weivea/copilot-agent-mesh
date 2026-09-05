@@ -19,6 +19,8 @@ import {
 	timestampSchema,
 	uuidSchema,
 	type MeshErrorReason,
+	type NodeDirectoryResult,
+	type TaskTarget,
 	type RoutedTaskStartParams,
 	type TaskSnapshot,
 	type TaskSnapshotAfterEventSeq,
@@ -43,6 +45,7 @@ import type {
 	RemoteTaskRouteAdapter,
 	RemoteTaskStartOutcome,
 } from '../tools/LocalBrokerTaskFacade';
+import type { AuthenticatedRemoteTarget } from '../broker/RemotePeerPolicyService';
 
 export const REMOTE_TASK_ROUTE_STATE_KEY = 'copilotAgentMesh.remoteTaskRoutes.v2';
 export const REMOTE_TASK_ROUTE_LIMIT = 1_000;
@@ -122,6 +125,8 @@ export class ProductionRemoteTaskAdapter implements RemoteTaskRouteAdapter {
 	private readonly routeAttemptGroups = new Map<string, RemoteRouteAttemptGroup>();
 	private routeMutation = Promise.resolve();
 	private nextRouteAttemptId = 1;
+	private directory: MeshRemoteDirectorySnapshot = { devices: [], truncated: false, totalDevices: 0 };
+	private readonly authenticatedCatalog = new Map<string, { generation: string; directory: NodeDirectoryResult }>();
 
 	public constructor(
 		private readonly peers: PeerConnectionManager,
@@ -152,6 +157,7 @@ export class ProductionRemoteTaskAdapter implements RemoteTaskRouteAdapter {
 					|| !this.peers.isEnabled(profile.id)
 					|| state !== 'online'
 				) {
+					this.authenticatedCatalog.delete(profile.id);
 					return incompatible;
 				}
 				try {
@@ -161,8 +167,12 @@ export class ProductionRemoteTaskAdapter implements RemoteTaskRouteAdapter {
 					]);
 					const device = deviceInfoSchema.parse(deviceValue);
 					const directory = nodeDirectoryResultSchema.parse(nodesValue);
-					if (directory.deviceId !== device.deviceId) {
+					if (directory.deviceId !== device.deviceId || device.deviceId !== profile.workerDeviceId) {
+						this.authenticatedCatalog.delete(profile.id);
 						return incompatible;
+					}
+					if (profile.generation !== undefined) {
+						this.authenticatedCatalog.set(profile.id, { generation: profile.generation, directory });
 					}
 					return {
 						deviceId: device.deviceId,
@@ -188,6 +198,7 @@ export class ProductionRemoteTaskAdapter implements RemoteTaskRouteAdapter {
 						})),
 					};
 				} catch (error: unknown) {
+					this.authenticatedCatalog.delete(profile.id);
 					if (signal.aborted) {
 						throw error;
 					}
@@ -195,12 +206,28 @@ export class ProductionRemoteTaskAdapter implements RemoteTaskRouteAdapter {
 				}
 			},
 		));
-		return budgetRemoteDirectory(devices.filter((device) => device !== undefined));
+		this.directory = budgetRemoteDirectory(devices.filter((device) => device !== undefined));
+		return this.cachedDevices();
+	}
+
+	public cachedDevices(): MeshRemoteDirectorySnapshot {
+		return structuredClone(this.directory);
+	}
+
+	public lookupTarget(profileId: string, target: TaskTarget): AuthenticatedRemoteTarget | undefined {
+		const catalog = this.authenticatedCatalog.get(profileId);
+		const node = catalog?.directory.nodes.find((value) =>
+			value.nodeId === target.nodeId && value.nodeInstanceId === target.nodeInstanceId);
+		if (catalog === undefined || node === undefined || catalog.directory.deviceId !== target.deviceId
+			|| this.peers.get(profileId)?.snapshot().state !== 'online') {
+			return undefined;
+		}
+		return { profileId, profileGeneration: catalog.generation, deviceId: catalog.directory.deviceId, node: structuredClone(node) };
 	}
 
 	public async startTask(
 		input: RoutedTaskStartParams,
-		route: { readonly peerId?: string },
+		route: { readonly peerId?: string; readonly assertAuthorized?: () => Promise<void> },
 		outcome?: RemoteTaskStartOutcome,
 	): Promise<TaskSnapshot> {
 		const params = routedTaskStartParamsSchema.parse(input);
@@ -230,6 +257,7 @@ export class ProductionRemoteTaskAdapter implements RemoteTaskRouteAdapter {
 		};
 		const dispatch = outcome ?? { taskStartRequestAttempted: false };
 		try {
+			await route.assertAuthorized?.();
 			if (this.requireOnline(peerId.data) !== connection) {
 				throw new MeshDomainError(
 					'TUNNEL_UNAVAILABLE',

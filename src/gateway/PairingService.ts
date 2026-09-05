@@ -151,6 +151,11 @@ type AuthenticationSessionWithoutTimer =
 	| Omit<ReconnectSession, 'expirationTimer'>;
 
 export interface PairingServiceOptions {
+	readonly accessControl?: {
+		assertAllowed(peerId: string): void;
+		revoke(peerId: string): Promise<void>;
+		retryCleanup(): Promise<void>;
+	};
 	readonly invitationTtlMs?: number;
 	readonly pendingTtlMs?: number;
 	readonly handshakeTtlMs?: number;
@@ -188,6 +193,8 @@ export class PairingService {
 	private readonly connectionGenerations = new Map<string, number>();
 	private readonly inFlightHellos = new Map<string, number>();
 	private recordMutation = Promise.resolve();
+	private readonly accessControl: PairingServiceOptions['accessControl'];
+	private readonly connectionPeers = new Map<string, string>();
 
 	public constructor(
 		public readonly workerDeviceId: string,
@@ -201,6 +208,35 @@ export class PairingService {
 		this.maxInvitations = options.maxInvitations ?? 5;
 		this.now = options.now ?? Date.now;
 		this.id = options.id ?? randomUUID;
+		this.accessControl = options.accessControl;
+	}
+
+	public assertPeerAllowed(peerId: string): void {
+		this.accessControl?.assertAllowed(peerId);
+	}
+
+	public async assertActivePeer(peerId: string): Promise<void> {
+		this.assertPeerAllowed(peerId);
+		const peer = await this.records.getPeer(peerId);
+		this.assertPeerAllowed(peerId);
+		if (peer === undefined) {
+			throw new PairingProtocolError('AUTH_FAILED', 'Peer authentication failed.');
+		}
+	}
+
+	public connectionHasPeer(connectionId: string, peerId: string): boolean {
+		return this.connectionPeers.get(connectionId) === peerId;
+	}
+
+	public revokePeer(peerId: string): Promise<void> {
+		if (this.accessControl === undefined) {
+			throw new Error('Target-side peer revocation is unavailable.');
+		}
+		return this.mutateRecords(() => this.accessControl!.revoke(peerId));
+	}
+
+	public retryRevocationCleanup(): Promise<void> {
+		return this.mutateRecords(() => this.accessControl?.retryCleanup() ?? Promise.resolve());
 	}
 
 	public async createInvitation(origin: string): Promise<CreatedInvitation> {
@@ -263,6 +299,10 @@ export class PairingService {
 		this.assertHello(params);
 		const generation = this.beginHello(connectionId);
 		try {
+			if (params.peerId !== undefined) {
+				this.assertPeerAllowed(params.peerId);
+				this.connectionPeers.set(connectionId, params.peerId);
+			}
 			return await this.helloCore(connectionId, params, generation);
 		} finally {
 			this.endHello(connectionId);
@@ -329,11 +369,13 @@ export class PairingService {
 			};
 		}
 		const peer = await this.records.getPeer(params.peerId!);
+		this.assertPeerAllowed(params.peerId!);
 		this.assertConnectionOpen(connectionId, generation);
 		if (peer === undefined || peer.coordinatorDeviceId !== params.coordinatorDeviceId) {
 			throw new PairingProtocolError('AUTH_FAILED', 'Peer authentication failed.');
 		}
 		const encodedRoot = await this.secretStore.get(peer.rootKeyRef);
+		this.assertPeerAllowed(peer.peerId);
 		this.assertConnectionOpen(connectionId, generation);
 		if (encodedRoot === undefined) {
 			throw new PairingProtocolError('AUTH_FAILED', 'Peer authentication failed.');
@@ -376,6 +418,14 @@ export class PairingService {
 		sessionId: string,
 		encodedProof: string,
 	): Promise<{ readonly result: Record<string, unknown>; readonly peerId?: string }> {
+		return this.mutateRecords(() => this.authenticateLocked(connectionId, sessionId, encodedProof));
+	}
+
+	private async authenticateLocked(
+		connectionId: string,
+		sessionId: string,
+		encodedProof: string,
+	): Promise<{ readonly result: Record<string, unknown>; readonly peerId?: string }> {
 		const session = this.getSession(connectionId, sessionId);
 		let proof: Buffer;
 		try {
@@ -384,6 +434,7 @@ export class PairingService {
 			this.authenticationFailed(sessionId, session);
 		}
 		if (session.mode === 'reconnect') {
+			this.assertPeerAllowed(session.transcript.peerId);
 			const expected = reconnectProof(
 				session.rootKey,
 				'mesh/reconnect-client-proof/v1',
@@ -403,6 +454,8 @@ export class PairingService {
 			this.authenticationFailed(sessionId, session);
 		}
 		const peerId = session.peerId ?? this.id();
+		this.assertPeerAllowed(peerId);
+		this.connectionPeers.set(connectionId, peerId);
 		const enrollmentId = session.enrollmentId ?? this.id();
 		const hash = enrollmentTranscriptHash(session.transcript);
 		const rootKey = derivePeerRoot(session.secret, session.transcript);
@@ -425,6 +478,8 @@ export class PairingService {
 		}
 		session.enrollmentId = enrollmentId;
 		session.peerId = peerId;
+		this.assertPeerAllowed(peerId);
+		this.getSession(connectionId, sessionId);
 		return {
 			result: {
 				enrollmentId,
@@ -463,6 +518,13 @@ export class PairingService {
 		peerId: string,
 		encodedProof: string,
 	): Promise<string> {
+		this.assertPeerAllowed(peerId);
+		const generation = this.connectionGenerations.get(connectionId);
+		if (generation === undefined) {
+			throw new PairingProtocolError('AUTH_FAILED', 'Authentication connection is closed.');
+		}
+		this.assertConnectionOpen(connectionId, generation);
+		this.connectionPeers.set(connectionId, peerId);
 		const session = sessionId === undefined || !this.sessions.has(sessionId)
 			? undefined
 			: this.getSession(connectionId, sessionId);
@@ -484,6 +546,8 @@ export class PairingService {
 			}
 			await this.verifyCommitProof(active, enrollmentId, encodedProof, sessionId, session);
 			await this.cleanupCommittedPeer(active);
+			this.assertPeerAllowed(peerId);
+			this.assertConnectionOpen(connectionId, generation);
 			if (sessionId !== undefined) {
 				this.deleteSession(sessionId);
 			}
@@ -499,6 +563,7 @@ export class PairingService {
 			);
 		}
 		await this.verifyCommitProof(pending, enrollmentId, encodedProof, sessionId, session);
+		this.assertPeerAllowed(peerId);
 		const invitation = await this.records.getInvitation(pending.invitationId);
 		const peer: PeerRecord = {
 			peerId: pending.peerId,
@@ -524,10 +589,13 @@ export class PairingService {
 		if (sessionId !== undefined) {
 			this.deleteSession(sessionId);
 		}
+		this.assertPeerAllowed(peerId);
+		this.assertConnectionOpen(connectionId, generation);
 		return pending.peerId;
 	}
 
 	public disposeConnection(connectionId: string): void {
+		this.connectionPeers.delete(connectionId);
 		this.activeConnections.delete(connectionId);
 		this.closedConnections.add(connectionId);
 		this.connectionGenerations.set(
@@ -552,6 +620,7 @@ export class PairingService {
 		this.closedConnections.clear();
 		this.connectionGenerations.clear();
 		this.inFlightHellos.clear();
+		this.connectionPeers.clear();
 	}
 
 	private assertHello(params: HelloParams): void {

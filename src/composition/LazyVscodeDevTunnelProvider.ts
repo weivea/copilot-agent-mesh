@@ -17,6 +17,7 @@ export interface LazyVscodeDevTunnelProviderOptions {
 }
 
 export interface LazyDevTunnelDelegate extends DevTunnelProvider {
+	deleteOwnedResource?(): Promise<'deleted' | 'already-absent'>;
 	deleteOwnedForE2e(
 		capability: E2eCapability,
 	): Promise<'deleted' | 'already-absent'>;
@@ -112,6 +113,14 @@ export class LazyVscodeDevTunnelProvider implements DevTunnelProvider {
 		capability: E2eCapability,
 	): Promise<'deleted' | 'already-absent'> {
 		return (await this.load()).deleteOwnedForE2e(capability);
+	}
+
+	public async deleteOwnedResource(): Promise<'deleted' | 'already-absent'> {
+		const delegate = await this.load();
+		if (delegate.deleteOwnedResource === undefined) {
+			throw new Error('The CLI provider does not support exact owned-resource cleanup.');
+		}
+		return delegate.deleteOwnedResource();
 	}
 
 	public async ownedMetadataForE2e(capability: E2eCapability): Promise<{

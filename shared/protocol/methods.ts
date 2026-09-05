@@ -15,51 +15,68 @@ import {
 	routedTaskStartParamsSchema,
 } from './nodes';
 
-const nonceSchema = z.string().regex(/^[A-Za-z0-9_-]{32,256}$/);
-const proofSchema = z.string().regex(/^[A-Za-z0-9_-]{43,512}$/);
+const nonceSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
+const proofSchema = nonceSchema;
+const pairingIdentifierSchema = z.string().min(1).max(128).regex(/^[A-Za-z0-9._~-]+$/u);
 
 export const helloParamsSchema = z.strictObject({
-	protocolMin: z.number().int().min(1),
-	protocolMax: z.number().int().min(1),
-	deviceId: uuidSchema,
-	nonce: nonceSchema,
-});
+	protocolMin: z.number().int(),
+	protocolMax: z.number().int(),
+	coordinatorDeviceId: pairingIdentifierSchema,
+	clientNonce: nonceSchema,
+	invitationId: pairingIdentifierSchema.optional(),
+	peerId: pairingIdentifierSchema.optional(),
+}).refine(
+	(value) => (value.invitationId === undefined) !== (value.peerId === undefined),
+	'Exactly one authentication mode is required.',
+);
 
 export const helloResultSchema = z.strictObject({
-	protocolVersion: z.literal(MESH_PROTOCOL_VERSION),
-	deviceId: uuidSchema,
-	nonce: nonceSchema,
-	proof: proofSchema,
+	mode: z.enum(['enrollment', 'reconnect']),
+	version: z.literal(MESH_PROTOCOL_VERSION),
+	workerDeviceId: pairingIdentifierSchema,
+	sessionId: pairingIdentifierSchema,
+	serverNonce: nonceSchema,
+	serverProof: proofSchema,
 });
 
 export const authenticateParamsSchema = z.strictObject({
-	peerId: uuidSchema,
-	sessionId: uuidSchema,
-	nonce: nonceSchema,
+	sessionId: pairingIdentifierSchema,
 	proof: proofSchema,
 });
 
-export const authenticateResultSchema = z.strictObject({
-	authenticated: z.literal(true),
-	sessionId: uuidSchema,
-});
+export const authenticateResultSchema = z.union([
+	z.strictObject({
+		authenticated: z.literal(true),
+		peerId: pairingIdentifierSchema,
+	}),
+	z.strictObject({
+		enrollmentId: pairingIdentifierSchema,
+		peerId: pairingIdentifierSchema,
+		expiresAt: z.number(),
+		pendingProof: proofSchema,
+	}),
+]);
 
 export const enrollmentCommitParamsSchema = z.strictObject({
-	enrollmentId: uuidSchema,
-	commitProof: proofSchema,
+	sessionId: pairingIdentifierSchema.optional(),
+	enrollmentId: pairingIdentifierSchema,
+	peerId: pairingIdentifierSchema,
+	proof: proofSchema,
 });
 
 export const enrollmentCommitResultSchema = z.strictObject({
 	committed: z.literal(true),
-	peerId: uuidSchema,
+	peerId: pairingIdentifierSchema,
 });
 
 export const pingParamsSchema = z.strictObject({
-	sentAt: timestampSchema,
+	sentAt: z.number(),
 });
 
 export const pingResultSchema = z.strictObject({
-	receivedAt: timestampSchema,
+	sentAt: z.number(),
+	receivedAt: z.number(),
 });
 
 export const taskStartParamsSchema = z.strictObject({
