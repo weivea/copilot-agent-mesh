@@ -10,6 +10,8 @@ import {
 	brokerRemoteListResultSchema,
 	connectivitySnapshotParamsSchema,
 	connectivityActionParamsSchema,
+	remotePolicyDashboardParamsSchema,
+	remotePolicyActionParamsSchema,
 	brokerRemoteTaskAnswerParamsSchema,
 	brokerRemoteTaskCancelParamsSchema,
 	brokerRemoteTaskGetParamsSchema,
@@ -538,6 +540,24 @@ export class DeviceBroker {
 
 		const binding = this.requireRegistration(session);
 		switch (method) {
+			case LOCAL_BROKER_METHODS.remotePolicyDashboard: {
+				const input = remotePolicyDashboardParamsSchema.parse(params);
+				this.assertIdentity(binding, input);
+				if (!this.options.connectivity?.policySnapshot) {
+					throw new MeshDomainError('POLICY_FORBIDDEN', 'Remote policy configuration is unavailable.');
+				}
+				return toJsonValue(await this.options.connectivity.policySnapshot(binding, session));
+			}
+			case LOCAL_BROKER_METHODS.remotePolicyAction: {
+				const input = remotePolicyActionParamsSchema.parse(params);
+				this.assertIdentity(binding, input);
+				if (!this.options.connectivity?.policyAction) {
+					throw new MeshDomainError('POLICY_FORBIDDEN', 'Remote policy configuration is unavailable.');
+				}
+				await this.options.connectivity.policyAction(binding, input, session);
+				this.notifyDashboardChanged();
+				return null;
+			}
 			case LOCAL_BROKER_METHODS.connectivitySnapshot: {
 				const input = connectivitySnapshotParamsSchema.parse(params);
 				this.assertIdentity(binding, input);

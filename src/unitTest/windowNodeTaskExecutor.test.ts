@@ -561,6 +561,56 @@ test('ungranted legacy target prompts exactly once and preapproves its runtime b
 	await fixture.executor.dispose();
 });
 
+test('a bound Broker auto-accept approval skips only the remote task-start prompt and keeps runtime consent task-scoped', async () => {
+	const fixture = createFixture();
+	const params = startParams({
+		sourceNodeId: undefined, requireEditor: true,
+		remoteTaskApproval: {
+			kind: 'remoteAutoAccept', peerId: OWNER_ID, taskId: TASK_ID,
+			workspaceIdentity: WORKSPACE_IDENTITY, policyRevision: 1,
+		},
+	});
+	try {
+		await fixture.executor.start(params);
+		await fixture.executor.start(params);
+		assert.equal(fixture.runtime.requests.length, 1);
+		assert.equal(fixture.confirmations.length, 0);
+		assert.equal(fixture.runtime.requests[0].requireEditor, true);
+		assert.equal(fixture.approvalCapabilities.accepts(fixture.runtime.requests[0]), true);
+		assert.equal(fixture.approvalCapabilities.accepts({ ...fixture.runtime.requests[0], taskId: INPUT_ID }), false);
+		await fixture.runtime.handles[0].events.push({
+			type: 'inputRequired',
+			request: { requestId: 'terminal-command', kind: 'toolConfirmation', prompt: 'Run a terminal command?' },
+		});
+		await waitFor(() => fixture.events.some((event) => event.event.type === 'inputRequired'));
+		assert.equal(fixture.runtime.handles[0].answers.length, 0);
+	} finally { await fixture.executor.dispose(); }
+});
+
+test('remote task-start approval rejects wrong task, peer, Workspace, local-source and non-editor routes', async () => {
+	const approval: NonNullable<NodeTaskStartParams['remoteTaskApproval']> = {
+		kind: 'remoteAutoAccept', taskId: TASK_ID, peerId: OWNER_ID,
+		workspaceIdentity: WORKSPACE_IDENTITY, policyRevision: 1,
+	};
+	const variations: Partial<NodeTaskStartParams>[] = [
+		{ remoteTaskApproval: { ...approval, taskId: INPUT_ID } },
+		{ remoteTaskApproval: { ...approval, peerId: DEVICE_ID } },
+		{ remoteTaskApproval: { ...approval, workspaceIdentity: `sha256:${'b'.repeat(43)}` } },
+		{ sourceNodeId: NODE_ID, remoteTaskApproval: approval },
+		{ requireEditor: undefined, remoteTaskApproval: approval },
+	];
+	for (const variation of variations) {
+		const fixture = createFixture();
+		try {
+			await assert.rejects(fixture.executor.start(startParams({
+				sourceNodeId: undefined, requireEditor: true, ...variation,
+			})), { reason: 'AUTH_FAILED' });
+			assert.equal(fixture.runtime.requests.length, 0);
+			assert.equal(fixture.confirmations.length, 0);
+		} finally { await fixture.executor.dispose(); }
+	}
+});
+
 test('maps and UTF-8 bounds runtime events while preserving terminal semantics', async () => {
 	const fixture = createFixture();
 	await fixture.executor.start(startParams());

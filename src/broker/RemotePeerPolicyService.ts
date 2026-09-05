@@ -1,6 +1,6 @@
 import {
 	nodeDirectoryResultSchema, type NodeDirectoryResult, type NodeIdentityParams,
-	type TaskTarget, type WindowNodeDescriptor,
+	type TaskTarget, type WindowNodeDescriptor, type RemoteTaskApproval,
 } from '../../shared/protocol';
 import type { MeshRemoteDirectorySnapshot } from '../../shared/toolProtocol';
 import { REMOTE_POLICY_CAPABILITY } from '../connectivity/ConnectivitySchemas';
@@ -104,6 +104,7 @@ export class RemotePeerPolicyService implements PeerRouteAuthorizer {
 			if (allowed) {
 				await this.options.assertPeerActive(peerId);
 			}
+			this.requireOwned(caller, workspaceIdentity);
 		};
 		await validate();
 		await this.store.update(workspaceIdentity, (entry) => ({
@@ -111,7 +112,77 @@ export class RemotePeerPolicyService implements PeerRouteAuthorizer {
 			incomingPeerIds: allowed
 				? [...new Set([...entry.incomingPeerIds, peerId])]
 				: entry.incomingPeerIds.filter((value) => value !== peerId),
+			autoAcceptPeerIds: allowed ? entry.autoAcceptPeerIds : entry.autoAcceptPeerIds.filter((value) => value !== peerId),
 		}), validate);
+	}
+
+	public async setAllowedForWindow(
+		caller: NodeIdentityParams, sourceScope: string, target: RemoteAllowedTarget, allowed: boolean,
+		expectedRevision: number,
+	): Promise<void> {
+		const validate = async () => {
+			this.requireEnabled();
+			if (this.sourceScope(caller) !== sourceScope) {
+				throw new MeshDomainError('POLICY_FORBIDDEN', 'The source Workspace set changed.');
+			}
+			if (allowed) {
+				const profile = await this.profiles.get(target.profileId);
+				if (profile?.generation !== target.profileGeneration || profile.cleanupPending
+					|| this.bindings.get(target.profileId)?.profileGeneration !== target.profileGeneration) {
+					throw new MeshDomainError('PEER_NOT_ALLOWED', 'The approved peer binding changed.');
+				}
+			}
+			this.requireEnabled();
+			if (this.sourceScope(caller) !== sourceScope) {
+				throw new MeshDomainError('POLICY_FORBIDDEN', 'The source Workspace set changed.');
+			}
+		};
+		await validate();
+		await this.store.updateMany(this.sources(caller).map((workspace) => workspace.workspaceIdentity), (entry) => {
+			const remaining = entry.allowlist.filter((candidate) => !sameTarget(candidate, target));
+			return { ...entry, allowlist: allowed ? [...remaining, target] : remaining };
+		}, validate, expectedRevision);
+	}
+
+	public revision(): number { return this.store.revision(); }
+
+	public async setAutoAccept(
+		caller: NodeIdentityParams, workspaceIdentity: string, peerId: string, enabled: boolean,
+		expectedRevision?: number,
+	): Promise<void> {
+		const validate = async (): Promise<void> => {
+			this.requireOwned(caller, workspaceIdentity);
+			await this.options.assertPeerActive(peerId);
+			this.requireOwned(caller, workspaceIdentity);
+			if (!this.store.get(workspaceIdentity).incomingPeerIds.includes(peerId)) {
+				throw new MeshDomainError('PEER_NOT_ALLOWED', 'Grant this paired device the Workspace before enabling automatic task acceptance.');
+			}
+		};
+		await validate();
+		await this.store.update(workspaceIdentity, (entry) => ({
+			...entry,
+			autoAcceptPeerIds: enabled ? [...new Set([...entry.autoAcceptPeerIds, peerId])]
+				: entry.autoAcceptPeerIds.filter((value) => value !== peerId),
+		}), validate, expectedRevision);
+	}
+
+	public async approveTaskStart(
+		peerId: string, target: TaskTarget, workspaceIdentity: string, taskId: string,
+	): Promise<RemoteTaskApproval | undefined> {
+		await this.options.assertPeerActive(peerId);
+		if (!this.strict()) { return undefined; }
+		this.requireEnabled();
+		const node = this.registry.peerNode({ nodeId: target.nodeId, nodeInstanceId: target.nodeInstanceId });
+		const workspace = node?.workspaces.find((value) => value.workspaceId === target.workspaceId);
+		if (target.deviceId !== this.registry.list().deviceId || workspace?.workspaceIdentity !== workspaceIdentity) {
+			throw new MeshDomainError('PEER_OFFLINE', 'The exact target Workspace changed before task approval.');
+		}
+		this.assertRouteAllowed({
+			ownerId: peerId, remotePeerId: peerId, taskId,
+			nodeId: target.nodeId, nodeInstanceId: target.nodeInstanceId, workspaceId: target.workspaceId,
+		}, { source: undefined, target: node, targetWorkspaceIdentity: workspaceIdentity });
+		if (!this.store.get(workspaceIdentity).autoAcceptPeerIds.includes(peerId)) { return undefined; }
+		return { kind: 'remoteAutoAccept', taskId, peerId, workspaceIdentity, policyRevision: this.store.revision() };
 	}
 
 	public async setReceive(caller: NodeIdentityParams, workspaceIdentity: string, enabled: boolean): Promise<void> {
@@ -240,9 +311,20 @@ export class RemotePeerPolicyService implements PeerRouteAuthorizer {
 			|| workspace?.claimStatus !== 'claimed' || !workspace.enabled || !workspace.acceptsIncoming) {
 			return false;
 		}
+
 		const required = { profileId: target.profileId, profileGeneration: target.profileGeneration, workspaceIdentity: workspace.workspaceIdentity };
 		return this.sources(caller).every((source) =>
 			this.store.get(source.workspaceIdentity).allowlist.some((candidate) => sameTarget(candidate, required)));
+	}
+
+	public outgoingAllowed(caller: NodeIdentityParams, target: AuthenticatedRemoteTarget, workspaceId: string): boolean {
+		if (!this.remoteDirectoryAvailable()) { return false; }
+		return !this.strict() || this.isOutgoingAllowed(caller, target, workspaceId);
+	}
+
+	public sourceAllows(caller: NodeIdentityParams, target: RemoteAllowedTarget): boolean {
+		return this.sources(caller).every((source) =>
+			this.store.get(source.workspaceIdentity).allowlist.some((candidate) => sameTarget(candidate, target)));
 	}
 
 	private canReceive(peerId: string, identity: string): boolean {

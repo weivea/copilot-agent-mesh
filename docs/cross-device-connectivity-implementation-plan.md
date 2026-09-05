@@ -65,7 +65,11 @@ A Chat
   -> 权威事件、结果、输入或取消原路返回 A
 ```
 
-本期保留 B 当前的**远端逐任务确认**，不因为账号相同、设备已配对或 allowlist 已配置就删除确认。若后续需要一次性长期授权/无人值守，必须另立授权范围与产品设计。
+默认保留 B 的**远端逐任务确认**，不因为账号相同、设备已配对或 allowlist 已配置就删除确认。
+后续用户明确批准的设备树版本增加一个默认关闭的例外：B 可对**指定已配对来源设备 →
+B 当前 Workspace**单独启用自动接受。它只跳过任务启动提示，不扩大任务内敏感操作权限，
+也不替代来源 allowlist、目标 grant/receive、claim、Lease 或 editor-only 要求。
+具体交互与内部批准绑定见 [0.4.0 设计的后续授权修订](0.4.0-peer-delegation-design.md#后续-ux--跨设备授权修订)。
 
 新严格跨设备模式要求目标使用 `editor` source；选择器或endpoint失效时明确失败，不能静默回退standalone。通过内部、受信任的任务启动选项传递这一要求，不允许wire自行声明；原本地/legacy任务的fallback行为不变，不升级AHP或改变Session配置策略。
 
@@ -312,7 +316,7 @@ B 目标Workspace
 
 A的规则有方向；多根来源须由每个当前claimed Workspace都允许目标，复用现有canonical scope计算。B的peer grant绑定真实配对记录，不仅是 `coordinatorDeviceId`、显示名或账号；重新配对产生的新peer不继承旧grant。
 
-B不依赖A自称运行了新版本来保护自己。即使A是其他客户端，B也必须独立执行目标peer grant、接收开关、claim、Lease和逐任务确认。来源allowlist是A侧约束，不能宣传为B已独立验证远端来源窗口。
+B不依赖A自称运行了新版本来保护自己。即使A是其他客户端，B也必须独立执行目标peer grant、接收开关、claim、Lease和自己的任务启动确认策略（默认逐任务，仅对明确勾选的设备/Workspace自动接受）。来源allowlist是A侧约束，不能宣传为B已独立验证远端来源窗口。
 
 如果以后需要B按A的具体Workspace/Window制定规则、跨Broker传递可验证来源声明，应另设计协议版本；不在本期v2中偷偷扩展 `sourceNodeId` 的含义。
 
@@ -326,7 +330,7 @@ B不依赖A自称运行了新版本来保护自己。即使A是其他客户端�
 | B `GatewayRouter.node.list` | 从RpcPeer取得authenticated peer；调用新增 `listNodesForPeer(peerId)`，不再直接返回raw registry |
 | B `BrokerTaskService.prevalidateRemote` / 新任务Route | 使用服务端确定的peer principal验证policy；不得只在列表阶段检查 |
 | B `NodeRegistry` route authorizer | 复用当前lease前检查点；组合本地 `PeerPolicyService` 与远端策略，不继续对缺sourceNode的远端请求无条件放行 |
-| B `WindowNodeTaskExecutor` / Host source选择 | 保留远端逐任务确认和真实runtime取消；严格远端任务在真实start前要求editor source，失败不回退standalone；本地/legacy默认不变 |
+| B `WindowNodeTaskExecutor` / Host source选择 | 默认远端逐任务确认；仅接受Broker签发并绑定peer/task/Workspace的内部自动接受裁决；保留真实runtime取消；严格远端任务在真实start前要求editor source，失败不回退standalone；本地/legacy默认不变 |
 
 `TaskRouteRequest.ownerId` 当前可由服务端传入authenticated peer ID，但“没有sourceNode就是remote”不能成为任意内部调用的隐式授权规则。由Gateway/Broker创建不可由wire指定的principal分支，确认它对应active pairing后才进入远端策略。
 
@@ -449,7 +453,7 @@ Cloud不可用不能阻塞同设备IPC；新增存储损坏时停止相应远端
 | 升级安装但未启用新功能 | 保留当前v2手工邀请行为，不改已有CLI/隧道/账号 |
 | 用户首次启用严格远端策略 | 展示已有peers和影响；不自动生成Workspace grants；未批准目标不可进入新Tool目录 |
 | A新、B未提供policy能力标记 | 候选/配对状态可显示，但新委派路径拒绝；不能宣称新授权模式可用 |
-| A旧、B已启用严格策略 | B照样独立执行目标权限和逐任务确认；不信任旧A有来源allowlist；双方新体验不标为完成 |
+| A旧、B已启用严格策略 | B照样独立执行目标权限和本地任务启动确认策略；不信任旧A有来源allowlist；双方新体验不标为完成 |
 | 关闭新delegation开关 | 停止新严格远端任务；仍允许active peer对已接受且归属匹配的任务get/cancel/answer；已经激活的保护不得回落到旧的无远端策略分支 |
 | 仅关闭discovery | 已有身份不被删除；locator不可安全解析时明确offline/auth-required，不跨账号或跨安全模式猜地址 |
 | 回退二进制到旧版本 | 先停Listener、断连接、drain/cancel任务，撤销/清理新增严格模式peer密钥，再回退；不能假设旧代码会读取新revocation/policy文件 |

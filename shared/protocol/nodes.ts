@@ -2,6 +2,7 @@ import { z } from 'zod';
 
 import { PROTOCOL_LIMITS, utf8ByteLength, utf8String } from './limits';
 import { connectivityActionParamsSchema, connectivitySnapshotParamsSchema } from './connectivity';
+import { remotePolicyActionParamsSchema, remotePolicyDashboardParamsSchema } from './remotePolicy';
 import {
 	deviceInfoSchema,
 	recoveryDescriptorSchema,
@@ -346,6 +347,8 @@ export const peerPolicyCandidateParamsSchema = nodeIdentityParamsSchema.extend({
 });
 
 export const peerPolicyCandidateSchema = z.strictObject({
+	nodeId: uuidSchema.optional(),
+	nodeInstanceId: uuidSchema.optional(),
 	actionHandle: dashboardActionHandleSchema.optional(),
 	windowLabel: utf8String(PROTOCOL_LIMITS.nameBytes, 'window label', 1),
 	workspaceName: utf8String(PROTOCOL_LIMITS.nameBytes, 'workspace name', 1),
@@ -402,8 +405,18 @@ export const dashboardTaskReservationResultSchema = z.strictObject({
 	reservationHandle: dashboardActionHandleSchema,
 });
 
+export const remoteTaskApprovalSchema = z.strictObject({
+	kind: z.literal('remoteAutoAccept'),
+	taskId: uuidSchema,
+	peerId: uuidSchema,
+	workspaceIdentity: workspaceIdentitySchema,
+	policyRevision: z.number().int().nonnegative(),
+});
+export type RemoteTaskApproval = z.infer<typeof remoteTaskApprovalSchema>;
+
 export const nodeTaskStartParamsSchema = routedTaskStartParamsSchema.extend({
 	requireEditor: z.literal(true).optional(),
+	remoteTaskApproval: remoteTaskApprovalSchema.optional(),
 	authenticatedOwnerId: uuidSchema,
 	sourceLabel: utf8String(PROTOCOL_LIMITS.nameBytes, 'task source label', 1),
 	delegationGrant: delegationGrantSchema,
@@ -532,6 +545,8 @@ export const LOCAL_BROKER_METHODS = {
 	remoteCachedList: 'broker.remote.cachedList',
 	connectivitySnapshot: 'broker.connectivity.snapshot',
 	connectivityAction: 'broker.connectivity.action',
+	remotePolicyDashboard: 'broker.remote.policy.dashboard',
+	remotePolicyAction: 'broker.remote.policy.action',
 	remoteTaskStart: 'broker.remote.task.start',
 	remoteTaskGet: 'broker.remote.task.get',
 	remoteTaskCancel: 'broker.remote.task.cancel',
@@ -578,6 +593,8 @@ export const localBrokerMethodParamsSchemas = {
 	[LOCAL_BROKER_METHODS.remoteCachedList]: z.strictObject({}),
 	[LOCAL_BROKER_METHODS.connectivitySnapshot]: connectivitySnapshotParamsSchema,
 	[LOCAL_BROKER_METHODS.connectivityAction]: connectivityActionParamsSchema,
+	[LOCAL_BROKER_METHODS.remotePolicyDashboard]: remotePolicyDashboardParamsSchema,
+	[LOCAL_BROKER_METHODS.remotePolicyAction]: remotePolicyActionParamsSchema,
 	[LOCAL_BROKER_METHODS.remoteTaskStart]: brokerRemoteTaskStartParamsSchema,
 	[LOCAL_BROKER_METHODS.remoteTaskGet]: brokerRemoteTaskGetParamsSchema,
 	[LOCAL_BROKER_METHODS.remoteTaskCancel]: brokerRemoteTaskCancelParamsSchema,

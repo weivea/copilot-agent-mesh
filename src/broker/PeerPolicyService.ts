@@ -240,6 +240,8 @@ export class PeerPolicyService implements PeerRouteAuthorizer {
 						: 'unclaimed' as const;
 				return {
 					candidate: {
+						nodeId: node.nodeId,
+						nodeInstanceId: node.nodeInstanceId,
 						windowLabel: labels.get(node.nodeId) ?? node.nodeId.slice(0, 8),
 						workspaceName: node.workspaces.length > 1
 							? `${node.workspaces.length} workspaces`

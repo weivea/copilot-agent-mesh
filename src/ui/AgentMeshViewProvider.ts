@@ -17,9 +17,9 @@ import {
 	parseDashboardInboundMessage,
 } from './DashboardMessages';
 import { DashboardPresenter, type DashboardViewModel } from './DashboardPresenter';
-import { CONNECTIVITY_ACTIONS } from '../../shared/protocol';
+import { CONNECTIVITY_ACTIONS, REMOTE_POLICY_ACTIONS } from '../../shared/protocol';
 
-const connectivityActions = new Set<string>(CONNECTIVITY_ACTIONS);
+const promptActions = new Set<string>([...CONNECTIVITY_ACTIONS, ...REMOTE_POLICY_ACTIONS]);
 
 interface ScopedDashboardAction {
 	readonly action: DashboardAction;
@@ -125,8 +125,8 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 			return;
 		}
 		if (instance.pendingActions.has(message.action)
-			|| (connectivityActions.has(message.action)
-				&& [...instance.pendingActions].some((action) => connectivityActions.has(action)))) {
+			|| (promptActions.has(message.action)
+				&& [...instance.pendingActions].some((action) => promptActions.has(action)))) {
 			await this.postError(instance, 'ACTION_FAILED', 'This Dashboard action is already in progress. Task cancellation remains available.');
 			return;
 		}
@@ -186,6 +186,24 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 				await this.facade.setPeerAllowed(action.brokerHandle, enabled);
 				return;
 			}
+			case 'openTargetChat': {
+				const action = this.consumeAction(instance, message);
+				if (this.facade.openTargetChat === undefined) {
+					throw new Error('Target Chat is unavailable.');
+				}
+				await this.facade.openTargetChat(action.brokerHandle);
+				return;
+			}
+			case 'setRemoteAutoAccept':
+			case 'setRemoteReceive':
+			case 'setRemoteAllowed': {
+				const action = this.consumeAction(instance, message);
+				if (this.facade.remotePolicyAction === undefined) {
+					throw new Error('Remote Workspace policy is unavailable.');
+				}
+				await this.facade.remotePolicyAction(message.action, action.brokerHandle, requireEnabled(message));
+				return;
+			}
 			case 'cancelOutgoingTask': {
 				const action = this.consumeAction(instance, message);
 				await this.facade.cancelDashboardTask(action.brokerHandle, 'outgoing');
@@ -199,6 +217,7 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 			case 'configureConnectivity':
 			case 'refreshDiscovery':
 			case 'configureRemotePolicy':
+			case 'refreshRemoteTargets':
 			case 'retryConnectivityCleanup':
 				await this.facade.connectivityAction(message.action);
 				return;
@@ -376,6 +395,28 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 				...task,
 				actionHandle: scope('cancelIncomingTask', task.actionHandle, { stable: true }),
 			})),
+			deviceTree: model.deviceTree.map((device) => ({
+				...device,
+				nodes: device.nodes.map((node) => ({
+					...node,
+					workspaces: node.workspaces.map((workspace) => ({
+						...workspace,
+						delegateActionHandle: scope('openTargetChat', workspace.delegateActionHandle),
+						allowActionHandle: scope(
+							device.locality === 'local' ? 'setPeerAllowed' : 'setRemoteAllowed',
+							workspace.allowActionHandle,
+						),
+						receiveActionHandle: scope(
+							workspace.receiveAction ?? 'setAcceptIncoming',
+							workspace.receiveActionHandle,
+						),
+						incomingPeers: workspace.incomingPeers.map((peer) => ({
+							...peer,
+							actionHandle: scope('setRemoteAutoAccept', peer.actionHandle)!,
+						})),
+					})),
+				})),
+			})),
 		};
 	}
 
@@ -416,30 +457,86 @@ export function createDashboardHtml(
 	<title>Copilot Agent Mesh</title>
 </head>
 <body data-ui-instance-id="${uiInstanceId}">
-	<header><h1>Copilot Agent Mesh</h1><button data-action="refresh" title="Refresh local status without account discovery">Refresh</button></header>
+	<header class="dashboardHeader">
+		<div class="headerCopy">
+			<h1>Copilot Agent Mesh</h1>
+			<p class="detail">Select a device, window, or Workspace to review status and actions.</p>
+		</div>
+		<div class="headerActions">
+			<button id="refreshButton" data-action="refresh" title="Refresh local status without account discovery">Refresh</button>
+			<button id="settingsButton" type="button" aria-expanded="false" aria-controls="settingsDrawer">Settings</button>
+		</div>
+	</header>
 	<p id="operationStatus" class="detail"></p>
-	<main>
-		<section aria-labelledby="device-heading"><h2 id="device-heading">This Device</h2><div id="device" class="card loading">Loading...</div></section>
-		<section aria-labelledby="this-window-heading"><h2 id="this-window-heading">This Window</h2><div id="thisWindow" class="card loading">Loading...</div></section>
-		<section aria-labelledby="accept-heading"><h2 id="accept-heading">Accept Incoming Tasks</h2><div id="acceptIncoming" class="card loading">Loading...</div></section>
-		<section aria-labelledby="listener-heading"><h2 id="listener-heading">Listener</h2><div id="listener" class="card loading">Loading...</div></section>
-		<section class="connectivity" aria-labelledby="connectivity-heading">
-			<h2 id="connectivity-heading">Cross-device</h2>
-			<p class="detail">Microsoft Dev Tunnels account discovery is off by default. Rendering or refreshing this Dashboard reads local status only; it does not sign in, discover devices, or start hosting.</p>
-			<div id="connectivity" class="card loading">Loading...</div>
-			<h3 id="candidates-heading">Discovery candidates — not workers</h3>
-			<p class="detail">Discovery is not pairing or permission to run tasks. Pair explicitly, configure directional Workspace grants, and enable the target receive gate before using Mesh Tools. Host hints do not establish worker readiness.</p>
-			<div id="discoveryCandidates" class="stack loading" aria-labelledby="candidates-heading">Loading...</div>
-			<h3 id="incoming-peers-heading">Incoming peers on this device</h3>
-			<p class="detail">Revoke a peer here to withdraw this device's incoming admission. Source Workspace grants are managed separately in remote policy.</p>
-			<div id="incomingPeers" class="stack loading" aria-labelledby="incoming-peers-heading">Loading...</div>
+	<div class="workspaceArea">
+	<main class="dashboardLayout">
+		<section class="panel" aria-labelledby="targets-heading">
+			<div class="panelHeader">
+				<h2 id="targets-heading">Workspace targets</h2>
+				<p class="detail">This device and Other devices</p>
+			</div>
+			<div id="deviceTree" class="card treePanel loading">Loading...</div>
 		</section>
-		<section aria-labelledby="nodes-heading"><h2 id="nodes-heading">Local Window Nodes</h2><p class="detail">A checked box authorizes only this Workspace to delegate to that target. The target must also accept incoming tasks and have one claimed Workspace before it appears to Mesh Tools.</p><div id="localNodes" class="stack loading">Loading...</div></section>
-		<section aria-labelledby="saved-authorizations-heading"><h2 id="saved-authorizations-heading">Saved Authorizations</h2><p class="detail">Offline Workspaces are not live Window Nodes. Remove a saved authorization here, or reopen that Workspace to manage it under Local Window Nodes.</p><div id="savedAuthorizations" class="stack loading">Loading...</div></section>
-		<section aria-labelledby="outgoing-heading"><h2 id="outgoing-heading">Outgoing Tasks</h2><div id="outgoingTasks" class="stack loading">Loading...</div></section>
-		<section aria-labelledby="incoming-heading"><h2 id="incoming-heading">Incoming Tasks</h2><div id="incomingTasks" class="stack loading">Loading...</div></section>
-		<section aria-labelledby="errors-heading"><h2 id="errors-heading">Errors</h2><div id="errors" class="stack"></div></section>
+		<section class="panel" aria-labelledby="details-heading">
+			<div class="panelHeader">
+				<h2 id="details-heading">Selection</h2>
+				<p id="selectionSummary" class="detail">Loading...</p>
+			</div>
+			<div id="selectionDetails" class="card loading">Loading...</div>
+		</section>
 	</main>
+	<aside id="settingsDrawer" class="drawer" hidden aria-labelledby="settings-heading">
+		<div class="drawerHeader">
+			<h2 id="settings-heading">Settings and diagnostics</h2>
+			<button id="closeSettingsButton" type="button">Close</button>
+		</div>
+		<section aria-labelledby="device-heading"><h3 id="device-heading">This device</h3><div id="device" class="card loading">Loading...</div></section>
+		<section aria-labelledby="this-window-heading"><h3 id="this-window-heading">Current window</h3><div id="thisWindow" class="card loading">Loading...</div></section>
+		<section aria-labelledby="accept-heading"><h3 id="accept-heading">Receive summary</h3><div id="acceptIncoming" class="card loading">Loading...</div></section>
+		<section aria-labelledby="listener-heading"><h3 id="listener-heading">Listener</h3><div id="listener" class="card loading">Loading...</div></section>
+		<section class="connectivity" aria-labelledby="connectivity-heading">
+			<h3 id="connectivity-heading">Cross-device</h3>
+			<div id="connectivity" class="card loading">Loading...</div>
+		</section>
+		<details class="drawerDisclosure">
+			<summary>Discovery candidates — not workers</summary>
+			<p class="detail">Discovery hints never imply worker readiness or Workspace permission.</p>
+			<div id="discoveryCandidates" class="stack loading"></div>
+		</details>
+		<details class="drawerDisclosure">
+			<summary>Incoming peers on this device</summary>
+			<div id="incomingPeers" class="stack loading"></div>
+		</details>
+		<details class="drawerDisclosure">
+			<summary>Local directional allowlist</summary>
+			<div id="localNodes" class="stack loading"></div>
+		</details>
+		<details class="drawerDisclosure">
+			<summary>Saved authorizations</summary>
+			<div id="savedAuthorizations" class="stack loading"></div>
+		</details>
+		<details class="drawerDisclosure">
+			<summary>Diagnostic errors</summary>
+			<div id="errors" class="stack"></div>
+		</details>
+	</aside>
+	</div>
+	<section class="panel taskPanel" aria-labelledby="tasks-heading">
+		<div class="panelHeader">
+			<h2 id="tasks-heading">Tasks</h2>
+			<p class="detail">Task status and cancellation stay available while Settings is open.</p>
+		</div>
+		<div class="taskColumns">
+			<section aria-labelledby="outgoing-heading">
+				<h3 id="outgoing-heading">Outgoing</h3>
+				<div id="outgoingTasks" class="stack loading">Loading...</div>
+			</section>
+			<section aria-labelledby="incoming-heading">
+				<h3 id="incoming-heading">Incoming</h3>
+				<div id="incomingTasks" class="stack loading">Loading...</div>
+			</section>
+		</div>
+	</section>
 	<div id="announcement" role="status" aria-live="polite"></div>
 	<script nonce="${nonce}" src="${scriptUri}"></script>
 </body>

@@ -28,7 +28,7 @@ establishes the scoped service-admission results.
 | CLI backend | Existing macOS arm64 `1.0.2030+fc9273aa0f` binary and SHA-256 validation, unchanged |
 | AHP | Existing submodule `f19dd8b3942d029744a3bdd31d830f9428e8ea47`, unchanged |
 | Mesh | v2; actual `RpcPeer` / `PairingService` enrollment/reconnect/commit |
-| Dashboard | v7, strict local DTOs and one-use per-view action aliases |
+| Dashboard | v8 device tree, strict local DTOs and one-use per-view action aliases |
 
 The published packages were retrieved from the configured Microsoft
 `1es-public/npm-public` feed. Direct public npm registry access returned
@@ -45,7 +45,9 @@ authentication uses `sessionId` and `proof`; enrollment commit uses the existing
 peer/enrollment proof. Ping sends and returns numeric `sentAt`/`receivedAt`.
 Unknown fields remain rejected. No second handshake or protocol-v3 envelope
 was introduced. `requireEditor` is an internal Broker-to-Node option, never
-accepted in a network task request.
+accepted in a network task request. The device-tree update adds a server-derived
+`remoteTaskApproval` on that same trusted local boundary only. Network v2 remains
+unchanged and rejects injected approval metadata.
 
 ## Production entry points
 
@@ -57,12 +59,12 @@ accepted in a network task request.
 | `src/connectivity/DevTunnelManagement.ts` | Public SDK calls, cancellation, bounded requests, rate-limit cooldown, restricted cluster redirects and safe errors |
 | `src/connectivity/DevTunnelDiscoveryProvider.ts`, `DiscoveryService.ts` | Caller-owned Mesh resources, bounded candidate cache, unknown/stale presence and exact CLI publication |
 | `src/connectivity/EndpointBindingStore.ts`, `DevTunnelEndpointResolver.ts`, `BoundPeerTransport.ts` | Explicit binding intents, locator resolution, Mesh identity proof and generation-fenced verified address commits |
-| `src/broker/RemotePeerPolicyStore.ts`, `RemotePeerPolicyService.ts` | A's real local source allowlists; B's paired-device grants and receive gate |
+| `src/broker/RemotePeerPolicyStore.ts`, `RemotePeerPolicyService.ts` | A's real local source allowlists; B's paired-device grants, receive gate and default-off per-device/Workspace task-start auto-accept |
 | `src/gateway/PeerRevocationService.ts`, `PairingService.ts`, `RpcPeer.ts` | Durable denial, live and pending handshake closure, target cancellation and retryable key cleanup |
 | `src/tunnel/RemoteExposureProvider.ts`, `CliDevTunnelExposureAdapter.ts` | Thin provider-neutral exposure and adaptation of the unchanged CLI metadata contract |
 | `src/tunnel/SdkDevTunnelExposureProvider.ts`, `SdkRelayStreamFactory.ts`, `SelectedExposureProvider.ts` | Actual SDK host, owned cancellable relay socket, private capabilities, renewal, exact cleanup and exclusive selection |
-| `shared/protocol/connectivity.ts`, `DeviceBroker.ts`, `WindowNodeClient.ts` | Strict authenticated local IPC for all six Dashboard actions, including non-owner windows |
-| `src/ui/`, `media/dashboard.js`, `ProductionDashboardBindings.ts` | Safe Cross-device panel, native-operation feedback, scoped aliases and cached-only rendering |
+| `shared/protocol/connectivity.ts`, `shared/protocol/remotePolicy.ts`, `DeviceBroker.ts`, `WindowNodeClient.ts` | Strict authenticated local IPC for connectivity and scoped policy actions, including non-owner windows |
+| `src/ui/`, `media/dashboard.js`, `ProductionDashboardBindings.ts` | Device/Window/Workspace tree, selected-object controls, task dock, Settings, scoped aliases and cached-only rendering |
 | `LocalBrokerTaskFacade.ts`, `ProductionRemoteTaskAdapter.ts`, `WindowNodeTaskExecutor.ts` | Real Tools integration, explicit routing, task reconciliation and editor-only strict remote execution |
 
 The five Mesh Tools remain unchanged. Candidates are not executable workers.
@@ -72,11 +74,46 @@ An endpoint refresh never creates a replacement task ID.
 
 ## Setup and use
 
+### Device-tree and scoped-acceptance follow-up
+
+The subsequent device-tree update changes Dashboard messages to v8, not the
+network protocol. It adds default-off automatic task-start acceptance for one
+granted paired device in one target Workspace. B issues the internal approval
+at dispatch; the Node requires matching peer, task, Workspace and strict editor
+routing. Sensitive runtime inputs retain their existing approval boundaries.
+Removing a grant or revoking the peer removes this opt-in. Disabling it affects
+future approvals and does not impersonate cancellation of an accepted task.
+
+This update's offline run contains 819 tests: 818 pass, zero fail, one
+platform-conditional skip, across 15 suites. The isolated VS Code 1.136.1
+extension run has 63 passing tests. Coverage includes default-off policy
+migration, atomic all-source-root allowlist edits, claim/owner/revision races,
+actual paired-loopback local IPC, one-use UI handles, exact-target unsubmitted
+Chat drafts, sensitive-input escalation, bounded tree rendering, duplicate
+names, stale selections, and focus/receive-action isolation. Packaging uses
+the production bundle and existing VSIX whitelist. The resulting VSIX
+(`fa58ff7b6123f84c973d5c8b6550468502a20ab6b45f4d9fdae3e180a3b31992`)
+also activated from an isolated installed-extension directory on VS Code
+1.136.1; the disposable profile was removed without changing the user's
+installed extension or accounts.
+
+The A/B layout preview uses the actual production HTML, CSS and renderer with
+explicitly marked example data. It is not real remote-task or Chat visibility
+evidence. Earlier private-service/Agent evidence predates this update. No
+additional cloud resource, account login or real model turn is authorized or
+claimed by these tests; physical-device automatic acceptance and ordinary
+Copilot Chat UI remain Unverified.
+
+Existing policy documents load with an empty auto-accept list. Uncheck the
+per-device option to restore B's per-task startup prompt. Older builds reject
+the newly stored field instead of silently ignoring its authorization meaning;
+do not delete policy/revocation records to force a downgrade.
+
 Use two separately approved **physical macOS arm64 devices** for a physical
 gate. Two profiles/processes on one computer only test logical isolation.
 
 1. Open B's existing ordinary VS Code window and intended local Workspace.
-   In **Dashboard -> Cross-device -> Configure discovery and hosting**, enable
+   In **Dashboard -> Settings -> Cross-device -> Configure discovery and hosting**, enable
    account discovery, choose GitHub or Microsoft, then choose the exact account
    in native authentication UI. Account identity is provider plus account ID,
    not an email or display name.
@@ -100,8 +137,11 @@ gate. Two profiles/processes on one computer only test logical isolation.
 7. Enable the existing experimental Agent Host feature only when real model
    execution is separately approved. In A's Agent-mode Chat, use
    `#meshListWorkers` and `#meshDelegateTask` with the exact returned
-   Device/Node/NodeInstance/Workspace target. B still confirms each remote
-   task. Missing/unusable editor hosting fails explicitly; it does not create
+   Device/Node/NodeInstance/Workspace target. The selected tree Workspace's
+   **Delegate from Chat…** opens a partial, unsubmitted draft, without an additional
+   source Mesh confirmation. B confirms each remote task by default; it can
+   explicitly auto-accept one granted paired device in this target Workspace.
+   Sensitive tool approvals are unchanged. Missing/unusable editor hosting fails explicitly; it does not create
    a standalone or Remote Extension Host as a substitute.
 
 GitHub scopes are exactly `read:org` and `user:email`; no `repo` scope is
@@ -126,7 +166,7 @@ All new documents are bounded strict-schema atomic files under the existing
 | `connectivity/settings.json` | Local account reference/ID/scopes, publish intent, advertisement, strict latch and explicit backend/migration state |
 | `connectivity/endpoints.json` | Verified peer/profile-generation bindings; separate approved non-secret pending binding intents |
 | `connectivity/sdk-hosting.json` | Exact owned SDK resource/port/account reference, phase and endpoint cleanup handle |
-| `peers/remote-policy.json` | Per-source bound targets and per-target incoming peer IDs |
+| `peers/remote-policy.json` | Per-source bound targets, per-target incoming peer IDs and their default-empty auto-accept subset |
 | `peers/revocations.json` | Durable denial and exact remaining credential/cancellation cleanup work |
 | Existing `peers/policy.json` | Shared receive field; local allowlist semantics remain unchanged |
 

@@ -20,6 +20,10 @@ import {
 	type ConnectivityAction,
 	type ConnectivitySnapshot,
 	type BrokerRemoteListResult,
+	remotePolicyDashboardSchema,
+	remotePolicyActionParamsSchema,
+	type RemotePolicyAction,
+	type RemotePolicyDashboard,
 	LOCAL_BROKER_NOTIFICATIONS,
 	PROTOCOL_LIMITS,
 	nodeDirectoryResultSchema,
@@ -420,6 +424,19 @@ export class WindowNodeClient implements WorkspaceResolver {
 
 	public cachedRemoteDevices(): Promise<BrokerRemoteListResult> {
 		return this.request(LOCAL_BROKER_METHODS.remoteCachedList, {}, brokerRemoteListResultSchema);
+	}
+
+	public remotePolicyDashboard(): Promise<RemotePolicyDashboard> {
+		return this.request(LOCAL_BROKER_METHODS.remotePolicyDashboard, {
+			nodeId: this.nodeId, nodeInstanceId: this.nodeInstanceId,
+		}, remotePolicyDashboardSchema);
+	}
+
+	public async remotePolicyAction(action: RemotePolicyAction, actionHandle: string, enabled: boolean): Promise<void> {
+		const params = remotePolicyActionParamsSchema.parse({
+			nodeId: this.nodeId, nodeInstanceId: this.nodeInstanceId, action, actionHandle, enabled,
+		});
+		await this.requireConnected().request(LOCAL_BROKER_METHODS.remotePolicyAction, toJsonValue(params), 180_000);
 	}
 
 	public getPeerPolicy(workspaceIdentity?: string): Promise<NodePolicyResult> {

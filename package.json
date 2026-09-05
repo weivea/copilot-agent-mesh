@@ -442,7 +442,7 @@
           "type": "boolean",
           "default": false,
           "scope": "machine",
-          "markdownDescription": "Enable strict cross-device delegation: source Workspace allowlists, target receive plus incoming device grants, and the target's existing editor Host. Activation is durable; turning this off blocks new remote tasks rather than restoring legacy authorization. Target per-task confirmation remains required."
+          "markdownDescription": "Enable strict cross-device delegation: source Workspace allowlists, target receive plus incoming device grants, and the target's existing editor Host. Activation is durable; turning this off blocks new remote tasks rather than restoring legacy authorization. Target task-start confirmation defaults on; the target Workspace may explicitly auto-accept future tasks from a specific granted paired device. Sensitive tool approvals are unchanged."
         },
         "copilotAgentMesh.experimental.devTunnelSdkHosting": {
           "type": "boolean",

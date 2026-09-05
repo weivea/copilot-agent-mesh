@@ -124,7 +124,7 @@ new-session policy.
 
 ## Cross-device opt-in
 
-Use **Dashboard -> Cross-device -> Configure discovery and hosting**. Authorize
+Use **Dashboard -> Settings -> Cross-device -> Configure discovery and hosting**. Authorize
 an exact GitHub or Microsoft account and separately allow Mesh advertisement
 updates. D1 keeps the CLI's independent login; D2 is selected through the explicit
 SDK private-host migration action. Merely opening the Dashboard does not query
@@ -135,8 +135,26 @@ input. Then activate strict cross-device delegation on both devices. In
 **Configure strict remote policy**, B grants the paired device its target
 Workspace and enables receive; A allowlists that authenticated remote Workspace
 from every claimed source root. Use the existing five Mesh Tools with explicit
-Device/Node/Workspace IDs. Strict remote tasks retain B's per-task confirmation
-and require B's existing editor Host, without standalone fallback.
+Device/Node/Workspace IDs. Strict remote tasks require B's existing editor Host,
+without standalone fallback.
+
+The Dashboard groups **This device / Other devices -> Window -> Workspace**.
+Select a Workspace for its controls; tasks stay in the task dock and connection
+configuration/diagnostics stay under Settings. **Delegate from Chat…** opens an
+unsubmitted Agent Chat draft for that exact target. A has no additional Mesh
+task-start dialog; Copilot's existing tool-confirmation behavior is unchanged.
+Refreshing the tree only reads cached/local state. **Refresh remote windows**
+explicitly refreshes already-paired peers; account discovery is a separate action.
+
+On B, select **this window's Workspace** and enable automatic task acceptance
+for a specific already-granted paired device. One explicit, scoped opt-in lets
+that device's future tasks skip B's task-start prompt for this Workspace only.
+It defaults off and does not bypass receive, grants, A's source allowlist,
+editor availability, or sensitive terminal/authentication/publishing approvals.
+B authorizes the paired device, not an independently authenticated window on A.
+Turning it off restores startup confirmation for future approvals, without
+cancelling tasks already approved. Removing the incoming grant or revoking the
+peer clears its saved automatic acceptance; granting it again does not restore it.
 
 The three settings `experimental.crossDeviceDiscovery`,
 `experimental.crossDeviceDelegation`, and `experimental.devTunnelSdkHosting`
@@ -146,6 +164,11 @@ authorization. Receive/grant removal does not cancel accepted tasks; **Revoke
 incoming peer** additionally closes connections and requests authoritative
 target-side cancellation. Cleanup failure remains visible and never restores
 permission.
+
+Existing saved remote policies migrate with no automatically accepted peers.
+Disable the per-device checkbox to return to per-task confirmation. Older
+builds that do not understand the new policy field fail closed for remote
+initialization; do not delete policy or revocation files to force a downgrade.
 
 ## Install the local Preview
 

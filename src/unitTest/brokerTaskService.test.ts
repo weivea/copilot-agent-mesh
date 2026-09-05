@@ -256,6 +256,64 @@ async function createFixture(
 	};
 }
 
+test('Broker derives remote auto-accept approval after acceptance and never accepts it from the v2 wire', async (t) => {
+	let approvals = 0;
+	const fixture = await createFixture(undefined, {
+		requiresEditorForRemote: () => true,
+		approveRemoteTaskStart: async (peerId, target, workspaceIdentity, taskId) => {
+			approvals += 1;
+			assert.equal(peerId, OWNER_ID);
+			assert.deepEqual(target, startParams().target);
+			assert.equal(workspaceIdentity, createOpaqueWorkspaceIdentity('opaque-workspace-identity'));
+			return { kind: 'remoteAutoAccept', peerId, workspaceIdentity, taskId, policyRevision: 7 };
+		},
+	});
+	t.after(() => fixture.dispose());
+	await fixture.service.startRemote(OWNER_ID, startParams());
+	for (let index = 0; fixture.session.requests.length === 0 && index < 20; index += 1) {
+		await new Promise((resolve) => setImmediate(resolve));
+	}
+	const dispatched = nodeTaskStartParamsSchema.parse(
+		fixture.session.requests.find((request) => request.method === 'node.task.start')?.params,
+	);
+	assert.equal(dispatched.requireEditor, true);
+	assert.equal(dispatched.remoteTaskApproval?.peerId, OWNER_ID);
+	assert.equal(dispatched.remoteTaskApproval?.taskId, TASK_ID);
+	assert.equal(dispatched.remoteTaskApproval?.policyRevision, 7);
+	assert.equal(approvals, 1);
+	await fixture.service.startRemote(OWNER_ID, startParams());
+	assert.equal(approvals, 1);
+	assert.doesNotMatch(JSON.stringify(await fixture.store.getOwned(OWNER_ID, TASK_ID)), /remoteTaskApproval|remoteAutoAccept/u);
+	const router = new GatewayRouter({ getInfo: async () => ({}) }, {
+		listNodes: () => fixture.registry.list(),
+		startRemote: (peerId, request) => fixture.service.startRemote(peerId, request),
+		getRemote: (peerId, taskId) => fixture.service.get(peerId, taskId),
+		cancelRemote: (peerId, taskId) => fixture.service.cancel(peerId, taskId),
+		answerRemote: (peerId, taskId, inputId, answerId, answer) => fixture.service.answer(peerId, taskId, inputId, answerId, answer),
+	});
+	await assert.rejects(router.dispatch(OWNER_ID, 'task.start', {
+		...startParams(), remoteTaskApproval: dispatched.remoteTaskApproval,
+	}));
+	assert.equal(fixture.session.requests.filter((request) => request.method === 'node.task.start').length, 1);
+});
+
+test('a remote approval policy failure prevents Node dispatch after durable task acceptance', async (t) => {
+	const fixture = await createFixture(undefined, {
+		requiresEditorForRemote: () => true,
+		approveRemoteTaskStart: async () => { throw new MeshDomainError('PEER_NOT_ALLOWED', 'Grant withdrawn.'); },
+	});
+	t.after(() => fixture.dispose());
+	await fixture.service.startRemote(OWNER_ID, startParams());
+	let snapshot = await fixture.service.get(OWNER_ID, TASK_ID);
+	for (let index = 0; snapshot.state !== 'failed' && index < 20; index += 1) {
+		await new Promise((resolve) => setImmediate(resolve));
+		snapshot = await fixture.service.get(OWNER_ID, TASK_ID);
+	}
+	assert.equal(snapshot.state, 'failed');
+	assert.equal(fixture.session.requests.some((request) => request.method === 'node.task.start'), false);
+	assert.equal(fixture.registry.lookupTaskRoute(OWNER_ID, TASK_ID), undefined);
+});
+
 function startParams(
 	changes: Partial<RoutedTaskStartParams> = {},
 ): RoutedTaskStartParams {

@@ -3,7 +3,7 @@ import { uuidSchema } from './models';
 
 export const CONNECTIVITY_ACTIONS = [
 	'configureConnectivity', 'refreshDiscovery', 'pairDiscoveredPeer',
-	'configureRemotePolicy', 'revokeIncomingPeer', 'retryConnectivityCleanup',
+	'configureRemotePolicy', 'revokeIncomingPeer', 'retryConnectivityCleanup', 'refreshRemoteTargets',
 ] as const;
 export type ConnectivityAction = typeof CONNECTIVITY_ACTIONS[number];
 

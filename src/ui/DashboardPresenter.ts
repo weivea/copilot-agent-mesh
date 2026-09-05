@@ -6,6 +6,7 @@ import {
 	timestampSchema,
 	type ConnectivitySnapshot,
 } from '../../shared/protocol';
+import { dashboardDeviceTreeSchema, type DashboardDeviceTree } from './DashboardTree';
 
 const dashboardStringBytes = 2 * 1_024;
 
@@ -15,6 +16,7 @@ export interface DashboardViewModel {
 	readonly broker: NonNullable<DashboardSnapshot['broker']>;
 	readonly thisWindow: DashboardSnapshot['thisWindow'];
 	readonly connectivity: DashboardConnectivityViewModel;
+	readonly deviceTree: DashboardDeviceTree;
 	readonly localNodes: readonly DashboardLocalNodeViewModel[];
 	readonly savedAuthorizations: readonly DashboardSavedAuthorizationViewModel[];
 	readonly outgoingTasks: readonly NonNullable<DashboardSnapshot['outgoingTasks']>[number][];
@@ -28,7 +30,7 @@ export interface DashboardConnectivityViewModel extends Omit<ConnectivitySnapsho
 }
 
 type DashboardLocalNodeViewModel =
-	NonNullable<DashboardSnapshot['policyCandidates']>[number]
+	Omit<NonNullable<DashboardSnapshot['policyCandidates']>[number], 'nodeId' | 'nodeInstanceId'>
 	& { readonly online: true };
 
 interface DashboardSavedAuthorizationViewModel {
@@ -76,9 +78,10 @@ export class DashboardPresenter {
 				},
 			},
 			connectivity: presentConnectivity(snapshot.connectivity ?? DISABLED_CONNECTIVITY_SNAPSHOT),
+			deviceTree: presentDeviceTree(snapshot.deviceTree ?? []),
 			localNodes: policyCandidates
 				.filter(isOnlinePolicyCandidate)
-				.map((candidate) => ({
+				.map(({ nodeId: _nodeId, nodeInstanceId: _nodeInstanceId, ...candidate }) => ({
 					...candidate,
 					windowLabel: redactRemoteText(candidate.windowLabel),
 					workspaceName: redactRemoteText(candidate.workspaceName),
@@ -91,6 +94,19 @@ export class DashboardPresenter {
 			errors: snapshot.errors.map(redactError),
 		};
 	}
+}
+
+function presentDeviceTree(value: DashboardDeviceTree): DashboardDeviceTree {
+	return dashboardDeviceTreeSchema.parse(value).map((device) => ({
+		...device, name: redactRemoteText(device.name),
+		nodes: device.nodes.map((node) => ({
+			...node, label: redactRemoteText(node.label),
+			workspaces: node.workspaces.map((workspace) => ({
+				...workspace, name: redactRemoteText(workspace.name),
+				incomingPeers: workspace.incomingPeers.map((peer) => ({ ...peer, label: redactRemoteText(peer.label) })),
+			})),
+		})),
+	}));
 }
 
 function presentConnectivity(snapshot: ConnectivitySnapshot): DashboardConnectivityViewModel {
@@ -127,7 +143,7 @@ function presentConnectivity(snapshot: ConnectivitySnapshot): DashboardConnectiv
 
 function isOnlinePolicyCandidate(
 	candidate: NonNullable<DashboardSnapshot['policyCandidates']>[number],
-): candidate is DashboardLocalNodeViewModel {
+): candidate is NonNullable<DashboardSnapshot['policyCandidates']>[number] & { readonly online: true } {
 	return candidate.online;
 }
 

@@ -6,10 +6,12 @@ import {
 	utf8ByteLength,
 	type ConnectivityAction,
 	type ConnectivitySnapshot,
+	type RemotePolicyAction,
 	type DashboardTaskDirection,
 	type TaskStatus,
 } from '../../shared/protocol';
 import { validateWindowName } from '../broker/WindowName';
+import type { DashboardDeviceTree } from './DashboardTree';
 export {
 	DashboardActionError,
 	type DashboardActionErrorCode,
@@ -75,6 +77,7 @@ export interface DashboardSnapshot {
 		readonly detail?: string;
 	};
 	readonly connectivity?: ConnectivitySnapshot;
+	readonly deviceTree?: DashboardDeviceTree;
 	readonly policyCandidates?: readonly DashboardPolicyCandidateSnapshot[];
 	readonly outgoingTasks?: readonly DashboardTaskSummarySnapshot[];
 	readonly incomingTasks?: readonly DashboardTaskSummarySnapshot[];
@@ -127,6 +130,8 @@ export interface DashboardSnapshot {
 }
 
 export interface DashboardPolicyCandidateSnapshot {
+	readonly nodeId?: string;
+	readonly nodeInstanceId?: string;
 	readonly actionHandle?: string;
 	readonly windowLabel: string;
 	readonly workspaceName: string;
@@ -201,6 +206,8 @@ export interface DashboardFacade {
 	setAcceptIncoming(actionHandle: string, enabled: boolean): Promise<void>;
 	setPeerAllowed(actionHandle: string, allowed: boolean): Promise<void>;
 	connectivityAction(action: ConnectivityAction, actionHandle?: string): Promise<void>;
+	remotePolicyAction?(action: RemotePolicyAction, actionHandle: string, enabled: boolean): Promise<void>;
+	openTargetChat?(actionHandle: string): Promise<void>;
 	cancelDashboardTask(actionHandle: string, direction: DashboardTaskDirection): Promise<void>;
 	registerCurrentWorkspace(): Promise<void>;
 	removeWorkspace(workspaceId: string): Promise<void>;
@@ -221,6 +228,8 @@ export interface DashboardServiceBindings {
 	setAcceptIncoming(actionHandle: string, enabled: boolean): Promise<void>;
 	setPeerAllowed(actionHandle: string, allowed: boolean): Promise<void>;
 	connectivityAction(action: ConnectivityAction, actionHandle?: string): Promise<void>;
+	remotePolicyAction?(action: RemotePolicyAction, actionHandle: string, enabled: boolean): Promise<void>;
+	openTargetChat?(actionHandle: string): Promise<void>;
 	prepareDashboardTaskCancellation(
 		actionHandle: string,
 		direction: DashboardTaskDirection,
@@ -307,6 +316,20 @@ export class ServiceDashboardFacade implements DashboardFacade {
 
 	public connectivityAction(action: ConnectivityAction, actionHandle?: string): Promise<void> {
 		return this.services.connectivityAction(action, actionHandle);
+	}
+
+	public remotePolicyAction(action: RemotePolicyAction, actionHandle: string, enabled: boolean): Promise<void> {
+		if (!this.services.remotePolicyAction) {
+			throw new Error('Remote Workspace policy is unavailable.');
+		}
+		return this.services.remotePolicyAction(action, actionHandle, enabled);
+	}
+
+	public openTargetChat(actionHandle: string): Promise<void> {
+		if (!this.services.openTargetChat) {
+			throw new Error('Target Chat preparation is unavailable.');
+		}
+		return this.services.openTargetChat(actionHandle);
 	}
 
 	public async cancelDashboardTask(
@@ -519,6 +542,14 @@ export class UnavailableDashboardFacade implements DashboardFacade {
 
 	public async connectivityAction(_action: ConnectivityAction, _actionHandle?: string): Promise<void> {
 		throw new Error('Cross-device connectivity is unavailable. No action was performed.');
+	}
+
+	public async remotePolicyAction(_action: RemotePolicyAction, _actionHandle: string, _enabled: boolean): Promise<void> {
+		throw new Error('Remote Workspace policy is unavailable. No action was performed.');
+	}
+
+	public async openTargetChat(_actionHandle: string): Promise<void> {
+		throw new Error('Target Chat preparation is unavailable. No action was performed.');
 	}
 
 	public cancelDashboardTask(

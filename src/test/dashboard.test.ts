@@ -11,6 +11,7 @@ import {
 	timestampSchema,
 	type ConnectivityAction,
 	type ConnectivitySnapshot,
+	type RemotePolicyAction,
 } from '../../shared/protocol';
 import type { ListenerSnapshot } from '../application/ListenerService';
 import {
@@ -53,12 +54,59 @@ suite('Dashboard', () => {
 		assert.ok(view.webview.html.includes(view.webview.cspSource));
 		assert.ok(view.webview.html.includes('dashboard.js'));
 		assert.ok(view.webview.html.includes('dashboard.css'));
-		assert.ok(view.webview.html.includes('This Window'));
-		assert.ok(view.webview.html.includes('Saved Authorizations'));
-		assert.ok(view.webview.html.includes('Cross-device'));
+		assert.ok(view.webview.html.includes('Workspace targets'));
+		assert.ok(view.webview.html.includes('This device and Other devices'));
+		assert.ok(view.webview.html.includes('id="tasks-heading">Tasks</h2>'));
+		assert.ok(view.webview.html.includes('Settings and diagnostics'));
 		assert.ok(view.webview.html.includes('Discovery candidates — not workers'));
-		assert.ok(view.webview.html.includes('Incoming peers on this device'));
 		provider.dispose();
+	});
+
+	test('refresh preserves policy-control focus instead of moving it back into the tree or out of Settings', async () => {
+		const media = await createDashboardMediaHarness();
+		media.render(DISABLED_CONNECTIVITY_SNAPSHOT);
+		media.treeItem('tree-3').focus();
+		media.checkbox('Accept incoming tasks for this Workspace').focus();
+		media.render(DISABLED_CONNECTIVITY_SNAPSHOT);
+		assert.strictEqual(media.focusedElement(), media.checkbox('Accept incoming tasks for this Workspace'));
+		media.button('Settings').click();
+		media.render(DISABLED_CONNECTIVITY_SNAPSHOT);
+		assert.strictEqual(media.focusedElement(), media.button('Settings'));
+		assert.equal(media.element('settingsDrawer').hidden, false);
+	});
+
+	test('a same-named unbound Workspace cannot borrow the current Workspace receive action', async () => {
+		const media = await createDashboardMediaHarness();
+		const source = snapshot();
+		const tree = structuredClone(source.deviceTree);
+		assert.ok(tree);
+		const current = tree[0].nodes[0].workspaces[0];
+		tree[0].nodes[0].workspaces.push({
+			...current, key: 'tree-15', receiveAction: undefined, receiveActionHandle: undefined, incomingPeers: [],
+		});
+		media.receive({
+			version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view',
+			type: 'dashboard.snapshot', model: new DashboardPresenter().present({ ...source, deviceTree: tree }),
+		});
+		media.treeItem('tree-15').click();
+		assert.equal(media.checkbox('Accept incoming tasks for this Workspace').disabled, true);
+		assert.equal(media.messages.some((message) => message.type === 'action'), false);
+	});
+
+	test('media accepts the full supported node count rather than silently rejecting more than 32 windows', async () => {
+		const media = await createDashboardMediaHarness();
+		const source = snapshot();
+		const tree = structuredClone(source.deviceTree);
+		assert.ok(tree);
+		const template = tree[0].nodes[0];
+		tree[0].nodes.push(...Array.from({ length: 32 }, (_, index) => ({
+			...template, key: `tree-${100 + index}`, label: `Window ${index + 1}`, thisWindow: false, workspaces: [],
+		})));
+		media.receive({
+			version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view',
+			type: 'dashboard.snapshot', model: new DashboardPresenter().present({ ...source, deviceTree: tree }),
+		});
+		assert.match(media.element('deviceTree').text, /Window 32/u);
 	});
 
 	test('uses textContent rather than innerHTML for remote strings', async () => {
@@ -83,6 +131,7 @@ suite('Dashboard', () => {
 		assert.match(media.element('discoveryCandidates').text, /discovery is disabled/u);
 		assert.strictEqual(media.button('Refresh account discovery').disabled, true);
 		assert.strictEqual(media.button('Retry connectivity cleanup').disabled, true);
+		assert.strictEqual(media.button('Refresh connected devices').disabled, false);
 		assert.strictEqual(media.button('Configure discovery and hosting…').disabled, false);
 		assert.strictEqual(media.button('Configure strict remote policy…').disabled, false);
 		media.button('Configure discovery and hosting…').click();
@@ -112,6 +161,7 @@ suite('Dashboard', () => {
 		for (const [label, action] of [
 			['Configure discovery and hosting…', 'configureConnectivity'],
 			['Refresh account discovery', 'refreshDiscovery'],
+			['Refresh connected devices', 'refreshRemoteTargets'],
 			['Pair this candidate…', 'pairDiscoveredPeer'],
 			['Configure strict remote policy…', 'configureRemotePolicy'],
 			['Revoke incoming peer…', 'revokeIncomingPeer'],
@@ -135,7 +185,7 @@ suite('Dashboard', () => {
 			incomingPeers: [{ ...source.incomingPeers[0], state: 'revoked', cleanupPending: true }],
 		});
 		assert.match(media.element('discoveryCandidates').text, /Offline/u);
-		assert.match(media.element('discoveryCandidates').text, /stale/u);
+		assert.match(media.element('discoveryCandidates').text, /stale/iu);
 		assert.match(media.element('discoveryCandidates').text, /Legacy CLI admission/u);
 		assert.match(media.element('incomingPeers').text, /Revoked/u);
 		assert.match(media.element('incomingPeers').text, /cleanup is still pending/u);
@@ -172,10 +222,186 @@ suite('Dashboard', () => {
 			{ ...valid, model: { ...model, connectivity: {
 				...model.connectivity, incomingPeers: [{ ...model.connectivity.incomingPeers[0], label: `sha256:${'a'.repeat(43)}` }],
 			} } },
+			{ ...valid, model: { ...model, deviceTree: [{ ...model.deviceTree[0], path: '/private/project' }] } },
 		]) {
 			media.receive(invalid);
 			assert.strictEqual(media.element('connectivity').text, original);
 		}
+	});
+
+	test('renders the device tree layout with persistent expansion, selection, and keyboard navigation', async () => {
+		const media = await createDashboardMediaHarness();
+		media.render(DISABLED_CONNECTIVITY_SNAPSHOT);
+
+		assert.match(media.element('deviceTree').text, /This device/u);
+		assert.match(media.element('deviceTree').text, /Other devices/u);
+		assert.match(media.selectedTreeLabel() ?? '', /service-workspace/u);
+		assert.match(media.element('selectionSummary').text, /test-device.*This Window.*service-workspace/u);
+		assert.doesNotMatch(media.element('deviceTree').text, /Candidate abcdef01/u);
+
+		media.treeItem('tree-7').click();
+		assert.match(media.element('selectionSummary').text, /Lab Mac/u);
+		media.treeItem('tree-7').click();
+		assert.doesNotMatch(media.element('deviceTree').text, /billing-api/u);
+		media.treeItem('tree-7').keydown('ArrowRight');
+		assert.match(media.selectedTreeLabel() ?? '', /Backend window/u);
+		media.treeItem('tree-8').keydown('ArrowRight');
+		assert.match(media.element('deviceTree').text, /billing-api/u);
+		media.treeItem('tree-8').keydown('ArrowDown');
+		assert.match(media.selectedTreeLabel() ?? '', /orders-api/u);
+		media.treeItem('tree-10').click();
+		assert.match(media.element('selectionSummary').text, /Lab Mac.*Backend window.*billing-api/u);
+
+		media.render(DISABLED_CONNECTIVITY_SNAPSHOT);
+		assert.match(media.selectedTreeLabel() ?? '', /billing-api/u);
+		assert.match(media.element('deviceTree').text, /billing-api/u);
+	});
+
+	test('uses stable presentation keys for duplicate labels and does not silently retarget stale selections', async () => {
+		const media = await createDashboardMediaHarness();
+		const source = snapshot();
+		const duplicateNames = {
+			...source,
+			deviceTree: source.deviceTree?.map((device) => device.key !== 'tree-7'
+				? device
+				: {
+					...device,
+					nodes: device.nodes.map((node) => ({
+						...node,
+						workspaces: node.workspaces.map((workspace) => ({
+							...workspace,
+							name: 'shared-target',
+						})),
+					})),
+				}),
+		};
+		media.receive({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: 'media-view',
+			type: 'dashboard.snapshot',
+			model: new DashboardPresenter().present(duplicateNames),
+		});
+		media.treeItem('tree-7').click();
+		media.treeItem('tree-7').keydown('ArrowRight');
+		media.treeItem('tree-8').click();
+		media.treeItem('tree-8').keydown('ArrowRight');
+		media.treeItem('tree-10').click();
+		assert.strictEqual(media.treeItem('tree-10').attributes['aria-selected'], 'true');
+		assert.strictEqual(media.treeItem('tree-9').attributes['aria-selected'], 'false');
+
+		const reordered = {
+			...duplicateNames,
+			deviceTree: duplicateNames.deviceTree?.map((device) => device.key !== 'tree-7'
+				? device
+				: {
+					...device,
+					nodes: device.nodes.map((node) => ({
+						...node,
+						workspaces: [...node.workspaces].reverse(),
+					})),
+				}),
+		};
+		media.receive({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: 'media-view',
+			type: 'dashboard.snapshot',
+			model: new DashboardPresenter().present(reordered),
+		});
+		assert.strictEqual(media.treeItem('tree-10').attributes['aria-selected'], 'true');
+		assert.strictEqual(media.treeItem('tree-9').attributes['aria-selected'], 'false');
+
+		const removed = {
+			...reordered,
+			deviceTree: reordered.deviceTree?.map((device) => device.key !== 'tree-7'
+				? device
+				: {
+					...device,
+					nodes: device.nodes.map((node) => ({
+						...node,
+						workspaces: node.workspaces.filter((workspace) => workspace.key !== 'tree-10'),
+					})),
+				}),
+		};
+		media.receive({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: 'media-view',
+			type: 'dashboard.snapshot',
+			model: new DashboardPresenter().present(removed),
+		});
+		assert.strictEqual(media.selectedTreeLabel(), undefined);
+		assert.match(media.element('selectionDetails').text, /will not silently retarget/u);
+	});
+
+	test('renders exact remote policy checkboxes and opens Chat drafts without extra modal actions', async () => {
+		const media = await createDashboardMediaHarness();
+		media.render(DISABLED_CONNECTIVITY_SNAPSHOT);
+
+		const autoAccept = media.checkbox(/Automatically accept tasks from Lab Mac/u);
+		assert.strictEqual(autoAccept.checked, false);
+		assert.match(media.element('selectionDetails').text, /Skips task-start confirmation, not sensitive tool approvals/u);
+		autoAccept.toggle();
+		assert.deepStrictEqual(media.messages.at(-1), {
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: 'media-view',
+			type: 'action',
+			action: 'setRemoteAutoAccept',
+			actionHandle: 'f'.repeat(32),
+			enabled: true,
+		});
+
+		media.treeItem('tree-7').click();
+		media.treeItem('tree-7').keydown('ArrowRight');
+		media.treeItem('tree-8').click();
+		media.treeItem('tree-8').keydown('ArrowRight');
+		media.treeItem('tree-10').click();
+		assert.match(
+			media.element('selectionDetails').text,
+			/Authorize this window’s claimed source Workspaces for this remote Workspace/u,
+		);
+		assert.match(
+			media.element('selectionDetails').text,
+			/Applies to all claimed source roots in this window/u,
+		);
+		media.button('Delegate from Chat…').click();
+		assert.deepStrictEqual(media.messages.at(-1), {
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: 'media-view',
+			type: 'action',
+			action: 'openTargetChat',
+			actionHandle: 'j'.repeat(32),
+		});
+	});
+
+	test('renders unknown remote device state as cached metadata without guessed availability', async () => {
+		const media = await createDashboardMediaHarness();
+		const value = snapshot();
+		media.receive({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: 'media-view',
+			type: 'dashboard.snapshot',
+			model: new DashboardPresenter().present({
+				...value,
+				deviceTree: value.deviceTree?.map((device) => device.key !== 'tree-7'
+					? device
+					: {
+						...device,
+						state: 'unknown',
+						nodes: device.nodes.map((node) => ({
+							...node,
+							workspaces: node.workspaces.map((workspace) => ({
+								...workspace,
+								canDelegate: false,
+								delegateActionHandle: undefined,
+							})),
+						})),
+					}),
+			}),
+		});
+		media.treeItem('tree-7').click();
+		assert.match(media.element('selectionDetails').text, /Unknown\/Cached/u);
+		assert.match(media.element('selectionDetails').text, /Refresh connected devices/u);
+		assert.throws(() => media.button('Delegate from Chat…'));
+		assert.doesNotMatch(media.element('selectionDetails').text, /Online|Offline/u);
 	});
 
 	test('validates inbound messages and rejects extra or malformed data', () => {
@@ -212,6 +438,36 @@ suite('Dashboard', () => {
 			type: 'action',
 			action: 'renameWindow',
 		}));
+		assert.ok(parseDashboardInboundMessage({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: 'instance-1',
+			type: 'action',
+			action: 'openTargetChat',
+			actionHandle: 'd'.repeat(32),
+		}));
+		assert.ok(parseDashboardInboundMessage({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: 'instance-1',
+			type: 'action',
+			action: 'setRemoteAutoAccept',
+			actionHandle: 'e'.repeat(32),
+			enabled: false,
+		}));
+		assert.strictEqual(parseDashboardInboundMessage({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: 'instance-1',
+			type: 'action',
+			action: 'openTargetChat',
+			actionHandle: 'd'.repeat(32),
+			enabled: true,
+		}), undefined);
+		assert.strictEqual(parseDashboardInboundMessage({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: 'instance-1',
+			type: 'action',
+			action: 'setAcceptIncoming',
+			actionHandle: 'e'.repeat(32),
+		}), undefined);
 		assert.strictEqual(parseDashboardInboundMessage({
 			version: DASHBOARD_MESSAGE_VERSION,
 			uiInstanceId: 'instance-1',
@@ -221,7 +477,7 @@ suite('Dashboard', () => {
 		}), undefined);
 	});
 
-	test('accepts only the six exact connectivity actions with kind-specific aliases and no payload', () => {
+	test('accepts only exact connectivity actions with kind-specific aliases and no payload', () => {
 		for (const action of CONNECTIVITY_ACTIONS) {
 			const requiresHandle = action === 'pairDiscoveredPeer' || action === 'revokeIncomingPeer';
 			const message = {
@@ -496,6 +752,67 @@ suite('Dashboard', () => {
 			...base,
 			model: withTaskTitle(safeModel, 'tokenCount = 12'),
 		}));
+	});
+
+	test('strictly validates device-tree actions, bounds, and safe labels', () => {
+		const message = {
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: 'instance-1',
+			type: 'dashboard.snapshot' as const,
+			model: new DashboardPresenter().present(snapshot()),
+		};
+		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage(message));
+		assert.throws(() => assertSafeDashboardOutboundMessage({
+			...message,
+			model: {
+				...message.model,
+				deviceTree: message.model.deviceTree.map((device, index) => index === 0
+					? { ...device, key: 'tree-7' }
+					: device),
+			},
+		} as never));
+		assert.throws(() => assertSafeDashboardOutboundMessage({
+			...message,
+			model: {
+				...message.model,
+				deviceTree: message.model.deviceTree.map((device) => device.key !== 'tree-7'
+					? device
+					: {
+						...device,
+						nodes: device.nodes.map((node) => ({
+							...node,
+							workspaces: node.workspaces.map((workspace) => workspace.key !== 'tree-10'
+								? workspace
+								: {
+									...workspace,
+									canDelegate: true,
+									delegateActionHandle: undefined,
+								}),
+						})),
+					}),
+			},
+		} as never));
+		assert.throws(() => assertSafeDashboardOutboundMessage({
+			...message,
+			model: {
+				...message.model,
+				deviceTree: message.model.deviceTree.map((device) => ({
+					...device,
+					nodes: device.nodes.map((node) => ({
+						...node,
+						workspaces: node.workspaces.map((workspace) => workspace.key !== 'tree-3'
+							? workspace
+							: {
+								...workspace,
+								incomingPeers: [{
+									...workspace.incomingPeers[0],
+									label: 'file:///private/project',
+								}],
+							}),
+					})),
+				})),
+			},
+		} as never));
 	});
 
 	test('redacts path-bearing remote summaries, details, and errors before validation', () => {
@@ -997,6 +1314,116 @@ suite('Dashboard', () => {
 		provider.dispose();
 	});
 
+	test('scopes device-tree remote policy and Chat draft handles to one view and exact action', async () => {
+		const extension = getExtension();
+		const facade = new RecordingDashboardFacade();
+		const tree = structuredClone(facade.snapshotValue.deviceTree);
+		assert.ok(tree);
+		tree[0].nodes[0].workspaces[0].receiveAction = 'setRemoteReceive';
+		facade.snapshotValue = { ...facade.snapshotValue, deviceTree: tree };
+		const provider = new AgentMeshViewProvider(facade, extension.extensionUri);
+		const first = new TestWebviewView();
+		const second = new TestWebviewView();
+		provider.resolveWebviewView(first);
+		provider.resolveWebviewView(second);
+		const firstId = getUiInstanceId(first.webview.html);
+		const secondId = getUiInstanceId(second.webview.html);
+		await first.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: firstId, type: 'ready' });
+		await second.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: secondId, type: 'ready' });
+
+		const firstSnapshot = first.webview.sent[0];
+		const delegateHandle = getTreeWorkspaceHandle(firstSnapshot, 'tree-10', 'delegateActionHandle');
+		const allowHandle = getTreeWorkspaceHandle(firstSnapshot, 'tree-10', 'allowActionHandle');
+		const receiveHandle = getTreeWorkspaceHandle(firstSnapshot, 'tree-3', 'receiveActionHandle');
+		const autoAcceptHandle = getTreeIncomingPeerHandle(firstSnapshot, 'tree-3', 'tree-4');
+		assert.match(delegateHandle ?? '', /^[A-Za-z0-9_-]{32}$/u);
+		assert.match(allowHandle ?? '', /^[A-Za-z0-9_-]{32}$/u);
+		assert.match(receiveHandle ?? '', /^[A-Za-z0-9_-]{32}$/u);
+		assert.match(autoAcceptHandle ?? '', /^[A-Za-z0-9_-]{32}$/u);
+		assert.notStrictEqual(delegateHandle, 'j'.repeat(32));
+		assert.notStrictEqual(receiveHandle, 'c'.repeat(32));
+		assert.notStrictEqual(autoAcceptHandle, 'f'.repeat(32));
+
+		await second.webview.receive({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: secondId,
+			type: 'action',
+			action: 'openTargetChat',
+			actionHandle: delegateHandle,
+		});
+		assert.ok(second.webview.sent.some(({ code }) => code === 'STALE_ACTION'));
+		assert.deepStrictEqual(facade.calls, []);
+
+		await first.webview.receive({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: firstId,
+			type: 'action',
+			action: 'setRemoteAllowed',
+			actionHandle: delegateHandle,
+			enabled: true,
+		});
+		assert.ok(first.webview.sent.some(({ code }) => code === 'STALE_ACTION'));
+		assert.deepStrictEqual(facade.calls, []);
+
+		const afterInvalid = first.webview.sent.filter(({ type }) => type === 'dashboard.snapshot').at(-1);
+		assert.ok(afterInvalid);
+		const freshDelegateHandle = getTreeWorkspaceHandle(afterInvalid, 'tree-10', 'delegateActionHandle');
+		await first.webview.receive({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: firstId,
+			type: 'action',
+			action: 'openTargetChat',
+			actionHandle: freshDelegateHandle,
+		});
+		const afterChat = first.webview.sent.filter(({ type }) => type === 'dashboard.snapshot').at(-1);
+		const nextAllowHandle = afterChat ? getTreeWorkspaceHandle(afterChat, 'tree-10', 'allowActionHandle') : undefined;
+		await first.webview.receive({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: firstId,
+			type: 'action',
+			action: 'setRemoteAllowed',
+			actionHandle: nextAllowHandle,
+			enabled: false,
+		});
+		const afterAllow = first.webview.sent.filter(({ type }) => type === 'dashboard.snapshot').at(-1);
+		const nextReceiveHandle = afterAllow ? getTreeWorkspaceHandle(afterAllow, 'tree-3', 'receiveActionHandle') : undefined;
+		await first.webview.receive({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: firstId,
+			type: 'action',
+			action: 'setRemoteReceive',
+			actionHandle: nextReceiveHandle,
+			enabled: true,
+		});
+		const afterReceive = first.webview.sent.filter(({ type }) => type === 'dashboard.snapshot').at(-1);
+		const nextAutoAcceptHandle = afterReceive ? getTreeIncomingPeerHandle(afterReceive, 'tree-3', 'tree-4') : undefined;
+		await first.webview.receive({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: firstId,
+			type: 'action',
+			action: 'setRemoteAutoAccept',
+			actionHandle: nextAutoAcceptHandle,
+			enabled: true,
+		});
+		assert.deepStrictEqual(facade.calls, [
+			`openTargetChat:${'j'.repeat(32)}`,
+			`remotePolicy:setRemoteAllowed:${'k'.repeat(32)}:false`,
+			`remotePolicy:setRemoteReceive:${'c'.repeat(32)}:true`,
+			`remotePolicy:setRemoteAutoAccept:${'f'.repeat(32)}:true`,
+		]);
+
+		await first.webview.receive({
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: firstId,
+			type: 'action',
+			action: 'setRemoteAutoAccept',
+			actionHandle: nextAutoAcceptHandle,
+			enabled: false,
+		});
+		assert.ok(first.webview.sent.some(({ code }) => code === 'STALE_ACTION'));
+		provider.dispose();
+	});
+
 	test('keeps active task UI handles stable across refresh and removes them at terminal state', async () => {
 		const extension = getExtension();
 		const facade = new RecordingDashboardFacade();
@@ -1271,6 +1698,27 @@ suite('Dashboard', () => {
 		);
 	});
 
+	test('forwards remote policy and exact Chat draft actions without local confirmation', async () => {
+		const services = new RecordingServiceBindings();
+		const facade = new ServiceDashboardFacade(
+			services,
+			{ confirm: async () => assert.fail('Remote policy prompts belong to the Broker owner.') },
+			{ showInputBox: async () => assert.fail('Target Chat drafts must not request extra Dashboard input.') },
+		);
+		await facade.remotePolicyAction('setRemoteAutoAccept', 'a'.repeat(32), true);
+		await facade.remotePolicyAction('setRemoteReceive', 'b'.repeat(32), false);
+		await facade.openTargetChat('c'.repeat(32));
+		assert.deepStrictEqual(services.remotePolicyCalls, [
+			{ action: 'setRemoteAutoAccept', actionHandle: 'a'.repeat(32), enabled: true },
+			{ action: 'setRemoteReceive', actionHandle: 'b'.repeat(32), enabled: false },
+		]);
+		assert.deepStrictEqual(services.targetChatCalls, ['c'.repeat(32)]);
+		await assert.rejects(
+			new UnavailableDashboardFacade().openTargetChat('d'.repeat(32)),
+			/unavailable/u,
+		);
+	});
+
 	test('reserves exact task cancellation before confirmation and releases a denial', async () => {
 		const services = new RecordingServiceBindings();
 		const order: string[] = [];
@@ -1493,6 +1941,101 @@ suite('Dashboard', () => {
 		}
 	});
 
+	test('Production bindings open an exact Chat draft target without confirmation or task start, and reject replayed stale handles', async () => {
+		const fixture = createConnectivityBindings();
+		try {
+			fixture.state.connectivity = {
+				...connectivitySnapshot(),
+				delegationEnabled: true,
+				strictPolicyActivated: true,
+			};
+			const first = await fixture.bindings.getSnapshot();
+			const target = findSnapshotWorkspace(
+				first,
+				(workspace) => workspace.deviceLocality === 'remote' && workspace.name === 'billing-api',
+			);
+			assert.ok(target);
+			const handle = getSnapshotTreeWorkspaceHandle(first, target.key, 'delegateActionHandle');
+			assert.match(handle ?? '', /^[A-Za-z0-9_-]{32}$/u);
+
+			await fixture.bindings.openTargetChat(handle!);
+			assert.deepStrictEqual(fixture.describedTargets, [{
+				deviceId: '00000000-0000-4000-8000-000000000201',
+				peerId: '00000000-0000-4000-8000-000000000202',
+				nodeId: '00000000-0000-4000-8000-000000000211',
+				nodeInstanceId: '00000000-0000-4000-8000-000000000212',
+				workspaceId: '00000000-0000-4000-8000-000000000213',
+				title: 'Prepare a delegation',
+				prompt: 'Describe the task to delegate.',
+				acceptanceCriteria: [],
+			}]);
+			assert.deepStrictEqual(fixture.commandCalls, [{
+				command: 'workbench.action.chat.open',
+				args: [{
+					query: 'Use #meshDelegateTask for this exact Mesh target: '
+						+ `${JSON.stringify({
+							deviceId: '00000000-0000-4000-8000-000000000201',
+							peerId: '00000000-0000-4000-8000-000000000202',
+							nodeId: '00000000-0000-4000-8000-000000000211',
+							nodeInstanceId: '00000000-0000-4000-8000-000000000212',
+							workspaceId: '00000000-0000-4000-8000-000000000213',
+						})}.\nTask: `,
+					isPartialQuery: true,
+					mode: 'agent',
+				}],
+			}]);
+			assert.strictEqual(fixture.calls.includes('native'), false);
+			assert.strictEqual(fixture.calls.includes('cloud'), false);
+
+			await assert.rejects(
+				fixture.bindings.openTargetChat(handle!),
+				(error: unknown) => error instanceof DashboardActionError && error.code === 'STALE_ACTION',
+			);
+
+			const second = await fixture.bindings.getSnapshot();
+			const secondTarget = findSnapshotWorkspace(
+				second,
+				(workspace) => workspace.deviceLocality === 'remote' && workspace.name === 'billing-api',
+			);
+			assert.ok(secondTarget);
+			const staleHandle = getSnapshotTreeWorkspaceHandle(second, secondTarget.key, 'delegateActionHandle');
+			assert.match(staleHandle ?? '', /^[A-Za-z0-9_-]{32}$/u);
+			await fixture.bindings.getSnapshot();
+			await assert.rejects(
+				fixture.bindings.openTargetChat(staleHandle!),
+				(error: unknown) => error instanceof DashboardActionError && error.code === 'STALE_ACTION',
+			);
+			assert.strictEqual(fixture.commandCalls.length, 1);
+		} finally {
+			fixture.bindings.dispose();
+		}
+	});
+
+	test('Production bindings keep cached remote metadata as unknown without enabling delegation', async () => {
+		const fixture = createConnectivityBindings();
+		try {
+			fixture.state.connectivity = {
+				...connectivitySnapshot(),
+				delegationEnabled: true,
+				strictPolicyActivated: true,
+			};
+			fixture.state.remotePolicy = {
+				...fixture.state.remotePolicy,
+				peerStates: [],
+			};
+			const value = await fixture.bindings.getSnapshot();
+			const target = findSnapshotWorkspace(
+				value,
+				(workspace) => workspace.deviceLocality === 'remote' && workspace.name === 'billing-api',
+			);
+			assert.ok(target);
+			assert.strictEqual(target.deviceState, 'unknown');
+			assert.strictEqual(getSnapshotTreeWorkspaceHandle(value, target.key, 'delegateActionHandle'), undefined);
+		} finally {
+			fixture.bindings.dispose();
+		}
+	});
+
 	test('Production Dashboard accepts neutral CLI and SDK exposure status without projecting hosting metadata', async () => {
 		const fixture = createConnectivityBindings();
 		const media = await createDashboardMediaHarness();
@@ -1572,13 +2115,12 @@ suite('Dashboard', () => {
 				};
 				assert.doesNotThrow(() => assertSafeDashboardOutboundMessage(message));
 				media.receive(message);
-				const checkbox = media.element('acceptIncoming').descendants().find(({ tagName }) => tagName === 'input');
-				assert.ok(checkbox);
-				assert.strictEqual(checkbox.checked, receivingWorkspaceCount === 1);
-				assert.strictEqual(checkbox.disabled, true);
 				assert.match(media.element('connectivity').text, new RegExp(`Receiving Workspaces\\s+${receivingWorkspaceCount}`, 'u'));
-				assert.match(media.element('acceptIncoming').text, /without enabling local delegation/u);
-				assert.doesNotMatch(media.element('acceptIncoming').text, /Enable Peer Delegation Preview/u);
+				assert.match(
+					media.element('acceptIncoming').text,
+					receivingWorkspaceCount === 1 ? /Accepting incoming tasks/u : /Not accepting incoming tasks/u,
+				);
+				assert.match(media.element('acceptIncoming').text, /strict remote policy/i);
 				media.button('Configure strict remote policy…').click();
 				assert.deepStrictEqual(media.messages.at(-1), {
 					version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view',
@@ -1694,6 +2236,7 @@ suite('Dashboard', () => {
 			{ action: 'copyConnectionUrl' },
 			{ action: 'configureConnectivity' },
 			{ action: 'refreshDiscovery' },
+			{ action: 'refreshRemoteTargets' },
 			{ action: 'configureRemotePolicy' },
 			{ action: 'retryConnectivityCleanup' },
 			{ action: 'refresh' },
@@ -1716,6 +2259,7 @@ suite('Dashboard', () => {
 			'copyConnectionUrl',
 			'connectivity:configureConnectivity:',
 			'connectivity:refreshDiscovery:',
+			'connectivity:refreshRemoteTargets:',
 			'connectivity:configureRemotePolicy:',
 			'connectivity:retryConnectivityCleanup:',
 		]);
@@ -1759,6 +2303,14 @@ class RecordingDashboardFacade implements DashboardFacade {
 
 	public async connectivityAction(action: ConnectivityAction, actionHandle?: string): Promise<void> {
 		this.calls.push(`connectivity:${action}:${actionHandle ?? ''}`);
+	}
+
+	public async remotePolicyAction(action: RemotePolicyAction, actionHandle: string, enabled: boolean): Promise<void> {
+		this.calls.push(`remotePolicy:${action}:${actionHandle}:${enabled}`);
+	}
+
+	public async openTargetChat(actionHandle: string): Promise<void> {
+		this.calls.push(`openTargetChat:${actionHandle}`);
 	}
 
 	public async cancelDashboardTask(actionHandle: string, direction: 'incoming' | 'outgoing'): Promise<void> {
@@ -1830,6 +2382,8 @@ class RecordingServiceBindings implements DashboardServiceBindings {
 	public cancellationOrder?: string[];
 	public lastWindowName?: string;
 	public readonly connectivityCalls: Array<{ action: ConnectivityAction; actionHandle?: string }> = [];
+	public readonly remotePolicyCalls: Array<{ action: RemotePolicyAction; actionHandle: string; enabled: boolean }> = [];
+	public readonly targetChatCalls: string[] = [];
 	public lastTaskRequest?: {
 		readonly target?: DashboardTaskTarget;
 		readonly title: string;
@@ -1852,6 +2406,12 @@ class RecordingServiceBindings implements DashboardServiceBindings {
 	public async setPeerAllowed(_actionHandle: string, _allowed: boolean): Promise<void> {}
 	public async connectivityAction(action: ConnectivityAction, actionHandle?: string): Promise<void> {
 		this.connectivityCalls.push({ action, ...(actionHandle === undefined ? {} : { actionHandle }) });
+	}
+	public async remotePolicyAction(action: RemotePolicyAction, actionHandle: string, enabled: boolean): Promise<void> {
+		this.remotePolicyCalls.push({ action, actionHandle, enabled });
+	}
+	public async openTargetChat(actionHandle: string): Promise<void> {
+		this.targetChatCalls.push(actionHandle);
 	}
 	public async prepareDashboardTaskCancellation(
 		_actionHandle: string,
@@ -1977,6 +2537,93 @@ function snapshot(): DashboardSnapshot {
 				degraded: false,
 			},
 		},
+		deviceTree: [{
+			key: 'tree-1',
+			name: 'test-device',
+			locality: 'local',
+			state: 'online',
+			nodes: [{
+				key: 'tree-2',
+				label: 'This Window',
+				thisWindow: true,
+				status: 'online',
+				workspaces: [{
+					key: 'tree-3',
+					name: 'service-workspace',
+					claimStatus: 'claimed',
+					enabled: true,
+					busy: false,
+					acceptsIncoming: false,
+					allowlisted: false,
+					gateState: 'self',
+					canDelegate: false,
+					receiveActionHandle: 'c'.repeat(32),
+					receiveAction: 'setAcceptIncoming',
+					incomingPeers: [{
+						key: 'tree-4',
+						label: 'Lab Mac',
+						autoAccept: false,
+						actionHandle: 'f'.repeat(32),
+					}],
+				}],
+			}, {
+				key: 'tree-5',
+				label: 'Local Window',
+				thisWindow: false,
+				status: 'online',
+				workspaces: [{
+					key: 'tree-6',
+					name: 'local-target',
+					claimStatus: 'claimed',
+					enabled: true,
+					busy: false,
+					acceptsIncoming: true,
+					allowlisted: true,
+					gateState: 'allowed',
+					canDelegate: true,
+					delegateActionHandle: 'g'.repeat(32),
+					allowActionHandle: 'h'.repeat(32),
+					incomingPeers: [],
+				}],
+			}],
+		}, {
+			key: 'tree-7',
+			name: 'Lab Mac',
+			locality: 'remote',
+			state: 'online',
+			nodes: [{
+				key: 'tree-8',
+				label: 'Backend window',
+				thisWindow: false,
+				status: 'online',
+				workspaces: [{
+					key: 'tree-9',
+					name: 'orders-api',
+					claimStatus: 'claimed',
+					enabled: true,
+					busy: false,
+					acceptsIncoming: true,
+					allowlisted: false,
+					gateState: 'notAllowed',
+					canDelegate: false,
+					allowActionHandle: 'i'.repeat(32),
+					incomingPeers: [],
+				}, {
+					key: 'tree-10',
+					name: 'billing-api',
+					claimStatus: 'claimed',
+					enabled: true,
+					busy: false,
+					acceptsIncoming: true,
+					allowlisted: true,
+					gateState: 'allowed',
+					canDelegate: true,
+					delegateActionHandle: 'j'.repeat(32),
+					allowActionHandle: 'k'.repeat(32),
+					incomingPeers: [],
+				}],
+			}],
+		}],
 		policyCandidates: [{
 			actionHandle: 'a'.repeat(32),
 			windowLabel: 'Remote Window',
@@ -2093,6 +2740,135 @@ function getConnectivityActionHandle(
 	return handle;
 }
 
+function getTreeWorkspaceHandle(
+	message: Record<string, unknown>,
+	workspaceKey: string,
+	field: 'delegateActionHandle' | 'allowActionHandle' | 'receiveActionHandle',
+): string | undefined {
+	const model = message.model;
+	if (typeof model !== 'object' || model === null || Array.isArray(model)) {
+		return undefined;
+	}
+	const deviceTree = (model as Record<string, unknown>).deviceTree;
+	if (!Array.isArray(deviceTree)) {
+		return undefined;
+	}
+	for (const device of deviceTree) {
+		const nodes = (device as { nodes?: unknown }).nodes;
+		if (!Array.isArray(nodes)) {
+			continue;
+		}
+		for (const node of nodes) {
+			const workspaces = (node as { workspaces?: unknown }).workspaces;
+			if (!Array.isArray(workspaces)) {
+				continue;
+			}
+			for (const workspace of workspaces) {
+				const record = workspace as Record<string, unknown>;
+				if (record.key === workspaceKey && typeof record[field] === 'string') {
+					return record[field] as string;
+				}
+			}
+		}
+	}
+	return undefined;
+}
+
+function getTreeIncomingPeerHandle(
+	message: Record<string, unknown>,
+	workspaceKey: string,
+	peerKey: string,
+): string | undefined {
+	const model = message.model;
+	if (typeof model !== 'object' || model === null || Array.isArray(model)) {
+		return undefined;
+	}
+	const deviceTree = (model as Record<string, unknown>).deviceTree;
+	if (!Array.isArray(deviceTree)) {
+		return undefined;
+	}
+	for (const device of deviceTree) {
+		const nodes = (device as { nodes?: unknown }).nodes;
+		if (!Array.isArray(nodes)) {
+			continue;
+		}
+		for (const node of nodes) {
+			const workspaces = (node as { workspaces?: unknown }).workspaces;
+			if (!Array.isArray(workspaces)) {
+				continue;
+			}
+			for (const workspace of workspaces) {
+				const record = workspace as Record<string, unknown>;
+				if (record.key !== workspaceKey || !Array.isArray(record.incomingPeers)) {
+					continue;
+				}
+				for (const peer of record.incomingPeers) {
+					const peerRecord = peer as Record<string, unknown>;
+					if (peerRecord.key === peerKey && typeof peerRecord.actionHandle === 'string') {
+						return peerRecord.actionHandle as string;
+					}
+				}
+			}
+		}
+	}
+	return undefined;
+}
+
+function getSnapshotTreeWorkspaceHandle(
+	value: DashboardSnapshot,
+	workspaceKey: string,
+	field: 'delegateActionHandle' | 'allowActionHandle' | 'receiveActionHandle',
+): string | undefined {
+	const deviceTree = value.deviceTree;
+	if (!Array.isArray(deviceTree)) {
+		return undefined;
+	}
+	for (const device of deviceTree) {
+		for (const node of device.nodes) {
+			for (const workspace of node.workspaces) {
+				if (workspace.key === workspaceKey) {
+					const candidate = workspace[field];
+					return typeof candidate === 'string' ? candidate : undefined;
+				}
+			}
+		}
+	}
+	return undefined;
+}
+
+function findSnapshotWorkspace(
+	value: DashboardSnapshot,
+	predicate: (workspace: {
+		key: string;
+		name: string;
+		deviceLocality: 'local' | 'remote';
+		deviceState: string;
+		nodeLabel: string;
+	}) => boolean,
+): { key: string; name: string; deviceLocality: 'local' | 'remote'; deviceState: string; nodeLabel: string } | undefined {
+	const deviceTree = value.deviceTree;
+	if (!Array.isArray(deviceTree)) {
+		return undefined;
+	}
+	for (const device of deviceTree) {
+		for (const node of device.nodes) {
+			for (const workspace of node.workspaces) {
+				const candidate = {
+					key: workspace.key,
+					name: workspace.name,
+					deviceLocality: device.locality,
+					deviceState: device.state,
+					nodeLabel: node.label,
+				} as const;
+				if (predicate(candidate)) {
+					return candidate;
+				}
+			}
+		}
+	}
+	return undefined;
+}
+
 function withScopedConnectivity(connectivity: ConnectivitySnapshot): ReturnType<DashboardPresenter['present']> {
 	const model = new DashboardPresenter().present({ ...snapshot(), connectivity });
 	return {
@@ -2114,11 +2890,16 @@ class DashboardTestElement {
 	public className = '';
 	public disabled = false;
 	public checked = false;
+	public hidden = false;
+	public tabIndex = 0;
+	public readonly dataset: Record<string, string> = {};
+	public readonly attributes: Record<string, string> = {};
 	public readonly classList = { remove: (_name: string) => undefined };
 	public readonly children: DashboardTestElement[] = [];
-	private readonly listeners = new Map<string, () => void>();
+	private readonly listeners = new Map<string, (...args: unknown[]) => void>();
+	public onFocus?: (element: DashboardTestElement) => void;
 
-	public constructor(public readonly tagName: string) {}
+	public constructor(public tagName: string) {}
 
 	public get text(): string {
 		return [this.textContent, ...this.children.map((child) => child.text)].join(' ');
@@ -2133,15 +2914,40 @@ class DashboardTestElement {
 		this.children.length = 0;
 	}
 
-	public setAttribute(_name: string, _value: string): void {}
+	public setAttribute(name: string, value: string): void {
+		this.attributes[name] = value;
+		if (name.startsWith('data-')) {
+			this.dataset[name.slice(5).replace(/-([a-z])/gu, (_all, letter: string) => letter.toUpperCase())] = value;
+		}
+	}
 
-	public addEventListener(event: string, listener: () => void): void {
+	public addEventListener(event: string, listener: (...args: unknown[]) => void): void {
 		this.listeners.set(event, listener);
+	}
+
+	public focus(): void {
+		this.onFocus?.(this);
+		this.listeners.get('focus')?.();
 	}
 
 	public click(): void {
 		assert.strictEqual(this.disabled, false, 'A disabled control cannot be activated.');
+		this.focus();
 		this.listeners.get('click')?.();
+	}
+
+	public toggle(): void {
+		assert.strictEqual(this.disabled, false, 'A disabled control cannot be activated.');
+		this.focus();
+		this.checked = !this.checked;
+		this.listeners.get('change')?.();
+	}
+
+	public keydown(key: string): void {
+		this.listeners.get('keydown')?.({
+			key,
+			preventDefault: () => undefined,
+		} as unknown as never);
 	}
 
 	public descendants(): DashboardTestElement[] {
@@ -2153,17 +2959,38 @@ async function createDashboardMediaHarness(): Promise<{
 	readonly messages: Array<Record<string, unknown>>;
 	element(id: string): DashboardTestElement;
 	button(text: string): DashboardTestElement;
+	treeItem(key: string): DashboardTestElement;
+	checkbox(label: string | RegExp): DashboardTestElement;
+	focusedElement(): DashboardTestElement | undefined;
+	selectedTreeLabel(): string | undefined;
 	receive(message: unknown): void;
 	render(connectivity: ConnectivitySnapshot): void;
 }> {
 	const messages: Array<Record<string, unknown>> = [];
-	const roots = new Map([
-		'device', 'thisWindow', 'acceptIncoming', 'listener', 'connectivity',
-		'discoveryCandidates', 'incomingPeers', 'localNodes', 'savedAuthorizations',
-		'outgoingTasks', 'incomingTasks', 'errors', 'announcement', 'operationStatus',
-	].map((id) => [id, new DashboardTestElement('div')]));
-	const refresh = new DashboardTestElement('button');
+	let activeElement: DashboardTestElement | undefined;
+	const roots = new Map<string, DashboardTestElement>([
+		['refreshButton', new DashboardTestElement('button')],
+		['settingsButton', new DashboardTestElement('button')],
+		['closeSettingsButton', new DashboardTestElement('button')],
+		['deviceTree', new DashboardTestElement('div')],
+		['selectionSummary', new DashboardTestElement('p')],
+		['selectionDetails', new DashboardTestElement('div')],
+		['settingsDrawer', new DashboardTestElement('aside')],
+		...[
+			'device', 'thisWindow', 'acceptIncoming', 'listener', 'connectivity',
+			'discoveryCandidates', 'incomingPeers', 'localNodes', 'savedAuthorizations',
+			'outgoingTasks', 'incomingTasks', 'errors', 'announcement', 'operationStatus',
+		].map((id) => [id, new DashboardTestElement('div')] as const),
+	]);
+	const onFocus = (element: DashboardTestElement) => { activeElement = element; };
+	for (const root of roots.values()) { root.onFocus = onFocus; }
+	const refresh = roots.get('refreshButton');
+	const settings = roots.get('settingsButton');
+	const closeSettings = roots.get('closeSettingsButton');
+	assert.ok(refresh && settings && closeSettings);
 	refresh.textContent = 'Refresh';
+	settings.textContent = 'Settings';
+	closeSettings.textContent = 'Close';
 	const element = (id: string): DashboardTestElement => {
 		const result = roots.get(id);
 		assert.ok(result, `Unknown Dashboard element: ${id}`);
@@ -2175,14 +3002,17 @@ async function createDashboardMediaHarness(): Promise<{
 		'utf8',
 	);
 	runInNewContext(bundle, {
+		TextEncoder,
 		document: {
 			body: { dataset: { uiInstanceId: 'media-view' } },
-			querySelector: (selector: string) => {
-				assert.strictEqual(selector, 'button[data-action="refresh"]');
-				return refresh;
-			},
+			get activeElement() { return activeElement; },
+			querySelector: () => undefined,
 			getElementById: element,
-			createElement: (tag: string) => new DashboardTestElement(tag),
+			createElement: (tag: string) => {
+				const element = new DashboardTestElement(tag);
+				element.onFocus = onFocus;
+				return element;
+			},
 		},
 		window: {
 			addEventListener: (event: string, callback: (event: { data: unknown }) => void) => {
@@ -2203,12 +3033,31 @@ async function createDashboardMediaHarness(): Promise<{
 	return {
 		messages,
 		element,
+		focusedElement: () => activeElement,
 		button: (text: string) => {
-			const result = [refresh, ...[...roots.values()].flatMap((root) => root.descendants())]
+			const result = [...[...roots.values()].flatMap((root) => root.descendants())]
 				.find((candidate) => candidate.tagName === 'button' && candidate.textContent === text);
 			assert.ok(result, `Missing Dashboard button: ${text}`);
 			return result;
 		},
+		treeItem: (key: string) => {
+			const result = element('deviceTree').descendants().find((candidate) =>
+				candidate.attributes['data-tree-key'] === key);
+			assert.ok(result, `Missing tree item: ${key}`);
+			return result;
+		},
+		checkbox: (label: string | RegExp) => {
+			const matcher = typeof label === 'string'
+				? (value: string | undefined) => value === label
+				: (value: string | undefined) => value !== undefined && label.test(value);
+			const result = [...roots.values()].flatMap((root) => root.descendants()).find((candidate) =>
+				candidate.tagName === 'input' && matcher(candidate.attributes['aria-label']));
+			assert.ok(result, `Missing Dashboard checkbox: ${String(label)}`);
+			return result;
+		},
+		selectedTreeLabel: () => element('deviceTree').descendants()
+			.find((candidate) => candidate.attributes['aria-selected'] === 'true')
+			?.text,
 		receive,
 		render: (connectivity: ConnectivitySnapshot) => receive({
 			version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view',
@@ -2221,8 +3070,41 @@ function createConnectivityBindings(): {
 	readonly bindings: ProductionDashboardBindings;
 	readonly calls: string[];
 	readonly mutations: Array<{ action: ConnectivityAction; actionHandle?: string }>;
+	readonly commandCalls: Array<{ command: string; args: unknown[] }>;
+	readonly describedTargets: unknown[];
 	readonly state: {
 		connectivity: ConnectivitySnapshot;
+		remotePolicy: {
+			workspaces: Array<{
+				workspaceId: string;
+				name: string;
+				acceptsIncoming: boolean;
+				receiveActionHandle: string;
+				incomingPeers: Array<{
+					peerId: string;
+					label: string;
+					autoAccept: boolean;
+					actionHandle: string;
+				}>;
+			}>;
+			remoteTargets: Array<{
+				profileId: string;
+				deviceId: string;
+				nodeId: string;
+				nodeInstanceId: string;
+				workspaceId: string;
+				allowlisted: boolean;
+				acceptsIncoming: boolean;
+				canDelegate: boolean;
+				actionHandle?: string;
+			}>;
+			peerStates: Array<{
+				profileId: string;
+				deviceId: string;
+				state: 'connecting' | 'online' | 'busy' | 'offline' | 'authFailed' | 'incompatible';
+			}>;
+			truncated: boolean;
+		};
 		connectivityError?: Error;
 		directoryError?: Error;
 		guardError?: Error;
@@ -2235,15 +3117,81 @@ function createConnectivityBindings(): {
 	const disposable = { dispose: () => undefined };
 	const calls: string[] = [];
 	const mutations: Array<{ action: ConnectivityAction; actionHandle?: string }> = [];
+	const commandCalls: Array<{ command: string; args: unknown[] }> = [];
+	const describedTargets: unknown[] = [];
 	const state: {
 		connectivity: ConnectivitySnapshot;
+		remotePolicy: {
+			workspaces: Array<{
+				workspaceId: string;
+				name: string;
+				acceptsIncoming: boolean;
+				receiveActionHandle: string;
+				incomingPeers: Array<{
+					peerId: string;
+					label: string;
+					autoAccept: boolean;
+					actionHandle: string;
+				}>;
+			}>;
+			remoteTargets: Array<{
+				profileId: string;
+				deviceId: string;
+				nodeId: string;
+				nodeInstanceId: string;
+				workspaceId: string;
+				allowlisted: boolean;
+				acceptsIncoming: boolean;
+				canDelegate: boolean;
+				actionHandle?: string;
+			}>;
+			peerStates: Array<{
+				profileId: string;
+				deviceId: string;
+				state: 'connecting' | 'online' | 'busy' | 'offline' | 'authFailed' | 'incompatible';
+			}>;
+			truncated: boolean;
+		};
 		connectivityError?: Error;
 		directoryError?: Error;
 		guardError?: Error;
 		ownerListener?: ListenerSnapshot;
 		previewEnabled?: boolean;
 		localAcceptsIncoming?: boolean;
-	} = { connectivity: DISABLED_CONNECTIVITY_SNAPSHOT };
+	} = {
+		connectivity: DISABLED_CONNECTIVITY_SNAPSHOT,
+		remotePolicy: {
+			workspaces: [{
+				workspaceId: '00000000-0000-4000-8000-000000000401',
+				name: 'Source Workspace',
+				acceptsIncoming: false,
+				receiveActionHandle: '00000000-0000-4000-8000-000000000402',
+				incomingPeers: [{
+					peerId: '00000000-0000-4000-8000-000000000202',
+					label: 'Cached remote device · Source Workspace',
+					autoAccept: false,
+					actionHandle: '00000000-0000-4000-8000-000000000403',
+				}],
+			}],
+			remoteTargets: [{
+				profileId: '00000000-0000-4000-8000-000000000202',
+				deviceId: '00000000-0000-4000-8000-000000000201',
+				nodeId: '00000000-0000-4000-8000-000000000211',
+				nodeInstanceId: '00000000-0000-4000-8000-000000000212',
+				workspaceId: '00000000-0000-4000-8000-000000000213',
+				allowlisted: true,
+				acceptsIncoming: true,
+				canDelegate: true,
+				actionHandle: '00000000-0000-4000-8000-000000000214',
+			}],
+			peerStates: [{
+				profileId: '00000000-0000-4000-8000-000000000202',
+				deviceId: '00000000-0000-4000-8000-000000000201',
+				state: 'online',
+			}],
+			truncated: false,
+		},
+	};
 	const native = () => {
 		calls.push('native');
 		assert.fail('Dashboard bindings must not call native account or provider APIs.');
@@ -2260,6 +3208,11 @@ function createConnectivityBindings(): {
 			workspace: {
 				getConfiguration: () => ({ get: () => state.previewEnabled ?? false }),
 				getWorkspaceFolder: () => undefined,
+			},
+			commands: {
+				executeCommand: async (command: string, ...args: unknown[]) => {
+					commandCalls.push({ command, args });
+				},
 			},
 		},
 		changed: {
@@ -2312,19 +3265,38 @@ function createConnectivityBindings(): {
 						peerId: '00000000-0000-4000-8000-000000000202',
 						locality: 'remote',
 						status: 'online',
-						nodes: [],
+						nodes: [{
+							nodeId: '00000000-0000-4000-8000-000000000211',
+							nodeInstanceId: '00000000-0000-4000-8000-000000000212',
+							label: 'Backend window',
+							status: 'online',
+							workspaces: [{
+								workspaceId: '00000000-0000-4000-8000-000000000213',
+								name: 'billing-api',
+								tags: [],
+								busy: false,
+								claimStatus: 'claimed',
+							}],
+						}],
 						nodesTruncated: false,
-						totalNodes: 0,
+						totalNodes: 1,
 					}],
 					truncated: false,
 					totalDevices: 1,
 				};
 			},
+			remotePolicyDashboard: async () => state.remotePolicy,
 			connectivityAction: async (action: ConnectivityAction, actionHandle?: string) => {
 				mutations.push({ action, ...(actionHandle === undefined ? {} : { actionHandle }) });
 			},
 		},
-		localTasks: {},
+		localTasks: {
+			describeDelegationTarget: async (intent: unknown) => {
+				describedTargets.push(intent);
+				return { windowName: 'Backend window', workspaceName: 'billing-api' };
+			},
+			startTask: async () => assert.fail('Opening a Chat draft must not start a task.'),
+		},
 		remoteTasks: {
 			listDevices: async () => {
 				calls.push('cloud');
@@ -2370,7 +3342,7 @@ function createConnectivityBindings(): {
 			};
 		},
 	} as unknown as ProductionDashboardBindingsOptions);
-	return { bindings, calls, mutations, state };
+	return { bindings, calls, mutations, commandCalls, describedTargets, state };
 }
 
 function withTaskTitle(

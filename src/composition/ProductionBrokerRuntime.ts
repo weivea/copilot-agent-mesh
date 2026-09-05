@@ -268,6 +268,8 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 			{
 				requiresEditorForRemote: () => connectivity?.strict() === true,
 				assertRemotePeer: (peerId) => connectivity!.pairing.assertActivePeer(peerId),
+				approveRemoteTaskStart: (peerId, target, workspaceIdentity, taskId) =>
+					connectivity!.remotePolicies.approveTaskStart(peerId, target, workspaceIdentity, taskId),
 				onDidChange: options.onDidChange,
 				onTaskSnapshot: async (snapshot, sourceNodeId) => {
 					if (taskRoutes.get(snapshot.taskId) !== undefined) {

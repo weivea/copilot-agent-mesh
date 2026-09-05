@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import type * as vscode from 'vscode';
 
-import { LOCAL_BROKER_METHODS, LOCAL_BROKER_NOTIFICATIONS, connectivitySnapshotSchema } from '../../shared/protocol';
+import { LOCAL_BROKER_METHODS, LOCAL_BROKER_NOTIFICATIONS, connectivitySnapshotSchema, remotePolicyDashboardSchema } from '../../shared/protocol';
 import { LocalDesktopWorkspaceGuard } from '../application/LocalDesktopWorkspaceGuard';
 import { getWorkerPlatformSupport } from '../application/WorkerPlatformSupport';
 import { ProductionBrokerRuntime } from '../composition/ProductionBrokerRuntime';
@@ -18,6 +18,12 @@ import { VscodeSecretStore } from '../storage/VscodeStorageAdapters';
 import { TestOwnership, uuid } from '../unitTest/artifactStoreTestSupport';
 import { ConnectivityMemoryState, TestAuthentication } from '../unitTest/connectivityTestSupport';
 import { createOpaqueWorkspaceIdentity } from '../workspaces/OpaqueWorkspaceIdentity';
+import { GatewayServer } from '../gateway/GatewayServer';
+import { GatewayRouter } from '../gateway/GatewayRouter';
+import { PeerConnectionManager } from '../peer/PeerConnectionManager';
+import { WebSocketPeerTransport } from '../peer/WebSocketPeerTransport';
+import { InMemoryPeerProfileStore } from '../peer/PeerProfile';
+import WebSocket from 'ws';
 
 test('real production owner composition defaults off and serves authenticated local IPC without auth/discovery/hosting', async (t) => {
 	const f = await productionFixture();
@@ -91,12 +97,98 @@ test('strict activation persists across a real Broker restart and remote receive
 	assert.equal(f.authentication.requests.length, 0);
 });
 
+test('production IPC scopes auto-accept to the claiming window and paired peer, rejects replay and revokes saved approval', async (t) => {
+	const f = await productionFixture({ strict: true });
+	t.after(() => f.dispose());
+	await f.runtime.start();
+	const local = await f.connect();
+	const other = await f.connect();
+	t.after(() => { local.client.dispose(); other.client.dispose(); });
+	const workspaceId = uuid(805);
+	const workspaceIdentity = createOpaqueWorkspaceIdentity('paired-auto-accept-target');
+	await local.session.request(LOCAL_BROKER_METHODS.claimWorkspace, {
+		...local.identity, workspaceId, workspaceIdentity, name: 'Target Workspace', capabilityTags: [],
+	});
+	const paired = await pairWithRuntime(f.runtime);
+	t.after(() => paired.dispose());
+	const peerId = paired.peerId;
+	await f.runtime.connectivity.remotePolicies.setIncomingGrant(local.identity, workspaceIdentity, peerId, true);
+	const snapshot = () => local.session.request(LOCAL_BROKER_METHODS.remotePolicyDashboard, local.identity)
+		.then((value) => remotePolicyDashboardSchema.parse(value));
+	const first = (await snapshot()).workspaces[0].incomingPeers[0];
+	assert.equal(first.autoAccept, false);
+	await assert.rejects(other.session.request(LOCAL_BROKER_METHODS.remotePolicyAction, {
+		...other.identity, action: 'setRemoteAutoAccept', actionHandle: first.actionHandle, enabled: true,
+	}));
+	await assert.rejects(local.session.request(LOCAL_BROKER_METHODS.remotePolicyAction, {
+		...local.identity, action: 'setRemoteAutoAccept', actionHandle: first.actionHandle, enabled: true, peerId: uuid(800),
+	}));
+	assert.deepEqual(f.runtime.connectivity.remotePolicies.policy(workspaceIdentity).autoAcceptPeerIds, []);
+	const current = (await snapshot()).workspaces[0].incomingPeers[0];
+	const action = { ...local.identity, action: 'setRemoteAutoAccept', actionHandle: current.actionHandle, enabled: true };
+	await local.session.request(LOCAL_BROKER_METHODS.remotePolicyAction, action);
+	assert.equal(f.confirmations.length, 1);
+	assert.match(f.confirmations[0], /skips only the target task-start prompt/u);
+	assert.equal((await snapshot()).workspaces[0].incomingPeers[0].autoAccept, true);
+	await assert.rejects(local.session.request(LOCAL_BROKER_METHODS.remotePolicyAction, action));
+	await f.runtime.connectivity.pairing.revokePeer(peerId);
+	assert.deepEqual(f.runtime.connectivity.remotePolicies.policy(workspaceIdentity).autoAcceptPeerIds, []);
+	assert.equal((await snapshot()).workspaces[0].incomingPeers.length, 0);
+	assert.equal(f.authentication.requests.length, 0);
+	assert.equal(f.runtime.tunnel.lifecycleMetrics().loadAttempts, 0);
+});
+
+test('a grant revoked while native auto-accept consent is open cannot turn into a saved permission', async (t) => {
+	const f = await productionFixture({ strict: true });
+	t.after(() => f.dispose());
+	await f.runtime.start();
+	const local = await f.connect();
+	t.after(() => local.client.dispose());
+	const workspaceId = uuid(807);
+	const workspaceIdentity = createOpaqueWorkspaceIdentity('approval-race-target');
+	await local.session.request(LOCAL_BROKER_METHODS.claimWorkspace, {
+		...local.identity, workspaceId, workspaceIdentity, name: 'Target Workspace', capabilityTags: [],
+	});
+	const paired = await pairWithRuntime(f.runtime);
+	t.after(() => paired.dispose());
+	await f.runtime.connectivity.remotePolicies.setIncomingGrant(local.identity, workspaceIdentity, paired.peerId, true);
+	const snapshot = remotePolicyDashboardSchema.parse(await local.session.request(LOCAL_BROKER_METHODS.remotePolicyDashboard, local.identity));
+	let show!: () => void;
+	const shown = new Promise<void>((resolve) => { show = resolve; });
+	let release!: () => void;
+	const released = new Promise<void>((resolve) => { release = resolve; });
+	f.confirmation.wait = async () => { show(); await released; };
+	const attempt = local.session.request(LOCAL_BROKER_METHODS.remotePolicyAction, {
+		...local.identity, action: 'setRemoteAutoAccept', actionHandle: snapshot.workspaces[0].incomingPeers[0].actionHandle, enabled: true,
+	});
+	const rejected = assert.rejects(attempt);
+	await shown;
+	await f.runtime.connectivity.remotePolicies.setIncomingGrant(local.identity, workspaceIdentity, paired.peerId, false);
+	release();
+	await rejected;
+	assert.deepEqual(f.runtime.connectivity.remotePolicies.policy(workspaceIdentity).autoAcceptPeerIds, []);
+});
+
+async function pairWithRuntime(runtime: ProductionBrokerRuntime) {
+	const gateway = new GatewayServer(runtime.connectivity.pairing, new GatewayRouter(runtime.device, runtime.broker));
+	const address = await gateway.start();
+	const manager = new PeerConnectionManager(randomUUID(), new InMemoryPeerProfileStore(), new InMemorySecretStore(), new WebSocketPeerTransport({
+		webSocketFactory: () => new WebSocket(`ws://127.0.0.1:${address.port}/agent-mesh/rpc`),
+	}));
+	const connection = await manager.add((await runtime.connectivity.pairing.createInvitation('https://test-43121.use2.devtunnels.ms')).url);
+	const profile = await connection.profile();
+	assert.ok(profile?.peerId);
+	return { peerId: profile.peerId, dispose: async () => { await manager.dispose(); await gateway.dispose(); } };
+}
+
 async function productionFixture(options: { corrupt?: boolean; strict?: boolean } = {}) {
 	const root = await mkdtemp(join(tmpdir(), 'mesh-connectivity-composition-'));
 	const state = new ConnectivityMemoryState();
 	const ownership = new TestOwnership();
 	const authentication = new TestAuthentication();
 	const secrets = new InMemorySecretStore();
+	const confirmations: string[] = [];
+	const confirmation: { wait?: () => Promise<void> } = {};
 	const settings = new Map<string, unknown>([['deviceName', 'Connectivity test']]);
 	if (options.strict) { settings.set('experimental.crossDeviceDelegation', true); }
 	const configuration = {
@@ -112,6 +204,13 @@ async function productionFixture(options: { corrupt?: boolean; strict?: boolean 
 			fs: { createDirectory: async (uri: { fsPath: string }) => { await mkdir(uri.fsPath, { recursive: true }); } },
 		},
 		authentication,
+		window: {
+			showWarningMessage: async (message: string) => {
+				confirmations.push(message);
+				await confirmation.wait?.();
+				return 'Continue';
+			},
+		},
 	};
 	if (options.corrupt) {
 		await mkdir(join(root, 'mesh-state/connectivity'), { recursive: true });
@@ -145,7 +244,7 @@ async function productionFixture(options: { corrupt?: boolean; strict?: boolean 
 	});
 	let runtime = await create();
 	return {
-		authentication, settings,
+		authentication, settings, confirmations, confirmation,
 		get runtime() { return runtime; },
 		restart: async () => { ownership.generation = randomUUID(); runtime = await create(); await runtime.start(); },
 		connect: async () => {

@@ -78,12 +78,89 @@ test('remote policy requires every claimed source Workspace and rejects foreign 
 	assert.equal(f.leases.isLeased(IB), false);
 });
 
+test('remote automatic task acceptance defaults off, binds one peer and Workspace, and remains subordinate to receive/grants', async (t) => {
+	const f = await policyFixture();
+	t.after(() => f.dispose());
+	const target = { deviceId: DEVICE, ...B, workspaceId: WB };
+	await assert.rejects(f.service.setAutoAccept(B, IB, PEER, true), { reason: 'PEER_NOT_ALLOWED' });
+	await f.service.setIncomingGrant(B, IB, PEER, true);
+	await f.service.setReceive(B, IB, true);
+	assert.equal(await f.service.approveTaskStart(PEER, target, IB, uuid(902)), undefined);
+	await assert.rejects(f.service.setAutoAccept(A, IB, PEER, true), { reason: 'POLICY_FORBIDDEN' });
+	await f.service.setAutoAccept(B, IB, PEER, true, f.service.revision());
+	assert.deepEqual(await f.service.approveTaskStart(PEER, target, IB, uuid(902)), {
+		kind: 'remoteAutoAccept', peerId: PEER, workspaceIdentity: IB, taskId: uuid(902),
+		policyRevision: f.service.revision(),
+	});
+	await f.service.setIncomingGrant(A, IA, PEER, true);
+	await f.service.setReceive(A, IA, true);
+	assert.equal(await f.service.approveTaskStart(PEER, { deviceId: DEVICE, ...A, workspaceId: WA }, IA, uuid(903)), undefined);
+	await assert.rejects(f.service.approveTaskStart(uuid(901), target, IB, uuid(904)));
+	await f.service.setReceive(B, IB, false);
+	await assert.rejects(f.service.approveTaskStart(PEER, target, IB, uuid(905)), { reason: 'PEER_NOT_ACCEPTING' });
+	await f.service.setReceive(B, IB, true);
+	await f.service.setIncomingGrant(B, IB, PEER, false);
+	assert.deepEqual(f.service.policy(IB).autoAcceptPeerIds, []);
+	await f.service.setIncomingGrant(B, IB, PEER, true);
+	assert.equal(await f.service.approveTaskStart(PEER, target, IB, uuid(906)), undefined);
+});
+
+test('automatic acceptance persists but cannot survive an obsolete policy revision or lost Workspace claim', async (t) => {
+	const f = await policyFixture();
+	t.after(() => f.dispose());
+	await f.service.setIncomingGrant(B, IB, PEER, true);
+	const staleRevision = f.service.revision();
+	await f.service.setAutoAccept(B, IB, PEER, true, staleRevision);
+	await assert.rejects(f.service.setAutoAccept(B, IB, PEER, false, staleRevision), { reason: 'POLICY_FORBIDDEN' });
+	const reopened = new RemotePeerPolicyStore(f.files, f.fence);
+	await reopened.initialize();
+	assert.deepEqual(reopened.get(IB).autoAcceptPeerIds, [PEER]);
+	await f.service.setAutoAccept(B, IB, PEER, false);
+	f.fs.syncFile = async () => { f.registry.releaseWorkspace({ ...B, workspaceId: WB }); };
+	await assert.rejects(f.service.setAutoAccept(B, IB, PEER, true), { reason: 'POLICY_FORBIDDEN' });
+	const afterRace = new RemotePeerPolicyStore(f.files, f.fence);
+	await afterRace.initialize();
+	assert.deepEqual(afterRace.get(IB).autoAcceptPeerIds, []);
+});
+
+test('revoking a peer removes saved automatic acceptance and all of its Workspace grants', async (t) => {
+	const f = await policyFixture();
+	t.after(() => f.dispose());
+	await f.service.setIncomingGrant(B, IB, PEER, true);
+	await f.service.setAutoAccept(B, IB, PEER, true);
+	await f.remoteStore.removePeer(PEER);
+	assert.deepEqual(f.remoteStore.get(IB).autoAcceptPeerIds, []);
+	assert.deepEqual(f.remoteStore.get(IB).incomingPeerIds, []);
+});
+
+test('tree allowlist edits cover every actual source root and reject a changed source set', async (t) => {
+	const f = await policyFixture();
+	t.after(() => f.dispose());
+	const additionalIdentity = createOpaqueWorkspaceIdentity('additional-source-root');
+	await f.registry.claimWorkspace({
+		...A, workspaceId: uuid(980), workspaceIdentity: additionalIdentity, name: 'Second source root', capabilityTags: [],
+	});
+	const scope = f.service.sourceScope(A);
+	await f.service.setAllowedForWindow(A, scope, f.allowed, true, f.service.revision());
+	assert.deepEqual(f.service.policy(IA).allowlist, [f.allowed]);
+	assert.deepEqual(f.service.policy(additionalIdentity).allowlist, [f.allowed]);
+	await f.service.assertOutgoing(A, f.remoteTarget(true), WB);
+	f.registry.releaseWorkspace({ ...A, workspaceId: uuid(980) });
+	await assert.rejects(
+		f.service.setAllowedForWindow(A, scope, f.allowed, false, f.service.revision()),
+		{ reason: 'POLICY_FORBIDDEN' },
+	);
+	assert.deepEqual(f.service.policy(IA).allowlist, [f.allowed]);
+});
+
 test('disabling a previously activated strict feature never restores legacy authorization or trusts a node capability', async (t) => {
 	const f = await policyFixture();
 	t.after(() => f.dispose());
 	await f.service.setIncomingGrant(B, IB, PEER, true);
 	await f.service.setReceive(B, IB, true);
+	await f.service.setAutoAccept(B, IB, PEER, true);
 	f.enabled = false;
+	await assert.rejects(f.service.approveTaskStart(PEER, { deviceId: DEVICE, ...B, workspaceId: WB }, IB, uuid(906)), { reason: 'PEER_NOT_ALLOWED' });
 	await assert.rejects(f.service.listIncoming(PEER), { reason: 'PEER_NOT_ALLOWED' });
 	await assert.rejects(f.registry.acquireTaskRoute(f.route), { reason: 'PEER_NOT_ALLOWED' });
 	f.strict = false;
@@ -123,7 +200,8 @@ async function policyFixture() {
 	});
 	registry.setPeerRouteAuthorizer(service);
 	return {
-		registry, service, profiles, leases, localEnabled: false,
+		registry, service, profiles, leases, remoteStore,
+		files: base.files, fs: base.fs, fence: base.fence, localEnabled: false,
 		get enabled() { return state.enabled; }, set enabled(value: boolean) { state.enabled = value; },
 		get strict() { return state.strict; }, set strict(value: boolean) { state.strict = value; },
 		allowed: { profileId: PROFILE, profileGeneration: PROFILE, workspaceIdentity: IB },

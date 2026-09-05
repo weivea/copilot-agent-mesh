@@ -1,171 +1,280 @@
 body {
 	margin: 0;
-	padding: 0 14px 24px;
+	height: 100vh;
+	display: flex;
+	flex-direction: column;
+	overflow: hidden;
 	color: var(--vscode-foreground);
 	background: var(--vscode-sideBar-background);
 	font-family: var(--vscode-font-family);
 	font-size: var(--vscode-font-size);
 }
 
-header {
-	position: sticky;
-	z-index: 1;
+.dashboardHeader {
+	flex-shrink: 0;
+	z-index: 2;
 	top: 0;
 	display: flex;
-	align-items: center;
+	gap: 10px;
+	align-items: flex-start;
 	justify-content: space-between;
-	padding: 12px 0;
+	padding: 12px 14px 8px;
 	background: var(--vscode-sideBar-background);
+	border-bottom: 1px solid var(--vscode-sideBarSectionHeader-border, var(--vscode-widget-border));
+}
+
+.headerCopy {
+	min-width: 0;
+}
+
+.headerActions {
+	display: flex;
+	flex-shrink: 0;
+	gap: 6px;
+}
+
+h1,
+h2,
+h3,
+p {
+	margin: 0;
 }
 
 h1 {
-	margin: 0;
 	font-size: 13px;
 }
 
-h2 {
-	margin: 20px 0 8px;
+h2,
+h3 {
 	font-size: 11px;
 	letter-spacing: .08em;
 	text-transform: uppercase;
 }
 
-h3 {
-	margin: 16px 0 8px;
-	font-size: 12px;
+#operationStatus {
+	padding: 0 14px 8px;
+	flex-shrink: 0;
 }
 
+.workspaceArea {
+	position: relative;
+	flex: 1;
+	min-height: 0;
+}
+
+.dashboardLayout {
+	display: grid;
+	gap: 12px;
+	padding: 0 14px 14px;
+	max-height: 100%;
+	overflow: auto;
+	box-sizing: border-box;
+}
+
+.panel {
+	display: grid;
+	gap: 8px;
+}
+
+.panelHeader {
+	display: grid;
+	gap: 3px;
+}
+
+.treePanel,
 .card,
 .error {
 	padding: 10px 12px;
 	border: 1px solid var(--vscode-widget-border);
-	border-radius: 5px;
+	border-radius: 6px;
 	background: var(--vscode-editorWidget-background);
+}
+
+.treePanel {
+	padding: 8px 0;
+	max-height: 38vh;
+	overflow: auto;
 }
 
 .stack {
 	display: grid;
 	gap: 8px;
+}
+
+.treeSection {
+	padding: 6px 12px;
+	color: var(--vscode-descriptionForeground);
+	font-size: 10px;
+	font-weight: 600;
+	letter-spacing: .08em;
+	text-transform: uppercase;
+}
+
+.treeItem {
+	display: grid;
+	grid-template-columns: 14px 14px minmax(0, 1fr) auto;
+	gap: 6px;
+	width: 100%;
+	padding: 6px 12px;
+	border: 0;
+	border-left: 2px solid transparent;
+	border-radius: 0;
+	color: inherit;
+	background: transparent;
+	text-align: left;
+	cursor: pointer;
+}
+
+.treeItem:hover {
+	background: var(--vscode-list-hoverBackground);
+}
+
+.treeItem:focus-visible {
+	outline: 1px solid var(--vscode-focusBorder);
+	outline-offset: -1px;
+}
+
+.treeItem.selected {
+	border-left-color: var(--vscode-focusBorder);
+	background: var(--vscode-list-activeSelectionBackground);
+	color: var(--vscode-list-activeSelectionForeground);
+}
+
+.treeChevron,
+.treeMarker,
+.treeMeta {
+	color: var(--vscode-descriptionForeground);
+}
+
+.treeItem.selected .treeChevron,
+.treeItem.selected .treeMarker,
+.treeItem.selected .treeMeta {
+	color: inherit;
+	opacity: .85;
+}
+
+.treeLabel {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.treeMeta {
+	font-size: 10px;
+	max-width: 96px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.depth-1 {
+	padding-left: 26px;
+}
+
+.depth-2 {
+	padding-left: 40px;
+}
+
+.headingBlock {
+	display: grid;
+	gap: 4px;
+	margin-bottom: 10px;
+}
+
+.detailTitle {
+	font-size: 13px;
+}
+
+.selectionSection,
+.componentSummary {
+	margin-top: 12px;
+	padding-top: 12px;
+	border-top: 1px solid var(--vscode-widget-border);
+}
+
+.sectionHeading {
 	margin-bottom: 8px;
+}
+
+.propertyRow {
+	display: grid;
+	grid-template-columns: minmax(86px, max-content) 1fr;
+	gap: 8px;
+	margin-top: 6px;
+}
+
+.detail,
+.label,
+.empty,
+.treeMeta {
+	color: var(--vscode-descriptionForeground);
 }
 
 .item {
 	display: grid;
-	grid-template-columns: 1fr auto;
+	grid-template-columns: minmax(0, 1fr) auto;
 	gap: 6px 8px;
 }
 
 .item p,
 .item button,
-.item article,
-.component,
-.actions {
+.item label,
+.item .propertyRow {
 	grid-column: 1 / -1;
 }
 
-.toggle {
+.statusPill {
+	color: var(--vscode-descriptionForeground);
+	font-size: 10px;
+}
+
+.toggleCard {
 	display: flex;
-	align-items: flex-start;
 	gap: 8px;
-	margin-top: 8px;
-}
-
-.toggle input {
-	margin-top: 2px;
-}
-
-.nested {
-	margin-top: 6px;
+	align-items: flex-start;
+	padding: 9px 10px;
+	border: 1px solid var(--vscode-widget-border);
+	border-radius: 6px;
 	background: var(--vscode-sideBar-background);
 }
 
-.node {
-	gap: 8px;
+.toggleCard input {
+	margin-top: 2px;
 }
 
-.definition {
+.textBlock {
 	display: grid;
-	grid-template-columns: minmax(72px, max-content) 1fr;
-	gap: 8px;
-	margin: 4px 0;
-}
-
-.connectivity .definition {
-	grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr);
-}
-
-.connectivity .definition span,
-.connectivity .item strong {
-	overflow-wrap: anywhere;
-}
-
-.notice {
-	margin: 10px 0;
-	padding-left: 8px;
-	border-left: 2px solid var(--vscode-notificationsWarningIcon-foreground);
-}
-
-.label,
-.detail,
-.empty,
-.tags {
-	color: var(--vscode-descriptionForeground);
-}
-
-.component {
-	margin-top: 8px;
-	padding-top: 8px;
-	border-top: 1px solid var(--vscode-widget-border);
-}
-
-.component p,
-.item p,
-.error p {
-	margin: 5px 0 0;
-}
-
-.status::before {
-	display: inline-block;
-	width: 7px;
-	height: 7px;
-	margin-right: 6px;
-	border-radius: 50%;
-	background: var(--vscode-disabledForeground);
-	content: "";
-}
-
-.status-running::before,
-.status-online::before,
-.status-ready::before,
-.status-enabled::before {
-	background: var(--vscode-testing-iconPassed);
-}
-
-.status-error::before,
-.status-authfailed::before,
-.status-incompatible::before,
-.status-failed::before {
-	background: var(--vscode-testing-iconFailed);
-}
-
-.status-busy::before,
-.status-running::before,
-.status-needsinput::before {
-	background: var(--vscode-notificationsWarningIcon-foreground);
+	gap: 3px;
 }
 
 .actions {
 	display: flex;
 	flex-wrap: wrap;
 	gap: 6px;
-	margin-top: 10px;
+	margin-top: 12px;
+}
+
+.taskPanel {
+	flex-shrink: 0;
+	max-height: 32vh;
+	overflow: auto;
+	padding: 10px 14px 14px;
+	background: var(--vscode-sideBar-background);
+	border-top: 1px solid var(--vscode-widget-border);
+	box-sizing: border-box;
+}
+
+.taskPanel .taskColumns {
+	display: grid;
+	gap: 10px;
 }
 
 button {
-	margin: 4px 4px 0 0;
+	margin: 0;
 	padding: 4px 8px;
 	border: 1px solid var(--vscode-button-border, transparent);
-	border-radius: 2px;
+	border-radius: 4px;
 	color: var(--vscode-button-foreground);
 	background: var(--vscode-button-background);
 	cursor: pointer;
@@ -181,10 +290,41 @@ button:disabled {
 	cursor: not-allowed;
 }
 
-button.danger {
+.primary {
+	color: var(--vscode-button-foreground);
+	background: var(--vscode-button-background);
+}
+
+.secondary {
+	color: var(--vscode-button-secondaryForeground);
+	background: var(--vscode-button-secondaryBackground);
+	border-color: var(--vscode-button-border, var(--vscode-widget-border));
+}
+
+.secondary:hover {
+	background: var(--vscode-button-secondaryHoverBackground);
+}
+
+.danger {
 	color: var(--vscode-errorForeground);
 	background: transparent;
 	border-color: var(--vscode-errorForeground);
+}
+
+.danger:hover {
+	background: color-mix(in srgb, var(--vscode-errorForeground) 10%, transparent);
+}
+
+.linkButton {
+	padding: 0;
+	border: 0;
+	color: var(--vscode-textLink-foreground);
+	background: transparent;
+}
+
+.linkButton:hover {
+	background: transparent;
+	color: var(--vscode-textLink-activeForeground);
 }
 
 .error {
@@ -193,6 +333,59 @@ button.danger {
 
 .action-hint {
 	color: var(--vscode-notificationsWarningIcon-foreground);
+}
+
+.drawer {
+	position: absolute;
+	z-index: 3;
+	inset: 0 0 0 auto;
+	width: min(100%, 420px);
+	box-sizing: border-box;
+	padding: 12px 14px 16px;
+	overflow-y: auto;
+	background: var(--vscode-sideBar-background);
+	border-left: 1px solid var(--vscode-widget-border);
+	box-shadow: -12px 0 24px color-mix(in srgb, black 35%, transparent);
+}
+
+.drawerHeader {
+	position: sticky;
+	top: -12px;
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 10px;
+	padding: 12px 0 10px;
+	margin-bottom: 10px;
+	background: var(--vscode-sideBar-background);
+	border-bottom: 1px solid var(--vscode-widget-border);
+}
+
+.drawer > section,
+.drawerDisclosure {
+	margin-top: 12px;
+}
+
+.drawerDisclosure > summary {
+	cursor: pointer;
+	color: var(--vscode-descriptionForeground);
+	font-size: 11px;
+	list-style: none;
+}
+
+.drawerDisclosure > summary::-webkit-details-marker {
+	display: none;
+}
+
+.drawerDisclosure > summary::before {
+	content: "▸";
+	display: inline-block;
+	width: 12px;
+	color: var(--vscode-descriptionForeground);
+}
+
+.drawerDisclosure[open] > summary::before {
+	content: "▾";
 }
 
 #announcement {
@@ -205,4 +398,30 @@ button.danger {
 
 #operationStatus:empty {
 	display: none;
+}
+
+@media (min-width: 600px) {
+	.dashboardLayout {
+		grid-template-columns: minmax(210px, .85fr) minmax(0, 1.25fr);
+		align-items: start;
+	}
+
+	.taskPanel .taskColumns {
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+	}
+}
+
+@media (max-width: 360px) {
+	.dashboardHeader,
+	#operationStatus,
+	.dashboardLayout,
+	.drawer {
+		padding-left: 10px;
+		padding-right: 10px;
+	}
+
+	.propertyRow {
+		grid-template-columns: 1fr;
+		gap: 3px;
+	}
 }

@@ -12,6 +12,9 @@ import {
 	utf8String,
 	type ConnectivityAction,
 	type ConnectivitySnapshot,
+	remotePolicyDashboardSchema,
+	type RemotePolicyAction,
+	type RemotePolicyDashboard,
 	type DashboardTaskDirection,
 } from '../../shared/protocol';
 import type {
@@ -45,6 +48,7 @@ import {
 import type { WindowNodeClient } from '../node/WindowNodeClient';
 import type { LocalIpcRemoteTaskAdapter } from '../node/LocalIpcRemoteTaskAdapter';
 import type { ProductionBrokerRuntime } from './ProductionBrokerRuntime';
+import { DashboardTreeBuilder } from '../ui/DashboardTreeBuilder';
 
 const activeTaskStates = new Set<string>(ACTIVE_TASK_STATUSES);
 
@@ -76,6 +80,9 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 	private readonly remoteTaskActions = new Map<string, RemoteTaskActionBinding>();
 	private readonly remoteTaskHandlesById = new Map<string, string>();
 	private remoteHandleGeneration = 'uninitialized';
+	private readonly treeBuilder = new DashboardTreeBuilder();
+	private readonly targetChatActions = new Map<string, { readonly target: DashboardTaskTarget; readonly generation: string }>();
+	private readonly remotePolicyActions = new Map<string, { readonly action: RemotePolicyAction; readonly handle: string; readonly generation: string }>();
 
 	public constructor(private readonly options: ProductionDashboardBindingsOptions) {
 		this.subscriptions.push(
@@ -96,6 +103,8 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 
 	public async getSnapshot(): Promise<DashboardSnapshot> {
 		this.acceptActions.clear();
+		this.targetChatActions.clear();
+		this.remotePolicyActions.clear();
 		this.refreshRemoteHandleGeneration();
 		this.options.guard.assertAllowed({ requireWorkspace: false });
 		const profile = this.options.profile();
@@ -377,7 +386,7 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 		const tasks: DashboardSnapshot['tasks'] = remoteTasks;
 		const legacyWorkspaces = uniqueWorkspaces(localNodes);
 		const broker = brokerSnapshot(lifecycle);
-		return {
+		const snapshot: DashboardSnapshot = {
 			device: {
 				deviceId: profile.deviceId,
 				name: profile.name,
@@ -414,6 +423,43 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 			})),
 			tasks,
 			errors,
+		};
+		let policy: RemotePolicyDashboard = { workspaces: [], remoteTargets: [], peerStates: [], truncated: false };
+		if (connectivity.delegationEnabled && connectivity.strictPolicyActivated) {
+			try {
+				policy = remotePolicyDashboardSchema.parse(await this.options.node.remotePolicyDashboard());
+				if (policy.truncated) {
+					errors.push({ code: 'REMOTE_POLICY_TRUNCATED', message: 'Some remote policy targets are not shown.', action: 'Use native remote policy configuration for the full selection.' });
+				}
+			} catch {
+				errors.push({ code: 'REMOTE_POLICY_UNAVAILABLE', message: 'Remote Workspace policy is unavailable.', action: 'Refresh after claims and Broker state are ready.' });
+			}
+		}
+		const generation = this.currentRemoteHandleGeneration();
+		const treeSnapshot = {
+			...snapshot,
+			remoteDevices: [
+				...remoteDevices,
+				...policy.peerStates.filter((peer) => !remoteDevices.some((device) =>
+					device.peerId === peer.profileId && device.deviceId === peer.deviceId))
+					.map((peer) => ({
+						deviceId: peer.deviceId, peerId: peer.profileId,
+						name: `Device ${peer.deviceId.slice(0, 8)}`, state: peer.state, nodes: [],
+					})),
+			],
+		};
+		return {
+			...snapshot,
+			deviceTree: this.treeBuilder.build(treeSnapshot, policy, {
+				currentPolicyWorkspaceId: policySelection.kind === 'selected' ? policySelection.workspaceId : undefined,
+				delegate: (target) => this.issueBindingHandle(this.targetChatActions, { target, generation }),
+				remoteAction: (action, handle) => this.issueBindingHandle(this.remotePolicyActions, { action, handle, generation }),
+				onTruncated: () => errors.push({
+					code: 'DEVICE_TREE_TRUNCATED',
+					message: 'Some Window Nodes or Workspaces were omitted from the bounded tree.',
+					action: 'The current window is retained first. Reduce directory metadata or use Mesh Tools for explicit targets.',
+				}),
+			}),
 		};
 	}
 
@@ -551,6 +597,41 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 		this.options.guard.assertAllowed({ requireWorkspace: false });
 		await this.options.node.connectivityAction(action, actionHandle);
 		this.options.changed.fire();
+	}
+
+	public async remotePolicyAction(action: RemotePolicyAction, actionHandle: string, enabled: boolean): Promise<void> {
+		this.options.guard.assertAllowed({ requireWorkspace: false });
+		const binding = this.remotePolicyActions.get(actionHandle);
+		this.remotePolicyActions.delete(actionHandle);
+		if (binding?.action !== action || binding.generation !== this.currentRemoteHandleGeneration()) {
+			throw new DashboardActionError('STALE_ACTION', 'This remote Workspace policy action is stale.');
+		}
+		try {
+			await this.options.node.remotePolicyAction(action, binding.handle, enabled);
+		} catch (error: unknown) { throw toDashboardPolicyError(error); }
+		this.options.changed.fire();
+	}
+
+	public async openTargetChat(actionHandle: string): Promise<void> {
+		this.options.guard.assertAllowed({ requireWorkspace: false });
+		const binding = this.targetChatActions.get(actionHandle);
+		this.targetChatActions.delete(actionHandle);
+		if (binding === undefined || binding.generation !== this.currentRemoteHandleGeneration()) {
+			throw new DashboardActionError('STALE_ACTION', 'The selected target changed. Refresh before opening Chat.');
+		}
+		const target = binding.target;
+		// This performs no task start. Local targets never enter remote directory resolution.
+		await this.options.localTasks.describeDelegationTarget({
+			...target, title: 'Prepare a delegation', prompt: 'Describe the task to delegate.', acceptanceCriteria: [],
+		}, new AbortController().signal);
+		if (binding.generation !== this.currentRemoteHandleGeneration()) {
+			throw new DashboardActionError('STALE_ACTION', 'The Broker changed while preparing Chat.');
+		}
+		await this.options.vscodeApi.commands.executeCommand('workbench.action.chat.open', {
+			query: `Use #meshDelegateTask for this exact Mesh target: ${JSON.stringify(target)}.\nTask: `,
+			isPartialQuery: true,
+			mode: 'agent',
+		});
 	}
 
 	public async prepareDashboardTaskCancellation(
@@ -735,6 +816,9 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 	}
 
 	public dispose(): void {
+		this.treeBuilder.dispose();
+		this.targetChatActions.clear();
+		this.remotePolicyActions.clear();
 		this.acceptActions.clear();
 		this.remoteTaskActions.clear();
 		this.remoteTaskHandlesById.clear();

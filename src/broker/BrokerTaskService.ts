@@ -109,6 +109,9 @@ export interface BrokerTaskNotificationSink {
 export interface BrokerTaskServiceOptions {
 	readonly requiresEditorForRemote?: () => boolean;
 	readonly assertRemotePeer?: (peerId: string) => Promise<void>;
+	readonly approveRemoteTaskStart?: (
+		peerId: string, target: RoutedTaskStartParams['target'], workspaceIdentity: string, taskId: string,
+	) => Promise<import('../../shared/protocol').RemoteTaskApproval | undefined>;
 	readonly notificationSink?: BrokerTaskNotificationSink;
 	readonly onTaskSnapshot?: (
 		snapshot: TaskSnapshot,
@@ -659,8 +662,14 @@ export class BrokerTaskService {
 	): Promise<void> {
 		let result: z.infer<typeof nodeTaskStartedResultSchema>;
 		try {
+			let remoteTaskApproval: import('../../shared/protocol').RemoteTaskApproval | undefined;
 			if (params.sourceNodeId === undefined) {
 				await this.options.assertRemotePeer?.(ownerId);
+				if (this.options.approveRemoteTaskStart !== undefined) {
+					remoteTaskApproval = await this.options.approveRemoteTaskStart(
+						ownerId, params.target, route.workspaceLeaseKey, params.taskId,
+					);
+				}
 			}
 			const rawResult = await route.session.request(
 				LOCAL_BROKER_METHODS.taskStart,
@@ -668,6 +677,7 @@ export class BrokerTaskService {
 					...params,
 					authenticatedOwnerId: ownerId,
 					...(route.requireEditor ? { requireEditor: true } : {}),
+					...(remoteTaskApproval === undefined ? {} : { remoteTaskApproval }),
 					sourceLabel: sourceLabel ?? params.sourceNodeId ?? ownerId,
 					delegationGrant: createDelegationGrant({
 						taskId: params.taskId,

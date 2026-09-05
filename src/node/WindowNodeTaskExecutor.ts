@@ -326,6 +326,14 @@ export class WindowNodeTaskExecutor {
 			record.preStartAbort.signal,
 		);
 		const grant = assertDelegationGrantBinding(params, workspace);
+		const approval = params.remoteTaskApproval;
+		if (approval !== undefined && (
+			params.sourceNodeId !== undefined || params.requireEditor !== true
+			|| approval.peerId !== params.authenticatedOwnerId || approval.taskId !== params.taskId
+			|| approval.workspaceIdentity !== grant.workspaceIdentity
+		)) {
+			throw new MeshDomainError('AUTH_FAILED', 'The Broker task approval does not match this remote task and Workspace.');
+		}
 		this.assertRecordWithinWorkerDeadline(record, params.workerDeadline);
 		const probe = await abortablePreStartOperation(
 			this.options.runtime.probe(params.requireEditor ? { requireEditor: true } : undefined),
@@ -360,7 +368,7 @@ export class WindowNodeTaskExecutor {
 				requestHash: record.fingerprint,
 			},
 		} satisfies AgentTaskRequest;
-		if (params.sourceNodeId === undefined) {
+		if (params.sourceNodeId === undefined && approval === undefined) {
 			const confirmation = await abortablePreStartOperation(
 				this.options.confirmationHost.confirm({
 					sourceWindowLabel: params.sourceLabel,

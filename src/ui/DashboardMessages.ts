@@ -1,8 +1,14 @@
 import { DashboardViewModel } from './DashboardPresenter';
 import { containsUnsafeDashboardText } from './DashboardRedaction';
-import { CONNECTIVITY_ACTIONS, TASK_STATUSES, utf8ByteLength } from '../../shared/protocol';
+import { dashboardDeviceTreeSchema } from './DashboardTree';
+import {
+	CONNECTIVITY_ACTIONS,
+	REMOTE_POLICY_ACTIONS,
+	TASK_STATUSES,
+	utf8ByteLength,
+} from '../../shared/protocol';
 
-export const DASHBOARD_MESSAGE_VERSION = 7 as const;
+export const DASHBOARD_MESSAGE_VERSION = 8 as const;
 
 export const DASHBOARD_ACTIONS = [
 	'configureDevice',
@@ -12,6 +18,8 @@ export const DASHBOARD_ACTIONS = [
 	'copyConnectionUrl',
 	'setAcceptIncoming',
 	'setPeerAllowed',
+	'openTargetChat',
+	...REMOTE_POLICY_ACTIONS,
 	'cancelOutgoingTask',
 	'cancelIncomingTask',
 	...CONNECTIVITY_ACTIONS,
@@ -65,10 +73,20 @@ export type DashboardOutboundMessage =
 	};
 
 const actions = new Set<string>(DASHBOARD_ACTIONS);
-const booleanActions = new Set<DashboardAction>(['setAcceptIncoming', 'setPeerAllowed']);
+const booleanActions = new Set<DashboardAction>([
+	'setAcceptIncoming',
+	'setPeerAllowed',
+	'setRemoteAutoAccept',
+	'setRemoteReceive',
+	'setRemoteAllowed',
+]);
 const handleActions = new Set<DashboardAction>([
 	'setAcceptIncoming',
 	'setPeerAllowed',
+	'openTargetChat',
+	'setRemoteAutoAccept',
+	'setRemoteReceive',
+	'setRemoteAllowed',
 	'cancelOutgoingTask',
 	'cancelIncomingTask',
 	'pairDiscoveredPeer',
@@ -167,6 +185,7 @@ function assertDashboardViewModel(model: unknown): asserts model is DashboardVie
 			'broker',
 			'thisWindow',
 			'connectivity',
+			'deviceTree',
 			'localNodes',
 			'savedAuthorizations',
 			'outgoingTasks',
@@ -262,6 +281,7 @@ function assertDashboardViewModel(model: unknown): asserts model is DashboardVie
 	assertOptionalString(model.thisWindow.agentHost.detail);
 
 	assertConnectivity(model.connectivity);
+	dashboardDeviceTreeSchema.parse(model.deviceTree);
 
 	assertArray(model.localNodes, 128);
 	for (const candidate of model.localNodes) {

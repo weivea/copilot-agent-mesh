@@ -4,12 +4,15 @@ import type * as vscode from 'vscode';
 import {
 	ACTIVE_TASK_STATUSES, connectivitySnapshotSchema,
 	type ConnectivityActionParams, type ConnectivitySnapshot, type NodeIdentityParams,
+	remotePolicyDashboardSchema,
+	type RemotePolicyActionParams, type RemotePolicyDashboard, type TaskTarget,
 } from '../../shared/protocol';
 import type { ListenerService } from '../application/ListenerService';
 import type { NodeRegistry } from '../broker/NodeRegistry';
 import type { PeerPolicyService } from '../broker/PeerPolicyService';
 import { RemotePeerPolicyService } from '../broker/RemotePeerPolicyService';
 import { RemotePeerPolicyStore } from '../broker/RemotePeerPolicyStore';
+import type { RemoteAllowedTarget } from '../broker/RemotePeerPolicyStore';
 import { AccountSessionProvider } from '../connectivity/AccountSessionProvider';
 import { BoundPeerTransport } from '../connectivity/BoundPeerTransport';
 import type { BrokerConnectivity } from '../connectivity/BrokerConnectivity';
@@ -40,6 +43,7 @@ import { SdkDevTunnelExposureProvider } from '../tunnel/SdkDevTunnelExposureProv
 import { SelectedExposureProvider } from '../tunnel/SelectedExposureProvider';
 import type { LazyVscodeDevTunnelProvider } from './LazyVscodeDevTunnelProvider';
 import type { ProductionRemoteTaskAdapter } from './ProductionRemoteTaskAdapter';
+import { resolveWindowDisplayName } from '../broker/WindowName';
 
 interface ConnectivityOptions {
 	readonly vscodeApi: typeof vscode;
@@ -65,6 +69,27 @@ interface ActionBinding {
 	readonly id: string;
 }
 
+type PolicyActionBinding = {
+	readonly action: 'setRemoteAutoAccept';
+	readonly workspaceId: string;
+	readonly workspaceIdentity: string;
+	readonly peerId: string;
+	readonly workspaceName: string;
+	readonly peerLabel: string;
+	readonly revision: number;
+} | {
+	readonly action: 'setRemoteReceive';
+	readonly workspaceId: string;
+	readonly workspaceIdentity: string;
+	readonly revision: number;
+} | {
+	readonly action: 'setRemoteAllowed';
+	readonly target: RemoteAllowedTarget;
+	readonly route: TaskTarget;
+	readonly sourceScope: string;
+	readonly revision: number;
+};
+
 export class ProductionConnectivity implements BrokerConnectivity {
 	public readonly settings: FencedDocumentStore<ConnectivitySettings>;
 	public readonly endpoints: EndpointBindingStore;
@@ -89,6 +114,7 @@ export class ProductionConnectivity implements BrokerConnectivity {
 	private publishing: Promise<void> | undefined;
 	private actionQueue: Promise<void> = Promise.resolve();
 	private readonly actions = new WeakMap<LocalIpcSession, Map<string, ActionBinding>>();
+	private readonly policyActions = new WeakMap<LocalIpcSession, Map<string, PolicyActionBinding>>();
 	private subscriptions: { dispose(): void }[] = [];
 
 	public constructor(private readonly options: ConnectivityOptions) {
@@ -106,10 +132,19 @@ export class ProductionConnectivity implements BrokerConnectivity {
 		this.revocations = new PeerRevocationService(files, fence, options.records, options.secrets,
 			(peerId) => options.listener()?.closePeer(peerId),
 			async (peerId) => {
-				for (const task of await options.tasks.list()) {
-					if (task.peerId === peerId && (ACTIVE_TASK_STATUSES as readonly string[]).includes(task.state)) {
-						await options.cancelTask(peerId, task.taskId);
-					}
+				const results = await Promise.allSettled([
+					this.remotePolicyStore.removePeer(peerId),
+					(async () => {
+						const tasks = (await options.tasks.list()).filter((task) =>
+							task.peerId === peerId && (ACTIVE_TASK_STATUSES as readonly string[]).includes(task.state));
+						const cancelled = await Promise.allSettled(tasks.map((task) => options.cancelTask(peerId, task.taskId)));
+						if (cancelled.some((result) => result.status === 'rejected')) {
+							throw new Error('Revoked peer task cancellation requires retry.');
+						}
+					})(),
+				]);
+				if (results.some((result) => result.status === 'rejected')) {
+					throw new Error('Revoked peer grant or task cleanup requires retry.');
 				}
 			}, options.changed);
 		this.pairing = new PairingService(options.deviceId, options.secrets, options.records, {
@@ -240,6 +275,7 @@ export class ProductionConnectivity implements BrokerConnectivity {
 					state: peer.state, cleanupPending: peer.cleanupPending,
 				});
 			}
+
 		}
 		return connectivitySnapshotSchema.parse({
 			discoveryEnabled: this.flag('crossDeviceDiscovery'), delegationEnabled: this.flag('crossDeviceDelegation'),
@@ -259,6 +295,138 @@ export class ProductionConnectivity implements BrokerConnectivity {
 		});
 	}
 
+	public async policySnapshot(caller: NodeIdentityParams, session: LocalIpcSession): Promise<RemotePolicyDashboard> {
+		this.assertCaller(caller, session);
+		this.remotePolicies.requireEnabled();
+		const handles = new Map<string, PolicyActionBinding>();
+		this.policyActions.set(session, handles);
+		const peers = await this.options.records.listPeers();
+		this.assertCaller(caller, session);
+		const revoked = new Set(this.revocations.snapshot().map((entry) => entry.peerId));
+		const sources = this.remotePolicies.sources(caller);
+		const revision = this.remotePolicies.revision();
+		const issue = (binding: PolicyActionBinding) => {
+			const handle = randomUUID();
+			handles.set(handle, binding);
+			return handle;
+		};
+		const workspaces = sources.map((workspace) => {
+			const policy = this.remotePolicies.policy(workspace.workspaceIdentity);
+			const name = resolveWindowDisplayName(undefined, workspace.name, caller.nodeId);
+			return {
+				workspaceId: workspace.workspaceId,
+				name,
+				acceptsIncoming: this.options.localPolicies.acceptsIncoming(workspace.workspaceIdentity),
+				receiveActionHandle: issue({
+					action: 'setRemoteReceive', workspaceId: workspace.workspaceId, workspaceIdentity: workspace.workspaceIdentity, revision,
+				}),
+				incomingPeers: peers.filter((peer) =>
+					!revoked.has(peer.peerId) && policy.incomingPeerIds.includes(peer.peerId))
+					.map((peer) => {
+						const label = `Device ${peer.coordinatorDeviceId.slice(0, 8)} (peer ${peer.peerId.slice(0, 8)})`;
+						return {
+							peerId: peer.peerId, label, autoAccept: policy.autoAcceptPeerIds.includes(peer.peerId),
+							actionHandle: issue({
+								action: 'setRemoteAutoAccept', workspaceId: workspace.workspaceId,
+								workspaceIdentity: workspace.workspaceIdentity, peerId: peer.peerId,
+								workspaceName: name, peerLabel: label, revision,
+							}),
+						};
+					}),
+			};
+		});
+		const remote = this.options.remoteTasks();
+		const remoteTargets: RemotePolicyDashboard['remoteTargets'] = [];
+		const peerStates: RemotePolicyDashboard['peerStates'] = [];
+		for (const profile of (await this.options.profiles.list()).filter((entry) =>
+			!entry.cleanupPending && entry.peerId !== undefined && entry.credentialKeyRef !== undefined
+			&& entry.invitationId === undefined && entry.pendingEnrollmentId === undefined).slice(0, 32)) {
+			const state = this.peers.get(profile.id)?.snapshot().state ?? 'offline';
+			peerStates.push({
+				profileId: profile.id, deviceId: profile.workerDeviceId,
+				state: state === 'rePairRequired' ? 'authFailed' : state,
+			});
+		}
+		let truncated = false;
+		for (const device of remote.cachedDevices().devices) {
+			if (device.peerId === undefined) { continue; }
+			for (const node of device.nodes) {
+				for (const workspace of node.workspaces) {
+					const route = { deviceId: device.deviceId, nodeId: node.nodeId, nodeInstanceId: node.nodeInstanceId, workspaceId: workspace.workspaceId };
+					const metadata = remote.lookupTarget(device.peerId, route);
+					const actual = metadata?.node.workspaces.find((entry) => entry.workspaceId === workspace.workspaceId);
+					if (metadata === undefined || actual === undefined) { continue; }
+					if (remoteTargets.length >= 128) { truncated = true; continue; }
+					const target = { profileId: metadata.profileId, profileGeneration: metadata.profileGeneration, workspaceIdentity: actual.workspaceIdentity };
+					const allowlisted = this.remotePolicies.sourceAllows(caller, target);
+					remoteTargets.push({
+						...route, profileId: device.peerId, allowlisted, acceptsIncoming: actual.acceptsIncoming,
+						canDelegate: this.remotePolicies.outgoingAllowed(caller, metadata, workspace.workspaceId),
+						actionHandle: issue({ action: 'setRemoteAllowed', target, route, sourceScope: this.remotePolicies.sourceScope(caller), revision }),
+					});
+				}
+			}
+		}
+		return remotePolicyDashboardSchema.parse({ workspaces, remoteTargets, peerStates, truncated });
+	}
+
+	public policyAction(caller: NodeIdentityParams, input: RemotePolicyActionParams, session: LocalIpcSession): Promise<void> {
+		const binding = this.policyActions.get(session)?.get(input.actionHandle);
+		this.policyActions.get(session)?.delete(input.actionHandle);
+		if (binding === undefined || binding.action !== input.action) {
+			throw new MeshDomainError('POLICY_FORBIDDEN', 'This Workspace policy action is stale or belongs to a different window.');
+		}
+		const validate = async () => {
+			await assertDocumentFence(this.options.fence);
+			this.assertCaller(caller, session);
+			this.remotePolicies.requireEnabled();
+			if (this.remotePolicies.revision() !== binding.revision) {
+				throw new MeshDomainError('POLICY_FORBIDDEN', 'Remote policy changed while this action was open. Refresh and try again.');
+			}
+			if (binding.action !== 'setRemoteAllowed') {
+				if (!this.remotePolicies.sources(caller).some((workspace) =>
+					workspace.workspaceIdentity === binding.workspaceIdentity && workspace.workspaceId === binding.workspaceId)) {
+					throw new MeshDomainError('POLICY_FORBIDDEN', 'The target Workspace claim changed.');
+				}
+			} else if (this.remotePolicies.sourceScope(caller) !== binding.sourceScope) {
+				throw new MeshDomainError('POLICY_FORBIDDEN', 'The source Workspace claims changed.');
+			}
+		};
+		const operation = this.actionQueue.then(async () => {
+			await validate();
+			if (binding.action === 'setRemoteAutoAccept') {
+				if (input.enabled && !await this.confirm(
+					`Automatically accept future tasks from ${binding.peerLabel} in Workspace "${binding.workspaceName}"? `
+					+ 'This skips only the target task-start prompt. Receive, peer grants and sensitive tool approvals still apply. '
+					+ 'Turn this off here to require confirmation for future tasks.',
+				)) {
+					return;
+				}
+				await validate();
+				await this.remotePolicies.setAutoAccept(caller, binding.workspaceIdentity, binding.peerId, input.enabled, binding.revision);
+			} else if (binding.action === 'setRemoteReceive') {
+				await this.remotePolicies.setReceive(caller, binding.workspaceIdentity, input.enabled);
+			} else {
+				if (input.enabled) {
+					const remote = this.options.remoteTasks();
+					await remote.listDevices(new AbortController().signal);
+					const target = remote.lookupTarget(binding.target.profileId, binding.route);
+					if (target?.profileGeneration !== binding.target.profileGeneration
+						|| !target.node.workspaces.some((entry) => entry.workspaceIdentity === binding.target.workspaceIdentity && entry.workspaceId === binding.route.workspaceId)) {
+						throw new MeshDomainError('PEER_OFFLINE', 'The exact remote target changed.');
+					}
+				}
+				await validate();
+				await this.remotePolicies.setAllowedForWindow(
+					caller, binding.sourceScope, binding.target, input.enabled, binding.revision,
+				);
+			}
+			this.options.changed();
+		});
+		this.actionQueue = operation.then(() => undefined, () => undefined);
+		return operation;
+	}
+
 	public act(caller: NodeIdentityParams, input: ConnectivityActionParams, session: LocalIpcSession): Promise<void> {
 		const binding = input.actionHandle === undefined ? undefined : this.actions.get(session)?.get(input.actionHandle);
 		if (input.actionHandle !== undefined) {
@@ -272,6 +440,10 @@ export class ProductionConnectivity implements BrokerConnectivity {
 			try {
 				switch (input.action) {
 					case 'configureConnectivity': await this.configure(caller, session); break;
+					case 'refreshRemoteTargets':
+						if (!this.remotePolicies.remoteDirectoryAvailable()) { throw new ConnectivityError('DISABLED'); }
+						await this.options.remoteTasks().listDevices(new AbortController().signal);
+						break;
 					case 'refreshDiscovery':
 						await this.discovery.refresh();
 						await this.publishCurrent();

@@ -67,6 +67,7 @@ export class FencedDocumentStore<T extends { revision: number }> {
 			await this.files.writeJson(this.path, next, async () => {
 				await assertDocumentFence(this.fence);
 				await validate?.();
+				await assertDocumentFence(this.fence);
 			});
 			// The rename is the commit point. Later claim changes must not turn a committed
 			// authorization into an apparently rejected write that reappears after restart.
