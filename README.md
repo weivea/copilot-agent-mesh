@@ -146,6 +146,14 @@ task-start dialog; Copilot's existing tool-confirmation behavior is unchanged.
 Refreshing the tree only reads cached/local state. **Refresh remote windows**
 explicitly refreshes already-paired peers; account discovery is a separate action.
 
+Offline windows disappear from the tree automatically. Reopening the same
+repository creates a new Window Node, while its saved Workspace configuration
+and authorizations remain. Paired remote devices stay listed when offline.
+The Broker keeps a short in-memory reconnect grace period (30 seconds by
+default); expired window records are reclaimed automatically, but task cleanup
+bindings and their leases are retained until the existing task lifecycle releases
+them. This does not delete projects or task history.
+
 On B, select **this window's Workspace** and enable automatic task acceptance
 for a specific already-granted paired device. One explicit, scoped opt-in lets
 that device's future tasks skip B's task-start prompt for this Workspace only.

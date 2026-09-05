@@ -109,6 +109,22 @@ per-device option to restore B's per-task startup prompt. Older builds reject
 the newly stored field instead of silently ignoring its authorization meaning;
 do not delete policy/revocation records to force a downgrade.
 
+### Automatic offline-window cleanup
+
+Offline Window Nodes no longer appear in the Dashboard's local directory or
+device tree; cached offline windows under paired remote devices are also
+excluded without forgetting those devices. Reopening a repository registers a
+new window instance and reuses its canonical Workspace configuration, not the
+old window record.
+
+Internal offline records retain one heartbeat-TTL interval for reconnect
+validation (30 seconds by default), then expire on the existing sweep
+(5-second default interval). Records with task bindings are never collected by
+this timer. Once the existing lifecycle releases the last binding and Lease,
+an already-expired offline record is reclaimed. Workspace policies, task
+records and task-route history are untouched. No manual-delete RPC or button,
+wire-version change, cloud request, or account permission is added.
+
 Use two separately approved **physical macOS arm64 devices** for a physical
 gate. Two profiles/processes on one computer only test logical isolation.
 

@@ -36,6 +36,47 @@ import {
 import { DashboardPresenter } from '../ui/DashboardPresenter';
 
 suite('Dashboard', () => {
+	test('automatic window removal keeps saved policies and never silently selects the reopened instance', async () => {
+		const media = await createDashboardMediaHarness();
+		const source = snapshot();
+		media.receive({
+			version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view', type: 'dashboard.snapshot',
+			model: new DashboardPresenter().present(source),
+		});
+		media.treeItem('tree-5').click();
+		const closed: DashboardSnapshot = {
+			...source,
+			deviceTree: source.deviceTree?.map((device) => device.locality !== 'local' ? device : {
+				...device, nodes: device.nodes.filter((node) => node.key !== 'tree-5'),
+			}),
+			policyCandidates: source.policyCandidates?.map((candidate) => ({
+				...candidate, online: false, gateState: 'offline',
+			})),
+		};
+		const closedModel = new DashboardPresenter().present(closed);
+		media.receive({
+			version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view', type: 'dashboard.snapshot', model: closedModel,
+		});
+		assert.doesNotMatch(media.element('deviceTree').text, /Local Window/u);
+		assert.match(media.element('selectionDetails').text, /previous selection is no longer available/u);
+		assert.equal(closedModel.savedAuthorizations.length, 1);
+		const reopened: DashboardSnapshot = {
+			...source,
+			deviceTree: source.deviceTree?.map((device) => device.locality !== 'local' ? device : {
+				...device, nodes: device.nodes.map((node) => node.key !== 'tree-5' ? node : {
+					...node, key: 'tree-91', workspaces: node.workspaces.map((workspace) => ({ ...workspace, key: 'tree-92' })),
+				}),
+			}),
+		};
+		media.receive({
+			version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view', type: 'dashboard.snapshot',
+			model: new DashboardPresenter().present(reopened),
+		});
+		assert.match(media.element('selectionDetails').text, /previous selection is no longer available/u);
+		media.treeItem('tree-91').click();
+		assert.match(media.element('selectionSummary').text, /Local Window/u);
+	});
+
 	test('configures a script-enabled webview with media-only resources and a strict CSP', () => {
 		const extension = getExtension();
 		const facade = new RecordingDashboardFacade();

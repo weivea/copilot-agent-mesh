@@ -173,7 +173,7 @@ export class PeerPolicyService implements PeerRouteAuthorizer {
 
 	public listDashboard(caller: NodeIdentityParams): DashboardNodeDirectoryResult {
 		this.requireCaller(caller);
-		const raw = this.registry.list();
+		const raw = this.registry.list({ includeOffline: false });
 		const labels = this.effectiveNodeLabels();
 		return dashboardNodeDirectoryResultSchema.parse({
 			deviceId: raw.deviceId,

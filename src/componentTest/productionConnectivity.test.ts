@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import type * as vscode from 'vscode';
 
-import { LOCAL_BROKER_METHODS, LOCAL_BROKER_NOTIFICATIONS, connectivitySnapshotSchema, remotePolicyDashboardSchema } from '../../shared/protocol';
+import { LOCAL_BROKER_METHODS, LOCAL_BROKER_NOTIFICATIONS, connectivitySnapshotSchema, remotePolicyDashboardSchema, dashboardNodeDirectoryResultSchema } from '../../shared/protocol';
 import { LocalDesktopWorkspaceGuard } from '../application/LocalDesktopWorkspaceGuard';
 import { getWorkerPlatformSupport } from '../application/WorkerPlatformSupport';
 import { ProductionBrokerRuntime } from '../composition/ProductionBrokerRuntime';
@@ -40,6 +40,52 @@ test('real production owner composition defaults off and serves authenticated lo
 	assert.equal(f.runtime.listener.snapshot().state, 'stopped');
 	const directory = await local.session.request(LOCAL_BROKER_METHODS.dashboardList, local.identity);
 	assert.ok(directory);
+});
+
+test('production Dashboard automatically removes closed windows and reuses only the reopened Workspace permissions', async (t) => {
+	const f = await productionFixture();
+	t.after(() => f.dispose());
+	await f.runtime.start();
+	f.settings.set('experimental.peerDelegation', true);
+	const source = await f.connect();
+	const target = await f.connect();
+	t.after(() => { source.client.dispose(); target.client.dispose(); });
+	const sourceIdentity = createOpaqueWorkspaceIdentity('automatic-cleanup-source');
+	const targetIdentity = createOpaqueWorkspaceIdentity('automatic-cleanup-target');
+	for (const [local, workspaceIdentity, workspaceId, name] of [
+		[source, sourceIdentity, uuid(870), 'Source Workspace'],
+		[target, targetIdentity, uuid(871), 'Target Workspace'],
+	] as const) {
+		await local.session.request(LOCAL_BROKER_METHODS.claimWorkspace, {
+			...local.identity, workspaceIdentity, workspaceId, name, capabilityTags: [],
+		});
+	}
+	const policy = { ...source.identity, workspaceIdentity: sourceIdentity };
+	await source.session.request(LOCAL_BROKER_METHODS.policySet, { ...policy, allowlist: [targetIdentity] });
+	const before = await source.session.request(LOCAL_BROKER_METHODS.policyGet, policy);
+	await target.session.request(LOCAL_BROKER_METHODS.unregister, target.identity);
+	let directory = dashboardNodeDirectoryResultSchema.parse(
+		await source.session.request(LOCAL_BROKER_METHODS.dashboardList, source.identity),
+	);
+	assert.equal(directory.nodes.some((node) => node.nodeId === target.identity.nodeId), false);
+	assert.equal(directory.totalNodes, 1);
+	assert.deepEqual(await source.session.request(LOCAL_BROKER_METHODS.policyGet, policy), before);
+	const reopened = await f.connect();
+	t.after(() => reopened.client.dispose());
+	await reopened.session.request(LOCAL_BROKER_METHODS.claimWorkspace, {
+		...reopened.identity, workspaceIdentity: targetIdentity, workspaceId: uuid(871),
+		name: 'Target Workspace', capabilityTags: [],
+	});
+	directory = dashboardNodeDirectoryResultSchema.parse(
+		await source.session.request(LOCAL_BROKER_METHODS.dashboardList, source.identity),
+	);
+	assert.equal(directory.totalNodes, 2);
+	assert.equal(directory.nodes.some((node) => node.nodeId === target.identity.nodeId), false);
+	assert.equal(directory.nodes.find((node) => node.nodeId === reopened.identity.nodeId)?.workspaces[0].workspaceId, uuid(871));
+	assert.deepEqual(await source.session.request(LOCAL_BROKER_METHODS.policyGet, policy), before);
+	assert.equal(f.authentication.requests.length, 0);
+	assert.equal(f.runtime.tunnel.lifecycleMetrics().loadAttempts, 0);
+	assert.equal(f.runtime.listener.snapshot().state, 'stopped');
 });
 
 test('corrupt new remote state blocks only remote initialization, not the production local Broker or claims', async (t) => {

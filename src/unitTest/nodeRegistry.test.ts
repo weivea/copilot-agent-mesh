@@ -180,6 +180,70 @@ test('registers and lists deterministic Window Node descriptors', async (t) => {
 	assert.equal(directory.nodes[0].status, 'online');
 });
 
+test('offline records leave live listings immediately and expire without modifying the Workspace catalog', async (t) => {
+	const { registry, state, time } = await createFixture();
+	t.after(() => registry.dispose());
+	const session = new FakeSession();
+	registry.register(registration(), session.asRoute());
+	await registry.claimWorkspace(claim());
+	session.disconnect();
+	const catalog = structuredClone(state.get(WORKSPACE_CATALOG_STATE_KEY));
+	const writes = state.writes;
+	assert.equal(registry.list().nodes[0].status, 'offline');
+	assert.deepEqual(registry.list({ includeOffline: false }), {
+		deviceId: DEVICE_ID, nodes: [], totalNodes: 0, truncated: false,
+	});
+	time.advance(999);
+	registry.sweepExpired();
+	assert.equal(registry.list().nodes.length, 1);
+	time.advance(1);
+	registry.sweepExpired();
+	assert.equal(registry.list().nodes.length, 0);
+	assert.deepEqual(state.get(WORKSPACE_CATALOG_STATE_KEY), catalog);
+	assert.equal(state.writes, writes);
+});
+
+test('expired offline records retain task cleanup bindings and their Lease until authoritative release', async (t) => {
+	const { registry, leases, time } = await createFixture();
+	t.after(() => registry.dispose());
+	const session = new FakeSession();
+	const identity = { nodeId: NODE_A, nodeInstanceId: INSTANCE_A };
+	registry.register(registration(), session.asRoute());
+	await registry.claimWorkspace(claim());
+	const route = await registry.acquireTaskRoute({
+		...identity, workspaceId: WORKSPACE_ID, ownerId: OWNER_A, taskId: TASK_A,
+	});
+	session.disconnect();
+	time.advance(1_001);
+	registry.sweepExpired();
+	assert.equal(registry.list().nodes[0].status, 'offline');
+	assert.equal(registry.list({ includeOffline: false }).nodes.length, 0);
+	assert.equal(leases.isLeased(route.workspaceLeaseKey), true);
+	assert.equal(registry.releaseTaskRoute(OWNER_A, TASK_A), true);
+	assert.equal(registry.list().nodes.length, 0);
+	assert.equal(leases.isLeased(route.workspaceLeaseKey), false);
+});
+
+test('a reconnected instance is not removed when its previous offline grace period expires', async (t) => {
+	const { registry, time } = await createFixture();
+	t.after(() => registry.dispose());
+	const first = new FakeSession();
+	registry.register(registration(), first.asRoute());
+	first.disconnect();
+	time.advance(500);
+	const second = new FakeSession();
+	registry.register(registration(), second.asRoute());
+	time.advance(500);
+	registry.sweepExpired();
+	assert.equal(registry.list({ includeOffline: false }).nodes[0].nodeInstanceId, INSTANCE_A);
+	second.disconnect();
+	time.advance(1_000);
+	registry.sweepExpired();
+	assert.equal(registry.list().nodes.length, 0);
+	registry.register(registration(NODE_A, INSTANCE_B), new FakeSession().asRoute());
+	assert.equal(registry.list({ includeOffline: false }).nodes[0].nodeInstanceId, INSTANCE_B);
+});
+
 test('run-scoped state claims a workspace despite a full persistent catalog', async (t) => {
 	const persistentCatalog = {
 		schemaVersion: 2,

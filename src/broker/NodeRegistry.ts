@@ -394,12 +394,14 @@ export class NodeRegistry {
 				this.loseNode(node, true);
 			}
 		}
+		this.pruneOfflineTombstones();
 		return expired.sort();
 	}
 
-	public list(): NodeDirectoryResult {
+	public list(options: { readonly includeOffline?: boolean } = {}): NodeDirectoryResult {
 		this.assertReady();
 		const available = [...this.nodes.values()]
+			.filter((node) => options.includeOffline !== false || node.status !== 'offline')
 			.sort((left, right) => left.nodeId.localeCompare(right.nodeId))
 			.slice(0, PROTOCOL_LIMITS.nodeListCount)
 			.map((node) => this.descriptor(node));
@@ -653,6 +655,7 @@ export class NodeRegistry {
 		}
 		this.options.workspaceLeases.release(binding.workspaceLeaseKey, owner, task);
 		this.taskBindings.delete(task);
+		this.pruneOfflineTombstones();
 		return true;
 	}
 
@@ -966,6 +969,17 @@ export class NodeRegistry {
 		}
 		if (lostBindings.length > 0) {
 			this.options.onNodeTasksLost?.(lostBindings);
+		}
+	}
+
+	private pruneOfflineTombstones(): void {
+		const cutoff = this.options.clock.now().getTime() - (this.options.heartbeatTtlMs ?? 30_000);
+		for (const node of this.nodes.values()) {
+			// Keep a short reconnect window, and never remove a task's cleanup fence.
+			if (node.status === 'offline' && node.offlineAt !== undefined
+				&& node.offlineAt <= cutoff && !this.hasTaskBindings(node)) {
+				this.nodes.delete(node.nodeId);
+			}
 		}
 	}
 

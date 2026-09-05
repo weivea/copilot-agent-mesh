@@ -144,6 +144,25 @@ test('tree schema rejects raw identities, duplicated keys, unbound actions and f
 	assert.equal(dashboardDeviceTreeSchema.safeParse(foreign).success, false);
 });
 
+test('offline windows disappear from both device trees while paired devices and saved authorizations remain', () => {
+	const f = fixture();
+	const builder = new DashboardTreeBuilder();
+	const node = { ...f.snapshot.localNodes![1], status: 'offline' as const, workspaces: [] };
+	const tree = builder.build({
+		...f.snapshot, localNodes: [f.snapshot.localNodes![0], node],
+		remoteDevices: f.snapshot.remoteDevices?.map((device) => ({
+			...device, nodes: device.nodes.map((node) => ({ ...node, status: 'offline' })),
+		})),
+	}, f.policy, f.options);
+	assert.equal(tree[0].nodes.length, 1);
+	assert.equal(tree[0].nodes[0].thisWindow, true);
+	assert.equal(tree[1].nodes.length, 0);
+	assert.equal(tree[1].name, 'Lab Mac');
+	assert.equal(f.snapshot.policyCandidates?.[1].allowlisted, true);
+	const reopened = builder.build(f.snapshot, f.policy, f.options);
+	assert.equal(reopened[0].nodes.length, 2);
+	assert.equal(reopened[1].nodes.length, 1);
+});
 test('large directories remain bounded and explicitly report omission without hiding current-window policy', () => {
 	const f = fixture();
 	const other = f.snapshot.localNodes![1];

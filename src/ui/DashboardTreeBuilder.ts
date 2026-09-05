@@ -28,7 +28,7 @@ export class DashboardTreeBuilder {
 			return value;
 		};
 		const tree: DashboardDeviceTree = [];
-		const sources = snapshot.localNodes ?? [];
+		const sources = (snapshot.localNodes ?? []).filter((node) => node.status !== 'offline');
 		tree.push({
 			key: key('local-device'),
 			name: redactRemoteText(snapshot.device.name),
@@ -92,7 +92,7 @@ export class DashboardTreeBuilder {
 				key: key(identity),
 				name: redactRemoteText(device.name),
 				locality: 'remote', state,
-				nodes: (state === 'online' || state === 'unknown' ? device.nodes : []).map((node) => ({
+				nodes: (state === 'online' || state === 'unknown' ? device.nodes : []).filter((node) => node.status !== 'offline').map((node) => ({
 					key: key(`${identity}:${node.nodeId}:${node.nodeInstanceId}`),
 					label: redactRemoteText(node.label),
 					thisWindow: false, status: node.status,
