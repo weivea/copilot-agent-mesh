@@ -351,3 +351,31 @@ VS Code 1.135 在有真实 summary 时可能对带 schema-optional `limit` 的 `
 父 Chat 身份，不能证明用户在 Copilot 侧边栏接受委派。P8 的人工阶段保留两个真实窗口并
 给出精确 Agent-mode 操作；若没有人工可见观察，Q4' 继续记为 **unverified**，不从
 `listSessions` 或独立 modal 推断为 Pass。
+
+### VS Code 1.136.1 Chat 可见性诊断（2026-09-05）
+
+只读诊断发现真实委派 Session 已 materialize、返回输出并保留为 Idle，标题也仍带 Mesh
+前缀；这不等于 Chat 列表可识别该会话。当前 VS Code 源码固定在
+`a44adf7f53e00964ab890f9f8758a334f1fc15bc`，有两个独立的集成约束：
+
+- `createSession` 接受独立的 provider 和 client-chosen URI，但
+  `protocolServerHandler.ts` 的 `listSessions` 以及 `agentHostSessionListStore.ts`
+  都从 URI scheme 推导 provider。以 `copilotcli` 执行的 `ahp-session:` 会话因此被目录
+  归类为 `ahp-session`，无法匹配原生 Copilot controller。原生客户端使用
+  `AgentSession.uri(provider, uuid)`；Mesh 的 Editor 路径应遵循同一约定。这不是 AHP
+  协议禁止通用 scheme，而是 VS Code host/UI 的兼容性要求。
+- `shared/worktreeIsolation.ts` 对有 HEAD 的 Git 目录默认选择 worktree，缺少/非法配置
+  会被替换成默认值。folder 模式直接保留传入目录，不自动创建 worktree/branch；
+  非 Git 或 unborn HEAD 目录提供只读 folder。原生 Chat 对新会话按实际工作目录匹配
+  窗口，不以 project/repository 名称兜底，因此执行成功的任务仍可能不属于原窗口列表。
+
+修复应同时采用 provider-scoped URI 和经 Host schema 确认的 folder 配置，保留现有
+provisional 首轮启动及终态 detach 生命周期。不通过 UI 自动点击、伪造 legacy adoption
+metadata 或改写旧会话数据库规避边界。对新方案的真实 UI 观察仍须单独完成；本次只读
+诊断不将 Q4' 升为 Pass。
+
+同日启动回归的 AHP 跟踪进一步确认：原生 `createSessionState` 不复制 `resource`，
+权威标识只位于外层 `Snapshot.resource`。该调用的 provider、folder 配置和完整目标目录
+全部匹配，但错误要求 `state.resource` 的校验会在首次 send 前拒绝会话。校验必须接收
+完整 Snapshot 并核对外层标识；不能通过放宽 provider 或目录条件规避这一层级错误。
+模拟 Host 与 SDK wire fixture 同步采用不含重复 resource 的原生 Session payload。

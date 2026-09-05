@@ -6,6 +6,18 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [Unreleased]
 
+- Read the authoritative Session identity from the outer AHP Snapshot rather than
+  requiring a duplicate `resource` in the native Session state. This fixes a
+  startup rejection before the first turn on VS Code 1.136.1.
+- Align new Editor Agent Host Session URIs with the selected provider and require
+  schema-supported folder isolation, keeping delegated execution in the target
+  window's existing directory instead of a newly provisioned worktree.
+- Check Editor Session workspace/configuration consistency and include provider
+  and workspace matching in redacted catalog visibility evidence. Keep native
+  UI observation separate from backend execution and catalog retention.
+- Preserve standalone behavior, existing terminal-history cleanup, and old
+  Session resource identities; no automatic history migration is performed.
+
 ## [0.4.0 Preview] - 2026-08-31
 
 - Documented the 0.4.0 Peer Window Delegation redesign. Same-device multi-project

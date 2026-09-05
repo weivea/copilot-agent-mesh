@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import {
 	assertPassingPeerDelegationEvidence,
@@ -13,11 +15,15 @@ import {
 	PeerDelegationE2eRecorder,
 	PeerDelegationE2eToolClock,
 	projectPeerTaskEvents,
+	sessionSchemeFingerprint,
 } from '../e2e/PeerDelegationE2eRecorder';
 import {
 	EditorCatalogProbeError,
 	classifyEditorCatalogError,
+	projectEditorSessionCatalog,
+	resolveEditorSessionCatalogExpectation,
 } from '../composition/PeerDelegationE2eApi';
+import type { AhpSessionSummary } from '../agentHost/AhpAgentRuntime';
 import {
 	canRequestManualPostDetachObservation,
 	manualPostDetachObservationTimeoutMs,
@@ -30,6 +36,34 @@ const taskId = '00000000-0000-4000-8000-000000000002';
 const inputId = '00000000-0000-4000-8000-000000000003';
 const delegationRequestId = '00000000-0000-4000-8000-000000000004';
 const postDetachChallenge = '00000000-0000-4000-8000-000000000005';
+const targetWorkspaceId = '00000000-0000-4000-8000-000000000006';
+const targetWorkspaceUri = pathToFileURL(resolve('e2e', 'projects', 'target')).href;
+
+function testFingerprint(domain: string, value: string): string {
+	return createHash('sha256')
+		.update(`copilot-agent-mesh/${domain}/v1\0`, 'utf8')
+		.update(value, 'utf8')
+		.digest('hex')
+		.slice(0, 16);
+}
+
+function catalogSession(provider = 'native-agent'): AhpSessionSummary {
+	return {
+		resource: `${provider}:/${taskId}`,
+		provider,
+		status: 1,
+		workingDirectories: [targetWorkspaceUri],
+	};
+}
+
+function catalogExpectation(resource: string, provider = 'native-agent') {
+	return {
+		workspaceUri: targetWorkspaceUri,
+		expectedSessionHash: testFingerprint('agent-session', resource),
+		expectedSessionSchemeHash: testFingerprint('agent-provider', provider),
+		expectedProviderHash: testFingerprint('agent-provider', provider),
+	};
+}
 
 test('manual UI evidence accepts only the challenge issued after objective detach and catalog probe', () => {
 	const attestation = {
@@ -130,6 +164,235 @@ test('editor catalog diagnostics classify tagged protocol and timeout failures',
 		classifyEditorCatalogError(new EditorCatalogProbeError('timeout', 'synthetic timeout failure')),
 		'timeout',
 	);
+});
+
+test('editor catalog resolves the exact local Workspace without requiring a Broker owner', async () => {
+	const session = catalogSession();
+	const requests: string[] = [];
+	const node = {
+		resolve: async (workspaceId: string) => {
+			requests.push(workspaceId);
+			return workspaceId === targetWorkspaceId
+				? {
+					workspaceId,
+					workspaceIdentity: 'not-exported',
+					displayName: 'not-used-for-matching',
+					uri: targetWorkspaceUri,
+				}
+				: undefined;
+		},
+	};
+	const expected = catalogExpectation(session.resource);
+	assert.deepEqual(
+		await resolveEditorSessionCatalogExpectation(node, {
+			expectedWorkspaceId: targetWorkspaceId,
+			expectedSessionHash: expected.expectedSessionHash,
+			expectedSessionSchemeHash: expected.expectedSessionSchemeHash,
+			expectedProviderHash: expected.expectedProviderHash,
+		}),
+		expected,
+	);
+	assert.deepEqual(requests, [targetWorkspaceId]);
+	await assert.rejects(
+		resolveEditorSessionCatalogExpectation(node, { expectedWorkspaceId: taskId }),
+		/not registered in this Window Node/u,
+	);
+	assert.deepEqual(
+		await resolveEditorSessionCatalogExpectation(node, { expectedWorkspaceId: targetWorkspaceId }),
+		{ workspaceUri: targetWorkspaceUri },
+		'An absent Host observation can be probed but cannot produce an identity match.',
+	);
+});
+
+test('editor catalog validates opaque control inputs before resolving or connecting', async () => {
+	let resolutions = 0;
+	const node = {
+		resolve: async () => {
+			resolutions += 1;
+			return undefined;
+		},
+	};
+	for (const params of [
+		{},
+		{ expectedWorkspaceId: targetWorkspaceUri },
+		{ expectedWorkspaceId: targetWorkspaceId, expectedSessionHash: 'native-agent:/private' },
+		{ expectedWorkspaceId: targetWorkspaceId, expectedSessionHash: 'A'.repeat(16) },
+		{ expectedWorkspaceId: targetWorkspaceId, expectedSessionHash: 'a'.repeat(64) },
+		{ expectedWorkspaceId: targetWorkspaceId, expectedSessionSchemeHash: 'a'.repeat(16) },
+		{ expectedWorkspaceId: targetWorkspaceId, expectedProviderHash: 'a'.repeat(16) },
+		{
+			expectedWorkspaceId: targetWorkspaceId,
+			expectedSessionHash: 'a'.repeat(16),
+			expectedSessionSchemeHash: 'raw-provider',
+		},
+	]) {
+		await assert.rejects(resolveEditorSessionCatalogExpectation(node, params));
+	}
+	assert.equal(resolutions, 0);
+	await assert.rejects(
+		resolveEditorSessionCatalogExpectation({
+			resolve: async () => ({
+				workspaceId: targetWorkspaceId,
+				workspaceIdentity: 'not-exported',
+				displayName: 'target',
+				uri: 'https://example.invalid/target',
+			}),
+		}, { expectedWorkspaceId: targetWorkspaceId }),
+		/not registered/u,
+	);
+});
+
+test('editor catalog accepts only the exact terminal native-provider folder entry and redacts metadata', () => {
+	const session = catalogSession();
+	const projected = projectEditorSessionCatalog([session], catalogExpectation(session.resource));
+	assert.deepEqual(projected, {
+		sessionCount: 1,
+		catalogMatchingSessionCount: 1,
+		matchedSessionHash: testFingerprint('agent-session', session.resource),
+		catalogSessionHashMatched: true,
+		catalogProviderHash: testFingerprint('agent-provider', 'native-agent'),
+		catalogProviderMatched: true,
+		targetWorkspaceHash: testFingerprint('agent-workspace', targetWorkspaceUri),
+		catalogWorkingDirectoryCount: 1,
+		catalogWorkspaceMatched: true,
+	});
+	const serialized = JSON.stringify(projected);
+	for (const raw of [session.resource, 'native-agent', targetWorkspaceUri, taskId]) {
+		assert.equal(serialized.includes(raw), false, raw);
+	}
+	assert.equal(new Set([
+		projected.matchedSessionHash,
+		projected.catalogProviderHash,
+		projected.targetWorkspaceHash,
+	]).size, 3);
+	assert.equal(
+		projectEditorSessionCatalog([{
+			...session,
+			workingDirectories: [`${targetWorkspaceUri}/`],
+		}], catalogExpectation(session.resource)).catalogWorkspaceMatched,
+		true,
+	);
+});
+
+test('editor catalog rejects the original ahp-session and copilotcli provider mismatch', () => {
+	const session = { ...catalogSession('copilotcli'), resource: `ahp-session:/${taskId}` };
+	const expected = {
+		...catalogExpectation(session.resource, 'ahp-session'),
+		expectedProviderHash: testFingerprint('agent-provider', 'copilotcli'),
+	};
+	const projected = projectEditorSessionCatalog(
+		[session],
+		expected,
+	);
+	assert.equal(projected.catalogSessionHashMatched, true);
+	assert.equal(projected.catalogWorkspaceMatched, true);
+	assert.equal(projected.catalogProviderHash, testFingerprint('agent-provider', 'copilotcli'));
+	assert.equal(projected.catalogProviderMatched, false);
+	assert.equal(
+		projectEditorSessionCatalog([{ ...session, provider: 'ahp-session' }], expected).catalogProviderMatched,
+		false,
+		'The real Host also mislabels the catalog provider as ahp-session; matching the URI alone must not pass.',
+	);
+});
+
+test('editor catalog requires the observed provider identity rather than any consistent provider', () => {
+	const session = catalogSession();
+	const expected = catalogExpectation(session.resource);
+	assert.equal(
+		projectEditorSessionCatalog([session], {
+			...expected,
+			expectedSessionSchemeHash: testFingerprint('agent-provider', 'different-agent'),
+		}).catalogProviderMatched,
+		false,
+	);
+	assert.equal(
+		projectEditorSessionCatalog([session], {
+			...expected,
+			expectedSessionSchemeHash: undefined,
+		}).catalogProviderMatched,
+		false,
+	);
+	for (const expectedProviderHash of [undefined, testFingerprint('agent-provider', 'different-agent')]) {
+		assert.equal(
+			projectEditorSessionCatalog([session], { ...expected, expectedProviderHash }).catalogProviderMatched,
+			false,
+		);
+	}
+});
+
+test('editor catalog missing or malformed provider and directory metadata never satisfies visibility', () => {
+	const session = catalogSession();
+	const expected = catalogExpectation(session.resource);
+	for (const provider of [undefined, null, 1, {}, '', 'native-agent/private', 'NATIVE-AGENT', 'a'.repeat(129)]) {
+		const projected = projectEditorSessionCatalog(
+			[{ ...session, provider } as unknown as AhpSessionSummary],
+			expected,
+		);
+		assert.equal(projected.catalogProviderMatched, false);
+		assert.equal(projected.catalogProviderHash, undefined);
+		assert.equal(projected.catalogSessionHashMatched, true);
+	}
+	for (const workingDirectories of [
+		undefined,
+		null,
+		{},
+		targetWorkspaceUri,
+		[],
+		[null],
+		[1],
+		[targetWorkspaceUri, targetWorkspaceUri],
+		[targetWorkspaceUri, 'file:///e2e/other'],
+		['file:///different-parent/target'],
+		[`${targetWorkspaceUri}/worktree`],
+		['file://remote-host/e2e/projects/target'],
+		[`${targetWorkspaceUri}?untrusted=metadata`],
+	]) {
+		const projected = projectEditorSessionCatalog(
+			[{ ...session, workingDirectories } as unknown as AhpSessionSummary],
+			expected,
+		);
+		assert.equal(projected.catalogWorkspaceMatched, false, JSON.stringify(workingDirectories));
+		assert.equal(projected.catalogSessionHashMatched, true);
+		assert.equal(JSON.stringify(projected).includes('file:'), false);
+	}
+});
+
+test('editor catalog never borrows provider or Workspace matches from an unrelated Session', () => {
+	const session = catalogSession();
+	const unrelated = { ...session, resource: `native-agent:/${inputId}` };
+	const expected = catalogExpectation(session.resource);
+	const missing = projectEditorSessionCatalog([unrelated], expected);
+	assert.equal(missing.catalogMatchingSessionCount, 0);
+	assert.equal(missing.catalogSessionHashMatched, false);
+	assert.equal(missing.catalogProviderMatched, false);
+	assert.equal(missing.catalogWorkspaceMatched, false);
+	const mismatched = projectEditorSessionCatalog([{
+		...session,
+		provider: 'different-agent',
+		workingDirectories: ['file:///different-parent/target'],
+	}, unrelated], expected);
+	assert.equal(mismatched.catalogMatchingSessionCount, 1);
+	assert.equal(mismatched.catalogSessionHashMatched, true);
+	assert.equal(mismatched.catalogProviderMatched, false);
+	assert.equal(mismatched.catalogWorkspaceMatched, false);
+	const duplicate = projectEditorSessionCatalog([session, session], expected);
+	assert.equal(duplicate.catalogMatchingSessionCount, 2);
+	assert.equal(duplicate.catalogSessionHashMatched, false);
+	assert.equal(duplicate.catalogProviderMatched, false);
+	assert.equal(duplicate.catalogWorkspaceMatched, false);
+});
+
+test('editor catalog ignores nonterminal, archived, or malformed Session status', () => {
+	const session = catalogSession();
+	for (const status of [undefined, 0, 1 | 8, 1 | 64, '1', -1, 1.1, Infinity, 2 ** 32 + 1]) {
+		const projected = projectEditorSessionCatalog(
+			[{ ...session, status } as unknown as AhpSessionSummary],
+			catalogExpectation(session.resource),
+		);
+		assert.equal(projected.catalogSessionHashMatched, false, String(status));
+		assert.equal(projected.catalogProviderMatched, false);
+		assert.equal(projected.catalogWorkspaceMatched, false);
+	}
 });
 
 test('peer-delegation evidence rejects unsafe persistent content', () => {
@@ -312,7 +575,11 @@ test('peer-delegation passing evidence requires all real AC-5 conditions', () =>
 		sessionVisibility: {
 			...sessionWithoutHostEcho,
 			hostSessionEchoObserved: false,
+			catalogMatchingSessionCount: 0,
 			catalogSessionHashMatched: false,
+			catalogProviderMatched: false,
+			catalogWorkingDirectoryCount: 0,
+			catalogWorkspaceMatched: false,
 		},
 		ac5: evidence.ac5.map((item) => item.item === 9
 			? { ...item, status: 'unverified' as const, evidenceRefs: [] }
@@ -367,6 +634,82 @@ test('peer-delegation passing evidence requires all real AC-5 conditions', () =>
 			}],
 		}),
 		/Outcome must be fail|require failed cleanup status/u,
+	);
+});
+
+test('UI visibility evidence cannot Pass without exact provider, folder, detach, and manual observation', () => {
+	const evidence = passingEvidence();
+	evidence.sessionVisibility.status = 'pass';
+	evidence.sessionVisibility.uiObserved = true;
+	evidence.experiments[0] = {
+		id: 'O1',
+		status: 'pass',
+		conclusion: 'editor-session-visible',
+	};
+	assert.doesNotThrow(() => parsePeerDelegationEvidence(evidence));
+	for (const field of [
+		'catalogProviderMatched',
+		'catalogWorkspaceMatched',
+		'catalogSessionHashMatched',
+		'clientDetachedObserved',
+		'catalogAfterTerminalCleanup',
+		'uiObserved',
+	]) {
+		assert.throws(
+			() => parsePeerDelegationEvidence({
+				...evidence,
+				sessionVisibility: { ...evidence.sessionVisibility, [field]: false },
+			}),
+			/Passing O1 evidence requires editor catalog and objective UI observation/u,
+			field,
+		);
+	}
+	for (const catalogProviderHash of [undefined, 'aaaaaaaaaaaaaaaa']) {
+		assert.throws(
+			() => parsePeerDelegationEvidence({
+				...evidence,
+				sessionVisibility: { ...evidence.sessionVisibility, catalogProviderHash },
+			}),
+			/native provider fingerprints/u,
+		);
+	}
+	assert.throws(
+		() => parsePeerDelegationEvidence({
+			...evidence,
+			sessionVisibility: { ...evidence.sessionVisibility, hostProviderHash: undefined },
+		}),
+		/native provider fingerprints/u,
+	);
+	for (const catalogWorkingDirectoryCount of [0, 2]) {
+		assert.throws(
+			() => parsePeerDelegationEvidence({
+				...evidence,
+				sessionVisibility: { ...evidence.sessionVisibility, catalogWorkingDirectoryCount },
+			}),
+			/one actual directory/u,
+		);
+	}
+	assert.throws(
+		() => parsePeerDelegationEvidence({
+			...evidence,
+			sessionVisibility: {
+				...evidence.sessionVisibility,
+				catalogMatchingSessionCount: 2,
+			},
+		}),
+		/exact Host Session/u,
+	);
+	assert.throws(
+		() => parsePeerDelegationEvidence({
+			...evidence,
+			sessionVisibility: {
+				...evidence.sessionVisibility,
+				catalogProviderMatched: undefined,
+				catalogWorkspaceMatched: undefined,
+			},
+		}),
+		/catalogProviderMatched|catalogWorkspaceMatched/u,
+		'Old artifacts lacking native provider/folder diagnostics must not become passing evidence.',
 	);
 });
 
@@ -450,6 +793,37 @@ test('peer-delegation recorder stores identities and hashes without prompt or ou
 	]);
 	assert.match(snapshot.ahp[1]?.sessionHash ?? '', /^[a-f0-9]{16}$/u);
 	assert.equal(JSON.stringify(snapshot).includes('do-not-persist-this-identifier'), false);
+});
+
+test('peer recorder fingerprints the observed native URI provider without exporting its raw identity', () => {
+	const resource = catalogSession().resource;
+	const recorder = new PeerDelegationE2eRecorder();
+	recorder.observeLifecycle({
+		taskId,
+		eventType: 'session/hostObserved',
+		sessionUri: resource,
+		provider: 'native-agent',
+		source: 'editor',
+		endpointFingerprint: '0123456789abcdef',
+		protocolOffer: ['1.0.0'],
+		selectedProtocolVersion: '1.0.0',
+	});
+	const snapshot = recorder.snapshot();
+	assert.equal(snapshot.ahp[0]?.sessionHash, testFingerprint('agent-session', resource));
+	assert.equal(snapshot.ahp[0]?.sessionSchemeHash, testFingerprint('agent-provider', 'native-agent'));
+	assert.equal(snapshot.ahp[0]?.providerHash, testFingerprint('agent-provider', 'native-agent'));
+	assert.equal(JSON.stringify(snapshot).includes('native-agent'), false);
+	assert.equal(JSON.stringify(snapshot).includes(resource), false);
+	for (const invalidResource of [
+		undefined,
+		'native-agent:not-a-native-session',
+		`native-agent://${taskId}`,
+		`${resource}?token=not-exported`,
+		`${resource}#not-exported`,
+		`native-agent:/${taskId}/extra`,
+	]) {
+		assert.equal(sessionSchemeFingerprint(invalidResource), undefined);
+	}
 });
 
 test('peer task evidence projection bounds verbose journals without inventing milestones', () => {
@@ -572,6 +946,17 @@ test('0.4.0 release metadata keeps the real peer gate default-off and five-tool 
 	assert.match(
 		harness,
 		/canRequestManualPostDetachObservation\(\s*manualUi,\s*clientDetachedObserved,\s*catalogProbeCompleted/u,
+	);
+	assert.match(
+		harness,
+		/await request\(target, 'peer\.session\.catalog', \{\s*expectedWorkspaceId: targetInputBase\.workspaceId,/u,
+	);
+	assert.match(harness, /expectedSessionHash: hostSessionHash/u);
+	assert.match(harness, /expectedSessionSchemeHash: hostSessionSchemeHash/u);
+	assert.match(harness, /expectedProviderHash: hostProviderHash/u);
+	assert.match(
+		harness,
+		/status: editorSessionObserved\s*&& catalogSessionHashMatched\s*&& catalogProviderMatched\s*&& catalogWorkspaceMatched\s*&& uiObserved/u,
 	);
 	assert.doesNotMatch(harness, /rm\(meshGlobalStorageDirectory/u);
 	assert.match(
@@ -705,7 +1090,11 @@ function unverifiedEvidence(): PeerDelegationEvidence {
 			hostSessionEchoObserved: false,
 			clientDetachedObserved: false,
 			catalogAfterTerminalCleanup: false,
+			catalogMatchingSessionCount: 0,
 			catalogSessionHashMatched: false,
+			catalogProviderMatched: false,
+			catalogWorkingDirectoryCount: 0,
+			catalogWorkspaceMatched: false,
 			uiObserved: false,
 		},
 		transport: {
@@ -902,11 +1291,19 @@ function passingEvidence(): PeerDelegationEvidence {
 			catalogBefore: 0,
 			catalogAfter: 1,
 			hostSessionHash: '0123456789abcdef',
+			hostSessionSchemeHash: '1111111111111111',
+			hostProviderHash: '1111111111111111',
+			catalogProviderHash: '1111111111111111',
+			targetWorkspaceHash: '2222222222222222',
 			editorEndpointFingerprint: 'fedcba9876543210',
 			hostSessionEchoObserved: true,
 			clientDetachedObserved: true,
 			catalogAfterTerminalCleanup: true,
+			catalogMatchingSessionCount: 1,
 			catalogSessionHashMatched: true,
+			catalogProviderMatched: true,
+			catalogWorkingDirectoryCount: 1,
+			catalogWorkspaceMatched: true,
 			uiObserved: false,
 		},
 		transport: {

@@ -193,11 +193,19 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 		catalogBefore: nonNegativeInteger,
 		catalogAfter: nonNegativeInteger,
 		hostSessionHash: fingerprint.optional(),
+		hostSessionSchemeHash: fingerprint.optional(),
+		hostProviderHash: fingerprint.optional(),
+		catalogProviderHash: fingerprint.optional(),
+		targetWorkspaceHash: fingerprint.optional(),
 		editorEndpointFingerprint: fingerprint.optional(),
 		hostSessionEchoObserved: z.boolean(),
 		clientDetachedObserved: z.boolean(),
 		catalogAfterTerminalCleanup: z.boolean(),
+		catalogMatchingSessionCount: nonNegativeInteger,
 		catalogSessionHashMatched: z.boolean(),
+		catalogProviderMatched: z.boolean(),
+		catalogWorkingDirectoryCount: nonNegativeInteger,
+		catalogWorkspaceMatched: z.boolean(),
 		uiObserved: z.boolean(),
 	}),
 	transport: z.strictObject({
@@ -860,6 +868,41 @@ function validateAc5Correspondence(
 		addInvariantIssue(context, ['sessionVisibility'], 'A Host Session echo requires an editor source, channel hash, and endpoint fingerprint.');
 	}
 	if (
+		evidence.sessionVisibility.catalogSessionHashMatched
+		&& (
+			!evidence.sessionVisibility.hostSessionEchoObserved
+			|| !evidence.sessionVisibility.clientDetachedObserved
+			|| !evidence.sessionVisibility.catalogAfterTerminalCleanup
+			|| evidence.sessionVisibility.catalogMatchingSessionCount !== 1
+			|| evidence.sessionVisibility.catalogAfter < 1
+		)
+	) {
+		addInvariantIssue(context, ['sessionVisibility'], 'A catalog Session match requires the exact Host Session after objective client detach.');
+	}
+	if (
+		evidence.sessionVisibility.catalogProviderMatched
+		&& (
+			!evidence.sessionVisibility.catalogSessionHashMatched
+			|| evidence.sessionVisibility.hostSessionSchemeHash === undefined
+			|| evidence.sessionVisibility.hostProviderHash === undefined
+			|| evidence.sessionVisibility.catalogProviderHash === undefined
+			|| evidence.sessionVisibility.hostSessionSchemeHash !== evidence.sessionVisibility.catalogProviderHash
+			|| evidence.sessionVisibility.hostProviderHash !== evidence.sessionVisibility.catalogProviderHash
+		)
+	) {
+		addInvariantIssue(context, ['sessionVisibility'], 'A catalog provider match requires matching observed native provider fingerprints for the exact Session.');
+	}
+	if (
+		evidence.sessionVisibility.catalogWorkspaceMatched
+		&& (
+			!evidence.sessionVisibility.catalogSessionHashMatched
+			|| evidence.sessionVisibility.catalogWorkingDirectoryCount !== 1
+			|| evidence.sessionVisibility.targetWorkspaceHash === undefined
+		)
+	) {
+		addInvariantIssue(context, ['sessionVisibility'], 'A catalog Workspace match requires one actual directory matching the exact target Workspace.');
+	}
+	if (
 		evidence.sessionVisibility.status === 'pass'
 		&& (
 			evidence.sessionVisibility.source !== 'editor'
@@ -867,6 +910,8 @@ function validateAc5Correspondence(
 			|| !evidence.sessionVisibility.clientDetachedObserved
 			|| !evidence.sessionVisibility.catalogAfterTerminalCleanup
 			|| !evidence.sessionVisibility.catalogSessionHashMatched
+			|| !evidence.sessionVisibility.catalogProviderMatched
+			|| !evidence.sessionVisibility.catalogWorkspaceMatched
 			|| !evidence.sessionVisibility.uiObserved
 			|| evidence.sessionVisibility.catalogAfter < 1
 		)

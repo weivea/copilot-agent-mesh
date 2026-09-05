@@ -1172,6 +1172,18 @@ async function recordCompletionScenario({
 			observation.taskId === completionTaskId
 			&& observation.eventType === 'session/clientDetached',
 	);
+	const hostSessionObservation = [...completionObservations.ahp]
+		.reverse()
+		.find((observation) =>
+			observation.taskId === completionTaskId
+			&& observation.eventType === 'session/hostObserved');
+	const hostSessionHash = observedFingerprint(hostSessionObservation?.sessionHash);
+	const hostSessionSchemeHash = observedFingerprint(hostSessionObservation?.sessionSchemeHash);
+	const hostProviderHash = observedFingerprint(hostSessionObservation?.providerHash);
+	const editorEndpointFingerprint = observedFingerprint(hostSessionObservation?.endpointFingerprint);
+	const hostSessionEchoObserved = hostSessionHash !== undefined
+		&& editorEndpointFingerprint !== undefined
+		&& hostSessionObservation?.source === 'editor';
 	console.log(JSON.stringify({
 		type: 'sanitized-agent-host-cleanup',
 		events: completionObservations.ahp
@@ -1181,12 +1193,51 @@ async function recordCompletionScenario({
 	let catalogProbeCompleted = false;
 	let catalogAfter = { available: false, source: 'editor' };
 	if (clientDetachedObserved) {
-		catalogAfter = await request(target, 'peer.session.catalog', {}, 60_000);
+		catalogAfter = await request(target, 'peer.session.catalog', {
+			expectedWorkspaceId: targetInputBase.workspaceId,
+			...(hostSessionHash === undefined ? {} : {
+				expectedSessionHash: hostSessionHash,
+				...(hostSessionSchemeHash === undefined
+					? {}
+					: { expectedSessionSchemeHash: hostSessionSchemeHash }),
+				...(hostProviderHash === undefined ? {} : { expectedProviderHash: hostProviderHash }),
+			}),
+		}, 60_000);
 		catalogProbeCompleted = true;
 	}
+	const catalogAfterTerminalCleanup = clientDetachedObserved && catalogAfter.available === true;
+	const catalogMatchingSessionCount = observedCount(catalogAfter.catalogMatchingSessionCount);
+	const catalogWorkingDirectoryCount = observedCount(catalogAfter.catalogWorkingDirectoryCount);
+	const catalogProviderHash = observedFingerprint(catalogAfter.catalogProviderHash);
+	const targetWorkspaceHash = observedFingerprint(catalogAfter.targetWorkspaceHash);
+	const catalogSessionHashMatched = catalogAfterTerminalCleanup
+		&& hostSessionEchoObserved
+		&& catalogMatchingSessionCount === 1
+		&& catalogAfter.catalogSessionHashMatched === true
+		&& catalogAfter.matchedSessionHash === hostSessionHash;
+	const catalogProviderMatched = catalogSessionHashMatched
+		&& catalogAfter.catalogProviderMatched === true
+		&& hostSessionSchemeHash !== undefined
+		&& catalogProviderHash === hostSessionSchemeHash
+		&& hostProviderHash !== undefined
+		&& catalogProviderHash === hostProviderHash;
+	const catalogWorkspaceMatched = catalogSessionHashMatched
+		&& catalogAfter.catalogWorkspaceMatched === true
+		&& catalogWorkingDirectoryCount === 1
+		&& targetWorkspaceHash !== undefined;
 	console.log(JSON.stringify({
 		type: 'sanitized-agent-host-catalog',
 		available: catalogAfter.available === true,
+		sessionCount: observedCount(catalogAfter.sessionCount),
+		catalogMatchingSessionCount,
+		catalogSessionHashMatched,
+		catalogProviderMatched,
+		catalogWorkingDirectoryCount,
+		catalogWorkspaceMatched,
+		...(hostSessionSchemeHash === undefined ? {} : { hostSessionSchemeHash }),
+		...(hostProviderHash === undefined ? {} : { hostProviderHash }),
+		...(catalogProviderHash === undefined ? {} : { catalogProviderHash }),
+		...(targetWorkspaceHash === undefined ? {} : { targetWorkspaceHash }),
 		...(catalogAfter.errorStage === undefined ? {} : { stage: catalogAfter.errorStage }),
 		...(catalogAfter.errorKind === undefined ? {} : { kind: catalogAfter.errorKind }),
 		...(catalogAfter.rpcCode === undefined ? {} : { rpcCode: catalogAfter.rpcCode }),
@@ -1217,30 +1268,11 @@ async function recordCompletionScenario({
 		error.code = 'EDITOR_CATALOG_CLEANUP_FAILED';
 		observedCleanupFailures.push({ phase: 'editor-session-catalog', error });
 	}
-	const hostSessionObservation = [...completionObservations.ahp]
-		.reverse()
-		.find((observation) =>
-			observation.taskId === completionTaskId
-			&& observation.eventType === 'session/hostObserved');
 	const protocolObservation = [...completionObservations.ahp]
 		.reverse()
 		.find((observation) =>
 			observation.taskId === completionTaskId
 			&& observation.eventType === 'protocol/negotiated');
-	const hostSessionHash = typeof hostSessionObservation?.sessionHash === 'string'
-		&& /^[a-f0-9]{16}$/u.test(hostSessionObservation.sessionHash)
-		? hostSessionObservation.sessionHash
-		: undefined;
-	const catalogSessionHashMatched = catalogAfter.available === true
-		&& hostSessionHash !== undefined
-		&& catalogAfter.sessionHashes.includes(hostSessionHash);
-	const editorEndpointFingerprint = typeof hostSessionObservation?.endpointFingerprint === 'string'
-		&& /^[a-f0-9]{16}$/u.test(hostSessionObservation.endpointFingerprint)
-		? hostSessionObservation.endpointFingerprint
-		: undefined;
-	const hostSessionEchoObserved = hostSessionHash !== undefined
-		&& editorEndpointFingerprint !== undefined
-		&& hostSessionObservation?.source === 'editor';
 	const observedProtocolOffer = protocolObservation?.protocolOffer;
 	const observedSelectedProtocol = protocolObservation?.selectedProtocolVersion;
 	const protocolNegotiationObserved =
@@ -1340,18 +1372,30 @@ async function recordCompletionScenario({
 
 	const uiObserved = uiAttestation.targetSessionVisible === true;
 	evidence.sessionVisibility = {
-		status: editorSessionObserved && catalogSessionHashMatched && uiObserved
+		status: editorSessionObserved
+			&& catalogSessionHashMatched
+			&& catalogProviderMatched
+			&& catalogWorkspaceMatched
+			&& uiObserved
 			? 'pass'
 			: 'unverified',
 		source: sourceKind,
 		catalogBefore: catalogBeforeCount,
-		catalogAfter: catalogAfter.available ? catalogAfter.sessionCount : 0,
+		catalogAfter: catalogAfter.available ? observedCount(catalogAfter.sessionCount) : 0,
 		...(hostSessionHash === undefined ? {} : { hostSessionHash }),
+		...(hostSessionSchemeHash === undefined ? {} : { hostSessionSchemeHash }),
+		...(hostProviderHash === undefined ? {} : { hostProviderHash }),
+		...(catalogProviderHash === undefined ? {} : { catalogProviderHash }),
+		...(targetWorkspaceHash === undefined ? {} : { targetWorkspaceHash }),
 		...(editorEndpointFingerprint === undefined ? {} : { editorEndpointFingerprint }),
 		hostSessionEchoObserved,
 		clientDetachedObserved,
-		catalogAfterTerminalCleanup: clientDetachedObserved && catalogAfter.available === true,
+		catalogAfterTerminalCleanup,
+		catalogMatchingSessionCount,
 		catalogSessionHashMatched,
+		catalogProviderMatched,
+		catalogWorkingDirectoryCount,
+		catalogWorkspaceMatched,
 		uiObserved,
 	};
 	evidence.experiments[0] = {
@@ -1386,6 +1430,16 @@ async function recordCompletionScenario({
 		};
 	}
 	return true;
+}
+
+function observedFingerprint(value) {
+	return typeof value === 'string' && /^[a-f0-9]{16}$/u.test(value)
+		? value
+		: undefined;
+}
+
+function observedCount(value) {
+	return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
 async function runProgrammaticCoreCompletion(source, targetInputBase) {
@@ -2560,7 +2614,11 @@ function initialEvidence() {
 			hostSessionEchoObserved: false,
 			clientDetachedObserved: false,
 			catalogAfterTerminalCleanup: false,
+			catalogMatchingSessionCount: 0,
 			catalogSessionHashMatched: false,
+			catalogProviderMatched: false,
+			catalogWorkingDirectoryCount: 0,
+			catalogWorkspaceMatched: false,
 			uiObserved: false,
 		},
 		transport: {

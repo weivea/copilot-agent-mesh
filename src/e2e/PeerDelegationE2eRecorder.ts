@@ -46,6 +46,8 @@ export interface SafePeerAhpObservation {
 	readonly eventType: AgentRuntimeLifecycleObservation['eventType'];
 	readonly source?: 'editor' | 'standalone';
 	readonly sessionHash?: string;
+	readonly sessionSchemeHash?: string;
+	readonly providerHash?: string;
 	readonly endpointFingerprint?: string;
 	readonly protocolOffer?: AhpProtocolOffer;
 	readonly selectedProtocolVersion?: AhpProtocolVersion;
@@ -119,6 +121,12 @@ export class PeerDelegationE2eRecorder implements
 			) {
 				return;
 			}
+			const sessionSchemeHash = observesSession && observation.source === 'editor'
+				? sessionSchemeFingerprint(observation.sessionUri)
+				: undefined;
+			const providerHash = observesSession && observation.source === 'editor'
+				? providerFingerprint(observation.provider)
+				: undefined;
 			this.push(this.ahp, {
 				sequence: this.nextSequence(),
 				at: new Date().toISOString(),
@@ -133,6 +141,8 @@ export class PeerDelegationE2eRecorder implements
 						...(observesSession
 							? {
 								sessionHash: digest('agent-session', observation.sessionUri).slice(0, 16),
+								...(sessionSchemeHash === undefined ? {} : { sessionSchemeHash }),
+								...(providerHash === undefined ? {} : { providerHash }),
 							}
 							: {}),
 						...(
@@ -168,6 +178,22 @@ export class PeerDelegationE2eRecorder implements
 			this.truncated = true;
 		}
 	}
+}
+
+export function sessionSchemeFingerprint(resource: unknown): string | undefined {
+	if (typeof resource !== 'string') {
+		return undefined;
+	}
+	const nativeIdentity = /^([a-z][a-z0-9+.-]{0,127}):\/([a-f0-9-]{36})$/u.exec(resource);
+	return nativeIdentity !== null && uuidPattern.test(nativeIdentity[2]!)
+		? providerFingerprint(nativeIdentity[1])
+		: undefined;
+}
+
+export function providerFingerprint(provider: unknown): string | undefined {
+	return typeof provider === 'string' && /^[a-z][a-z0-9+.-]{0,127}$/u.test(provider)
+		? digest('agent-provider', provider).slice(0, 16)
+		: undefined;
 }
 
 export function projectPeerTaskEvents<

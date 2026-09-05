@@ -84,6 +84,7 @@ export type AgentRuntimeLifecycleObservation =
 		readonly taskId: string;
 		readonly eventType: 'session/hostObserved';
 		readonly sessionUri: string;
+		readonly provider?: string;
 		readonly source: AgentHostSource;
 		readonly endpointFingerprint?: string;
 		readonly protocolOffer: AhpProtocolOffer;

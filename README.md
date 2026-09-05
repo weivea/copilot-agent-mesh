@@ -64,6 +64,11 @@ See [Preview release and installation](./docs/mvp/release.md) for packaging, ins
   peer allowlist from the Dashboard. Display names never authorize or route.
 - Prefer the running VS Code instance's AHP `editor` endpoint for delegated
   sessions, with a visibly degraded standalone fallback.
+- Create new Editor sessions with provider-scoped identities and require
+  Host-supported `folder` isolation, so tasks use the target window's existing
+  directory rather than an automatically provisioned worktree. Existing
+  worktrees and branches are kept; unsupported folder configuration fails
+  explicitly. Standalone behavior is unchanged.
 - Operate the Broker, owner/takeover state, local nodes, workspace conflicts,
   remote nodes, listener, peers, and tasks from the Activity Bar Dashboard.
 - Persist shared task/delegation state and bounded reducer events behind
@@ -91,6 +96,12 @@ cancellation, released leases/profile lock, and zero harness-owned residue.
 The editor Host objectively echoed the created Session channel on the selected
 editor endpoint. Copilot-sidebar confirmation, target Chat Sessions UI
 visibility, and 60-minute UI stability remain explicitly Unverified.
+
+An Editor Session's presence in the Host catalog alone does not establish Chat
+visibility: its provider and actual working directory must also match the target
+window. Normal terminal cleanup retains Editor history without keeping the Mesh
+connection alive. Old `ahp-session:` resources are not renamed or migrated by the
+new-session policy.
 
 ## Install the local Preview
 

@@ -266,6 +266,33 @@ borrowed-client lifecycle can perturb editor identity readiness. Only fingerprin
 and counts leave the Extension Host. A standalone fallback can demonstrate degraded
 execution but can never satisfy the editor Session claim.
 
+## Editor Session identity and workspace policy
+
+New Editor sessions use the selected provider as their URI scheme, for example
+`copilotcli:/<uuid>`, rather than the generic AHP `ahp-session:` example. Identity
+is fixed before creation and remains unchanged during recovery. VS Code's native
+catalog and Chat adapter derive the provider from this scheme.
+
+Editor configuration resolution always carries `isolation: "folder"` and checks
+the Host's schema and effective value before creation. Read-only folder mode is
+supported; a missing or incompatible isolation property fails explicitly without
+falling back to worktree execution. Other configuration, including the current
+branch, remains Host-owned. This is a cwd/provisioning policy, not a sandbox.
+
+The provisional Session snapshot and later authoritative configuration/directory
+changes must agree with the target workspace. Identity is checked against the
+outer `Snapshot.resource`; native Session state need not repeat that field.
+If a redundant state resource is present, it must agree with the envelope.
+Startup still waits for the default
+Chat, not `session/ready`, before the first send. Normal terminal history cleanup
+remains unchanged. VS Code may materialize directories without a directory action,
+so ready handling and pre-detach validation serially re-read the existing Session
+snapshot without attaching an extra local iterator. Catalog evidence compares the
+selected provider, URI scheme, catalog provider, and exact workspace as well as
+retention, but still requires separate UI observation. Raw
+directory and resource values stay inside the runtime. Existing standalone and
+old Session identities are not migrated.
+
 ## Verified result
 
 On 2026-08-30, macOS arm64 with VS Code `1.135.0` negotiated AHP `1.0.0`,

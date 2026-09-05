@@ -8,6 +8,7 @@ import {
 	isUsableTerminalSessionStatus,
 	listSessionsBounded,
 	type AhpConnection,
+	type AhpSessionSummary,
 } from '../agentHost/AhpAgentRuntime';
 import type {
 	AgentHostSourceStatusProvider,
@@ -16,6 +17,7 @@ import type {
 import type { LaunchedAgentHost } from '../agentHost/AgentHostLauncher';
 import { EditorAgentHostLauncher } from '../agentHost/AgentHostSourceSelector';
 import { EditorAgentHostLocator } from '../agentHost/EditorAgentHostLocator';
+import { matchesEditorSessionWorkspace } from '../agentHost/EditorSessionPolicy';
 import {
 	UnixSocketWebSocketConnector,
 } from '../agentHost/UnixSocketWebSocketConnector';
@@ -47,6 +49,8 @@ import {
 } from '../tools/toolManifest';
 import {
 	projectPeerTaskEvents,
+	providerFingerprint,
+	sessionSchemeFingerprint,
 	type PeerDelegationE2eRecorder,
 	type PeerDelegationE2eToolClock,
 } from '../e2e/PeerDelegationE2eRecorder';
@@ -60,6 +64,7 @@ import type { E2eCapability } from './E2eCapability';
 
 const taskTerminalStates = new Set(['completed', 'failed', 'cancelled', 'timedOut']);
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+const fingerprintPattern = /^[a-f0-9]{16}$/u;
 const safeWindowLabel = /^[\p{L}\p{N} ._()-]{1,128}$/u;
 
 export interface PeerDelegationE2eApiOptions {
@@ -134,7 +139,10 @@ export function createPeerDelegationE2eApi(
 						probe: await options.runtime.probe(),
 					};
 				case 'peer.session.catalog':
-					return editorSessionCatalog(options);
+					return editorSessionCatalog(
+						options,
+						await resolveEditorSessionCatalogExpectation(options.node, params),
+					);
 				case 'peer.resources':
 					return resourceMetrics(options);
 				default:
@@ -426,15 +434,101 @@ async function taskEvidence(
 	};
 }
 
+interface EditorSessionCatalogExpectation {
+	readonly workspaceUri: string;
+	readonly expectedSessionHash?: string;
+	readonly expectedSessionSchemeHash?: string;
+	readonly expectedProviderHash?: string;
+}
+
+interface EditorSessionCatalogDiagnostics {
+	readonly sessionCount: number;
+	readonly catalogMatchingSessionCount: number;
+	readonly matchedSessionHash?: string;
+	readonly catalogSessionHashMatched: boolean;
+	readonly catalogProviderHash?: string;
+	readonly catalogProviderMatched: boolean;
+	readonly targetWorkspaceHash: string;
+	readonly catalogWorkingDirectoryCount: number;
+	readonly catalogWorkspaceMatched: boolean;
+}
+
+export async function resolveEditorSessionCatalogExpectation(
+	node: Pick<WindowNodeClient, 'resolve'>,
+	params: Record<string, unknown>,
+): Promise<EditorSessionCatalogExpectation> {
+	const workspaceId = requiredUuid(params, 'expectedWorkspaceId');
+	const expectedSessionHash = optionalFingerprint(params, 'expectedSessionHash');
+	const expectedSessionSchemeHash = optionalFingerprint(params, 'expectedSessionSchemeHash');
+	const expectedProviderHash = optionalFingerprint(params, 'expectedProviderHash');
+	if ((expectedSessionSchemeHash !== undefined || expectedProviderHash !== undefined) && expectedSessionHash === undefined) {
+		throw new TypeError('The expected Session provider and scheme require an observed Session fingerprint.');
+	}
+	const workspace = await node.resolve(workspaceId);
+	if (
+		workspace?.workspaceId !== workspaceId
+		|| !matchesEditorSessionWorkspace([workspace.uri], workspace.uri)
+	) {
+		throw new Error('The expected catalog Workspace is not registered in this Window Node.');
+	}
+	return {
+		workspaceUri: workspace.uri,
+		...(expectedSessionHash === undefined ? {} : { expectedSessionHash }),
+		...(expectedSessionSchemeHash === undefined ? {} : { expectedSessionSchemeHash }),
+		...(expectedProviderHash === undefined ? {} : { expectedProviderHash }),
+	};
+}
+
+export function projectEditorSessionCatalog(
+	sessions: readonly AhpSessionSummary[],
+	expected: EditorSessionCatalogExpectation,
+): EditorSessionCatalogDiagnostics {
+	const matches = expected.expectedSessionHash === undefined
+		? []
+		: sessions.filter(({ resource }) =>
+			typeof resource === 'string'
+			&& resource.length > 0
+			&& resource.length <= 2_048
+			&& fingerprint('agent-session', resource) === expected.expectedSessionHash);
+	const candidate = matches.length === 1 ? matches[0] : undefined;
+	const session = typeof candidate?.status === 'number'
+		&& Number.isSafeInteger(candidate.status)
+		&& candidate.status >= 0
+		&& candidate.status <= 0x7fff_ffff
+		&& isUsableTerminalSessionStatus(candidate.status)
+		? candidate
+		: undefined;
+	const catalogProviderHash = providerFingerprint(session?.provider);
+	const catalogProviderMatched = catalogProviderHash !== undefined
+		&& catalogProviderHash === expected.expectedProviderHash
+		&& catalogProviderHash === expected.expectedSessionSchemeHash
+		&& catalogProviderHash === sessionSchemeFingerprint(session?.resource);
+	return {
+		sessionCount: sessions.length,
+		catalogMatchingSessionCount: matches.length,
+		...(session === undefined
+			? {}
+			: { matchedSessionHash: fingerprint('agent-session', session.resource) }),
+		catalogSessionHashMatched: session !== undefined,
+		...(catalogProviderHash === undefined ? {} : { catalogProviderHash }),
+		catalogProviderMatched,
+		targetWorkspaceHash: fingerprint('agent-workspace', expected.workspaceUri),
+		catalogWorkingDirectoryCount: Array.isArray(session?.workingDirectories)
+			? session.workingDirectories.length
+			: 0,
+		catalogWorkspaceMatched: session !== undefined
+			&& matchesEditorSessionWorkspace(session.workingDirectories, expected.workspaceUri),
+	};
+}
+
 async function editorSessionCatalog(
 	options: PeerDelegationE2eApiOptions,
-): Promise<{
+	expected: EditorSessionCatalogExpectation,
+): Promise<Partial<EditorSessionCatalogDiagnostics> & {
 	readonly available: boolean;
 	readonly source: 'editor';
 	readonly protocolOffer?: readonly string[];
 	readonly selectedProtocolVersion?: string;
-	readonly sessionCount?: number;
-	readonly sessionHashes?: readonly string[];
 	readonly errorCode?: 'EDITOR_CATALOG_UNAVAILABLE' | 'EDITOR_CATALOG_CLEANUP_FAILED';
 }> {
 	const configuration = options.vscodeApi.workspace.getConfiguration('copilotAgentMesh');
@@ -459,14 +553,12 @@ async function editorSessionCatalog(
 	let host: LaunchedAgentHost | undefined;
 	let connection: AhpConnection | undefined;
 	let result:
-		| {
+		| (EditorSessionCatalogDiagnostics & {
 			readonly available: true;
 			readonly source: 'editor';
 			readonly protocolOffer: readonly string[];
 			readonly selectedProtocolVersion: string;
-			readonly sessionCount: number;
-			readonly sessionHashes: readonly string[];
-		}
+		})
 		| {
 			readonly available: false;
 			readonly source: 'editor';
@@ -533,11 +625,7 @@ async function editorSessionCatalog(
 			source: 'editor',
 			protocolOffer: connection.protocolPolicy.offer,
 			selectedProtocolVersion,
-			sessionCount: sessions.length,
-			sessionHashes: sessions
-				.filter(({ status }) => status !== undefined && isUsableTerminalSessionStatus(status))
-				.map(({ resource }) => fingerprint('agent-session', resource))
-				.sort(),
+			...projectEditorSessionCatalog(sessions, expected),
 		};
 	} catch (error: unknown) {
 		const errorKind = classifyEditorCatalogError(error);
@@ -629,6 +717,17 @@ function requiredUuid(params: Record<string, unknown>, key: string): string {
 	const value = requiredString(params, key);
 	if (!uuidPattern.test(value)) {
 		throw new TypeError(`${key} must be a canonical UUID.`);
+	}
+	return value;
+}
+
+function optionalFingerprint(params: Record<string, unknown>, key: string): string | undefined {
+	const value = params[key];
+	if (value === undefined) {
+		return undefined;
+	}
+	if (typeof value !== 'string' || !fingerprintPattern.test(value)) {
+		throw new TypeError(`${key} must be a truncated fingerprint.`);
 	}
 	return value;
 }

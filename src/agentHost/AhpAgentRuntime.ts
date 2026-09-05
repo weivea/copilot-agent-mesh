@@ -16,6 +16,12 @@ import type {
 
 import { AhpEventMapper } from './AhpEventMapper';
 import {
+	createAgentSessionIdentity,
+	EditorSessionPolicy,
+	EditorSessionPolicyError,
+	type AgentSessionIdentity,
+} from './EditorSessionPolicy';
+import {
 	AgentRuntimeError,
 	AsyncEventQueueCapacityError,
 	createAgentRuntimeEventQueue,
@@ -95,6 +101,8 @@ export interface AhpInitializeResult {
 export interface AhpSessionSummary {
 	readonly resource: string;
 	readonly status?: number;
+	readonly provider?: string;
+	readonly workingDirectories?: readonly string[];
 }
 
 export interface AhpSessionPage {
@@ -114,6 +122,7 @@ export interface AhpConnection {
 	}>;
 	attachSubscription(uri: string): AhpSubscription;
 	subscribe(uri: string, signal?: AbortSignal): Promise<{ readonly snapshot?: Snapshot; readonly subscription: AhpSubscription }>;
+	readSessionSnapshot(uri: string): Promise<Snapshot | undefined>;
 	authenticate(resource: string, token: string, scopes: readonly string[]): Promise<void>;
 	resolveSessionConfig(provider: string, workingDirectory: string, config: Readonly<Record<string, unknown>>): Promise<{
 		readonly schema: SessionConfigSchema;
@@ -579,6 +588,12 @@ class SdkAhpConnection implements AhpConnection {
 		});
 	}
 
+	async readSessionSnapshot(uri: string): Promise<Snapshot | undefined> {
+		// Re-read the existing channel without attaching another local iterator.
+		const result = await this.client.request('subscribe', { channel: uri });
+		return result.snapshot;
+	}
+
 	async resolveSessionConfig(
 		provider: string,
 		workingDirectory: string,
@@ -640,7 +655,12 @@ class SdkAhpConnection implements AhpConnection {
 			...(cursor === undefined ? {} : { cursor }),
 		});
 		return {
-			items: result.items.map(({ resource, status }) => ({ resource, status })),
+			items: result.items.map(({ resource, status, provider, workingDirectories }) => ({
+				resource,
+				status,
+				provider,
+				...(workingDirectories === undefined ? {} : { workingDirectories: [...workingDirectories] }),
+			})),
 			...(result.nextCursor === undefined ? {} : { nextCursor: result.nextCursor }),
 		};
 	}
@@ -727,7 +747,11 @@ class AhpTask implements AgentTaskHandle {
 	readonly taskId: string;
 	private readonly mapper = new AhpEventMapper();
 	private readonly clientId = `copilot-agent-mesh-${randomUUID()}`;
-	private readonly sessionUri = `ahp-session:/${randomUUID()}`;
+	private readonly sessionId = randomUUID();
+	private sessionIdentity: AgentSessionIdentity | undefined;
+	private editorSessionPolicy: EditorSessionPolicy | undefined;
+	private sessionPolicyFailure: AgentRuntimeError | undefined;
+	private readonly editorPolicyRefreshes = new WeakMap<AhpConnection, Promise<void>>();
 	private subscriptions = new Map<string, AhpSubscription>();
 	private readonly staleConnections = new Set<AhpConnection>();
 	private connection: AhpConnection;
@@ -825,6 +849,13 @@ class AhpTask implements AgentTaskHandle {
 		};
 	}
 
+	private get sessionUri(): string {
+		if (this.sessionIdentity === undefined) {
+			throw new AgentRuntimeError('TASK_EXECUTION_FAILED', 'The Agent Session identity has not been selected.');
+		}
+		return this.sessionIdentity.uri;
+	}
+
 	get recovery(): AgentRecoveryDescriptor {
 		return {
 			clientId: this.clientId,
@@ -869,6 +900,10 @@ class AhpTask implements AgentTaskHandle {
 		}
 		const root = parseRootState(rootSnapshot);
 		this.provider = selectProvider(root.agents, this.request.providerId);
+		this.sessionIdentity = createAgentSessionIdentity(this.host.source, this.provider.provider, this.sessionId);
+		if (this.host.source === 'editor') {
+			this.editorSessionPolicy = new EditorSessionPolicy(this.sessionIdentity, this.request.workspace.uri);
+		}
 		this.rootTerminals = root.terminals ?? [];
 		this.startSubscription(rootUri, rootSubscription, this.generation);
 		await this.authenticate(this.provider.protectedResources ?? [], 'initial', this.request.allowInteractiveAuthentication === true);
@@ -894,6 +929,7 @@ class AhpTask implements AgentTaskHandle {
 		this.throwIfTerminalError();
 
 		await this.ensureStartupSubscription(this.sessionUri);
+		this.editorSessionPolicy?.assertCurrentState();
 		if (this.request.sourceWindowName !== undefined) {
 			await this.dispatchAcknowledged(this.sessionUri, {
 				type: 'session/titleChanged',
@@ -928,6 +964,7 @@ class AhpTask implements AgentTaskHandle {
 				}
 				continue;
 			}
+			this.editorSessionPolicy?.assertCurrentState();
 			this.turnId = randomUUID();
 			this.chatUri = defaultChat;
 			this.dispatchTracked(defaultChat, {
@@ -1050,7 +1087,7 @@ class AhpTask implements AgentTaskHandle {
 				closed: false,
 				unsubscribed: this.shutdownConnections.has(this.connection)
 					|| (
-						uri === this.sessionUri
+						uri === this.sessionIdentity?.uri
 						&& this.terminalSessionUnsubscribedConnections.has(this.connection)
 					),
 			},
@@ -1195,12 +1232,13 @@ class AhpTask implements AgentTaskHandle {
 
 	private async resolveConfig(): Promise<Readonly<Record<string, unknown>>> {
 		const provider = this.provider!;
-		let config: Readonly<Record<string, unknown>> = {};
+		let config: Readonly<Record<string, unknown>> = this.editorSessionPolicy?.constrainConfiguration({}) ?? {};
 		for (let iteration = 0; iteration < 16; iteration += 1) {
 			const resolved = await this.withAuthenticationRetry(
 				() => this.connection.resolveSessionConfig(provider.provider, this.request.workspace.uri, config),
 				'challenge',
 			);
+			this.editorSessionPolicy?.assertResolvedConfiguration(resolved.schema, resolved.values);
 			const missing = resolved.schema.required?.filter((id) => resolved.values[id] === undefined) ?? [];
 			if (missing.length === 0) {
 				return resolved.values;
@@ -1227,13 +1265,14 @@ class AhpTask implements AgentTaskHandle {
 				}),
 				signal,
 			);
-			if (stableJson(next) === stableJson(config)) {
+			const constrained = this.editorSessionPolicy?.constrainConfiguration(next) ?? next;
+			if (stableJson(constrained) === stableJson(config)) {
 				throw new AgentRuntimeError(
 					'AGENT_CONFIG_REQUIRED',
 					`Agent session configuration remains incomplete: ${missing.join(', ')}.`,
 				);
 			}
-			config = next;
+			config = constrained;
 		}
 		throw new AgentRuntimeError('AGENT_CONFIG_REQUIRED', 'Agent session configuration did not converge.');
 	}
@@ -1461,10 +1500,14 @@ class AhpTask implements AgentTaskHandle {
 						? mismatch
 						: combineRuntimeErrors(mismatch, cleanupFailure(failures));
 				}
+			}
+			generation.subscriptions.set(uri, result.subscription);
+			if (result.snapshot !== undefined) {
 				await this.applySnapshot(result.snapshot);
 			}
 			this.throwIfTerminalError();
 			if (!this.isCurrentGeneration(generation)) {
+				generation.subscriptions.delete(uri);
 				await unsubscribeThenClose(
 					generation.connection,
 					uri,
@@ -1472,7 +1515,6 @@ class AhpTask implements AgentTaskHandle {
 				).catch(() => undefined);
 				continue;
 			}
-			generation.subscriptions.set(uri, result.subscription);
 			this.startSubscription(uri, result.subscription, generation);
 			return;
 		}
@@ -1570,7 +1612,9 @@ class AhpTask implements AgentTaskHandle {
 				&& this.isCurrentGeneration(generation)
 				&& !this.isSubscriptionDeparting(generation.connection, uri)
 			) {
-				if (error instanceof AsyncEventQueueCapacityError) {
+				if (error instanceof EditorSessionPolicyError) {
+					this.fail(this.requestSessionPolicyCancellation(error, generation.connection));
+				} else if (error instanceof AsyncEventQueueCapacityError) {
 					this.fail(new AgentRuntimeError(
 						'TASK_EXECUTION_FAILED',
 						'The Agent Host emitted a control event larger than the runtime safety limit.',
@@ -1605,6 +1649,9 @@ class AhpTask implements AgentTaskHandle {
 	): Promise<void> {
 		this.lastSeenServerSeq = Math.max(this.lastSeenServerSeq, envelope.serverSeq);
 		this.acknowledgeDispatch(envelope);
+		if (this.sessionPolicyFailure !== undefined) {
+			return;
+		}
 		const action = envelope.action;
 		this.trackDelegatedToolInvocation(envelope);
 		if (envelope.channel === rootUri) {
@@ -1628,8 +1675,12 @@ class AhpTask implements AgentTaskHandle {
 				this.defaultChatReject?.(error);
 				this.fail(error);
 			} else {
+				if (envelope.rejectionReason === undefined) {
+					this.editorSessionPolicy?.acceptAction(action);
+				}
 				this.observeHostSession(envelope.channel);
 				if (action.type === 'session/ready') {
+					await this.refreshEditorSessionPolicy(terminalCatalogConnection);
 					this.markSessionMaterialized();
 				}
 				if (action.type === 'session/defaultChatChanged') {
@@ -1696,6 +1747,9 @@ class AhpTask implements AgentTaskHandle {
 			if (this.disposed) {
 				return;
 			}
+			if (error instanceof EditorSessionPolicyError) {
+				this.sessionPolicyFailure = error;
+			}
 			if (type === 'chat/turnComplete') {
 				this.fail(normalizeRuntimeError(error));
 				return;
@@ -1709,6 +1763,10 @@ class AhpTask implements AgentTaskHandle {
 		connection = this.connection,
 		sessionSubscription?: AhpSubscription,
 	): Promise<void> {
+		if (this.sessionPolicyFailure !== undefined) {
+			throw this.sessionPolicyFailure;
+		}
+		this.editorSessionPolicy?.assertCurrentState();
 		if (this.host.preserveTerminalSession !== true) {
 			this.authoritativeTurnTerminal = true;
 			return;
@@ -1724,14 +1782,65 @@ class AhpTask implements AgentTaskHandle {
 				this.terminalPreparationAbort.signal,
 			);
 		}
+		if (this.sessionPolicyFailure !== undefined) {
+			throw this.sessionPolicyFailure;
+		}
+		this.editorSessionPolicy?.assertCurrentState();
 		if (!this.terminalSessionClientLeft) {
+			await this.refreshEditorSessionPolicy(connection);
 			await this.detachTerminalSessionClient(
 				connection,
 				this.terminalPreparationAbort.signal,
 				sessionSubscription,
 			);
 		}
+		if (this.sessionPolicyFailure !== undefined) {
+			throw this.sessionPolicyFailure;
+		}
+		this.editorSessionPolicy?.assertCurrentState();
 		this.authoritativeTurnTerminal = true;
+	}
+
+	private refreshEditorSessionPolicy(connection: AhpConnection): Promise<void> {
+		const policy = this.editorSessionPolicy;
+		if (
+			policy === undefined
+			|| this.terminal
+			|| this.disposed
+			|| this.terminalSessionDepartingConnections.has(connection)
+			|| this.terminalSessionUnsubscribedConnections.has(connection)
+		) {
+			return Promise.resolve();
+		}
+		// VS Code materialization updates directory metadata without a directory action.
+		// Serialize re-reads because concurrent subscribe RPCs can cancel one another.
+		const previous = this.editorPolicyRefreshes.get(connection) ?? Promise.resolve();
+		const operation = previous.then(async () => {
+			if (this.terminal || this.disposed || this.terminalSessionDepartingConnections.has(connection)) {
+				return;
+			}
+			const snapshot = await withAbortableTimeout(
+				(signal) => abortableConfigurationResolution(connection.readSessionSnapshot(this.sessionUri), signal),
+				actionAcknowledgementTimeoutMs,
+				'The editor Agent Session workspace policy could not be refreshed.',
+				this.terminalPreparationAbort.signal,
+			);
+			if (this.sessionPolicyFailure !== undefined) {
+				throw this.sessionPolicyFailure;
+			}
+			if (snapshot?.resource !== this.sessionUri) {
+				throw new EditorSessionPolicyError();
+			}
+			policy.acceptSnapshot(snapshot);
+		});
+		this.editorPolicyRefreshes.set(connection, operation);
+		const clear = () => {
+			if (this.editorPolicyRefreshes.get(connection) === operation) {
+				this.editorPolicyRefreshes.delete(connection);
+			}
+		};
+		void operation.then(clear, clear);
+		return operation;
 	}
 
 	private async detachTerminalSessionClient(
@@ -1915,6 +2024,7 @@ class AhpTask implements AgentTaskHandle {
 				taskId: this.taskId,
 				eventType: 'session/hostObserved',
 				sessionUri,
+				provider: this.sessionIdentity?.provider,
 				source: this.host.source ?? 'standalone',
 				protocolOffer: this.connection.protocolPolicy.offer,
 				selectedProtocolVersion: this.negotiatedProtocolVersion!,
@@ -1968,6 +2078,7 @@ class AhpTask implements AgentTaskHandle {
 					safeMessage(state.creationError?.message ?? 'Agent session creation failed.'),
 				);
 			}
+			this.editorSessionPolicy?.acceptSnapshot(snapshot);
 			if (lifecycle === 'ready') {
 				this.markSessionMaterialized();
 			}
@@ -2600,6 +2711,9 @@ class AhpTask implements AgentTaskHandle {
 					'The Agent Host task could not be recovered because its Host or Session is unavailable.',
 				)
 				: normalizeRuntimeError(error);
+			if (!stopped && error instanceof EditorSessionPolicyError && candidate !== undefined) {
+				failure = this.requestSessionPolicyCancellation(error, candidate);
+			}
 			if (candidate !== undefined && candidate !== this.connection) {
 				if (candidateGeneration !== undefined) {
 					candidateGeneration.valid = false;
@@ -2611,6 +2725,7 @@ class AhpTask implements AgentTaskHandle {
 					recoveredSubscriptions,
 					candidateAbortShutdown,
 					() => this.retainedRecoveryCandidates.delete(retainedCandidate),
+					error instanceof EditorSessionPolicyError ? this.sessionUri : undefined,
 				);
 				this.retainedRecoveryCandidates.add(retainedCandidate);
 				try {
@@ -2683,6 +2798,24 @@ class AhpTask implements AgentTaskHandle {
 		void this.events.pushAndClose({ type: 'failed', error }).then(() => this.finishTerminal());
 	}
 
+	private requestSessionPolicyCancellation(
+		error: EditorSessionPolicyError,
+		connection: AhpConnection,
+	): AgentRuntimeError {
+		this.sessionPolicyFailure = error;
+		if (this.chatUri === undefined || this.turnId === undefined || this.terminal || this.disposed) {
+			return error;
+		}
+		try {
+			const action = { type: 'chat/turnCancelled', turnId: this.turnId, duration: 0 } as const;
+			this.assertActionSupported(action, connection);
+			connection.dispatch(this.chatUri, action, this.nextClientSeq++);
+			return error;
+		} catch (cancellationError: unknown) {
+			return combineRuntimeErrors(error, normalizeRuntimeError(cancellationError));
+		}
+	}
+
 	private finishTerminal(): void {
 		this.terminal = true;
 		this.clearDelegatedToolInvocations();
@@ -2749,7 +2882,9 @@ class AhpTask implements AgentTaskHandle {
 	}
 
 	private clearDelegatedToolInvocations(): void {
-		this.delegatedToolInvocations?.clearScope(this.sessionUri);
+		if (this.sessionIdentity !== undefined) {
+			this.delegatedToolInvocations?.clearScope(this.sessionIdentity.uri);
+		}
 	}
 }
 
@@ -2933,12 +3068,14 @@ class RecoveryCandidateCleanup {
 	private shutdownComplete = false;
 	private disposal: Promise<void> | undefined;
 	private disposed = false;
+	private sessionDisposed = false;
 
 	constructor(
 		private readonly connection: AhpConnection,
 		subscriptions: ReadonlyMap<string, AhpSubscription>,
 		private initialShutdown: Promise<void> | undefined,
 		private readonly didDispose: () => void,
+		private readonly invalidSessionUri?: string,
 	) {
 		this.subscriptions = new Map([...subscriptions].map(([uri, subscription]) => [
 			uri,
@@ -2959,6 +3096,15 @@ class RecoveryCandidateCleanup {
 	}
 
 	private async disposeOwned(): Promise<void> {
+		if (this.invalidSessionUri !== undefined && !this.sessionDisposed) {
+			await runCleanupPhase([{
+				label: 'dispose recovery Session with an invalid editor workspace policy',
+				run: async () => {
+					await this.connection.disposeSession(this.invalidSessionUri!);
+					this.sessionDisposed = true;
+				},
+			}]);
+		}
 		if (this.initialShutdown !== undefined && !this.shutdownComplete) {
 			try {
 				await this.initialShutdown;

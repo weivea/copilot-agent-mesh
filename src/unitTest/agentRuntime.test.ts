@@ -4,9 +4,11 @@ import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { pathToFileURL } from 'node:url';
 
 import type {
 	ActionEnvelope,
+	SessionConfigPropertySchema,
 	SessionConfigSchema,
 	Snapshot,
 } from '@microsoft/agent-host-protocol' with { 'resolution-mode': 'import' };
@@ -65,7 +67,7 @@ import {
 } from '../agentHost/AuthBroker';
 import { OwnedCommandError } from '../spikes/ownedProcess';
 
-const workspaceUri = 'file:///tmp/copilot-agent-mesh-safe-workspace';
+const workspaceUri = pathToFileURL(join(tmpdir(), 'copilot-agent-mesh-safe-workspace')).href;
 const protectedResource = {
 	resource: 'https://agent.example.test',
 	resource_name: 'Example Agent',
@@ -495,6 +497,7 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 			taskId: 'task-1',
 			eventType: 'session/hostObserved',
 			sessionUri: handle.recovery.sessionUri,
+			provider: 'dynamic-provider',
 			source: 'standalone',
 			protocolOffer: ['1.0.0'],
 			selectedProtocolVersion: '1.0.0',
@@ -1059,6 +1062,358 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 		await handle.dispose();
 		assert.equal(transport.shutdownCalls, 1);
 	});
+
+test('Editor startup fixes native identity and preserves folder policy through dynamic configuration', async () => {
+	const transport = new FakeAhpTransport();
+	transport.providerId = 'copilotcli';
+	transport.completeAfterTurnDispatch = true;
+	const runtime = createRuntime(editorLauncher(), new FakeConnectionFactory([transport]));
+	const handle = await runtime.start(taskRequest());
+	assert.match(handle.recovery.sessionUri, /^copilotcli:\/[a-f0-9-]+$/u);
+	assert.equal(transport.created?.provider, 'copilotcli');
+	assert.deepEqual(transport.created?.workingDirectories, [workspaceUri]);
+	assert.deepEqual(transport.created?.config, { model: 'test-model', isolation: 'folder' });
+	assert.equal(transport.configRequests.length, 2);
+	assert.ok(transport.configRequests.every((config) => config.isolation === 'folder'));
+	const events = [];
+	for await (const event of handle.events) {
+		events.push(event);
+	}
+	assert.equal(events.at(-1)?.type, 'completed');
+	await handle.dispose();
+	assert.equal(transport.disposeSessionCalls, 0);
+	await runtime.dispose();
+});
+
+test('Editor applies folder policy when Host defaults already satisfy all required configuration', async () => {
+	const transport = new FakeAhpTransport();
+	transport.resolvedConfigOverrides = { model: 'auto' };
+	transport.completeAfterTurnDispatch = true;
+	const runtime = createRuntime(editorLauncher(), new FakeConnectionFactory([transport]));
+	const handle = await runtime.start(taskRequest());
+	assert.equal(transport.resolveConfigCalls, 1);
+	assert.deepEqual(transport.created?.config, { isolation: 'folder', model: 'auto' });
+	for await (const event of handle.events) {
+		assert.notEqual(event.type, 'failed');
+	}
+	await handle.dispose();
+	await runtime.dispose();
+});
+
+test('Editor startup accepts a read-only folder configuration', async () => {
+	const transport = new FakeAhpTransport();
+	transport.isolationSchema = { type: 'string', title: 'Isolation', enum: ['folder'], readOnly: true };
+	transport.completeAfterTurnDispatch = true;
+	const runtime = createRuntime(editorLauncher(), new FakeConnectionFactory([transport]));
+	const handle = await runtime.start(taskRequest());
+	for await (const event of handle.events) {
+		assert.notEqual(event.type, 'failed');
+	}
+	assert.equal(transport.created?.config.isolation, 'folder');
+	await handle.dispose();
+	await runtime.dispose();
+});
+
+for (const { name, configure } of [
+	{ name: 'missing schema', configure: (transport: FakeAhpTransport) => { transport.isolationSchema = undefined; } },
+	{ name: 'unsupported value', configure: (transport: FakeAhpTransport) => {
+		transport.isolationSchema = { type: 'string', title: 'Isolation', enum: ['worktree'] };
+	} },
+	{ name: 'Host overrides folder', configure: (transport: FakeAhpTransport) => {
+		transport.resolvedConfigOverrides = { isolation: 'worktree' };
+	} },
+	{ name: 'Host omits isolation', configure: (transport: FakeAhpTransport) => {
+		transport.resolvedConfigOverrides = { isolation: undefined };
+	} },
+]) {
+	test(`Editor rejects ${name} before creating a Session`, async () => {
+		const transport = new FakeAhpTransport();
+		configure(transport);
+		const runtime = createRuntime(editorLauncher(), new FakeConnectionFactory([transport]));
+		await assert.rejects(
+			runtime.start(taskRequest()),
+			(error: unknown) => error instanceof AgentRuntimeError && error.code === 'AGENT_CONFIG_REQUIRED',
+		);
+		assert.equal(transport.createSessionCalls, 0);
+		assert.equal(transport.dispatched.length, 0);
+		assert.equal(transport.shutdownCalls, 1);
+		await runtime.dispose();
+	});
+}
+
+test('invalid native provider fails before identity creation without masking cleanup', async () => {
+	const transport = new FakeAhpTransport();
+	transport.providerId = 'invalid/provider';
+	const registry = new DelegatedToolInvocationRegistry();
+	const runtime = createRuntime(editorLauncher(), new FakeConnectionFactory([transport]), undefined, registry);
+	await assert.rejects(
+		runtime.start(taskRequest()),
+		(error: unknown) => error instanceof AgentRuntimeError && error.code === 'AGENT_CONFIG_REQUIRED',
+	);
+	assert.equal(transport.createSessionCalls, 0);
+	assert.equal(transport.shutdownCalls, 1);
+	await runtime.dispose();
+	registry.dispose();
+});
+
+for (const [name, overrides] of [
+	['wrong provider', { provider: 'other-provider' }],
+	['missing folder config', { config: undefined }],
+	['worktree config', { config: { values: { isolation: 'worktree' } } }],
+	['outside workspace', { workingDirectories: [pathToFileURL(join(tmpdir(), 'outside-target')).href] }],
+	['missing directories', { workingDirectories: undefined }],
+] as const) {
+	test(`Editor rejects a provisional snapshot with ${name} before sending a turn`, async () => {
+		const transport = new FakeAhpTransport();
+		transport.sessionStartsProvisional = true;
+		transport.sessionSnapshotOverrides = overrides;
+		const runtime = createRuntime(editorLauncher(), new FakeConnectionFactory([transport]));
+		await assert.rejects(
+			runtime.start(taskRequest()),
+			(error: unknown) => error instanceof AgentRuntimeError && error.code === 'TASK_EXECUTION_FAILED',
+		);
+		assert.equal(transport.dispatched.some(({ action }) => action.type === 'chat/turnStarted'), false);
+		assert.equal(transport.disposeSessionCalls, 1);
+		assert.ok(transport.unsubscribedUris.includes(transport.created!.sessionUri));
+		assert.ok(transport.cleanupOperations.includes(`close:${transport.created!.sessionUri}`));
+		await runtime.dispose();
+	});
+}
+
+test('Editor provisional Session sends its first turn without waiting for materialization', async () => {
+	const transport = new FakeAhpTransport();
+	transport.sessionStartsProvisional = true;
+	const runtime = createRuntime(editorLauncher(), new FakeConnectionFactory([transport]));
+	const handle = await runtime.start(taskRequest());
+	const snapshot = await transport.readSessionSnapshot(handle.recovery.sessionUri);
+	assert.ok(snapshot);
+	assert.equal(Object.hasOwn(snapshot.state, 'resource'), false);
+	const turnId = currentTurnId(transport);
+	await nextEvent(handle.events);
+	await transport.emitSession({ type: 'session/ready' });
+	await transport.emitChat({ type: 'chat/turnComplete', turnId, duration: 0 });
+	assert.equal((await nextEvent(handle.events)).type, 'completed');
+	await handle.dispose();
+	assert.equal(transport.disposeSessionCalls, 0);
+	await runtime.dispose();
+});
+
+for (const phase of ['materialization', 'completion'] as const) {
+	test(`Editor re-reads authoritative directories at ${phase} even without a directory action`, async () => {
+		const transport = new FakeAhpTransport();
+		transport.sessionStartsProvisional = phase === 'materialization';
+		const runtime = createRuntime(editorLauncher(), new FakeConnectionFactory([transport]));
+		const handle = await runtime.start(taskRequest());
+		await nextEvent(handle.events);
+		transport.sessionSnapshotOverrides = {
+			workingDirectories: [pathToFileURL(join(tmpdir(), 'silently-provisioned-worktree')).href],
+		};
+		if (phase === 'materialization') {
+			await transport.emitSession({ type: 'session/ready' });
+		} else {
+			await transport.emitChat({ type: 'chat/turnComplete', turnId: currentTurnId(transport), duration: 0 });
+		}
+		const failure = await nextEvent(handle.events);
+		assert.equal(failure.type, 'failed');
+		if (failure.type === 'failed') {
+			assert.equal(failure.error.code, 'TASK_EXECUTION_FAILED');
+		}
+		assert.ok(transport.sessionSnapshotReads > 0);
+		assert.equal(
+			transport.dispatched.some(({ action }) => action.type === 'chat/turnCancelled'),
+			phase === 'materialization',
+		);
+		await handle.dispose();
+		assert.equal(transport.disposeSessionCalls, 1);
+		await runtime.dispose();
+	});
+}
+
+test('Editor serializes ready and terminal snapshot re-reads on the same connection', async () => {
+	const transport = new FakeAhpTransport();
+	let activeReads = 0;
+	let maximumReads = 0;
+	const readSnapshot = transport.readSessionSnapshot.bind(transport);
+	transport.readSessionSnapshot = async (uri) => {
+		activeReads += 1;
+		maximumReads = Math.max(maximumReads, activeReads);
+		try {
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			return await readSnapshot(uri);
+		} finally {
+			activeReads -= 1;
+		}
+	};
+	const runtime = createRuntime(editorLauncher(), new FakeConnectionFactory([transport]));
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+	await transport.emitSession({ type: 'session/ready' });
+	await transport.emitChat({ type: 'chat/turnComplete', turnId: currentTurnId(transport), duration: 0 });
+	assert.equal((await nextEvent(handle.events)).type, 'completed');
+	assert.equal(maximumReads, 1);
+	assert.equal(transport.sessionSnapshotReads, 2);
+	await handle.dispose();
+	assert.equal(transport.disposeSessionCalls, 0);
+	await runtime.dispose();
+});
+
+test('Editor disposal aborts a pending policy snapshot read', async () => {
+	const transport = new FakeAhpTransport();
+	let readStarted = false;
+	transport.readSessionSnapshot = () => {
+		readStarted = true;
+		return new Promise(() => undefined);
+	};
+	const runtime = createRuntime(editorLauncher(), new FakeConnectionFactory([transport]));
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+	await transport.emitSession({ type: 'session/ready' });
+	await waitForCondition(() => readStarted);
+	await handle.dispose();
+	assert.equal(transport.shutdownCalls, 1);
+	assert.equal(transport.disposeSessionCalls, 1);
+	await runtime.dispose();
+});
+
+test('Editor policy failure during terminal detachment cannot preserve an invalid Session', async () => {
+	const transport = new FakeAhpTransport();
+	const runtime = createRuntime(editorLauncher(), new FakeConnectionFactory([transport]));
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+	transport.ackDispatches = false;
+	await transport.emitChat({ type: 'chat/turnComplete', turnId: currentTurnId(transport), duration: 0 });
+	await waitForCondition(() => transport.dispatched.some(({ action }) => action.type === 'session/activeClientRemoved'));
+	await transport.emitSession({
+		type: 'session/workingDirectoryReplaced', directory: workspaceUri,
+		replacement: pathToFileURL(join(tmpdir(), 'late-workspace-change')).href,
+	});
+	assert.equal((await nextEvent(handle.events)).type, 'failed');
+	await handle.dispose();
+	assert.equal(transport.disposeSessionCalls, 1);
+	await runtime.dispose();
+});
+
+for (const [name, action] of [
+	['directory addition', { type: 'session/workingDirectorySet', directory: 'file:///outside' }],
+	['directory removal', { type: 'session/workingDirectoryRemoved', directory: workspaceUri }],
+	['directory replacement', {
+		type: 'session/workingDirectoryReplaced', directory: workspaceUri, replacement: 'file:///outside',
+	}],
+	['worktree config', { type: 'session/configChanged', config: { isolation: 'worktree' } }],
+	['config replacement', { type: 'session/configChanged', config: { model: 'auto' }, replace: true }],
+] as const) {
+	test(`Editor ${name} stops the exact turn instead of recovering or reporting success`, async () => {
+		const transport = new FakeAhpTransport();
+		const factory = new FakeConnectionFactory([transport]);
+		const runtime = createRuntime(editorLauncher(), factory);
+		const handle = await runtime.start(taskRequest());
+		const turnId = currentTurnId(transport);
+		await nextEvent(handle.events);
+		await transport.emitSession(action);
+		const failure = await nextEvent(handle.events);
+		assert.equal(failure.type, 'failed');
+		if (failure.type === 'failed') {
+			assert.equal(failure.error.code, 'TASK_EXECUTION_FAILED');
+			assert.equal(failure.error.message.includes(workspaceUri), false);
+		}
+		assert.equal(factory.connectCalls, 1);
+		assert.deepEqual(transport.dispatched.at(-1)?.action, {
+			type: 'chat/turnCancelled', turnId, duration: 0,
+		});
+		await handle.dispose();
+		assert.equal(transport.disposeSessionCalls, 1);
+		await runtime.dispose();
+	});
+}
+
+test('rejected Session config changes retain the existing Host rejection failure', async () => {
+	const transport = new FakeAhpTransport();
+	const runtime = createRuntime(editorLauncher(), new FakeConnectionFactory([transport]));
+	const handle = await runtime.start(taskRequest());
+	await nextEvent(handle.events);
+	await transport.emitSessionRejection({ type: 'session/configChanged', config: { isolation: 'worktree' } });
+	const failure = await nextEvent(handle.events);
+	assert.equal(failure.type, 'failed');
+	if (failure.type === 'failed') {
+		assert.match(failure.error.message, /rejected an action/u);
+	}
+	assert.equal(transport.dispatched.some(({ action }) => action.type === 'chat/turnCancelled'), false);
+	await handle.dispose();
+	assert.equal(transport.disposeSessionCalls, 1);
+	await runtime.dispose();
+});
+
+for (const outcome of ['valid', 'wrong-workspace', 'cleanup-retry'] as const) {
+	test(`Editor recovery ${outcome} keeps the original identity and enforces its workspace`, async () => {
+		const first = new FakeAhpTransport();
+		const recovered = new FakeAhpTransport();
+		const runtime = createRuntime(editorLauncher(), new FakeConnectionFactory([first, recovered]));
+		const handle = await runtime.start(taskRequest());
+		const sessionUri = handle.recovery.sessionUri;
+		const turnId = currentTurnId(first);
+		await nextEvent(handle.events);
+		recovered.created = first.created;
+		if (outcome === 'cleanup-retry') {
+			recovered.disposeSessionFailures = 1;
+		}
+		recovered.reconnectResult = {
+			type: 'snapshot',
+			snapshots: [
+				{
+					resource: 'ahp-root://', fromSeq: 20,
+					state: { agents: [{
+						provider: 'dynamic-provider', displayName: 'Dynamic Provider', description: 'Test', models: [],
+					}] },
+				} as Snapshot,
+				{
+					resource: sessionUri, fromSeq: 20,
+					state: {
+						provider: 'dynamic-provider',
+						title: 'Task', status: 8, lifecycle: 'ready',
+						activeClients: [], chats: [], defaultChat: 'ahp-chat:/default',
+						config: { schema: { type: 'object', properties: {} }, values: { ...first.created!.config } },
+						workingDirectories: outcome === 'valid'
+							? [workspaceUri]
+							: [pathToFileURL(join(tmpdir(), 'outside-target')).href],
+					},
+				} as Snapshot,
+				{
+					resource: 'ahp-chat:/default', fromSeq: 20,
+					state: {
+						resource: 'ahp-chat:/default', title: 'Task', status: 8,
+						modifiedAt: new Date(0).toISOString(),
+						activeTurn: {
+							id: turnId, startedAt: new Date(0).toISOString(),
+							message: { text: 'safe', origin: { kind: 'user' } }, responseParts: [], usage: undefined,
+						},
+						turns: [],
+					},
+				} as Snapshot,
+			],
+		};
+		first.failChat();
+		assert.deepEqual(await nextEvent(handle.events), { type: 'progress', message: 'Reconnecting to Agent Host.' });
+		if (outcome === 'valid') {
+			assert.deepEqual(await nextEvent(handle.events), {
+				type: 'progress', message: 'Agent Host connection recovered.',
+			});
+			assert.equal(handle.recovery.sessionUri, sessionUri);
+			assert.equal(recovered.createSessionCalls, 0);
+			assert.equal(recovered.dispatched.some(({ action }) => action.type === 'chat/turnStarted'), false);
+			await recovered.emitChat({ type: 'chat/turnComplete', turnId, duration: 0 });
+			assert.equal((await nextEvent(handle.events)).type, 'completed');
+		} else {
+			assert.equal((await nextEvent(handle.events)).type, 'failed');
+			assert.deepEqual(recovered.dispatched.at(-1)?.action, {
+				type: 'chat/turnCancelled', turnId, duration: 0,
+			});
+		}
+		await handle.dispose();
+		assert.equal(recovered.disposeSessionCalls, outcome === 'valid' ? 0 : outcome === 'cleanup-retry' ? 2 : 1);
+		assert.equal(recovered.shutdownCalls, 1);
+		await runtime.dispose();
+	});
+}
 
 	test('outbound action guard rejects 1.0-only actions under 0.9 without weakening 1.0', async () => {
 		const action = { type: 'chat/turnResume', turnId: 'turn-1' };
@@ -3403,6 +3758,14 @@ for (const outcome of ['decline', 'cancel'] as const) {
 		});
 }
 
+function editorLauncher(): FakeLauncher {
+	const launcher = new FakeLauncher();
+	launcher.host.source = 'editor';
+	launcher.host.registryProtocolVersion = '1.0.0';
+	launcher.host.preserveTerminalSession = true;
+	return launcher;
+}
+
 function createRuntime(
 		launcher: FakeLauncher,
 		connections: AhpConnectionFactory,
@@ -3754,6 +4117,17 @@ class FakeAhpHostCatalog {
 
 class FakeAhpTransport implements AhpConnection {
 	protocolPolicy: AhpProtocolPolicy = { offer: AHP_PROTOCOL_OFFER };
+	providerId = 'dynamic-provider';
+	isolationSchema: SessionConfigPropertySchema | undefined = {
+		type: 'string',
+		title: 'Isolation',
+		enum: ['folder', 'worktree'],
+		default: 'worktree',
+	};
+	resolvedConfigOverrides: Readonly<Record<string, unknown>> = {};
+	sessionSnapshotOverrides: Readonly<Record<string, unknown>> = {};
+	sessionSnapshotReads = 0;
+	readonly configRequests: Readonly<Record<string, unknown>>[] = [];
 	initialized = false;
 	initializedClientId = '';
 	ackDispatches = true;
@@ -3793,6 +4167,7 @@ class FakeAhpTransport implements AhpConnection {
 	notificationDuringInitialize: readonly ProtectedResource[] = [];
 	rootAttachedBeforeInitialize = false;
 	disposeSessionCalls = 0;
+	disposeSessionFailures = 0;
 	shutdownCalls = 0;
 
 	assertActionSupported(action: unknown, selected: '1.0.0' | '0.9.0'): void {
@@ -3862,7 +4237,7 @@ class FakeAhpTransport implements AhpConnection {
 				fromSeq: 1,
 				state: {
 					agents: [{
-						provider: 'dynamic-provider',
+						provider: this.providerId,
 						displayName: 'Dynamic Provider',
 						description: 'Test provider',
 						models: [],
@@ -3930,7 +4305,7 @@ class FakeAhpTransport implements AhpConnection {
 	}> {
 		this.assertOpen();
 		this.subscribeAttempts.push(uri);
-		if (this.blockSessionSubscriptions && uri.startsWith('ahp-session:') && !this.subscribeBarriers.has(uri)) {
+		if (this.blockSessionSubscriptions && uri === this.created?.sessionUri && !this.subscribeBarriers.has(uri)) {
 			this.blockSubscribe(uri);
 		}
 		const barrier = this.subscribeBarriers.get(uri);
@@ -3946,15 +4321,19 @@ class FakeAhpTransport implements AhpConnection {
 			}
 		}
 		this.subscribedUris.push(uri);
-		if (uri.startsWith('ahp-session:')) {
+		if (uri === this.created?.sessionUri) {
 			const resource = this.sessionSnapshotResource ?? uri;
 			return {
 				snapshot: {
 					resource,
 					fromSeq: 2,
 					state: {
-						resource,
-						provider: 'dynamic-provider',
+						provider: this.created.provider,
+						workingDirectories: [...this.created.workingDirectories],
+						config: {
+							schema: { type: 'object', properties: {} },
+							values: { ...this.created.config },
+						},
 						title: 'Task',
 						status: 1,
 						lifecycle: this.sessionCreationFailed
@@ -3968,6 +4347,7 @@ class FakeAhpTransport implements AhpConnection {
 						activeClients: [],
 						chats: [],
 						defaultChat: this.sessionStartsPending ? undefined : this.sessionDefaultChat,
+						...this.sessionSnapshotOverrides,
 					},
 				} as Snapshot,
 				subscription: this.queue(uri),
@@ -4001,6 +4381,11 @@ class FakeAhpTransport implements AhpConnection {
 		this.authenticated.push({ resource, token, scopes });
 	}
 
+	async readSessionSnapshot(uri: string): Promise<Snapshot | undefined> {
+		this.sessionSnapshotReads += 1;
+		return (await this.subscribe(uri)).snapshot;
+	}
+
 	async resolveSessionConfig(
 		_provider: string,
 		_workingDirectory: string,
@@ -4008,6 +4393,9 @@ class FakeAhpTransport implements AhpConnection {
 	): Promise<{ readonly schema: SessionConfigSchema; readonly values: Record<string, unknown> }> {
 		this.assertOpen();
 		this.resolveConfigCalls += 1;
+		this.configRequests.push({ ...config });
+		const isolation: Record<string, SessionConfigPropertySchema> = this.isolationSchema === undefined
+			? {} : { isolation: this.isolationSchema };
 		if (this.failRootDuringConfig) {
 			this.failRootDuringConfig = false;
 			this.queue('ahp-root://').fail(new Error('startup transport closed'));
@@ -4023,18 +4411,20 @@ class FakeAhpTransport implements AhpConnection {
 				schema: {
 					type: 'object',
 					properties: {
+						...isolation,
 						target: { type: 'string', title: 'Target' },
 						model: { type: 'string', title: 'Model' },
 					},
 					required,
 				},
-				values: { ...config },
+				values: { ...config, ...this.resolvedConfigOverrides },
 			};
 		}
 		return {
 			schema: {
 				type: 'object',
 				properties: {
+					...isolation,
 					model: {
 						type: 'string',
 						title: 'Model',
@@ -4043,7 +4433,7 @@ class FakeAhpTransport implements AhpConnection {
 				},
 				required: ['model'],
 			},
-			values: { ...config },
+			values: { ...config, ...this.resolvedConfigOverrides },
 		};
 	}
 
@@ -4167,6 +4557,10 @@ class FakeAhpTransport implements AhpConnection {
 	async disposeSession(uri: string): Promise<void> {
 		this.assertOpen();
 		this.disposeSessionCalls += 1;
+		if (this.disposeSessionFailures > 0) {
+			this.disposeSessionFailures -= 1;
+			throw new Error('synthetic Session disposal failure');
+		}
 		this.hostCatalog?.dispose(uri);
 	}
 
@@ -4193,6 +4587,17 @@ class FakeAhpTransport implements AhpConnection {
 	emitSession(action: Record<string, unknown>): Promise<boolean> {
 		assert.ok(this.created);
 		return this.emit(this.created.sessionUri, action);
+	}
+
+	emitSessionRejection(action: Record<string, unknown>): Promise<boolean> {
+		assert.ok(this.created);
+		return this.queue(this.created.sessionUri).push({
+			type: 'action',
+			params: {
+				...envelope(this.created.sessionUri, action, 4, { clientId: 'other-client', clientSeq: 1 }),
+				rejectionReason: 'Synthetic rejection.',
+			},
+		});
 	}
 
 	emitRootAuth(resources: readonly ProtectedResource[]): Promise<boolean> {

@@ -31,6 +31,7 @@ extend Worker support beyond macOS arm64 or authorize publication.
 | AHP package | TypeScript package `0.9.0` from pinned upstream commit `f19dd8b3942d029744a3bdd31d830f9428e8ea47`; standalone and registry-1.0 editors offer exact `["1.0.0"]`, registry-0.9 editors offer `["1.0.0","0.9.0"]` | VS Code 1.135.0 selected `1.0.0`; VS Code 1.136.1 selected `0.9.0` and completed a real turn with the same generated client | Pass; upstream revision is not yet tagged or npm-published |
 | AHP authentication | `https://api.github.com` → provider `github`, scopes `read:user`, `user:email` | Dedicated profile exposed a silent session accepted by Agent Host | Pass on tested profile |
 | Editor Agent Host source (0.4.0 P6) | schema-v2 editor endpoint, known registry metadata `1.0.0` or `0.9.0`, Unix socket WebSocket, registry-derived exact protocol policy, selected-version membership validation, and per-action version guards; standalone fallback | Offline strict parser/socket/selector/lifecycle coverage plus live authenticated editor completions on VS Code 1.135.0 (`1.0.0`) and 1.136.1 (`0.9.0`) | Live execution Pass on both versions; Chat Sessions UI visibility remains Unverified |
+| Editor Session identity/workspace policy | Provider-scoped new Session URI, schema-supported folder isolation, and authoritative snapshot re-reads | VS Code 1.136.1 source compatibility plus offline Runtime/SDK coverage; earlier live execution evidence predates this policy | Real target Chat visibility remains Unverified; no history migration |
 | Peer Window Delegation (0.4.0) | Five registered LM Tools, directional allowlist plus target receive gate, one Broker/two ordinary windows, editor-first AHP | Real VS Code 1.135.0/macOS arm64 objective run passed AC-5 1-4, 6, 8-12, needs-input resume, token cancellation, short-budget cancellation, and cleanup against the existing full-Catalog authenticated profile | 10/12 objective items Pass; Copilot confirmation/same-Chat UI items Unverified |
 | Dev Tunnel CLI | Exact macOS arm64 build `1.0.2030+fc9273aa0f` | Existing exact-build lifecycle evidence; multi-window local route kept Listener/Tunnel stopped | Pass on macOS arm64 only |
 | Remote v2 route | One device Gateway/Tunnel → Broker → explicit Window Node | Historical two-device pairing/discovery and durable acceptance passed; its disposable Worker profile then stopped at `AGENT_AUTH_REQUIRED` | Transport/routing pass; authenticated two-device execution not yet run |
@@ -67,6 +68,10 @@ Worker Host execution and editor endpoint discovery remain unsupported/unverifie
 - Migration from 0.1 preserves the stable device ID and v1 workspace/task data
   into schema v2. Unknown or corrupt persisted versions fail closed.
 - Protocol-v1 network peers do not interoperate with protocol v2.
+- New Editor sessions require provider-scoped URI identities and Host-advertised
+  `folder` isolation. Existing `ahp-session:` histories are not renamed. A Host
+  that cannot honor this workspace policy fails explicitly; this does not add
+  platform support or upgrade the Chat UI visibility gate from Unverified.
 - SSH, WSL, Dev Containers, Codespaces, `vscode.dev`, virtual workspaces,
   untrusted workspaces, and mixed local/remote workspace folders remain
   unsupported.
