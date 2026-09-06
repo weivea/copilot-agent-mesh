@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 
 import type * as vscode from 'vscode';
+import { compactPresentedDelegation } from '../tools/ToolResultPresentation';
 
 import {
 	requireSelectedAhpProtocol,
@@ -158,6 +159,8 @@ export function createPeerDelegationE2eApi(
 				switch (toolName) {
 					case MESH_TOOL_NAMES.listWorkers:
 						return core.listWorkers(input);
+					case MESH_TOOL_NAMES.listTasks:
+						return core.listTasks(input);
 					case MESH_TOOL_NAMES.delegateTask:
 						return core.delegateTask(input);
 					case MESH_TOOL_NAMES.getTask:
@@ -176,6 +179,9 @@ export function createPeerDelegationE2eApi(
 				rawInput: Record<string, unknown>,
 			): Promise<{ readonly rejected: true; readonly code: string }> {
 				const parsed = parseDelegateTaskInput(rawInput);
+				if ('targetHandle' in parsed) {
+					throw new TypeError('This low-level authorization probe requires explicit target IDs.');
+				}
 				try {
 					await options.localTasks.persistDelegationIntent({
 						...parsed,
@@ -280,7 +286,7 @@ async function invokeTool(
 		if (!isPlainRecord(parsed)) {
 			throw new Error('The Mesh Tool result was not a JSON object.');
 		}
-		return parsed;
+		return compactPresentedDelegation(parsed) ?? parsed;
 	} finally {
 		cancellation?.dispose();
 	}
@@ -297,6 +303,9 @@ async function invokeCoreDelegateAndCancelAfterEvents(
 	readonly observedEventTypes: readonly string[];
 }> {
 	const parsed = parseDelegateTaskInput(rawInput);
+	if ('targetHandle' in parsed) {
+		throw new TypeError('This exact-route cancellation probe requires explicit target IDs.');
+	}
 	if (parsed.delegationRequestId === undefined) {
 		throw new TypeError('Cancellation E2E requires an explicit delegationRequestId.');
 	}

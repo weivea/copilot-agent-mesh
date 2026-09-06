@@ -869,7 +869,7 @@ test('peer-delegation Tool clock shortens only minute-scale budget timers', () =
 	assert.equal(clock.snapshot().timersDisposed, 2);
 });
 
-test('0.4.0 release metadata keeps the real peer gate default-off and five-tool parity', () => {
+test('0.4.0 release metadata keeps the real peer gate default-off and six-tool parity', () => {
 	const root = resolve(__dirname, '../../..');
 	const manifest = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8'));
 	const wrapper = readFileSync(
@@ -897,7 +897,7 @@ test('0.4.0 release metadata keeps the real peer gate default-off and five-tool 
 		manifest.scripts['test:peer-delegation-real'],
 		'node scripts/e2e/peer-delegation/run.mjs',
 	);
-	assert.equal(manifest.contributes.languageModelTools.length, 5);
+	assert.equal(manifest.contributes.languageModelTools.length, 6);
 	assert.equal(
 		manifest.contributes.configuration.properties[
 			'copilotAgentMesh.experimental.peerDelegation'

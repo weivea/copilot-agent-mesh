@@ -396,6 +396,71 @@ export const dashboardTaskListResultSchema = z.strictObject({
 	totalTasks: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
 });
 
+export const ownedTaskListStateSchema = z.union([
+	taskStatusSchema,
+	z.literal('ambiguous'),
+]);
+
+export const ownedTaskListParamsSchema = nodeIdentityParamsSchema.extend({
+	limit: z.number().int().min(1).max(100).default(20),
+	includeTerminal: z.boolean().default(false),
+	beforeTaskId: uuidSchema.optional(),
+});
+
+export const ownedTaskSummarySchema = z.strictObject({
+	taskId: uuidSchema,
+	delegationRequestId: uuidSchema,
+	title: utf8String(256, 'owned task title', 1),
+	lastKnownState: ownedTaskListStateSchema,
+	createdAt: timestampSchema,
+	target: taskTargetSchema,
+	locality: z.enum(['local', 'remote']),
+});
+
+export const ownedTaskListResultSchema = z.strictObject({
+	tasks: z.array(ownedTaskSummarySchema).max(100),
+	truncated: z.boolean(),
+	totalTasks: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+	nextBeforeTaskId: uuidSchema.optional(),
+}).superRefine((result, context) => {
+	if (new Set(result.tasks.map((task) => task.taskId)).size !== result.tasks.length) {
+		context.addIssue({ code: 'custom', message: 'Owned task IDs must be unique.' });
+	}
+	if (result.tasks.length > result.totalTasks) {
+		context.addIssue({
+			code: 'custom',
+			path: ['totalTasks'],
+			message: 'Owned task counts cannot be smaller than the returned page size',
+		});
+	}
+	if (result.truncated !== (result.nextBeforeTaskId !== undefined)) {
+		context.addIssue({
+			code: 'custom',
+			path: ['nextBeforeTaskId'],
+			message: 'Pagination cursor presence must match truncation state',
+		});
+	}
+	if (
+		result.nextBeforeTaskId !== undefined
+		&& (
+			result.tasks.length === 0
+			|| result.tasks[result.tasks.length - 1]?.taskId !== result.nextBeforeTaskId
+		)
+	) {
+		context.addIssue({
+			code: 'custom',
+			path: ['nextBeforeTaskId'],
+			message: 'Pagination cursor must match the last returned task',
+		});
+	}
+	if (serializedLocalResultBytes(result) > PROTOCOL_LIMITS.frameBytes) {
+		context.addIssue({
+			code: 'custom',
+			message: 'Serialized owned task list exceeds the protocol frame limit',
+		});
+	}
+});
+
 export const dashboardTaskCancelParamsSchema = nodeIdentityParamsSchema.extend({
 	actionHandle: dashboardActionHandleSchema,
 	direction: dashboardTaskDirectionSchema,
@@ -533,6 +598,7 @@ export const LOCAL_BROKER_METHODS = {
 	policyCandidates: 'node.policy.candidates',
 	policyCandidateSet: 'node.policy.candidate.set',
 	dashboardTasks: 'node.dashboard.tasks',
+	ownedTaskList: 'node.tools.tasks.list',
 	dashboardTaskReserve: 'node.dashboard.task.reserve',
 	dashboardTaskCancel: 'node.dashboard.task.cancel',
 	dashboardTaskRelease: 'node.dashboard.task.release',
@@ -581,6 +647,7 @@ export const localBrokerMethodParamsSchemas = {
 	[LOCAL_BROKER_METHODS.policyCandidates]: peerPolicyCandidateParamsSchema,
 	[LOCAL_BROKER_METHODS.policyCandidateSet]: peerPolicyCandidateMutationParamsSchema,
 	[LOCAL_BROKER_METHODS.dashboardTasks]: nodeIdentityParamsSchema,
+	[LOCAL_BROKER_METHODS.ownedTaskList]: ownedTaskListParamsSchema,
 	[LOCAL_BROKER_METHODS.dashboardTaskReserve]: dashboardTaskCancelParamsSchema,
 	[LOCAL_BROKER_METHODS.dashboardTaskCancel]: dashboardTaskCancelParamsSchema,
 	[LOCAL_BROKER_METHODS.dashboardTaskRelease]: dashboardTaskCancelParamsSchema,
@@ -629,6 +696,8 @@ export type PeerPolicyCandidateMutationParams = z.infer<typeof peerPolicyCandida
 export type DashboardTaskDirection = z.infer<typeof dashboardTaskDirectionSchema>;
 export type DashboardTaskSummary = z.infer<typeof dashboardTaskSummarySchema>;
 export type DashboardTaskListResult = z.infer<typeof dashboardTaskListResultSchema>;
+export type OwnedTaskListParams = z.infer<typeof ownedTaskListParamsSchema>;
+export type OwnedTaskListResult = z.infer<typeof ownedTaskListResultSchema>;
 export type DashboardTaskCancelParams = z.infer<typeof dashboardTaskCancelParamsSchema>;
 export type DashboardTaskReservationResult = z.infer<typeof dashboardTaskReservationResultSchema>;
 export type DelegationGrantProtocol = z.infer<typeof delegationGrantSchema>;

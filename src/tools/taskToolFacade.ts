@@ -8,8 +8,11 @@ import type {
 	TaskToolErrorCode,
 	TaskToolReadResult,
 	TaskToolSnapshot,
+	ExplicitToolTarget,
+	MeshTargetScope,
+	ListTasksInput,
 } from '../../shared/toolProtocol';
-import type { DelegatedExecutionContext } from '../../shared/protocol';
+import type { DelegatedExecutionContext, OwnedTaskListResult } from '../../shared/protocol';
 
 export interface DelegationTargetDisplay {
 	readonly windowName: string;
@@ -23,7 +26,11 @@ export interface TaskSnapshotSubscription {
 export interface TaskToolFacade {
 	readonly sourceNodeId?: string;
 
-	listWorkers(signal: AbortSignal): Promise<MeshDirectorySnapshot>;
+	listWorkers(signal: AbortSignal, options?: { readonly scope?: MeshTargetScope }): Promise<MeshDirectorySnapshot>;
+
+	resolveTargetHandle?(handle: string): Promise<ExplicitToolTarget>;
+
+	listTasks?(request: ListTasksInput, signal: AbortSignal): Promise<OwnedTaskListResult>;
 
 	identifyDelegation?(intent: DelegationIntentInput): DelegationIdentity;
 

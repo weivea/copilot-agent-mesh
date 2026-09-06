@@ -6,6 +6,7 @@ import {
 	MESH_ERROR_CODES,
 	GATEWAY_NOTIFICATIONS,
 	ACTIVE_TASK_STATUSES,
+	TERMINAL_TASK_STATUSES,
 	PROTOCOL_LIMITS,
 	brokerRemoteListResultSchema,
 	connectivitySnapshotParamsSchema,
@@ -26,6 +27,8 @@ import {
 	nodeHeartbeatParamsSchema,
 	nodeIdentityParamsSchema,
 	nodeRegistrationResultSchema,
+	ownedTaskListParamsSchema,
+	ownedTaskListResultSchema,
 	nodePolicyGetParamsSchema,
 	nodePolicySetParamsSchema,
 	peerPolicyCandidateListResultSchema,
@@ -38,6 +41,7 @@ import {
 	nodeWorkspaceClaimParamsSchema,
 	nodeWorkspaceReleaseParamsSchema,
 	routedTaskStartParamsSchema,
+	serializedLocalResultBytes,
 	taskSnapshotAfterEventSeqSchema,
 	taskSnapshotSchema,
 	uuidSchema,
@@ -47,6 +51,7 @@ import {
 	type TaskSnapshotAfterEventSeq,
 	type MeshErrorReason,
 	type DashboardTaskDirection,
+	type OwnedTaskListParams,
 } from '../../shared/protocol';
 import { MeshDomainError } from '../domain/errors';
 import { containsUnsafeDashboardText } from '../ui/DashboardRedaction';
@@ -105,6 +110,9 @@ interface DashboardActionRegistry {
 	readonly taskHandlesByKey: Map<string, string>;
 	readonly taskReservations: Map<string, DashboardTaskBinding>;
 }
+
+type KnownRemoteTaskSnapshot = TaskSnapshot | TaskSnapshotAfterEventSeq;
+const terminalTaskRouteStates = new Set<string>(TERMINAL_TASK_STATUSES);
 
 export interface DeviceBrokerOptions extends LocalIpcSessionOptions {
 	readonly identity: LocalIpcIdentity;
@@ -674,6 +682,11 @@ export class DeviceBroker {
 				this.assertIdentity(binding, input);
 				return toJsonValue(await this.listDashboardTasks(session, binding));
 			}
+			case LOCAL_BROKER_METHODS.ownedTaskList: {
+				const input = ownedTaskListParamsSchema.parse(params);
+				this.assertIdentity(binding, input);
+				return toJsonValue(await this.listOwnedTasks(session, binding, input));
+			}
 			case LOCAL_BROKER_METHODS.dashboardTaskReserve: {
 				const input = dashboardTaskCancelParamsSchema.parse(params);
 				this.assertIdentity(binding, input);
@@ -1192,6 +1205,99 @@ export class DeviceBroker {
 		});
 	}
 
+	private async listOwnedTasks(
+		session: LocalIpcSession,
+		binding: RegisteredSession,
+		input: OwnedTaskListParams,
+	): Promise<ReturnType<typeof ownedTaskListResultSchema.parse>> {
+		const includeTerminal = input.includeTerminal;
+		const ownedRoutes = this.taskRoutes.list()
+			.filter((route) => route.sourceNodeId === binding.nodeId)
+			.sort(compareOwnedTaskRoutesDescending);
+		const ownedRoutesById = new Map(ownedRoutes.map((route) => [route.taskId, route]));
+		const cursorIndex = input.beforeTaskId === undefined
+			? -1
+			: ownedRoutes.findIndex(({ taskId }) => taskId === input.beforeTaskId);
+		if (input.beforeTaskId !== undefined && cursorIndex < 0) {
+			throw new MeshDomainError('TASK_NOT_FOUND', 'Task not found.');
+		}
+		const localRecordsByTaskId = new Map<string, DashboardTaskIndexRecord>();
+		if (ownedRoutes.some(({ routeKind }) => routeKind === 'local')) {
+			for (const record of await this.options.taskService.listDashboardRecords()) {
+				const route = ownedRoutesById.get(record.taskId);
+				if (
+					record.schemaVersion !== 2
+					|| record.peerId !== this.options.identity.deviceId
+					|| record.sourceNodeId !== binding.nodeId
+					|| route?.routeKind !== 'local'
+				) {
+					continue;
+				}
+				if (record.workspaceId !== route.target.workspaceId || record.target.deviceId !== route.target.deviceId
+					|| (record.target.nodeId !== undefined && record.target.nodeId !== route.target.nodeId)
+					|| (record.target.nodeInstanceId !== undefined && record.target.nodeInstanceId !== route.target.nodeInstanceId)) {
+					throw new MeshDomainError('PROTOCOL_INCOMPATIBLE', 'The cached task metadata does not match its owned route.');
+				}
+				localRecordsByTaskId.set(record.taskId, record);
+			}
+		}
+		const remoteSnapshotsByTaskId = new Map<string, KnownRemoteTaskSnapshot>();
+		if (ownedRoutes.some(({ routeKind }) => routeKind === 'remote')) {
+			for (const snapshot of this.options.remoteTaskService?.listKnownTasks?.() ?? []) {
+				const route = ownedRoutesById.get(snapshot.taskId);
+				if (route?.routeKind === 'remote') {
+					remoteSnapshotsByTaskId.set(snapshot.taskId, requireRoutedSnapshot(snapshot, route));
+				}
+			}
+		}
+		this.assertActive();
+		this.assertIdentity(this.requireRegistration(session), input);
+		const knownForRoute = (route: TaskRouteRecord) => ({
+			localRecord: localRecordsByTaskId.get(route.taskId),
+			remoteSnapshot: remoteSnapshotsByTaskId.get(route.taskId),
+		});
+		const visibleRoute = (route: TaskRouteRecord): boolean =>
+			includeTerminal || !isTerminalOwnedTaskState(ownedTaskLastKnownState(
+				route,
+				knownForRoute(route),
+			));
+		const totalTasks = ownedRoutes.reduce(
+			(total, route) => total + (visibleRoute(route) ? 1 : 0),
+			0,
+		);
+		const projected = ownedRoutes
+			.slice(cursorIndex + 1)
+			.filter(visibleRoute)
+			.map((route) => ownedTaskSummary(route, knownForRoute(route)));
+		if (projected.length === 0) {
+			return ownedTaskListResultSchema.parse({
+				tasks: [],
+				truncated: false,
+				totalTasks,
+			});
+		}
+		const maximumVisible = Math.min(input.limit, projected.length);
+		for (let visibleCount = maximumVisible; visibleCount > 0; visibleCount -= 1) {
+			const tasks = projected.slice(0, visibleCount);
+			const truncated = projected.length > visibleCount;
+			const result = {
+				tasks,
+				truncated,
+				totalTasks,
+				...(truncated ? {
+					nextBeforeTaskId: tasks[tasks.length - 1]!.taskId,
+				} : {}),
+			};
+			if (serializedLocalResultBytes(result) <= PROTOCOL_LIMITS.frameBytes) {
+				return ownedTaskListResultSchema.parse(result);
+			}
+		}
+		throw new MeshDomainError(
+			'RATE_LIMITED',
+			'The owned task list exceeds the local IPC frame limit.',
+		);
+	}
+
 	private dashboardTaskCounterpart(
 		record: DashboardTaskIndexRecord,
 		direction: DashboardTaskDirection,
@@ -1468,8 +1574,87 @@ function dashboardTaskBindingKey(binding: DashboardTaskBinding): string {
 	return `${binding.ownerId}:${binding.taskId}:${binding.direction}`;
 }
 
+function ownedTaskSummary(
+	route: TaskRouteRecord,
+	known: {
+		readonly localRecord?: DashboardTaskIndexRecord;
+		readonly remoteSnapshot?: KnownRemoteTaskSnapshot;
+	},
+): ReturnType<typeof ownedTaskListResultSchema.parse>['tasks'][number] {
+	const title = route.routeKind === 'local'
+		? safeOwnedTaskTitle(known.localRecord?.title)
+		: safeOwnedTaskTitle(known.remoteSnapshot?.title);
+	return {
+		taskId: route.taskId,
+		delegationRequestId: route.delegationRequestId,
+		title,
+		lastKnownState: ownedTaskLastKnownState(route, known),
+		createdAt: route.createdAt,
+		target: { ...route.target },
+		locality: route.routeKind === 'remote' ? 'remote' : 'local',
+	};
+}
+
+function ownedTaskLastKnownState(
+	route: TaskRouteRecord,
+	known: {
+		readonly localRecord?: DashboardTaskIndexRecord;
+		readonly remoteSnapshot?: KnownRemoteTaskSnapshot;
+	},
+): ReturnType<typeof ownedTaskListResultSchema.parse>['tasks'][number]['lastKnownState'] {
+	const metadataState = route.routeKind === 'local'
+		? known.localRecord?.state
+		: known.remoteSnapshot?.state;
+	if (route.state === 'ambiguous') {
+		return 'ambiguous';
+	}
+	if (isTerminalTaskRouteState(route.state)) {
+		return route.state;
+	}
+	return metadataState ?? route.state;
+}
+
 function safeDashboardLabel(value: string, fallback: string): string {
 	return containsUnsafeDashboardText(value) ? fallback : value;
+}
+
+function safeOwnedTaskTitle(value: string | undefined): string {
+	return truncateUtf8(
+		value === undefined ? 'Delegated task' : safeDashboardLabel(value, 'Delegated task'),
+		256,
+	);
+}
+
+function truncateUtf8(value: string, maximumBytes: number): string {
+	if (Buffer.byteLength(value, 'utf8') <= maximumBytes) {
+		return value;
+	}
+	let result = '';
+	let bytes = 0;
+	for (const character of value) {
+		const characterBytes = Buffer.byteLength(character, 'utf8');
+		if (bytes + characterBytes > maximumBytes) {
+			break;
+		}
+		result += character;
+		bytes += characterBytes;
+	}
+	return result;
+}
+
+function compareOwnedTaskRoutesDescending(left: TaskRouteRecord, right: TaskRouteRecord): number {
+	return compareDashboardTimestampsDescending(left.createdAt, right.createdAt)
+		|| left.taskId.localeCompare(right.taskId);
+}
+
+function isTerminalTaskRouteState(state: TaskRouteRecord['state']): boolean {
+	return state !== 'ambiguous' && terminalTaskRouteStates.has(state);
+}
+
+function isTerminalOwnedTaskState(
+	state: ReturnType<typeof ownedTaskListResultSchema.parse>['tasks'][number]['lastKnownState'],
+): boolean {
+	return state !== 'ambiguous' && terminalTaskRouteStates.has(state);
 }
 
 function compareDashboardTimestampsDescending(left: string, right: string): number {

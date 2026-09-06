@@ -2,8 +2,8 @@
 
 Copilot Agent Mesh 0.4.0 Preview adds default-off **Peer Window Delegation** for
 ordinary VS Code windows on one macOS arm64 device. In Agent mode, Copilot can use
-five Mesh tools to discover an explicitly authorized peer window, delegate one
-task, wait for its authoritative result, answer input, or cancel it. Mesh protocol
+six Mesh tools to discover an explicitly authorized peer window, delegate tasks,
+wait for authoritative results, recover task IDs, answer input, or cancel work. Mesh protocol
 v2 remains in use; v1 peers are explicitly incompatible. This is an evaluation
 build, not a cross-device, cross-platform Worker, or general-availability claim.
 
@@ -67,8 +67,8 @@ See [Preview release and installation](./docs/mvp/release.md) for packaging, ins
 - Discover explicit Device → Node → Workspace targets, then delegate and wait,
   cancel, and answer tasks.
 - Run the production Agent Host/AHP adapter with explicit VS Code authentication.
-- Use the five Copilot task tools to discover workers, delegate, recover, cancel,
-  or answer tasks.
+- Use the six Copilot task tools to discover targets, submit or wait for tasks,
+  recover owned task IDs, cancel, or answer input.
 - Configure a safe per-Workspace window name, receive switch, and directional
   peer allowlist from the Dashboard. Display names never authorize or route.
 - Prefer the running VS Code instance's AHP `editor` endpoint for delegated
@@ -122,6 +122,48 @@ window. Normal terminal cleanup retains Editor history without keeping the Mesh
 connection alive. Old `ahp-session:` resources are not renamed or migrated by the
 new-session policy.
 
+## Mesh tool workflow
+
+Existing tool references and explicit-ID calls remain supported. Configuration,
+sign-in, pairing, hosting and Workspace grants stay in the Dashboard, not in
+model-callable management tools.
+
+| Tool | Purpose and important options |
+| --- | --- |
+| `#meshListWorkers` | Find authorized targets. `scope` is `local`, `remote`, or `all` (default). Local scope never requests remote directories; all-scope failures are explicit `partial` results when another scope is available. |
+| `#meshDelegateTask` | Prefer a returned `targetHandle`, or supply the legacy exact IDs, never both. `mode: "wait"` is the default; `"submit"` returns after durable acceptance so other targets can be scheduled. |
+| `#meshGetTask` | Read an owned task by ID. `waitFor: "snapshot"` reads once; `"change"` or `"outcome"` subscribes to events. Outcome means input is needed or the task reached a terminal state. |
+| `#meshAnswerTask` | Answer the exact current input with a stable `answerId`. Native confirmation shows the current question and a safe answer preview. Then get/wait on the same task ID; do not create a new delegation. |
+| `#meshCancelTask` | Explicitly request cancellation. A `cancelling` receipt is not a confirmed `cancelled` task. |
+| `#meshListTasks` | Recover IDs from this authenticated window's owned task index. Active tasks are the default; `includeTerminal`, `limit` (default 20, maximum 100), and `beforeTaskId` support bounded history/pagination. States are explicitly last-known, not a remote refresh. |
+
+For one-to-many work, list targets, submit a separate task to each intended
+Workspace, then inspect or wait on their returned IDs. Each target still needs
+its independent authorization and free Workspace Lease. There is no broadcast
+operation or automatic recursive delegation.
+
+`timeoutMinutes` remains the execution budget (default and maximum 60 minutes).
+Get/wait has a separate `waitSeconds` event-wait budget (default 60, maximum
+3,600 seconds), plus bounded initial/final reads. Stopping or timing out get/wait
+does **not** cancel the task. After submit returns, stopping the source Chat
+does not cancel submitted work either; use the explicit cancel tool. Default
+Delegate wait-mode cancellation retains its existing task-cancellation behavior.
+
+Target handles are temporary, per-window references to exact routing IDs, not
+authentication or execution grants. They expire after five minutes and are
+invalidated by Broker reconnect; source scope and live authorization are still
+checked. Refresh a stale selection instead of substituting a same-named window.
+Reopening a repository under a new Window Node identity does not transfer
+another window's task ownership.
+
+Default delegation output now uses `outcome`, `taskId`, `delegationRequestId`,
+`taskState`, and `nextAction`. The call outcome and actual task state are separate;
+`unknown` is not proof of failure. Tight output budgets retain the compact
+fallback with `s` (0 completed, 1 input needed, 2 failed call, 3 cancelled call,
+4 accepted), `t`/`d` identities, and authoritative `taskState` when needed.
+An accepted task is never reported as completed. Get/wait timeouts explicitly
+mark their snapshot as the last read rather than pretending it is current.
+
 ## Cross-device opt-in
 
 Use **Dashboard -> Settings -> Cross-device -> Configure discovery and hosting**. Authorize
@@ -134,8 +176,8 @@ Import B's one-time invitation through A's candidate action and native password
 input. Then activate strict cross-device delegation on both devices. In
 **Configure strict remote policy**, B grants the paired device its target
 Workspace and enables receive; A allowlists that authenticated remote Workspace
-from every claimed source root. Use the existing five Mesh Tools with explicit
-Device/Node/Workspace IDs. Strict remote tasks require B's existing editor Host,
+from every claimed source root. Use the Mesh task tools with target handles or
+explicit Device/Node/Workspace IDs. Strict remote tasks require B's existing editor Host,
 without standalone fallback.
 
 The Dashboard groups **This device / Other devices -> Window -> Workspace**.

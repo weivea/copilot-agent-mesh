@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 
 import {
 	MESH_ERROR_CODES,
@@ -26,6 +26,9 @@ import {
 	type TaskToolErrorCode,
 	type TaskToolReadResult,
 	type TaskToolSnapshot,
+	type ExplicitToolTarget,
+	type MeshTargetScope,
+	type ListTasksInput,
 } from '../../shared/toolProtocol';
 import { LocalIpcRemoteError } from '../ipc';
 import type { WindowNodeClient } from '../node/WindowNodeClient';
@@ -52,10 +55,12 @@ type WindowNodeFacadeClient = Pick<
 	readonly onTaskSnapshot?: WindowNodeClient['onTaskSnapshot'];
 	readonly onDidChange?: WindowNodeClient['onDidChange'];
 	readonly snapshot?: () => { readonly registered: boolean };
+	readonly listOwnedTasks?: WindowNodeClient['listOwnedTasks'];
 };
 
 export interface RemoteTaskRouteAdapter {
 	listDevices(signal: AbortSignal): Promise<MeshRemoteDirectorySnapshot>;
+	listKnownTasks?(): readonly (TaskSnapshot | TaskSnapshotAfterEventSeq)[];
 	cachedDevices?(): MeshRemoteDirectorySnapshot;
 	lookupTarget?(
 		profileId: string, target: RoutedTaskStartParams['target'],
@@ -104,6 +109,9 @@ export class LocalBrokerTaskFacade implements TaskToolFacade {
 	private readonly deviceName: () => string;
 	private readonly now: () => Date;
 	private persistenceQueue = Promise.resolve();
+	private readonly targets = new Map<string, { readonly target: ExplicitToolTarget; readonly scope: string; readonly expiresAt: number }>();
+	private readonly targetSubscription: { dispose(): void } | undefined;
+	private disposed = false;
 
 	public constructor(
 		private readonly client: WindowNodeFacadeClient,
@@ -121,57 +129,153 @@ export class LocalBrokerTaskFacade implements TaskToolFacade {
 			1,
 		).parse(readDeviceName());
 		this.now = options.now ?? (() => new Date());
+		let registered = client.snapshot?.().registered ?? true;
+		this.targetSubscription = client.onDidChange?.(() => {
+			const next = client.snapshot?.().registered ?? true;
+			if (next !== registered) { this.targets.clear(); }
+			registered = next;
+		});
 	}
 
-	public async listWorkers(signal: AbortSignal): Promise<MeshDirectorySnapshot> {
+	public async listWorkers(
+		signal: AbortSignal,
+		options: { readonly scope?: MeshTargetScope } = {},
+	): Promise<MeshDirectorySnapshot> {
 		try {
+			if (this.disposed) { throw new TaskToolFacadeError('WORKER_DRAINING'); }
+			const scope = options.scope ?? 'all';
 			const [local, remote] = await Promise.all([
-				raceAbort(this.client.listNodes(), signal),
-				this.options.remoteAdapter?.listDevices(signal) ?? Promise.resolve({
-					devices: [],
-					truncated: false,
-					totalDevices: 0,
-				}),
+				scope === 'remote' ? undefined : raceAbort(this.client.listNodes(), signal),
+				scope === 'local' ? { devices: [], truncated: false, totalDevices: 0 }
+					: this.options.remoteAdapter?.listDevices(signal) ?? Promise.resolve({
+						devices: [],
+						truncated: false,
+						totalDevices: 0,
+					}),
 			]);
-			this.assertLocalDirectory(local);
+			if (local !== undefined) { this.assertLocalDirectory(local); }
 			if (remote.devices.some((device) =>
 				device.locality !== 'remote' || device.deviceId === this.client.deviceId,
 			)) {
 				throw new TaskToolFacadeError('OUTPUT_INVALID');
 			}
 
-			return {
-				devices: [
-					{
-						deviceId: this.client.deviceId,
-						deviceName: this.deviceName(),
-						locality: 'local',
-						status: 'online',
-						nodesTruncated: local.truncated,
-						totalNodes: local.totalNodes,
-						nodes: local.nodes.map((node) => ({
-							nodeId: node.nodeId,
-							nodeInstanceId: node.nodeInstanceId,
-							label: node.label,
-							status: node.status,
-							capabilities: [...node.capabilities],
-							workspaces: node.workspaces.map((workspace) => ({
-								workspaceId: workspace.workspaceId,
-								name: workspace.name,
-								tags: [...workspace.capabilityTags],
-								busy: workspace.busy,
-								claimStatus: workspace.claimStatus,
-							})),
+			const devices: MeshDeviceToolSummary[] = [...remote.devices];
+			if (local !== undefined) {
+				devices.unshift({
+					deviceId: this.client.deviceId,
+					deviceName: this.deviceName(),
+					locality: 'local',
+					status: 'online',
+					nodesTruncated: local.truncated,
+					totalNodes: local.totalNodes,
+					nodes: local.nodes.map((node) => ({
+						nodeId: node.nodeId,
+						nodeInstanceId: node.nodeInstanceId,
+						label: node.label,
+						status: node.status,
+						capabilities: [...node.capabilities],
+						workspaces: node.workspaces.map((workspace) => ({
+							workspaceId: workspace.workspaceId,
+							name: workspace.name,
+							tags: [...workspace.capabilityTags],
+							busy: workspace.busy,
+							claimStatus: workspace.claimStatus,
 						})),
-					},
-					...remote.devices,
-				],
-				truncated: local.truncated
+					})),
+				});
+			}
+			this.pruneTargets();
+			return {
+				devices: devices.map((device) => ({
+					...device,
+					nodes: device.nodes.map((node) => ({
+						...node,
+						workspaces: node.workspaces.map((workspace) => ({
+							...workspace,
+							...((device.deviceId !== this.client.deviceId || node.nodeId !== this.sourceNodeId) && ['online', 'busy'].includes(node.status)
+								&& workspace.claimStatus === 'claimed' ? {
+									targetHandle: this.issueTarget({
+										deviceId: device.deviceId, nodeId: node.nodeId, nodeInstanceId: node.nodeInstanceId,
+										workspaceId: workspace.workspaceId,
+										...(device.peerId === undefined ? {} : { peerId: device.peerId }),
+									}),
+								} : {}),
+						})),
+					})),
+				})),
+				truncated: (local?.truncated ?? false)
 					|| remote.truncated
 					|| remote.devices.some(({ nodesTruncated }) => nodesTruncated),
 			};
 		} catch (error: unknown) {
 			throw toFacadeError(error);
+		}
+	}
+
+	public async resolveTargetHandle(handle: string): Promise<ExplicitToolTarget> {
+		return { ...this.requireTarget(handle).target };
+	}
+
+	public async listTasks(request: ListTasksInput, signal: AbortSignal) {
+		if (this.disposed) { throw new TaskToolFacadeError('WORKER_DRAINING'); }
+		if (this.client.listOwnedTasks === undefined) { throw new TaskToolFacadeError('OUTPUT_INVALID'); }
+		try {
+			throwIfAborted(signal);
+			return await raceAbort(this.client.listOwnedTasks(request), signal);
+		} catch (error: unknown) {
+			throw toFacadeError(error);
+		}
+	}
+
+	public dispose(): void {
+		this.disposed = true;
+		this.targetSubscription?.dispose();
+		this.targets.clear();
+	}
+
+	private currentSourceScope(): string {
+		return workspaceIdentitySchema.parse(this.options.sourceWorkspaceIdentity?.()
+			?? fallbackSourceWorkspaceIdentity(this.sourceNodeId));
+	}
+
+	private issueTarget(target: ExplicitToolTarget): string {
+		while (this.targets.size >= TASK_TOOL_LIMITS.maxTargetHandles) {
+			const oldest = this.targets.keys().next().value;
+			if (oldest !== undefined) { this.targets.delete(oldest); }
+		}
+		let handle: string;
+		do { handle = randomBytes(24).toString('base64url'); } while (this.targets.has(handle));
+		this.targets.set(handle, {
+			target, scope: this.currentSourceScope(), expiresAt: this.now().valueOf() + TASK_TOOL_LIMITS.targetHandleTtlMs,
+		});
+		return handle;
+	}
+
+	private pruneTargets(): void {
+		for (const [handle, value] of this.targets) {
+			if (value.expiresAt <= this.now().valueOf()) { this.targets.delete(handle); }
+		}
+	}
+
+	private requireTarget(handle: string) {
+		if (this.disposed) { throw new TaskToolFacadeError('WORKER_DRAINING'); }
+		this.pruneTargets();
+		const reference = this.targets.get(handle);
+		if (reference === undefined || reference.scope !== this.currentSourceScope()
+			|| this.client.snapshot?.().registered === false) {
+			throw new TaskToolFacadeError('STALE_TARGET');
+		}
+		return reference;
+	}
+
+	private assertTargetSelection(intent: DelegationIntentInput): void {
+		if (intent.targetHandle === undefined) { return; }
+		const { target } = this.requireTarget(intent.targetHandle);
+		if (target.deviceId !== intent.deviceId || target.nodeId !== intent.nodeId
+			|| target.nodeInstanceId !== intent.nodeInstanceId || target.workspaceId !== intent.workspaceId
+			|| target.peerId !== intent.peerId) {
+			throw new TaskToolFacadeError('STALE_TARGET');
 		}
 	}
 
@@ -212,8 +316,9 @@ export class LocalBrokerTaskFacade implements TaskToolFacade {
 			}
 			return { windowName: node.label, workspaceName: workspace.name };
 		}
-		const directory = await this.listWorkers(signal);
-		const device = directory.devices.find(({ deviceId }) => deviceId === intent.deviceId);
+		const directory = await this.listWorkers(signal, { scope: 'remote' });
+		const device = directory.devices.find((device) => device.deviceId === intent.deviceId
+			&& (intent.peerId === undefined || device.peerId === intent.peerId));
 		const node = device?.nodes.find(({ nodeId, nodeInstanceId }) =>
 			nodeId === intent.nodeId && nodeInstanceId === intent.nodeInstanceId,
 		);
@@ -316,6 +421,8 @@ export class LocalBrokerTaskFacade implements TaskToolFacade {
 			throw new TaskToolFacadeError('INVALID_INPUT');
 		}
 		try {
+			this.assertTargetSelection(intent);
+			if (this.disposed) { throw new TaskToolFacadeError('WORKER_DRAINING'); }
 			const identity = this.identifyDelegation(intent);
 			const { delegationRequestId, taskId, sourceWorkspaceIdentity } = identity;
 			const target = {
@@ -361,6 +468,7 @@ export class LocalBrokerTaskFacade implements TaskToolFacade {
 				),
 			};
 			let snapshot: TaskSnapshot;
+			this.assertTargetSelection(intent);
 			if (remote === undefined) {
 				if (context === undefined) {
 					snapshot = await this.client.startTask(input);

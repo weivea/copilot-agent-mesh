@@ -27,6 +27,8 @@ import {
 	LOCAL_BROKER_NOTIFICATIONS,
 	PROTOCOL_LIMITS,
 	nodeDirectoryResultSchema,
+	ownedTaskListParamsSchema,
+	ownedTaskListResultSchema,
 	nodePolicyGetParamsSchema,
 	nodePolicyResultSchema,
 	nodePolicySetParamsSchema,
@@ -57,6 +59,7 @@ import {
 	type NodePolicyResult,
 	type NodePolicySetParams,
 	type NodeStatus,
+	type OwnedTaskListResult,
 	type PeerPolicyCandidateListResult,
 	type NodeTaskEventParams,
 	type RoutedTaskStartParams,
@@ -507,6 +510,25 @@ export class WindowNodeClient implements WorkspaceResolver {
 				nodeInstanceId: this.nodeInstanceId,
 			}),
 			dashboardTaskListResultSchema,
+		);
+	}
+
+	public listOwnedTasks(
+		input: {
+			readonly limit?: number;
+			readonly includeTerminal?: boolean;
+			readonly beforeTaskId?: string;
+		} = {},
+	): Promise<OwnedTaskListResult> {
+		const params = ownedTaskListParamsSchema.parse({
+			...input,
+			nodeId: this.nodeId,
+			nodeInstanceId: this.nodeInstanceId,
+		});
+		return this.request(
+			LOCAL_BROKER_METHODS.ownedTaskList,
+			toJsonValue(params),
+			ownedTaskListResultSchema,
 		);
 	}
 

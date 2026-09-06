@@ -19,6 +19,11 @@ export type DelegationCancellationReason = 'token' | 'budget' | 'peer';
 
 export type DelegationOutcome =
 	| {
+		readonly kind: 'accepted';
+		readonly taskId: string;
+		readonly taskState: TaskToolSnapshot['status'];
+	}
+	| {
 		readonly kind: 'completed';
 		readonly taskId: string;
 		readonly result: Readonly<Record<string, unknown>>;
@@ -34,12 +39,14 @@ export type DelegationOutcome =
 		readonly taskId: string;
 		readonly code: TaskToolErrorCode | string;
 		readonly message: string;
+		readonly taskState?: 'failed' | 'timedOut';
 	}
 	| {
 		readonly kind: 'cancelled';
 		readonly taskId: string;
 		readonly reason: DelegationCancellationReason;
 		readonly code: 'CANCELLED' | 'TIMEOUT';
+		readonly taskState?: 'completed';
 	};
 
 export interface DelegationTaskSubscription {
@@ -49,6 +56,7 @@ export interface DelegationTaskSubscription {
 export interface DelegationWaiterOptions {
 	readonly taskId: string;
 	readonly timeoutMinutes: number;
+	readonly returnOnAccepted?: boolean;
 	readonly cancellation: ToolCancellation;
 	readonly clock: ToolClock;
 	readonly subscribe: (
@@ -129,6 +137,8 @@ export class DelegationWaiter {
 							}
 							if (this.cancelReason !== undefined) {
 								this.beginCancellation(settle);
+							} else if (this.options.returnOnAccepted) {
+								settle({ kind: 'accepted', taskId: this.options.taskId, taskState: snapshot.status });
 							}
 						},
 						(error: unknown) => {
@@ -226,7 +236,7 @@ export class DelegationWaiter {
 		switch (snapshot.status) {
 			case 'completed':
 				if (this.cancellationAccepted && this.cancelReason !== undefined) {
-					return this.cancelled(this.cancelReason);
+					return { ...this.cancelled(this.cancelReason), taskState: 'completed' };
 				}
 				return {
 					kind: 'completed',
@@ -275,10 +285,10 @@ export class DelegationWaiter {
 				};
 			case 'failed':
 			case 'timedOut':
-				return this.failed(
+				return { ...this.failed(
 					snapshot.failure?.code ?? (snapshot.status === 'timedOut' ? 'TIMEOUT' : 'TASK_EXECUTION_FAILED'),
 					snapshot.failure?.message ?? 'The delegated task failed.',
-				);
+				), taskState: snapshot.status };
 			case 'cancelled':
 				return this.cancelled(
 					this.cancelOperation === undefined
@@ -292,7 +302,7 @@ export class DelegationWaiter {
 
 	private cancelled(
 		reason: Exclude<DelegationCancellationReason, 'peer'> | 'peer',
-	): DelegationOutcome {
+	): Extract<DelegationOutcome, { kind: 'cancelled' }> {
 		return {
 			kind: 'cancelled',
 			taskId: this.options.taskId,
@@ -314,7 +324,7 @@ export class DelegationWaiter {
 		);
 	}
 
-	private failed(code: string, message: string): DelegationOutcome {
+	private failed(code: string, message: string): Extract<DelegationOutcome, { kind: 'failed' }> {
 		let safeMessage = 'The delegated task failed.';
 		try {
 			safeMessage = this.options.sanitizeText(message);

@@ -24,6 +24,10 @@ export const TASK_TOOL_LIMITS = {
 	defaultOutputBytes: 32 * 1024,
 	defaultTimeoutMinutes: 60,
 	maxTimeoutMinutes: 60,
+	targetHandleTtlMs: 5 * 60_000,
+	maxTargetHandles: 2_048,
+	defaultWaitSeconds: 60,
+	maxWaitSeconds: 3_600,
 } as const;
 
 export const TASK_TOOL_DEADLINES_MS = {
@@ -69,6 +73,7 @@ export const TASK_TOOL_ERROR_CODES = [
 	'PEER_MULTI_WORKSPACE',
 	'WINDOW_NAME_CONFLICT',
 	'POLICY_FORBIDDEN',
+	'STALE_TARGET',
 	'DELEGATION_RECURSION',
 	'ARTIFACT_NOT_FOUND',
 	'ARTIFACT_FORBIDDEN',
@@ -80,12 +85,23 @@ export const TASK_TOOL_ERROR_CODES = [
 
 export type TaskToolErrorCode = typeof TASK_TOOL_ERROR_CODES[number];
 
+export type MeshTargetScope = 'local' | 'remote' | 'all';
+
+export interface ExplicitToolTarget {
+	readonly deviceId: string;
+	readonly nodeId: string;
+	readonly nodeInstanceId: string;
+	readonly workspaceId: string;
+	readonly peerId?: string;
+}
+
 export interface MeshWorkspaceToolSummary {
 	readonly workspaceId: string;
 	readonly name: string;
 	readonly tags: readonly string[];
 	readonly busy: boolean;
 	readonly claimStatus: 'claimed' | 'readOnly' | 'conflict';
+	readonly targetHandle?: string;
 }
 
 export interface MeshNodeToolSummary {
@@ -160,6 +176,8 @@ export interface DelegationIntentInput {
 	 * Language Model Tool input.
 	 */
 	readonly sourceWorkspaceIdentity?: string;
+	/** Internal, per-window selection reference; never sent in a network task request. */
+	readonly targetHandle?: string;
 }
 
 export interface PersistedDelegationIntent {
@@ -237,4 +255,10 @@ export interface TaskToolReadResult {
 export interface TaskActionReceipt {
 	readonly taskId: string;
 	readonly status: TaskStatus;
+}
+
+export interface ListTasksInput {
+	readonly limit?: number;
+	readonly includeTerminal?: boolean;
+	readonly beforeTaskId?: string;
 }

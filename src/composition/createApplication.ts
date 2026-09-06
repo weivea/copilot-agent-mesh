@@ -342,6 +342,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			remoteAdapter: remoteTasks,
 			sourceWorkspaceIdentity: () => node.delegationSourceScopeIdentity(),
 		});
+		addApplicationCleanup(cleanup, () => localTasks.dispose());
 		const bindings = new ProductionDashboardBindings({
 			vscodeApi: vscode,
 			changed: changeEvents,

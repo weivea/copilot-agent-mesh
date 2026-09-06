@@ -67,10 +67,40 @@ unchanged and rejects injected approval metadata.
 | `src/ui/`, `media/dashboard.js`, `ProductionDashboardBindings.ts` | Device/Window/Workspace tree, selected-object controls, task dock, Settings, scoped aliases and cached-only rendering |
 | `LocalBrokerTaskFacade.ts`, `ProductionRemoteTaskAdapter.ts`, `WindowNodeTaskExecutor.ts` | Real Tools integration, explicit routing, task reconciliation and editor-only strict remote execution |
 
-The five Mesh Tools remain unchanged. Candidates are not executable workers.
+The original five task-tool responsibilities remain, with the later scoped
+`meshListTasks` recovery tool and submit/read-only-wait enhancements described
+in the README. These tool changes do not change the network v2 contract.
+Candidates are not executable workers.
 Task ownership, request hashes, cancellation, needs-input, leases and event
 sequence reconciliation continue through the existing Broker/task services.
 An endpoint refresh never creates a replacement task ID.
+
+### Tool workflow optimization
+
+The later six-tool surface retains default completion waiting and adds explicit
+submit, read-only event waits, temporary exact-target handles, scoped target
+listing, and an owned-task recovery index. Readable task outcomes are separate
+from authoritative task state; compact output remains a budget fallback.
+Read-only wait cancellation does not cancel execution, and a returned submission
+requires explicit cancellation afterward. The original default delegate wait
+keeps its task-cancellation behavior.
+
+The owned-task index is authenticated local IPC only. It filters by the same
+source Window Node ownership used by get/cancel/answer, validates cached metadata
+against its route, and reports last-known or ambiguous state without contacting
+remote peers. It does not transfer ownership when a repository is reopened.
+
+The updated offline run has 842 tests: 841 pass, zero fail and one
+platform-conditional skip. These results cover submit durability, event-wait
+races/cleanup, target expiry/source scope, child-recursion provenance, partial
+directory results, task-list ownership/pagination and readable/compact budgets.
+The isolated VS Code extension run has 65 passing tests. The production VSIX
+(`be40f6abf861ebce9eb99c96eef421a27ca0bd07cc82378df951fb6a6a5b2572`)
+passed the existing package whitelist and activated from a disposable installed
+profile, without replacing the user's installed extension.
+They do not establish real multi-device Agent execution or real Chat acceptance
+of these newer tool modes. Earlier account/private-ingress evidence retains its
+original scope.
 
 ## Setup and use
 

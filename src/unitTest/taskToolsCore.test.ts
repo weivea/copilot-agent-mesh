@@ -18,6 +18,7 @@ import {
 	ToolClock,
 } from '../tools/taskToolsCore';
 import { sanitizeDelegationText } from '../tools/DelegationTextSanitizer';
+import { presentToolResult } from '../tools/ToolResultPresentation';
 import {
 	assertMeshToolNameParity,
 	getMeshColdActivationContract,
@@ -182,6 +183,236 @@ function encodeInsertedCodePoint(value: string, rounds: number): string {
 }
 
 suite('TaskToolsCore', () => {
+	test('submit waits for durable acceptance and no longer links later Chat cancellation to the task', async () => {
+		const facade = new RecordingFacade();
+		facade.delegationSnapshot = runningSnapshot();
+		let accept!: (value: PersistedDelegationIntent) => void;
+		facade.persistence = new Promise((resolve) => { accept = resolve; });
+		const clock = new ManualClock();
+		const cancellation = new ManualCancellation();
+		const pending = new TaskToolsCore(facade, { clock }).delegateTask({
+			...delegationInput(), mode: 'submit',
+		}, cancellation);
+		let completed = false;
+		void pending.then(() => { completed = true; });
+		await settleMicrotasks();
+		assert.equal(completed, false);
+		assert.equal(facade.persistCalls, 1);
+		accept(facade.persisted);
+		const result = await pending;
+		assert.equal(result.s, 4);
+		assert.equal(result.taskState, 'running');
+		assert.equal(Object.hasOwn(facade.persistedIntents[0], 'mode'), false);
+		assert.equal(clock.activeTimers, 0);
+		assert.equal(facade.taskListenerCount, 0);
+		cancellation.cancel();
+		await settleMicrotasks();
+		assert.equal(facade.cancelCalls, 0);
+	});
+
+	test('cancelling a pending submission still waits for authoritative task cancellation', async () => {
+		const facade = new RecordingFacade();
+		facade.delegationSnapshot = runningSnapshot();
+		facade.cancelStatus = 'cancelling';
+		const cancellation = new ManualCancellation();
+		const pending = new TaskToolsCore(facade).delegateTask({ ...delegationInput(), mode: 'submit' }, cancellation);
+		cancellation.cancel();
+		await settleMicrotasks();
+		assert.equal(facade.cancelCalls, 1);
+		facade.emitTask(cancelledSnapshot());
+		assert.equal((await pending).s, 3);
+		assert.equal(facade.taskListenerCount, 0);
+	});
+
+	test('answers a current input and resumes an event-driven wait by task ID without re-delegating', async () => {
+		const facade = new RecordingFacade();
+		const clock = new ManualClock();
+		const core = new TaskToolsCore(facade, { clock });
+		facade.taskRead = { ...facade.taskRead, snapshot: {
+			...runningSnapshot(), status: 'needsInput', pendingInput: { inputId: INPUT_ID, prompt: 'Which test suite?' },
+		} };
+		const input = { taskId: TASK_ID, inputId: INPUT_ID, answerId: ANSWER_ID, answer: 'Run the focused suite.' };
+		const preparation = await core.prepareAnswerInvocation(input);
+		assert.match(preparation.confirmationMessage, /Fix scheduler/);
+		assert.match(preparation.confirmationMessage, /Which test suite/);
+		assert.match(preparation.confirmationMessage, /Run the focused suite/);
+		const receipt = presentToolResult(await core.answerTask(input));
+		assert.deepEqual(receipt.nextAction, { tool: 'meshGetTask', taskId: TASK_ID, waitFor: 'outcome' });
+		facade.taskRead = { ...facade.taskRead, snapshot: runningSnapshot() };
+		const wait = core.getTask({ taskId: TASK_ID, waitFor: 'outcome' });
+		await settleMicrotasks();
+		assert.equal(facade.taskListenerCount, 1);
+		facade.taskRead = { ...facade.taskRead, snapshot: { ...runningSnapshot(), status: 'completed', summary: 'Done.' } };
+		facade.emitTask(facade.taskRead.snapshot);
+		const result = await wait;
+		assert.equal(result.waitOutcome, 'outcome');
+		assert.equal((result.snapshot as TaskToolSnapshot).status, 'completed');
+		assert.equal(facade.persistCalls, 0);
+		assert.equal(facade.cancelCalls, 0);
+		assert.equal(facade.taskListenerCount, 0);
+		assert.equal(clock.activeTimers, 0);
+	});
+
+	test('read-only wait timeout and cancellation leave the task running with an explicit last-read snapshot', async () => {
+		for (const stop of ['timeout', 'cancelled']) {
+			const facade = new RecordingFacade();
+			const clock = new ManualClock();
+			const cancellation = new ManualCancellation();
+			const pending = new TaskToolsCore(facade, { clock }).getTask({
+				taskId: TASK_ID, waitFor: 'outcome', waitSeconds: 1,
+			}, cancellation);
+			await settleMicrotasks();
+			if (stop === 'timeout') { clock.advanceBy(1_000); } else { cancellation.cancel(); }
+			const result = await pending;
+			assert.equal(result.waitOutcome, stop);
+			assert.equal(result.snapshotIsLastRead, true);
+			assert.equal((result.snapshot as TaskToolSnapshot).status, 'running');
+			assert.equal(facade.cancelCalls, 0);
+			assert.equal(facade.persistCalls, 0);
+			assert.equal(facade.taskListenerCount, 0);
+			assert.equal(clock.activeTimers, 0);
+		}
+	});
+
+	test('scoped listing isolates local discovery and explicitly returns partial results after a remote failure', async () => {
+		const facade = new RecordingFacade();
+		const calls: string[] = [];
+		const { peerId: _peerId, ...device } = facade.workers.devices[0];
+		const scoped = Object.assign(facade, {
+			listWorkers: async (_signal: AbortSignal, options?: { scope?: string }) => {
+				calls.push(options?.scope ?? 'all');
+				if (options?.scope === 'remote') { throw new TaskToolFacadeError('TUNNEL_UNAVAILABLE', true); }
+				return { devices: [{ ...device, locality: 'local' as const }], truncated: false };
+			},
+		});
+		const core = new TaskToolsCore(scoped);
+		assert.equal((await core.listWorkers({ scope: 'local' })).status, 'ok');
+		assert.deepEqual(calls, ['local']);
+		const result = await core.listWorkers({ scope: 'all' });
+		assert.equal(result.status, 'partial');
+		assert.equal((result.devices as unknown[]).length, 1);
+		assert.deepEqual(result.issues, [{
+			scope: 'remote',
+			error: { code: 'TUNNEL_UNAVAILABLE', message: 'The worker connection is unavailable.', retryable: true },
+		}]);
+	});
+
+	test('read-only waits subscribe before the initial read and do not lose a fast terminal notification', async () => {
+			const facade = new RecordingFacade();
+			let first = true;
+			let release!: (read: TaskToolReadResult) => void;
+			const initial = facade.taskRead;
+			facade.getTask = async () => {
+				if (first) {
+					first = false;
+					return new Promise<TaskToolReadResult>((resolve) => { release = resolve; });
+				}
+				return facade.taskRead;
+			};
+			const pending = new TaskToolsCore(facade).getTask({ taskId: TASK_ID, waitFor: 'outcome' });
+			await settleMicrotasks();
+			facade.taskRead = { ...initial, snapshot: { ...runningSnapshot(), status: 'completed', summary: 'Finished.' } };
+			facade.emitTask(facade.taskRead.snapshot);
+			release(initial);
+			const result = await pending;
+			assert.equal((result.snapshot as TaskToolSnapshot).status, 'completed');
+			assert.equal(result.waitOutcome, 'outcome');
+			assert.equal(facade.taskListenerCount, 0);
+			assert.equal(facade.cancelCalls, 0);
+	});
+
+	test('read-only waits reject another task event and invalid wait budgets without cancelling a task', async () => {
+			const facade = new RecordingFacade();
+			const core = new TaskToolsCore(facade);
+			for (const input of [
+				{ taskId: TASK_ID, waitSeconds: 10 },
+				{ taskId: TASK_ID, waitFor: 'outcome', waitSeconds: 0 },
+				{ taskId: TASK_ID, waitFor: 'outcome', waitSeconds: 3_601 },
+				{ taskId: TASK_ID, waitFor: 'forever' },
+			]) {
+				assert.equal((await core.getTask(input)).status, 'error');
+			}
+			const pending = core.getTask({ taskId: TASK_ID, waitFor: 'outcome' });
+			await settleMicrotasks();
+			facade.emitTask({ ...runningSnapshot(), taskId: OTHER_TASK_ID });
+			assert.equal((await pending).status, 'error');
+			assert.equal(facade.taskListenerCount, 0);
+			assert.equal(facade.cancelCalls, 0);
+	});
+
+	test('a question answered by another operator before the final read is not reported as a current outcome', async () => {
+			const facade = new RecordingFacade();
+			const pending = new TaskToolsCore(facade).getTask({ taskId: TASK_ID, waitFor: 'outcome' });
+			await settleMicrotasks();
+			facade.emitTask({
+				...runningSnapshot(), status: 'needsInput',
+				pendingInput: { inputId: INPUT_ID, prompt: 'Already handled by another operator.' },
+			});
+			const result = await pending;
+			assert.equal(result.waitOutcome, 'changed');
+			assert.equal((result.snapshot as TaskToolSnapshot).status, 'running');
+			assert.equal(facade.cancelCalls, 0);
+	});
+
+	test('target-handle input resolves an exact route and rejects ambiguous or forged selection fields', async () => {
+		const facade = new RecordingFacade();
+		facade.delegationSnapshot = runningSnapshot();
+		const targetHandle = 'h'.repeat(32);
+		const target = { deviceId: DEVICE_ID, nodeId: NODE_ID, nodeInstanceId: NODE_INSTANCE_ID, workspaceId: WORKSPACE_ID, peerId: PEER_ID };
+		const scoped = Object.assign(facade, {
+			resolveTargetHandle: async (handle: string) => {
+				assert.equal(handle, targetHandle);
+				return target;
+			},
+		});
+		const input = { targetHandle, title: 'Fix scheduler', prompt: 'Fix it.', delegationRequestId: DELEGATION_ID, mode: 'submit' };
+		const core = new TaskToolsCore(scoped);
+		assert.equal((await core.delegateTask(input)).s, 4);
+		assert.equal(facade.persistedIntents[0].targetHandle, targetHandle);
+		assert.equal(facade.persistedIntents[0].nodeInstanceId, NODE_INSTANCE_ID);
+		for (const invalid of [
+			{ ...input, nodeId: NODE_ID },
+			{ ...input, sourceNodeId: SOURCE_NODE_ID },
+			{ ...input, targetHandle: DELEGATION_ID },
+			{ ...input, mode: 'broadcast' },
+		]) {
+			assert.equal((await core.delegateTask(invalid)).status, 'error');
+		}
+		assert.equal(facade.persistCalls, 1);
+	});
+
+	test('owned task recovery is bounded, keeps last-known ambiguity and maintains its pagination cursor', async () => {
+		const facade = new RecordingFacade();
+		let calls = 0;
+		const tasks = Array.from({ length: 5 }, (_, index) => ({
+			taskId: uuidFromIndex(index + 100),
+			delegationRequestId: uuidFromIndex(index + 200),
+			title: `Task ${index} ${'details '.repeat(20)}`,
+			lastKnownState: 'ambiguous' as const,
+			createdAt: '2026-09-01T00:00:00.000Z',
+			target: { deviceId: DEVICE_ID, nodeId: NODE_ID, nodeInstanceId: NODE_INSTANCE_ID, workspaceId: WORKSPACE_ID },
+			locality: 'remote' as const,
+		}));
+		const owned = Object.assign(facade, {
+			listTasks: async () => { calls += 1; return { tasks, truncated: false, totalTasks: tasks.length }; },
+		});
+		const core = new TaskToolsCore(owned, { outputByteLimit: 1_024 });
+		const result = await core.listTasks({ limit: 5 });
+		const returned = result.tasks as typeof tasks;
+		assert.ok(returned.length > 0 && returned.length < tasks.length);
+		assert.equal(result.stateSource, 'lastKnown');
+		assert.equal(returned[0].lastKnownState, 'ambiguous');
+		assert.equal(result.nextBeforeTaskId, returned.at(-1)?.taskId);
+		assert.equal(result.truncated, true);
+		assert.ok(Buffer.byteLength(JSON.stringify(result)) <= 1_024);
+		for (const invalid of [{ nodeId: NODE_ID }, { limit: 101 }, { includeTerminal: 'yes' }]) {
+			assert.equal((await core.listTasks(invalid)).status, 'error');
+		}
+		assert.equal(calls, 1);
+		assert.equal(facade.persistCalls, 0);
+		assert.equal(facade.cancelCalls, 0);
+	});
+
 	test('lists only bounded opaque Device -> Node -> Workspace metadata', async () => {
 		const facade = new RecordingFacade();
 		const core = new TaskToolsCore(facade);
@@ -233,7 +464,7 @@ suite('TaskToolsCore', () => {
 		assert.match(first.confirmationMessage, /non-control-plane structured file changes proven to stay inside/);
 		assert.match(first.confirmationMessage, /Terminal commands.*still require confirmation/);
 		assert.match(first.confirmationMessage, /execution\/instruction-control files/);
-		assert.match(first.confirmationMessage, /at most 60 minutes/);
+		assert.match(first.confirmationMessage, /at most 30 minutes/);
 		assert.doesNotMatch(first.confirmationMessage, new RegExp(NODE_ID));
 		assert.doesNotMatch(first.confirmationMessage, new RegExp(WORKSPACE_ID));
 		assert.ok(!first.confirmationMessage.includes(input.prompt));
@@ -572,6 +803,7 @@ suite('TaskToolsCore', () => {
 			t: TASK_ID,
 			d: DELEGATION_ID,
 			e: 'AGENT_UNAVAILABLE',
+			taskState: 'failed',
 		});
 
 		facade.delegationSnapshot = {
@@ -1207,6 +1439,7 @@ suite('TaskToolsCore', () => {
 				t: TASK_ID,
 				d: DELEGATION_ID,
 				e: 'TASK_EXECUTION_FAILED',
+				taskState: 'failed',
 			},
 		);
 	});
@@ -1672,10 +1905,10 @@ suite('TaskToolsCore', () => {
 });
 
 suite('Mesh tool manifest contract', () => {
-	test('exports five manifest descriptors with runtime name parity', () => {
+	test('exports six strict manifest descriptors with runtime name parity and legacy target compatibility', () => {
 		const manifestNames = MESH_TOOL_MANIFEST_DESCRIPTORS.map(({ name }) => name);
 
-		assert.equal(manifestNames.length, 5);
+		assert.equal(manifestNames.length, 6);
 		assert.doesNotThrow(() => assertMeshToolNameParity(manifestNames, MESH_RUNTIME_TOOL_NAMES));
 		for (const removed of [
 			'mesh_start_collaboration',
@@ -1692,8 +1925,8 @@ suite('Mesh tool manifest contract', () => {
 		);
 		assert.ok(delegateDescriptor);
 		assert.match(delegateDescriptor.modelDescription, /s=0 completed/);
-		assert.match(delegateDescriptor.modelDescription, /IDEMPOTENCY_CONFLICT/);
-		assert.match(delegateDescriptor.modelDescription, /normal-path mesh_get_task polling is unnecessary/);
+		assert.match(delegateDescriptor.modelDescription, /identical target/);
+		assert.match(delegateDescriptor.modelDescription, /mesh_get_task with waitFor=outcome/);
 		const delegateProperties = delegateDescriptor.inputSchema.properties as Record<string, unknown>;
 		assert.ok(delegateProperties.delegationRequestId);
 		assert.deepStrictEqual(delegateProperties.timeoutMinutes, {
@@ -1709,16 +1942,16 @@ suite('Mesh tool manifest contract', () => {
 		assert.ok(!Array.isArray(delegateRequired)
 			|| !delegateRequired.includes('delegationRequestId'));
 		assert.ok(Array.isArray(delegateRequired));
-		for (const target of ['deviceId', 'nodeId', 'nodeInstanceId', 'workspaceId']) {
-			assert.ok(delegateRequired.includes(target));
-		}
+		assert.deepEqual(delegateRequired, ['title', 'prompt']);
+		assert.ok(delegateProperties.targetHandle);
+		assert.ok(Array.isArray(delegateDescriptor.inputSchema.oneOf));
 		assert.ok(!delegateRequired.includes('peerId'));
 		const getDescriptor = MESH_TOOL_MANIFEST_DESCRIPTORS.find(
 			({ name }) => name === MESH_TOOL_NAMES.getTask,
 		);
 		assert.ok(getDescriptor);
-		assert.match(getDescriptor.modelDescription, /abnormal mesh_delegate_task interruption recovery/);
-		assert.match(getDescriptor.modelDescription, /Do not poll/);
+		assert.match(getDescriptor.modelDescription, /reattach after submission/);
+		assert.match(getDescriptor.modelDescription, /Event-driven waits avoid polling/);
 	});
 
 	test('exports the cold implicit activation contract for every tool', () => {
@@ -1846,6 +2079,7 @@ class RecordingFacade implements TaskToolFacade {
 	lastAcceptanceSignal?: AbortSignal;
 	persistedIntents: DelegationIntentInput[] = [];
 	private readonly taskListeners = new Set<(snapshot: TaskToolSnapshot) => void>();
+	get taskListenerCount(): number { return this.taskListeners.size; }
 
 	identifyDelegation(intent: DelegationIntentInput) {
 		return {

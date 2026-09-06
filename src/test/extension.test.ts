@@ -14,6 +14,7 @@ import {
 	MeshDelegateTaskTool,
 	MeshGetTaskTool,
 	MeshListWorkersTool,
+	MeshListTasksTool,
 } from '../tools/taskTools';
 import {
 	MESH_RUNTIME_TOOL_NAMES,
@@ -148,6 +149,46 @@ suite('Copilot Agent Mesh', () => {
 		assert.strictEqual(typeof globalThis.WebSocket, 'function');
 	});
 
+	test('public submit uses readable outcomes and get/wait adds no extra confirmation', async () => {
+		const taskId = '00000000-0000-4000-8000-000000000003';
+		const delegationRequestId = '00000000-0000-4000-8000-000000000004';
+		const facade = Object.assign(createTaskToolFacade(), {
+			resolveTargetHandle: async () => ({
+				deviceId: '00000000-0000-4000-8000-000000000001',
+				nodeId: '00000000-0000-4000-8000-000000000007',
+				nodeInstanceId: '00000000-0000-4000-8000-000000000008',
+				workspaceId: '00000000-0000-4000-8000-000000000002',
+			}),
+			identifyDelegation: () => ({
+				taskId, delegationRequestId, sourceWorkspaceIdentity: `sha256:${'a'.repeat(43)}`,
+			}),
+			describeDelegationTarget: async () => ({ windowName: 'Target window', workspaceName: 'Target Workspace' }),
+			subscribeToTask: () => ({ dispose: () => undefined }),
+		});
+		const cancellation = new vscode.CancellationTokenSource();
+		try {
+			const input = {
+				targetHandle: 'h'.repeat(32), delegationRequestId, mode: 'submit' as const,
+				title: 'Submit a task', prompt: 'Use the test facade only.',
+			};
+			const tool = new MeshDelegateTaskTool(facade);
+			const preparation = await tool.prepareInvocation({ input }, cancellation.token);
+			assert.match(String(preparation.confirmationMessages?.message), /stopping Chat does not cancel/u);
+			const result = await tool.invoke({ input, toolInvocationToken: undefined }, cancellation.token);
+			const part = result.content[0];
+			assert.ok(part instanceof vscode.LanguageModelTextPart);
+			const parsed = JSON.parse(part.value);
+			assert.equal(parsed.outcome, 'accepted');
+			assert.equal(parsed.taskId, taskId);
+			assert.equal(parsed.taskState, 'running');
+			assert.equal(parsed.s, undefined);
+			assert.equal(parsed.nextAction.tool, 'meshGetTask');
+			const wait = new MeshGetTaskTool(facade).prepareInvocation({ input: { taskId, waitFor: 'outcome' } });
+			assert.equal(wait.confirmationMessages, undefined);
+			assert.match(String(wait.invocationMessage), /leaves the task running/u);
+		} finally { cancellation.dispose(); }
+	});
+
 	test('all production tools contain tokenizer failures without retrying the tokenizer', async () => {
 		const taskId = '00000000-0000-4000-8000-000000000003';
 		const facade = createTaskToolFacade();
@@ -167,6 +208,10 @@ suite('Copilot Agent Mesh', () => {
 		try {
 			const results = await Promise.all([
 				new MeshListWorkersTool(facade).invoke({
+					...invocationBase,
+					input: {},
+				}, cancellation.token),
+				new MeshListTasksTool(facade).invoke({
 					...invocationBase,
 					input: {},
 				}, cancellation.token),
@@ -200,7 +245,7 @@ suite('Copilot Agent Mesh', () => {
 				}, cancellation.token),
 			]);
 
-			assert.equal(tokenizerCalls, 5);
+			assert.equal(tokenizerCalls, 6);
 			for (const result of results) {
 				const [part] = result.content;
 				assert.ok(part instanceof vscode.LanguageModelTextPart);
@@ -278,7 +323,10 @@ suite('Copilot Agent Mesh', () => {
 			assert.deepStrictEqual(receivedContext, executionContext);
 			const [part] = result.content;
 			assert.ok(part instanceof vscode.LanguageModelTextPart);
-			assert.strictEqual(JSON.parse(part.value).e, 'DELEGATION_RECURSION');
+			const parsed = JSON.parse(part.value);
+			assert.strictEqual(parsed.error.code, 'DELEGATION_RECURSION');
+			assert.strictEqual(parsed.outcome, 'failed');
+			assert.strictEqual(parsed.taskState, 'unknown');
 		} finally {
 			cancellation.dispose();
 			delegatedToolInvocations.dispose();
@@ -318,6 +366,7 @@ function createTaskToolFacade(): TaskToolFacade {
 	const taskId = '00000000-0000-4000-8000-000000000003';
 	return {
 		listWorkers: async () => ({ devices: [], truncated: false }),
+		listTasks: async () => ({ tasks: [], truncated: false, totalTasks: 0 }),
 		persistDelegationIntent: async () => ({
 			delegationRequestId,
 			taskId,

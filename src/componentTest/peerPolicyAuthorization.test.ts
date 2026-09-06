@@ -381,6 +381,7 @@ test('two windows and one Broker deliver authoritative delegation outcomes witho
 		t: failedTaskId,
 		d: failedInput.delegationRequestId,
 		e: 'TASK_EXECUTION_FAILED',
+		taskState: 'failed',
 	});
 
 	const cancelledInput = delegationInput(214);

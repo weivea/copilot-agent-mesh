@@ -17,6 +17,7 @@ const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 const stableCodePattern = /^[A-Z][A-Z0-9_]{0,127}$/u;
 const knownToolNames = new Set([
 	'mesh_list_workers',
+	'mesh_list_tasks',
 	'mesh_delegate_task',
 	'mesh_get_task',
 	'mesh_cancel_task',

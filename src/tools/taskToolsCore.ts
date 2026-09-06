@@ -17,11 +17,15 @@ import {
 	TaskToolReadResult,
 	TaskToolSnapshot,
 	TaskValidationSummary,
+	ExplicitToolTarget,
+	MeshTargetScope,
+	ListTasksInput,
 } from '../../shared/toolProtocol';
 import {
 	TASK_STATUSES,
 	type DelegatedExecutionContext,
 	TaskStatus,
+	ownedTaskListResultSchema,
 } from '../../shared/protocol';
 import {
 	DelegationWaiter,
@@ -33,31 +37,41 @@ import { sanitizeDelegationText } from './DelegationTextSanitizer';
 import { TaskToolFacade, TaskToolFacadeError } from './taskToolFacade';
 import { MESH_TOOL_NAMES } from './toolManifest';
 import type { DelegatedToolInvocationRegistry } from './DelegatedToolInvocationRegistry';
+import { isTaskOutcome, TaskSnapshotWaiter, type TaskReadWaitOutcome } from './TaskSnapshotWaiter';
+import { compactPresentedDelegation } from './ToolResultPresentation';
 
 export type { ToolCancellation, ToolClock } from './DelegationWaiter';
+export type { ListTasksInput } from '../../shared/toolProtocol';
 
 export interface ToolDeadlineTimer {
 	readonly promise: Promise<void>;
 	dispose(): void;
 }
 
-export interface DelegateTaskInput {
+interface DelegateTaskParameters {
 	readonly delegationRequestId?: string;
-	readonly deviceId: string;
-	readonly nodeId: string;
-	readonly nodeInstanceId: string;
-	readonly workspaceId: string;
-	readonly peerId?: string;
 	readonly title: string;
 	readonly prompt: string;
 	readonly acceptanceCriteria?: readonly string[];
 	readonly timeoutMinutes?: number;
+	readonly mode?: 'wait' | 'submit';
+}
+
+export type DelegateTaskInput = DelegateTaskParameters & (ExplicitToolTarget | { readonly targetHandle: string });
+type ParsedDelegateTaskInput = Omit<DelegateTaskParameters, 'acceptanceCriteria'>
+	& { readonly acceptanceCriteria: readonly string[] }
+	& (ExplicitToolTarget | { readonly targetHandle: string });
+
+export interface ListWorkersInput {
+	readonly scope?: MeshTargetScope;
 }
 
 export interface GetTaskInput {
 	readonly taskId: string;
 	readonly afterEventSequence?: number;
 	readonly maxEvents?: number;
+	readonly waitFor?: 'snapshot' | 'change' | 'outcome';
+	readonly waitSeconds?: number;
 }
 
 export interface CancelTaskInput {
@@ -166,6 +180,7 @@ const safeErrorMessages: Readonly<Record<TaskToolErrorCode, string>> = {
 	PEER_MULTI_WORKSPACE: 'The target window must claim exactly one workspace.',
 	WINDOW_NAME_CONFLICT: 'The requested window name is already in use.',
 	POLICY_FORBIDDEN: 'The caller cannot modify that peer policy.',
+	STALE_TARGET: 'The selected target reference expired or its source scope changed. List targets again; do not substitute a same-named window.',
 	DELEGATION_RECURSION: 'A delegated child task cannot delegate another task.',
 	ARTIFACT_NOT_FOUND: 'The required artifact was not found.',
 	ARTIFACT_FORBIDDEN: 'The artifact is not authorized for this task.',
@@ -201,7 +216,10 @@ export class TaskToolsCore {
 		rawInput: unknown,
 		cancellation: ToolCancellation = neverCancelled,
 	): Promise<DelegateInvocationPreparation> {
-		const input = parseDelegateTaskInput(rawInput);
+		const parsed = parseDelegateTaskInput(rawInput);
+		const input = 'targetHandle' in parsed
+			? await this.resolveHandleInput(parsed)
+			: delegationIntent(parsed, parsed);
 		const displayOutcome = await this.runBounded(
 			(signal) => {
 				if (this.facade.describeDelegationTarget === undefined) {
@@ -225,11 +243,14 @@ export class TaskToolsCore {
 				`Target window: ${windowName}`,
 				`Workspace: ${workspaceName}`,
 				`Task: ${summary}`,
+				...(parsed.mode === 'submit'
+					? ['Submit returns after durable acceptance, before completion. After it returns, stopping Chat does not cancel the task; use #meshCancelTask.']
+					: []),
 				'Continue grants approval for this task only.',
 				'Automatically approved: non-control-plane structured file changes proven to stay inside this Workspace.',
 				'Terminal commands, execution/instruction-control files, and operations without authoritative path evidence still require confirmation.',
 				'Never auto-approved: network authentication, cross-Workspace writes, secret access, external publishing, or Workspace command configuration.',
-				'The task may run for at most 60 minutes.',
+				`The task may run for at most ${input.timeoutMinutes ?? TASK_TOOL_LIMITS.defaultTimeoutMinutes} minutes.`,
 			].join('\n'),
 		};
 	}
@@ -243,15 +264,31 @@ export class TaskToolsCore {
 		};
 	}
 
-	prepareAnswerInvocation(rawInput: unknown): DelegateInvocationPreparation {
+	async prepareAnswerInvocation(
+		rawInput: unknown,
+		cancellation: ToolCancellation = neverCancelled,
+	): Promise<DelegateInvocationPreparation> {
 		const input = parseAnswerTaskInput(rawInput);
+		const outcome = await this.runBounded(
+			(signal) => this.facade.getTask({ taskId: input.taskId, maxEvents: 1 }, signal),
+			TASK_TOOL_DEADLINES_MS.getTask,
+			cancellation,
+		);
+		if (outcome.kind !== 'success') { throw new Error('The task input could not be read.'); }
+		const read = parseTaskReadResult(outcome.value, 1);
+		if (read.snapshot.taskId !== input.taskId || read.snapshot.status !== 'needsInput'
+			|| read.snapshot.pendingInput?.inputId !== input.inputId) {
+			throw new Error('The requested task input is no longer pending.');
+		}
 		return {
 			invocationMessage: 'Sending an answer to the remote task',
 			confirmationTitle: 'Send this answer to the mesh task?',
 			confirmationMessage: [
-				`Task: ${input.taskId}`,
-				`Input: ${input.inputId}`,
-				`Answer ID: ${input.answerId}`,
+				`Task: ${safeDelegationText(read.snapshot.title, TASK_TOOL_LIMITS.titleBytes)}`,
+				`Task ID: ${input.taskId}`,
+				`Question: ${safeDelegationText(read.snapshot.pendingInput.prompt, 1_024)}`,
+				`Answer: ${safeDelegationText(input.answer, 1_024)}`,
+				'This answers only the current input request. It does not approve future requests.',
 			].join('\n'),
 		};
 	}
@@ -260,23 +297,75 @@ export class TaskToolsCore {
 		rawInput: unknown,
 		cancellation: ToolCancellation = neverCancelled,
 	): Promise<ToolJsonResult> {
+		let input: ListWorkersInput;
 		try {
-			parseListWorkersInput(rawInput);
+			input = parseListWorkersInput(rawInput);
 		} catch {
 			return this.errorResult('INVALID_INPUT');
 		}
 
-		const outcome = await this.runBounded(
-			(signal) => this.facade.listWorkers(signal),
-			TASK_TOOL_DEADLINES_MS.listWorkers,
-			cancellation,
-		);
-		if (outcome.kind !== 'success') {
-			return this.outcomeResult(outcome);
-		}
-
+		const scopes: Array<'local' | 'remote'> = input.scope === 'local' ? ['local']
+			: input.scope === 'remote' ? ['remote'] : ['local', 'remote'];
+		const outcomes = await Promise.all(scopes.map(async (scope) => ({
+			scope,
+			outcome: await this.runBounded((signal) => this.facade.listWorkers(signal, { scope }),
+				TASK_TOOL_DEADLINES_MS.listWorkers, cancellation),
+		})));
+		if (cancellation.isCancellationRequested) { return this.cancelledResult(); }
 		try {
-			return this.boundWorkerResult(parseWorkerDirectory(outcome.value));
+			const directories: MeshDirectorySnapshot[] = [];
+			const issues: Record<string, unknown>[] = [];
+			let firstFailure: Exclude<OperationOutcome<MeshDirectorySnapshot>, OperationSuccess<MeshDirectorySnapshot>> | undefined;
+			for (const { scope, outcome } of outcomes) {
+				if (outcome.kind !== 'success') {
+					firstFailure ??= outcome;
+					const error = this.outcomeResult(outcome).error;
+					if (!isRecord(error)) { return this.errorResult('OUTPUT_INVALID'); }
+					issues.push({ scope, error });
+					continue;
+				}
+				try {
+					const directory = parseWorkerDirectory(outcome.value);
+					directories.push({ ...directory, devices: directory.devices.filter((device) => device.locality === scope) });
+				} catch {
+					const failure: OperationFailure = { kind: 'failure', error: new TaskToolFacadeError('OUTPUT_INVALID') };
+					firstFailure ??= failure;
+					issues.push({ scope, error: this.outcomeResult(failure).error });
+				}
+			}
+			if (directories.length === 0 && firstFailure !== undefined) { return this.outcomeResult(firstFailure); }
+			return this.boundWorkerResult({
+				devices: directories.flatMap((directory) => directory.devices),
+				truncated: directories.some((directory) => directory.truncated),
+			}, issues);
+		} catch {
+			return this.errorResult('OUTPUT_INVALID');
+		}
+	}
+
+	async listTasks(
+		rawInput: unknown,
+		cancellation: ToolCancellation = neverCancelled,
+	): Promise<ToolJsonResult> {
+		let input: ListTasksInput;
+		try {
+			input = parseListTasksInput(rawInput);
+		} catch {
+			return this.errorResult('INVALID_INPUT');
+		}
+		const listTasks = this.facade.listTasks?.bind(this.facade);
+		if (listTasks === undefined) { return this.errorResult('OUTPUT_INVALID'); }
+		const outcome = await this.runBounded(
+			(signal) => listTasks(input, signal),
+			TASK_TOOL_DEADLINES_MS.getTask, cancellation,
+		);
+		if (outcome.kind !== 'success') { return this.outcomeResult(outcome); }
+		try {
+			const result = ownedTaskListResultSchema.parse(outcome.value);
+			return fitToolResultToByteBudget({
+				status: 'ok', stateSource: 'lastKnown', ...result,
+				tasks: result.tasks.map((task) => ({ ...task, title: safeDelegationText(task.title, TASK_TOOL_LIMITS.titleBytes) })),
+			}, this.outputByteLimit);
 		} catch {
 			return this.errorResult('OUTPUT_INVALID');
 		}
@@ -291,17 +380,22 @@ export class TaskToolsCore {
 			readonly timeoutMinutes: number;
 		};
 		let delegatedExecutionContext: DelegatedExecutionContext | undefined;
+		let mode: 'wait' | 'submit';
 		try {
 			const parsed = parseDelegateTaskInput(rawInput);
 			delegatedExecutionContext = this.delegatedToolInvocations?.consume(parsed);
+			mode = parsed.mode ?? 'wait';
+			const intent = 'targetHandle' in parsed
+				? await this.resolveHandleInput(parsed)
+				: delegationIntent(parsed, parsed);
 			input = {
-				...parsed,
-				delegationRequestId: parsed.delegationRequestId ?? this.id(),
-				timeoutMinutes: parsed.timeoutMinutes
+				...intent,
+				delegationRequestId: intent.delegationRequestId ?? this.id(),
+				timeoutMinutes: intent.timeoutMinutes
 					?? TASK_TOOL_LIMITS.defaultTimeoutMinutes,
 			};
-		} catch {
-			return this.errorResult('INVALID_INPUT');
+		} catch (error: unknown) {
+			return error instanceof TaskToolFacadeError ? this.errorFromUnknown(error) : this.errorResult('INVALID_INPUT');
 		}
 
 		let identity: DelegationIdentity;
@@ -321,6 +415,7 @@ export class TaskToolsCore {
 		const waiter = new DelegationWaiter({
 			taskId: identity.taskId,
 			timeoutMinutes,
+			returnOnAccepted: mode === 'submit',
 			cancellation,
 			clock: this.clock,
 			subscribe: (listener, onError) => {
@@ -385,6 +480,8 @@ export class TaskToolsCore {
 		delegationRequestId: string,
 	): ToolJsonResult {
 		switch (outcome.kind) {
+			case 'accepted':
+				return { s: 4, t: outcome.taskId, d: delegationRequestId, taskState: outcome.taskState };
 			case 'completed':
 				return {
 					s: 0,
@@ -406,6 +503,7 @@ export class TaskToolsCore {
 					t: outcome.taskId,
 					d: delegationRequestId,
 					e: normalizeErrorCode(outcome.code),
+					...(outcome.taskState === undefined ? {} : { taskState: outcome.taskState }),
 				};
 			case 'cancelled':
 				return {
@@ -414,6 +512,7 @@ export class TaskToolsCore {
 					d: delegationRequestId,
 					e: outcome.code,
 					x: outcome.reason,
+					...(outcome.taskState === undefined ? {} : { taskState: outcome.taskState }),
 				};
 		}
 	}
@@ -422,15 +521,42 @@ export class TaskToolsCore {
 		rawInput: unknown,
 		cancellation: ToolCancellation = neverCancelled,
 	): Promise<ToolJsonResult> {
-		let input: Required<Pick<GetTaskInput, 'taskId' | 'maxEvents'>> & Pick<GetTaskInput, 'afterEventSequence'>;
+		let input: ReturnType<typeof parseGetTaskInput>;
 		try {
 			input = parseGetTaskInput(rawInput);
 		} catch {
 			return this.errorResult('INVALID_INPUT');
 		}
 
-		const outcome = await this.runBounded(
-			(signal) => this.facade.getTask(input, signal),
+		let waiter: TaskSnapshotWaiter | undefined;
+		try {
+			if (input.waitFor !== 'snapshot') {
+				if (this.facade.subscribeToTask === undefined) { return this.errorResult('OUTPUT_INVALID'); }
+				waiter = new TaskSnapshotWaiter({
+					taskId: input.taskId, mode: input.waitFor, seconds: input.waitSeconds,
+					clock: this.clock, cancellation,
+					subscribe: (listener, onError) => this.facade.subscribeToTask!(input.taskId, (snapshot) => {
+						try {
+							listener(parseTaskReadResult({ snapshot, eventCursor: 0, events: [], truncated: false }, 1).snapshot);
+						} catch { onError(new TaskToolFacadeError('OUTPUT_INVALID')); }
+					}, onError),
+				});
+			}
+			return await this.readTaskWithWait(input, cancellation, waiter);
+		} catch (error: unknown) {
+			return this.errorFromUnknown(error);
+		} finally { waiter?.dispose(); }
+	}
+
+	private async readTaskWithWait(
+		input: ReturnType<typeof parseGetTaskInput>,
+		cancellation: ToolCancellation,
+		waiter: TaskSnapshotWaiter | undefined,
+	): Promise<ToolJsonResult> {
+		const request = { taskId: input.taskId, maxEvents: input.maxEvents,
+			...(input.afterEventSequence === undefined ? {} : { afterEventSequence: input.afterEventSequence }) };
+		let outcome = await this.runBounded(
+			(signal) => this.facade.getTask(request, signal),
 			TASK_TOOL_DEADLINES_MS.getTask,
 			cancellation,
 		);
@@ -439,7 +565,7 @@ export class TaskToolsCore {
 		}
 
 		try {
-			const read = parseTaskReadResult(
+			let read = parseTaskReadResult(
 				outcome.value,
 				input.maxEvents,
 				input.afterEventSequence,
@@ -447,10 +573,43 @@ export class TaskToolsCore {
 			if (read.snapshot.taskId !== input.taskId) {
 				return this.errorResult('OUTPUT_INVALID');
 			}
-			return this.boundTaskResult(read, input.afterEventSequence ?? 0);
-		} catch {
-			return this.errorResult('OUTPUT_INVALID');
+			let waitOutcome: TaskReadWaitOutcome | undefined;
+			if (waiter !== undefined) {
+				waitOutcome = await waiter.wait(read.snapshot, input.afterEventSequence !== undefined
+					&& read.eventCursor > input.afterEventSequence);
+				if (waitOutcome === 'changed' || waitOutcome === 'outcome') {
+					outcome = await this.runBounded((signal) => this.facade.getTask(request, signal),
+						TASK_TOOL_DEADLINES_MS.getTask, cancellation);
+					if (outcome.kind !== 'success') { return this.outcomeResult(outcome); }
+					read = parseTaskReadResult(outcome.value, input.maxEvents, input.afterEventSequence);
+					if (read.snapshot.taskId !== input.taskId) { return this.errorResult('OUTPUT_INVALID'); }
+					if (waitOutcome === 'outcome' && !isTaskOutcome(read.snapshot)) { waitOutcome = 'changed'; }
+				}
+			}
+			return fitToolResultToByteBudget({
+				...this.boundTaskResult(read, input.afterEventSequence ?? 0),
+				...(waitOutcome === undefined ? {} : {
+					waitOutcome,
+					snapshotIsLastRead: waitOutcome === 'timeout' || waitOutcome === 'cancelled',
+				}),
+			}, this.outputByteLimit);
+		} catch (error: unknown) {
+			return error instanceof TaskToolFacadeError ? this.errorFromUnknown(error) : this.errorResult('OUTPUT_INVALID');
 		}
+	}
+
+	private async resolveHandleInput(
+		input: ParsedDelegateTaskInput & { readonly targetHandle: string },
+	): Promise<DelegationIntentInput> {
+		if (this.facade.resolveTargetHandle === undefined) { throw new TaskToolFacadeError('STALE_TARGET'); }
+		const resolved = await this.facade.resolveTargetHandle(input.targetHandle);
+		let target: ExplicitToolTarget;
+		try {
+			target = parseExplicitTarget(resolved);
+		} catch {
+			throw new TaskToolFacadeError('OUTPUT_INVALID');
+		}
+		return { ...delegationIntent(input, target), targetHandle: input.targetHandle };
 	}
 
 	async cancelTask(
@@ -599,7 +758,7 @@ export class TaskToolsCore {
 		});
 	}
 
-	private boundWorkerResult(directory: MeshDirectorySnapshot): ToolJsonResult {
+	private boundWorkerResult(directory: MeshDirectorySnapshot, issues: readonly Record<string, unknown>[] = []): ToolJsonResult {
 		const devices: Array<{
 			deviceId: string;
 			deviceName: string;
@@ -618,6 +777,7 @@ export class TaskToolsCore {
 					tags: string[];
 					busy: boolean;
 					claimStatus: 'claimed' | 'readOnly' | 'conflict';
+					targetHandle?: string;
 				}>;
 			}>;
 		}> = [];
@@ -625,7 +785,9 @@ export class TaskToolsCore {
 			status: string;
 			devices: typeof devices;
 			truncated: boolean;
-		} = { status: 'ok', devices, truncated: false };
+			issues?: readonly Record<string, unknown>[];
+		} = { status: issues.length > 0 ? 'partial' : 'ok', devices, truncated: false,
+			...(issues.length > 0 ? { issues } : {}) };
 		const sourceTruncated = directory.truncated
 			|| directory.devices.some(({ nodesTruncated }) => nodesTruncated);
 
@@ -678,6 +840,7 @@ export class TaskToolsCore {
 						tags: [] as string[],
 						busy: sourceWorkspace.busy,
 						claimStatus: sourceWorkspace.claimStatus,
+						...(sourceWorkspace.targetHandle === undefined ? {} : { targetHandle: sourceWorkspace.targetHandle }),
 					};
 					node.workspaces.push(workspace);
 					if (utf8JsonBytes(result) > this.outputByteLimit) {
@@ -1012,13 +1175,23 @@ export class TaskToolsCore {
 	}
 }
 
-export function parseListWorkersInput(value: unknown): Record<string, never> {
+export function parseListWorkersInput(value: unknown): ListWorkersInput {
 	const input = expectRecord(value, 'input');
-	expectExactKeys(input, []);
-	return {};
+	expectExactKeys(input, ['scope']);
+	return input.scope === undefined ? {} : { scope: expectEnum(input.scope, 'scope', ['local', 'remote', 'all'] as const) };
 }
 
-export function parseDelegateTaskInput(value: unknown): DelegationIntentInput {
+export function parseListTasksInput(value: unknown): ListTasksInput {
+	const input = expectRecord(value, 'input');
+	expectExactKeys(input, ['limit', 'includeTerminal', 'beforeTaskId']);
+	return {
+		limit: input.limit === undefined ? 20 : expectInteger(input.limit, 'limit', 1, 100),
+		includeTerminal: input.includeTerminal === undefined ? false : expectBoolean(input.includeTerminal, 'includeTerminal'),
+		...(input.beforeTaskId === undefined ? {} : { beforeTaskId: expectIdentifier(input.beforeTaskId, 'beforeTaskId') }),
+	};
+}
+
+export function parseDelegateTaskInput(value: unknown): ParsedDelegateTaskInput {
 	const input = expectRecord(value, 'input');
 	expectExactKeys(input, [
 		'delegationRequestId',
@@ -1031,15 +1204,20 @@ export function parseDelegateTaskInput(value: unknown): DelegationIntentInput {
 		'prompt',
 		'acceptanceCriteria',
 		'timeoutMinutes',
+		'targetHandle',
+		'mode',
 	]);
 	const delegationRequestId = input.delegationRequestId === undefined
 		? undefined
 		: expectIdentifier(input.delegationRequestId, 'delegationRequestId');
-	const deviceId = expectIdentifier(input.deviceId, 'deviceId');
-	const nodeId = expectIdentifier(input.nodeId, 'nodeId');
-	const nodeInstanceId = expectIdentifier(input.nodeInstanceId, 'nodeInstanceId');
-	const peerId = input.peerId === undefined ? undefined : expectIdentifier(input.peerId, 'peerId');
-	const workspaceId = expectIdentifier(input.workspaceId, 'workspaceId');
+	if (input.targetHandle !== undefined && ['deviceId', 'nodeId', 'nodeInstanceId', 'workspaceId', 'peerId']
+		.some((key) => Object.hasOwn(input, key))) {
+		throw new Error('Use either a target handle or the explicit routing tuple.');
+	}
+	const target = input.targetHandle === undefined ? parseExplicitTarget({
+		deviceId: input.deviceId, nodeId: input.nodeId, nodeInstanceId: input.nodeInstanceId,
+		workspaceId: input.workspaceId, ...(input.peerId === undefined ? {} : { peerId: input.peerId }),
+	}) : { targetHandle: expectTargetHandle(input.targetHandle) };
 	const title = expectString(input.title, 'title', TASK_TOOL_LIMITS.titleBytes);
 	const prompt = expectString(input.prompt, 'prompt', TASK_TOOL_LIMITS.promptBytes);
 	const acceptanceCriteria = input.acceptanceCriteria === undefined
@@ -1060,23 +1238,49 @@ export function parseDelegateTaskInput(value: unknown): DelegationIntentInput {
 		);
 	return {
 		...(delegationRequestId === undefined ? {} : { delegationRequestId }),
-		deviceId,
-		nodeId,
-		nodeInstanceId,
-		workspaceId,
-		...(peerId === undefined ? {} : { peerId }),
+		...target,
 		title,
 		prompt,
 		acceptanceCriteria,
 		...(timeoutMinutes === undefined ? {} : { timeoutMinutes }),
+		...(input.mode === undefined ? {} : { mode: expectEnum(input.mode, 'mode', ['wait', 'submit'] as const) }),
+	};
+}
+
+function expectTargetHandle(value: unknown): string {
+	if (typeof value !== 'string' || !/^[A-Za-z0-9_-]{32}$/u.test(value)) {
+		throw new Error('Target references must be opaque selection handles.');
+	}
+	return value;
+}
+
+function parseExplicitTarget(value: unknown): ExplicitToolTarget {
+	const target = expectRecord(value, 'target');
+	expectExactKeys(target, ['deviceId', 'nodeId', 'nodeInstanceId', 'workspaceId', 'peerId']);
+	return {
+		deviceId: expectIdentifier(target.deviceId, 'deviceId'),
+		nodeId: expectIdentifier(target.nodeId, 'nodeId'),
+		nodeInstanceId: expectIdentifier(target.nodeInstanceId, 'nodeInstanceId'),
+		workspaceId: expectIdentifier(target.workspaceId, 'workspaceId'),
+		...(target.peerId === undefined ? {} : { peerId: expectIdentifier(target.peerId, 'peerId') }),
+	};
+}
+
+function delegationIntent(input: ParsedDelegateTaskInput, target: ExplicitToolTarget): DelegationIntentInput {
+	return {
+		deviceId: target.deviceId, nodeId: target.nodeId, nodeInstanceId: target.nodeInstanceId,
+		workspaceId: target.workspaceId, ...(target.peerId === undefined ? {} : { peerId: target.peerId }),
+		title: input.title, prompt: input.prompt, acceptanceCriteria: input.acceptanceCriteria,
+		...(input.delegationRequestId === undefined ? {} : { delegationRequestId: input.delegationRequestId }),
+		...(input.timeoutMinutes === undefined ? {} : { timeoutMinutes: input.timeoutMinutes }),
 	};
 }
 
 export function parseGetTaskInput(
 	value: unknown,
-): Required<Pick<GetTaskInput, 'taskId' | 'maxEvents'>> & Pick<GetTaskInput, 'afterEventSequence'> {
+): Required<Pick<GetTaskInput, 'taskId' | 'maxEvents' | 'waitFor' | 'waitSeconds'>> & Pick<GetTaskInput, 'afterEventSequence'> {
 	const input = expectRecord(value, 'input');
-	expectExactKeys(input, ['taskId', 'afterEventSequence', 'maxEvents']);
+	expectExactKeys(input, ['taskId', 'afterEventSequence', 'maxEvents', 'waitFor', 'waitSeconds']);
 	const taskId = expectIdentifier(input.taskId, 'taskId');
 	const afterEventSequence = input.afterEventSequence === undefined
 		? undefined
@@ -1084,9 +1288,17 @@ export function parseGetTaskInput(
 	const maxEvents = input.maxEvents === undefined
 		? 20
 		: expectInteger(input.maxEvents, 'maxEvents', 1, TASK_TOOL_LIMITS.maxEvents);
+	const waitFor = input.waitFor === undefined ? 'snapshot'
+		: expectEnum(input.waitFor, 'waitFor', ['snapshot', 'change', 'outcome'] as const);
+	if (waitFor === 'snapshot' && input.waitSeconds !== undefined) {
+		throw new Error('A snapshot read cannot specify an event wait budget.');
+	}
 	return {
 		taskId,
 		maxEvents,
+		waitFor,
+		waitSeconds: input.waitSeconds === undefined ? TASK_TOOL_LIMITS.defaultWaitSeconds
+			: expectInteger(input.waitSeconds, 'waitSeconds', 1, TASK_TOOL_LIMITS.maxWaitSeconds),
 		...(afterEventSequence === undefined ? {} : { afterEventSequence }),
 	};
 }
@@ -1106,6 +1318,24 @@ export function parseAnswerTaskInput(value: unknown): AnswerTaskInput {
 		answerId: expectIdentifier(input.answerId, 'answerId'),
 		answer: expectString(input.answer, 'answer', TASK_TOOL_LIMITS.answerBytes),
 	};
+}
+
+export function fitToolResultToByteBudget(value: ToolJsonResult, maximumBytes: number): ToolJsonResult {
+	if (!Number.isSafeInteger(maximumBytes) || maximumBytes < TASK_TOOL_LIMITS.minimumOutputBytes) {
+		throw new TypeError('The tool byte budget is below the minimum supported size.');
+	}
+	let candidate = value;
+	while (utf8JsonBytes(candidate) > maximumBytes) {
+		const smaller = shrinkToolResult(candidate);
+		if (smaller === undefined || utf8JsonBytes(smaller) >= utf8JsonBytes(candidate)) {
+			return {
+				status: 'error',
+				error: { code: 'OUTPUT_TOO_LARGE', message: safeErrorMessages.OUTPUT_TOO_LARGE, retryable: false },
+			};
+		}
+		candidate = smaller;
+	}
+	return candidate;
 }
 
 export async function serializeToolResultToTokenBudget(
@@ -1209,6 +1439,7 @@ function parseWorkerDirectory(value: unknown): MeshDirectorySnapshot {
 						'tags',
 						'busy',
 						'claimStatus',
+						'targetHandle',
 					]);
 					return {
 						workspaceId: expectIdentifier(workspace.workspaceId, 'workspaceId'),
@@ -1229,6 +1460,7 @@ function parseWorkerDirectory(value: unknown): MeshDirectorySnapshot {
 							'claimStatus',
 							['claimed', 'readOnly', 'conflict'] as const,
 						),
+						...(workspace.targetHandle === undefined ? {} : { targetHandle: expectTargetHandle(workspace.targetHandle) }),
 					};
 				});
 				return {
@@ -1596,6 +1828,15 @@ function halveUtf8(value: string, minimumBytes: number): string {
 }
 
 function shrinkToolResult(value: ToolJsonResult): ToolJsonResult | undefined {
+	const presented = compactPresentedDelegation(value);
+	if (presented !== undefined) { return presented; }
+	if (Array.isArray(value.tasks) && value.stateSource === 'lastKnown' && value.tasks.length > 1) {
+		const tasks = value.tasks.slice(0, -1);
+		const last = tasks[tasks.length - 1];
+		if (isRecord(last) && typeof last.taskId === 'string') {
+			return { ...value, tasks, truncated: true, nextBeforeTaskId: last.taskId };
+		}
+	}
 	const compactDelegation = compactDelegationResult(value);
 	if (compactDelegation !== undefined) {
 		return compactDelegation;
@@ -1796,6 +2037,7 @@ function shrinkToolResult(value: ToolJsonResult): ToolJsonResult | undefined {
 				return {
 					status: typeof value.status === 'string' ? value.status : 'ok',
 					...compactTaskEventWindow(value),
+					...waitResultMetadata(value),
 					snapshot: {
 						taskId: snapshot.taskId,
 						status: 'needsInput',
@@ -1820,6 +2062,7 @@ function shrinkToolResult(value: ToolJsonResult): ToolJsonResult | undefined {
 			return {
 				status: typeof value.status === 'string' ? value.status : 'ok',
 				...compactTaskEventWindow(value),
+				...waitResultMetadata(value),
 				snapshot: {
 					taskId: snapshot.taskId,
 					status: snapshot.status,
@@ -1902,6 +2145,13 @@ function replaceLast(values: readonly unknown[], replacement: unknown): readonly
 	return [...values.slice(0, -1), replacement];
 }
 
+function waitResultMetadata(value: ToolJsonResult): ToolJsonResult {
+	return {
+		...(value.waitOutcome === undefined ? {} : { waitOutcome: value.waitOutcome }),
+		...(value.snapshotIsLastRead === undefined ? {} : { snapshotIsLastRead: value.snapshotIsLastRead }),
+	};
+}
+
 function compactTaskEventWindow(value: ToolJsonResult): ToolJsonResult {
 	return {
 		...(Array.isArray(value.events) ? { events: value.events } : {}),
@@ -1942,7 +2192,7 @@ function normalizeErrorCode(code: string): TaskToolErrorCode {
 function isCompactDelegationResult(value: ToolJsonResult): boolean {
 	return typeof value.s === 'number'
 		&& value.s >= 0
-		&& value.s <= 3;
+		&& value.s <= 4;
 }
 
 function compactDelegationResult(value: ToolJsonResult): ToolJsonResult | undefined {
@@ -2037,5 +2287,8 @@ function compactDelegationOutputFailure(value: ToolJsonResult): ToolJsonResult |
 		t: value.t,
 		d: value.d,
 		e: 'OUTPUT_TOO_LARGE',
+		...(value.taskState !== undefined ? { taskState: value.taskState }
+			: value.s === 0 ? { taskState: 'completed' }
+				: value.s === 1 ? { taskState: 'needsInput' } : {}),
 	};
 }

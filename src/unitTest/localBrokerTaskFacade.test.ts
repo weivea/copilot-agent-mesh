@@ -89,6 +89,77 @@ test('describing and starting an explicit same-device target never touches the r
 	assert.equal(requests, 0);
 });
 
+test('opaque target references are window-local, expire, and never replace the exact local routing tuple', async (t) => {
+	const client = new FakeWindowNodeClient();
+	const list = client.listNodes.bind(client);
+	client.listNodes = async () => {
+		const directory = await list();
+		return {
+			...directory,
+			nodes: directory.nodes.map((node) => node.nodeId !== OTHER_NODE_ID ? node : {
+				...node, status: 'online',
+				workspaces: [{ ...directory.nodes[0].workspaces[0], workspaceId: INPUT_ID }],
+			}),
+		};
+	};
+	let now = Date.parse('2026-08-25T00:00:00Z');
+	let sourceScope = SOURCE_IDENTITY_A;
+	let remoteRequests = 0;
+	const remote = async (): Promise<never> => { remoteRequests += 1; throw new Error('Unexpected remote request.'); };
+	const facade = new LocalBrokerTaskFacade(client, {
+		deviceName: 'Local Device', now: () => new Date(now), sourceWorkspaceIdentity: () => sourceScope,
+		remoteAdapter: { listDevices: remote, startTask: remote, getTask: remote, cancelTask: remote, answerTask: remote },
+	});
+	t.after(() => facade.dispose());
+	const directory = await facade.listWorkers(new AbortController().signal, { scope: 'local' });
+	const handle = directory.devices[0].nodes[1].workspaces[0].targetHandle;
+	assert.match(handle ?? '', /^[A-Za-z0-9_-]{32}$/u);
+	const target = await facade.resolveTargetHandle(handle!);
+	assert.deepEqual(target, {
+		deviceId: DEVICE_ID, nodeId: OTHER_NODE_ID, nodeInstanceId: OTHER_INSTANCE_ID, workspaceId: INPUT_ID,
+	});
+	await facade.persistDelegationIntent({ ...intent(), ...target, targetHandle: handle });
+	assert.deepEqual(client.lastStart?.target, target);
+	assert.equal(Object.hasOwn(client.lastStart!, 'targetHandle'), false);
+	const anotherWindowFacade = new LocalBrokerTaskFacade(client, { deviceName: 'Local Device' });
+	t.after(() => anotherWindowFacade.dispose());
+	await assert.rejects(anotherWindowFacade.resolveTargetHandle(handle!), { code: 'STALE_TARGET' });
+	sourceScope = SOURCE_IDENTITY_B;
+	await assert.rejects(facade.resolveTargetHandle(handle!), { code: 'STALE_TARGET' });
+	sourceScope = SOURCE_IDENTITY_A;
+	now += 300_000;
+	await assert.rejects(facade.resolveTargetHandle(handle!), { code: 'STALE_TARGET' });
+	const fresh = (await facade.listWorkers(new AbortController().signal, { scope: 'local' }))
+		.devices[0].nodes[1].workspaces[0].targetHandle!;
+	client.setRegistered(false);
+	client.setRegistered(true);
+	await assert.rejects(facade.resolveTargetHandle(fresh), { code: 'STALE_TARGET' });
+	assert.equal(remoteRequests, 0);
+});
+
+test('owned task recovery forwards only the listing filters through the local client', async (t) => {
+	const requests: unknown[] = [];
+	const client = Object.assign(new FakeWindowNodeClient(), {
+		listOwnedTasks: async (input: unknown) => {
+			requests.push(input);
+			return { tasks: [], truncated: false, totalTasks: 0 };
+		},
+	});
+	const unavailable = async (): Promise<never> => { throw new Error('No remote task request is allowed.'); };
+	const facade = new LocalBrokerTaskFacade(client, {
+		deviceName: 'Local Device',
+		remoteAdapter: { listDevices: unavailable, startTask: unavailable, getTask: unavailable, cancelTask: unavailable, answerTask: unavailable },
+	});
+	t.after(() => facade.dispose());
+	const input = { limit: 10, includeTerminal: true, beforeTaskId: DELEGATION_ID };
+	assert.deepEqual(await facade.listTasks(input, new AbortController().signal), { tasks: [], truncated: false, totalTasks: 0 });
+	assert.deepEqual(requests, [input]);
+	const cancelled = new AbortController();
+	cancelled.abort();
+	await assert.rejects(facade.listTasks({}, cancelled.signal));
+	assert.equal(requests.length, 1);
+});
+
 test('stable task IDs survive facade reload and changed retries surface broker conflict', async () => {
 	const client = new FakeWindowNodeClient();
 	const firstFacade = new LocalBrokerTaskFacade(client, { deviceName: 'Local Device' });
@@ -203,6 +274,8 @@ test('task subscription reconciles an authoritative snapshot after Broker reconn
 	const snapshot = await reconciled;
 	assert.equal(snapshot.taskId, persisted.taskId);
 	assert.equal(snapshot.status, 'failed');
+	assert.equal(client.stateListenerCount, 1);
+	facade.dispose();
 	assert.equal(client.stateListenerCount, 0);
 });
 

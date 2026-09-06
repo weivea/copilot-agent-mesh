@@ -118,7 +118,7 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 		parentResultBytes: nonNegativeInteger,
 		parentResultHash: fingerprint.optional(),
 		invocationSource: z.enum(['copilot-ui', 'programmatic-core', 'none']),
-		compactStatus: z.number().int().min(0).max(3).optional(),
+		compactStatus: z.number().int().min(0).max(4).optional(),
 		eventTypes: z.array(z.string().min(1).max(64)).max(256),
 		eventSequences: z.array(z.number().int().positive()).max(256),
 		eventJournalTruncated: z.boolean(),
@@ -153,7 +153,7 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 	needsInput: z.strictObject({
 		status,
 		taskId: taskUuid.optional(),
-		compactStatus: z.number().int().min(0).max(3).optional(),
+		compactStatus: z.number().int().min(0).max(4).optional(),
 		inputId: taskUuid.optional(),
 		questionPresent: z.boolean(),
 		eventTypes: z.array(z.string().min(1).max(64)).max(256),
@@ -167,7 +167,7 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 	cancellation: z.strictObject({
 		status,
 		taskId: taskUuid.optional(),
-		compactStatus: z.number().int().min(0).max(3).optional(),
+		compactStatus: z.number().int().min(0).max(4).optional(),
 		reason: z.enum(['token', 'budget', 'peer', 'not-observed']),
 		eventTypes: z.array(z.string().min(1).max(64)).max(256),
 		eventJournalTruncated: z.boolean(),
@@ -177,7 +177,7 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 	timeout: z.strictObject({
 		status,
 		taskId: taskUuid.optional(),
-		compactStatus: z.number().int().min(0).max(3).optional(),
+		compactStatus: z.number().int().min(0).max(4).optional(),
 		reason: z.enum(['budget', 'not-observed']),
 		budgetMs: nonNegativeInteger,
 		productionDefaultMinutes: z.literal(60),

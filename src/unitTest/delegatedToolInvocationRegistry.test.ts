@@ -10,6 +10,8 @@ import { LocalIpcRemoteTaskAdapter } from '../node/LocalIpcRemoteTaskAdapter';
 import type { WindowNodeClient } from '../node/WindowNodeClient';
 import { DelegatedToolInvocationRegistry } from '../tools/DelegatedToolInvocationRegistry';
 import { MESH_TOOL_NAMES } from '../tools/toolManifest';
+import { TaskToolsCore } from '../tools/taskToolsCore';
+import { TaskToolFacadeError, type TaskToolFacade } from '../tools/taskToolFacade';
 
 const context: DelegatedExecutionContext = {
 	kind: 'delegatedChild',
@@ -30,6 +32,34 @@ test('keeps an exact delegated Mesh invocation correlated until authoritative co
 	assert.equal(registry.consume(input), undefined);
 });
 
+test('handle-based submit preserves the trusted child context rather than bypassing recursion checks', async (t) => {
+	const registry = new DelegatedToolInvocationRegistry();
+	t.after(() => registry.dispose());
+	const original = delegationInput(90);
+	const { deviceId, nodeId, nodeInstanceId, workspaceId, ...parameters } = original;
+	const input = { ...parameters, targetHandle: 'h'.repeat(32), mode: 'submit' };
+	registry.observe({ ...observation('scope-a', 'handle-call', original), toolInput: JSON.stringify(input) });
+	let receivedContext: DelegatedExecutionContext | undefined;
+	const unused = async (): Promise<never> => { throw new Error('Unexpected task operation.'); };
+	const facade: TaskToolFacade = {
+		listWorkers: async () => ({ devices: [], truncated: false }),
+		resolveTargetHandle: async () => ({ deviceId, nodeId, nodeInstanceId, workspaceId }),
+		identifyDelegation: () => ({
+			delegationRequestId: original.delegationRequestId, taskId: original.delegationRequestId,
+			sourceWorkspaceIdentity: `sha256:${'a'.repeat(43)}`,
+		}),
+		subscribeToTask: () => ({ dispose: () => undefined }),
+		persistDelegationIntent: async (_intent, trustedContext) => {
+			receivedContext = trustedContext;
+			throw new TaskToolFacadeError('DELEGATION_RECURSION');
+		},
+		waitForDelegationAcceptance: unused, getTask: unused, cancelOwnedTask: unused, answerOwnedTask: unused,
+	};
+	const result = await new TaskToolsCore(facade, { delegatedToolInvocations: registry }).delegateTask(input);
+	assert.deepEqual(receivedContext, context);
+	assert.equal(result.e, 'DELEGATION_RECURSION');
+	assert.equal(result.s, 2);
+});
 test('forged, ambiguous, referenced, stale, and removed correlations yield no principal', () => {
 	let now = 1_000;
 	const registry = new DelegatedToolInvocationRegistry({

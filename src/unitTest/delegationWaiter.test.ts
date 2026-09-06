@@ -76,7 +76,7 @@ test('a fast terminal event cannot mask a start idempotency conflict', async () 
 	});
 });
 
-test('budget cancellation is sent once and completion after acceptance cannot win', async () => {
+test('budget cancellation is sent once and preserves a racing authoritative completion state', async () => {
 	const fixture = waiterFixture();
 	const pending = fixture.waiter().wait();
 	fixture.fireBudget();
@@ -92,6 +92,7 @@ test('budget cancellation is sent once and completion after acceptance cannot wi
 		taskId: TASK_ID,
 		reason: 'budget',
 		code: 'TIMEOUT',
+		taskState: 'completed',
 	});
 	assert.equal(fixture.counts().subscriptions, 0);
 	assert.equal(fixture.counts().timers, 0);

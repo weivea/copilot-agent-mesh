@@ -194,17 +194,17 @@ export class DelegatedToolInvocationRegistry {
 function delegationFingerprint(rawInput: unknown): string | undefined {
 	try {
 		const input = parseDelegateTaskInput(rawInput);
+		const target = 'targetHandle' in input ? [input.targetHandle] : [
+			input.deviceId, input.nodeId, input.nodeInstanceId, input.workspaceId, input.peerId ?? null,
+		];
 		return digest(JSON.stringify([
 			input.delegationRequestId ?? null,
-			input.deviceId,
-			input.nodeId,
-			input.nodeInstanceId,
-			input.workspaceId,
-			input.peerId ?? null,
+			target,
 			input.title,
 			input.prompt,
 			input.acceptanceCriteria,
 			input.timeoutMinutes ?? null,
+			input.mode ?? 'wait',
 		]));
 	} catch {
 		return undefined;
