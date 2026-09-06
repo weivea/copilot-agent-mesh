@@ -255,9 +255,7 @@ export function createVscodeAgentRuntime(
 		enabled: common.enabled,
 		preferEditor: () => vscodeApi.workspace
 			.getConfiguration(configurationSection)
-			.get<boolean>('experimental.peerDelegation', false)
-			|| vscodeApi.workspace.getConfiguration(configurationSection)
-				.get<boolean>('experimental.crossDeviceDelegation', false),
+			.get<boolean>('experimental.peerDelegation', false),
 		editor,
 		standalone,
 		confirmation: approval,

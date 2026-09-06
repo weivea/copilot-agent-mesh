@@ -747,12 +747,12 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 	}
 
 	public async startListener(): Promise<void> {
-		await this.requireOwner().listener.start();
+		await this.options.node.connectivityAction('enableConnectivity');
 		this.options.changed.fire();
 	}
 
 	public async stopListener(): Promise<void> {
-		await this.requireOwner().listener.stop();
+		await this.options.node.connectivityAction('disableConnectivity');
 		this.options.changed.fire();
 	}
 

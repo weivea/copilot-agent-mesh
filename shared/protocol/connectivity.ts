@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { uuidSchema } from './models';
 
 export const CONNECTIVITY_ACTIONS = [
+	'enableConnectivity', 'disableConnectivity',
 	'configureConnectivity', 'refreshDiscovery', 'pairDiscoveredPeer',
 	'configureRemotePolicy', 'revokeIncomingPeer', 'retryConnectivityCleanup', 'refreshRemoteTargets',
 ] as const;
@@ -19,6 +20,10 @@ export const connectivityActionParamsSchema = connectivitySnapshotParamsSchema.e
 ) === (value.actionHandle !== undefined), 'This connectivity action requires an exact handle.');
 
 export const connectivitySnapshotSchema = z.strictObject({
+	enabled: z.boolean().default(false),
+	connectionState: z.enum(['disabled', 'authenticating', 'starting', 'online', 'stopping', 'authRequired', 'error', 'cleanupPending']).default('disabled'),
+	accountLabel: z.string().max(256).optional(),
+	connectedDeviceCount: z.number().int().min(0).max(256).default(0),
 	discoveryEnabled: z.boolean(),
 	delegationEnabled: z.boolean(),
 	strictPolicyActivated: z.boolean(),
@@ -53,8 +58,9 @@ export type ConnectivitySnapshot = z.infer<typeof connectivitySnapshotSchema>;
 export type ConnectivityActionParams = z.infer<typeof connectivityActionParamsSchema>;
 
 export const DISABLED_CONNECTIVITY_SNAPSHOT: ConnectivitySnapshot = {
+	enabled: false, connectionState: 'disabled', connectedDeviceCount: 0,
 	discoveryEnabled: false, delegationEnabled: false, strictPolicyActivated: false,
-	publishEnabled: false, hostingBackend: 'cli', migrationPending: false, accountProvider: 'none',
+	publishEnabled: false, hostingBackend: 'sdk', migrationPending: false, accountProvider: 'none',
 	claimedWorkspaceCount: 0, receivingWorkspaceCount: 0,
 	state: 'disabled', truncated: false, candidates: [], incomingPeers: [],
 };

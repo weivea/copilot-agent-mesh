@@ -113,6 +113,10 @@ function presentConnectivity(snapshot: ConnectivitySnapshot): DashboardConnectiv
 	// Validate Broker UUID handles before the provider replaces them with Webview aliases.
 	const value = connectivitySnapshotSchema.parse(snapshot);
 	return {
+		enabled: value.enabled,
+		connectionState: value.connectionState,
+		connectedDeviceCount: value.connectedDeviceCount,
+		...(value.accountLabel === undefined ? {} : { accountLabel: redactRemoteText(value.accountLabel) }),
 		discoveryEnabled: value.discoveryEnabled,
 		delegationEnabled: value.delegationEnabled,
 		strictPolicyActivated: value.strictPolicyActivated,

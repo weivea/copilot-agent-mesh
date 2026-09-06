@@ -62,9 +62,9 @@ export class AccountSessionProvider {
 	): Promise<AccountBinding> {
 		this.initialize();
 		await this.assertCurrent();
-		const epoch = this.epoch;
+		const previousBinding = this.binding;
 		const scopes = [...DEV_TUNNEL_SCOPES[providerId]];
-		const detail = 'Allow Mesh to use this account only with Microsoft Dev Tunnels. This does not pair devices or authorize tasks.';
+		const detail = 'Enable private Mesh connections and automatically trust your devices using this account. Workspaces still require separate task authorization.';
 		const session = await nativeAuthentication(this.authentication.getSession(providerId, scopes, account === undefined
 			? { forceNewSession: { detail } } : { account, createIfNone: { detail } }));
 		await this.assertCurrent();
@@ -75,7 +75,7 @@ export class AccountSessionProvider {
 			throw new ConnectivityError('ACCOUNT_CHANGED');
 		}
 		// The authentication event from this explicit login may invalidate a previous binding.
-		if (this.epoch !== epoch && this.binding?.providerId !== providerId) {
+		if (this.binding !== previousBinding) {
 			throw new ConnectivityError('ACCOUNT_CHANGED');
 		}
 		assertScopes(session.scopes, scopes);
@@ -84,6 +84,7 @@ export class AccountSessionProvider {
 				? this.binding.accountRef : randomUUID(),
 			providerId,
 			accountId: session.account.id,
+			accountLabel: session.account.label,
 			scopes,
 		});
 	}

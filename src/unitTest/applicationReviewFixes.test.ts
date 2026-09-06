@@ -51,7 +51,8 @@ test('Worker Preview platform gate supports only macOS arm64', () => {
 		assert.equal(support.supported, false);
 		assert.equal(support.listenerCode, 'CLI_UNSUPPORTED');
 		assert.equal(support.agentCode, 'AGENT_UNAVAILABLE');
-		assert.match(support.listenerMessage, /Coordinator/u);
+		assert.match(support.listenerMessage, /Local coordination/u);
+		assert.doesNotMatch(support.listenerMessage, /Dev Tunnel CLI/u);
 		assert.match(support.agentMessage, /Coordinator/u);
 	}
 });

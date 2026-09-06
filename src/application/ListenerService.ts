@@ -34,6 +34,7 @@ export interface ListenerServiceOptions {
 	readonly accessDuration?: `${number}h` | `${number}d`;
 	readonly tunnelExpiration?: `${number}h` | `${number}d`;
 	readonly configuredPort?: () => number | undefined;
+	readonly reusePort?: boolean;
 	readonly workerPlatform?: WorkerPlatformSupport;
 	readonly ownership?: WorkerOwnership;
 }
@@ -226,7 +227,7 @@ export class ListenerService {
 		}
 		const persisted = this.read();
 		const configured = this.options.configuredPort?.();
-		const preferredPort = configured ?? persisted.preferredPort;
+		const preferredPort = configured ?? (this.options.reusePort === false ? undefined : persisted.preferredPort);
 		const gateway = this.createGateway();
 		this.gateway = gateway;
 		try {

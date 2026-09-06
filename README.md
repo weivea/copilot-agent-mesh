@@ -7,14 +7,16 @@ wait for authoritative results, recover task IDs, answer input, or cancel work. 
 v2 remains in use; v1 peers are explicitly incompatible. This is an evaluation
 build, not a cross-device, cross-platform Worker, or general-availability claim.
 
-The repository also implements default-off **D1 account discovery and strict
-cross-device authorization**, plus **D2 optional SDK private hosting**. These
-are production code paths. An explicitly authorized single-Mac GitHub native
-account and read-only directory query has passed. A separately authorized
-single-Mac D2 run also passed private ingress, Mesh authentication and 100 pings,
-with exact cleanup. Entra/MSA, cross-profile, physical-device, live renewal and
-real cross-device Agent/Chat gates remain separate and unverified. See
-[cross-device setup and evidence](./docs/cross-device-connectivity-validation.md).
+Cross-device connections are also default-off, with **one Enable/Disable switch**
+and **SDK-only private Tunnels**. Native VS Code account selection/sign-in enables
+automatic discovery and device trust for your same-account devices; Workspace
+grants, receive permission and task approval stay separate and default-deny.
+Earlier, explicitly authorized single-Mac GitHub sign-in/read-only discovery and
+D2 private-ingress/Mesh-authentication/100-ping runs passed with exact cleanup.
+Those historical results do not validate this new automatic workflow across
+physical devices. Entra/MSA, cross-profile, live renewal and real cross-device
+Agent/Chat gates remain unverified. See
+[the workflow and historical evidence](./docs/cross-device-connectivity-validation.md).
 
 One stable **Device Broker** owns pairing, peer roots, the Gateway, one Dev Tunnel,
 the peer manager, global task/delegation persistence, reducer/event log, remote
@@ -24,9 +26,9 @@ Data is an active **Window Node** with process-lifetime random
 runtime and handles. Non-owner windows are active Broker clients, not read-only
 coordinators.
 
-Worker hosting and real task execution remain limited to **macOS arm64** in this
-Preview. Other platforms fail closed with `CLI_UNSUPPORTED` or
-`AGENT_UNAVAILABLE`; they do not start an unowned process or unvalidated tunnel.
+Worker hosting, cross-device hosting and real task execution remain limited to
+**macOS arm64** in this Preview. Other platforms fail closed; SDK-only hosting
+does not expand Windows, Linux or macOS x64 participation.
 
 ## Preview prerequisites and limitations
 
@@ -47,7 +49,9 @@ Preview. Other platforms fail closed with `CLI_UNSUPPORTED` or
   authorization-server URL must map to an installed VS Code authentication
   provider and exact scopes. Missing standalone mappings fail with
   `AGENT_AUTH_REQUIRED`.
-- The **CLI hosting backend** requires a user-supplied `copilotAgentMesh.devTunnelPath` pointing to the exact validated macOS arm64 CLI build `1.0.2030+fc9273aa0f`. The extension does not search `PATH`, download, install, or upgrade Dev Tunnel. The separately selected SDK private backend does not use CLI credentials.
+- Cross-device connections use the Dev Tunnels SDK and native GitHub or Microsoft
+  authentication in VS Code. No Dev Tunnel CLI installation, CLI login, or
+  hosting-backend setting is required.
 - A fresh shared profile has no authentication session by default. Real AHP E2E
   uses an explicitly configured, dedicated persistent test profile; it never
   defaults to the developer's normal VS Code profile.
@@ -61,9 +65,11 @@ See [Preview release and installation](./docs/mvp/release.md) for packaging, ins
 
 - Register trusted local Workspaces by opaque ID and enforce one claimed Window
   Node per physical workspace.
-- Run one generation-fenced Device Broker, authenticated local IPC, loopback
-  Gateway, and exact-build Microsoft Dev Tunnel per User Data.
-- Pair devices with one-time invitations and application-layer mutual authentication.
+- Run one generation-fenced Device Broker and authenticated local IPC per User
+  Data, with one loopback Gateway/private SDK Tunnel when cross-device connections
+  are enabled.
+- Automatically discover and authenticate same-account devices with durable device
+  keys and application-layer mutual authentication, without exchanging invitations.
 - Discover explicit Device → Node → Workspace targets, then delegate and wait,
   cancel, and answer tasks.
 - Run the production Agent Host/AHP adapter with explicit VS Code authentication.
@@ -83,14 +89,13 @@ See [Preview release and installation](./docs/mvp/release.md) for packaging, ins
 - Persist shared task/delegation state and bounded reducer events behind
   generation-fenced Broker writes.
 - Discover only caller-owned Mesh Dev Tunnels using pinned public SDK packages;
-  keep unpaired candidates out of executable worker directories.
+  discovery hints and device trust alone never authorize executable workers.
 - Bind locators to authenticated peer/profile generations, recover pending
   enrollment, and re-resolve endpoints without changing task identities.
 - Enforce A's real local-source allowlists and B's independent paired-device
   grants/receive switch; revoke incoming peers durably and close their sockets.
-- Select exactly one CLI or SDK private host. SDK hosting uses Host and
-  port-specific Connect capabilities, never creates anonymous ACEs, and never
-  silently falls back to the CLI's legacy outer admission.
+- Use SDK-only private hosting with Host and port-specific Connect capabilities,
+  never anonymous ACEs or a CLI fallback.
 
 Local tasks take the full direct route Window A → local Broker → Window B → real
 AHP → Broker store → Window A and never touch Dev Tunnel. Remote v2 traffic uses
@@ -166,27 +171,54 @@ mark their snapshot as the last read rather than pretending it is current.
 
 ## Cross-device opt-in
 
-Use **Dashboard -> Settings -> Cross-device -> Configure discovery and hosting**. Authorize
-an exact GitHub or Microsoft account and separately allow Mesh advertisement
-updates. D1 keeps the CLI's independent login; D2 is selected through the explicit
-SDK private-host migration action. Merely opening the Dashboard does not query
-the cloud or start hosting.
+On **every participating macOS arm64 device**, open the Mesh Dashboard and choose
+**Enable cross-device connections**. Select the same GitHub or Microsoft account
+through native VS Code account selection/sign-in. The Broker starts a private SDK
+Tunnel, discovers other enabled same-account devices and authenticates their
+durable device identities automatically. There is no invitation, manual connection
+URL, separate Listener button, or discovery/delegation/hosting toggle to manage.
+Merely opening a default-off Dashboard does not query the cloud or start hosting.
 
-Import B's one-time invitation through A's candidate action and native password
-input. Then activate strict cross-device delegation on both devices. In
-**Configure strict remote policy**, B grants the paired device its target
-Workspace and enables receive; A allowlists that authenticated remote Workspace
-from every claimed source root. Use the Mesh task tools with target handles or
-explicit Device/Node/Workspace IDs. Strict remote tasks require B's existing editor Host,
-without standalone fallback.
+Devices are symmetric: there is no master or hub. Remote traffic uses outbound
+private WSS through the target device's Tunnel cloud relay. Windows on the same
+device use the local Broker's authenticated IPC, not the Tunnel.
+
+**Device trust is not Workspace or task authorization.** In **Manage devices and
+permissions…** or the selected Workspace's controls, B separately grants the
+trusted device its target Workspace and enables receive. A separately allowlists
+that authenticated remote Workspace from every claimed source root. These gates
+default to deny; B still confirms each task unless its scoped automatic-acceptance
+policy is explicitly enabled. Use the Mesh task tools with target handles or
+explicit Device/Node/Workspace IDs. Strict remote tasks require B's existing editor
+Host, without standalone fallback.
+
+**Disable cross-device connections** is the one-click off path: it stops discovery,
+outbound peers and the Listener, and deletes **only this Broker's exact owned
+Tunnel**. **Cancel connection startup** is available while native sign-in/startup
+is pending. VS Code authentication, durable device keys, peer credentials,
+Workspace policies and task records are retained. A failed cloud cleanup stays
+persisted and visible as pending; **Retry Tunnel cleanup** resumes it rather than
+claiming the resource was deleted. Disconnecting is not proof that a task was
+cancelled.
+
+Device identity is durable; the Tunnel is an ephemeral connection resource.
+Re-enabling recreates the Tunnel and automatically rediscovers/rebinds trusted
+same-account devices without a new invitation or automatic permission changes.
+Switching back to a previously selected account reuses that account's saved device
+identity; choosing a different account does not transfer Workspace grants.
+The old CLI hosting settings and UI are removed. A recorded legacy CLI-owned
+Tunnel can be retired only through exact SDK ownership proof with its native
+account, not a CLI login or a name/prefix-based deletion sweep.
 
 The Dashboard groups **This device / Other devices -> Window -> Workspace**.
-Select a Workspace for its controls; tasks stay in the task dock and connection
-configuration/diagnostics stay under Settings. **Delegate from Chat…** opens an
+Select a Workspace for its controls; tasks stay in the task dock, the connection
+switch stays visible, and transport diagnostics remain collapsed in Settings.
+**Delegate from Chat…** opens an
 unsubmitted Agent Chat draft for that exact target. A has no additional Mesh
 task-start dialog; Copilot's existing tool-confirmation behavior is unchanged.
-Refreshing the tree only reads cached/local state. **Refresh remote windows**
-explicitly refreshes already-paired peers; account discovery is a separate action.
+Refreshing the tree only reads cached/local state. **Refresh connected devices**
+explicitly refreshes trusted peers; account discovery runs automatically while
+connections are enabled.
 
 Offline windows disappear from the tree automatically. Reopening the same
 repository creates a new Window Node, while its saved Workspace configuration
@@ -206,14 +238,11 @@ Turning it off restores startup confirmation for future approvals, without
 cancelling tasks already approved. Removing the incoming grant or revoking the
 peer clears its saved automatic acceptance; granting it again does not restore it.
 
-The three settings `experimental.crossDeviceDiscovery`,
-`experimental.crossDeviceDelegation`, and `experimental.devTunnelSdkHosting`
-all default to `false` under `copilotAgentMesh`. Strict activation is latched:
-disabling delegation blocks new remote tasks rather than restoring legacy
-authorization. Receive/grant removal does not cancel accepted tasks; **Revoke
-incoming peer** additionally closes connections and requests authoritative
-target-side cancellation. Cleanup failure remains visible and never restores
-permission.
+The unified connection switch defaults off. Disabling connections never restores
+legacy authorization or clears Workspace policy. Receive/grant removal does not
+cancel accepted tasks; **Revoke incoming peer** additionally closes connections
+and requests authoritative target-side cancellation. Cleanup failure remains
+visible and never restores permission.
 
 Existing saved remote policies migrate with no automatically accepted peers.
 Disable the per-device checkbox to return to per-task confirmation. Older

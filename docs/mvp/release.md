@@ -35,10 +35,17 @@ The real Agent Host/AHP runtime requires:
 No provider, account, resource, or scope is inferred. A successful real turn may
 consume Copilot quota.
 
-Worker tunnel hosting additionally requires a user-supplied
-`copilotAgentMesh.devTunnelPath` to the exact validated macOS arm64 build
-`1.0.2030+fc9273aa0f`. The extension does not discover it on `PATH` and never
-downloads, installs, or upgrades the CLI.
+Cross-device hosting remains macOS arm64-only, SDK-only and default-off. Enable **cross-device
+connections** in the Dashboard on every participating device and use native
+VS Code account selection/sign-in; no Dev Tunnel CLI installation or login is
+required. Same-account device trust does not grant Workspace or task permission.
+Disable deletes only the Broker's exact owned Tunnel, retaining durable identity,
+authentication, policies and task records; failed cleanup remains pending.
+See [the current workflow](../../README.md#cross-device-opt-in).
+
+Earlier D1/D2 CLI prerequisites and multi-toggle setup are **HISTORICAL /
+SUPERSEDED**. Existing dated gates below retain their original scope; the new
+workflow adds no physical-device, platform, production or SLA validation.
 
 ## Build and verify
 

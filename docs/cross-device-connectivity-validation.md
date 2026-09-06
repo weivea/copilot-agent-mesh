@@ -1,10 +1,34 @@
 # Cross-device implementation and validation
 
-Date: 2026-09-05. Mesh 0.4.0 Preview, protocol v2.
+## Current SDK-only workflow (2026-09-06)
 
-D1 and D2 are implemented in the production composition. All three feature
-settings default off. D2 is an optional **runtime backend**, not an omitted
-deliverable. Physical-device, account SSO, private-service admission, real
+Use **Enable cross-device connections** in the Dashboard on every participating
+device, selecting the same account through native VS Code authentication. The
+Broker starts a private SDK Tunnel and automatically discovers/authenticates
+same-account devices; there is no master/hub or invitation exchange. Remote
+traffic uses outbound private WSS through the target Tunnel's relay; local
+windows use authenticated IPC. Workspace grants, receive and task approval remain
+independent, default-deny gates. See [the current guide](../README.md#cross-device-opt-in).
+
+**Disable cross-device connections** stops discovery, outbound peers and hosting,
+and deletes only this Broker's exact owned Tunnel. Authentication, durable device
+keys, peer credentials, Workspace policy and task records remain. Cleanup failures
+are persisted and surfaced for **Retry Tunnel cleanup**, never reported as a
+confirmed deletion. Re-enable recreates the ephemeral Tunnel and automatically
+rebinds retained identities. Legacy owned CLI resources require exact SDK
+ownership proof with native authentication; no CLI login or fallback is used.
+
+> **HISTORICAL / SUPERSEDED operational instructions below.** The D1/D2
+> multi-toggle, CLI-backend, manual Listener and invitation procedures describe
+> earlier builds, not the current switch. Their dated evidence is preserved.
+> This workflow update adds no live physical-device, account-provider, production,
+> SLA, platform, renewal, or Agent/Chat validation.
+
+Historical evidence baseline: 2026-09-05. Mesh 0.4.0 Preview, protocol v2.
+
+At that baseline D1 and D2 were implemented in the production composition.
+All three feature settings defaulted off; D2 was an optional **runtime backend**.
+Physical-device, account SSO, private-service admission, real
 Agent execution and Chat UI acceptance are separate gates. The authorized
 single-Mac GitHub native sign-in/read-only directory gate and the separately
 authorized single-Mac D2 private admission plus Mesh/ping gate have passed;
@@ -18,7 +42,7 @@ advertisements. No anonymous ACE or model turn was used, and the gate runs
 performed no Git commit, push or pull request. The real D2 evidence below, not an offline SDK fixture,
 establishes the scoped service-admission results.
 
-## Fixed contracts
+## Historical D1/D2 contracts
 
 | Component | Exact implementation contract |
 | --- | --- |
@@ -49,7 +73,7 @@ accepted in a network task request. The device-tree update adds a server-derived
 `remoteTaskApproval` on that same trusted local boundary only. Network v2 remains
 unchanged and rejects injected approval metadata.
 
-## Production entry points
+## Historical implementation entry points
 
 | Location | Responsibility |
 | --- | --- |
@@ -102,7 +126,7 @@ They do not establish real multi-device Agent execution or real Chat acceptance
 of these newer tool modes. Earlier account/private-ingress evidence retains its
 original scope.
 
-## Setup and use
+## Historical D1/D2 setup and follow-ups
 
 ### Device-tree and scoped-acceptance follow-up
 
@@ -155,7 +179,10 @@ an already-expired offline record is reclaimed. Workspace policies, task
 records and task-route history are untouched. No manual-delete RPC or button,
 wire-version change, cloud request, or account permission is added.
 
-Use two separately approved **physical macOS arm64 devices** for a physical
+### Historical multi-toggle setup (superseded, not physical-device evidence)
+
+The following procedure belongs to the earlier D1/D2 build, not the current
+SDK-only switch. Use two separately approved **physical macOS arm64 devices** for a physical
 gate. Two profiles/processes on one computer only test logical isolation.
 
 1. Open B's existing ordinary VS Code window and intended local Workspace.
@@ -202,7 +229,7 @@ authenticated A window. A's Broker derives its source from authenticated
 local IPC and current claims. Network callers still cannot supply a local
 `sourceNodeId`. Display labels and capability markers never grant permission.
 
-## Storage, lifecycle and recovery
+## Historical D1/D2 storage, lifecycle and recovery
 
 All new documents are bounded strict-schema atomic files under the existing
 `mesh-state` storage root, fenced to the current owner generation.
@@ -267,7 +294,7 @@ The bounded incoming view prioritizes active/pending peers before revoked
 history. Native configuration also provides an exact-peer selector covering
 records outside the view; truncation never makes a peer impossible to revoke.
 
-### Migration and rollback
+### Migration and rollback (superseded)
 
 The native migration action latches migration-pending, requires active target
 tasks to drain, stops the old host successfully, and only then selects/starts

@@ -7,11 +7,19 @@ export const DISCOVERY_LABELS = ['copilot-agent-mesh', 'mesh-discovery-v1', 'mes
 export const PRIVATE_LABEL = 'mesh-private-v1';
 export const ADVERTISEMENT_PREFIX = 'mesh-ad-';
 export const REMOTE_POLICY_CAPABILITY = 'mesh.remote-policy.v1';
+export const ACCOUNT_IDENTITY_PREFIX = 'mesh-account-v1:';
+
+export const accountDeviceIdentitySchema = z.strictObject({
+	deviceId: uuidSchema,
+	publicKey: z.string().regex(/^[A-Za-z0-9_-]{59}$/u),
+});
+export type AccountDeviceIdentity = z.infer<typeof accountDeviceIdentitySchema>;
 
 export const accountBindingSchema = z.strictObject({
 	accountRef: uuidSchema,
 	providerId: z.enum(['github', 'microsoft']),
 	accountId: z.string().min(1).max(256),
+	accountLabel: z.string().min(1).max(256).optional(),
 	scopes: z.array(z.string().min(1).max(256)).min(1).max(8),
 });
 export type AccountBinding = z.infer<typeof accountBindingSchema>;
@@ -47,12 +55,19 @@ export const connectivitySettingsSchema = z.strictObject({
 	schemaVersion: z.literal(1),
 	revision: z.number().int().nonnegative(),
 	account: accountBindingSchema.optional(),
+	accounts: z.array(accountBindingSchema).max(32).default([]).refine(
+		(accounts) => new Set(accounts.map((account) => `${account.providerId}:${account.accountId}`)).size === accounts.length
+			&& new Set(accounts.map((account) => account.accountRef)).size === accounts.length,
+	),
 	publishEnabled: z.boolean(),
 	advertisementId: uuidSchema.optional(),
 	strictPolicyActivated: z.boolean(),
 	hostingBackend: z.enum(['cli', 'sdk']),
 	// A failed migration stays stopped across restart until explicitly resolved.
 	migrationPending: z.boolean(),
+	enabled: z.boolean().default(false),
+	cleanupPending: z.boolean().default(false),
+	legacyResourceRetired: z.boolean().default(false),
 });
 export type ConnectivitySettings = z.infer<typeof connectivitySettingsSchema>;
 
@@ -63,6 +78,10 @@ export const EMPTY_CONNECTIVITY_SETTINGS: ConnectivitySettings = {
 	strictPolicyActivated: false,
 	hostingBackend: 'cli',
 	migrationPending: false,
+	enabled: false,
+	cleanupPending: false,
+	legacyResourceRetired: false,
+	accounts: [],
 };
 
 export type ConnectivityCode =

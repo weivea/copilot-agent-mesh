@@ -374,9 +374,7 @@ export class ServiceDashboardFacade implements DashboardFacade {
 	}
 
 	public async stopListener(): Promise<void> {
-		if (await this.confirmations.confirm('Stop the listener and disconnect remote devices?', 'Stop Listener')) {
-			await this.services.stopListener();
-		}
+		await this.services.stopListener();
 	}
 
 	public async copyConnectionUrl(): Promise<void> {

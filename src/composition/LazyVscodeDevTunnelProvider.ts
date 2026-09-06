@@ -39,8 +39,8 @@ export interface LazyDevTunnelMetrics {
 
 /**
  * Keeps the Dev Tunnel implementation out of the local Broker/task startup
- * path. Loading and CLI probing begin only from an explicit Listener/E2E action
- * or Listener auto-restore.
+ * path. Production uses this only to read legacy migration metadata without
+ * loading the CLI. Explicit legacy test harnesses can still load the delegate.
  */
 export class LazyVscodeDevTunnelProvider implements DevTunnelProvider {
 	private readonly listeners = new Set<() => void>();
@@ -102,6 +102,10 @@ export class LazyVscodeDevTunnelProvider implements DevTunnelProvider {
 			probeAttempts: this.probeAttempts,
 			ensureHostedAttempts: this.ensureHostedAttempts,
 		};
+	}
+
+	public ownedResourceForMigration(): Promise<TunnelMetadata | undefined> {
+		return this.options.stateStore.load();
 	}
 
 	public onDidChange(listener: () => void): { dispose(): void } {

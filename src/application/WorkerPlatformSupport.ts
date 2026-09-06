@@ -16,7 +16,7 @@ export function getWorkerPlatformSupport(
 		listenerCode: 'CLI_UNSUPPORTED',
 		listenerMessage: supported
 			? 'The macOS arm64 Worker Preview listener is available.'
-			: 'Worker Preview listener hosting requires macOS arm64 and the exact supported Dev Tunnel CLI build. This device can still act as a Coordinator.',
+			: 'Cross-device connections in this Preview require macOS arm64. Local coordination remains available.',
 		agentCode: 'AGENT_UNAVAILABLE',
 		agentMessage: supported
 			? 'The macOS arm64 Worker Preview Agent Host is available when enabled and configured.'

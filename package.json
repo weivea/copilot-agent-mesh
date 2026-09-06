@@ -487,27 +487,15 @@
       },
       {
         "command": "copilotAgentMesh.startListener",
-        "title": "Start Listener",
+        "title": "Enable Cross-device Connections",
         "category": "Copilot Agent Mesh",
         "icon": "$(radio-tower)"
       },
       {
         "command": "copilotAgentMesh.stopListener",
-        "title": "Stop Listener",
+        "title": "Disable Cross-device Connections",
         "category": "Copilot Agent Mesh",
         "icon": "$(debug-stop)"
-      },
-      {
-        "command": "copilotAgentMesh.copyConnectionUrl",
-        "title": "Copy Connection URL",
-        "category": "Copilot Agent Mesh",
-        "icon": "$(copy)"
-      },
-      {
-        "command": "copilotAgentMesh.addPeer",
-        "title": "Add Peer",
-        "category": "Copilot Agent Mesh",
-        "icon": "$(link)"
       },
       {
         "command": "copilotAgentMesh.removePeer",
@@ -544,11 +532,6 @@
           "group": "navigation@3"
         },
         {
-          "command": "copilotAgentMesh.copyConnectionUrl",
-          "when": "view == copilotAgentMesh.dashboard",
-          "group": "navigation@4"
-        },
-        {
           "command": "copilotAgentMesh.refreshDashboard",
           "when": "view == copilotAgentMesh.dashboard",
           "group": "navigation@9"
@@ -582,24 +565,6 @@
           "scope": "machine",
           "markdownDescription": "Enable Preview same-device peer window discovery, policy configuration, and incoming task routing. Authorization remains default-deny."
         },
-        "copilotAgentMesh.experimental.crossDeviceDiscovery": {
-          "type": "boolean",
-          "default": false,
-          "scope": "machine",
-          "markdownDescription": "Enable Broker-owned Microsoft Dev Tunnels account discovery. Authorize an exact account and separately allow Mesh advertisement updates from the Dashboard. This does not start hosting, pair devices, or authorize tasks."
-        },
-        "copilotAgentMesh.experimental.crossDeviceDelegation": {
-          "type": "boolean",
-          "default": false,
-          "scope": "machine",
-          "markdownDescription": "Enable strict cross-device delegation: source Workspace allowlists, target receive plus incoming device grants, and the target's existing editor Host. Activation is durable; turning this off blocks new remote tasks rather than restoring legacy authorization. Target task-start confirmation defaults on; the target Workspace may explicitly auto-accept future tasks from a specific granted paired device. Sensitive tool approvals are unchanged."
-        },
-        "copilotAgentMesh.experimental.devTunnelSdkHosting": {
-          "type": "boolean",
-          "default": false,
-          "scope": "machine",
-          "markdownDescription": "Allow the optional Dev Tunnels SDK private hosting backend on macOS arm64. Select and migrate explicitly in the Dashboard; this flag does not replace a running CLI host. No anonymous ACE or automatic legacy fallback is used."
-        },
         "copilotAgentMesh.agentHost.userDataDir": {
           "type": "string",
           "default": "",
@@ -630,26 +595,6 @@
             "additionalProperties": false
           },
           "markdownDescription": "Maps an AHP protected-resource or authorization-server URL to a VS Code authentication provider ID and exact scopes. No provider or scope is inferred."
-        },
-        "copilotAgentMesh.devTunnelPath": {
-          "type": "string",
-          "default": "",
-          "scope": "machine",
-          "markdownDescription": "User-supplied path to the exact supported macOS arm64 Dev Tunnel CLI `1.0.2030+fc9273aa0f` executable. Required for Worker Preview tunnel hosting. Other platforms are Coordinator-only. The extension never downloads, installs, discovers by PATH, or upgrades this CLI."
-        },
-        "copilotAgentMesh.listener.port": {
-          "type": "integer",
-          "default": 0,
-          "minimum": 0,
-          "maximum": 65535,
-          "scope": "machine",
-          "markdownDescription": "Preferred loopback Gateway port. Use 0 to restore the last owned port or allocate one on first start."
-        },
-        "copilotAgentMesh.listener.autoStart": {
-          "type": "boolean",
-          "default": false,
-          "scope": "machine",
-          "markdownDescription": "Start the persisted Worker Preview listener during local Extension Host activation. Listener hosting is supported only on macOS arm64."
         },
         "copilotAgentMesh.workspace.capabilityTags": {
           "type": "array",
