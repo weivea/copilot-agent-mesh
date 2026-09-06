@@ -675,7 +675,6 @@
 			propertyRow('Listener', listenerStateLabel(listener.state)),
 			renderComponentSummary('Gateway', listener.gateway),
 			renderComponentSummary('Tunnel', listener.tunnel),
-			renderComponentSummary('Agent Host', listener.agentHost),
 		);
 	}
 

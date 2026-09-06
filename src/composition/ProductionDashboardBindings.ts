@@ -22,7 +22,9 @@ import type {
 	MeshRemoteDirectorySnapshot,
 	MeshWorkerDirectorySnapshot,
 } from '../../shared/toolProtocol';
-import type { AgentRuntime, AgentRuntimeProbe } from '../agentHost/AgentRuntime';
+import type {
+	AgentHostSourceFailure, AgentHostSourceStatusProvider, AgentRuntime, AgentRuntimeProbe,
+} from '../agentHost/AgentRuntime';
 import type { LocalDesktopWorkspaceGuard } from '../application/LocalDesktopWorkspaceGuard';
 import type { WorkerPlatformSupport } from '../application/WorkerPlatformSupport';
 import type {
@@ -64,7 +66,7 @@ export interface ProductionDashboardBindingsOptions {
 	readonly node: WindowNodeClient;
 	readonly localTasks: LocalBrokerTaskFacade;
 	readonly remoteTasks: LocalIpcRemoteTaskAdapter;
-	readonly runtime: () => AgentRuntime;
+	readonly runtime: () => AgentRuntime & Partial<Pick<AgentHostSourceStatusProvider, 'sourceStatus'>>;
 	readonly guard: LocalDesktopWorkspaceGuard;
 	readonly workerPlatform: WorkerPlatformSupport;
 	readonly lifecycle: BrokerLifecycle<ProductionBrokerRuntime>;
@@ -215,8 +217,9 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 		);
 
 		const runtimePreviewEnabled = thisWindowBase.previewEnabled || connectivity.delegationEnabled;
-		const runtimeProbe: AgentRuntimeProbe = runtimePreviewEnabled
-			? await this.options.runtime().probe(
+		const runtime = runtimePreviewEnabled ? this.options.runtime() : undefined;
+		const runtimeProbe: AgentRuntimeProbe = runtime !== undefined
+			? await runtime.probe(
 				!thisWindowBase.previewEnabled && connectivity.delegationEnabled ? { requireEditor: true } : undefined,
 			).catch(() => ({
 				available: false,
@@ -228,7 +231,9 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 				featureEnabled: false,
 				reason: 'AGENT_UNAVAILABLE',
 			};
-		const listener = listenerSnapshot(owner, runtimeProbe, this.options.workerPlatform);
+		const runtimeStatus = runtime?.sourceStatus?.();
+		const failure = runtimeStatus !== undefined && 'failure' in runtimeStatus ? runtimeStatus.failure : undefined;
+		const listener = listenerSnapshot(owner, runtimeProbe, this.options.workerPlatform, failure);
 		const thisWindow: DashboardSnapshot['thisWindow'] = {
 			...thisWindowBase,
 			acceptsIncoming: !thisWindowBase.previewEnabled
@@ -246,16 +251,16 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 				: {}),
 			agentHost: !runtimePreviewEnabled ? {
 				source: 'unavailable',
-				label: 'Unavailable (Preview off)',
+				label: 'Not in use',
 				degraded: false,
-				detail: 'Enable local or cross-device delegation before an Agent Host source is selected.',
+				detail: 'The execution runtime is selected only when an authorized task needs it.',
 			} : {
 				source: runtimeProbe.source === 'editor'
 					? 'editor'
 					: runtimeProbe.source === 'standalone' ? 'standalone' : 'unavailable',
 				label: listener.agentHost.label,
 				degraded: runtimeProbe.degradation !== undefined,
-				...(runtimeProbe.degradation === undefined ? {} : {
+				...(runtimeProbe.degradation === undefined ? { detail: listener.agentHost.detail } : {
 					reason: runtimeProbe.degradation.reason,
 					detail: runtimeProbe.degradation.message,
 				}),
@@ -1205,48 +1210,53 @@ function brokerSnapshot(
 	};
 }
 
+function agentHostSnapshot(
+	probe: AgentRuntimeProbe,
+	platform: WorkerPlatformSupport,
+	failure?: AgentHostSourceFailure,
+): DashboardSnapshot['listener']['agentHost'] {
+	if (!platform.supported) {
+		return { state: 'unavailable', label: 'Unsupported', detail: platform.agentMessage, action: 'Use macOS arm64 for task execution.' };
+	}
+	if (probe.available) {
+		return probe.source === 'editor'
+			? { state: 'ready', label: 'Editor', detail: 'Tasks use the current VS Code instance Agent Host.' }
+			: probe.degradation === undefined
+				? { state: 'ready', label: 'Standalone', detail: 'Tasks use the owned standalone Agent Host.' }
+				: { state: 'ready', label: 'Standalone (degraded)', detail: probe.degradation.message };
+	}
+	const reason = failure?.code ?? probe.reason;
+	if (reason === 'AGENT_AUTH_REQUIRED' || reason === 'AGENT_AUTH_FAILED') {
+		return {
+			state: 'error', label: 'Sign-in required',
+			detail: 'Sign in to Copilot in this VS Code window, then retry the authorized task.',
+		};
+	}
+	if (reason === 'AGENT_CONFIG_REQUIRED') {
+		return { state: 'error', label: 'Configuration required', detail: 'Complete the Agent session configuration, then retry the authorized task.' };
+	}
+	if (failure !== undefined) {
+		return { state: 'error', label: 'Startup failed', detail: failure.message };
+	}
+	if (probe.canStart) {
+		return {
+			state: 'stopped', label: 'On demand',
+			detail: 'An authorized task connects to the Agent Host when needed. Workspace permissions and task approval still apply.',
+		};
+	}
+	return {
+		state: 'unavailable', label: 'Unavailable',
+		detail: 'The execution runtime is unavailable in this VS Code window. Check Copilot availability and retry the authorized task.',
+	};
+}
+
 function listenerSnapshot(
 	owner: ProductionBrokerRuntime | undefined,
-	runtimeProbe: {
-		readonly available: boolean;
-		readonly featureEnabled: boolean;
-		readonly reason?: string;
-		readonly source?: 'editor' | 'standalone';
-		readonly degradation?: {
-			readonly reason: string;
-			readonly message: string;
-		};
-	},
+	runtimeProbe: AgentRuntimeProbe,
 	workerPlatform: WorkerPlatformSupport,
+	failure?: AgentHostSourceFailure,
 ): DashboardSnapshot['listener'] {
-	const agentHost = runtimeProbe.available
-		? runtimeProbe.source === 'editor'
-			? {
-				state: 'ready' as const,
-				label: 'Editor',
-				detail: 'Tasks use the current VS Code instance Agent Host.',
-			}
-			: runtimeProbe.degradation === undefined
-				? {
-					state: 'ready' as const,
-					label: 'Standalone',
-					detail: 'Tasks use the owned standalone Agent Host.',
-				}
-				: {
-					state: 'ready' as const,
-					label: 'Standalone (degraded)',
-					detail: runtimeProbe.degradation.message,
-				}
-		: {
-			state: 'unavailable' as const,
-			label: runtimeProbe.featureEnabled ? 'Unavailable' : 'Disabled',
-			detail: workerPlatform.supported
-				? 'Enable the Agent Host feature after satisfying the AHP compatibility gate.'
-				: workerPlatform.agentMessage,
-			action: workerPlatform.supported
-				? 'Configure copilotAgentMesh.experimental.agentHost.'
-				: 'Use macOS arm64 for task execution.',
-		};
+	const agentHost = agentHostSnapshot(runtimeProbe, workerPlatform, failure);
 	if (owner === undefined) {
 		return {
 			state: 'unavailable',

@@ -14,6 +14,12 @@ credentials or endpoints. **Manage devices and permissions…** opens native
 configuration; transport diagnostics stay collapsed in Settings. There are no
 separate Listener start/stop, connection-URL or candidate-pairing buttons.
 
+Agent Host status belongs to Current window, not Transport diagnostics. It shows
+**Not in use** when task features are off and **On demand** before an authorized
+task starts the runtime connection. Recorded startup/authentication/configuration
+failures remain explicit. The removed `experimental.agentHost` setting and
+developer-only AHP-gate instructions are not part of user setup.
+
 Startup exposes **Cancel connection startup**, authentication loss exposes
 **Sign in and connect**, and incomplete cleanup exposes **Retry Tunnel cleanup**.
 Disable stops connections and deletes only the Broker's exact owned Tunnel,

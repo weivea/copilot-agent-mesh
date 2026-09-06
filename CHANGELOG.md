@@ -6,6 +6,9 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [Unreleased]
 
+- Remove the redundant `experimental.agentHost` setting and obsolete AHP-gate
+  guidance. Execution remains on demand behind Workspace grants and task approval.
+  Show on-demand and failed runtime states in Current window, not Transport diagnostics.
 - Replace cross-device discovery/hosting toggles and manual invitations with one
   default-off Enable/Disable switch: native VS Code account selection, SDK-only
   private Tunnels, and automatic same-account device discovery and trust.

@@ -107,9 +107,10 @@ Connection URL creation is allowed only while hosted and creates a new one-time 
 the URL is written to the clipboard inside the Extension Host and never posted to the
 webview.
 
-Real tasks require `copilotAgentMesh.experimental.agentHost`. Disabled or unavailable AHP
-returns the stable `AGENT_UNAVAILABLE` boundary. The extension never substitutes a fake
-production runtime.
+Real tasks connect to the Agent Host on demand after Workspace authorization and
+task approval; no separate `experimental.agentHost` switch is required.
+Unavailable AHP returns the stable `AGENT_UNAVAILABLE` boundary. The extension
+never substitutes a fake production runtime.
 
 ## Shutdown
 

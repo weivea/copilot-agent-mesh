@@ -7,17 +7,17 @@ and negotiates AHP 1.0.0 with
 VS Code 1.135.0 and does not use the Fake Agent. Fake AHP connections are limited
 to deterministic tests.
 
-## Enable and invoke
+## Authorize and invoke
 
-The runtime is disabled by default:
+The runtime connects on demand for an authorized task. The obsolete
+`copilotAgentMesh.experimental.agentHost` setting is removed and ignored;
+Workspace grants, receive permission and task approval remain required. Opening
+the Dashboard or enabling cross-device connections does not start an Agent task.
 
-```json
-{
-  "copilotAgentMesh.experimental.agentHost": true
-}
-```
-
-Run **Copilot Agent Mesh: Run Agent Host Task** for an explicit local invocation. Extension consumers can also use the `agentRuntime` returned by `activate()`. Requests carry only a workspace ID. The injected `WorkspaceResolver` must resolve that ID from the trusted local registry; the adapter rejects unknown or non-`file:` results and passes only the resolved URI as the Session `workingDirectories` entry.
+Use the Mesh task tools with an explicitly authorized target Workspace. Requests
+carry a workspace ID. The injected `WorkspaceResolver` must resolve that ID from
+the trusted local registry; the adapter rejects unknown or non-`file:` results
+and passes only the resolved URI as the Session `workingDirectories` entry.
 
 The first-task safety decision is an injected `FirstTaskConfirmation`. The VS Code command supplies a modal implementation; the AHP adapter never assumes approval and cannot bypass the injected decision.
 
@@ -53,7 +53,7 @@ search `PATH` or download a runtime. That validated E2E path uses proxy-only
 connection so a known-refused Code Helper attempt cannot immediately poison the
 helper attempt; ordinary production remains direct-first.
 Before any task selects a source, Dashboard probes are passive and report editor
-health as unavailable/pending with an internal `canStart` capability rather than
+health as **On demand** with an internal `canStart` capability rather than
 executing `code agent endpoints`. The task executor may attempt such a source,
 but Dashboard does not report it healthy. The actual task start performs the
 first fresh locate/connect. This prevents UI refreshes from perturbing the
@@ -85,12 +85,15 @@ runtime startup gate. The
 capability is not a wire/model boolean and carries no serializable grant, path,
 or identity data.
 
-The Dashboard does not infer a healthy source before selection. With Peer
-Delegation off it reports the source as unavailable for delegation. With the
-Preview on, a successful editor probe displays `Editor`; discovery, connection,
+The Dashboard does not infer a healthy source before selection. With task
+features off it reports **Not in use**; a lazily selected editor displays
+**On demand**, not an error. Runtime status belongs to Current window rather
+than Transport diagnostics. A successful editor probe displays `Editor`; discovery, connection,
 initialize, or protocol fallback displays `Standalone (degraded)` with only the
 bounded reason category/message. Endpoint tokens, instance IDs, executable,
-socket, and user-data paths never enter the ViewModel.
+socket, and user-data paths never enter the ViewModel. A failed start remains
+**Startup failed**, **Sign-in required**, or **Configuration required** until
+recovery; `canStart` does not hide a recorded failure.
 
 1. Probe a configured or known VS Code CLI candidate with `code --version`.
 2. Create an owned instance directory, owner-only token file, dedicated user/server data directories, and an isolated process group.

@@ -95,8 +95,8 @@ try {
 		: resolveCliPathFromVSCodeExecutablePath(vscodeExecutablePath);
 
 	await Promise.all([
-		writeSettings(worker, 'Mesh Worker', true),
-		writeSettings(coordinator, 'Mesh Coordinator', false),
+		writeSettings(worker, 'Mesh Worker'),
+		writeSettings(coordinator, 'Mesh Coordinator'),
 	]);
 
 	workerRun = launchHost(worker, 'worker');
@@ -447,7 +447,7 @@ async function prepareHost(host) {
 	]);
 }
 
-async function writeSettings(host, name, workerEnabled) {
+async function writeSettings(host, name) {
 	const authenticationResource = process.env.MESH_TWO_DEVICE_E2E_AUTH_RESOURCE;
 	const authenticationProvider = process.env.MESH_TWO_DEVICE_E2E_AUTH_PROVIDER;
 	const authenticationScopes = parseStringArray(process.env.MESH_TWO_DEVICE_E2E_AUTH_SCOPES_JSON, []);
@@ -463,7 +463,6 @@ async function writeSettings(host, name, workerEnabled) {
 		'copilotAgentMesh.deviceName': name,
 		'copilotAgentMesh.devTunnelPath': devTunnelPath,
 		'copilotAgentMesh.codePath': codeCli,
-		'copilotAgentMesh.experimental.agentHost': workerEnabled,
 		'copilotAgentMesh.experimental.authenticationProviders': mappings,
 		'copilotAgentMesh.e2e.nonce': host.nonce,
 		'copilotAgentMesh.e2e.role': host.role,

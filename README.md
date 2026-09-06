@@ -33,8 +33,8 @@ does not expand Windows, Linux or macOS x64 participation.
 ## Preview prerequisites and limitations
 
 - VS Code 1.103 or newer is required.
-- Real Worker execution is experimental, disabled by default, and may consume Copilot quota.
-- Enable `copilotAgentMesh.experimental.agentHost` only after reviewing the first-task confirmation and process ownership behavior.
+- Real Worker execution is experimental, requires Workspace/task authorization, and may consume Copilot quota.
+- The Agent Host connects on demand for an authorized task. There is no separate runtime feature switch; merely enabling connections or opening the Dashboard does not start an Agent task.
 - For same-device delegation, enable `copilotAgentMesh.experimental.peerDelegation` in every participating
   window. The directional source allowlist and the target's **Accept Incoming
   Tasks** switch are both default-off.

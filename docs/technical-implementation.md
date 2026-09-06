@@ -1176,7 +1176,7 @@ Category：
 | `copilotAgentMesh.codePath` | 空 | 可选 VS Code CLI 绝对路径 |
 | `copilotAgentMesh.taskRetentionDays` | `30` | Terminal Summary 保留 |
 | `copilotAgentMesh.logLevel` | `info` | 日志级别 |
-| `copilotAgentMesh.experimental.agentHost` | `false` | Phase 0 验证前默认关闭 |
+| `copilotAgentMesh.experimental.agentHost` | 已移除 | 运行时按授权任务按需连接；不再需要独立开关 |
 | `copilotAgentMesh.experimental.peerDelegation` | `false` | 同设备 Peer Window 目录、策略与接收路由；默认拒绝 |
 
 本地端口、Tunnel ID、Peer ID 不应作为普通 Setting 暴露；由 Store 管理并通过 UI 操作。

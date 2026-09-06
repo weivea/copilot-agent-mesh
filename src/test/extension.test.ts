@@ -96,11 +96,11 @@ suite('Copilot Agent Mesh', () => {
 		assert.deepStrictEqual(manifest.extensionKind, ['ui']);
 	});
 
-	test('keeps the real Agent Host runtime disabled by default', () => {
+	test('requires no separate Agent Host flag while delegation remains default-off', () => {
 		const manifest = getExtension().packageJSON;
 		const properties = manifest.contributes.configuration.properties as Record<string, { default?: unknown }>;
 
-		assert.strictEqual(properties['copilotAgentMesh.experimental.agentHost']?.default, false);
+		assert.strictEqual(properties['copilotAgentMesh.experimental.agentHost'], undefined);
 		assert.strictEqual(properties['copilotAgentMesh.experimental.peerDelegation']?.default, false);
 		assert.strictEqual(properties['copilotAgentMesh.agentHost.userDataDir']?.default, '');
 		assert.strictEqual(
