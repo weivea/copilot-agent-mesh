@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { basename } from 'node:path';
 import { test } from 'node:test';
 import type { Tunnel } from '@microsoft/dev-tunnels-contracts';
 import { AxiosError, type AxiosAdapter } from 'axios';
@@ -154,7 +155,7 @@ test('queued directory results cannot be enrolled into a different account after
 	await a.identity.load(next);
 	release();
 	await Promise.all([first, queued]);
-	const stored = [...a.fs.files].find(([path]) => path.endsWith('/account-peers.json'))?.[1];
+	const stored = [...a.fs.files].find(([path]) => basename(path) === 'account-peers.json')?.[1];
 	assert.ok(stored);
 	assert.ok(!stored.includes(next.accountRef));
 	assert.notEqual(a.peers.get(profile.id)?.snapshot().state, 'online');
