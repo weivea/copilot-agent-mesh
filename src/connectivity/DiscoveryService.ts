@@ -27,6 +27,7 @@ export class DiscoveryService {
 	private nextRequestAt = 0;
 	private truncated = false;
 	private disposed = false;
+	private readonly listeners = new Set<() => void>();
 
 	public constructor(
 		private readonly provider: DevTunnelDiscoveryProvider,
@@ -37,12 +38,25 @@ export class DiscoveryService {
 		private readonly now: () => number = Date.now,
 	) {}
 
-	public snapshot(): DiscoverySnapshot {
+	public endpoints(): readonly DiscoveredEndpoint[] {
+		return [...this.candidates.values()]
+			.filter((entry) => this.now() - entry.observedAt <= 120_000)
+			.map((entry) => structuredClone(entry.endpoint));
+	}
+
+	public onDidRefresh(listener: () => void): { dispose(): void } {
+		this.listeners.add(listener);
+		return { dispose: () => this.listeners.delete(listener) };
+	}
+
+	public snapshot(excludeDeviceId?: string): DiscoverySnapshot {
 		return {
 			state: this.enabled() ? this.state : 'disabled',
 			...(this.code === undefined ? {} : { error: this.code }),
 			truncated: this.truncated,
-			candidates: [...this.candidates].map(([candidateHandle, { endpoint, observedAt }]) => ({
+			candidates: [...this.candidates].filter(([, { endpoint }]) =>
+				excludeDeviceId === undefined || endpoint.accountIdentity?.deviceId !== excludeDeviceId)
+				.map(([candidateHandle, { endpoint, observedAt }]) => ({
 				candidateHandle,
 				label: `Candidate ${endpoint.locator.advertisementId.slice(0, 8)}`,
 				hostHint: endpoint.hostHint,
@@ -92,6 +106,7 @@ export class DiscoveryService {
 		this.disposed = true;
 		this.invalidate();
 		await this.refreshing;
+		this.listeners.clear();
 	}
 
 	private async refreshCore(): Promise<void> {
@@ -127,6 +142,7 @@ export class DiscoveryService {
 			this.truncated = result.truncated;
 			this.state = 'ready';
 			this.code = undefined;
+			for (const listener of this.listeners) { listener(); }
 		} catch (error: unknown) {
 			if (controller.signal.aborted) {
 				return;
@@ -151,7 +167,7 @@ export class DiscoveryService {
 						this.code = 'DISCOVERY_UNAVAILABLE';
 						this.changed();
 					});
-				}, Math.max(60_000 + Math.floor(Math.random() * 5000), this.nextRequestAt - this.now()));
+				}, Math.max(15_000 + Math.floor(Math.random() * 3000), this.nextRequestAt - this.now()));
 				this.timer.unref();
 				this.changed();
 			}

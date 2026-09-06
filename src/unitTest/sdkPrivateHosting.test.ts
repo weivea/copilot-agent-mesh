@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { basename } from 'node:path';
 import { test } from 'node:test';
 
 import { AxiosError, type AxiosAdapter } from 'axios';
@@ -85,7 +86,7 @@ test('SDK cleanup failure is retryable and an old active/unknown host remains a 
 	f.api.failEndpointDelete = false;
 	await f.provider.retryCleanup();
 	assert.equal(f.provider.getStatus().state, 'stopped');
-	const ledger = [...f.fs.files.keys()].find((path) => path.endsWith('/sdk-hosting.json'));
+	const ledger = [...f.fs.files.keys()].find((path) => basename(path) === 'sdk-hosting.json');
 	assert.ok(ledger);
 	const stored = JSON.parse(f.fs.files.get(ledger)!);
 	stored.owned.phase = 'hosting';

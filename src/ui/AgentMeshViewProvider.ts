@@ -19,7 +19,8 @@ import {
 import { DashboardPresenter, type DashboardViewModel } from './DashboardPresenter';
 import { CONNECTIVITY_ACTIONS, REMOTE_POLICY_ACTIONS } from '../../shared/protocol';
 
-const promptActions = new Set<string>([...CONNECTIVITY_ACTIONS, ...REMOTE_POLICY_ACTIONS]);
+const promptActions = new Set<string>([...CONNECTIVITY_ACTIONS, ...REMOTE_POLICY_ACTIONS]
+	.filter((action) => action !== 'disableConnectivity'));
 
 interface ScopedDashboardAction {
 	readonly action: DashboardAction;
@@ -215,6 +216,8 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 				return;
 			}
 			case 'configureConnectivity':
+			case 'enableConnectivity':
+			case 'disableConnectivity':
 			case 'refreshDiscovery':
 			case 'configureRemotePolicy':
 			case 'refreshRemoteTargets':
@@ -468,6 +471,10 @@ export function createDashboardHtml(
 		</div>
 	</header>
 	<p id="operationStatus" class="detail"></p>
+	<section class="connectivity" aria-labelledby="connectivity-heading">
+		<h2 id="connectivity-heading">Cross-device connections</h2>
+		<div id="connectivity" class="card loading">Loading...</div>
+	</section>
 	<div class="workspaceArea">
 	<main class="dashboardLayout">
 		<section class="panel" aria-labelledby="targets-heading">
@@ -493,11 +500,10 @@ export function createDashboardHtml(
 		<section aria-labelledby="device-heading"><h3 id="device-heading">This device</h3><div id="device" class="card loading">Loading...</div></section>
 		<section aria-labelledby="this-window-heading"><h3 id="this-window-heading">Current window</h3><div id="thisWindow" class="card loading">Loading...</div></section>
 		<section aria-labelledby="accept-heading"><h3 id="accept-heading">Receive summary</h3><div id="acceptIncoming" class="card loading">Loading...</div></section>
-		<section aria-labelledby="listener-heading"><h3 id="listener-heading">Listener</h3><div id="listener" class="card loading">Loading...</div></section>
-		<section class="connectivity" aria-labelledby="connectivity-heading">
-			<h3 id="connectivity-heading">Cross-device</h3>
-			<div id="connectivity" class="card loading">Loading...</div>
-		</section>
+		<details class="drawerDisclosure">
+			<summary>Transport diagnostics</summary>
+			<div id="listener" class="card loading">Loading...</div>
+		</details>
 		<details class="drawerDisclosure">
 			<summary>Discovery candidates — not workers</summary>
 			<p class="detail">Discovery hints never imply worker readiness or Workspace permission.</p>

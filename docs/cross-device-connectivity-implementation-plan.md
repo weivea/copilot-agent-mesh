@@ -1,12 +1,19 @@
 # 跨设备发现与通信实现方案
 
-> 状态：D1/D2 生产代码已实施，默认关闭；已获准通过单机 GitHub 原生账号/只读目录，以及单机 D2 真实私有接入、Mesh 双向认证和 100 次 ping，并确认精确资源清理。前次配对失败记录保留，根因尚未确定。Entra/MSA、跨 Profile、两台物理设备、真实续期/迁移和 Agent/Chat Gate 仍需独立验证，详见[实现与验证记录](./cross-device-connectivity-validation.md)。本文不授权自动创建隧道、登录账号或执行模型任务。<br>
+> **HISTORICAL / 已取代的操作说明（2026-09-06）**：下文保留 D1/D2 设计与当时证据，
+> 不再作为当前连接配置指引。多开关、CLI 后端/登录、手动 Listener 和邀请步骤已被
+> [SDK-only 单开关流程](../README.md#cross-device-opt-in)取代：每台设备启用同一开关，
+> 使用 VS Code 原生账号选择/登录，自动发现并认证同账号设备；Workspace 授权、接收和任务批准仍独立默认拒绝。
+> 关闭会删除本 Broker 精确拥有的 Tunnel，保留账号、设备密钥、peer 凭据、策略和任务记录；
+> 清理失败持久化并提示重试，重启用自动重建/重绑定。本文没有新增真实物理设备、平台或 SLA 验证。
+
+> 历史状态：D1/D2 生产代码已实施，默认关闭；已获准通过单机 GitHub 原生账号/只读目录，以及单机 D2 真实私有接入、Mesh 双向认证和 100 次 ping，并确认精确资源清理。前次配对失败记录保留，根因尚未确定。Entra/MSA、跨 Profile、两台物理设备、真实续期/迁移和 Agent/Chat Gate 仍需独立验证，详见[实现与验证记录](./cross-device-connectivity-validation.md)。本文不授权自动创建隧道、登录账号或执行模型任务。<br>
 > 日期：2026-09-05。<br>
 > 源码基线：`536982f4251a4a841de561cb4220a4d10e107338`，Mesh 0.4.0 Preview，protocol v2。<br>
 > 调研依据：[跨设备连接方案调研](./spikes/cross-device-connectivity-options.md)。<br>
 > 实施方式：按能力 Gate 推进，不承诺未经验证的发布日期，不预设下一版本号。
 
-本文保留 M0–M5 的设计要求作为验收规范，而不是第二份待批准计划。当前实现同时包含 D1 和 D2；“可选”仅指用户运行时选择 CLI 或 SDK 后端。已固定 contracts/management/connections `1.3.56`、SSH `3.12.42`，并按生产 `RpcPeer`/`PairingService` 收敛 hello/authenticate/commit 与数值 ping 的共享声明。实现入口、离线证据和未获准真实 Gate 的复现条件以验证记录为准。
+本文保留 M0–M5 的历史设计要求，而不是当前操作规范或第二份待批准计划。当时实现同时包含 D1 和 D2；当时的“可选”指用户运行时选择 CLI 或 SDK 后端，现已废弃该选择。已固定 contracts/management/connections `1.3.56`、SSH `3.12.42`，并按生产 `RpcPeer`/`PairingService` 收敛 hello/authenticate/commit 与数值 ping 的共享声明。历史实现入口、离线证据和未获准真实 Gate 的复现条件以验证记录为准。
 
 ## 1. 实施决策
 

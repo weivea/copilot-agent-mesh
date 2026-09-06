@@ -356,18 +356,30 @@ function assertConnectivity(value: unknown): void {
 			'truncated',
 			'candidates',
 			'incomingPeers',
+			'enabled',
+			'connectionState',
+			'connectedDeviceCount',
 		],
-		['error'],
+		['error', 'accountLabel'],
 	);
 	for (const key of [
 		'discoveryEnabled', 'delegationEnabled', 'strictPolicyActivated',
-		'publishEnabled', 'migrationPending', 'truncated',
+		'publishEnabled', 'migrationPending', 'truncated', 'enabled',
 	]) {
 		assertBoolean(value[key]);
 	}
 	assertEnum(value.hostingBackend, ['cli', 'sdk']);
 	assertEnum(value.accountProvider, ['none', 'github', 'microsoft']);
 	assertEnum(value.state, ['disabled', 'authRequired', 'discovering', 'ready', 'error']);
+	assertEnum(value.connectionState, ['disabled', 'authenticating', 'starting', 'online', 'stopping', 'authRequired', 'error', 'cleanupPending']);
+	if (value.accountLabel !== undefined) {
+		assertString(value.accountLabel);
+		if (value.accountLabel.length > 256) { throw new Error('Dashboard account label is too long.'); }
+	}
+	if (typeof value.connectedDeviceCount !== 'number' || !Number.isInteger(value.connectedDeviceCount)
+		|| value.connectedDeviceCount < 0 || value.connectedDeviceCount > 256) {
+		throw new Error('Dashboard device count is outside its safe bound.');
+	}
 	for (const key of ['claimedWorkspaceCount', 'receivingWorkspaceCount']) {
 		const count = value[key];
 		if (typeof count !== 'number' || !Number.isInteger(count) || count < 0 || count > 32) {

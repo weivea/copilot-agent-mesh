@@ -11,6 +11,8 @@
 	const textEncoder = new TextEncoder();
 
 	const connectivityActions = new Set([
+		'enableConnectivity',
+		'disableConnectivity',
 		'configureConnectivity',
 		'refreshDiscovery',
 		'pairDiscoveredPeer',
@@ -24,9 +26,10 @@
 		'setRemoteReceive',
 		'setRemoteAllowed',
 	]);
-	const promptActions = new Set([...connectivityActions, ...remotePolicyActions]);
+	const promptActions = new Set([...connectivityActions, ...remotePolicyActions].filter((action) => action !== 'disableConnectivity'));
 	const dashboardActions = new Set([
 		...promptActions,
+		'disableConnectivity',
 		'configureDevice',
 		'renameWindow',
 		'startListener',
@@ -411,7 +414,7 @@
 			headingBlock(device.name, device.locality === 'local' ? 'This device' : 'Paired remote device'),
 			propertyRow('State', deviceStateLabel(device.state)),
 			propertyRow('Visible windows', device.nodes.length),
-			propertyRow('Connectivity', connectivityStateLabel(model.connectivity.state)),
+			propertyRow('Connectivity', connectionStateLabel(model.connectivity.connectionState)),
 			propertyRow('Incoming tasks', model.incomingTasks.length),
 			propertyRow('Outgoing tasks', model.outgoingTasks.length),
 		);
@@ -674,73 +677,26 @@
 			renderComponentSummary('Tunnel', listener.tunnel),
 			renderComponentSummary('Agent Host', listener.agentHost),
 		);
-		const actions = actionsRow();
-		if (listener.canStart) {
-			actions.append(actionButton('Start listener', 'startListener'));
-		}
-		if (listener.canStop) {
-			actions.append(actionButton('Stop listener', 'stopListener', undefined, false, true));
-		}
-		if (listener.canCopyConnectionUrl) {
-			actions.append(actionButton('Copy connection URL', 'copyConnectionUrl'));
-		}
-		root.append(actions);
 	}
 
 	function renderConnectivity(connectivity, statusAvailable) {
 		const root = reset(document.getElementById('connectivity'));
 		const setting = (value) => statusAvailable ? String(value) : 'Unknown';
 		root.append(
-			propertyRow('Discovery state', connectivityStateLabel(connectivity.state)),
-			propertyRow('Account discovery', setting(connectivity.discoveryEnabled ? 'Enabled' : 'Disabled (default)')),
-			propertyRow('New remote tasks', setting(connectivity.delegationEnabled ? 'Enabled, subject to policy' : 'Disabled')),
-			propertyRow('Strict remote policy', setting(connectivity.strictPolicyActivated ? 'Activated — latched on' : 'Not activated')),
-			propertyRow('Discovery publishing', setting(connectivity.publishEnabled ? 'Enabled' : 'Disabled')),
-			propertyRow('Hosting selection', setting(connectivity.hostingBackend === 'sdk' ? 'SDK private hosting' : 'Legacy CLI hosting')),
-			propertyRow('Account provider', setting({ none: 'None selected', github: 'GitHub', microsoft: 'Microsoft' }[connectivity.accountProvider])),
-			propertyRow('Claimed Workspaces', setting(connectivity.claimedWorkspaceCount)),
+			propertyRow('Status', setting(connectionStateLabel(connectivity.connectionState))),
+			propertyRow('Account', setting(connectivity.accountLabel
+				? `${connectivity.accountProvider === 'github' ? 'GitHub' : 'Microsoft'} · ${connectivity.accountLabel}`
+				: { none: 'Choose when enabling', github: 'GitHub', microsoft: 'Microsoft' }[connectivity.accountProvider])),
+			propertyRow('Connected devices', setting(connectivity.connectedDeviceCount)),
 			propertyRow('Receiving Workspaces', setting(connectivity.receivingWorkspaceCount)),
-			textElement(
-				'p',
-				statusAvailable
-					? 'Rendering and Refresh read local status only. They do not sign in, discover devices, or start hosting.'
-					: 'Connectivity settings are unavailable. Local task status and cancellation remain available.',
-				'detail',
-			),
-			textElement(
-				'p',
-				statusAvailable
-					? admissionLabel(connectivity.hostingBackend === 'sdk' ? 'private-port-token' : 'legacy-mesh-auth')
-					: 'Current hosting admission is unavailable in this snapshot.',
-				'detail',
-			),
-			textElement(
-				'p',
-				'Discovery candidates are hints only. Pair explicitly, authorize the exact Workspace, and enable the target receive gate before delegating work.',
-				'detail',
-			),
-			textElement(
-				'p',
-				'Disabling remote delegation blocks new remote tasks; it does not cancel tasks already accepted.',
-				'detail',
-			),
-			textElement(
-				'p',
-				'SDK private hosting never silently falls back to the legacy CLI.',
-				'detail',
-			),
-			textElement(
-				'p',
-				'Remote policy uses only Workspaces owned by this calling window. Prompts open in the Broker owner window, including requests from non-owner windows.',
-				'detail',
-			),
+			textElement('p', 'Your devices using the same account connect automatically through private SDK tunnels. Workspace task permissions stay separate.', 'detail'),
+			textElement('p', 'Disabling closes connections and deletes this device’s Tunnel. Device identity and Workspace permissions are kept.', 'detail'),
 		);
-		if (connectivity.migrationPending) {
-			root.append(textElement(
-				'p',
-				'Hosting migration pending. Finish cleanup before switching exposure backends.',
-				'action-hint',
-			));
+		if (!statusAvailable) {
+			root.append(textElement('p', 'Connection status is unavailable. Local tasks and cancellation remain available.', 'detail'));
+		}
+		if (connectivity.connectionState === 'cleanupPending' || connectivity.migrationPending) {
+			root.append(textElement('p', 'Connections are stopped, but Tunnel cleanup is incomplete. Retry with the account that owns this device’s Tunnel.', 'action-hint'));
 		}
 		if (connectivity.error) {
 			root.append(renderError({
@@ -755,25 +711,25 @@
 				'action-hint',
 			));
 		}
-		const actions = actionsRow(
-			actionButton('Configure discovery and hosting…', 'configureConnectivity'),
-			actionButton(
-				'Refresh account discovery',
-				'refreshDiscovery',
-				undefined,
-				!connectivity.discoveryEnabled || connectivity.state === 'discovering',
-			),
-			actionButton('Refresh connected devices', 'refreshRemoteTargets'),
-			actionButton('Configure strict remote policy…', 'configureRemotePolicy'),
-			actionButton(
-				'Retry connectivity cleanup',
-				'retryConnectivityCleanup',
-				undefined,
-				!connectivity.migrationPending
-					&& connectivity.error !== 'CLEANUP_FAILED'
-					&& !connectivity.incomingPeers.some((peer) => peer.cleanupPending),
-			),
-		);
+		const actions = actionsRow();
+		const starting = ['authenticating', 'starting'].includes(connectivity.connectionState);
+		const awaitingStartup = state.pendingActions.has('enableConnectivity');
+		const stopping = connectivity.connectionState === 'stopping';
+		if (!starting && !stopping && connectivity.connectionState !== 'online') {
+			actions.append(actionButton(
+				connectivity.connectionState === 'authRequired' ? 'Sign in and connect' : 'Enable cross-device connections',
+				'enableConnectivity', undefined, !statusAvailable,
+			));
+		}
+		if (connectivity.enabled || starting || awaitingStartup) {
+			actions.append(actionButton(starting || awaitingStartup ? 'Cancel connection startup' : 'Disable cross-device connections',
+				'disableConnectivity', undefined, !statusAvailable || stopping, true));
+		}
+		actions.append(actionButton('Manage devices and permissions…', 'configureConnectivity', undefined, !statusAvailable));
+		if (connectivity.connectionState === 'cleanupPending' || connectivity.migrationPending || connectivity.error === 'CLEANUP_FAILED'
+			|| connectivity.incomingPeers.some((peer) => peer.cleanupPending)) {
+			actions.append(actionButton('Retry Tunnel cleanup', 'retryConnectivityCleanup', undefined, !statusAvailable));
+		}
 		root.append(actions);
 		renderCollection(
 			'discoveryCandidates',
@@ -782,8 +738,8 @@
 			!statusAvailable
 				? 'Discovery status is unavailable.'
 				: connectivity.discoveryEnabled
-				? 'No discovery candidates. Refresh account discovery explicitly when needed.'
-				: 'Account discovery is disabled.',
+				? 'No other devices found yet. Enable cross-device connections with the same account on each device.'
+				: 'Device discovery is disabled.',
 		);
 		renderCollection(
 			'incomingPeers',
@@ -801,16 +757,11 @@
 			textElement(
 				'p',
 				candidate.stale
-					? 'Refresh discovery before pairing this candidate.'
+					? 'This discovery hint is stale; automatic discovery will refresh it.'
 					: 'This is not an executable worker or a task grant.',
 				candidate.stale ? 'action-hint' : 'detail',
 			),
-			actionButton(
-				'Pair this candidate…',
-				'pairDiscoveredPeer',
-				{ actionHandle: candidate.actionHandle },
-				candidate.stale || !discoveryEnabled,
-			),
+			textElement('p', discoveryEnabled ? 'Device identity is checked automatically before connecting.' : 'Enable cross-device connections to join.', 'detail'),
 		);
 		return card;
 	}
@@ -1138,17 +1089,26 @@
 		}
 		state.pendingActions.add(action);
 		state.actionFailure = undefined;
+		if (action === 'enableConnectivity' && state.model !== undefined) {
+			render(state.model);
+		}
 		updateControls();
 		setStatus(actionStatusMessage(action));
 		vscode.postMessage({ version, uiInstanceId, type: 'action', action, ...(fields || {}) });
 	}
 
 	function actionStatusMessage(action) {
+		if (action === 'enableConnectivity') {
+			return 'Enabling private cross-device connections. Complete the VS Code account prompt, or cancel startup here.';
+		}
+		if (action === 'disableConnectivity') {
+			return 'Closing cross-device connections and deleting this device’s Tunnel.';
+		}
 		if (action === 'openTargetChat') {
 			return 'Opening a Chat draft for the selected exact target.';
 		}
 		if (promptActions.has(action)) {
-			return 'Applying cross-device action. Complete any native prompts in the Broker owner window; task cancellation remains available.';
+			return 'Applying cross-device action. Complete any native prompts in VS Code; disconnect and task cancellation remain available.';
 		}
 		return 'Applying Dashboard action.';
 	}
@@ -1158,7 +1118,7 @@
 			return state.actionFailure;
 		}
 		if ([...state.pendingActions].some((action) => promptActions.has(action))) {
-			return 'Applying cross-device action. Complete any native prompts in the Broker owner window; task cancellation remains available.';
+			return 'Applying cross-device action. Complete any native prompts in VS Code; disconnect and task cancellation remain available.';
 		}
 		if (state.pendingActions.size > 0) {
 			return 'Applying Dashboard action.';
@@ -1330,6 +1290,15 @@
 		}[status] || status;
 	}
 
+	function connectionStateLabel(state) {
+		return {
+			disabled: 'Off', authenticating: 'Waiting for account authorization',
+			starting: 'Connecting', online: 'Online', stopping: 'Disconnecting',
+			authRequired: 'Sign-in required', error: 'Connection needs attention',
+			cleanupPending: 'Offline · Tunnel cleanup pending',
+		}[state];
+	}
+
 	function listenerStateLabel(state) {
 		return {
 			stopped: 'Stopped',
@@ -1380,22 +1349,22 @@
 
 	function connectivityErrorMessage(code) {
 		return {
-			DISABLED: 'Account discovery is disabled. Enable it explicitly in configuration.',
-			AUTH_REQUIRED: 'Choose and sign in to an account in native configuration.',
-			ACCOUNT_CHANGED: 'The account changed. Reconfigure and explicitly refresh discovery.',
-			SCOPES_CHANGED: 'Account permissions changed. Reconfigure before refreshing discovery.',
-			OFFLINE: 'Discovery could not reach the service. Check connectivity and explicitly retry.',
-			DISCOVERY_UNAVAILABLE: 'Cross-device status or discovery is unavailable. Settings shown may not be current; local-window controls remain separate.',
-			RATE_LIMITED: 'Discovery was rate limited. Wait before explicitly refreshing.',
+			DISABLED: 'Cross-device connections are off. Use Enable cross-device connections.',
+			AUTH_REQUIRED: 'Authorize your VS Code account to connect or retry Tunnel cleanup.',
+			ACCOUNT_CHANGED: 'The selected account is unavailable or does not own this Tunnel. Select its original account to reconnect or finish cleanup.',
+			SCOPES_CHANGED: 'Sign in again to grant the permissions required for private cross-device connections.',
+			OFFLINE: 'The private connection is offline. Mesh retries temporarily; use Enable cross-device connections to retry.',
+			DISCOVERY_UNAVAILABLE: 'Device discovery or connection status is unavailable. Local windows remain available.',
+			RATE_LIMITED: 'Dev Tunnels temporarily rate limited this account. Wait before retrying.',
 			TIMEOUT: 'The connectivity operation timed out. Check local status before retrying.',
 			CANCELLED: 'The connectivity operation was cancelled.',
 			INVALID_ENDPOINT: 'A discovered endpoint failed validation. It was not admitted for use.',
-			BINDING_CHANGED: 'The candidate or account binding changed. Refresh discovery before pairing.',
+			BINDING_CHANGED: 'A saved device identity or binding changed. Restore the original device profile; changed identities are not trusted automatically.',
 			POLICY_DENIED: 'Remote policy denied this operation. Check source grants and target receive permission.',
 			PRIVATE_ACCESS_REQUIRED: 'SDK private admission requires private-port access. No anonymous fallback was used.',
-			CLEANUP_FAILED: 'Connectivity cleanup is incomplete. Retry cleanup before changing exposure.',
-			MIGRATION_REQUIRED: 'An explicit hosting migration is required. Open discovery and hosting configuration.',
-			PROTOCOL_INCOMPATIBLE: 'The peer uses an incompatible Mesh protocol. Update both devices before pairing.',
+			CLEANUP_FAILED: 'Tunnel or device cleanup is incomplete. Use Retry Tunnel cleanup; saved permissions are not broadened.',
+			MIGRATION_REQUIRED: 'Finish pending cleanup before connecting. Existing tasks and Workspace permissions are kept.',
+			PROTOCOL_INCOMPATIBLE: 'The device uses an incompatible Mesh protocol. Update both devices before reconnecting.',
 		}[code];
 	}
 
@@ -1546,14 +1515,18 @@
 				'discoveryEnabled', 'delegationEnabled', 'strictPolicyActivated', 'publishEnabled',
 				'hostingBackend', 'migrationPending', 'accountProvider', 'claimedWorkspaceCount',
 				'receivingWorkspaceCount', 'state', 'truncated', 'candidates', 'incomingPeers',
-			], ['error'])
+				'enabled', 'connectionState', 'connectedDeviceCount',
+			], ['error', 'accountLabel'])
 			|| ![
 				'discoveryEnabled', 'delegationEnabled', 'strictPolicyActivated',
-				'publishEnabled', 'migrationPending', 'truncated',
+				'publishEnabled', 'migrationPending', 'truncated', 'enabled',
 			].every((key) => typeof value[key] === 'boolean')
 			|| !['cli', 'sdk'].includes(value.hostingBackend)
 			|| !['none', 'github', 'microsoft'].includes(value.accountProvider)
 			|| !['disabled', 'authRequired', 'discovering', 'ready', 'error'].includes(value.state)
+			|| !['disabled', 'authenticating', 'starting', 'online', 'stopping', 'authRequired', 'error', 'cleanupPending'].includes(value.connectionState)
+			|| !Number.isInteger(value.connectedDeviceCount) || value.connectedDeviceCount < 0 || value.connectedDeviceCount > 256
+			|| (value.accountLabel !== undefined && (typeof value.accountLabel !== 'string' || value.accountLabel.length > 256))
 			|| !['claimedWorkspaceCount', 'receivingWorkspaceCount'].every((key) =>
 				Number.isInteger(value[key]) && value[key] >= 0 && value[key] <= 32)
 			|| (value.error !== undefined && ![

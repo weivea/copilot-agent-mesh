@@ -32,6 +32,7 @@ import {
 	assertSafeDashboardOutboundMessage,
 	DASHBOARD_MESSAGE_VERSION,
 	parseDashboardInboundMessage,
+	type DashboardAction,
 } from '../ui/DashboardMessages';
 import { DashboardPresenter } from '../ui/DashboardPresenter';
 
@@ -100,6 +101,19 @@ suite('Dashboard', () => {
 		assert.ok(view.webview.html.includes('id="tasks-heading">Tasks</h2>'));
 		assert.ok(view.webview.html.includes('Settings and diagnostics'));
 		assert.ok(view.webview.html.includes('Discovery candidates — not workers'));
+		assert.strictEqual(view.webview.html.match(/id="connectivity"/gu)?.length, 1);
+		const connectionCard = view.webview.html.indexOf('id="connectivity"');
+		assert.ok(connectionCard < view.webview.html.indexOf('class="workspaceArea"'));
+		assert.ok(
+			connectionCard < view.webview.html.indexOf('id="settingsDrawer"'),
+			'Enabling connections must not require opening Settings.',
+		);
+		const diagnostics = view.webview.html.match(
+			/<details\b([^>]*)>\s*<summary>Transport diagnostics<\/summary>[\s\S]*?<\/details>/u,
+		);
+		assert.ok(diagnostics);
+		assert.doesNotMatch(diagnostics[1], /\bopen\b/u, 'Transport diagnostics must start collapsed.');
+		assert.ok(diagnostics[0].includes('id="listener"'));
 		provider.dispose();
 	});
 
@@ -167,48 +181,69 @@ suite('Dashboard', () => {
 		}]);
 		media.render(DISABLED_CONNECTIVITY_SNAPSHOT);
 		assert.strictEqual(media.messages.length, 1);
-		assert.match(media.element('connectivity').text, /Disabled \(default\)/u);
-		assert.match(media.element('connectivity').text, /outer port is anonymous; Mesh authentication is still required/u);
+		assert.match(media.element('connectivity').text, /Status\s+Off/u);
+		assert.match(media.element('connectivity').text, /Account\s+Choose when enabling/u);
+		assert.match(media.element('connectivity').text, /Connected devices\s+0/u);
+		assert.match(media.element('connectivity').text, /Receiving Workspaces\s+0/u);
+		assert.match(media.element('connectivity').text, /same account connect automatically through private SDK tunnels/u);
+		assert.match(media.element('connectivity').text, /Workspace task permissions stay separate/u);
+		assert.doesNotMatch(media.element('connectivity').text, /anonymous|CLI|invitation/u);
 		assert.match(media.element('discoveryCandidates').text, /discovery is disabled/u);
-		assert.strictEqual(media.button('Refresh account discovery').disabled, true);
-		assert.strictEqual(media.button('Retry connectivity cleanup').disabled, true);
-		assert.strictEqual(media.button('Refresh connected devices').disabled, false);
-		assert.strictEqual(media.button('Configure discovery and hosting…').disabled, false);
-		assert.strictEqual(media.button('Configure strict remote policy…').disabled, false);
-		media.button('Configure discovery and hosting…').click();
-		assert.match(media.element('operationStatus').text, /native prompts in the Broker owner window/u);
+		assert.deepStrictEqual(
+			media.element('connectivity').descendants().filter(({ tagName }) => tagName === 'button')
+				.map(({ textContent }) => textContent),
+			['Enable cross-device connections', 'Manage devices and permissions…'],
+		);
+		assert.strictEqual(media.button('Enable cross-device connections').disabled, false);
+		assert.strictEqual(media.button('Manage devices and permissions…').disabled, false);
+		assert.deepStrictEqual(
+			media.element('listener').descendants().filter(({ tagName }) => tagName === 'button'), [],
+		);
+		for (const label of [
+			'Start listener', 'Stop listener', 'Copy connection URL', 'Pair this candidate…',
+			'Configure discovery and hosting…', 'Configure strict remote policy…', 'Refresh account discovery',
+			'Retry Tunnel cleanup', 'Disable cross-device connections',
+		]) {
+			assert.throws(() => media.button(label), `Removed or inapplicable action: ${label}`);
+		}
+		media.button('Enable cross-device connections').click();
+		assert.match(media.element('operationStatus').text, /VS Code account prompt/u);
+		assert.doesNotMatch(media.element('operationStatus').text, /Broker owner/u);
 		assert.deepStrictEqual(media.messages.at(-1), {
 			version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view',
-			type: 'action', action: 'configureConnectivity',
+			type: 'action', action: 'enableConnectivity',
 		});
 	});
 
-	test('renders candidates as hints, strict grants, private hosting, revocation, and explicit cleanup actions', async () => {
+	test('renders online account connections without treating discovery hints as workers or task grants', async () => {
 		const media = await createDashboardMediaHarness();
-		const source = { ...connectivitySnapshot(), migrationPending: true };
+		const source = { ...connectivitySnapshot(), connectedDeviceCount: 2, receivingWorkspaceCount: 0 };
 		media.render(source);
 		const candidateText = media.element('discoveryCandidates').text;
 		assert.match(candidateText, /Unknown/u);
 		assert.doesNotMatch(candidateText, /Offline|Ready/u);
 		assert.match(candidateText, /not an executable worker or a task grant/u);
-		assert.strictEqual(media.button('Pair this candidate…').disabled, false);
-		assert.match(media.element('connectivity').text, /Activated — latched on/u);
-		assert.match(media.element('connectivity').text, /blocks new remote tasks; it does not cancel/u);
-		assert.match(media.element('connectivity').text, /SDK private hosting never silently falls back/u);
-		assert.match(media.element('connectivity').text, /migration pending/u);
-		assert.match(media.element('connectivity').text, /only Workspaces owned by this calling window/u);
-		assert.match(media.element('connectivity').text, /non-owner windows/u);
+		assert.match(candidateText, /identity is checked automatically before connecting/u);
+		assert.throws(() => media.button('Pair this candidate…'));
+		assert.match(media.element('connectivity').text, /Status\s+Online/u);
+		assert.match(media.element('connectivity').text, /Account\s+Microsoft · Mesh test account/u);
+		assert.match(media.element('connectivity').text, /Connected devices\s+2/u);
+		assert.match(media.element('connectivity').text, /Receiving Workspaces\s+0/u);
+		assert.match(media.element('connectivity').text, /Device identity and Workspace permissions are kept/u);
 		assert.match(media.element('incomingPeers').text, /Active/u);
+		assert.strictEqual(media.checkbox(/Automatically accept tasks from Lab Mac/u).checked, false);
+		assert.deepStrictEqual(
+			media.element('connectivity').descendants().filter(({ tagName }) => tagName === 'button')
+				.map(({ textContent }) => textContent),
+			['Disable cross-device connections', 'Manage devices and permissions…'],
+		);
 		for (const [label, action] of [
-			['Configure discovery and hosting…', 'configureConnectivity'],
-			['Refresh account discovery', 'refreshDiscovery'],
-			['Refresh connected devices', 'refreshRemoteTargets'],
-			['Pair this candidate…', 'pairDiscoveredPeer'],
-			['Configure strict remote policy…', 'configureRemotePolicy'],
+			['Disable cross-device connections', 'disableConnectivity'],
+			['Manage devices and permissions…', 'configureConnectivity'],
 			['Revoke incoming peer…', 'revokeIncomingPeer'],
-			['Retry connectivity cleanup', 'retryConnectivityCleanup'],
 		] as const) {
 			media.render(source);
+			assert.strictEqual(media.button(label).disabled, false);
 			media.button(label).click();
 			const message = media.messages.at(-1);
 			assert.ok(message);
@@ -218,9 +253,73 @@ suite('Dashboard', () => {
 			assert.ok(!JSON.stringify(message).includes(source.incomingPeers[0].actionHandle));
 		}
 
+		media.render({ ...source, accountProvider: 'github', candidates: [] });
+		assert.match(media.element('connectivity').text, /Account\s+GitHub · Mesh test account/u);
+		assert.match(media.element('discoveryCandidates').text, /same account on each device/u);
+		assert.strictEqual(media.messages.filter(({ type }) => type === 'action').length, 3);
+	});
+
+	test('renders startup, authentication, stopping, and cleanup states without duplicate Listener controls', async () => {
+		const media = await createDashboardMediaHarness();
+		const source = connectivitySnapshot();
+		for (const [connectionState, status, actionLabel] of [
+			['disabled', 'Off', 'Enable cross-device connections'],
+			['authenticating', 'Waiting for account authorization', 'Cancel connection startup'],
+			['starting', 'Connecting', 'Cancel connection startup'],
+			['online', 'Online', 'Disable cross-device connections'],
+			['stopping', 'Disconnecting', 'Disable cross-device connections'],
+			['authRequired', 'Sign-in required', 'Sign in and connect'],
+			['error', 'Connection needs attention', 'Enable cross-device connections'],
+			['cleanupPending', 'Offline · Tunnel cleanup pending', 'Enable cross-device connections'],
+		] as const) {
+			media.render({
+				...source,
+				enabled: connectionState !== 'disabled' && connectionState !== 'cleanupPending',
+				connectionState,
+				connectedDeviceCount: connectionState === 'online' ? 1 : 0,
+				migrationPending: connectionState === 'cleanupPending',
+			});
+			assert.match(
+				media.element('connectivity').text,
+				new RegExp(`Status\\s+${status}\\s+Account`, 'u'),
+				connectionState,
+			);
+			assert.strictEqual(media.button(actionLabel).disabled, connectionState === 'stopping');
+			assert.strictEqual(media.button('Manage devices and permissions…').disabled, false);
+			assert.deepStrictEqual(
+				media.element('listener').descendants().filter(({ tagName }) => tagName === 'button'), [],
+			);
+			for (const label of ['Start listener', 'Stop listener', 'Copy connection URL', 'Pair this candidate…']) {
+				assert.throws(() => media.button(label), `${connectionState}: ${label}`);
+			}
+			if (connectionState === 'authenticating' || connectionState === 'starting' || connectionState === 'stopping') {
+				assert.throws(() => media.button('Enable cross-device connections'));
+			}
+			if (connectionState === 'authRequired') {
+				media.button('Sign in and connect').click();
+				assert.deepStrictEqual(media.messages.at(-1), {
+					version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view',
+					type: 'action', action: 'enableConnectivity',
+				});
+			}
+			if (connectionState === 'cleanupPending') {
+				assert.match(media.element('connectivity').text, /Tunnel cleanup is incomplete/u);
+				assert.strictEqual(media.button('Retry Tunnel cleanup').disabled, false);
+				assert.doesNotMatch(media.element('connectivity').text, /Tunnel (?:was |is )?deleted/u);
+			}
+		}
+	});
+
+	test('keeps cleanup failure and revocation visible until explicitly retried', async () => {
+		const media = await createDashboardMediaHarness();
+		const source = connectivitySnapshot();
 		media.render({
 			...source,
-			migrationPending: false,
+			enabled: false,
+			connectionState: 'cleanupPending',
+			connectedDeviceCount: 0,
+			migrationPending: true,
+			error: 'CLEANUP_FAILED',
 			truncated: true,
 			candidates: [{ ...source.candidates[0], stale: true, hostHint: 'offline', admission: 'legacy-mesh-auth' }],
 			incomingPeers: [{ ...source.incomingPeers[0], state: 'revoked', cleanupPending: true }],
@@ -231,12 +330,34 @@ suite('Dashboard', () => {
 		assert.match(media.element('incomingPeers').text, /Revoked/u);
 		assert.match(media.element('incomingPeers').text, /cleanup is still pending/u);
 		assert.match(media.element('connectivity').text, /safe display limit/u);
-		assert.strictEqual(media.button('Pair this candidate…').disabled, true);
+		assert.match(media.element('connectivity').text, /Tunnel cleanup is incomplete/u);
+		assert.match(media.element('connectivity').text, /CLEANUP_FAILED/u);
+		assert.throws(() => media.button('Pair this candidate…'));
 		assert.strictEqual(media.button('Revoke incoming peer…').disabled, true);
-		assert.strictEqual(media.button('Retry connectivity cleanup').disabled, false);
+		assert.strictEqual(media.button('Retry Tunnel cleanup').disabled, false);
+		assert.strictEqual(media.messages.length, 1, 'Rendering pending cleanup must not retry it.');
+
+		const stopped = { ...source, enabled: false, connectionState: 'cleanupPending' as const, connectedDeviceCount: 0 };
+		for (const pending of [
+			{ ...stopped, migrationPending: false },
+			{ ...stopped, migrationPending: true },
+			{ ...stopped, error: 'CLEANUP_FAILED' as const },
+			{ ...source, incomingPeers: [{ ...source.incomingPeers[0], cleanupPending: true }] },
+		]) {
+			media.render(pending);
+			media.button('Retry Tunnel cleanup').click();
+			assert.deepStrictEqual(media.messages.at(-1), {
+				version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view',
+				type: 'action', action: 'retryConnectivityCleanup',
+			});
+		}
+		media.render({ ...DISABLED_CONNECTIVITY_SNAPSHOT, accountProvider: 'microsoft', accountLabel: source.accountLabel });
+		assert.match(media.element('connectivity').text, /Status\s+Off/u);
+		assert.match(media.element('connectivity').text, /Account\s+Microsoft · Mesh test account/u);
+		assert.throws(() => media.button('Retry Tunnel cleanup'));
 
 		for (const error of connectivitySnapshotSchema.shape.error.unwrap().options) {
-			media.render({ ...source, state: 'error', error });
+			media.render({ ...source, connectionState: 'error', state: 'error', error });
 			assert.ok(media.element('connectivity').text.includes(error));
 			assert.ok(!media.element('connectivity').text.includes('undefined'));
 		}
@@ -255,6 +376,8 @@ suite('Dashboard', () => {
 			{ ...valid, version: DASHBOARD_MESSAGE_VERSION - 1 },
 			{ ...valid, uiInstanceId: 'other-view' },
 			{ ...valid, account: 'private-account' },
+			{ ...valid, pendingActions: ['enableConnectivity', 'enableConnectivity'] },
+			{ ...valid, pendingActions: ['disableConnectivity', 'unknown'] },
 			{ ...valid, model: { ...model, connectivity: connectivitySnapshot() } },
 			{ ...valid, model: { ...model, connectivity: { ...model.connectivity, endpoint: 'https://example.test' } } },
 			{ ...valid, model: { ...model, connectivity: {
@@ -535,6 +658,10 @@ suite('Dashboard', () => {
 				{ nodeId: 'caller-chosen' },
 				{ peerId: 'caller-chosen' },
 				{ accountProvider: 'microsoft' },
+				{ accountLabel: 'Mesh test account' },
+				{ connectionState: 'online' },
+				{ connectedDeviceCount: 1 },
+				{ hostingBackend: 'sdk' },
 				{ endpoint: 'https://example.test' },
 				{ invitation: 'private-input' },
 				{ payload: {} },
@@ -570,11 +697,16 @@ suite('Dashboard', () => {
 		assert.strictEqual(discovered.connectivity.candidates[0].hostHint, 'unknown');
 		assert.deepStrictEqual(discovered.localNodes, disabled.localNodes);
 		assert.deepStrictEqual(discovered.outgoingTasks, disabled.outgoingTasks);
+		assert.deepStrictEqual(discovered.deviceTree, disabled.deviceTree);
+		assert.strictEqual(discovered.connectivity.enabled, true);
+		assert.strictEqual(discovered.connectivity.connectionState, 'online');
+		assert.strictEqual(discovered.connectivity.connectedDeviceCount, 1);
+		assert.strictEqual(discovered.connectivity.accountLabel, 'Mesh test account');
 		assert.strictEqual(discovered.connectivity.strictPolicyActivated, true);
 		assert.strictEqual(discovered.connectivity.delegationEnabled, false);
 	});
 
-	test('strictly whitelists connectivity fields, enum values, bounds, and Webview aliases', () => {
+	test('strictly whitelists connectivity fields, enum values, bounds, and Webview aliases', async () => {
 		const source = connectivitySnapshot();
 		const presented = new DashboardPresenter().present({ ...snapshot(), connectivity: source });
 		const model = {
@@ -598,6 +730,9 @@ suite('Dashboard', () => {
 		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage(message));
 		assert.throws(() => connectivitySnapshotSchema.parse(model.connectivity));
 		assert.throws(() => assertSafeDashboardOutboundMessage({ ...message, model: presented }));
+		const media = await createDashboardMediaHarness();
+		media.receive({ ...message, uiInstanceId: 'media-view' });
+		const original = media.element('connectivity').text;
 
 		const candidate = model.connectivity.candidates[0];
 		const peer = model.connectivity.incomingPeers[0];
@@ -608,6 +743,26 @@ suite('Dashboard', () => {
 			{ accessToken: 'hidden' },
 			{ hostingBackend: 'automatic' },
 			{ accountProvider: 'https://example.test' },
+			{ enabled: 'true' },
+			{ enabled: 1 },
+			{ enabled: null },
+			{ enabled: undefined },
+			{ connectionState: 'ready' },
+			{ connectionState: 1 },
+			{ connectionState: undefined },
+			{ connectedDeviceCount: -1 },
+			{ connectedDeviceCount: 257 },
+			{ connectedDeviceCount: 1.5 },
+			{ connectedDeviceCount: Number.NaN },
+			{ connectedDeviceCount: Number.POSITIVE_INFINITY },
+			{ connectedDeviceCount: undefined },
+			{ connectedDeviceCount: null },
+			{ connectedDeviceCount: '1' },
+			{ accountLabel: 'a'.repeat(257) },
+			{ accountLabel: 1 },
+			{ accountLabel: null },
+			{ accountLabel: {} },
+			{ accountLabel: ['Mesh test account'] },
 			{ discoveryEnabled: 'false' },
 			{ strictPolicyActivated: 1 },
 			{ publishEnabled: undefined },
@@ -638,10 +793,21 @@ suite('Dashboard', () => {
 			{ incomingPeers: [{ ...peer, cleanupPending: 'false' }] },
 			{ incomingPeers: [{ ...peer, peerId: 'hidden-peer' }] },
 		]) {
-			assert.throws(() => assertSafeDashboardOutboundMessage({
+			const invalid = {
 				...message,
 				model: { ...model, connectivity: { ...model.connectivity, ...changes } },
-			} as never));
+			};
+			assert.throws(() => assertSafeDashboardOutboundMessage(invalid as never));
+			media.receive({ ...invalid, uiInstanceId: 'media-view' });
+			assert.strictEqual(media.element('connectivity').text, original, JSON.stringify(changes));
+		}
+		for (const field of ['enabled', 'connectionState', 'connectedDeviceCount'] as const) {
+			const incomplete: Record<string, unknown> = { ...model.connectivity };
+			delete incomplete[field];
+			const invalid = { ...message, model: { ...model, connectivity: incomplete } };
+			assert.throws(() => assertSafeDashboardOutboundMessage(invalid as never));
+			media.receive({ ...invalid, uiInstanceId: 'media-view' });
+			assert.strictEqual(media.element('connectivity').text, original, field);
 		}
 		for (const unsafe of [
 			'Bearer private-value',
@@ -687,10 +853,74 @@ suite('Dashboard', () => {
 				} },
 			}));
 		}
+		for (const count of [0, 1, 256]) {
+			assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({
+				...message,
+				model: { ...model, connectivity: { ...model.connectivity, connectedDeviceCount: count } },
+			}));
+			media.render({ ...source, connectedDeviceCount: count });
+			assert.match(media.element('connectivity').text, new RegExp(`Connected devices\\s+${count}\\b`, 'u'));
+		}
+		for (const accountLabel of [undefined, '', 'Mesh test account', 'a'.repeat(256)]) {
+			assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({
+				...message,
+				model: { ...model, connectivity: { ...model.connectivity, accountLabel } },
+			}));
+			assert.doesNotThrow(() => connectivitySnapshotSchema.parse({ ...source, accountLabel }));
+			media.render({ ...source, accountLabel });
+			assert.ok(media.element('connectivity').text.includes(accountLabel || 'Microsoft'));
+		}
+		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({
+			...message, pendingActions: ['enableConnectivity', 'disableConnectivity'],
+		}));
+		for (const pendingActions of [
+			['enableConnectivity', 'enableConnectivity'],
+			['disableConnectivity', 'unknown'],
+			['enableConnectivity', { accountLabel: 'private-input' }],
+		]) {
+			assert.throws(() => assertSafeDashboardOutboundMessage({ ...message, pendingActions } as never));
+		}
 		assert.throws(() => new DashboardPresenter().present({
 			...snapshot(),
 			connectivity: { ...source, endpoint: 'https://example.test' },
 		} as never));
+	});
+
+	test('validates and redacts the display-only account label before sending it to the Webview', () => {
+		const source = connectivitySnapshot();
+		for (const changes of [
+			{ enabled: 'false' },
+			{ connectionState: 'ready' },
+			{ connectedDeviceCount: -1 },
+			{ connectedDeviceCount: 257 },
+			{ connectedDeviceCount: Number.NaN },
+			{ connectedDeviceCount: 0.5 },
+			{ connectedDeviceCount: '1' },
+			{ accountLabel: false },
+			{ accountLabel: 'a'.repeat(257) },
+		]) {
+			assert.throws(() => new DashboardPresenter().present({
+				...snapshot(), connectivity: { ...source, ...changes },
+			} as never));
+		}
+		for (const accountLabel of [
+			'access_token=private-value',
+			'file:///private/project',
+			'C:\\private\\project',
+			'https://example.test/#secret=private-value',
+		]) {
+			const model = withScopedConnectivity({ ...source, accountLabel });
+			assert.strictEqual(model.connectivity.accountLabel, '[redacted sensitive details]');
+			const message = {
+				version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'connectivity-view',
+				type: 'dashboard.snapshot' as const, model,
+			};
+			assert.doesNotThrow(() => assertSafeDashboardOutboundMessage(message));
+			assert.throws(() => assertSafeDashboardOutboundMessage({
+				...message,
+				model: { ...model, connectivity: { ...model.connectivity, accountLabel } },
+			}));
+		}
 	});
 
 	test('rejects secrets and path forms in otherwise valid outbound models', () => {
@@ -1603,54 +1833,114 @@ suite('Dashboard', () => {
 		provider.dispose();
 	});
 
-	test('keeps connectivity actions single-flight without blocking live snapshots or task cancellation', async () => {
+	test('keeps enable single-flight while allowing disable, live snapshots, and task cancellation', async () => {
 		const facade = new RecordingDashboardFacade();
-		facade.snapshotValue = { ...snapshot(), connectivity: connectivitySnapshot() };
-		let finish!: () => void;
+		const source = { ...connectivitySnapshot(), enabled: false, connectionState: 'disabled' as const };
+		facade.snapshotValue = { ...snapshot(), connectivity: source };
+		let finishEnable!: () => void;
+		let finishDisable!: () => void;
+		const enabling = new Promise<void>((resolve) => { finishEnable = resolve; });
+		const disabling = new Promise<void>((resolve) => { finishDisable = resolve; });
 		facade.connectivityAction = async (action) => {
 			facade.calls.push(action);
-			await new Promise<void>((resolve) => { finish = resolve; });
+			if (action === 'enableConnectivity') { await enabling; }
+			if (action === 'disableConnectivity') { await disabling; }
 		};
 		const provider = new AgentMeshViewProvider(facade, getExtension().extensionUri);
 		const view = new TestWebviewView();
 		provider.resolveWebviewView(view);
 		const uiInstanceId = getUiInstanceId(view.webview.html);
-		await view.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'ready' });
-		const oldHandle = getConnectivityActionHandle(view, 'candidates');
-		await view.webview.receive({
-			version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'action', action: 'configureConnectivity',
+		const send = (action: ConnectivityAction) => view.webview.receive({
+			version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'action', action,
 		});
-		facade.fireChanged();
-		await view.webview.receive({
-			version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'action', action: 'configureRemotePolicy',
-		});
-		await settle();
-		assert.deepStrictEqual(facade.calls, ['configureConnectivity']);
-		assert.ok(view.webview.sent.length > 1, 'Local task status must keep updating during native prompts.');
-		assert.deepStrictEqual(view.webview.sent.at(-1)?.pendingActions, ['configureConnectivity']);
-		const tasks = (view.webview.sent.filter((message) => message.type === 'dashboard.snapshot').at(-1)?.model as {
-			outgoingTasks: { actionHandle: string }[];
-		}).outgoingTasks;
-		await view.webview.receive({
-			version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'action',
-			action: 'cancelOutgoingTask', actionHandle: tasks[0].actionHandle,
-		});
-		await settle();
-		assert.ok(facade.calls.some((call) => call.includes('cancelDashboardTask')));
-		finish();
-		await waitFor(() => (view.webview.sent.at(-1)?.pendingActions as unknown[])?.length === 0);
-		assert.notStrictEqual(oldHandle, getConnectivityActionHandle(view, 'candidates'));
-		provider.dispose();
+		try {
+			await view.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'ready' });
+			const oldHandle = getConnectivityActionHandle(view, 'candidates');
+			await send('enableConnectivity');
+			facade.snapshotValue = {
+				...snapshot(), connectivity: { ...source, connectionState: 'authenticating' },
+			};
+			facade.fireChanged();
+			await send('enableConnectivity');
+			await send('configureConnectivity');
+			await send('configureRemotePolicy');
+			await settle();
+			assert.deepStrictEqual(facade.calls, ['enableConnectivity']);
+			assert.ok(view.webview.sent.length > 1, 'Local task status must keep updating during native prompts.');
+			assert.deepStrictEqual(view.webview.sent.at(-1)?.pendingActions, ['enableConnectivity']);
+			assert.notStrictEqual(oldHandle, getConnectivityActionHandle(view, 'candidates'));
+
+			await send('disableConnectivity');
+			await send('disableConnectivity');
+			assert.deepStrictEqual(facade.calls, ['enableConnectivity', 'disableConnectivity']);
+			assert.deepStrictEqual(view.webview.sent.at(-1)?.pendingActions, ['enableConnectivity', 'disableConnectivity']);
+			const tasks = (view.webview.sent.filter((message) => message.type === 'dashboard.snapshot').at(-1)?.model as {
+				outgoingTasks: { actionHandle: string }[];
+			}).outgoingTasks;
+			await view.webview.receive({
+				version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'action',
+				action: 'cancelOutgoingTask', actionHandle: tasks[0].actionHandle,
+			});
+			assert.ok(facade.calls.some((call) => call.includes('cancelDashboardTask')));
+			finishDisable();
+			await waitFor(() => (view.webview.sent.at(-1)?.pendingActions as unknown[])?.length === 1);
+			assert.deepStrictEqual(view.webview.sent.at(-1)?.pendingActions, ['enableConnectivity']);
+			finishEnable();
+			await waitFor(() => (view.webview.sent.at(-1)?.pendingActions as unknown[])?.length === 0);
+		} finally {
+			finishEnable();
+			finishDisable();
+			provider.dispose();
+		}
 	});
 
-	test('media preserves native pending state across snapshots but keeps cancel controls usable', async () => {
+	test('media preserves native pending state across snapshots without blocking disconnect or task cancellation', async () => {
 		const media = await createDashboardMediaHarness();
 		media.render(connectivitySnapshot());
-		media.button('Configure discovery and hosting…').click();
-		assert.strictEqual(media.button('Configure strict remote policy…').disabled, true);
+		media.button('Manage devices and permissions…').click();
+		media.render(connectivitySnapshot(), ['configureConnectivity']);
+		assert.strictEqual(media.button('Manage devices and permissions…').disabled, true);
+		assert.strictEqual(media.button('Revoke incoming peer…').disabled, true);
+		assert.strictEqual(media.button('Disable cross-device connections').disabled, false);
 		assert.strictEqual(media.button('Cancel task').disabled, false);
+		assert.match(media.element('operationStatus').text, /native prompts/u);
+		media.button('Disable cross-device connections').click();
+		assert.strictEqual(media.messages.at(-1)?.action, 'disableConnectivity');
+		assert.strictEqual(media.button('Disable cross-device connections').disabled, true);
 		media.button('Cancel task').click();
 		assert.strictEqual(media.messages.at(-1)?.action, 'cancelOutgoingTask');
+	});
+
+	test('media keeps native-login startup cancellable and does not duplicate pending enable or disable actions', async () => {
+		const media = await createDashboardMediaHarness();
+		media.render(DISABLED_CONNECTIVITY_SNAPSHOT);
+		media.button('Enable cross-device connections').click();
+		assert.strictEqual(media.button('Enable cross-device connections').disabled, true);
+		assert.strictEqual(media.button('Cancel connection startup').disabled, false);
+		assert.strictEqual(media.button('Manage devices and permissions…').disabled, true);
+		assert.throws(() => media.button('Enable cross-device connections').click());
+		media.render({
+			...DISABLED_CONNECTIVITY_SNAPSHOT, connectionState: 'authenticating',
+		}, ['enableConnectivity']);
+		assert.strictEqual(media.button('Cancel connection startup').disabled, false);
+		assert.strictEqual(media.button('Manage devices and permissions…').disabled, true);
+		media.button('Cancel connection startup').click();
+		media.render({
+			...DISABLED_CONNECTIVITY_SNAPSHOT, enabled: true, connectionState: 'starting',
+		}, ['enableConnectivity', 'disableConnectivity']);
+		assert.strictEqual(media.button('Cancel connection startup').disabled, true);
+		assert.strictEqual(media.button('Cancel task').disabled, false);
+		assert.throws(() => media.button('Cancel connection startup').click());
+		assert.deepStrictEqual(media.messages.filter(({ type }) => type === 'action').map(({ action }) => action), [
+			'enableConnectivity', 'disableConnectivity',
+		]);
+
+		media.render(DISABLED_CONNECTIVITY_SNAPSHOT, ['enableConnectivity']);
+		assert.strictEqual(media.button('Enable cross-device connections').disabled, true);
+		media.render(DISABLED_CONNECTIVITY_SNAPSHOT);
+		assert.strictEqual(media.button('Enable cross-device connections').disabled, false);
+		assert.strictEqual(media.button('Manage devices and permissions…').disabled, false);
+		assert.strictEqual(media.element('operationStatus').text, '');
 	});
 
 	test('shows safe connectivity action failures without forwarding native diagnostics', async () => {
@@ -1665,7 +1955,7 @@ suite('Dashboard', () => {
 		await view.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'ready' });
 		await view.webview.receive({
 			version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'action',
-			action: 'configureConnectivity',
+			action: 'enableConnectivity',
 		});
 		assert.ok(view.webview.sent.some(({ code }) => code === 'ACTION_FAILED'));
 		assert.doesNotMatch(JSON.stringify(view.webview.sent), /private-value|example\.test|private\/project/u);
@@ -1674,8 +1964,8 @@ suite('Dashboard', () => {
 			media.receive({ ...message, uiInstanceId: 'media-view' });
 		}
 		assert.match(media.element('operationStatus').text, /dashboard action failed/u);
-		media.button('Configure discovery and hosting…').click();
-		assert.match(media.element('operationStatus').text, /native prompts/u);
+		media.button('Enable cross-device connections').click();
+		assert.match(media.element('operationStatus').text, /VS Code account prompt/u);
 		provider.dispose();
 	});
 
@@ -1701,18 +1991,12 @@ suite('Dashboard', () => {
 		provider.dispose();
 	});
 
-	test('requires local confirmation before stopping the listener', async () => {
+	test('stops through the compatibility Listener facade without a second confirmation', async () => {
 		const services = new RecordingServiceBindings();
-		const denied = new ServiceDashboardFacade(services, {
-			confirm: async () => false,
+		const facade = new ServiceDashboardFacade(services, {
+			confirm: async () => assert.fail('The unified disable action must not add a Listener-stop modal.'),
 		});
-		await denied.stopListener();
-		assert.strictEqual(services.stopCalls, 0);
-
-		const approved = new ServiceDashboardFacade(services, {
-			confirm: async () => true,
-		});
-		await approved.stopListener();
+		await facade.stopListener();
 		assert.strictEqual(services.stopCalls, 1);
 	});
 
@@ -1973,6 +2257,10 @@ suite('Dashboard', () => {
 					action, ...(handle === undefined ? {} : { actionHandle: handle }),
 				});
 			}
+			await fixture.bindings.startListener();
+			assert.deepStrictEqual(fixture.mutations.at(-1), { action: 'enableConnectivity' });
+			await fixture.bindings.stopListener();
+			assert.deepStrictEqual(fixture.mutations.at(-1), { action: 'disableConnectivity' });
 			assert.strictEqual(fixture.calls.filter((call) => call === 'ownerRuntime').length, ownerReads);
 			assert.strictEqual(fixture.calls.includes('cloud'), false);
 			assert.strictEqual(fixture.calls.includes('runtime'), false);
@@ -2077,7 +2365,7 @@ suite('Dashboard', () => {
 		}
 	});
 
-	test('Production Dashboard accepts neutral CLI and SDK exposure status without projecting hosting metadata', async () => {
+	test('Production Dashboard accepts historical exposure diagnostics without restoring backend or Listener controls', async () => {
 		const fixture = createConnectivityBindings();
 		const media = await createDashboardMediaHarness();
 		try {
@@ -2119,9 +2407,16 @@ suite('Dashboard', () => {
 				assert.doesNotThrow(() => assertSafeDashboardOutboundMessage(message));
 				assert.doesNotMatch(JSON.stringify(model), /neutral-forwarding|neutral-resource|neutral-owner|00000000-0000-4000-8000-000000000301/u);
 				media.receive(message);
-				assert.ok(media.element('connectivity').text.includes(
-					provider === 'sdk' ? 'SDK private hosting' : 'Legacy CLI hosting',
-				));
+				assert.match(media.element('listener').text, /Listener\s+Running/u);
+				assert.match(media.element('connectivity').text, /Status\s+Off/u);
+				assert.doesNotMatch(media.element('connectivity').text, /Legacy CLI|hosting backend|outer port is anonymous/u);
+				assert.strictEqual(media.button('Enable cross-device connections').disabled, false);
+				assert.deepStrictEqual(
+					media.element('listener').descendants().filter(({ tagName }) => tagName === 'button'), [],
+				);
+				for (const label of ['Start listener', 'Stop listener', 'Copy connection URL', 'Configure discovery and hosting…']) {
+					assert.throws(() => media.button(label));
+				}
 			}
 			assert.deepStrictEqual(fixture.mutations, []);
 			assert.strictEqual(fixture.calls.includes('cloud'), false);
@@ -2162,16 +2457,16 @@ suite('Dashboard', () => {
 					receivingWorkspaceCount === 1 ? /Accepting incoming tasks/u : /Not accepting incoming tasks/u,
 				);
 				assert.match(media.element('acceptIncoming').text, /strict remote policy/i);
-				media.button('Configure strict remote policy…').click();
+				media.button('Manage devices and permissions…').click();
 				assert.deepStrictEqual(media.messages.at(-1), {
 					version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view',
-					type: 'action', action: 'configureRemotePolicy',
+					type: 'action', action: 'configureConnectivity',
 				});
-				await fixture.bindings.connectivityAction('configureRemotePolicy');
+				await fixture.bindings.connectivityAction('configureConnectivity');
 			}
 			assert.deepStrictEqual(fixture.mutations, [
-				{ action: 'configureRemotePolicy' },
-				{ action: 'configureRemotePolicy' },
+				{ action: 'configureConnectivity' },
+				{ action: 'configureConnectivity' },
 			]);
 			assert.strictEqual(fixture.calls.includes('localPolicy'), false);
 			assert.strictEqual(fixture.calls.includes('passiveEditorProbe'), true);
@@ -2275,6 +2570,8 @@ suite('Dashboard', () => {
 			{ action: 'startListener' },
 			{ action: 'stopListener' },
 			{ action: 'copyConnectionUrl' },
+			{ action: 'enableConnectivity' },
+			{ action: 'disableConnectivity' },
 			{ action: 'configureConnectivity' },
 			{ action: 'refreshDiscovery' },
 			{ action: 'refreshRemoteTargets' },
@@ -2298,6 +2595,8 @@ suite('Dashboard', () => {
 			'startListener',
 			'stopListener',
 			'copyConnectionUrl',
+			'connectivity:enableConnectivity:',
+			'connectivity:disableConnectivity:',
 			'connectivity:configureConnectivity:',
 			'connectivity:refreshDiscovery:',
 			'connectivity:refreshRemoteTargets:',
@@ -2745,6 +3044,10 @@ function snapshot(): DashboardSnapshot {
 function connectivitySnapshot(): ConnectivitySnapshot {
 	return {
 		...DISABLED_CONNECTIVITY_SNAPSHOT,
+		enabled: true,
+		connectionState: 'online',
+		connectedDeviceCount: 1,
+		accountLabel: 'Mesh test account',
 		discoveryEnabled: true,
 		strictPolicyActivated: true,
 		publishEnabled: true,
@@ -3005,7 +3308,7 @@ async function createDashboardMediaHarness(): Promise<{
 	focusedElement(): DashboardTestElement | undefined;
 	selectedTreeLabel(): string | undefined;
 	receive(message: unknown): void;
-	render(connectivity: ConnectivitySnapshot): void;
+	render(connectivity: ConnectivitySnapshot, pendingActions?: readonly DashboardAction[]): void;
 }> {
 	const messages: Array<Record<string, unknown>> = [];
 	let activeElement: DashboardTestElement | undefined;
@@ -3100,9 +3403,9 @@ async function createDashboardMediaHarness(): Promise<{
 			.find((candidate) => candidate.attributes['aria-selected'] === 'true')
 			?.text,
 		receive,
-		render: (connectivity: ConnectivitySnapshot) => receive({
+		render: (connectivity: ConnectivitySnapshot, pendingActions: readonly DashboardAction[] = []) => receive({
 			version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view',
-			type: 'dashboard.snapshot', model: withScopedConnectivity(connectivity),
+			type: 'dashboard.snapshot', model: withScopedConnectivity(connectivity), pendingActions,
 		}),
 	};
 }

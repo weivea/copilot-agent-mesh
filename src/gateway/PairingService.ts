@@ -57,6 +57,7 @@ export interface PairingRecordStore {
 	deletePending(enrollmentId: string): Promise<void>;
 	listPeers(): Promise<readonly PeerRecord[]>;
 	getPeer(peerId: string): Promise<PeerRecord | undefined>;
+	storeAccountPeerIfAbsent(record: PeerRecord): Promise<boolean>;
 	commitPeer(record: PeerRecord, pending: PendingPeerRecord): Promise<boolean>;
 	completePeerCleanup(peerId: string, enrollmentId: string): Promise<boolean>;
 }
@@ -95,6 +96,11 @@ export class InMemoryPairingRecordStore implements PairingRecordStore {
 	}
 	public async listPeers(): Promise<readonly PeerRecord[]> {
 		return [...this.peers.values()];
+	}
+	public async storeAccountPeerIfAbsent(record: PeerRecord): Promise<boolean> {
+		if (this.peers.has(record.peerId)) { return false; }
+		this.peers.set(record.peerId, record);
+		return true;
 	}
 	public async commitPeer(record: PeerRecord, pending: PendingPeerRecord): Promise<boolean> {
 		const invitation = this.invitations.get(pending.invitationId);
@@ -222,6 +228,33 @@ export class PairingService {
 		if (peer === undefined) {
 			throw new PairingProtocolError('AUTH_FAILED', 'Peer authentication failed.');
 		}
+	}
+
+	public registerAccountPeer(
+		peerId: string, coordinatorDeviceId: string, root: string, transcriptHash: string,
+	): Promise<void> {
+		return this.mutateRecords(async () => {
+			this.assertPeerAllowed(peerId);
+			decodeFixedBase64Url(root, SECRET_BYTES, 'account peer root');
+			decodeFixedBase64Url(transcriptHash, SECRET_BYTES, 'account peer transcript');
+			const rootKeyRef = `mesh.peer.${peerId}`;
+			const existing = await this.records.getPeer(peerId);
+			if (existing !== undefined) {
+				if (existing.coordinatorDeviceId !== coordinatorDeviceId || existing.transcriptHash !== transcriptHash
+					|| existing.rootKeyRef !== rootKeyRef || existing.cleanupPending
+					|| await this.secretStore.get(rootKeyRef) !== root) {
+					throw new PairingProtocolError('AUTH_FAILED', 'The registered account device identity changed.');
+				}
+				return;
+			}
+			await this.secretStore.store(rootKeyRef, root);
+			this.assertPeerAllowed(peerId);
+			if (!await this.records.storeAccountPeerIfAbsent({
+				peerId, coordinatorDeviceId, rootKeyRef, enrollmentId: peerId, transcriptHash, createdAt: this.now(),
+			})) {
+				throw new PairingProtocolError('AUTH_FAILED', 'The account device registration changed.');
+			}
+		});
 	}
 
 	public connectionHasPeer(connectionId: string, peerId: string): boolean {

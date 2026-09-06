@@ -289,9 +289,7 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 		);
 		const pairingRecords = new VscodePairingRecordStore(fencedState);
 		const peerProfiles = new VscodePeerProfileStore(fencedState);
-		const tunnelPath = configuration.get<string>('devTunnelPath', '').trim();
 		const tunnel = new LazyVscodeDevTunnelProvider({
-			executable: tunnelPath || undefined,
 			reportStatusListenerError: (error: unknown) =>
 				options.logger.error('listener', 'A Dev Tunnel status listener failed.', error),
 			stateStore: new VscodeDevTunnelStateStore(fencedState),
@@ -346,25 +344,18 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 			),
 		});
 		const router = new GatewayRouter(device, broker);
-		const configuredPort = (): number | undefined => {
-			const value = options.vscodeApi.workspace
-				.getConfiguration('copilotAgentMesh')
-				.get<number>('listener.port', 0);
-			return value === 0 ? undefined : value;
-		};
 		listener = new ListenerService(
 			profile.deviceId,
 			pairing,
 			connectivity.exposure,
 			() => new GatewayServer(pairing, router, {
-				admissionReady: () => connectivity!.isReady()
-					&& (connectivity!.settings.snapshot().hostingBackend !== 'sdk'
-						|| connectivity!.sdkExposure.getStatus().state === 'ready'),
+				admissionReady: () => connectivity!.connectionsEnabled()
+					&& connectivity!.sdkExposure.getStatus().state === 'ready',
 			}),
 			fencedState,
 			options.guard,
 			{
-				configuredPort,
+				reusePort: false,
 				workerPlatform: options.workerPlatform,
 				ownership: options.ownership,
 			},
@@ -410,12 +401,7 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 		}
 		await this.broker.start();
 		await this.connectivity.initialize();
-		if (this.connectivity.isReady()) {
-			await this.peers.restore().catch((error: unknown) => {
-				this.options.logger.error('connectivity', 'Remote peers could not be restored; local nodes remain available.', error);
-			});
-		}
-		await this.restoreListener();
+		await this.connectivity.restore();
 		await this.coordinator.refreshKnownTasks().catch((error: unknown) => {
 			this.options.logger.error(
 				'coordinator',
@@ -442,25 +428,6 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 		});
 		this.disposal = disposal;
 		return disposal;
-	}
-
-	private async restoreListener(): Promise<void> {
-		const configuration = this.options.vscodeApi.workspace.getConfiguration('copilotAgentMesh');
-		try {
-			await this.listener.restore();
-			if (
-				this.listener.snapshot().state === 'stopped'
-				&& configuration.get<boolean>('listener.autoStart', false)
-			) {
-				await this.listener.start();
-			}
-		} catch (error: unknown) {
-			this.options.logger.error(
-				'listener',
-				'Listener restoration failed safely; local Window Nodes remain available.',
-				error,
-			);
-		}
 	}
 
 	private async disposeOnce(): Promise<void> {

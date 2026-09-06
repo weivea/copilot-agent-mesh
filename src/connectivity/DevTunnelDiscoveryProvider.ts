@@ -3,6 +3,8 @@ import { TunnelConstraints, type Tunnel } from '@microsoft/dev-tunnels-contracts
 
 import {
 	ADVERTISEMENT_PREFIX,
+	ACCOUNT_IDENTITY_PREFIX,
+	accountDeviceIdentitySchema,
 	ConnectivityError,
 	DISCOVERY_LABELS,
 	PRIVATE_LABEL,
@@ -10,7 +12,9 @@ import {
 	type EndpointLocator,
 	type PeerAdmission,
 	type TunnelResource,
+	type AccountDeviceIdentity,
 } from './ConnectivitySchemas';
+import { readAccountPublicKey } from './AccountDeviceIdentity';
 import type { DevTunnelManagement } from './DevTunnelManagement';
 import { portOrigin } from './DevTunnelUris';
 
@@ -19,6 +23,7 @@ export interface DiscoveredEndpoint {
 	readonly admission: PeerAdmission;
 	readonly origin: string;
 	readonly hostHint: 'online' | 'offline' | 'unknown';
+	readonly accountIdentity?: AccountDeviceIdentity;
 }
 
 export class DevTunnelDiscoveryProvider {
@@ -96,6 +101,7 @@ export class DevTunnelDiscoveryProvider {
 		const count = typeof hostCount === 'number' ? hostCount : hostCount?.current;
 		const hostHint = typeof count !== 'number' || !Number.isFinite(count) || count < 0
 			? 'unknown' : count > 0 ? 'online' : 'offline';
+		const accountIdentity = readAdvertisedIdentity(tunnel);
 		return (tunnel.ports ?? []).filter((port) => port.protocol === 'http' || port.protocol === 'https')
 			.map((port) => {
 				const parsed = endpointLocatorSchema.safeParse({
@@ -113,8 +119,23 @@ export class DevTunnelDiscoveryProvider {
 					admission: tunnel.labels!.includes(PRIVATE_LABEL) ? 'private-port-token' : 'legacy-mesh-auth',
 					origin: portOrigin(port, parsed.data),
 					hostHint,
+					...(accountIdentity === undefined ? {} : { accountIdentity }),
 				};
 			});
+	}
+}
+
+function readAdvertisedIdentity(tunnel: Tunnel): AccountDeviceIdentity | undefined {
+	if (!tunnel.description?.startsWith(ACCOUNT_IDENTITY_PREFIX)) { return undefined; }
+	if (!tunnel.labels?.includes(PRIVATE_LABEL) || tunnel.description.length > 512) {
+		throw new ConnectivityError('INVALID_ENDPOINT');
+	}
+	try {
+		const identity = accountDeviceIdentitySchema.parse(JSON.parse(tunnel.description.slice(ACCOUNT_IDENTITY_PREFIX.length)));
+		readAccountPublicKey(identity.publicKey);
+		return identity;
+	} catch {
+		throw new ConnectivityError('INVALID_ENDPOINT');
 	}
 }
 

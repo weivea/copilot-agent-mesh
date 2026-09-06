@@ -122,6 +122,12 @@ export class VscodePairingRecordStore implements PairingRecordStore {
 		return this.read().peers.find((record) => record.peerId === peerId);
 	}
 
+	public storeAccountPeerIfAbsent(record: PeerRecord): Promise<boolean> {
+		return this.mutateResult((current) => current.peers.some((peer) => peer.peerId === record.peerId)
+			? { state: current, result: false }
+			: { state: { ...current, peers: [...current.peers, record] }, result: true });
+	}
+
 	public commitPeer(record: PeerRecord, pending: PendingPeerRecord): Promise<boolean> {
 		return this.mutateResult((current) => {
 			const invitation = current.invitations.find(

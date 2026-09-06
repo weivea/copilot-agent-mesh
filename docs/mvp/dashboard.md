@@ -3,6 +3,27 @@
 The dashboard is a secure presentation and command surface. It does not own device,
 listener, tunnel, workspace, peer, or task state.
 
+## Cross-device connection control
+
+The default-off **Enable cross-device connections** / **Disable cross-device
+connections** control uses native VS Code account selection and SDK-only private
+Tunnels. Enabled devices automatically discover and authenticate same-account
+devices; Workspace grants, receive and task approval remain separate. Status,
+Account, Connected devices and Receiving Workspaces are shown without exposing
+credentials or endpoints. **Manage devices and permissions…** opens native
+configuration; transport diagnostics stay collapsed in Settings. There are no
+separate Listener start/stop, connection-URL or candidate-pairing buttons.
+
+Startup exposes **Cancel connection startup**, authentication loss exposes
+**Sign in and connect**, and incomplete cleanup exposes **Retry Tunnel cleanup**.
+Disable stops connections and deletes only the Broker's exact owned Tunnel,
+retaining durable identity, authentication, peer credentials, policies and tasks.
+Cleanup failure remains visible; re-enable recreates/rebinds the Tunnel.
+Native prompt actions are single-flight, but disable and task cancellation
+remain available during a pending enable/sign-in or configuration action.
+
+## Window and task controls
+
 P7 provides `This Window`, `Accept Incoming Tasks`, `Local Window Nodes`,
 `Outgoing Tasks`, and `Incoming Tasks`. `This Window` keeps the P3 effective
 window label, current Workspace display name, claim status, Preview status, and
@@ -124,16 +145,17 @@ composition root should adapt the real stores and application services to
 | `configureDeviceName` | Collect the name in Extension Host UI and persist it through the device service |
 | `prepareWindowRename` / `renameCurrentWindow` | Capture one owned Workspace before collecting a bounded name, revalidate it on submit, then invoke the authenticated policy RPC |
 | `registerCurrentWorkspace` / `removeWorkspace` | Register the active local workspace or confirm and remove by `workspaceId` |
-| `startListener` / `stopListener` | Drive the real gateway and tunnel lifecycle |
-| `copyConnectionUrl` | Obtain the one-time URL and write it directly with `vscode.env.clipboard`; never return or post it to the webview |
-| `addPeer` / `removePeer` | Collect the URL in Extension Host UI, enroll it, or confirm and revoke by `peerId` |
+| `connectivityAction` | Route `enableConnectivity` / `disableConnectivity` and native management actions through the authenticated Broker IPC, including from non-owner windows |
+| `startListener` / `stopListener` | Compatibility aliases for unified enable/disable; stop adds no extra confirmation |
+| `copyConnectionUrl` | Legacy API only, absent from normal UI; never return or post an invitation to the webview |
+| `addPeer` / `removePeer` | Legacy enrollment/revocation API; automatic same-account connections do not require invitation import |
 | `setAcceptIncoming` | Resolve the current exact owned Workspace in Extension Host and update only its receive policy |
 | `setPeerAllowed` | Redeem a one-time Broker candidate handle for one directional allow/revoke mutation |
 | `cancelDashboardTask` | Confirm locally and redeem a direction-bound one-time task handle |
 
-Destructive confirmations are a Facade responsibility and therefore remain an
-Extension Host security boundary. This includes listener stop, workspace/peer
-removal, and task cancellation. The production fallback is
+Workspace/peer removal and task-cancellation confirmations remain an Extension
+Host security boundary. Unified connection disable is an explicit one-click
+action, not a second Listener-stop modal. The production fallback is
 `UnavailableDashboardFacade`; it reads only the configured device metadata and
 reports services as unavailable. It never creates fake online state or fake tasks.
 
@@ -142,6 +164,11 @@ reports services as unavailable. It never creates fake online state or fake task
 The webview sends only action names and bounded opaque IDs. Window names,
 Workspace identities, connection URLs, pairing secrets, task prompts, complete
 output, answers, credentials, and local paths never cross the message bus.
+Connectivity snapshots explicitly allow `enabled`, bounded `connectionState`,
+integer `connectedDeviceCount` (0–256), and an optional redacted `accountLabel`
+(at most 256 characters). The label is display-only, never an account identity
+or authorization input. Old discovery diagnostics remain compatibility fields,
+not separate user switches.
 Both directions are runtime validated, and
 outbound messages are rejected when they contain forbidden fields, local path
 shapes, secret URL fragments, or oversized strings. Foundation's complete task

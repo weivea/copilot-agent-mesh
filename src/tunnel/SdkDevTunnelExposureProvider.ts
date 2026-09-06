@@ -9,8 +9,8 @@ import { isAxiosError, type AxiosAdapter } from 'axios';
 import { uuidSchema } from '../../shared/protocol';
 import type { AccountSessionProvider } from '../connectivity/AccountSessionProvider';
 import {
-	ADVERTISEMENT_PREFIX, ConnectivityError, DISCOVERY_LABELS, PRIVATE_LABEL,
-	tunnelResourceSchema, type EndpointLocator,
+	ACCOUNT_IDENTITY_PREFIX, ADVERTISEMENT_PREFIX, ConnectivityError, DISCOVERY_LABELS, PRIVATE_LABEL,
+	accountDeviceIdentitySchema, tunnelResourceSchema, type EndpointLocator, type AccountDeviceIdentity,
 } from '../connectivity/ConnectivitySchemas';
 import { ConnectivityOperation } from '../connectivity/ConnectivityOperations';
 import { portCapability, validateCapability } from '../connectivity/DevTunnelEndpointResolver';
@@ -33,6 +33,7 @@ const ownedSchema = z.strictObject({
 	localPort: z.number().int().min(1).max(65535),
 	phase: z.enum(['creating', 'stopped', 'hosting', 'cleanupPending']),
 	endpointId: endpointIdSchema.optional(),
+	identity: accountDeviceIdentitySchema.optional(),
 });
 const ledgerSchema = z.strictObject({
 	schemaVersion: z.literal(1),
@@ -71,6 +72,7 @@ export class SdkDevTunnelExposureProvider implements RemoteExposureProvider {
 		private readonly options: {
 			readonly enabled: () => boolean;
 			readonly advertisementId: () => string | undefined;
+			readonly identity?: () => AccountDeviceIdentity | undefined;
 			readonly hostFactory?: (client: TunnelManagementHttpClient) => SdkTunnelHost;
 			readonly hostAdapter?: AxiosAdapter;
 			readonly probe?: (origin: string, capability: string, signal: AbortSignal) => Promise<void>;
@@ -220,6 +222,8 @@ export class SdkDevTunnelExposureProvider implements RemoteExposureProvider {
 				const accountRef = this.account.current()?.accountRef;
 				const advertisementId = this.options.advertisementId();
 				if (accountRef === undefined || advertisementId === undefined) { throw new ConnectivityError('AUTH_REQUIRED'); }
+				const identity = this.options.identity?.();
+				if (this.options.identity !== undefined && identity === undefined) { throw new ConnectivityError('AUTH_REQUIRED'); }
 				const recommendations = await this.management.run(
 					(client, token) => client.getClusterRecommendations(undefined, undefined, token),
 					operation.controller.signal,
@@ -229,7 +233,7 @@ export class SdkDevTunnelExposureProvider implements RemoteExposureProvider {
 						clusterId: recommendations.recommendedClusterId,
 						tunnelId: `cam-${randomUUID().replaceAll('-', '')}`,
 					},
-					accountRef, advertisementId, ownershipId: randomUUID(), localPort, phase: 'creating',
+					accountRef, advertisementId, ownershipId: randomUUID(), localPort, phase: 'creating', identity,
 				});
 				// Persist the exact chosen ID before the create request, including ambiguous timeout recovery.
 				await this.ledger.update((current) => ({ ...current, owned }));
@@ -237,6 +241,7 @@ export class SdkDevTunnelExposureProvider implements RemoteExposureProvider {
 					`${ADVERTISEMENT_PREFIX}${owned.advertisementId}`, ownershipLabel(owned)];
 				tunnel = await this.management.run((client, token) => client.createTunnel({
 					...owned!.resource, labels, customExpiration: 3600,
+					...(identity === undefined ? {} : { description: `${ACCOUNT_IDENTITY_PREFIX}${JSON.stringify(identity)}` }),
 					accessControl: { entries: [] },
 					ports: [{ portNumber: localPort, protocol: 'http', accessControl: { entries: [] } }],
 				}, { includePorts: true, tokenScopes: [TunnelAccessScopes.Host], followRedirects: false }, token), operation.controller.signal);
@@ -439,6 +444,10 @@ export function assertOwnedPrivate(tunnel: Tunnel, owned: OwnedSdkTunnel): void 
 			.every((label) => tunnel.labels?.includes(label))
 		|| tunnel.ports?.length !== 1 || tunnel.ports[0].portNumber !== owned.localPort
 		|| tunnel.ports[0].protocol !== 'http') {
+		throw new ConnectivityError('BINDING_CHANGED');
+	}
+	if (owned.identity !== undefined
+		&& tunnel.description !== `${ACCOUNT_IDENTITY_PREFIX}${JSON.stringify(owned.identity)}`) {
 		throw new ConnectivityError('BINDING_CHANGED');
 	}
 	if ([...(tunnel.accessControl?.entries ?? []), ...(tunnel.ports[0].accessControl?.entries ?? [])]

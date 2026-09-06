@@ -24,6 +24,7 @@ export class BoundPeerTransport implements PeerTransport {
 		private readonly fence: DocumentFence,
 		private readonly ready: () => boolean,
 		private readonly transportOptions: WebSocketPeerTransportOptions = {},
+		private readonly profileAllowed?: (profile: PeerProfile) => boolean,
 	) {}
 
 	public async prepare(profile: PeerProfile, endpoint: DiscoveredEndpoint): Promise<void> {
@@ -50,7 +51,7 @@ export class BoundPeerTransport implements PeerTransport {
 		profile: PeerProfile, coordinatorDeviceId: string, secrets: SecretStore,
 		profiles: PeerProfileStore, signal: AbortSignal,
 	): Promise<PeerSession> {
-		if (!this.ready()) {
+		if (!this.ready() || this.profileAllowed?.(profile) === false) {
 			throw new PeerTransportError('CONNECTION_FAILED', 'Remote connectivity initialization is blocked.');
 		}
 		await assertDocumentFence(this.fence);
@@ -61,7 +62,7 @@ export class BoundPeerTransport implements PeerTransport {
 				.connect(profile, coordinatorDeviceId, secrets, profiles, signal);
 			try {
 				await assertDocumentFence(this.fence);
-				if (!this.ready() || signal.aborted) { throw new ConnectivityError('CANCELLED'); }
+				if (!this.ready() || signal.aborted || this.profileAllowed?.(profile) === false) { throw new ConnectivityError('CANCELLED'); }
 				return legacySession;
 			} catch (error: unknown) {
 				await legacySession.close();
@@ -79,6 +80,9 @@ export class BoundPeerTransport implements PeerTransport {
 		try {
 			const assertCurrent = async (): Promise<void> => {
 				await assertDocumentFence(this.fence);
+				if (!this.ready() || this.profileAllowed?.(profile) === false) {
+					throw new ConnectivityError('POLICY_DENIED');
+				}
 				const current = await profiles.get(profile.id);
 				if (signal.aborted || closed) {
 					throw new ConnectivityError('CANCELLED');

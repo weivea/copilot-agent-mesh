@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type * as vscode from 'vscode';
+import { isAxiosError } from 'axios';
 
 import {
 	ACTIVE_TASK_STATUSES, connectivitySnapshotSchema,
@@ -14,13 +15,15 @@ import { RemotePeerPolicyService } from '../broker/RemotePeerPolicyService';
 import { RemotePeerPolicyStore } from '../broker/RemotePeerPolicyStore';
 import type { RemoteAllowedTarget } from '../broker/RemotePeerPolicyStore';
 import { AccountSessionProvider } from '../connectivity/AccountSessionProvider';
+import { AccountDeviceIdentityStore } from '../connectivity/AccountDeviceIdentity';
+import { AccountPeerEnrollment } from '../connectivity/AccountPeerEnrollment';
 import { BoundPeerTransport } from '../connectivity/BoundPeerTransport';
 import type { BrokerConnectivity } from '../connectivity/BrokerConnectivity';
 import {
 	ConnectivityError, EMPTY_CONNECTIVITY_SETTINGS, connectivitySettingsSchema,
-	type ConnectivityCode, type ConnectivitySettings,
+	tunnelResourceSchema, type AccountBinding, type ConnectivityCode, type ConnectivitySettings,
 } from '../connectivity/ConnectivitySchemas';
-import { DevTunnelDiscoveryProvider, type DiscoveredEndpoint } from '../connectivity/DevTunnelDiscoveryProvider';
+import { DevTunnelDiscoveryProvider } from '../connectivity/DevTunnelDiscoveryProvider';
 import { DevTunnelEndpointResolver } from '../connectivity/DevTunnelEndpointResolver';
 import { DevTunnelManagement, normalizeConnectivityError } from '../connectivity/DevTunnelManagement';
 import { DiscoveryService } from '../connectivity/DiscoveryService';
@@ -32,15 +35,12 @@ import { PairingService, type PairingRecordStore } from '../gateway/PairingServi
 import { PeerRevocationService } from '../gateway/PeerRevocationService';
 import type { SecretStore } from '../gateway/SecretStore';
 import type { LocalIpcSession } from '../ipc';
-import { parseConnectionUrl } from '../peer/ConnectionUrl';
 import { PeerConnectionManager } from '../peer/PeerConnectionManager';
 import type { PeerProfileStore } from '../peer/PeerProfile';
 import type { AtomicFileStore } from '../storage/AtomicFileStore';
 import { assertDocumentFence, FencedDocumentStore, type DocumentFence } from '../storage/FencedDocumentStore';
 import type { FileTaskStore } from '../tasks/FileTaskStore';
-import { CliDevTunnelExposureAdapter } from '../tunnel/CliDevTunnelExposureAdapter';
 import { SdkDevTunnelExposureProvider } from '../tunnel/SdkDevTunnelExposureProvider';
-import { SelectedExposureProvider } from '../tunnel/SelectedExposureProvider';
 import type { LazyVscodeDevTunnelProvider } from './LazyVscodeDevTunnelProvider';
 import type { ProductionRemoteTaskAdapter } from './ProductionRemoteTaskAdapter';
 import { resolveWindowDisplayName } from '../broker/WindowName';
@@ -103,15 +103,20 @@ export class ProductionConnectivity implements BrokerConnectivity {
 	public readonly transport: BoundPeerTransport;
 	public readonly peers: PeerConnectionManager;
 	public readonly sdkExposure: SdkDevTunnelExposureProvider;
-	public readonly exposure: SelectedExposureProvider;
-	private readonly publisher: DevTunnelDiscoveryProvider;
+	public readonly exposure: SdkDevTunnelExposureProvider;
+	public readonly identity: AccountDeviceIdentityStore;
+	public readonly enrollment: AccountPeerEnrollment;
 	private ready = false;
 	private settingsLoaded = false;
-	private strictActivated = false;
 	private disposed = false;
 	private error: ConnectivityCode | undefined;
-	private publishedKey: string | undefined;
-	private publishing: Promise<void> | undefined;
+	private connectionState: ConnectivitySnapshot['connectionState'] = 'disabled';
+	private stopRequested = false;
+	private stopEpoch = 0;
+	private starting = false;
+	private accountReaction: Promise<void> = Promise.resolve();
+	private recoveryTimer: NodeJS.Timeout | undefined;
+	private recoveryAttempts = 0;
 	private actionQueue: Promise<void> = Promise.resolve();
 	private readonly actions = new WeakMap<LocalIpcSession, Map<string, ActionBinding>>();
 	private readonly policyActions = new WeakMap<LocalIpcSession, Map<string, PolicyActionBinding>>();
@@ -124,11 +129,12 @@ export class ProductionConnectivity implements BrokerConnectivity {
 		this.endpoints = new EndpointBindingStore(files, fence);
 		this.remotePolicyStore = new RemotePeerPolicyStore(files, fence);
 		this.account = new AccountSessionProvider(options.vscodeApi.authentication, fence);
+		this.identity = new AccountDeviceIdentityStore(files, fence, options.secrets, options.deviceId);
 		this.management = new DevTunnelManagement(this.account, fence, () =>
-			this.ready && this.flag('crossDeviceDiscovery'));
-		this.publisher = new DevTunnelDiscoveryProvider(this.management);
-		this.discovery = new DiscoveryService(this.publisher, fence,
-			() => this.ready && this.flag('crossDeviceDiscovery'), () => this.account.current() !== undefined, options.changed);
+			this.ready && this.account.current() !== undefined);
+		this.discovery = new DiscoveryService(new DevTunnelDiscoveryProvider(this.management), fence,
+			() => this.connectionsEnabled() && this.connectionState === 'online',
+			() => this.account.current() !== undefined, options.changed);
 		this.revocations = new PeerRevocationService(files, fence, options.records, options.secrets,
 			(peerId) => options.listener()?.closePeer(peerId),
 			async (peerId) => {
@@ -152,6 +158,9 @@ export class ProductionConnectivity implements BrokerConnectivity {
 				assertAllowed: (peerId) => {
 					this.assertReady();
 					this.revocations.assertAllowed(peerId);
+					if (!this.enrollment.permitsIncoming(peerId)) {
+						throw new MeshDomainError('AUTH_FAILED', 'Enable same-account connections before authenticating this device.');
+					}
 				},
 				revoke: (peerId) => this.revocations.revoke(peerId),
 				retryCleanup: () => this.revocations.retryCleanup(),
@@ -161,38 +170,51 @@ export class ProductionConnectivity implements BrokerConnectivity {
 			this.remotePolicyStore, options.registry, options.localPolicies, this.endpoints, options.profiles,
 			{
 				strict: () => this.strict(),
-				enabled: () => this.flag('crossDeviceDelegation'),
+				enabled: () => this.connectionsEnabled(),
 				ready: () => this.ready,
-				draining: () => this.currentSettings().migrationPending,
+				draining: () => this.stopRequested || this.currentSettings().cleanupPending,
 				assertPeerAllowed: (id) => this.revocations.assertAllowed(id),
 				assertPeerActive: (id) => this.pairing.assertActivePeer(id),
 			},
 		);
 		this.transport = new BoundPeerTransport(this.endpoints, new DevTunnelEndpointResolver(this.management),
-			this.account, fence, () => this.ready);
+			this.account, fence, () => this.connectionsEnabled(), {}, (profile) => this.enrollment.permitsOutgoing(profile.id));
 		this.peers = new PeerConnectionManager(options.deviceId, options.profiles, options.secrets,
 			this.transport, {
 				ownership: fence.ownership,
 				onProfileRemoved: async (profile) => {
+					const incoming = this.enrollment.incomingForProfile(profile.id);
+					if (incoming !== undefined) { await this.revokeDevice(incoming); }
 					if (this.ready && profile.generation !== undefined) { await this.endpoints.remove(profile.id, profile.generation); }
 				},
 			});
+		this.enrollment = new AccountPeerEnrollment(
+			files, fence, options.deviceId, this.account, this.identity, this.pairing, options.records,
+			options.profiles, options.secrets, this.endpoints, this.transport, this.peers, {
+				enabled: () => this.connectionsEnabled(),
+				isRevoked: (peerId) => this.revocations.snapshot().some((entry) => entry.peerId === peerId),
+				report: (code) => this.recordError(code),
+			},
+		);
 		this.sdkExposure = new SdkDevTunnelExposureProvider(files, fence, this.management, this.account, {
-			enabled: () => this.ready && this.flag('crossDeviceDiscovery')
-				&& this.flag('devTunnelSdkHosting') && this.currentSettings().publishEnabled,
+			enabled: () => this.connectionsEnabled(),
 			advertisementId: () => this.currentSettings().advertisementId,
+			identity: () => this.identity.current(this.account.current()?.accountRef),
 		});
-		this.exposure = new SelectedExposureProvider(new CliDevTunnelExposureAdapter(options.cli),
-			this.sdkExposure, () => this.currentSettings().hostingBackend, () =>
-				this.ready && !this.currentSettings().migrationPending
-				&& (this.currentSettings().hostingBackend === 'cli' || this.flag('devTunnelSdkHosting')));
+		this.exposure = this.sdkExposure;
 	}
 
 	public isReady(): boolean { return this.ready; }
-	public strict(): boolean { return this.strictActivated || this.flag('crossDeviceDelegation'); }
+	public strict(): boolean { return true; }
+	public connectionsEnabled(): boolean {
+		return this.ready && this.currentSettings().enabled && !this.stopRequested && !this.disposed;
+	}
 	public beginShutdown(): void {
 		this.disposed = true;
 		this.ready = false;
+		this.stopRequested = true;
+		this.stopEpoch += 1;
+		this.clearRecovery();
 		this.management.invalidate();
 		this.discovery.invalidate();
 		this.sdkExposure.cancel();
@@ -202,33 +224,35 @@ export class ProductionConnectivity implements BrokerConnectivity {
 		try {
 			await this.settings.initialize();
 			this.settingsLoaded = true;
-			this.strictActivated = this.currentSettings().strictPolicyActivated || this.flag('crossDeviceDelegation');
-			if (this.strictActivated && !this.currentSettings().strictPolicyActivated) {
+			const savedAccount = this.currentSettings().account;
+			if (savedAccount !== undefined && !this.currentSettings().accounts.some((account) =>
+				account.providerId === savedAccount.providerId && account.accountId === savedAccount.accountId)) {
+				await this.settings.update((value) => ({ ...value, accounts: [...value.accounts, savedAccount] }));
+			}
+			if (!this.currentSettings().strictPolicyActivated) {
 				await this.settings.update((value) => ({ ...value, strictPolicyActivated: true }));
 			}
 			await Promise.all([
 				this.endpoints.initialize(), this.remotePolicyStore.initialize(),
 				this.revocations.initialize(), this.sdkExposure.initialize(),
+				this.identity.initialize(), this.enrollment.initialize(),
 			]);
 			this.account.initialize();
 			this.account.setBinding(this.currentSettings().account);
 			this.ready = true;
 			this.subscriptions = [
 				this.account.onDidChange(() => {
-					this.publishedKey = undefined;
 					this.discovery.invalidate();
-					if (this.sdkExposure.getStatus().state !== 'stopped') {
-						void this.options.listener()?.stop().catch(() => this.recordError('CLEANUP_FAILED'));
+					if (!this.starting && this.connectionsEnabled()) {
+						this.accountReaction = this.actionQueue.then(() => this.refreshAccount())
+							.catch((error: unknown) => this.recordError(normalizeConnectivityError(error).code));
+						this.actionQueue = this.accountReaction;
 					}
 				}),
-				this.options.vscodeApi.workspace.onDidChangeConfiguration((event) => {
-					if (['crossDeviceDiscovery', 'crossDeviceDelegation', 'devTunnelSdkHosting']
-						.some((key) => event.affectsConfiguration(`copilotAgentMesh.experimental.${key}`))) {
-						this.strictActivated ||= this.flag('crossDeviceDelegation');
-						this.management.invalidate();
-						this.discovery.invalidate();
-						void this.configurationChanged().catch(() => this.blockRemote());
-					}
+				this.discovery.onDidRefresh(() => {
+					void this.enrollment.synchronize(this.discovery.endpoints())
+						.then(() => this.refreshConnectedDirectory())
+						.catch((error: unknown) => this.recordError(normalizeConnectivityError(error).code));
 				}),
 			];
 			// Denial is live before any cleanup can fail and before the Listener accepts connections.
@@ -239,9 +263,6 @@ export class ProductionConnectivity implements BrokerConnectivity {
 					await this.endpoints.remove(binding.profileId, binding.profileGeneration);
 				}
 			}
-			if (this.flag('crossDeviceDiscovery') && this.currentSettings().account !== undefined) {
-				void this.discovery.refresh().catch(() => this.recordError('DISCOVERY_UNAVAILABLE'));
-			}
 		} catch {
 			this.blockRemote();
 		}
@@ -251,14 +272,9 @@ export class ProductionConnectivity implements BrokerConnectivity {
 	public async snapshot(caller: NodeIdentityParams, session: LocalIpcSession): Promise<ConnectivitySnapshot> {
 		this.assertCaller(caller, session);
 		const settings = this.currentSettings();
-		const discovery = this.discovery.snapshot();
+		const discovery = this.discovery.snapshot(this.options.deviceId);
 		const claimed = this.options.registry.peerNode(caller)?.workspaces.filter((workspace) => workspace.status === 'claimed') ?? [];
-		const peerError = this.ready ? this.peers.listConnections().flatMap((connection) => {
-			if (this.endpoints.get(connection.profileId) === undefined
-				|| ['online', 'connecting'].includes(connection.snapshot().state)) { return []; }
-			return [this.transport.lastError(connection.profileId) ?? 'OFFLINE' as const];
-		})[0] : undefined;
-		const error = this.error ?? peerError ?? discovery.error;
+		const error = this.error ?? discovery.error;
 		const handles = new Map<string, ActionBinding>();
 		this.actions.set(session, handles);
 		const issue = (kind: ActionBinding['kind'], id: string): string => {
@@ -278,9 +294,13 @@ export class ProductionConnectivity implements BrokerConnectivity {
 
 		}
 		return connectivitySnapshotSchema.parse({
-			discoveryEnabled: this.flag('crossDeviceDiscovery'), delegationEnabled: this.flag('crossDeviceDelegation'),
-			strictPolicyActivated: this.strict(), publishEnabled: settings.publishEnabled,
-			hostingBackend: settings.hostingBackend, migrationPending: settings.migrationPending,
+			enabled: settings.enabled,
+			connectionState: !this.ready ? 'error' : this.connectionState,
+			accountLabel: settings.account?.accountLabel,
+			connectedDeviceCount: this.peers.listConnections().filter((connection) => connection.snapshot().state === 'online').length,
+			discoveryEnabled: this.connectionsEnabled(), delegationEnabled: this.connectionsEnabled(),
+			strictPolicyActivated: true, publishEnabled: this.connectionsEnabled(),
+			hostingBackend: 'sdk', migrationPending: settings.cleanupPending,
 			accountProvider: settings.account?.providerId ?? 'none',
 			claimedWorkspaceCount: claimed.length,
 			receivingWorkspaceCount: claimed.filter((workspace) => this.options.localPolicies.acceptsIncoming(workspace.workspaceIdentity)).length,
@@ -428,6 +448,15 @@ export class ProductionConnectivity implements BrokerConnectivity {
 	}
 
 	public act(caller: NodeIdentityParams, input: ConnectivityActionParams, session: LocalIpcSession): Promise<void> {
+		if (input.action === 'disableConnectivity') {
+			this.assertCaller(caller, session);
+			this.stopEpoch += 1;
+			this.stopRequested = true;
+			this.clearRecovery();
+			this.sdkExposure.cancel();
+			this.discovery.invalidate();
+		}
+		const stopEpoch = this.stopEpoch;
 		const binding = input.actionHandle === undefined ? undefined : this.actions.get(session)?.get(input.actionHandle);
 		if (input.actionHandle !== undefined) {
 			this.actions.get(session)?.delete(input.actionHandle);
@@ -439,6 +468,8 @@ export class ProductionConnectivity implements BrokerConnectivity {
 			this.assertReady();
 			try {
 				switch (input.action) {
+					case 'enableConnectivity': await this.enableConnections(true, () => this.assertCaller(caller, session), false, stopEpoch); break;
+					case 'disableConnectivity': await this.disableConnections(); break;
 					case 'configureConnectivity': await this.configure(caller, session); break;
 					case 'refreshRemoteTargets':
 						if (!this.remotePolicies.remoteDirectoryAvailable()) { throw new ConnectivityError('DISABLED'); }
@@ -446,23 +477,31 @@ export class ProductionConnectivity implements BrokerConnectivity {
 						break;
 					case 'refreshDiscovery':
 						await this.discovery.refresh();
-						await this.publishCurrent();
 						break;
 					case 'pairDiscoveredPeer':
-						if (binding?.kind !== 'candidate') { throw new ConnectivityError('BINDING_CHANGED'); }
-						await this.pairCandidate(this.discovery.select(binding.id), caller, session);
-						break;
+						throw new ConnectivityError('POLICY_DENIED');
 					case 'configureRemotePolicy': await this.configurePolicy(caller, session); break;
 					case 'revokeIncomingPeer':
 						if (binding?.kind !== 'peer') { throw new ConnectivityError('BINDING_CHANGED'); }
 						if (await this.confirm('Revoke this incoming peer? All its connections and handshakes will close. Its tasks receive authoritative cancellation requests; credentials remain denied even if cleanup fails.')) {
 							this.assertCaller(caller, session);
-							await this.pairing.revokePeer(binding.id);
+							await this.revokeDevice(binding.id);
 						}
 						break;
 					case 'retryConnectivityCleanup':
 						await this.pairing.retryRevocationCleanup();
-						await this.sdkExposure.retryCleanup();
+						if (this.currentSettings().cleanupPending || !this.currentSettings().enabled) {
+							if (this.currentSettings().cleanupPending) {
+								await this.ensureAccount(true, async () => {
+									this.assertCaller(caller, session);
+									await assertDocumentFence(this.options.fence);
+									if (stopEpoch !== this.stopEpoch) { throw new ConnectivityError('CANCELLED'); }
+								}, this.error !== undefined && isAuthenticationError(this.error));
+							}
+							await this.disableConnections();
+						} else {
+							await this.enableConnections(true, () => this.assertCaller(caller, session), false, stopEpoch);
+						}
 						break;
 				}
 				this.error = undefined;
@@ -477,8 +516,10 @@ export class ProductionConnectivity implements BrokerConnectivity {
 	}
 
 	public exposureChanged(): void {
-		if (this.ready && this.currentSettings().publishEnabled && this.exposure.getStatus().state === 'ready') {
-			void this.publishCurrent().catch((error: unknown) => this.recordError(normalizeConnectivityError(error).code));
+		if (this.connectionsEnabled() && this.connectionState === 'online' && this.exposure.getStatus().state !== 'ready') {
+			this.connectionState = 'error';
+			this.recordError('OFFLINE');
+			this.scheduleRecovery();
 		}
 	}
 
@@ -487,34 +528,39 @@ export class ProductionConnectivity implements BrokerConnectivity {
 		for (const subscription of this.subscriptions.splice(0)) { subscription.dispose(); }
 		this.management.invalidate();
 		await this.discovery.dispose();
-		await this.publishing?.catch((error: unknown) => {
-			const normalized = normalizeConnectivityError(error);
-			if (normalized.code !== 'CANCELLED') { this.options.report(normalized.code); }
-		});
+		await this.enrollment.suspend();
+		await this.accountReaction;
 		await this.management.dispose();
 		this.account.dispose();
 	}
 
 	private async configure(caller: NodeIdentityParams, session: LocalIpcSession): Promise<void> {
+		const stopEpoch = this.stopEpoch;
 		const items = [
-			{ label: this.flag('crossDeviceDiscovery') ? 'Disable account discovery' : 'Enable account discovery', id: 'discovery' },
-			{ label: 'Authorize GitHub discovery account', id: 'github' },
-			{ label: 'Authorize Microsoft discovery account (Entra or MSA gate required)', id: 'microsoft' },
-			{ label: 'Clear discovery account (does not revoke Mesh peers)', id: 'clear' },
-			{ label: this.currentSettings().publishEnabled ? 'Disable Mesh advertisement updates' : 'Allow publishing this Mesh endpoint', id: 'publish' },
-			{ label: this.flag('crossDeviceDelegation') ? 'Disable new cross-device tasks (keep strict policy)' : 'Activate strict cross-device delegation', id: 'strict' },
-			{ label: 'Switch to SDK private hosting and start', id: 'sdk' },
-			{ label: 'Explicitly switch or fall back to CLI legacy hosting and start', id: 'cli' },
-			{ label: 'Retry selected host after a failed migration', id: 'retry' },
-			{ label: 'Delete the exact owned SDK resource', id: 'deleteSdk' },
-			{ label: 'Delete the exact owned CLI resource', id: 'deleteCli' },
-			{ label: 'Select an incoming peer to revoke (including peers outside the bounded view)', id: 'revokePeer' },
-			{ label: 'Probe a bound connection (100 pings, no model, no resource creation)', id: 'probe' },
+			{ label: 'Switch account and enable cross-device connections', id: 'account' },
+			{ label: 'Manage this Workspace remote permissions', id: 'workspace' },
+			{ label: 'Revoke a trusted device', id: 'revokePeer' },
+			{ label: 'Connection diagnostics (100 pings, no Agent task)', id: 'probe' },
 		];
-		const picked = await this.options.vscodeApi.window.showQuickPick(items, { title: 'Mesh cross-device configuration (Broker owner)' });
+		const picked = await this.options.vscodeApi.window.showQuickPick(items, { title: 'Cross-device connections' });
 		if (picked === undefined) { return; }
 		this.assertCaller(caller, session);
 		switch (picked.id) {
+			case 'account':
+				if (this.currentSettings().enabled && !await this.confirm(
+					'Switch the cross-device account? Current connections will close and this device\'s Tunnel will be deleted. Workspace permissions are not transferred to a different account.',
+				)) { return; }
+				if (stopEpoch !== this.stopEpoch) { throw new ConnectivityError('CANCELLED'); }
+				if (this.currentSettings().cleanupPending) {
+					await this.ensureAccount(true, async () => {
+						this.assertCaller(caller, session);
+						if (stopEpoch !== this.stopEpoch) { throw new ConnectivityError('CANCELLED'); }
+					}, true);
+				}
+				await this.disableConnections();
+				await this.enableConnections(true, () => this.assertCaller(caller, session), true, stopEpoch);
+				break;
+			case 'workspace': await this.configurePolicy(caller, session); break;
 			case 'revokePeer': {
 				const peer = await this.options.vscodeApi.window.showQuickPick(
 					(await this.incomingPeers()).filter((entry) => entry.state !== 'revoked' || entry.cleanupPending)
@@ -523,7 +569,7 @@ export class ProductionConnectivity implements BrokerConnectivity {
 				);
 				if (peer !== undefined && await this.confirm('Persistently revoke this peer, close its connections and request cancellation of its target tasks?')) {
 					this.assertCaller(caller, session);
-					await this.pairing.revokePeer(peer.peerId);
+					await this.revokeDevice(peer.peerId);
 				}
 				break;
 			}
@@ -543,127 +589,6 @@ export class ProductionConnectivity implements BrokerConnectivity {
 					`Mesh protocol v2: ${result.replies} ping replies, at most ${result.applicationBytesUpperBound} application bytes in ${result.durationMs} ms. Physical topology, Agent execution and Chat UI remain separately unverified.`,
 				);
 				break;
-			}
-			case 'discovery':
-				if (this.flag('crossDeviceDiscovery') && !await this.confirm('Stop future account queries and advertisement updates? Existing service-side advertisements remain until the exact resource is deleted. This does not revoke Mesh peers.')) { return; }
-				await this.setFlag('crossDeviceDiscovery', !this.flag('crossDeviceDiscovery')); break;
-			case 'github':
-			case 'microsoft': {
-				if (!this.flag('crossDeviceDiscovery')) { throw new ConnectivityError('DISABLED'); }
-				const accounts = await this.options.vscodeApi.authentication.getAccounts(picked.id);
-				const selected = await this.options.vscodeApi.window.showQuickPick([
-					...accounts.map((account) => ({ label: account.label, account })),
-					{ label: 'Sign in with a different account', account: undefined },
-				], { title: 'Select the exact Dev Tunnels account (native authentication only)' });
-				if (selected === undefined) { return; }
-				this.assertCaller(caller, session);
-				const binding = await this.account.select(picked.id, selected.account);
-				this.assertCaller(caller, session);
-				await this.settings.update((value) => ({ ...value, account: binding }));
-				this.account.setBinding(binding);
-				await this.discovery.refresh();
-				break;
-			}
-			case 'clear':
-				if (!await this.confirm('Clear the discovery account and stop private hosting? Pairing, task history and existing service advertisements are not deleted. Delete the exact owned resource first if it should disappear from discovery.')) { return; }
-				this.assertCaller(caller, session);
-				if (this.currentSettings().hostingBackend === 'sdk') { await this.requireListener().stop(); }
-				await this.settings.update((value) => ({ ...value, account: undefined, publishEnabled: false }));
-				this.account.setBinding(undefined);
-				break;
-			case 'publish':
-				if (!this.flag('crossDeviceDiscovery') || this.account.current() === undefined) { throw new ConnectivityError('AUTH_REQUIRED'); }
-				if (this.currentSettings().publishEnabled
-					&& !await this.confirm('Stop future advertisement updates? This does not remove existing discovery markers. Stop and delete the exact owned resource to withdraw that candidate.')) { return; }
-				if (!this.currentSettings().publishEnabled
-					&& !await this.confirm('Publish only opaque Mesh/protocol markers on this exact owned tunnel? No Workspace, path, task, invitation, or credential is published. CLI hosting has a separate login.')) { return; }
-				this.assertCaller(caller, session);
-				await this.settings.update((value) => ({
-					...value, publishEnabled: !value.publishEnabled, advertisementId: value.advertisementId ?? randomUUID(),
-				}));
-				await this.publishCurrent();
-				break;
-			case 'strict':
-				if (!this.flag('crossDeviceDelegation')) {
-					if (!await this.confirm('Activate strict remote policy for all paired devices? Existing peers get no automatic Workspace grants. Disabling this feature later will not restore legacy authorization. Remote tasks still require target confirmation and its existing editor Host.')) { return; }
-					this.assertCaller(caller, session);
-					this.strictActivated = true;
-					await this.settings.update((value) => ({ ...value, strictPolicyActivated: true }));
-				}
-				await this.setFlag('crossDeviceDelegation', !this.flag('crossDeviceDelegation'));
-				break;
-			case 'cli':
-			case 'sdk': await this.migrate(picked.id, caller, session); break;
-			case 'retry': await this.migrate(this.currentSettings().hostingBackend, caller, session); break;
-			case 'deleteSdk':
-				if (await this.confirm('Stop hosting and delete only the exact SDK tunnel recorded by Mesh? Bound peers must explicitly rebind after a replacement is created.')) {
-					this.assertCaller(caller, session);
-					await this.requireListener().stop();
-					await this.sdkExposure.deleteOwnedResource();
-				}
-				break;
-			case 'deleteCli':
-				if (await this.confirm('Stop hosting and delete only the exact CLI tunnel recorded by Mesh? This withdraws its advertisement. Drain or cancel its tasks first.')) {
-					this.assertCaller(caller, session);
-					await this.requireListener().stop();
-					await this.options.cli.deleteOwnedResource();
-				}
-				break;
-		}
-	}
-
-	private async pairCandidate(endpoint: DiscoveredEndpoint, caller: NodeIdentityParams, session: LocalIpcSession): Promise<void> {
-		const accountRef = this.account.current()?.accountRef;
-		const profiles = (await this.options.profiles.list()).filter((profile) => !profile.cleanupPending && profile.peerId !== undefined);
-		const picked = await this.options.vscodeApi.window.showQuickPick([
-			{ label: 'Import a one-time invitation (new pairing)', id: '' },
-			...profiles.map((profile) => ({ label: `Rebind paired device ${profile.workerDeviceId.slice(0, 8)}`, id: profile.id })),
-		], { title: 'Bind this candidate only after Mesh identity proof' });
-		if (picked === undefined) { return; }
-		let profileId: string | undefined;
-		try {
-			if (picked.id === '') {
-				const invitation = await this.options.vscodeApi.window.showInputBox({
-					title: 'Import the target device one-time invitation', password: true, ignoreFocusOut: true,
-					prompt: 'The invitation stays in the native Extension Host, never the Dashboard or discovery directory.',
-				});
-				if (invitation === undefined) { return; }
-				this.assertCaller(caller, session);
-				if (this.account.current()?.accountRef !== accountRef) { throw new ConnectivityError('ACCOUNT_CHANGED'); }
-				const parsed = parseConnectionUrl(invitation);
-				if (parsed.workerDeviceId === this.options.deviceId) { throw new ConnectivityError('POLICY_DENIED'); }
-				if (new URL(parsed.rpcEndpoint).origin.replace(/^wss:/u, 'https:') !== endpoint.origin) {
-					throw new ConnectivityError('BINDING_CHANGED');
-				}
-				const connection = await this.peers.add(invitation, async (profile) => {
-					profileId = profile.id;
-					await this.transport.prepare(profile, endpoint);
-				});
-				profileId = connection.profileId;
-			} else {
-				const existing = await this.options.profiles.get(picked.id);
-				if (existing === undefined || existing.peerId === undefined || existing.cleanupPending) { throw new ConnectivityError('BINDING_CHANGED'); }
-				if (existing.workerDeviceId === this.options.deviceId) { throw new ConnectivityError('POLICY_DENIED'); }
-				if (this.endpoints.get(existing.id)?.admission === 'private-port-token'
-					&& endpoint.admission === 'legacy-mesh-auth'
-					&& !await this.confirm('Explicitly rebind from private port admission to legacy outer admission? The Mesh peer must still prove its original identity and all strict Workspace policy remains in force.')) { return; }
-				this.assertCaller(caller, session);
-				if (this.account.current()?.accountRef !== accountRef) { throw new ConnectivityError('ACCOUNT_CHANGED'); }
-				await this.peers.disconnect(existing.id);
-				let profile = existing;
-				if (existing.generation === undefined) {
-					profile = { ...existing, generation: randomUUID() };
-					if (!await this.options.profiles.replace?.(profile, existing)) { throw new ConnectivityError('BINDING_CHANGED'); }
-				}
-				profileId = profile.id;
-				await this.transport.prepare(profile, endpoint);
-				await this.peers.connect(profile.id);
-			}
-			this.assertCaller(caller, session);
-			await this.options.remoteTasks().listDevices(new AbortController().signal);
-		} finally {
-			if (profileId !== undefined && await this.options.profiles.get(profileId) === undefined) {
-				this.transport.forget(profileId);
 			}
 		}
 	}
@@ -728,78 +653,295 @@ export class ProductionConnectivity implements BrokerConnectivity {
 		}
 	}
 
-	private async migrate(backend: 'cli' | 'sdk', caller: NodeIdentityParams, session: LocalIpcSession): Promise<void> {
-		if ((await this.options.tasks.list()).some((task) => (ACTIVE_TASK_STATUSES as readonly string[]).includes(task.state))) {
-			throw new ConnectivityError('MIGRATION_REQUIRED');
-		}
-		if (backend === 'sdk' && (!this.flag('crossDeviceDiscovery') || !this.currentSettings().publishEnabled || this.account.current() === undefined)) {
-			throw new ConnectivityError('AUTH_REQUIRED');
-		}
-		if (!await this.confirm(backend === 'sdk'
-			? 'Stop the old host and create/start one private SDK tunnel with one port? Existing resources are retained. Peers must explicitly rebind to the new locator. Private failures never fall back automatically.'
-			: 'Explicitly use CLI legacy hosting? The outer port allows anonymous access; Mesh authentication and activated strict Workspace policy remain mandatory. Private peers require explicit locator rebinding.')) { return; }
-		const previous = this.currentSettings().hostingBackend;
-		const oldResource = previous === backend ? 'Retain' : await this.options.vscodeApi.window.showQuickPick(
-			['Retain', 'Delete exact owned resource'], { title: 'After the old host stops, retain or delete its resource?' });
-		if (oldResource === undefined) { return; }
-		this.assertCaller(caller, session);
-		await this.settings.update((value) => ({ ...value, migrationPending: true }));
-		if ((await this.options.tasks.list()).some((task) => (ACTIVE_TASK_STATUSES as readonly string[]).includes(task.state))) {
-			throw new ConnectivityError('MIGRATION_REQUIRED');
-		}
-		await this.requireListener().stop();
-		this.assertCaller(caller, session);
-		if (oldResource !== 'Retain') {
-			if (previous === 'sdk') { await this.sdkExposure.deleteOwnedResource(); }
-			else { await this.options.cli.deleteOwnedResource(); }
-		}
-		if (backend === 'sdk') { await this.setFlag('devTunnelSdkHosting', true); }
-		await this.settings.update((value) => ({ ...value, hostingBackend: backend, migrationPending: false }));
-		try { await this.requireListener().start(); }
-		catch (error: unknown) {
-			await this.settings.update((value) => ({ ...value, migrationPending: true }));
-			throw error;
-		}
-		await this.publishCurrent();
+	public async restore(): Promise<void> {
+		if (!this.ready) { return; }
+		const stopEpoch = this.stopEpoch;
+		const operation = this.actionQueue.then(async () => {
+			if (this.currentSettings().enabled) {
+				await this.enableConnections(false, () => this.assertReady(), false, stopEpoch);
+			} else if (this.currentSettings().cleanupPending) {
+				await this.disableConnections();
+			}
+		});
+		this.actionQueue = operation.catch((error: unknown) => {
+			this.recordError(normalizeConnectivityError(error).code);
+		});
+		await this.actionQueue;
 	}
 
-	private publishCurrent(): Promise<void> {
-		if (this.publishing !== undefined) { return this.publishing; }
-		const operation = this.publishCore().finally(() => {
-			if (this.publishing === operation) { this.publishing = undefined; }
-		});
-		this.publishing = operation;
-		return operation;
+	private async enableConnections(
+		interactive: boolean, validateCaller: () => void, chooseAccount = false, stopEpoch = this.stopEpoch,
+	): Promise<void> {
+		if (stopEpoch !== this.stopEpoch) { throw new ConnectivityError('CANCELLED'); }
+		if (this.connectionsEnabled() && this.connectionState === 'online' && !chooseAccount) { return; }
+		this.assertReady();
+		this.stopRequested = false;
+		this.clearRecovery();
+		if (interactive) { this.recoveryAttempts = 0; }
+		const selectAccount = chooseAccount || (this.currentSettings().cleanupPending
+			&& this.error !== undefined && isAuthenticationError(this.error));
+		this.starting = true;
+		this.connectionState = 'authenticating';
+		this.error = undefined;
+		this.options.changed();
+		const validate = async (): Promise<void> => {
+			await assertDocumentFence(this.options.fence);
+			this.assertReady();
+			validateCaller();
+			if (this.stopRequested || stopEpoch !== this.stopEpoch) { throw new ConnectivityError('CANCELLED'); }
+		};
+		let hostAttempted = false;
+		let accountReady = false;
+		try {
+			await this.ensureAccount(interactive, validate, selectAccount);
+			await validate();
+			const account = this.account.current();
+			if (account === undefined) { throw new ConnectivityError('AUTH_REQUIRED'); }
+			await this.identity.load(account);
+			await validate();
+			accountReady = true;
+			await this.settings.update((value) => ({ ...value, enabled: true, cleanupPending: true }));
+			await this.cleanupConnectionResources();
+			await validate();
+			await this.settings.update((value) => ({
+				...value, enabled: true, cleanupPending: false, hostingBackend: 'sdk',
+				strictPolicyActivated: true, migrationPending: false, publishEnabled: true,
+				advertisementId: randomUUID(),
+			}));
+			this.connectionState = 'starting';
+			this.options.changed();
+			hostAttempted = true;
+			await this.requireListener().start();
+			await validate();
+			this.connectionState = 'online';
+			this.recoveryAttempts = 0;
+			this.options.changed();
+			void this.discovery.refresh().catch((error: unknown) => this.recordError(normalizeConnectivityError(error).code));
+		} catch (error: unknown) {
+			const normalized = normalizeConnectivityError(error);
+			if (hostAttempted) {
+				await this.settings.update((value) => ({ ...value, cleanupPending: true }));
+				try {
+					await this.cleanupConnectionResources();
+					await this.settings.update((value) => ({ ...value, cleanupPending: false }));
+				} catch (cleanupError: unknown) {
+					this.options.report(normalizeConnectivityError(cleanupError).code);
+				}
+			}
+			this.connectionState = this.currentSettings().cleanupPending ? 'cleanupPending'
+				: isAuthenticationError(normalized.code) ? 'authRequired'
+				: normalized.code === 'CANCELLED' && !accountReady
+					? this.currentSettings().enabled ? 'authRequired' : 'disabled' : 'error';
+			if (normalized.code !== 'CANCELLED') { this.recordError(normalized.code); }
+			if (!isAuthenticationError(normalized.code) && !['BINDING_CHANGED', 'CLEANUP_FAILED'].includes(normalized.code)
+				&& (normalized.code !== 'CANCELLED' || accountReady)) {
+				this.scheduleRecovery();
+			}
+			throw normalized;
+		} finally {
+			this.starting = false;
+			this.options.changed();
+		}
 	}
-	private async publishCore(): Promise<void> {
-		const settings = this.currentSettings();
-		const status = this.exposure.getStatus();
-		if (!this.ready || !settings.publishEnabled || !this.flag('crossDeviceDiscovery')
-			|| status.state !== 'ready' || settings.advertisementId === undefined) { return; }
-		const key = `${JSON.stringify(status.tunnel.resource)}:${settings.advertisementId}:${settings.account?.accountRef}`;
-		if (key === this.publishedKey) { return; }
-		if (status.tunnel.provider === 'cli') {
-			await this.publisher.publish(status.tunnel.resource, status.tunnel.localPort,
-				status.tunnel.ownershipLabel, settings.advertisementId, new AbortController().signal,
-				async (advertisementId) => {
-					await this.settings.update((value) => ({ ...value, advertisementId }));
-				});
-		}
-		this.publishedKey = `${JSON.stringify(status.tunnel.resource)}:${this.currentSettings().advertisementId}:${this.currentSettings().account?.accountRef}`;
+
+	private async disableConnections(): Promise<void> {
+		this.stopRequested = true;
+		this.clearRecovery();
+		this.connectionState = 'stopping';
+		this.discovery.invalidate();
+		this.sdkExposure.cancel();
+		await this.settings.update((value) => ({
+			...value, enabled: false, publishEnabled: false, cleanupPending: true,
+		}));
+		this.options.changed();
+		try {
+			await this.cleanupConnectionResources();
+			await this.settings.update((value) => ({ ...value, cleanupPending: false, migrationPending: false }));
+			this.connectionState = 'disabled';
+			this.error = undefined;
+		} catch (error: unknown) {
+			this.connectionState = 'cleanupPending';
+			const normalized = normalizeConnectivityError(error);
+			this.recordError(normalized.code);
+			throw normalized;
+		} finally { this.options.changed(); }
 	}
-	private async configurationChanged(): Promise<void> {
-		if (this.strictActivated && !this.currentSettings().strictPolicyActivated) {
-			await this.settings.update((value) => ({ ...value, strictPolicyActivated: true }));
+
+	private async cleanupConnectionResources(): Promise<void> {
+		const failures: ConnectivityError[] = [];
+		for (const action of [
+			() => this.enrollment.suspend(),
+			() => this.requireListener().stop(),
+			() => this.options.cli.stop(),
+			() => this.sdkExposure.deleteOwnedResource(),
+			() => this.retireLegacyResource(),
+		]) {
+			try { await action(); }
+			catch (error: unknown) { failures.push(normalizeConnectivityError(error)); }
 		}
-		if (this.currentSettings().hostingBackend === 'sdk'
-			&& (!this.flag('crossDeviceDiscovery') || !this.flag('devTunnelSdkHosting'))) {
-			await this.requireListener().stop();
+		if (failures.length > 0) {
+			throw failures.find((error) => isAuthenticationError(error.code)) ?? new ConnectivityError('CLEANUP_FAILED');
 		}
-		if (this.flag('crossDeviceDiscovery') && this.currentSettings().account !== undefined) {
-			await this.discovery.refresh();
+	}
+
+	private async retireLegacyResource(): Promise<void> {
+		if (this.currentSettings().legacyResourceRetired) { return; }
+		const metadata = await this.options.cli.ownedResourceForMigration();
+		if (metadata !== undefined) {
+			const compact = this.options.deviceId.replaceAll('-', '');
+			const expectedLabel = `copilot-agent-mesh-${compact.slice(0, 31)}`;
+			const [tunnelId, clusterId, extra] = metadata.tunnelId.split('.');
+			const resource = tunnelResourceSchema.parse({ tunnelId, clusterId });
+			if (extra !== undefined || tunnelId !== metadata.tunnelAlias || metadata.ownershipLabel !== expectedLabel
+				|| metadata.tunnelAlias !== `cam${compact.slice(0, 18)}`) {
+				throw new ConnectivityError('BINDING_CHANGED');
+			}
+			await this.management.run(async (client, token) => {
+				const read = async () => {
+					try { return await client.getTunnel(resource, { includePorts: true, followRedirects: false }, token); }
+					catch (error: unknown) {
+						if (isAxiosError(error) && error.response?.status === 404) { return null; }
+						throw error;
+					}
+				};
+				const tunnel = await read();
+				if (tunnel === null) { return; }
+				const owned = await client.listTunnels(clusterId, undefined, {
+					labels: [expectedLabel], requireAllLabels: true, limit: 10, followRedirects: false,
+				}, token);
+				if (!owned.some((candidate) => candidate.tunnelId === tunnelId && candidate.clusterId === clusterId)
+					|| !tunnel.labels?.includes(expectedLabel)
+					|| (metadata.provisioned && !tunnel.ports?.some((port) => port.portNumber === metadata.localPort))) {
+					throw new ConnectivityError('ACCOUNT_CHANGED');
+				}
+				const hostCount = tunnel.status?.hostConnectionCount;
+				if ((typeof hostCount === 'number' ? hostCount : hostCount?.current) !== 0) {
+					throw new ConnectivityError('CLEANUP_FAILED');
+				}
+				await client.deleteTunnel(resource, { followRedirects: false }, token);
+				if (await read() !== null) {
+					throw new ConnectivityError('CLEANUP_FAILED');
+				}
+			});
 		}
+		await this.settings.update((value) => ({ ...value, legacyResourceRetired: true }));
+	}
+
+	private async ensureAccount(
+		interactive: boolean, validate: () => Promise<void>, forceSelection = false,
+	): Promise<void> {
+		if (!forceSelection && this.account.current() !== undefined) {
+			try {
+				await this.account.authorization(new AbortController().signal);
+				return;
+			} catch (error: unknown) {
+				if (!(error instanceof ConnectivityError) || !isAuthenticationError(error.code) || !interactive) { throw error; }
+			}
+		}
+		if (!interactive) { throw new ConnectivityError('AUTH_REQUIRED'); }
+		const providers = ['github', 'microsoft'] as const;
+		const accounts = (await Promise.all(providers.map(async (providerId) =>
+			(await this.options.vscodeApi.authentication.getAccounts(providerId)).map((account) => ({
+				label: account.label, description: providerId === 'github' ? 'GitHub' : 'Microsoft',
+				providerId, account,
+			}))))).flat();
+		await validate();
+		let providerId: AccountBinding['providerId'] = 'github';
+		let selectedAccount: vscode.AuthenticationSessionAccountInformation | undefined;
+		if (accounts.length > 0 || forceSelection) {
+			const selected = await this.options.vscodeApi.window.showQuickPick([
+				...accounts,
+				...providers.map((provider) => ({
+					label: `Sign in with ${provider === 'github' ? 'GitHub' : 'Microsoft'}`,
+					description: 'Use a different account', providerId: provider,
+					account: undefined,
+				})),
+			], {
+				title: 'Enable cross-device connections',
+				placeHolder: 'Your devices using this account connect automatically. Workspace task permissions stay separate.',
+			});
+			if (selected === undefined) { throw new ConnectivityError('CANCELLED'); }
+			providerId = selected.providerId;
+			selectedAccount = selected.account;
+		}
+		await validate();
+		const selected = await this.account.select(providerId, selectedAccount);
+		const previous = this.currentSettings().accounts.find((account) =>
+			account.providerId === selected.providerId && account.accountId === selected.accountId);
+		const binding = previous === undefined ? selected : { ...selected, accountRef: previous.accountRef };
+		await validate();
+		const owned = this.sdkExposure.ownedResource();
+		if (owned !== undefined && owned.accountRef !== binding.accountRef) {
+			throw new ConnectivityError('ACCOUNT_CHANGED');
+		}
+		await this.settings.update((value) => ({
+			...value, account: binding,
+			accounts: [...value.accounts.filter((account) => account.accountRef !== binding.accountRef), binding],
+		}));
+		this.account.setBinding(binding);
+	}
+
+	private async revokeDevice(peerId: string): Promise<void> {
+		const ids = await this.enrollment.block(peerId);
+		const records = await this.options.records.listPeers();
+		const pending = await this.options.records.listPending();
+		const results = await Promise.allSettled([
+			this.enrollment.disconnectDevice(peerId),
+			...ids.filter((id) => records.some((record) => record.peerId === id) || pending.some((record) => record.peerId === id))
+				.map((id) => this.pairing.revokePeer(id)),
+		]);
+		if (results.some((result) => result.status === 'rejected')) { throw new ConnectivityError('CLEANUP_FAILED'); }
+	}
+
+	private async refreshConnectedDirectory(): Promise<void> {
+		if (!this.connectionsEnabled() || this.connectionState !== 'online') { return; }
+		await this.options.remoteTasks().listDevices(new AbortController().signal);
+		if (this.error === 'OFFLINE') { this.error = undefined; }
 		this.options.changed();
 	}
+
+	private async refreshAccount(): Promise<void> {
+		if (!this.connectionsEnabled()) { return; }
+		try {
+			await this.account.authorization(new AbortController().signal);
+			if (!this.connectionsEnabled()) { return; }
+			if (this.sdkExposure.getStatus().state === 'ready') {
+				await this.sdkExposure.renew();
+				await this.discovery.refresh();
+			} else { this.scheduleRecovery(); }
+		} catch (error: unknown) {
+			if (!this.connectionsEnabled()) { return; }
+			const normalized = normalizeConnectivityError(error);
+			this.clearRecovery();
+			this.connectionState = isAuthenticationError(normalized.code) ? 'authRequired' : 'error';
+			await this.enrollment.suspend();
+			await this.requireListener().stop();
+			this.recordError(normalized.code);
+			if (!isAuthenticationError(normalized.code)) { this.scheduleRecovery(); }
+		}
+	}
+
+	private scheduleRecovery(): void {
+		if (!this.connectionsEnabled() || this.recoveryTimer !== undefined || this.recoveryAttempts >= 5) { return; }
+		const delay = Math.min(30_000, 2000 * 2 ** this.recoveryAttempts++);
+		const stopEpoch = this.stopEpoch;
+		this.recoveryTimer = setTimeout(() => {
+			this.recoveryTimer = undefined;
+			const operation = this.actionQueue.then(async () => {
+				if (stopEpoch === this.stopEpoch && this.connectionsEnabled() && this.connectionState !== 'online') {
+					await this.enableConnections(false, () => this.assertReady(), false, stopEpoch);
+				}
+			});
+			this.actionQueue = operation.catch((error: unknown) => this.recordError(normalizeConnectivityError(error).code));
+		}, delay);
+		this.recoveryTimer.unref();
+	}
+
+	private clearRecovery(): void {
+		if (this.recoveryTimer !== undefined) { clearTimeout(this.recoveryTimer); }
+		this.recoveryTimer = undefined;
+	}
+
 	private currentSettings(): ConnectivitySettings {
 		return this.settingsLoaded ? this.settings.snapshot() : EMPTY_CONNECTIVITY_SETTINGS;
 	}
@@ -808,16 +950,10 @@ export class ProductionConnectivity implements BrokerConnectivity {
 			await this.options.records.listPeers(), await this.options.records.listPending(), this.revocations.snapshot(),
 		);
 	}
-	private flag(name: 'crossDeviceDiscovery' | 'crossDeviceDelegation' | 'devTunnelSdkHosting'): boolean {
-		return this.options.vscodeApi.workspace.getConfiguration('copilotAgentMesh').get<boolean>(`experimental.${name}`, false);
-	}
-	private async setFlag(name: string, enabled: boolean): Promise<void> {
-		await this.options.vscodeApi.workspace.getConfiguration('copilotAgentMesh')
-			.update(`experimental.${name}`, enabled, this.options.vscodeApi.ConfigurationTarget.Global);
-	}
 	private confirm(message: string): Promise<boolean> {
 		return Promise.resolve(this.options.vscodeApi.window.showWarningMessage(message, { modal: true }, 'Continue')).then((answer) => answer === 'Continue');
 	}
+
 	private assertCaller(caller: NodeIdentityParams, session: LocalIpcSession): void {
 		if (this.disposed || session.closed || !this.options.registry.peerNode(caller)?.online) {
 			throw new MeshDomainError('AUTH_FAILED', 'The authenticated connectivity action window is no longer available.');
@@ -838,4 +974,8 @@ export class ProductionConnectivity implements BrokerConnectivity {
 		this.ready = false; this.management.invalidate(); this.discovery.invalidate();
 		this.recordError('DISCOVERY_UNAVAILABLE');
 	}
+}
+
+function isAuthenticationError(code: ConnectivityCode): boolean {
+	return ['AUTH_REQUIRED', 'ACCOUNT_CHANGED', 'SCOPES_CHANGED'].includes(code);
 }

@@ -6,6 +6,15 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [Unreleased]
 
+- Replace cross-device discovery/hosting toggles and manual invitations with one
+  default-off Enable/Disable switch: native VS Code account selection, SDK-only
+  private Tunnels, and automatic same-account device discovery and trust.
+- Disable stops connections and deletes only the Broker's exact owned Tunnel;
+  failed cleanup stays persisted and visible for retry. Re-enable recreates and
+  rebinds the ephemeral Tunnel using retained device identity and peer credentials.
+  Workspace grants, receive and task approval remain independently default-deny;
+  authentication, saved policies and task records survive disable. Historical
+  live evidence is unchanged.
 - Read the authoritative Session identity from the outer AHP Snapshot rather than
   requiring a duplicate `resource` in the native Session state. This fixes a
   startup rejection before the first turn on VS Code 1.136.1.
