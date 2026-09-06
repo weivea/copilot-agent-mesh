@@ -641,7 +641,6 @@ async function writeSettings() {
 		`${JSON.stringify({
 			'copilotAgentMesh.deviceName': 'Same-profile E2E Device',
 			'copilotAgentMesh.codePath': codeCliPath,
-			'copilotAgentMesh.experimental.agentHost': realTaskEnabled,
 			'copilotAgentMesh.experimental.authenticationProviders': mappings,
 			'copilotAgentMesh.devTunnelPath': sentinelPath,
 			'copilotAgentMesh.listener.autoStart': false,

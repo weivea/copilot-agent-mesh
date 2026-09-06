@@ -553,12 +553,6 @@
           "scope": "machine",
           "markdownDescription": "Optional VS Code CLI path used by the macOS arm64 Worker Preview Agent Host runtime. Other platforms are Coordinator-only."
         },
-        "copilotAgentMesh.experimental.agentHost": {
-          "type": "boolean",
-          "default": false,
-          "scope": "machine",
-          "markdownDescription": "Enable the real macOS arm64 Worker Preview Agent Host/AHP runtime. This may consume Copilot quota. Windows, Linux, macOS x64, and other architectures remain Coordinator-only."
-        },
         "copilotAgentMesh.experimental.peerDelegation": {
           "type": "boolean",
           "default": false,

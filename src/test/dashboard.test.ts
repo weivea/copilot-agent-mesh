@@ -14,6 +14,7 @@ import {
 	type RemotePolicyAction,
 } from '../../shared/protocol';
 import type { ListenerSnapshot } from '../application/ListenerService';
+import type { AgentHostSourceStatus, AgentRuntimeProbe } from '../agentHost/AgentRuntime';
 import {
 	ProductionDashboardBindings,
 	ProductionDashboardBindingsOptions,
@@ -2229,6 +2230,46 @@ suite('Dashboard', () => {
 		bindings.dispose();
 	});
 
+	test('runtime diagnostics distinguish on-demand startup from recorded failures without changing permissions', async () => {
+		const fixture = createConnectivityBindings();
+		try {
+			const unused = await fixture.bindings.getSnapshot();
+			assert.equal(unused.thisWindow.agentHost.label, 'Not in use');
+			assert.ok(!fixture.calls.includes('runtime'));
+			fixture.state.connectivity = { ...connectivitySnapshot(), delegationEnabled: true };
+			const onDemand = await fixture.bindings.getSnapshot();
+			assert.equal(onDemand.thisWindow.agentHost.label, 'On demand');
+			assert.match(onDemand.thisWindow.agentHost.detail ?? '', /Workspace permissions and task approval/u);
+			assert.doesNotMatch(JSON.stringify(onDemand.thisWindow.agentHost), /compatibility gate|experimental\.agentHost/u);
+			fixture.state.runtimeStatus = {
+				source: 'editor', degraded: false,
+				failure: { code: 'AGENT_UNAVAILABLE', stage: 'connection', message: 'The editor connection failed.' },
+			};
+			const failed = await fixture.bindings.getSnapshot();
+			assert.equal(failed.thisWindow.agentHost.label, 'Startup failed');
+			assert.equal(failed.thisWindow.agentHost.detail, 'The editor connection failed.');
+			fixture.state.runtimeStatus = undefined;
+			fixture.state.runtimeProbe = {
+				available: false, featureEnabled: true, canStart: true, source: 'editor', reason: 'AGENT_AUTH_REQUIRED',
+			};
+			assert.equal((await fixture.bindings.getSnapshot()).thisWindow.agentHost.label, 'Sign-in required');
+			fixture.state.runtimeProbe = { available: true, featureEnabled: true, source: 'editor' };
+			assert.equal((await fixture.bindings.getSnapshot()).thisWindow.agentHost.label, 'Editor');
+			fixture.state.runtimeError = new Error('native token=private-value file:///private/profile');
+			const unavailable = await fixture.bindings.getSnapshot();
+			assert.equal(unavailable.thisWindow.agentHost.label, 'Unavailable');
+			assert.doesNotMatch(JSON.stringify(unavailable.thisWindow.agentHost), /private-value|private\/profile/u);
+			assert.deepEqual(fixture.mutations, []);
+			const media = await createDashboardMediaHarness();
+			media.receive({
+				version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view', type: 'dashboard.snapshot',
+				model: new DashboardPresenter().present({ ...snapshot(), thisWindow: onDemand.thisWindow }),
+			});
+			assert.match(media.element('thisWindow').text, /On demand/u);
+			assert.doesNotMatch(media.element('listener').text, /Agent Host/u);
+		} finally { fixture.bindings.dispose(); }
+	});
+
 	test('Production connectivity uses authenticated local IPC from non-owner windows and never refreshes cloud state on render', async () => {
 		const fixture = createConnectivityBindings();
 		try {
@@ -3410,13 +3451,19 @@ async function createDashboardMediaHarness(): Promise<{
 	};
 }
 
+interface RuntimePresentationFixture {
+	runtimeProbe?: AgentRuntimeProbe;
+	runtimeStatus?: AgentHostSourceStatus;
+	runtimeError?: Error;
+}
+
 function createConnectivityBindings(): {
 	readonly bindings: ProductionDashboardBindings;
 	readonly calls: string[];
 	readonly mutations: Array<{ action: ConnectivityAction; actionHandle?: string }>;
 	readonly commandCalls: Array<{ command: string; args: unknown[] }>;
 	readonly describedTargets: unknown[];
-	readonly state: {
+	readonly state: RuntimePresentationFixture & {
 		connectivity: ConnectivitySnapshot;
 		remotePolicy: {
 			workspaces: Array<{
@@ -3463,7 +3510,7 @@ function createConnectivityBindings(): {
 	const mutations: Array<{ action: ConnectivityAction; actionHandle?: string }> = [];
 	const commandCalls: Array<{ command: string; args: unknown[] }> = [];
 	const describedTargets: unknown[] = [];
-	const state: {
+	const state: RuntimePresentationFixture & {
 		connectivity: ConnectivitySnapshot;
 		remotePolicy: {
 			workspaces: Array<{
@@ -3657,8 +3704,10 @@ function createConnectivityBindings(): {
 						assert.deepStrictEqual(options, { requireEditor: true });
 						calls.push('passiveEditorProbe');
 					}
-					return { available: false, featureEnabled: true, canStart: true, source: 'editor' };
+					if (state.runtimeError !== undefined) { throw state.runtimeError; }
+					return state.runtimeProbe ?? { available: false, featureEnabled: true, canStart: true, source: 'editor' };
 				},
+				sourceStatus: () => state.runtimeStatus ?? { source: 'editor', degraded: false },
 			};
 		},
 		guard: {

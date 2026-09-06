@@ -837,7 +837,6 @@ async function writeSettings() {
 		`${JSON.stringify({
 			'copilotAgentMesh.deviceName': 'P8 Peer Delegation E2E',
 			'copilotAgentMesh.codePath': codeCliPath,
-			'copilotAgentMesh.experimental.agentHost': true,
 			'copilotAgentMesh.experimental.peerDelegation': true,
 			'copilotAgentMesh.experimental.authenticationProviders': mappings,
 			'copilotAgentMesh.agentHost.userDataDir': userDataDirectory,

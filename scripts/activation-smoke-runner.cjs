@@ -11,12 +11,9 @@ async function run() {
 	);
 	assert.equal(extension.packageJSON.version, '0.4.0');
 	assert.equal(extension.packageJSON.preview, true);
-	assert.equal(
-		extension.packageJSON.contributes.configuration.properties[
-			'copilotAgentMesh.experimental.agentHost'
-		].default,
-		false,
-	);
+	assert.equal(extension.packageJSON.contributes.configuration.properties[
+		'copilotAgentMesh.experimental.agentHost'
+	], undefined);
 
 	await extension.activate();
 	assert.equal(extension.isActive, true);

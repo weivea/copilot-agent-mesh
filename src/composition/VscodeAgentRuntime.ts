@@ -212,9 +212,8 @@ export function createVscodeAgentRuntime(
 		configuredCodeCli: configuration.get<string>('codePath') || undefined,
 	});
 	const common = {
-		enabled: () => vscodeApi.workspace
-			.getConfiguration(configurationSection)
-			.get<boolean>('experimental.agentHost', false),
+		// Workspace grants and task approval gate execution; there is no separate runtime switch.
+		enabled: () => true,
 		confirmation: approval,
 		approvalCapabilities,
 		workspaceResolver,
@@ -252,7 +251,6 @@ export function createVscodeAgentRuntime(
 		connections: new SdkAhpConnectionFactory(),
 	});
 	const runtime = new AgentHostSourceSelector({
-		enabled: common.enabled,
 		preferEditor: () => vscodeApi.workspace
 			.getConfiguration(configurationSection)
 			.get<boolean>('experimental.peerDelegation', false),

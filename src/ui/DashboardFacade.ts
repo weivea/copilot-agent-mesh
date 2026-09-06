@@ -459,7 +459,7 @@ export class UnavailableDashboardFacade implements DashboardFacade {
 				state: 'unavailable',
 				gateway: unavailableComponent('Gateway service is not connected.', 'Complete service wiring'),
 				tunnel: unavailableComponent('Dev Tunnel service is not connected.', 'Install or sign in to devtunnel'),
-				agentHost: unavailableComponent('Agent Host service is not connected.', 'Complete the AHP compatibility gate'),
+				agentHost: unavailableComponent('The execution runtime is not connected.', 'Reconnect this VS Code window.'),
 				canStart: false,
 				canStop: false,
 				canCopyConnectionUrl: false,

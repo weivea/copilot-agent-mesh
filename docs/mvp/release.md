@@ -26,14 +26,15 @@ unknown or corrupt persisted versions fail.
 
 The real Agent Host/AHP runtime requires:
 
-1. `copilotAgentMesh.experimental.agentHost: true`.
-2. An explicit first-task confirmation.
-3. Explicit protected-resource or authorization-server mappings in
-   `copilotAgentMesh.experimental.authenticationProviders`.
-4. Available credentials from the mapped VS Code authentication provider.
+1. An authorized target Workspace and the applicable task approval.
+2. The target VS Code window's existing Copilot identity for editor-backed tasks.
+3. For the standalone fallback only, explicit protected-resource or
+   authorization-server mappings in `copilotAgentMesh.experimental.authenticationProviders`
+   and credentials from the mapped VS Code authentication provider.
 
-No provider, account, resource, or scope is inferred. A successful real turn may
-consume Copilot quota.
+There is no separate Agent Host feature switch. Runtime connections are created
+on demand; no standalone provider, account, resource, or scope is inferred.
+A successful real turn may consume Copilot quota.
 
 Cross-device hosting remains macOS arm64-only, SDK-only and default-off. Enable **cross-device
 connections** in the Dashboard on every participating device and use native
