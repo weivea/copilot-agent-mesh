@@ -54,6 +54,13 @@ export function connectivityFixture() {
 	return { fs, ownership, fence, files, authentication, account };
 }
 
+export function deferred<T = void>() {
+	let resolve!: (value: T) => void;
+	let reject!: (error: unknown) => void;
+	const promise = new Promise<T>((accept, fail) => { resolve = accept; reject = fail; });
+	return { promise, resolve, reject };
+}
+
 export function sdkResponse(config: InternalAxiosRequestConfig, data: unknown, status = 200) {
 	return { config, data, status, statusText: status === 200 ? 'OK' : 'Error', headers: new AxiosHeaders() };
 }

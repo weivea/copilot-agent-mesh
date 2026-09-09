@@ -48,6 +48,76 @@ test('disabled discovery and a non-owner never request authentication or managem
 	assert.equal(fixture.authentication.requests.length, 0);
 });
 
+for (const serialized of [false, true]) {
+	test(`discovery diagnostics distinguish HTTP regions, SDK tunnels and endpoints without secrets (JSON text: ${serialized})`, async (t) => {
+		const fixture = connectivityFixture();
+		const events: { message: string; fields: Readonly<Record<string, unknown>> }[] = [];
+		const diagnostics = (message: string, fields: Readonly<Record<string, unknown>>) => { events.push({ message, fields }); };
+		let requests = 0;
+		const management = new DevTunnelManagement(fixture.account, fixture.fence, () => true, {
+			diagnostics,
+			adapter: async (config) => {
+				requests += 1;
+				const tunnel = {
+					...advertisedTunnel(),
+					name: 'sensitive-workspace-name',
+					description: 'sensitive-description',
+					accessTokens: { host: 'synthetic-host-secret' },
+				};
+				const data = { value: [
+					{ value: [tunnel, { ...tunnel, ports: [{ portNumber: 22, protocol: 'ssh' }] }] },
+					{ error: { code: 'Forbidden', message: 'sensitive-region-error' } },
+				] };
+				return sdkResponse(config, serialized ? JSON.stringify(data) : data);
+			},
+		});
+		t.after(async () => { await management.dispose(); fixture.account.dispose(); });
+		const result = await new DevTunnelDiscoveryProvider(management, diagnostics).list(new AbortController().signal);
+		assert.equal(requests, 1);
+		assert.equal(result.endpoints.length, 1);
+		assert.deepEqual(events.find((event) => event.message === 'Tunnel discovery HTTP response.')?.fields, {
+			httpStatus: 200, hasValueArray: true, regionCount: 2, hasNextLink: false,
+			regions: [
+				{ hasValueArray: true, tunnelCount: 2, hasError: false },
+				{ hasValueArray: false, tunnelCount: 0, hasError: true, errorCode: 'Forbidden' },
+			],
+		});
+		assert.equal(events.find((event) => event.message === 'Tunnel discovery SDK result.')?.fields.tunnelCount, 2);
+		assert.equal(events.find((event) => event.message === 'Tunnel discovery projected endpoints.')?.fields.endpointCount, 1);
+		assert.doesNotMatch(JSON.stringify(events), /sensitive-|synthetic-|Authorization|accessTokens|portForwardingUris/u);
+	});
+}
+
+test('discovery diagnostics report refresh scheduling, invalidation and safe failures', async (t) => {
+	const fixture = connectivityFixture();
+	const events: { message: string; fields: Readonly<Record<string, unknown>> }[] = [];
+	const diagnostics = (message: string, fields: Readonly<Record<string, unknown>>) => { events.push({ message, fields }); };
+	let fail = false;
+	const management = new DevTunnelManagement(fixture.account, fixture.fence, () => true, {
+		adapter: async (config) => {
+			if (fail) {
+				throw new AxiosError('sensitive-sdk-error', 'AUTH', config, undefined, sdkResponse(config, {}, 401));
+			}
+			return sdkResponse(config, { value: [] });
+		},
+	});
+	const discovery = new DiscoveryService(new DevTunnelDiscoveryProvider(management), fixture.fence,
+		() => true, () => true, () => undefined, Date.now, diagnostics);
+	t.after(async () => { await discovery.dispose(); await management.dispose(); fixture.account.dispose(); });
+	await discovery.refresh();
+	assert.ok(events.some((event) => event.message === 'Requesting the account tunnel directory.'));
+	assert.ok(events.some((event) => event.message === 'Discovery refresh scheduled.'
+		&& event.fields.state === 'ready' && event.fields.candidateCount === 0
+		&& typeof event.fields.delayMs === 'number' && event.fields.delayMs >= 15_000));
+	discovery.invalidate();
+	assert.ok(events.some((event) => event.message === 'Discovery cache invalidated.' && event.fields.refreshInFlight === false));
+	fail = true;
+	await discovery.refresh();
+	assert.deepEqual(events.find((event) => event.message === 'Discovery request failed.')?.fields,
+		{ code: 'AUTH_REQUIRED', state: 'authRequired' });
+	assert.doesNotMatch(JSON.stringify(events), /sensitive-sdk-error|synthetic-test-oauth|Authorization/u);
+});
+
 test('silent account reads reject missing sessions, wrong accounts and changed scopes without broader consent', async (t) => {
 	const fixture = connectivityFixture();
 	t.after(() => fixture.account.dispose());

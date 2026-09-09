@@ -308,6 +308,7 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 				broker?.connectivityChanged();
 			},
 			report: (code) => options.logger.log('warn', 'connectivity', 'Remote connectivity requires attention.', { code }),
+			reportDiscovery: (message, fields) => options.logger.log('debug', 'discovery', message, fields),
 		});
 		registry.setPeerRouteAuthorizer(connectivity.remotePolicies);
 		const pairing = connectivity.pairing;

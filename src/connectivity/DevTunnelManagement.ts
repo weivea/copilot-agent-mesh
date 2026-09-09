@@ -8,12 +8,13 @@ import type { CancellationToken } from 'vscode-jsonrpc';
 
 import { assertDocumentFence, type DocumentFence } from '../storage/FencedDocumentStore';
 import type { AccountSessionProvider } from './AccountSessionProvider';
-import { ConnectivityError } from './ConnectivitySchemas';
+import { ConnectivityError, type ConnectivityDiagnosticsReporter } from './ConnectivitySchemas';
 import { ConnectivityOperation } from './ConnectivityOperations';
 import { validateManagementUri } from './DevTunnelUris';
 import { MeshDomainError } from '../domain/errors';
 
 export const DEV_TUNNELS_SDK_VERSION = '1.3.56';
+const MAX_MANAGEMENT_RESPONSE_BYTES = 1024 * 1024;
 
 /** Applied even to management requests made internally by the SDK host. */
 export function createGuardedTunnelHttpAdapter(send: AxiosAdapter): AxiosAdapter {
@@ -25,7 +26,7 @@ export function createGuardedTunnelHttpAdapter(send: AxiosAdapter): AxiosAdapter
 					...config, url: uri.toString(),
 					maxRedirects: 0,
 					timeout: Math.min(config.timeout ?? 10_000, 10_000),
-					maxContentLength: 1024 * 1024,
+					maxContentLength: MAX_MANAGEMENT_RESPONSE_BYTES,
 					maxBodyLength: 64 * 1024,
 				});
 			} catch (error: unknown) {
@@ -76,6 +77,7 @@ export class DevTunnelManagement {
 		private readonly options: {
 			readonly timeoutMs?: number;
 			readonly adapter?: AxiosAdapter;
+			readonly diagnostics?: ConnectivityDiagnosticsReporter;
 		} = {},
 	) {
 		this.subscription = account.onDidChange(() => this.invalidate());
@@ -122,9 +124,20 @@ export class DevTunnelManagement {
 		}
 		this.inFlight += 1;
 		const operation = new ConnectivityOperation(this.options.timeoutMs ?? 10_000, this.lifetime.signal, signal);
+		const send = this.options.adapter ?? guardedTunnelHttpAdapter;
+		const diagnostics = this.options.diagnostics;
 		const client = createTunnelManagementClient(
 			() => this.account.authorization(operation.controller.signal),
-			this.options.adapter,
+			diagnostics === undefined ? this.options.adapter : async (config) => {
+				const response = await send(config);
+				if (config.method?.toLowerCase() === 'get' && config.url !== undefined
+					&& new URL(config.url).pathname === '/tunnels') {
+					diagnostics('Tunnel discovery HTTP response.', {
+						httpStatus: response.status, ...directoryResponseSummary(response.data),
+					});
+				}
+				return response;
+			},
 		);
 		try {
 			operation.assertActive();
@@ -146,6 +159,39 @@ export class DevTunnelManagement {
 			await client.dispose();
 		}
 	}
+}
+
+function directoryResponseSummary(data: unknown): Readonly<Record<string, unknown>> {
+	if (typeof data === 'string') {
+		if (Buffer.byteLength(data, 'utf8') > MAX_MANAGEMENT_RESPONSE_BYTES) {
+			return { hasValueArray: false, oversized: true };
+		}
+		try {
+			data = JSON.parse(data);
+		} catch (error: unknown) {
+			if (!(error instanceof SyntaxError)) { throw error; }
+			return { hasValueArray: false, invalidJson: true };
+		}
+	}
+	if (typeof data !== 'object' || data === null || !('value' in data) || !Array.isArray(data.value)) {
+		return { hasValueArray: false };
+	}
+	return {
+		hasValueArray: true,
+		regionCount: data.value.length,
+		hasNextLink: 'nextLink' in data && typeof data.nextLink === 'string' && data.nextLink.length > 0,
+		regions: data.value.slice(0, 10).map((region: unknown) => {
+			if (typeof region !== 'object' || region === null) { return { hasValueArray: false }; }
+			const error = 'error' in region ? region.error : undefined;
+			const code = typeof error === 'object' && error !== null && 'code' in error ? error.code : undefined;
+			return {
+				hasValueArray: 'value' in region && Array.isArray(region.value),
+				tunnelCount: 'value' in region && Array.isArray(region.value) ? region.value.length : 0,
+				hasError: error !== undefined && error !== null,
+				...(typeof code === 'string' && /^[A-Za-z0-9_.-]{1,64}$/u.test(code) ? { errorCode: code } : {}),
+			};
+		}),
+	};
 }
 
 export function normalizeConnectivityError(error: unknown): ConnectivityError {
