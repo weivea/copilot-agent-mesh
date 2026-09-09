@@ -1071,6 +1071,30 @@ test('source selector retries failed runtime disposal', async () => {
 	assert.equal(standalone.disposals, 2);
 });
 
+test('session continuation always selects the editor and cannot fall back to a fresh standalone session', async (t) => {
+	const editor = new FakeRuntime();
+	const standalone = new FakeRuntime();
+	const selector = new AgentHostSourceSelector(selectorOptions({
+		preferEditor: () => false, editor, standalone,
+	}));
+	t.after(() => selector.dispose());
+	const request = {
+		...taskRequest(),
+		continuation: {
+			sessionUri: 'copilotcli:/00000000-0000-4000-8000-000000000001',
+			chatUri: 'ahp-chat:/original',
+		},
+	};
+	editor.startError = new AgentRuntimeError('AGENT_UNAVAILABLE', 'editor unavailable');
+	await assert.rejects(selector.start(request), { code: 'AGENT_UNAVAILABLE' });
+	assert.equal(editor.starts, 1);
+	assert.equal(standalone.starts, 0);
+	editor.startError = undefined;
+	await selector.start(request);
+	assert.equal(editor.starts, 2);
+	assert.equal(standalone.starts, 0);
+});
+
 test('source selector preserves the safe standalone fallback failure category', async () => {
 	const editor = new FakeRuntime();
 	const standalone = new FakeRuntime();

@@ -20,8 +20,9 @@ state.
 Window and Workspace display names and includes a bounded title summary,
 one-task scope, the structured in-Workspace file changes eligible for automatic
 approval, the terminal and sensitive categories that still require input, and
-the 60-minute maximum. It
-never displays IDs, paths, the raw prompt, or secrets, and it never persists an
+the 60-minute maximum. A continuation also identifies the previous task and
+states that its conversation history will be reused. It
+never displays target IDs, paths, the raw prompt, or secrets, and it never persists an
 intent or contacts a worker. P5 never treats a working directory or arbitrary
 tool prose as proof that a terminal command is confined to the Workspace.
 
@@ -170,9 +171,38 @@ multiple claimed sources use their sorted canonical set hash. Active editor,
 display names, and Window Node instance IDs do not define the scope. P2
 authorization still checks every claimed source Workspace separately. Exact
 retries reuse the task ID and never restart an accepted task.
-Changing target, title, prompt, criteria, or timeout returns
+Changing target, `continueFromTaskId`, title, prompt, criteria, or timeout returns
 `IDEMPOTENCY_CONFLICT`. Broker generation takeover restores the persisted route
 mapping before accepting another start.
+
+### Explicit session continuation
+
+`continueFromTaskId` is optional. Omit it to keep the fresh-session default.
+Provide an owned **completed** task's ID with the same exact target to create a
+new task and new turn in that task's retained editor Session and original Chat.
+The source may choose this independently for every call, in either `wait` or
+`submit` mode. A continuation needs its own `delegationRequestId`; an exact retry
+must retain the same continuation ID and all other execution semantics.
+
+The Broker resolves the session from its private task recovery record after
+checking authenticated ownership, source scope, task state and target identity.
+Callers cannot supply Session or Chat URIs. The target runtime rechecks provider,
+folder isolation, Workspace and original Chat membership, and requires an idle,
+unarchived session without another active client or queued Chat input. Missing
+history or an ineligible session fails explicitly (`TASK_RECOVERY_UNAVAILABLE`);
+ownership failures do not reveal another window's task. There is no automatic
+new-session fallback. Standalone sessions are not retained for continuation.
+
+Every follow-up has a fresh task-scoped grant, input state, deadline and output
+stream. Previous output is not replayed as the new task's result. Prior tasks stay
+terminal and queryable, and their runtime cleanup must finish before the next
+turn. This is live conversation reuse, not a transcript snapshot or branch:
+subsequent turns already in that same session remain visible to its agent.
+For a task still waiting for input, use `mesh_answer_task` instead.
+
+Stopping a follow-up cancels only its new turn, never the shared Session's
+history. If the Host cannot confirm that the turn stopped, cleanup reports
+`TASK_CANCELLATION_UNCONFIRMED` rather than claiming cancellation succeeded.
 
 The delegate subscribes before starting or reconciling the task, so an immediate
 terminal event cannot be lost. It uses Broker-published authoritative snapshots,

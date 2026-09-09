@@ -45,6 +45,7 @@ export interface WindowNodeTaskConfirmationRequest {
 	readonly workspaceDisplayName: string;
 	readonly taskTitle: string;
 	readonly prompt: string;
+	readonly continueFromTaskId?: string;
 }
 
 export type WindowNodeTaskConfirmationResult = 'once' | 'deny';
@@ -326,6 +327,7 @@ export class WindowNodeTaskExecutor {
 			record.preStartAbort.signal,
 		);
 		const grant = assertDelegationGrantBinding(params, workspace);
+		const requireEditor = params.requireEditor === true || params.continuation !== undefined;
 		const approval = params.remoteTaskApproval;
 		if (approval !== undefined && (
 			params.sourceNodeId !== undefined || params.requireEditor !== true
@@ -336,7 +338,7 @@ export class WindowNodeTaskExecutor {
 		}
 		this.assertRecordWithinWorkerDeadline(record, params.workerDeadline);
 		const probe = await abortablePreStartOperation(
-			this.options.runtime.probe(params.requireEditor ? { requireEditor: true } : undefined),
+			this.options.runtime.probe(requireEditor ? { requireEditor: true } : undefined),
 			record.preStartAbort.signal,
 		);
 		if (!probe.featureEnabled || (!probe.available && probe.canStart !== true)) {
@@ -347,7 +349,7 @@ export class WindowNodeTaskExecutor {
 			);
 		}
 		await abortablePreStartOperation(
-			this.options.runtime.prepareStart?.(params.requireEditor ? { requireEditor: true } : undefined) ?? Promise.resolve(),
+			this.options.runtime.prepareStart?.(requireEditor ? { requireEditor: true } : undefined) ?? Promise.resolve(),
 			record.preStartAbort.signal,
 		);
 		this.assertRecordWithinWorkerDeadline(record, params.workerDeadline);
@@ -359,7 +361,8 @@ export class WindowNodeTaskExecutor {
 			acceptanceCriteria: [...params.acceptanceCriteria],
 			workspaceId: workspace.workspaceId,
 			sourceWindowName: params.sourceLabel,
-			...(params.requireEditor ? { requireEditor: true as const } : {}),
+			...(requireEditor ? { requireEditor: true as const } : {}),
+			...(params.continuation === undefined ? {} : { continuation: { ...params.continuation } }),
 			allowInteractiveAuthentication: true,
 			delegatedExecutionContext: { ...params.delegatedExecutionContext },
 			approvalContext: {
@@ -376,6 +379,7 @@ export class WindowNodeTaskExecutor {
 					workspaceDisplayName: workspace.displayName,
 					taskTitle: params.title,
 					prompt: params.prompt,
+					...(params.continueFromTaskId === undefined ? {} : { continueFromTaskId: params.continueFromTaskId }),
 				}, record.preStartAbort.signal),
 				record.preStartAbort.signal,
 			);
@@ -390,8 +394,9 @@ export class WindowNodeTaskExecutor {
 		this.assertActive();
 
 		const handle = await this.withRuntimeStartGate(record, async () => {
+			await this.waitForContinuationCleanup(params, record);
 			await abortablePreStartOperation(
-				this.options.runtime.prepareStart?.(params.requireEditor ? { requireEditor: true } : undefined) ?? Promise.resolve(),
+				this.options.runtime.prepareStart?.(requireEditor ? { requireEditor: true } : undefined) ?? Promise.resolve(),
 				record.preStartAbort.signal,
 			);
 			this.assertRecordWithinWorkerDeadline(record, params.workerDeadline);
@@ -444,7 +449,10 @@ export class WindowNodeTaskExecutor {
 				'The task worker deadline expired before the Agent runtime start completed.',
 			);
 		}
-		if (handle.taskId !== params.taskId) {
+		if (handle.taskId !== params.taskId || (params.continuation !== undefined && (
+			handle.recovery.sessionUri !== params.continuation.sessionUri
+			|| handle.recovery.chatUri !== params.continuation.chatUri
+		))) {
 			this.destroyGrant(active);
 			active.cleanupRequired = true;
 			const cleanup = await Promise.allSettled([
@@ -499,6 +507,21 @@ export class WindowNodeTaskExecutor {
 		active.pump = pump;
 		this.trackPump(pump);
 		return result;
+	}
+
+	private async waitForContinuationCleanup(params: NodeTaskStartParams, record: StartRecord): Promise<void> {
+		if (params.continuation === undefined) {
+			return;
+		}
+		for (const previous of this.starts.values()) {
+			if (
+				previous !== record
+				&& previous.result?.recoveryDescriptor?.sessionId === params.continuation.sessionUri
+				&& previous.active?.pump !== undefined
+			) {
+				await abortablePreStartOperation(previous.active.pump, record.preStartAbort.signal);
+			}
+		}
 	}
 
 	private withRuntimeStartGate<T>(

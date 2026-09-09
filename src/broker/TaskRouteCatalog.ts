@@ -24,6 +24,7 @@ const routeStateSchema = z.union([taskStatusSchema, z.literal('ambiguous')]);
 const taskRouteRecordSchema = z.strictObject({
 	taskId: uuidSchema,
 	delegationRequestId: uuidSchema,
+	continueFromTaskId: uuidSchema.optional(),
 	requestHash: z.string().regex(/^[0-9a-f]{64}$/u),
 	target: taskTargetSchema,
 	routeKind: z.enum(['local', 'remote']),
@@ -397,10 +398,12 @@ export class TaskRouteCatalog {
 				return this.reservationResult(existing, false, asAttempt);
 			}
 
+			this.assertContinuationRoute(params, route);
 			const retained = makeCapacity(catalog.routes);
 			const candidate = taskRouteRecordSchema.parse({
 				taskId: params.taskId,
 				delegationRequestId: params.delegationRequestId,
+				...(params.continueFromTaskId === undefined ? {} : { continueFromTaskId: params.continueFromTaskId }),
 				requestHash,
 				target: params.target,
 				...route,
@@ -495,6 +498,32 @@ export class TaskRouteCatalog {
 				'Task identifiers are already bound to another authoritative route.',
 			);
 		}
+		if (existing === undefined) {
+			this.assertContinuationRoute(params, route);
+		}
+	}
+
+	private assertContinuationRoute(
+		input: RoutedTaskStartParams,
+		source: Pick<TaskRouteRecord, 'routeKind' | 'peerId' | 'sourceNodeId' | 'sourcePeerId'>,
+	): void {
+		if (input.continueFromTaskId === undefined) {
+			return;
+		}
+		const previous = this.routes.get(input.continueFromTaskId);
+		if (
+			previous === undefined
+			|| previous.routeKind !== source.routeKind
+			|| previous.peerId !== source.peerId
+			|| previous.sourceNodeId !== source.sourceNodeId
+			|| previous.sourcePeerId !== source.sourcePeerId
+			|| previous.sourceWorkspaceIdentity !== input.sourceWorkspaceIdentity
+		) {
+			throw new MeshDomainError('TASK_NOT_FOUND', 'The continuation task is not owned by this source.');
+		}
+		if (!sameTarget(previous.target, input.target)) {
+			throw new MeshDomainError('TASK_RECOVERY_UNAVAILABLE', 'The continuation requires the original exact target.');
+		}
 	}
 
 	private serialize<T>(operation: () => Promise<T>): Promise<T> {
@@ -571,6 +600,7 @@ function canonicalRouteRequestHash(
 		String(input.acceptanceCriteria.length),
 		...input.acceptanceCriteria,
 		input.workerDeadline,
+		...(input.continueFromTaskId === undefined ? [] : ['continueFromTaskId', input.continueFromTaskId]),
 	];
 	return createHash('sha256')
 		.update(fields.map(lengthPrefix).join(''), 'utf8')

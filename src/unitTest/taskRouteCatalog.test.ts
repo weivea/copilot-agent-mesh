@@ -129,6 +129,46 @@ test('authoritative catalog prunes oldest terminal route but retains ambiguous r
 	assert.equal(routes(ambiguousState).length, TASK_ROUTE_CATALOG_LIMIT);
 });
 
+test('continuation routes retain ownership and exact targets and hash the predecessor across reload', async () => {
+	const state = new MemoryState();
+	const catalog = new TaskRouteCatalog(state, () => new Date(AT));
+	const original = startParams(LOCAL_DEVICE_ID);
+	await catalog.reserveLocal(original, { nodeId: LOCAL_NODE_ID });
+	const next = { ...startParams(LOCAL_DEVICE_ID, uuid(20), uuid(21)), continueFromTaskId: TASK_ID };
+	const reserved = await catalog.reserveLocal(next, { nodeId: LOCAL_NODE_ID });
+	assert.equal(reserved.continueFromTaskId, TASK_ID);
+	const restored = new TaskRouteCatalog(state, () => new Date(AT));
+	assert.deepEqual(await restored.reserveLocal(next, { nodeId: LOCAL_NODE_ID }), reserved);
+	for (const continueFromTaskId of [undefined, uuid(30)]) {
+		assert.throws(() => restored.assertLocalCompatible({ ...next, continueFromTaskId }, { nodeId: LOCAL_NODE_ID }),
+			(error: unknown) => error instanceof MeshDomainError && error.reason === 'IDEMPOTENCY_CONFLICT');
+	}
+	const fresh = { ...next, taskId: uuid(22), delegationRequestId: uuid(23) };
+	for (const [input, source, reason] of [
+		[fresh, { nodeId: uuid(31) }, 'TASK_NOT_FOUND'],
+		[{ ...fresh, sourceWorkspaceIdentity: `sha256:${'B'.repeat(43)}` }, { nodeId: LOCAL_NODE_ID }, 'TASK_NOT_FOUND'],
+		[{ ...fresh, target: { ...fresh.target, nodeInstanceId: uuid(32) } }, { nodeId: LOCAL_NODE_ID }, 'TASK_RECOVERY_UNAVAILABLE'],
+	] as const) {
+		assert.throws(() => restored.assertLocalCompatible(input, source),
+			(error: unknown) => error instanceof MeshDomainError && error.reason === reason);
+		await assert.rejects(restored.reserveLocal(input, source),
+			(error: unknown) => error instanceof MeshDomainError && error.reason === reason);
+	}
+});
+
+test('outbound continuation cannot use another source window even on the same peer and workspace', async () => {
+	const catalog = new TaskRouteCatalog();
+	const original = startParams(REMOTE_DEVICE_ID);
+	await catalog.reserveRemote(original, REMOTE_PEER_ID, LOCAL_NODE_ID);
+	const next = { ...startParams(REMOTE_DEVICE_ID, uuid(20), uuid(21)), continueFromTaskId: TASK_ID };
+	await catalog.reserveRemote(next, REMOTE_PEER_ID, LOCAL_NODE_ID);
+	const forged = { ...next, taskId: uuid(22), delegationRequestId: uuid(23), sourceNodeId: uuid(24) };
+	assert.throws(() => catalog.assertRemoteCompatible(forged, REMOTE_PEER_ID, uuid(24)),
+		(error: unknown) => error instanceof MeshDomainError && error.reason === 'TASK_NOT_FOUND');
+	await assert.rejects(catalog.reserveRemote(forged, REMOTE_PEER_ID, uuid(24)),
+		(error: unknown) => error instanceof MeshDomainError && error.reason === 'TASK_NOT_FOUND');
+});
+
 test('authoritative catalog conditionally releases only an unshared exact ambiguous attempt', async () => {
 	const state = new MemoryState();
 	const catalog = new TaskRouteCatalog(state, () => new Date(AT));

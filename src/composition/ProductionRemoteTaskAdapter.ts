@@ -243,6 +243,7 @@ export class ProductionRemoteTaskAdapter implements RemoteTaskRouteAdapter {
 		const gatewayParams: RoutedTaskStartParams = {
 			delegationRequestId: params.delegationRequestId,
 			taskId: params.taskId,
+			...(params.continueFromTaskId === undefined ? {} : { continueFromTaskId: params.continueFromTaskId }),
 			target: params.target,
 			title: params.title,
 			prompt: params.prompt,
@@ -758,7 +759,7 @@ function sameRoute(
 	peerId: string,
 ): boolean {
 	return route.delegationRequestId === input.delegationRequestId
-		&& (route.requestHash === undefined
+		&& ((route.requestHash === undefined && input.continueFromTaskId === undefined)
 			|| route.requestHash === remoteRequestHash(input, peerId))
 		&& route.peerId === peerId
 		&& route.target.deviceId === input.target.deviceId
@@ -819,6 +820,7 @@ function remoteRequestHash(input: RoutedTaskStartParams, peerId: string): string
 		String(input.acceptanceCriteria.length),
 		...input.acceptanceCriteria,
 		input.workerDeadline,
+		...(input.continueFromTaskId === undefined ? [] : ['continueFromTaskId', input.continueFromTaskId]),
 	];
 	return createHash('sha256')
 		.update(fields.map((value) => `${Buffer.byteLength(value, 'utf8')}:${value}`).join(''), 'utf8')

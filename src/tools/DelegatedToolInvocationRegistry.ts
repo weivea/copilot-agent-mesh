@@ -205,6 +205,7 @@ function delegationFingerprint(rawInput: unknown): string | undefined {
 			input.acceptanceCriteria,
 			input.timeoutMinutes ?? null,
 			input.mode ?? 'wait',
+			input.continueFromTaskId ?? null,
 		]));
 	} catch {
 		return undefined;

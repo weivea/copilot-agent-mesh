@@ -226,6 +226,21 @@ test('source Workspace identity scopes stable delegation keys independently of d
 		sourceWorkspaceIdentity: () => SOURCE_IDENTITY_B,
 	});
 
+	test('facade forwards optional continuation without treating the previous task as the new identity', async (t) => {
+		const client = new FakeWindowNodeClient();
+		const facade = new LocalBrokerTaskFacade(client, { deviceName: 'Local Device' });
+		t.after(() => facade.dispose());
+		const original = await facade.persistDelegationIntent(intent());
+		assert.equal(Object.hasOwn(client.lastStart!, 'continueFromTaskId'), false);
+		const followUp = { ...intent(), delegationRequestId: INPUT_ID, continueFromTaskId: original.taskId };
+		const next = await facade.persistDelegationIntent(followUp);
+		assert.notEqual(next.taskId, original.taskId);
+		assert.equal(client.lastStart?.continueFromTaskId, original.taskId);
+		assert.equal((await facade.persistDelegationIntent(followUp)).taskId, next.taskId);
+		await assert.rejects(facade.persistDelegationIntent({ ...followUp, continueFromTaskId: ANSWER_ID }),
+			(error: unknown) => error instanceof TaskToolFacadeError && error.code === 'IDEMPOTENCY_CONFLICT');
+	});
+
 	const first = await sourceA.persistDelegationIntent(intent());
 	const retry = await sourceAReloaded.persistDelegationIntent(intent());
 	const independent = await sourceB.persistDelegationIntent(intent());

@@ -301,6 +301,7 @@ function startParams(changes: Partial<NodeTaskStartParams> = {}): NodeTaskStartP
 			requestHash: canonicalRoutedTaskRequestHash({
 				delegationRequestId: params.delegationRequestId,
 				taskId: params.taskId,
+				...(params.continueFromTaskId === undefined ? {} : { continueFromTaskId: params.continueFromTaskId }),
 				target: params.target,
 				sourceNodeId: params.sourceNodeId,
 				sourceWorkspaceIdentity: params.sourceWorkspaceIdentity,
@@ -535,6 +536,85 @@ test('reports confirmation denial as an explicit safe failure without starting t
 	);
 	assert.equal(fixture.runtime.requests.length, 0);
 	await fixture.executor.dispose();
+});
+
+test('continuation waits for prior session cleanup and creates fresh task-scoped execution state', async (t) => {
+	const fixture = createFixture();
+	let releaseCleanup!: () => void;
+	const cleanup = new Promise<void>((resolve) => { releaseCleanup = resolve; });
+	t.after(async () => { releaseCleanup(); await fixture.executor.dispose(); });
+	await fixture.executor.start(startParams());
+	const original = fixture.runtime.handles[0];
+	original.dispose = async () => {
+		original.disposeCalls += 1;
+		await cleanup;
+		original.events.close();
+	};
+	await original.events.push({ type: 'output', text: 'Original answer.' });
+	await original.events.push({ type: 'completed' });
+	await waitFor(() => original.disposeCalls === 1);
+	const continuation = { sessionUri: original.recovery.sessionUri, chatUri: original.recovery.chatUri };
+	const followUp = startParams({
+		taskId: SECOND_INPUT_ID, delegationRequestId: ANSWER_ID, continueFromTaskId: TASK_ID,
+		continuation, prompt: 'Follow-up task.',
+	});
+	const pending = fixture.executor.start(followUp);
+	await waitFor(() => fixture.runtime.prepareCalls >= 3);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(fixture.runtime.requests.length, 1);
+	releaseCleanup();
+	const started = await pending;
+	assert.equal(started.taskId, SECOND_INPUT_ID);
+	assert.equal(started.recoveryDescriptor?.sessionId, original.recovery.sessionUri);
+	assert.equal(fixture.runtime.requests.length, 2);
+	assert.deepEqual(fixture.runtime.requests[1].continuation, continuation);
+	assert.equal(fixture.runtime.requests[1].requireEditor, true);
+	assert.equal(fixture.approvalCapabilities.accepts({
+		...fixture.runtime.requests[1], approvalCapability: fixture.runtime.requests[0].approvalCapability,
+	}), false);
+	assert.equal(fixture.executor.delegatedExecutionContext(TASK_ID), undefined);
+	assert.equal(fixture.executor.delegatedExecutionContext(SECOND_INPUT_ID)?.taskId, SECOND_INPUT_ID);
+	await fixture.executor.start(followUp);
+	assert.equal(fixture.runtime.requests.length, 2);
+	assert.throws(() => fixture.executor.start(startParams({
+		...followUp, continueFromTaskId: INPUT_ID,
+	})), (error: unknown) => isReason(error, 'TASK_ID_CONFLICT'));
+	const next = fixture.runtime.handles[1];
+	await next.events.push({ type: 'output', text: 'New answer.' });
+	await next.events.push({ type: 'completed' });
+	await waitFor(() => next.disposeCalls === 1);
+	const completed = fixture.events.find(({ taskId, event }) => taskId === SECOND_INPUT_ID && event.type === 'completed');
+	assert.equal(completed?.event.type === 'completed' && completed.event.summary, 'New answer.');
+});
+
+test('continuation requires a Broker-resolved descriptor and rejects a runtime that silently creates another session', async (t) => {
+	const fixture = createFixture();
+	t.after(() => fixture.executor.dispose());
+	assert.throws(() => fixture.executor.start(startParams({ continueFromTaskId: INPUT_ID })));
+	assert.throws(() => fixture.executor.start(startParams({
+		continuation: { sessionUri: 'session', chatUri: 'conversation' },
+	})));
+	assert.equal(fixture.runtime.requests.length, 0);
+	await assert.rejects(fixture.executor.start(startParams({
+		continueFromTaskId: INPUT_ID,
+		continuation: { sessionUri: 'requested-retained-session', chatUri: 'conversation' },
+	})), (error: unknown) => error instanceof AgentRuntimeError && error.code === 'TASK_EXECUTION_FAILED');
+	assert.equal(fixture.runtime.requests[0].requireEditor, true);
+	assert.equal(fixture.runtime.handles[0].cancelCalls, 1);
+	assert.equal(fixture.runtime.handles[0].disposeCalls, 1);
+	assert.equal(fixture.events.length, 0);
+});
+
+test('continuation participates in delegation grant binding', async (t) => {
+	const fixture = createFixture();
+	t.after(() => fixture.executor.dispose());
+	const original = startParams();
+	await assert.rejects(fixture.executor.start(startParams({
+		continueFromTaskId: INPUT_ID,
+		continuation: { sessionUri: 'session', chatUri: 'conversation' },
+		delegationGrant: original.delegationGrant,
+	})), /delegation grant is not bound/u);
+	assert.equal(fixture.runtime.requests.length, 0);
 });
 
 test('target executor rejects the removed legacy always confirmation', async () => {

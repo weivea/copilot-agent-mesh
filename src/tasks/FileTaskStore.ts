@@ -1,6 +1,8 @@
 import {
 	persistedTaskRecordSchema,
+	recoveryDescriptorSchema,
 	uuidSchema,
+	type RecoveryDescriptor,
 } from '../../shared/protocol';
 import { MeshDomainError } from '../domain/errors';
 import {
@@ -147,6 +149,29 @@ export class FileTaskStore {
 
 	public getOwned(peerId: string, taskId: string): Promise<TaskRecord | undefined> {
 		return this.runExclusive(() => this.getOwnedUnlocked(peerId, taskId));
+	}
+
+	public recordRecoveryDescriptorOwned(
+		peerId: string,
+		taskId: string,
+		descriptor: RecoveryDescriptor,
+	): Promise<TaskRecord> {
+		return this.runExclusive(async () => {
+			const current = getOwnedTask(await this.getOwnedUnlocked(peerId, taskId), peerId);
+			const validated = recoveryDescriptorSchema.parse(descriptor);
+			const existing = current.recoveryDescriptor;
+			if (existing !== undefined) {
+				if (
+					existing.adapter !== validated.adapter
+					|| existing.sessionId !== validated.sessionId
+					|| existing.conversationId !== validated.conversationId
+				) {
+					throw new MeshDomainError('TASK_ID_CONFLICT', 'The task already has a different Agent session.');
+				}
+				return current;
+			}
+			return this.saveUnlocked({ ...current, recoveryDescriptor: validated });
+		});
 	}
 
 	public migrateOwnedV1(

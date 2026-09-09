@@ -766,6 +766,11 @@ class AhpTask implements AgentTaskHandle {
 	private lastSeenServerSeq = 0;
 	private terminal = false;
 	private authoritativeTurnTerminal = false;
+	private turnEnded = false;
+	private readonly turnTerminalProcessed: Promise<void>;
+	private readonly resolveTurnTerminalProcessed: () => void;
+	private continuationCancellation: Promise<void> | undefined;
+	private continuationStopFailure: AgentRuntimeError | undefined;
 	private terminalSessionClientLeft = false;
 	private terminalClientDetachedObserved = false;
 	private sessionMaterialized = false;
@@ -834,6 +839,11 @@ class AhpTask implements AgentTaskHandle {
 		private readonly lifecycleObserver: AgentRuntimeLifecycleObserver | undefined,
 		private readonly didDispose: () => void,
 	) {
+		let resolveTurnTerminalProcessed!: () => void;
+		this.turnTerminalProcessed = new Promise<void>((resolve) => {
+			resolveTurnTerminalProcessed = resolve;
+		});
+		this.resolveTurnTerminalProcessed = resolveTurnTerminalProcessed;
 		let resolveSessionMaterialized!: () => void;
 		this.sessionMaterializedPromise = new Promise<void>((resolve) => {
 			resolveSessionMaterialized = resolve;
@@ -899,8 +909,15 @@ class AhpTask implements AgentTaskHandle {
 			throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'AHP initialize did not return the root snapshot.');
 		}
 		const root = parseRootState(rootSnapshot);
-		this.provider = selectProvider(root.agents, this.request.providerId);
-		this.sessionIdentity = createAgentSessionIdentity(this.host.source, this.provider.provider, this.sessionId);
+		const continuation = this.request.continuation;
+		const retainedIdentity = continuation === undefined ? undefined : retainedSessionIdentity(
+			continuation.sessionUri,
+			this.host,
+			this.request.providerId,
+		);
+		this.provider = selectProvider(root.agents, retainedIdentity?.provider ?? this.request.providerId);
+		this.sessionIdentity = retainedIdentity
+			?? createAgentSessionIdentity(this.host.source, this.provider.provider, this.sessionId);
 		if (this.host.source === 'editor') {
 			this.editorSessionPolicy = new EditorSessionPolicy(this.sessionIdentity, this.request.workspace.uri);
 		}
@@ -913,23 +930,38 @@ class AhpTask implements AgentTaskHandle {
 		await this.drainAuthNotifications();
 		this.throwIfTerminalError();
 
-		const config = await this.resolveConfig();
-		this.throwIfTerminalError();
-		await this.withAuthenticationRetry(
-			() => this.connection.createSession({
-				sessionUri: this.sessionUri,
-				provider: this.provider!.provider,
-				workingDirectories: [this.request.workspace.uri],
-				config,
-				clientId: this.clientId,
-			}),
-			'challenge',
-		);
-		this.sessionCreated = true;
-		this.throwIfTerminalError();
+		if (continuation === undefined) {
+			const config = await this.resolveConfig();
+			this.throwIfTerminalError();
+			await this.withAuthenticationRetry(
+				() => this.connection.createSession({
+					sessionUri: this.sessionUri,
+					provider: this.provider!.provider,
+					workingDirectories: [this.request.workspace.uri],
+					config,
+					clientId: this.clientId,
+				}),
+				'challenge',
+			);
+			this.sessionCreated = true;
+			this.throwIfTerminalError();
+		}
 
 		await this.ensureStartupSubscription(this.sessionUri);
 		this.editorSessionPolicy?.assertCurrentState();
+		if (continuation !== undefined) {
+			this.sessionCreated = true;
+			this.chatUri = continuation.chatUri;
+			await this.ensureStartupChatSubscription();
+			await this.dispatchAcknowledged(this.sessionUri, {
+				type: 'session/activeClientSet',
+				activeClient: {
+					clientId: this.clientId,
+					displayName: 'Copilot Agent Mesh',
+					tools: [...DELEGATED_AGENT_CLIENT_TOOLS],
+				},
+			}, 'The Agent Host did not acknowledge joining the retained Session.');
+		}
 		if (this.request.sourceWindowName !== undefined) {
 			await this.dispatchAcknowledged(this.sessionUri, {
 				type: 'session/titleChanged',
@@ -940,7 +972,9 @@ class AhpTask implements AgentTaskHandle {
 		// `creating` until its first turn materializes it. The default Chat is the
 		// readiness boundary for that first dispatch; waiting for `session/ready`
 		// here would deadlock with such providers.
-		await this.waitForDefaultChat();
+		if (continuation === undefined) {
+			await this.waitForDefaultChat();
+		}
 		this.throwIfTerminalError();
 		await this.waitForStartupRecovery();
 		while (true) {
@@ -953,9 +987,11 @@ class AhpTask implements AgentTaskHandle {
 			if (
 				dispatchGeneration !== subscribedGeneration
 				|| !dispatchGeneration.valid
-				|| this.sessionDefaultChatRevision !== defaultChatRevision
-				|| this.sessionDefaultChatState !== 'available'
-				|| this.sessionDefaultChat !== defaultChat
+				|| (continuation === undefined && (
+					this.sessionDefaultChatRevision !== defaultChatRevision
+					|| this.sessionDefaultChatState !== 'available'
+					|| this.sessionDefaultChat !== defaultChat
+				))
 				|| dispatchGeneration.subscriptions.get(defaultChat) === undefined
 			) {
 				await this.releaseStartupSubscription(defaultChat, subscribedGeneration);
@@ -965,6 +1001,13 @@ class AhpTask implements AgentTaskHandle {
 				continue;
 			}
 			this.editorSessionPolicy?.assertCurrentState();
+			if (continuation !== undefined) {
+				await this.refreshEditorSessionPolicy(dispatchGeneration.connection);
+				this.throwIfTerminalError();
+				if (!this.isCurrentGeneration(dispatchGeneration)) {
+					continue;
+				}
+			}
 			this.turnId = randomUUID();
 			this.chatUri = defaultChat;
 			this.dispatchTracked(defaultChat, {
@@ -992,6 +1035,10 @@ class AhpTask implements AgentTaskHandle {
 		this.assertWritable();
 		this.clearDelegatedToolInvocations();
 		await this.events.push({ type: 'progress', message: 'Cancellation requested.' });
+		if (this.request.continuation !== undefined) {
+			await this.cancelContinuedTurn();
+			return;
+		}
 		this.dispatchTracked(this.chatUri, {
 			type: 'chat/turnCancelled',
 			turnId: this.currentTurnId(),
@@ -1033,6 +1080,20 @@ class AhpTask implements AgentTaskHandle {
 	}
 
 	private async disposeResources(): Promise<void> {
+		// A retained Session owns prior history; stop only this task's new turn.
+		if (this.request.continuation !== undefined && this.turnId !== undefined && !this.turnEnded) {
+			try {
+				await this.cancelContinuedTurn();
+			} catch (error: unknown) {
+				this.continuationStopFailure = new AgentRuntimeError(
+					'TASK_CANCELLATION_UNCONFIRMED',
+					'The continued turn could not be confirmed stopped before detaching its client.',
+					false,
+					error,
+					true,
+				);
+			}
+		}
 		this.disposed = true;
 		if (this.authoritativeTurnTerminal && this.host.preserveTerminalSession === true) {
 			this.observeLifecycleEvent('session/clientDetachStarted');
@@ -1155,6 +1216,7 @@ class AhpTask implements AgentTaskHandle {
 		}
 		if (
 			!this.sessionDisposed
+			&& this.request.continuation === undefined
 			&& !(this.authoritativeTurnTerminal && this.host.preserveTerminalSession === true)
 		) {
 			await runCleanupPhase([{
@@ -1196,6 +1258,9 @@ class AhpTask implements AgentTaskHandle {
 			});
 		}
 		await runCleanupPhase(detachedCleanup);
+		if (this.continuationStopFailure !== undefined && !this.turnEnded) {
+			throw this.continuationStopFailure;
+		}
 		if (pumpSettleFailure !== undefined) {
 			this.subscriptionPumps.clear();
 			throw pumpSettleFailure;
@@ -1228,6 +1293,28 @@ class AhpTask implements AgentTaskHandle {
 			this.observeLifecycleEvent('session/clientDetached');
 		}
 		this.didDispose();
+	}
+
+	private cancelContinuedTurn(): Promise<void> {
+		if (this.turnEnded) {
+			return withTimeout(this.turnTerminalProcessed, this.cancelTimeoutMs, 'The continued turn did not finish detaching.');
+		}
+		if (this.continuationCancellation === undefined) {
+			if (this.chatUri === undefined) {
+				throw new AgentRuntimeError('TASK_CANCELLATION_UNCONFIRMED', 'The continued turn has no Chat to cancel.');
+			}
+			const acknowledged = this.dispatchAcknowledged(this.chatUri, {
+				type: 'chat/turnCancelled',
+				turnId: this.currentTurnId(),
+				duration: 0,
+			}, 'The Agent Host did not acknowledge cancellation of the continued turn.');
+			this.continuationCancellation = withTimeout(
+				Promise.all([acknowledged, this.turnTerminalProcessed]).then(() => undefined),
+				this.cancelTimeoutMs,
+				'The Agent Host did not confirm the continued turn stopped.',
+			);
+		}
+		return this.continuationCancellation;
 	}
 
 	private async resolveConfig(): Promise<Readonly<Record<string, unknown>>> {
@@ -1474,6 +1561,13 @@ class AhpTask implements AgentTaskHandle {
 					await this.waitForStartupRecovery();
 					continue;
 				}
+				if (
+					this.request.continuation !== undefined
+					&& (uri === this.sessionUri || uri === this.request.continuation.chatUri)
+					&& isRpcResourceNotFound(error)
+				) {
+					throw new AgentRuntimeError('TASK_RECOVERY_UNAVAILABLE', 'The retained Session or Chat no longer exists.');
+				}
 				throw error;
 			}
 			if (!this.isCurrentGeneration(generation)) {
@@ -1502,6 +1596,13 @@ class AhpTask implements AgentTaskHandle {
 				}
 			}
 			generation.subscriptions.set(uri, result.subscription);
+			if (
+				this.request.continuation !== undefined
+				&& (uri === this.sessionUri || uri === this.request.continuation.chatUri)
+				&& result.snapshot === undefined
+			) {
+				throw new AgentRuntimeError('TASK_RECOVERY_UNAVAILABLE', 'The retained Session or Chat is unavailable.');
+			}
 			if (result.snapshot !== undefined) {
 				await this.applySnapshot(result.snapshot);
 			}
@@ -1521,6 +1622,11 @@ class AhpTask implements AgentTaskHandle {
 	}
 
 	private async ensureStartupChatSubscription(): Promise<string> {
+		const continuation = this.request.continuation;
+		if (continuation !== undefined) {
+			await this.ensureStartupSubscription(continuation.chatUri);
+			return continuation.chatUri;
+		}
 		if (this.sessionDefaultChatState === 'cleared') {
 			throw new AgentRuntimeError(
 				'TASK_EXECUTION_FAILED',
@@ -1649,10 +1755,40 @@ class AhpTask implements AgentTaskHandle {
 	): Promise<void> {
 		this.lastSeenServerSeq = Math.max(this.lastSeenServerSeq, envelope.serverSeq);
 		this.acknowledgeDispatch(envelope);
+		const action = envelope.action;
+		const authoritativeTurnTerminal = (
+			envelope.rejectionReason === undefined
+			&& envelope.channel === this.chatUri
+			&& (
+				action.type === 'chat/turnComplete'
+				|| action.type === 'chat/turnCancelled'
+				|| action.type === 'chat/error'
+			)
+			&& action.turnId === this.turnId
+		);
 		if (this.sessionPolicyFailure !== undefined) {
+			if (authoritativeTurnTerminal) {
+				this.turnEnded = true;
+				this.resolveTurnTerminalProcessed();
+			}
 			return;
 		}
-		const action = envelope.action;
+		if (
+			this.request.continuation !== undefined
+			&& envelope.channel === this.chatUri
+			&& this.turnId === undefined
+			&& action.type === 'chat/turnStarted'
+		) {
+			this.fail(new AgentRuntimeError('TASK_RECOVERY_UNAVAILABLE', 'Another turn started in the retained Chat.'));
+			return;
+		}
+		if (this.request.continuation !== undefined && action.type.startsWith('chat/') && (
+			envelope.channel !== this.chatUri
+			|| this.turnId === undefined
+			|| ('turnId' in action && action.turnId !== this.turnId)
+		)) {
+			return;
+		}
 		this.trackDelegatedToolInvocation(envelope);
 		if (envelope.channel === rootUri) {
 			if (action.type === 'root/agentsChanged') {
@@ -1688,15 +1824,6 @@ class AhpTask implements AgentTaskHandle {
 				}
 			}
 		}
-		const authoritativeTurnTerminal = (
-			envelope.channel === this.chatUri
-			&& (
-				action.type === 'chat/turnComplete'
-				|| action.type === 'chat/turnCancelled'
-				|| action.type === 'chat/error'
-			)
-			&& action.turnId === this.turnId
-		);
 		if (
 			envelope.channel === this.chatUri
 			&& (
@@ -1704,7 +1831,7 @@ class AhpTask implements AgentTaskHandle {
 				|| action.type === 'chat/turnCancelled'
 				|| action.type === 'chat/error'
 			)
-			&& !authoritativeTurnTerminal
+			&& action.turnId !== this.turnId
 		) {
 			return;
 		}
@@ -1738,25 +1865,30 @@ class AhpTask implements AgentTaskHandle {
 		connection: AhpConnection,
 		sessionSubscription?: AhpSubscription,
 	): Promise<void> {
-		this.clearCancellationTimer();
-		let retained = false;
+		this.turnEnded = true;
 		try {
-			await this.prepareTerminalSessionHistory(connection, sessionSubscription);
-			retained = true;
-		} catch (error) {
-			if (this.disposed) {
-				return;
+			this.clearCancellationTimer();
+			let retained = false;
+			try {
+				await this.prepareTerminalSessionHistory(connection, sessionSubscription);
+				retained = true;
+			} catch (error) {
+				if (this.disposed) {
+					return;
+				}
+				if (error instanceof EditorSessionPolicyError) {
+					this.sessionPolicyFailure = error;
+				}
+				if (type === 'chat/turnComplete') {
+					this.fail(normalizeRuntimeError(error));
+					return;
+				}
+				this.terminalHistoryPreparationFailure = normalizeRuntimeError(error);
 			}
-			if (error instanceof EditorSessionPolicyError) {
-				this.sessionPolicyFailure = error;
-			}
-			if (type === 'chat/turnComplete') {
-				this.fail(normalizeRuntimeError(error));
-				return;
-			}
-			this.terminalHistoryPreparationFailure = normalizeRuntimeError(error);
+			await this.emitMappedEvents(events, retained);
+		} finally {
+			this.resolveTurnTerminalProcessed();
 		}
-		await this.emitMappedEvents(events, retained);
 	}
 
 	private async prepareTerminalSessionHistory(
@@ -1831,6 +1963,7 @@ class AhpTask implements AgentTaskHandle {
 			if (snapshot?.resource !== this.sessionUri) {
 				throw new EditorSessionPolicyError();
 			}
+			this.assertContinuationSessionSnapshot(snapshot);
 			policy.acceptSnapshot(snapshot);
 		});
 		this.editorPolicyRefreshes.set(connection, operation);
@@ -2070,6 +2203,7 @@ class AhpTask implements AgentTaskHandle {
 	): Promise<void> {
 		this.lastSeenServerSeq = Math.max(this.lastSeenServerSeq, snapshot.fromSeq);
 		if (snapshot.resource === this.sessionUri) {
+			this.assertContinuationSessionSnapshot(snapshot);
 			const state = snapshot.state as SessionState;
 			const lifecycle = String(state.lifecycle);
 			if (lifecycle === 'failed' || lifecycle === 'creationFailed') {
@@ -2104,11 +2238,48 @@ class AhpTask implements AgentTaskHandle {
 			return;
 		}
 		if (snapshot.resource === this.chatUri) {
+			if (this.request.continuation !== undefined && this.turnId === undefined) {
+				const state = snapshot.state;
+				if (
+					!isRecord(state)
+					|| !isIdleContinuationStatus(state.status)
+					|| state.activeTurn !== undefined
+					|| state.steeringMessage !== undefined
+					|| (state.queuedMessages !== undefined
+						&& (!Array.isArray(state.queuedMessages) || state.queuedMessages.length > 0))
+				) {
+					throw new AgentRuntimeError('TASK_RECOVERY_UNAVAILABLE', 'The retained Chat is not idle.');
+				}
+				return;
+			}
 			await this.applyChatSnapshot(
 				snapshot.state,
 				snapshot.resource,
 				terminalCatalogConnection,
 				terminalSessionSubscription,
+			);
+		}
+	}
+
+	private assertContinuationSessionSnapshot(snapshot: Snapshot): void {
+		const continuation = this.request.continuation;
+		if (continuation === undefined || this.turnId !== undefined) {
+			return;
+		}
+		const state = snapshot.state;
+		if (
+			!isRecord(state)
+			|| state.lifecycle !== 'ready'
+			|| !isIdleContinuationStatus(state.status)
+			|| !Array.isArray(state.activeClients)
+			|| state.activeClients.some((client) => !isRecord(client) || client.clientId !== this.clientId)
+			|| (state.defaultChat !== continuation.chatUri
+				&& (!Array.isArray(state.chats)
+					|| !state.chats.some((chat) => isRecord(chat) && chat.resource === continuation.chatUri)))
+		) {
+			throw new AgentRuntimeError(
+				'TASK_RECOVERY_UNAVAILABLE',
+				'The retained Session is unavailable, busy, or no longer owns the original Chat.',
 			);
 		}
 	}
@@ -2725,7 +2896,8 @@ class AhpTask implements AgentTaskHandle {
 					recoveredSubscriptions,
 					candidateAbortShutdown,
 					() => this.retainedRecoveryCandidates.delete(retainedCandidate),
-					error instanceof EditorSessionPolicyError ? this.sessionUri : undefined,
+					error instanceof EditorSessionPolicyError && this.request.continuation === undefined
+						? this.sessionUri : undefined,
 				);
 				this.retainedRecoveryCandidates.add(retainedCandidate);
 				try {
@@ -2869,7 +3041,7 @@ class AhpTask implements AgentTaskHandle {
 			);
 			if (toolName !== undefined) {
 				this.delegatedToolInvocations.observe({
-					scopeId: this.sessionUri,
+					scopeId: this.delegatedInvocationScope,
 					invocationId,
 					toolName,
 					toolInput: envelope.action.toolInput,
@@ -2877,14 +3049,18 @@ class AhpTask implements AgentTaskHandle {
 				});
 			}
 		} else if (envelope.action.type === 'chat/toolCallComplete') {
-			this.delegatedToolInvocations.forget(this.sessionUri, invocationId);
+			this.delegatedToolInvocations.forget(this.delegatedInvocationScope, invocationId);
 		}
 	}
 
 	private clearDelegatedToolInvocations(): void {
 		if (this.sessionIdentity !== undefined) {
-			this.delegatedToolInvocations?.clearScope(this.sessionIdentity.uri);
+			this.delegatedToolInvocations?.clearScope(this.delegatedInvocationScope);
 		}
+	}
+
+	private get delegatedInvocationScope(): string {
+		return `${this.sessionUri}\0${this.taskId}`;
 	}
 }
 
@@ -2910,6 +3086,40 @@ function validateRequest(request: AgentTaskRequest): void {
 	if (request.sourceWindowName !== undefined && request.sourceWindowName.trim().length === 0) {
 		throw new AgentRuntimeError('TASK_EXECUTION_FAILED', 'A delegated task source window name cannot be empty.');
 	}
+	if (request.continuation !== undefined && (
+		typeof request.continuation.chatUri !== 'string'
+		|| request.continuation.chatUri.length === 0
+		|| request.continuation.chatUri.length > 16_384
+	)) {
+		throw new AgentRuntimeError('TASK_RECOVERY_UNAVAILABLE', 'A retained Chat identity is required.');
+	}
+}
+
+function retainedSessionIdentity(
+	sessionUri: string,
+	host: LaunchedAgentHost,
+	providerId?: string,
+): AgentSessionIdentity {
+	const match = typeof sessionUri === 'string'
+		? /^([a-z][a-z0-9+.-]*):\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.exec(sessionUri)
+		: null;
+	if (
+		host.source !== 'editor'
+		|| host.preserveTerminalSession !== true
+		|| match === null
+		|| (providerId !== undefined && providerId !== match[1])
+	) {
+		throw new AgentRuntimeError('TASK_RECOVERY_UNAVAILABLE', 'The task requires its retained native editor Session.');
+	}
+	return { provider: match[1], uri: sessionUri };
+}
+
+function isIdleContinuationStatus(status: unknown): boolean {
+	return typeof status === 'number'
+		&& Number.isSafeInteger(status)
+		&& status >= 0
+		&& (status & sessionStatusIdle) !== 0
+		&& (status & (sessionStatusError | sessionStatusInProgress | sessionStatusArchived)) === 0;
 }
 
 function validateWorkspace(workspaceId: string, workspace: ResolvedAgentTaskRequest['workspace']): void {
@@ -3490,6 +3700,10 @@ function isRpcInternalError(error: unknown): boolean {
 		&& error !== null
 		&& 'code' in error
 		&& error.code === -32603;
+}
+
+function isRpcResourceNotFound(error: unknown): boolean {
+	return isRecord(error) && (error.code === -32001 || error.code === -32008);
 }
 
 export function isUsableTerminalSessionStatus(status: number): boolean {

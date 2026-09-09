@@ -6,6 +6,12 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [Unreleased]
 
+- Add explicit `meshDelegateTask.continueFromTaskId` session reuse for completed
+  tasks on the same authorized target. Follow-ups get independent task IDs,
+  grants and turns while retaining editor conversation context; omitted input
+  preserves fresh-session behavior, and unavailable sessions never silently
+  fall back to new ones.
+
 ## [0.5.0 Preview] - 2026-09-09
 
 - Enable same-device discovery, Mesh task tools, window naming and policy

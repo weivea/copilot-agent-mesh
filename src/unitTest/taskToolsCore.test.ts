@@ -413,6 +413,35 @@ suite('TaskToolsCore', () => {
 		assert.equal(facade.cancelCalls, 0);
 	});
 
+	test('continuation is explicit, validated and forwarded for handles and exact targets', async () => {
+		for (const useHandle of [false, true]) {
+			const facade = new RecordingFacade();
+			facade.delegationSnapshot = runningSnapshot();
+			const scoped = Object.assign(facade, {
+				resolveTargetHandle: async () => ({
+					deviceId: DEVICE_ID, nodeId: NODE_ID, nodeInstanceId: NODE_INSTANCE_ID,
+					workspaceId: WORKSPACE_ID, peerId: PEER_ID,
+				}),
+			});
+			const input = useHandle
+				? { targetHandle: 'h'.repeat(32), title: 'Follow-up', prompt: 'Continue the work.' }
+				: delegationInput();
+			const core = new TaskToolsCore(scoped);
+			await core.delegateTask({ ...input, mode: 'submit' });
+			assert.equal(Object.hasOwn(facade.persistedIntents[0], 'continueFromTaskId'), false);
+			await core.delegateTask({ ...input, mode: 'submit', continueFromTaskId: OTHER_TASK_ID });
+			assert.equal(facade.persistedIntents[1].continueFromTaskId, OTHER_TASK_ID);
+			const prepared = await core.prepareDelegateInvocation({ ...input, continueFromTaskId: OTHER_TASK_ID });
+			assert.match(prepared.confirmationMessage, /Session: reuse completed task/);
+			assert.match(prepared.confirmationMessage, /conversation history/);
+			for (const invalid of ['', 'session:/arbitrary', true, null]) {
+				assert.equal((await core.delegateTask({ ...input, continueFromTaskId: invalid })).status, 'error');
+			}
+			assert.equal((await core.delegateTask({ ...input, sessionId: OTHER_TASK_ID })).status, 'error');
+			assert.equal(facade.persistCalls, 2);
+		}
+	});
+
 	test('lists only bounded opaque Device -> Node -> Workspace metadata', async () => {
 		const facade = new RecordingFacade();
 		const core = new TaskToolsCore(facade);
@@ -1929,6 +1958,7 @@ suite('Mesh tool manifest contract', () => {
 		assert.match(delegateDescriptor.modelDescription, /mesh_get_task with waitFor=outcome/);
 		const delegateProperties = delegateDescriptor.inputSchema.properties as Record<string, unknown>;
 		assert.ok(delegateProperties.delegationRequestId);
+		assert.ok(delegateProperties.continueFromTaskId);
 		assert.deepStrictEqual(delegateProperties.timeoutMinutes, {
 			type: 'integer',
 			minimum: 1,

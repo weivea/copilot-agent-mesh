@@ -829,6 +829,7 @@ function renderWindowTaskConfirmation(
 		<dt>Target window</dt><dd>${escapeHtml(request.targetWindowLabel)}</dd>
 		<dt>Workspace</dt><dd>${escapeHtml(request.workspaceDisplayName)}</dd>
 		<dt>Title</dt><dd>${escapeHtml(request.taskTitle)}</dd>
+		${request.continueFromTaskId === undefined ? '' : `<dt>Session</dt><dd>Reuse completed task ${escapeHtml(request.continueFromTaskId)}, including conversation history. Approval applies to this new task only.</dd>`}
 	</dl>
 	<h2>Full prompt</h2>
 	<pre>${escapeHtml(request.prompt)}</pre>
@@ -896,6 +897,7 @@ function runtimeApprovalDetail(request: ResolvedAgentTaskRequest): string {
 	return [
 		`Workspace: ${request.workspace.displayName} (${request.workspaceId})`,
 		`Title: ${request.title}`,
+		...(request.continuation === undefined ? [] : ['Session: reuse the retained conversation history for this task.']),
 		'',
 		'Full prompt:',
 		request.prompt,
@@ -930,6 +932,7 @@ function runtimeApprovalHash(request: ResolvedAgentTaskRequest): string {
 		title: request.title,
 		prompt: request.prompt,
 		acceptanceCriteria: request.acceptanceCriteria ?? [],
+		continuation: request.continuation,
 	});
 }
 
@@ -939,6 +942,7 @@ function approvalHash(request: {
 	readonly title: string;
 	readonly prompt: string;
 	readonly acceptanceCriteria: readonly string[];
+	readonly continuation?: AgentTaskRequest['continuation'];
 }): string {
 	return createHash('sha256').update([
 		request.taskId,
@@ -947,5 +951,6 @@ function approvalHash(request: {
 		request.prompt,
 		String(request.acceptanceCriteria.length),
 		...request.acceptanceCriteria,
+		...(request.continuation === undefined ? [] : [request.continuation.sessionUri, request.continuation.chatUri]),
 	].map((value) => `${Buffer.byteLength(value, 'utf8')}:${value}`).join(''), 'utf8').digest('hex');
 }
