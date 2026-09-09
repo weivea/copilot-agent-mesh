@@ -54,8 +54,10 @@ workflow adds no physical-device, platform, production or SLA validation.
 
 Use Node.js 22 or newer and the Go version declared in
 `native/windows-process-host/go.mod` or newer. Go is needed only to build the
-bundled Windows helpers, including when packaging on macOS or Linux. Extension
-users do not need Go or any new platform opt-in:
+bundled Windows helpers, including when packaging on macOS or Linux. Both standard
+Go distributions and Homebrew's `libexec` layout are supported; the build bundles
+the license from the selected Go installation. Extension users do not need Go or
+any new platform opt-in:
 
 ```sh
 git submodule update --init --recursive
