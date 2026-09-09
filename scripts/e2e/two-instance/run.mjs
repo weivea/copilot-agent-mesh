@@ -12,10 +12,21 @@ import {
 	stat,
 	writeFile,
 } from 'node:fs/promises';
-import { tmpdir, homedir } from 'node:os';
+import { homedir } from 'node:os';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+	assertNoPathAliases,
+	assertVscodeExecutable,
+	commandContainsPath,
+	guiEnvironment,
+	pathsOverlap,
+	readProcessTable as inspectProcesses,
+	realProfileDirectories,
+	supportsWorker,
+} from '../multi-window/platform.mjs';
+import { HarnessProcesses, runWindowsHarnessCommand } from '../multi-window/owned-processes.mjs';
 
 import {
 	downloadAndUnzipVSCode,
@@ -23,35 +34,70 @@ import {
 	runTests,
 } from '@vscode/test-electron';
 
-const expectedDevTunnelSha256 = '004f3cc8ebcce61223bacac80d31937eb2e92eaee9a05600a1cb62fb5f775afe';
-const devTunnelUrl = 'https://tunnelsassetsprod.blob.core.windows.net/cli/1.0.2030+fc9273aa0f/osx-arm64-devtunnel';
+const devTunnelArtifact = process.platform === 'win32' ? 'devtunnel.exe' : 'osx-arm64-devtunnel';
+const expectedDevTunnelSha256 = process.platform === 'win32'
+	? '78190ac81c664828858de2390fd9c15eeec0e4edfe4e7b0d6a323dc49df625db'
+	: '004f3cc8ebcce61223bacac80d31937eb2e92eaee9a05600a1cb62fb5f775afe';
+const devTunnelUrl = `https://tunnelsassetsprod.blob.core.windows.net/cli/1.0.2030+fc9273aa0f/${devTunnelArtifact}`;
 const terminalStates = new Set(['completed', 'failed', 'cancelled', 'timedOut']);
 const forceFallbackCleanup = process.env.MESH_TWO_DEVICE_E2E_FORCE_FALLBACK_CLEANUP === '1';
 const scriptDir = dirname(fileURLToPath(import.meta.url));
-const repoRoot = resolve(scriptDir, '../../..');
+const repoRoot = resolve(scriptDir, '..', '..', '..');
 const require = createRequire(import.meta.url);
+require('tsx/cjs');
+const { parseProcessTable } = require(join(repoRoot, 'src', 'e2e', 'MultiWindowE2eSupport.ts'));
 const {
 	decodeDevTunnelShowJson,
 	isExactDevTunnelNotFound,
 	SUPPORTED_DEVTUNNEL_BUILD,
-} = require(join(repoRoot, 'out/src/tunnel/DevTunnelJsonDecoder.js'));
+} = require(join(repoRoot, 'src', 'tunnel', 'DevTunnelJsonDecoder.ts'));
 
 if (process.env.MESH_TWO_DEVICE_E2E !== '1') {
 	throw new Error('MESH_TWO_DEVICE_E2E=1 is required because this test creates a public Dev Tunnel and may invoke Agent Host.');
 }
-if (process.platform !== 'darwin' || process.arch !== 'arm64') {
-	throw new Error('The real two-instance E2E requires macOS arm64.');
+if (!supportsWorker()) {
+	throw new Error('The real two-instance E2E requires Windows x64/ARM64 or macOS arm64.');
 }
 
+const evidenceBase = join(repoRoot, '.vscode-test', 'two-instance-evidence');
+const runtimeBase = process.env.MESH_TWO_DEVICE_E2E_RUNTIME_DIR
+	? resolve(process.env.MESH_TWO_DEVICE_E2E_RUNTIME_DIR)
+	: join(repoRoot, '.two-instance');
+if (['/tmp', '/var/tmp', '/private/tmp'].some((root) =>
+	runtimeBase === root || runtimeBase.startsWith(`${root}/`),
+)) {
+	throw new Error('The two-instance E2E runtime must not use a system temporary directory.');
+}
+if (process.platform === 'darwin' && Buffer.byteLength(
+	join(runtimeBase, 'run-123456', 'coordinator', 'user-data', '1.13-main.sock'),
+) > 103) {
+	throw new Error('Set MESH_TWO_DEVICE_E2E_RUNTIME_DIR to a short non-temporary directory for macOS IPC.');
+}
+await assertNoPathAliases(runtimeBase);
+await assertNoPathAliases(evidenceBase);
+if (realProfileDirectories().some((profile) => pathsOverlap(runtimeBase, profile))) {
+	throw new Error('Two-instance E2E runtime must not overlap a real VS Code profile.');
+}
+await mkdir(evidenceBase, { recursive: true });
+await mkdir(runtimeBase, { recursive: true });
 const evidenceRoot = process.env.MESH_TWO_DEVICE_E2E_EVIDENCE_DIR
 	? resolve(process.env.MESH_TWO_DEVICE_E2E_EVIDENCE_DIR)
-	: await mkdtemp(join(tmpdir(), 'copilot-agent-mesh-two-instance-e2e-'));
-const runtimeRoot = await mkdtemp(join(tmpdir(), 'cam2-'));
+	: await mkdtemp(join(evidenceBase, 'run-'));
+await assertNoPathAliases(evidenceRoot);
+if (
+	pathsOverlap(evidenceRoot, runtimeBase)
+	|| realProfileDirectories().some((profile) => pathsOverlap(evidenceRoot, profile))
+) {
+	throw new Error('Two-instance evidence must not overlap the runtime or a real VS Code profile.');
+}
+await mkdir(evidenceRoot, { recursive: true });
+const runtimeRoot = await mkdtemp(join(runtimeBase, 'run-'));
 const worker = hostPaths('worker');
 const coordinator = hostPaths('coordinator');
 const workspace = join(runtimeRoot, 'temporary-workspace');
-const extensionTestsPath = join(repoRoot, 'out/src/e2e/twoInstanceHost.js');
+const extensionTestsPath = join(repoRoot, 'out', 'src', 'e2e', 'twoInstanceHost.js');
 const rawLogs = [];
+const harnessProcesses = new HarnessProcesses();
 let invitation;
 let devTunnelPath;
 let downloadedDevTunnel = false;
@@ -72,6 +118,16 @@ let baselineConfiguredDevTunnelPids = new Set();
 let ownedTunnel;
 let cleanupFailure;
 let listenerStartAttempted = false;
+let interrupted = false;
+for (const signal of ['SIGINT', 'SIGTERM']) {
+	process.once(signal, () => {
+		interrupted = true;
+		process.exitCode = signal === 'SIGINT' ? 130 : 143;
+		void harnessProcesses.disposeWindows({ stopLaunching: true }).catch((error) => {
+			cleanupFailure ??= error;
+		});
+	});
+}
 
 try {
 	await Promise.all([
@@ -90,6 +146,8 @@ try {
 	vscodeExecutablePath = process.env.MESH_VSCODE_EXECUTABLE
 		? resolve(process.env.MESH_VSCODE_EXECUTABLE)
 		: await downloadAndUnzipVSCode('stable');
+	await access(vscodeExecutablePath);
+	assertVscodeExecutable(vscodeExecutablePath);
 	codeCli = process.env.MESH_CODE_CLI
 		? resolve(process.env.MESH_CODE_CLI)
 		: resolveCliPathFromVSCodeExecutablePath(vscodeExecutablePath);
@@ -133,7 +191,7 @@ try {
 		controlPath: worker.control,
 		globalStoragePath: join(
 			worker.userData,
-			'User/globalStorage/weivea.copilot-agent-mesh',
+			'User', 'globalStorage', 'weivea.copilot-agent-mesh',
 		),
 	})}\n`, { mode: 0o600 });
 	const invitationResponse = await request(worker, 'listener.invite');
@@ -272,6 +330,7 @@ try {
 		}
 	}
 } finally {
+	try {
 	invitation = undefined;
 	if (
 		!forceFallbackCleanup
@@ -296,7 +355,7 @@ try {
 		coordinator.userData,
 		worker.extensions,
 		coordinator.extensions,
-		join(worker.userData, 'User/globalStorage/weivea.copilot-agent-mesh/agent-host'),
+		join(worker.userData, 'User', 'globalStorage', 'weivea.copilot-agent-mesh', 'agent-host'),
 	].filter((marker) => typeof marker === 'string');
 	const hostSettlement = Promise.allSettled([workerRun, coordinatorRun].filter(Boolean));
 	let hostResults = await Promise.race([
@@ -323,7 +382,7 @@ try {
 		: listProcessesByExecutable(devTunnelPath).filter(
 			({ pid }) => !baselineConfiguredDevTunnelPids.has(pid),
 		);
-	ownedProcessesStopped = listOwnedProcesses(ownedMarkers).length === 0
+	ownedProcessesStopped = (await listOwnedProcesses(ownedMarkers)).length === 0
 		&& configuredLeaks.length === 0;
 
 	if (
@@ -374,6 +433,9 @@ try {
 			errorCode: 'CLEANUP_UNCONFIRMED',
 		})}\n`, { mode: 0o600 });
 	}
+	} finally {
+		await harnessProcesses.disposeWindows({ stopLaunching: true });
+	}
 }
 
 if (!['deleted', 'already-absent'].includes(tunnelCleanup) && listenerStartAttempted) {
@@ -391,10 +453,12 @@ if (hostFailures.length > 0) {
 
 const evidence = {
 	schemaVersion: 1,
-	baseline: '06775c7e2e8a18f7771507e4a739fad0b865d9a0',
+	release: '0.5.0-preview',
+	platform: { os: process.platform, architecture: process.arch },
 	devTunnel: {
 		build: '1.0.2030+fc9273aa0f',
 		sha256: expectedDevTunnelSha256,
+		architecture: process.platform === 'win32' ? 'x64' : 'arm64',
 		cleanup: tunnelCleanup,
 		cleanupMethod: tunnelCleanupMethod,
 	},
@@ -459,7 +523,7 @@ async function writeSettings(host, name) {
 			},
 		}
 		: {};
-	await writeFile(join(host.userData, 'User/settings.json'), `${JSON.stringify({
+	await writeFile(join(host.userData, 'User', 'settings.json'), `${JSON.stringify({
 		'copilotAgentMesh.deviceName': name,
 		'copilotAgentMesh.devTunnelPath': devTunnelPath,
 		'copilotAgentMesh.codePath': codeCli,
@@ -472,30 +536,59 @@ async function writeSettings(host, name) {
 
 function launchHost(host, role) {
 	const output = createWriteStream(host.log, { flags: 'wx', mode: 0o600 });
+	output.on('error', (error) => { hostFailures.push(error); });
 	rawLogs.push({ host, output });
-	const running = runTests({
+	const launchArgs = [
+		workspace,
+		`--user-data-dir=${host.userData}`,
+		`--extensions-dir=${host.extensions}`,
+		'--disable-extensions',
+		'--disable-gpu',
+		'--skip-welcome',
+		'--skip-release-notes',
+		'--new-window',
+	];
+	const extensionTestsEnv = {
+		MESH_TWO_DEVICE_E2E: '1',
+		MESH_TWO_DEVICE_E2E_CONTROL_DIR: host.control,
+		MESH_TWO_DEVICE_E2E_NONCE: host.nonce,
+		MESH_TWO_DEVICE_E2E_ROLE: role,
+	};
+	const running = (async () => {
+		await new Promise((resolveOpen, rejectOpen) => {
+			output.once('open', resolveOpen);
+			output.once('error', rejectOpen);
+		});
+		if (interrupted) {
+			throw new Error('Two-instance E2E was interrupted before launch.');
+		}
+		if (process.platform === 'win32') {
+			const child = await harnessProcesses.launch(vscodeExecutablePath, [
+				...launchArgs,
+				`--extensionDevelopmentPath=${repoRoot}`,
+				`--extensionTestsPath=${extensionTestsPath}`,
+			], {
+				env: { ...guiEnvironment(), ...extensionTestsEnv },
+				stdio: ['ignore', 'pipe', 'pipe'],
+			});
+			child.stdout.pipe(output, { end: false });
+			child.stderr.pipe(output, { end: false });
+			const code = await child.completion;
+			if (code !== 0) {
+				throw new Error(`The owned VS Code Development Host exited ${code}.`);
+			}
+			return;
+		}
+		await runTests({
 		vscodeExecutablePath,
 		extensionDevelopmentPath: repoRoot,
 		extensionTestsPath,
-		launchArgs: [
-			workspace,
-			`--user-data-dir=${host.userData}`,
-			`--extensions-dir=${host.extensions}`,
-			'--disable-extensions',
-			'--disable-gpu',
-			'--skip-welcome',
-			'--skip-release-notes',
-			'--new-window',
-		],
-		extensionTestsEnv: {
-			MESH_TWO_DEVICE_E2E: '1',
-			MESH_TWO_DEVICE_E2E_CONTROL_DIR: host.control,
-			MESH_TWO_DEVICE_E2E_NONCE: host.nonce,
-			MESH_TWO_DEVICE_E2E_ROLE: role,
-		},
+		launchArgs,
+		extensionTestsEnv,
 		stdout: output,
 		stderr: output,
-	});
+		});
+	})();
 	// Attach immediately so an early Extension Host failure is retained for the
 	// coordinated shutdown path instead of becoming an unhandled rejection.
 	void running.catch(() => undefined);
@@ -503,6 +596,9 @@ function launchHost(host, role) {
 }
 
 async function request(host, action, params = {}, timeoutMs = 30_000) {
+	if (interrupted && !['host.shutdown', 'listener.stop', 'tunnel.cleanup'].includes(action)) {
+		throw new Error('Two-instance E2E was interrupted.');
+	}
 	const id = randomUUID();
 	const requestPath = join(host.control, 'requests', `${id}.json`);
 	const temporary = `${requestPath}.tmp`;
@@ -586,9 +682,9 @@ async function shutdownHost(host) {
 
 async function prepareDevTunnel() {
 	const configured = process.env.MESH_DEVTUNNEL_PATH;
-	const path = configured ? resolve(configured) : join(runtimeRoot, 'osx-arm64-devtunnel');
+	const path = configured ? resolve(configured) : join(runtimeRoot, devTunnelArtifact);
 	if (!configured) {
-		const response = await fetch(devTunnelUrl);
+		const response = await fetch(devTunnelUrl, { signal: AbortSignal.timeout(60_000) });
 		if (!response.ok) {
 			throw new Error(`Official Dev Tunnel download failed with HTTP ${response.status}.`);
 		}
@@ -610,7 +706,7 @@ async function fallbackDeleteOwnedTunnel(metadata) {
 		throw new Error('Retained owned Tunnel metadata is incomplete.');
 	}
 	await verifyExactDevTunnel(metadata.executablePath);
-	let shown = runDevTunnel(metadata.executablePath, ['show', metadata.tunnelId, '--json'], [0, 2]);
+	let shown = await runDevTunnel(metadata.executablePath, ['show', metadata.tunnelId, '--json'], [0, 2]);
 	if (isExactDevTunnelNotFound(metadata.build, shown, metadata.tunnelId)) {
 		return 'already-absent';
 	}
@@ -623,10 +719,10 @@ async function fallbackDeleteOwnedTunnel(metadata) {
 		expectedTunnelId: metadata.tunnelId,
 		requireForwardingUri: false,
 	});
-	runDevTunnel(metadata.executablePath, ['delete', metadata.tunnelId], [0]);
+	await runDevTunnel(metadata.executablePath, ['delete', metadata.tunnelId], [0]);
 	const deadline = Date.now() + 30_000;
 	do {
-		shown = runDevTunnel(metadata.executablePath, ['show', metadata.tunnelId, '--json'], [0, 2]);
+		shown = await runDevTunnel(metadata.executablePath, ['show', metadata.tunnelId, '--json'], [0, 2]);
 		if (isExactDevTunnelNotFound(metadata.build, shown, metadata.tunnelId)) {
 			return 'deleted';
 		}
@@ -642,8 +738,12 @@ async function verifyExactDevTunnel(path) {
 	}
 }
 
-function runDevTunnel(executable, args, acceptedExitCodes) {
-	const result = spawnSync(executable, args, {
+async function runDevTunnel(executable, args, acceptedExitCodes) {
+	const result = process.platform === 'win32'
+		? await runWindowsHarnessCommand(executable, args, {
+			timeoutMs: 30_000, maxOutputBytes: 256 * 1024,
+		})
+		: spawnSync(executable, args, {
 		encoding: 'utf8',
 		maxBuffer: 256 * 1024,
 		timeout: 30_000,
@@ -708,30 +808,29 @@ async function sanitizeLogs() {
 	}
 }
 
-function listOwnedProcesses(markers) {
-	const result = spawnSync('ps', ['-axo', 'pid=,command='], { encoding: 'utf8' });
-	if (result.status !== 0) {
-		throw new Error('Unable to inspect owned E2E processes.');
+async function listOwnedProcesses(markers) {
+	if (process.platform === 'win32') {
+		return harnessProcesses.ownedWindowsProcesses(parseProcessTable);
 	}
-	return result.stdout
-		.split(/\r?\n/u)
-		.map((line) => {
-			const match = /^\s*(\d+)\s+(.+)$/u.exec(line);
-			return match === null ? undefined : { pid: Number(match[1]), command: match[2] };
-		})
+	return inspectProcesses(parseProcessTable)
 		.filter((entry) =>
-			entry !== undefined
-			&& entry.pid !== process.pid
-			&& markers.some((marker) => entry.command.includes(marker)),
+			entry.pid !== process.pid
+			&& markers.some((marker) => commandContainsPath(entry.command, marker)),
 		);
 }
 
 function listProcessesByExecutable(executable) {
-	return listOwnedProcesses([executable]);
+	return executable === undefined ? [] : inspectProcesses(parseProcessTable).filter((entry) =>
+		entry.pid !== process.pid && commandContainsPath(entry.command, executable),
+	);
 }
 
 async function terminateOwnedProcesses(markers) {
-	let remaining = listOwnedProcesses(markers);
+	if (process.platform === 'win32') {
+		await harnessProcesses.disposeWindows({ stopLaunching: true });
+		return;
+	}
+	let remaining = await listOwnedProcesses(markers);
 	for (const processInfo of remaining) {
 		try {
 			process.kill(processInfo.pid, 'SIGTERM');
@@ -743,7 +842,7 @@ async function terminateOwnedProcesses(markers) {
 	}
 	const deadline = Date.now() + 5_000;
 	do {
-		remaining = listOwnedProcesses(markers);
+		remaining = await listOwnedProcesses(markers);
 		if (remaining.length === 0) {
 			return;
 		}

@@ -18,12 +18,14 @@ import type {
 } from './AgentHostLauncher';
 import {
 	EditorAgentHostLocator,
+	EditorAgentHostLocatorError,
 	type LocatedEditorAgentHost,
 } from './EditorAgentHostLocator';
 import {
 	UnixSocketWebSocketConnector,
 	UnixSocketWebSocketError,
 } from './UnixSocketWebSocketConnector';
+import { EditorSessionPolicyError } from './EditorSessionPolicy';
 
 const borrowedEditorEndpoint = new URL('ws://editor-agent-host.invalid/');
 const defaultEditorConnectionRetryDelaysMs = [90_000] as const;
@@ -401,10 +403,13 @@ export class EditorAgentHostLauncher implements AgentHostLauncherLike {
 		};
 		const operation = this.locator.locate(controller.signal)
 			.then((located) => new BorrowedEditorAgentHost(located, this.connector))
-			.catch(() => {
+			.catch((error: unknown) => {
 				throw new AgentRuntimeError(
 					'AGENT_UNAVAILABLE',
 					'The editor Agent Host endpoint is unavailable.',
+					false,
+					undefined,
+					error instanceof EditorAgentHostLocatorError && error.cleanupRequired,
 				);
 			})
 			.finally(() => {
@@ -417,14 +422,12 @@ export class EditorAgentHostLauncher implements AgentHostLauncherLike {
 	}
 
 	public async dispose(): Promise<void> {
-		if (this.disposed) {
-			return;
-		}
 		this.disposed = true;
 		for (const operation of this.inFlight) {
 			operation.controller.abort();
 		}
 		await Promise.allSettled([...this.inFlight].map(({ operation }) => operation));
+		await this.locator.dispose();
 	}
 }
 
@@ -500,7 +503,8 @@ function safeEditorFailure(error: unknown): AgentHostSourceFailure {
 		? error.code
 		: 'TASK_EXECUTION_FAILED';
 	const message = error instanceof AgentRuntimeError ? error.message : '';
-	const stage = ['AGENT_AUTH_REQUIRED', 'AGENT_AUTH_FAILED', 'AGENT_CONFIG_REQUIRED'].includes(code)
+	const stage = error instanceof EditorSessionPolicyError
+		|| ['AGENT_AUTH_REQUIRED', 'AGENT_AUTH_FAILED', 'AGENT_CONFIG_REQUIRED'].includes(code)
 		? 'session'
 		: /endpoint is unavailable/u.test(message)
 		? 'discovery'

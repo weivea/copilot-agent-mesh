@@ -1,11 +1,13 @@
 # Copilot Agent Mesh
 
-Copilot Agent Mesh 0.4.0 Preview adds default-off **Peer Window Delegation** for
-ordinary VS Code windows on one macOS arm64 device. In Agent mode, Copilot can use
+Copilot Agent Mesh 0.5.0 Preview provides **Peer Window Delegation** for ordinary
+VS Code windows on Windows x64/ARM64 and macOS arm64. Local discovery, task tools,
+window naming, and policy controls are enabled by default. In Agent mode, Copilot can use
 six Mesh tools to discover an explicitly authorized peer window, delegate tasks,
 wait for authoritative results, recover task IDs, answer input, or cancel work. Mesh protocol
 v2 remains in use; v1 peers are explicitly incompatible. This is an evaluation
-build, not a cross-device, cross-platform Worker, or general-availability claim.
+build, not a general-availability claim. Existing dated macOS evidence is not
+evidence of a Windows or physical cross-device task run.
 
 Cross-device connections are also default-off, with **one Enable/Disable switch**
 and **SDK-only private Tunnels**. Native VS Code account selection/sign-in enables
@@ -26,18 +28,20 @@ Data is an active **Window Node** with process-lifetime random
 runtime and handles. Non-owner windows are active Broker clients, not read-only
 coordinators.
 
-Worker hosting, cross-device hosting and real task execution remain limited to
-**macOS arm64** in this Preview. Other platforms fail closed; SDK-only hosting
-does not expand Windows, Linux or macOS x64 participation.
+Worker hosting, cross-device hosting and task execution support **Windows
+x64/ARM64 and macOS arm64**. Linux, macOS x64, and Windows x86 remain
+Coordinator-only. The VSIX includes the Windows process controller; no Go
+installation or additional Windows feature setting is needed by users.
 
 ## Preview prerequisites and limitations
 
 - VS Code 1.103 or newer is required.
 - Real Worker execution is experimental, requires Workspace/task authorization, and may consume Copilot quota.
 - The Agent Host connects on demand for an authorized task. There is no separate runtime feature switch; merely enabling connections or opening the Dashboard does not start an Agent task.
-- For same-device delegation, enable `copilotAgentMesh.experimental.peerDelegation` in every participating
-  window. The directional source allowlist and the target's **Accept Incoming
-  Tasks** switch are both default-off.
+- Same-device discovery and policy controls work without an extra settings step.
+  The existing `copilotAgentMesh.experimental.peerDelegation` setting defaults
+  to `true`; an explicit `false` remains an opt-out. The directional source
+  allowlist and the target's **Accept Incoming Tasks** switch stay default-off.
 - Use Copilot Chat in Agent mode with tools enabled. Copilot tool choice is not
   guaranteed; use `#meshListWorkers` and `#meshDelegateTask` when explicit
   selection is needed.
@@ -171,7 +175,7 @@ mark their snapshot as the last read rather than pretending it is current.
 
 ## Cross-device opt-in
 
-On **every participating macOS arm64 device**, open the Mesh Dashboard and choose
+On **every participating Windows x64/ARM64 or macOS arm64 device**, open the Mesh Dashboard and choose
 **Enable cross-device connections**. Select the same GitHub or Microsoft account
 through native VS Code account selection/sign-in. The Broker starts a private SDK
 Tunnel, discovers other enabled same-account devices and authenticates their
@@ -270,13 +274,15 @@ Project documents:
 Requirements:
 
 - VS Code 1.103 or newer
-- Node.js and npm
+- Node.js 22 or newer and npm
+- Go at the version declared in `native/windows-process-host/go.mod` or newer
+  (build-time only; not required to install or use the VSIX)
 
 Install dependencies and build the extension:
 
 ```bash
 git submodule update --init --recursive
-npm install
+npm ci
 npm run compile
 ```
 
@@ -326,8 +332,9 @@ operator-visible phase in the exact enabled command; programmatic
 Sanitized evidence is written to
 `artifacts/peer-delegation-e2e/evidence.json`.
 
-Cross-device delegation remains unverified. Windows, Linux, and macOS x64 remain
-unable to host Worker/AHP execution in this Preview. Stable APIs also cannot
+Historical cross-device evidence does not establish the current workflow across
+physical devices. Linux, macOS x64, and Windows x86 remain unable to host
+Worker/AHP execution. Stable APIs also cannot
 detect concurrent edits made by the target window's separate user Copilot session;
 the Incoming Task record and target-side cancel action are the mitigation.
 
@@ -342,6 +349,7 @@ src/storage/          Broker ownership fencing and durable storage adapters
 src/composition/      Production application composition
 src/ui/               Activity Bar Dashboard and safe view models
 src/test/             VS Code extension integration tests
+native/windows-process-host/  Packaged Windows Job Object process controller
 ```
 
 Production modules also live under `gateway`, `peer`, `agentHost`, `tasks`,
@@ -361,3 +369,9 @@ identity is hashed before entering the Broker catalog or IPC. A duplicate physic
 workspace is conflict/read-only. Node loss releases its claim; an active task fails
 explicitly with `TASK_RECOVERY_UNAVAILABLE` because the current AHP runtime has no
 recovery API, and it is never executed twice.
+
+Windows-owned CLI and standalone Agent Host processes start inside a Job Object
+before their first instruction runs. The packaged controller owns that job and
+its process handles, so cancellation, failed startup, or loss of the parent
+connection cannot leave an untracked child process tree. Borrowed editor Hosts
+remain owned by VS Code and are never terminated by Mesh.

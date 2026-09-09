@@ -1,10 +1,8 @@
 import assert from 'node:assert/strict';
-import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
 import {
 	access,
-	chmod,
 	lstat,
 	mkdir,
 	readFile,
@@ -19,6 +17,29 @@ import { homedir } from 'node:os';
 import { createRequire } from 'node:module';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+	assertNoPathAliases,
+	assertProfileIdle,
+	assertVscodeExecutable,
+	commandContainsPath,
+	guiEnvironment,
+	pathKey,
+	pathsOverlap,
+	readProcessTable as inspectProcesses,
+	realProfileDirectories,
+	releaseOwnedProfileLock,
+	supportsWorker,
+	waitForIpcEndpointAbsent,
+} from './platform.mjs';
+import { HarnessProcesses } from './owned-processes.mjs';
+import { prepareSentinel, sentinelExecutablePath } from './sentinel.mjs';
+import { resolveHarnessProfile } from './profile.mjs';
+import {
+	combineOperationAndCleanupError,
+	confirmTaskCancellation,
+	grantTemporaryWorkspaceTask,
+	runtimeCanStart,
+} from './diagnostic-support.mjs';
 
 import {
 	downloadAndUnzipVSCode,
@@ -28,13 +49,17 @@ import {
 const terminalStates = new Set(['completed', 'failed', 'cancelled', 'timedOut']);
 const environmentPrefix = 'MESH_MULTI_WINDOW_E2E';
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
-const repositoryRoot = resolve(scriptDirectory, '../../..');
+const repositoryRoot = resolve(scriptDirectory, '..', '..', '..');
 const require = createRequire(import.meta.url);
+require('tsx/cjs');
 const {
 	multiWindowWorkspaceKey,
 	parseProcessTable,
 	selectOwnedProcesses,
-} = require(join(repositoryRoot, 'out/src/e2e/MultiWindowE2eSupport.js'));
+} = require(join(repositoryRoot, 'src', 'e2e', 'MultiWindowE2eSupport.ts'));
+const { runPeerDelegationCleanupPhases: runCleanupPhases } = require(
+	join(repositoryRoot, 'src', 'e2e', 'PeerDelegationCleanup.ts'),
+);
 
 class E2eRequestError extends Error {
 	constructor(action, code, message) {
@@ -45,11 +70,6 @@ class E2eRequestError extends Error {
 	}
 }
 
-if (process.platform === 'win32') {
-	throw new Error(
-		'The real multi-window E2E currently requires POSIX ps-based exact PID ownership inspection.',
-	);
-}
 if (
 	process.platform === 'linux'
 	&& !process.env.DISPLAY
@@ -75,10 +95,11 @@ const evidencePath = join(evidenceRoot, `${runId}.json`);
 // Opt-in only. When unset the run keeps its throwaway per-run profile, which has no
 // authentication sessions and therefore cannot exercise authenticated Agent turns.
 const configuredProfileBase = process.env[`${environmentPrefix}_PROFILE_DIR`];
-const persistentProfile = configuredProfileBase !== undefined;
-const profileBase = persistentProfile ? resolve(configuredProfileBase) : undefined;
+const profile = resolveHarnessProfile(environmentPrefix, runRoot);
+const persistentProfile = profile.persistent;
+const profileBase = persistentProfile ? profile.base : undefined;
 const userDataDirectory = persistentProfile
-	? join(profileBase, 'user-data')
+	? profile.userData
 	: join(runRoot, 'user-data');
 const meshGlobalStorageDirectory = join(
 	userDataDirectory,
@@ -92,7 +113,7 @@ const profileLockDirectory = persistentProfile
 const profileLockOwnerPath = persistentProfile
 	? join(profileLockDirectory, 'owner')
 	: undefined;
-const extensionsDirectory = join(runRoot, 'extensions');
+const extensionsDirectory = profile.extensions;
 const controlRoot = join(runRoot, 'control');
 const logsDirectory = join(runRoot, 'logs');
 const workspacesDirectory = join(runRoot, 'workspaces');
@@ -101,9 +122,19 @@ const repoBPath = join(workspacesDirectory, 'repo-b');
 const reopenedRepoAPath = join(workspacesDirectory, 'reopen-a', 'repo-a');
 const reopenedRepoBPath = join(workspacesDirectory, 'reopen-b', 'repo-b');
 const duplicateRepoAPath = join(workspacesDirectory, 'repo-a-duplicate');
-const sentinelPath = join(runRoot, 'devtunnel-sentinel');
+const sentinelPath = sentinelExecutablePath(runRoot);
 const sentinelInvocationPath = join(runRoot, 'devtunnel-invoked.json');
 const realTaskEnabled = process.env.MESH_MULTI_WINDOW_E2E_TASKS === '1';
+const diagnosticTask = process.env.MESH_MULTI_WINDOW_E2E_DIAGNOSTIC === '1';
+if (diagnosticTask && !realTaskEnabled) {
+	throw new Error('The single-task diagnostic still requires MESH_MULTI_WINDOW_E2E_TASKS=1.');
+}
+if (realTaskEnabled && !supportsWorker()) {
+	throw new Error('Real Worker turns require Windows x64/ARM64 or macOS arm64.');
+}
+if (realTaskEnabled && !persistentProfile) {
+	throw new Error('Real Worker turns require MESH_MULTI_WINDOW_E2E_PROFILE_DIR to select a dedicated authenticated profile.');
+}
 const nonce = randomUUID();
 const ownedMarkers = [
 	runRoot,
@@ -115,6 +146,7 @@ const rootPids = new Set();
 const historicalOwnedPids = new Set();
 const historicalOwnedCommands = new Map();
 const launchRecords = [];
+const harnessProcesses = new HarnessProcesses();
 const windowOpenRecords = [];
 const activeControllers = new Map();
 let maximumOwnedProcessCount = 0;
@@ -125,10 +157,24 @@ let sentinelDigest;
 let primaryFailure;
 let cleanupFailure;
 let persistentProfileLockOwned = false;
+let restoreTaskGrant;
+let interrupted = false;
+for (const signal of ['SIGINT', 'SIGTERM']) {
+	process.once(signal, () => {
+		interrupted = true;
+		primaryFailure ??= new Error(`Multi-window E2E was interrupted by ${signal}.`);
+		process.exitCode = signal === 'SIGINT' ? 130 : 143;
+		void harnessProcesses.disposeWindows({ stopLaunching: true }).catch((error) => {
+			cleanupFailure ??= error;
+		});
+	});
+}
 let evidence = {
 	schemaVersion: 1,
+	release: '0.5.0-preview',
+	platform: { os: process.platform, architecture: process.arch },
 	runId,
-	mode: realTaskEnabled ? 'transport-and-ahp' : 'transport-lifecycle',
+	mode: diagnosticTask ? 'single-task-diagnostic' : realTaskEnabled ? 'transport-and-ahp' : 'transport-lifecycle',
 	sharedProfile: {
 		oneUserDataDirectory: false,
 		oneExtensionsDirectory: false,
@@ -150,7 +196,9 @@ let evidence = {
 
 try {
 	assertUsableRuntimePath();
+	await assertSafeProfilePaths();
 	await acquirePersistentProfileLock();
+	await assertSafeProfilePaths();
 	assertPersistentProfileIdle();
 	if (persistentProfile) {
 		ownedMarkers.push(meshGlobalStorageDirectory);
@@ -160,13 +208,14 @@ try {
 		? resolve(process.env.MESH_VSCODE_EXECUTABLE)
 		: await downloadAndUnzipVSCode('stable');
 	await access(vscodeExecutablePath);
+	assertVscodeExecutable(vscodeExecutablePath);
 	codeCliPath = process.env.MESH_CODE_CLI
 		? resolve(process.env.MESH_CODE_CLI)
 		: resolveCliPathFromVSCodeExecutablePath(vscodeExecutablePath);
 	await access(codeCliPath);
 	await writeSettings();
 
-	assert.equal(currentOwnedProcesses().length, 0, 'The fresh run markers unexpectedly matched a process.');
+	assert.equal((await currentOwnedProcesses()).length, 0, 'The fresh run markers unexpectedly matched a process.');
 	const repoA = await launchAndDiscover(repoAPath);
 	activeControllers.set(repoA.windowId, repoA);
 	const firstState = await waitForControllerState(
@@ -179,6 +228,9 @@ try {
 
 	const repoB = await launchAndDiscover(repoBPath);
 	activeControllers.set(repoB.windowId, repoB);
+	if (realTaskEnabled) {
+		restoreTaskGrant = await grantTemporaryWorkspaceTask(request, repoA, repoB);
+	}
 	const bothActivatedAt = Math.max(
 		Date.parse(repoA.activatedAt),
 		Date.parse(repoB.activatedAt),
@@ -260,11 +312,23 @@ try {
 		ownedDevTunnelProcesses: 0,
 	};
 
-	if (realTaskEnabled) {
+	if (diagnosticTask) {
+		evidence.task = await runDiagnosticTask(repoA, repoB, initialDevice, repoBWorkspace);
+		evidence.reopen = evidence.takeover = evidence.duplicate = {
+			state: 'skipped',
+			reason: 'The approved diagnostic runs exactly one short task, not the full lifecycle suite.',
+		};
+		await assertTunnelUntouched();
+	} else if (realTaskEnabled) {
 		evidence.task = await runProductionTask(repoA, repoB, initialDevice, repoBWorkspace);
 		await assertTunnelUntouched();
 	}
+	if (restoreTaskGrant !== undefined) {
+		await restoreTaskGrant();
+		restoreTaskGrant = undefined;
+	}
 
+	if (!diagnosticTask) {
 	const repoBCloseStarted = Date.now();
 	await request(repoB, 'host.close');
 	activeControllers.delete(repoB.windowId);
@@ -274,7 +338,7 @@ try {
 			const local = localDevice(directory);
 			const closed = local?.nodes?.find((node) => node.nodeId === repoB.nodeId);
 			const source = local?.nodes?.find((node) => node.nodeId === repoA.nodeId);
-			return closed?.status === 'offline' && source?.status === 'online';
+			return (closed === undefined || closed.status === 'offline') && source?.status === 'online';
 		},
 		5_000,
 		'repo-b did not become offline while repo-a stayed online',
@@ -423,13 +487,12 @@ try {
 		prompt: 'This must be rejected before any Agent runtime is accessed.',
 		acceptanceCriteria: [],
 	});
-	assert.equal(
-		conflictError.code,
-		'WORKSPACE_NOT_FOUND',
-		'The conflicting Window Node unexpectedly accepted task execution.',
+	assert.ok(
+		['WORKSPACE_NOT_FOUND', 'PEER_NOT_ALLOWED'].includes(conflictError.code),
+		'The conflicting Window Node must be rejected by claim or default-deny peer policy before execution.',
 	);
 	assert.equal(
-		currentOwnedProcesses().some(isAgentHostProcess),
+		(await currentOwnedProcesses()).some(isAgentHostProcess),
 		false,
 		'The rejected duplicate claim accessed Agent Host.',
 	);
@@ -441,59 +504,20 @@ try {
 		agentHostAccessed: false,
 	};
 	await assertTunnelUntouched();
+	}
 } catch (error) {
 	primaryFailure = error;
 } finally {
 	try {
-		await closeControllers();
-		await waitForNoOwnedProcesses(10_000).catch(async () => {
-			await terminateOwnedProcesses();
-			await waitForNoOwnedProcesses(5_000);
-		});
-		await closeLogStreams();
-		if (primaryFailure !== undefined) {
-			await saveSanitizedLogs();
-		}
-
-		const socketRemoved = localIpcEndpoint === undefined
-			|| localIpcEndpoint.platform === 'win32'
-			|| await isAbsent(localIpcEndpoint.address);
-		const agentHosts = currentOwnedProcesses().filter(isAgentHostProcess);
-		const testProcesses = currentOwnedProcesses();
-		const sentinelInvoked = !await isAbsent(sentinelInvocationPath);
-		const sentinelUnchanged = sentinelDigest === undefined
-			|| createHash('sha256').update(await readFile(sentinelPath)).digest('hex') === sentinelDigest;
-		const cleanupPassed = socketRemoved
-			&& agentHosts.length === 0
-			&& testProcesses.length === 0
-			&& !sentinelInvoked
-			&& sentinelUnchanged;
-		evidence.cleanup = {
-			state: cleanupPassed ? 'passed' : 'failed',
-			localIpcSocketRemoved: socketRemoved,
-			agentHostProcesses: agentHosts.length,
-			testVscodeProcesses: testProcesses.length,
-			devTunnelProcesses: testProcesses.filter(isDevTunnelProcess).length,
-			ownedTimers: testProcesses.length === 0 ? 0 : undefined,
-			sentinelInvoked,
-			sentinelUnchanged,
-			trackedPidCount: historicalOwnedPids.size,
-			maximumOwnedProcessCount,
-			profileLockReleased: !persistentProfile,
-			runtimeRemoved: false,
-		};
-		if (!cleanupPassed) {
-			throw new Error('Owned multi-window E2E cleanup was not fully confirmed.');
-		}
-		evidence.cleanup.profileLockReleased = await releasePersistentProfileLock();
-		await rm(runRoot, { recursive: true, force: true });
-		if (!await isAbsent(runRoot)) {
-			throw new Error('The owned multi-window E2E runtime directory remains.');
-		}
-		evidence.cleanup.runtimeRemoved = true;
+		await performCleanup();
 	} catch (error) {
-		cleanupFailure = error;
-		await closeLogStreams().catch(() => undefined);
+		cleanupFailure = combineOperationAndCleanupError(cleanupFailure, error);
+		await harnessProcesses.disposeWindows({ stopLaunching: true }).catch((jobError) => {
+			cleanupFailure = combineOperationAndCleanupError(cleanupFailure, jobError);
+		});
+		await closeLogStreams().catch((logError) => {
+			cleanupFailure = combineOperationAndCleanupError(cleanupFailure, logError);
+		});
 	}
 }
 
@@ -518,6 +542,122 @@ console.log(JSON.stringify({
 	evidence: relative(repositoryRoot, evidencePath),
 	cleanup: evidence.cleanup.state,
 }));
+
+async function performCleanup() {
+	let finalOwned;
+	let socketRemoved = false;
+	let sentinelInvoked;
+	let sentinelUnchanged = sentinelDigest === undefined;
+	let profileLockReleased = !persistentProfile;
+	let runtimeRemoved = false;
+	const observations = [];
+	const requireReleasedProcessesAndIpc = () => {
+		if (finalOwned === undefined || finalOwned.length !== 0 || !socketRemoved) {
+			throw new Error('Owned process and IPC cleanup is unconfirmed; profile lock and run root were retained.');
+		}
+	};
+	const failures = await runCleanupPhases([
+		{
+			name: 'restore-temporary-grants',
+			run: async () => {
+				if (restoreTaskGrant !== undefined) {
+					await restoreTaskGrant();
+					restoreTaskGrant = undefined;
+				}
+			},
+		},
+		{ name: 'close-controllers', run: async () => observations.push(...await closeControllers()) },
+		{
+			name: 'owned-processes',
+			run: async () => {
+				if (process.platform === 'win32') {
+					await harnessProcesses.disposeWindows({ stopLaunching: true });
+				}
+				try {
+					await waitForNoOwnedProcesses(10_000);
+				} catch (error) {
+					observations.push({ phase: 'process-exit-fallback', ...safeFailure(error) });
+					await terminateOwnedProcesses();
+					await waitForNoOwnedProcesses(5_000);
+				}
+			},
+		},
+		{ name: 'close-logs', run: closeLogStreams },
+		{
+			name: 'save-logs',
+			run: async () => {
+				if (primaryFailure !== undefined || cleanupFailure !== undefined) {
+					await saveSanitizedLogs();
+				}
+			},
+		},
+		{ name: 'observe-processes', run: async () => { finalOwned = await currentOwnedProcesses(); } },
+		{
+			name: 'wait-local-ipc',
+			run: async () => {
+				if (finalOwned === undefined || finalOwned.length !== 0) {
+					throw new Error('IPC cleanup cannot be accepted before exact owned processes have exited.');
+				}
+				socketRemoved = await waitForIpcEndpointAbsent(localIpcEndpoint);
+			},
+		},
+		{
+			name: 'observe-sentinel',
+			run: async () => {
+				sentinelInvoked = !await isAbsent(sentinelInvocationPath);
+				sentinelUnchanged = sentinelDigest === undefined
+					|| createHash('sha256').update(await readFile(sentinelPath)).digest('hex') === sentinelDigest;
+				if (sentinelInvoked || !sentinelUnchanged) {
+					throw new Error('The no-Tunnel sentinel was invoked or changed.');
+				}
+			},
+		},
+		{
+			name: 'release-profile-lock',
+			run: async () => {
+				requireReleasedProcessesAndIpc();
+				profileLockReleased = await releasePersistentProfileLock();
+			},
+		},
+		{
+			name: 'remove-run-root',
+			run: async () => {
+				requireReleasedProcessesAndIpc();
+				if (!profileLockReleased) {
+					throw new Error('The exact profile lock was not released; the run root was retained.');
+				}
+				await rm(runRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+				runtimeRemoved = await isAbsent(runRoot);
+				if (!runtimeRemoved) {
+					throw new Error('The owned multi-window E2E runtime directory remains.');
+				}
+			},
+		},
+	]);
+	if (failures.length > 0) {
+		cleanupFailure = combineOperationAndCleanupError(cleanupFailure, new AggregateError(
+			failures.map(({ phase, error }) => new Error(`Cleanup phase ${phase} failed.`, { cause: error })),
+			'One or more multi-window cleanup phases failed.',
+		));
+	}
+	evidence.cleanup = {
+		state: cleanupFailure === undefined && finalOwned?.length === 0 && socketRemoved
+			&& profileLockReleased && runtimeRemoved ? 'passed' : 'failed',
+		localIpcSocketRemoved: socketRemoved,
+		agentHostProcesses: finalOwned?.filter(isAgentHostProcess).length,
+		testVscodeProcesses: finalOwned?.length,
+		devTunnelProcesses: finalOwned?.filter(isDevTunnelProcess).length,
+		ownedTimers: finalOwned?.length === 0 ? 0 : undefined,
+		sentinelInvoked,
+		sentinelUnchanged,
+		trackedPidCount: historicalOwnedPids.size,
+		maximumOwnedProcessCount,
+		profileLockReleased,
+		runtimeRemoved,
+		failures: failures.map(({ phase, error }) => ({ phase, ...safeFailure(error) })),
+		observations,
+	};
+}
 
 async function prepareRun() {
 	// A reused profile must not carry mesh Device/Node state between runs, or the
@@ -550,19 +690,11 @@ async function prepareRun() {
 		),
 	]);
 	await Promise.all([
-		symlink(repoAPath, reopenedRepoAPath, 'dir'),
-		symlink(repoBPath, reopenedRepoBPath, 'dir'),
+		symlink(repoAPath, reopenedRepoAPath, process.platform === 'win32' ? 'junction' : 'dir'),
+		symlink(repoBPath, reopenedRepoBPath, process.platform === 'win32' ? 'junction' : 'dir'),
 	]);
-	await symlink(repoAPath, duplicateRepoAPath, 'dir');
-	const sentinel = [
-		'#!/usr/bin/env node',
-		`require('node:fs').writeFileSync(${JSON.stringify(sentinelInvocationPath)}, JSON.stringify({ invoked: true, pid: process.pid }));`,
-		'process.exitCode = 97;',
-		'',
-	].join('\n');
-	await writeFile(sentinelPath, sentinel, { encoding: 'utf8', mode: 0o700 });
-	await chmod(sentinelPath, 0o700);
-	sentinelDigest = createHash('sha256').update(sentinel).digest('hex');
+	await symlink(repoAPath, duplicateRepoAPath, process.platform === 'win32' ? 'junction' : 'dir');
+	sentinelDigest = await prepareSentinel(sentinelPath, sentinelInvocationPath);
 }
 
 async function acquirePersistentProfileLock() {
@@ -592,16 +724,12 @@ function assertPersistentProfileIdle() {
 	if (!persistentProfile) {
 		return;
 	}
-	const users = readProcessTable().filter(({ pid, command }) =>
-		pid !== process.pid
-		&& command.includes('--user-data-dir')
-		&& command.includes(userDataDirectory),
-	);
-	if (users.length > 0) {
-		throw new Error(
-			'The persistent multi-window E2E profile is already in use. '
-			+ 'Close its VS Code and Agent Host processes before retrying.',
-		);
+	const entries = readProcessTable();
+	assertProfileIdle(entries, userDataDirectory);
+	if (profile.reusedExtensions && entries.some(({ pid, command }) =>
+		pid !== process.pid && command.includes('--extensions-dir') && commandContainsPath(command, extensionsDirectory),
+	)) {
+		throw new Error('The dedicated E2E extensions directory is still in use.');
 	}
 }
 
@@ -612,16 +740,27 @@ async function releasePersistentProfileLock() {
 	if (!persistentProfileLockOwned) {
 		return false;
 	}
-	const owner = await readFile(profileLockOwnerPath, 'utf8');
-	if (owner.trim() !== runId) {
-		throw new Error('The persistent multi-window E2E profile lock ownership changed.');
-	}
-	await rm(profileLockDirectory, { recursive: true, force: false });
+	await releaseOwnedProfileLock({
+		lockDirectory: profileLockDirectory,
+		expectedRunId: runId,
+		assertQuiescent: async () => {
+			await waitForNoOwnedProcesses(5_000);
+			await waitForIpcEndpointAbsent(localIpcEndpoint);
+			assertPersistentProfileIdle();
+		},
+	});
 	persistentProfileLockOwned = false;
 	return true;
 }
 
 async function writeSettings() {
+	const settingsPath = join(userDataDirectory, 'User', 'settings.json');
+	const existingSettings = JSON.parse(await readFile(settingsPath, 'utf8').catch((error) => {
+		if (error?.code === 'ENOENT') {
+			return '{}';
+		}
+		throw error;
+	}));
 	const authenticationResource = process.env[`${environmentPrefix}_AUTH_RESOURCE`];
 	const authenticationProvider = process.env[`${environmentPrefix}_AUTH_PROVIDER`];
 	const authenticationScopes = parseStringArray(
@@ -637,11 +776,13 @@ async function writeSettings() {
 		}
 		: {};
 	await writeFile(
-		join(userDataDirectory, 'User', 'settings.json'),
+		settingsPath,
 		`${JSON.stringify({
+			...existingSettings,
 			'copilotAgentMesh.deviceName': 'Same-profile E2E Device',
 			'copilotAgentMesh.codePath': codeCliPath,
 			'copilotAgentMesh.experimental.authenticationProviders': mappings,
+			'copilotAgentMesh.agentHost.userDataDir': userDataDirectory,
 			'copilotAgentMesh.devTunnelPath': sentinelPath,
 			'copilotAgentMesh.listener.autoStart': false,
 			'copilotAgentMesh.e2e.nonce': nonce,
@@ -660,7 +801,7 @@ async function launchAndDiscover(workspacePath, excludedWindowIds = new Set()) {
 	const launchedAt = Date.now();
 	const opener = [...activeControllers.values()][0];
 	if (opener === undefined) {
-		launchWindow(workspacePath);
+		await launchWindow(workspacePath);
 	} else {
 		await request(opener, 'window.open', { workspacePath }, 10_000);
 		windowOpenRecords.push({
@@ -676,16 +817,16 @@ async function launchAndDiscover(workspacePath, excludedWindowIds = new Set()) {
 		60_000,
 	);
 	await request(controller, 'controller.state');
-	refreshOwnedProcesses();
+	await refreshOwnedProcesses();
 	return controller;
 }
 
-function launchWindow(workspacePath) {
+async function launchWindow(workspacePath) {
 	const args = [
 		workspacePath,
 		`--user-data-dir=${userDataDirectory}`,
 		`--extensions-dir=${extensionsDirectory}`,
-		'--disable-extensions',
+		...(profile.reusedExtensions ? [] : ['--disable-extensions']),
 		'--disable-gpu',
 		'--disable-gpu-sandbox',
 		'--disable-updates',
@@ -703,7 +844,13 @@ function launchWindow(workspacePath) {
 		`${basename(workspacePath)}-${launchRecords.length + 1}.log`,
 	);
 	const output = createWriteStream(logPath, { flags: 'wx', mode: 0o600 });
-	const environment = { ...process.env };
+	let outputFailure;
+	output.on('error', (error) => { outputFailure ??= error; });
+	await new Promise((resolveOpen, rejectOpen) => {
+		output.once('open', resolveOpen);
+		output.once('error', rejectOpen);
+	});
+	const environment = guiEnvironment();
 	delete environment.MESH_TWO_DEVICE_E2E;
 	delete environment.MESH_TWO_DEVICE_E2E_NONCE;
 	delete environment.MESH_TWO_DEVICE_E2E_ROLE;
@@ -711,11 +858,17 @@ function launchWindow(workspacePath) {
 	environment[environmentPrefix] = '1';
 	environment[`${environmentPrefix}_CONTROL_DIR`] = controlRoot;
 	environment[`${environmentPrefix}_NONCE`] = nonce;
-	const child = spawn(vscodeExecutablePath, args, {
-		env: environment,
-		shell: false,
-		stdio: ['ignore', 'pipe', 'pipe'],
-	});
+	let child;
+	try {
+		child = await harnessProcesses.launch(vscodeExecutablePath, args, {
+			env: environment,
+			shell: false,
+			stdio: ['ignore', 'pipe', 'pipe'],
+		});
+	} catch (error) {
+		output.destroy();
+		throw error;
+	}
 	if (child.pid === undefined) {
 		throw new Error(`VS Code did not expose a child PID for ${basename(workspacePath)}.`);
 	}
@@ -729,8 +882,12 @@ function launchWindow(workspacePath) {
 		output,
 		logPath,
 		exit: undefined,
+		get outputFailure() { return outputFailure; },
 	};
 	child.once('error', (error) => {
+		record.exit = { error: error.message };
+	});
+	child.once('failure', (error) => {
 		record.exit = { error: error.message };
 	});
 	child.once('exit', (code, signal) => {
@@ -738,10 +895,13 @@ function launchWindow(workspacePath) {
 		rootPids.delete(child.pid);
 	});
 	launchRecords.push(record);
-	refreshOwnedProcesses();
+	await refreshOwnedProcesses();
 }
 
 async function waitForController(workspacePath, launchedAt, excludedWindowIds, timeoutMs) {
+	if (interrupted) {
+		throw new Error('Multi-window E2E was interrupted.');
+	}
 	const workspaceBasename = basename(workspacePath);
 	const workspaceKey = multiWindowWorkspaceKey(workspaceBasename);
 	const workspaceControlRoot = join(controlRoot, 'windows', workspaceKey);
@@ -793,6 +953,9 @@ async function waitForController(workspacePath, launchedAt, excludedWindowIds, t
 }
 
 async function request(controller, action, params = {}, timeoutMs = 30_000) {
+	if (interrupted && action !== 'host.close' && action !== 'controller.state') {
+		throw new Error('Multi-window E2E was interrupted.');
+	}
 	const id = randomUUID();
 	const requestPath = join(controller.controlDirectory, 'requests', `${id}.json`);
 	const temporary = `${requestPath}.${process.pid}.tmp`;
@@ -863,7 +1026,8 @@ async function waitForDirectory(controller, predicate, timeoutMs, message) {
 	let latest;
 	do {
 		try {
-			latest = await request(controller, 'directory.list', {}, 2_000);
+			// Topology visibility does not imply permission to execute a task.
+			latest = await request(controller, 'directory.dashboard', {}, 2_000);
 			if (predicate(latest)) {
 				return latest;
 			}
@@ -875,9 +1039,105 @@ async function waitForDirectory(controller, predicate, timeoutMs, message) {
 	throw new Error(`${message}; last directory: ${JSON.stringify(latest)}.`);
 }
 
+async function runDiagnosticTask(source, target, device, workspace) {
+	const probe = await request(target, 'runtime.probe', { requireEditor: true }, 30_000);
+	if (probe.editorOnly !== true) {
+		throw new Error('The isolated diagnostic requires a runtime API that guarantees editor-only execution without standalone fallback.');
+	}
+	if (!runtimeCanStart(probe)) {
+		throw new Error('The production runtime did not pass the diagnostic preflight.');
+	}
+	const targetNode = requireDirectoryNode(device, target.nodeId);
+	const taskId = randomUUID();
+	const startedAt = Date.now();
+	let terminalObserved = false;
+	let taskFailure;
+	try {
+		evidence.task = { state: 'start-attempted', taskCount: 1, terminalAuthoritative: false };
+		const started = await request(source, 'task.start', {
+			taskId,
+			requireEditor: true,
+			delegationRequestId: randomUUID(),
+			deviceId: device.deviceId,
+			nodeId: targetNode.nodeId,
+			nodeInstanceId: targetNode.nodeInstanceId,
+			workspaceId: workspace.workspaceId,
+			title: 'One short Windows Copilot diagnostic',
+			prompt: 'Reply with exactly MESH_WINDOWS_DIAGNOSTIC_OK. Do not use tools, run commands, read or modify files, or create network resources.',
+			acceptanceCriteria: ['One short acknowledgement completes through the production local task chain.'],
+		}, 60_000);
+		assert.equal(started.taskId, taskId);
+		while (Date.now() - startedAt < 120_000) {
+			const latest = await request(source, 'task.get', { taskId }, 10_000);
+			evidence.task = {
+				state: latest.snapshot.status,
+				taskCount: 1,
+				terminalAuthoritative: terminalStates.has(latest.snapshot.status),
+				eventTypes: latest.events.map(({ type }) => type),
+				...(latest.snapshot.failure?.code === undefined ? {} : { code: latest.snapshot.failure.code }),
+				automaticInputApprovals: 0,
+			};
+			if (latest.snapshot.status === 'needsInput') {
+				throw new Error('The diagnostic requested input; no permission or authentication prompt was approved automatically.');
+			}
+			if (terminalStates.has(latest.snapshot.status)) {
+				terminalObserved = true;
+				if (latest.snapshot.status !== 'completed') {
+					try {
+						evidence.task.runtimeDiagnostics = await request(target, 'runtime.diagnostics', {}, 15_000);
+					} catch (error) {
+						evidence.task.runtimeDiagnostics = {
+							diagnosticsUnavailable: true,
+							code: typeof error?.code === 'string' && /^[A-Z][A-Z0-9_]{0,127}$/u.test(error.code)
+								? error.code : 'RUNTIME_DIAGNOSTICS_FAILED',
+						};
+					}
+				}
+				assert.equal(latest.snapshot.status, 'completed',
+					`The diagnostic ended as ${latest.snapshot.status}; code ${latest.snapshot.failure?.code ?? 'none'}.`);
+				const eventTypes = latest.events.map(({ type }) => type);
+				assert.ok(eventTypes.includes('agentStarted') && eventTypes.includes('completed'));
+				const output = latest.events.filter(({ type }) => type === 'output')
+					.map(({ summary }) => summary ?? '').join('');
+				const expectedReplyObserved = output.includes('MESH_WINDOWS_DIAGNOSTIC_OK');
+				assert.equal(expectedReplyObserved, true, 'The short diagnostic reply was not observed.');
+				return {
+					state: 'completed',
+					taskCount: 1,
+					expectedReplyObserved,
+					eventTypes,
+					terminalAuthoritative: true,
+					outputBytes: Buffer.byteLength(output),
+					outputSha256: createHash('sha256').update(output).digest('hex'),
+					durationMs: Date.now() - startedAt,
+					automaticInputApprovals: 0,
+				};
+			}
+			await delay(250);
+		}
+		throw new Error('The single diagnostic task exceeded its two-minute observation budget.');
+	} catch (error) {
+		taskFailure = error;
+		throw error;
+	} finally {
+		if (!terminalObserved) {
+			try {
+				const terminalState = await confirmTaskCancellation(request, source, taskId);
+				evidence.task.cleanupTerminalState = terminalState;
+				evidence.task.cancellationConfirmed = terminalState === 'cancelled';
+			} catch (cleanupError) {
+				evidence.task.cleanupTerminalState = cleanupError.terminalState;
+				evidence.task.cancellationConfirmed = cleanupError.terminalState === 'cancelled';
+				cleanupFailure = combineOperationAndCleanupError(cleanupFailure, cleanupError);
+				throw combineOperationAndCleanupError(taskFailure, cleanupError);
+			}
+		}
+	}
+}
+
 async function runProductionTask(source, target, device, workspace) {
 	const probe = await request(target, 'runtime.probe', {}, 30_000);
-	if (probe.available !== true || probe.featureEnabled !== true) {
+	if (!runtimeCanStart(probe)) {
 		throw new Error(
 			`Production Agent Host runtime unavailable: ${probe.reason ?? 'probe failed'}.`,
 		);
@@ -1145,14 +1405,14 @@ async function assertTunnelUntouched() {
 		'The Dev Tunnel sentinel executable changed.',
 	);
 	assert.equal(
-		currentOwnedProcesses().filter(isDevTunnelProcess).length,
+		(await currentOwnedProcesses()).filter(isDevTunnelProcess).length,
 		0,
 		'An owned Dev Tunnel process was observed.',
 	);
 }
 
 function isDevTunnelProcess(processInfo) {
-	return processInfo.command.includes(sentinelPath);
+	return commandContainsPath(processInfo.command, sentinelPath);
 }
 
 function isAgentHostProcess(processInfo) {
@@ -1160,18 +1420,18 @@ function isAgentHostProcess(processInfo) {
 }
 
 function readProcessTable() {
-	const result = spawnSync(
-		'ps',
-		['-axo', 'pid=,ppid=,pgid=,command='],
-		{ encoding: 'utf8', maxBuffer: 4 * 1_024 * 1_024 },
-	);
-	if (result.status !== 0) {
-		throw new Error('Unable to inspect exact owned multi-window E2E PIDs.');
-	}
-	return parseProcessTable(result.stdout);
+	return inspectProcesses(parseProcessTable);
 }
 
-function currentOwnedProcesses() {
+async function currentOwnedProcesses() {
+	if (process.platform === 'win32') {
+		const owned = await harnessProcesses.ownedWindowsProcesses(parseProcessTable);
+		maximumOwnedProcessCount = Math.max(maximumOwnedProcessCount, owned.length);
+		for (const { pid } of owned) {
+			historicalOwnedPids.add(pid);
+		}
+		return owned;
+	}
 	const processTable = readProcessTable();
 	const selected = selectOwnedProcesses(processTable, {
 		rootPids,
@@ -1196,14 +1456,14 @@ function currentOwnedProcesses() {
 	return owned;
 }
 
-function refreshOwnedProcesses() {
-	currentOwnedProcesses();
+async function refreshOwnedProcesses() {
+	await currentOwnedProcesses();
 }
 
 async function waitForNoOwnedProcesses(timeoutMs) {
 	const deadline = Date.now() + timeoutMs;
 	do {
-		if (currentOwnedProcesses().length === 0) {
+		if ((await currentOwnedProcesses()).length === 0) {
 			return;
 		}
 		await delay(100);
@@ -1214,7 +1474,7 @@ async function waitForNoOwnedProcesses(timeoutMs) {
 async function waitForNoAgentHostProcesses(timeoutMs) {
 	const deadline = Date.now() + timeoutMs;
 	do {
-		if (currentOwnedProcesses().filter(isAgentHostProcess).length === 0) {
+		if ((await currentOwnedProcesses()).filter(isAgentHostProcess).length === 0) {
 			return;
 		}
 		await delay(100);
@@ -1223,14 +1483,18 @@ async function waitForNoAgentHostProcesses(timeoutMs) {
 }
 
 async function terminateOwnedProcesses() {
-	let remaining = currentOwnedProcesses();
+	if (process.platform === 'win32') {
+		await harnessProcesses.disposeWindows({ stopLaunching: interrupted });
+		return;
+	}
+	let remaining = await currentOwnedProcesses();
 	for (const processInfo of remaining) {
 		killExactProcess(processInfo.pid, 'SIGTERM');
 	}
 	const deadline = Date.now() + 5_000;
 	while (Date.now() < deadline) {
 		await delay(100);
-		remaining = currentOwnedProcesses();
+		remaining = await currentOwnedProcesses();
 		if (remaining.length === 0) {
 			return;
 		}
@@ -1241,6 +1505,9 @@ async function terminateOwnedProcesses() {
 }
 
 function killExactProcess(pid, signal) {
+	if (process.platform === 'win32') {
+		throw new Error('Windows cleanup requires Job Object ownership, not numeric PID termination.');
+	}
 	try {
 		process.kill(pid, signal);
 	} catch (error) {
@@ -1251,18 +1518,25 @@ function killExactProcess(pid, signal) {
 }
 
 async function closeControllers() {
+	const observations = [];
 	const controllers = [...activeControllers.values()];
 	const states = await Promise.all(controllers.map(async (controller) => ({
 		controller,
-		state: await request(controller, 'controller.state', {}, 2_000).catch(() => undefined),
+		state: await request(controller, 'controller.state', {}, 2_000).catch((error) => {
+			observations.push({ phase: 'controller-state', windowId: controller.windowId, ...safeFailure(error) });
+			return undefined;
+		}),
 	})));
 	states.sort((left, right) =>
 		Number(left.state?.broker?.owner === true) - Number(right.state?.broker?.owner === true),
 	);
 	for (const { controller } of states) {
-		await request(controller, 'host.close', {}, 5_000).catch(() => undefined);
+		await request(controller, 'host.close', {}, 5_000).catch((error) => {
+			observations.push({ phase: 'host-close', windowId: controller.windowId, ...safeFailure(error) });
+		});
 		activeControllers.delete(controller.windowId);
 	}
+	return observations;
 }
 
 async function closeLogStreams() {
@@ -1275,11 +1549,14 @@ async function closeLogStreams() {
 			output.end(resolveOutput);
 		}
 	})));
+	if (launchRecords.some(({ outputFailure }) => outputFailure !== undefined)) {
+		throw new Error('A multi-window E2E log stream failed.');
+	}
 }
 
 async function saveSanitizedLogs() {
 	for (const record of launchRecords) {
-		const raw = await readFile(record.logPath, 'utf8').catch(() => '');
+		const raw = await readFile(record.logPath, 'utf8');
 		const sanitized = sanitize(raw);
 		const name = `${runId}-${basename(record.logPath)}`;
 		await writeFile(join(evidenceRoot, name), sanitized, {
@@ -1400,26 +1677,22 @@ function assertUsableProfilePath() {
 }
 
 function realVscodeUserDataDirectories() {
-	const home = homedir();
-	const candidates = [
-		join(home, 'Library', 'Application Support', 'Code'),
-		join(home, 'Library', 'Application Support', 'Code - Insiders'),
-		join(home, '.config', 'Code'),
-		join(home, '.config', 'Code - Insiders'),
-		join(home, '.vscode'),
-		join(home, '.vscode-insiders'),
-	];
-	if (typeof process.env.APPDATA === 'string' && process.env.APPDATA.length > 0) {
-		candidates.push(
-			join(process.env.APPDATA, 'Code'),
-			join(process.env.APPDATA, 'Code - Insiders'),
-		);
-	}
-	return candidates;
+	return realProfileDirectories();
 }
 
 function isWithin(parent, candidate) {
-	return candidate.startsWith(`${parent}${sep}`);
+	return pathsOverlap(parent, candidate) && pathKey(candidate).startsWith(pathKey(parent));
+}
+
+async function assertSafeProfilePaths() {
+	for (const path of [
+		runtimeBase, runRoot, profileBase, userDataDirectory,
+		join(userDataDirectory, 'User', 'settings.json'),
+		meshGlobalStorageDirectory,
+		extensionsDirectory,
+	].filter(Boolean)) {
+		await assertNoPathAliases(path);
+	}
 }
 
 function safeFailure(error) {

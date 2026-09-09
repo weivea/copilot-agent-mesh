@@ -17,7 +17,9 @@ import {
 	type UnixSocketWebSocketConnector,
 } from './UnixSocketWebSocketConnector';
 import {
+	OwnedCommandError,
 	runOwnedCommand,
+	terminateOwnedProcessGroup,
 	type RunOwnedCommandOptions,
 } from '../spikes/ownedProcess';
 import {
@@ -42,7 +44,11 @@ export type EditorAgentHostLocatorErrorCode =
 	| 'USER_DATA_UNAVAILABLE';
 
 export class EditorAgentHostLocatorError extends Error {
-	public constructor(readonly code: EditorAgentHostLocatorErrorCode, message: string) {
+	public constructor(
+		readonly code: EditorAgentHostLocatorErrorCode,
+		message: string,
+		readonly cleanupRequired = false,
+	) {
 		super(message);
 		this.name = 'EditorAgentHostLocatorError';
 	}
@@ -144,6 +150,8 @@ export class EditorAgentHostLocator {
 	private readonly dependencies: EditorAgentHostLocatorDependencies;
 	private readonly commandTimeoutMs: number;
 	private readonly platform: EditorAgentHostPlatformContext;
+	private readonly pendingCleanup = new Set<{ dispose(): Promise<void> }>();
+	private disposed = false;
 
 	public constructor(
 		private readonly options: EditorAgentHostLocatorOptions = {},
@@ -179,7 +187,14 @@ export class EditorAgentHostLocator {
 	}
 
 	public async locate(signal?: AbortSignal): Promise<LocatedEditorAgentHost> {
+		if (this.disposed) {
+			throw new EditorAgentHostLocatorError('COMMAND_FAILED', 'The editor Agent Host locator has been disposed.');
+		}
 		throwIfCancelled(signal);
+		if (this.pendingCleanup.size > 0) {
+			await this.cleanupCommands();
+			throwIfCancelled(signal);
+		}
 		const derived = deriveEditorAgentHostUserDataDir(
 			this.platform,
 			readEditorAgentHostUserDataDirSetting(this.options.configuredUserDataDir),
@@ -201,9 +216,9 @@ export class EditorAgentHostLocator {
 			code = await discoverCodeCli(
 				this.options.configuredCodeCli,
 				signal,
-				this.dependencies.runCommand,
+				(executable, args, options) => this.runCommand(executable, args, options),
 			);
-			output = await this.dependencies.runCommand(
+			output = await this.runCommand(
 				code.executable,
 				['agent', 'endpoints', '--user-data-dir', derived.path],
 				{
@@ -213,10 +228,17 @@ export class EditorAgentHostLocator {
 				},
 			);
 		} catch {
-			throwIfCancelled(signal);
+			if (signal?.aborted) {
+				throw new EditorAgentHostLocatorError(
+					'CANCELLED',
+					'Editor Agent Host endpoint discovery was cancelled.',
+					this.pendingCleanup.size > 0,
+				);
+			}
 			throw new EditorAgentHostLocatorError(
 				'COMMAND_FAILED',
 				'VS Code editor Agent Host endpoint discovery failed.',
+				this.pendingCleanup.size > 0,
 			);
 		}
 		throwIfCancelled(signal);
@@ -238,7 +260,7 @@ export class EditorAgentHostLocator {
 			);
 		}
 
-		const endpoint = selectEditorEndpoint(document, this.dependencies.isProcessAlive);
+		const endpoint = selectEditorEndpoint(document, this.dependencies.isProcessAlive, this.platform.platform);
 		return new LocatedEditorAgentHost({
 			connectionToken: endpoint.connectionToken,
 			registryProtocolVersion: endpoint.protocolVersion,
@@ -253,6 +275,41 @@ export class EditorAgentHostLocator {
 				code.executable,
 			],
 		});
+	}
+
+	public async dispose(): Promise<void> {
+		this.disposed = true;
+		await this.cleanupCommands();
+	}
+
+	private async cleanupCommands(): Promise<void> {
+		const results = await Promise.allSettled([...this.pendingCleanup].map(async (resource) => {
+			await resource.dispose();
+			this.pendingCleanup.delete(resource);
+		}));
+		if (results.some((result) => result.status === 'rejected')) {
+			throw new EditorAgentHostLocatorError(
+				'COMMAND_FAILED',
+				'Editor discovery command cleanup could not be confirmed and remains tracked for retry.',
+				true,
+			);
+		}
+	}
+
+	private async runCommand(executable: string, args: readonly string[], options: RunOwnedCommandOptions): Promise<string> {
+		try {
+			return await this.dependencies.runCommand(executable, args, options);
+		} catch (error) {
+			if (error instanceof OwnedCommandError && error.cleanupRequired) {
+				if (error.ownedCleanup !== undefined) {
+					this.pendingCleanup.add(error.ownedCleanup);
+				} else if (error.processGroupId !== undefined) {
+					const pid = error.processGroupId;
+					this.pendingCleanup.add({ dispose: () => terminateOwnedProcessGroup(pid, 250) });
+				}
+			}
+			throw error;
+		}
 	}
 }
 
@@ -270,13 +327,13 @@ export function deriveEditorAgentHostUserDataDir(
 		}
 		return {
 			path: configured,
-			validatedWorkerHost: context.platform === 'darwin' && context.architecture === 'arm64',
+			validatedWorkerHost: supportedWorkerHost(context),
 		};
 	}
 	const strategy = strategyFor(context.platform);
 	return {
 		path: strategy.derive(context),
-		validatedWorkerHost: context.platform === 'darwin' && context.architecture === 'arm64',
+		validatedWorkerHost: supportedWorkerHost(context),
 	};
 }
 
@@ -324,6 +381,10 @@ function strategyFor(platform: NodeJS.Platform): EditorAgentHostUserDataStrategy
 		case 'win32':
 			return {
 				derive: (context) => {
+					const portable = context.environment.VSCODE_PORTABLE?.trim();
+					if (portable !== undefined && win32.isAbsolute(portable)) {
+						return win32.join(portable, 'user-data');
+					}
 					const appData = context.environment.APPDATA?.trim();
 					if (appData === undefined || appData.length === 0) {
 						throw new EditorAgentHostLocatorError(
@@ -340,6 +401,11 @@ function strategyFor(platform: NodeJS.Platform): EditorAgentHostUserDataStrategy
 				'This platform has no VS Code user-data directory strategy.',
 			);
 	}
+}
+
+function supportedWorkerHost(context: EditorAgentHostPlatformContext): boolean {
+	return (context.platform === 'darwin' && context.architecture === 'arm64')
+		|| (context.platform === 'win32' && (context.architecture === 'x64' || context.architecture === 'arm64'));
 }
 
 function currentPlatformContext(
@@ -433,6 +499,7 @@ function parseEndpoint(value: unknown): ParsedEndpoint {
 function selectEditorEndpoint(
 	document: ParsedEndpointDocument,
 	isProcessAlive: (pid: number) => boolean,
+	platform: NodeJS.Platform,
 ): ParsedEndpoint {
 	const editor = document.endpoints.filter((endpoint) => endpoint.type === 'editor');
 	if (editor.length === 0) {
@@ -444,7 +511,9 @@ function selectEditorEndpoint(
 	const socket = editor.filter((endpoint) =>
 		endpoint.endpoint.type === 'socket'
 		&& endpoint.endpoint.path !== undefined
-		&& isAbsolute(endpoint.endpoint.path));
+		&& (platform === 'win32'
+			? /^\\\\[.?]\\pipe\\[^\u0000\r\n]+$/iu.test(endpoint.endpoint.path)
+			: posix.isAbsolute(endpoint.endpoint.path)));
 	if (socket.length === 0) {
 		throw new EditorAgentHostLocatorError(
 			'UNSUPPORTED_TRANSPORT',

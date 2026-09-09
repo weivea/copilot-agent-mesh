@@ -1,10 +1,9 @@
 import assert from 'node:assert/strict';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, createWriteStream } from 'node:fs';
 import {
 	access,
-	chmod,
 	lstat,
 	mkdir,
 	readFile,
@@ -28,6 +27,23 @@ import {
 } from 'node:path';
 import { finished } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
+import {
+	assertNoPathAliases,
+	assertProfileIdle as assertIdle,
+	assertVscodeExecutable,
+	commandContainsPath,
+	guiEnvironment,
+	ipcEndpointAbsent,
+	pathKey,
+	pathsOverlap,
+	readProcessTable as inspectProcesses,
+	realProfileDirectories,
+	resolveCodeCommand,
+	supportsWorker,
+} from '../multi-window/platform.mjs';
+import { HarnessProcesses, runWindowsHarnessCommand } from '../multi-window/owned-processes.mjs';
+import { prepareSentinel, sentinelExecutablePath } from '../multi-window/sentinel.mjs';
+import { resolveHarnessProfile } from '../multi-window/profile.mjs';
 
 import {
 	downloadAndUnzipVSCode,
@@ -40,30 +56,31 @@ import {
 
 const environmentPrefix = 'MESH_PEER_DELEGATION_E2E';
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
-const repositoryRoot = resolve(scriptDirectory, '../../..');
+const repositoryRoot = resolve(scriptDirectory, '..', '..', '..');
 const require = createRequire(import.meta.url);
+require('tsx/cjs');
 const {
 	multiWindowWorkspaceKey,
 	parseProcessTable,
 	readMultiWindowStartupDiagnostic,
-} = require(join(repositoryRoot, 'out/src/e2e/MultiWindowE2eSupport.js'));
+} = require(join(repositoryRoot, 'src', 'e2e', 'MultiWindowE2eSupport.ts'));
 const {
 	createPeerDelegationDiagnosticEvidence,
 	createPeerDelegationTestDiagnosticEvidence,
 	normalizePeerDelegationEvidenceTerminalState,
 	parsePeerDelegationEvidence,
-} = require(join(repositoryRoot, 'out/src/e2e/PeerDelegationEvidence.js'));
+} = require(join(repositoryRoot, 'src', 'e2e', 'PeerDelegationEvidence.ts'));
 const {
 	runPeerDelegationCleanupPhases,
-} = require(join(repositoryRoot, 'out/src/e2e/PeerDelegationCleanup.js'));
+} = require(join(repositoryRoot, 'src', 'e2e', 'PeerDelegationCleanup.ts'));
 const {
 	PeerDelegationProcessTracker,
-} = require(join(repositoryRoot, 'out/src/e2e/PeerDelegationProcessTracker.js'));
+} = require(join(repositoryRoot, 'src', 'e2e', 'PeerDelegationProcessTracker.ts'));
 const {
 	canRequestManualPostDetachObservation,
 	manualPostDetachObservationTimeoutMs,
 	waitForManualPostDetachAttestation,
-} = require(join(repositoryRoot, 'out/src/e2e/PeerDelegationManualEvidence.js'));
+} = require(join(repositoryRoot, 'src', 'e2e', 'PeerDelegationManualEvidence.ts'));
 
 class E2eRequestError extends Error {
 	constructor(action, code, message) {
@@ -86,9 +103,12 @@ function revalidateEvidenceDestination(additionalFileNames = []) {
 const testMode = process.env[`${environmentPrefix}_TEST_MODE`] === '1';
 if (
 	!testMode
-	&& (process.platform !== 'darwin' || process.arch !== 'arm64')
+	&& !supportsWorker()
 ) {
-	throw new Error('The real peer-delegation E2E requires supported macOS arm64 Worker hardware.');
+	throw new Error('The real peer-delegation E2E requires Windows x64/ARM64 or macOS arm64 Worker hardware.');
+}
+if (!testMode && process.env[environmentPrefix] !== '1') {
+	throw new Error(`${environmentPrefix}=1 is required for real model turns.`);
 }
 
 const runId = randomUUID();
@@ -100,20 +120,22 @@ const runtimeBase = configuredRuntimeBase === undefined
 	: resolve(configuredRuntimeBase);
 const runRoot = join(runtimeBase, `peer-${runLabel}`);
 const configuredProfileBase = process.env[`${environmentPrefix}_PROFILE_DIR`];
-const persistentProfile = configuredProfileBase !== undefined;
-const profileBase = persistentProfile
-	? resolve(configuredProfileBase)
-	: join(runRoot, 'profile');
-const userDataDirectory = join(profileBase, 'user-data');
+const profile = resolveHarnessProfile(environmentPrefix, runRoot);
+const persistentProfile = profile.persistent;
+if (!testMode && !persistentProfile) {
+	throw new Error(`${environmentPrefix}_PROFILE_DIR must explicitly select a dedicated authenticated E2E profile.`);
+}
+const profileBase = profile.base;
+const userDataDirectory = profile.userData;
 const profileLockDirectory = join(profileBase, '.copilot-agent-mesh-peer-e2e-lock');
 const profileLockOwnerPath = join(profileLockDirectory, 'owner');
-const extensionsDirectory = join(runRoot, 'extensions');
+const extensionsDirectory = profile.extensions;
 const controlRoot = join(runRoot, 'control');
 const logsDirectory = join(runRoot, 'logs');
 const workspacesDirectory = join(runRoot, 'projects');
 const sourceWorkspacePath = join(workspacesDirectory, `source-${runLabel}`);
 const targetWorkspacePath = join(workspacesDirectory, `target-${runLabel}`);
-const sentinelPath = join(runRoot, 'devtunnel-sentinel');
+const sentinelPath = sentinelExecutablePath(runRoot);
 const sentinelInvocationPath = join(runRoot, 'devtunnel-invoked.json');
 const configuredEvidenceRoot = process.env[`${environmentPrefix}_EVIDENCE_DIR`];
 const releaseEvidenceRoot = join(repositoryRoot, 'artifacts', 'peer-delegation-e2e');
@@ -147,6 +169,7 @@ const processTracker = new PeerDelegationProcessTracker({
 	selfPid: process.pid,
 });
 const launchRecords = [];
+const harnessProcesses = new HarnessProcesses();
 const windowOpenRecords = [];
 const observedCleanupFailures = [];
 const activeControllers = new Map();
@@ -172,6 +195,7 @@ let cleanupOperation;
 let ownershipSampler;
 let ownershipSamplerStarted = false;
 let ownershipSamplerFailure;
+let ownershipSample;
 let testDirtyTree = false;
 let testEvidencePersistenceAllowed = true;
 
@@ -192,6 +216,9 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
 		}
 		signalCleanupStarted = true;
 		primaryFailure ??= new Error(`The peer-delegation E2E was interrupted by ${signal}.`);
+		void harnessProcesses.disposeWindows({ stopLaunching: true }).catch((error) => {
+			observedCleanupFailures.push({ phase: 'signal-job-cleanup', error });
+		});
 		void cleanupAfterSignal(signal);
 	});
 }
@@ -206,14 +233,15 @@ try {
 		? resolve(process.env.MESH_VSCODE_EXECUTABLE)
 		: await downloadAndUnzipVSCode('stable');
 	await access(vscodeExecutablePath);
+	assertVscodeExecutable(vscodeExecutablePath);
 	codeCliPath = process.env.MESH_CODE_CLI
 		? resolve(process.env.MESH_CODE_CLI)
 		: resolveCliPathFromVSCodeExecutablePath(vscodeExecutablePath);
 	await access(codeCliPath);
-	evidence.versions.vscode = readCodeVersion(codeCliPath);
+	evidence.versions.vscode = await readCodeVersion(codeCliPath);
 	await writeSettings();
 
-	assert.equal(currentOwnedProcesses().length, 0, 'Fresh peer E2E markers matched an existing process.');
+	assert.equal((await currentOwnedProcesses()).length, 0, 'Fresh peer E2E markers matched an existing process.');
 	const source = await launchAndDiscover(sourceWorkspacePath);
 	activeControllers.set(source.windowId, source);
 	await waitForControllerState(
@@ -298,6 +326,10 @@ try {
 
 	const catalogBeforeCount = 0;
 
+	await request(target, 'peer.policy.allow', {
+		windowLabel: sourceWindowLabel,
+		allowed: false,
+	});
 	await request(target, 'peer.policy.accept', { enabled: false });
 	await request(source, 'peer.policy.allow', {
 		windowLabel: targetWindowLabel,
@@ -398,7 +430,7 @@ try {
 		tunnelEnsureDelta,
 	].every(({ delta: difference }) => difference === 0)
 		&& await isAbsent(sentinelInvocationPath)
-		&& currentOwnedProcesses().filter(isDevTunnelProcess).length === 0;
+		&& (await currentOwnedProcesses()).filter(isDevTunnelProcess).length === 0;
 	evidence.transport = {
 		status: transportPass ? 'pass' : 'fail',
 		listenerStartAttempts: listenerDelta,
@@ -730,7 +762,7 @@ async function preflight() {
 	const submodule = runGit(['-C', 'third_party/agent-host-protocol', 'rev-parse', 'HEAD']);
 	assert.equal(submodule, 'f19dd8b3942d029744a3bdd31d830f9428e8ea47');
 	const manifest = JSON.parse(await readFile(join(repositoryRoot, 'package.json'), 'utf8'));
-	assert.equal(manifest.version, '0.4.0');
+	assert.equal(manifest.version, '0.5.0');
 	evidence.gitCommit = head;
 }
 
@@ -759,19 +791,13 @@ async function acquireProfileLock() {
 }
 
 function assertProfileIdle() {
-	const users = readProcessTable().filter(({ pid, command }) =>
-		pid !== process.pid
-		&& command.includes('--user-data-dir')
-		&& (
-			command.includes(userDataDirectory)
-			|| command.includes(canonicalUserDataDirectory)
-		),
-	);
-	if (users.length > 0) {
-		throw Object.assign(
-			new Error('The dedicated peer-delegation E2E profile is already in use.'),
-			{ code: 'PROFILE_IN_USE' },
-		);
+	const entries = readProcessTable();
+	assertIdle(entries, userDataDirectory);
+	assertIdle(entries, canonicalUserDataDirectory);
+	if (profile.reusedExtensions && entries.some(({ pid, command }) =>
+		pid !== process.pid && command.includes('--extensions-dir') && commandContainsPath(command, extensionsDirectory),
+	)) {
+		throw new Error('The dedicated E2E extensions directory is still in use.');
 	}
 }
 
@@ -812,15 +838,7 @@ async function prepareRun() {
 			'utf8',
 		),
 	]);
-	const sentinel = [
-		'#!/usr/bin/env node',
-		`require('node:fs').writeFileSync(${JSON.stringify(sentinelInvocationPath)}, JSON.stringify({ invoked: true, pid: process.pid }));`,
-		'process.exitCode = 97;',
-		'',
-	].join('\n');
-	await writeFile(sentinelPath, sentinel, { encoding: 'utf8', mode: 0o700 });
-	await chmod(sentinelPath, 0o700);
-	sentinelDigest = createHash('sha256').update(sentinel).digest('hex');
+	sentinelDigest = await prepareSentinel(sentinelPath, sentinelInvocationPath);
 	await revalidateEvidenceDestination([basename(attestationPath)]);
 	await rm(attestationPath, { force: true });
 }
@@ -837,7 +855,6 @@ async function writeSettings() {
 		`${JSON.stringify({
 			'copilotAgentMesh.deviceName': 'P8 Peer Delegation E2E',
 			'copilotAgentMesh.codePath': codeCliPath,
-			'copilotAgentMesh.experimental.peerDelegation': true,
 			'copilotAgentMesh.experimental.authenticationProviders': mappings,
 			'copilotAgentMesh.agentHost.userDataDir': userDataDirectory,
 			'copilotAgentMesh.devTunnelPath': sentinelPath,
@@ -865,11 +882,14 @@ async function launchAndDiscover(workspacePath) {
 	}
 	const controller = await waitForController(workspacePath, launchedAt, 60_000);
 	await request(controller, 'controller.state');
-	refreshOwnedProcesses();
+	await refreshOwnedProcesses();
 	return controller;
 }
 
 async function launchWindow(workspacePath) {
+	if (signalCleanupStarted) {
+		throw new Error('Peer-delegation E2E was interrupted.');
+	}
 	const args = [
 		workspacePath,
 		`--user-data-dir=${userDataDirectory}`,
@@ -907,7 +927,7 @@ async function launchWindow(workspacePath) {
 			{ code: 'E2E_LOG_FAILED' },
 		);
 	}
-	const environment = { ...process.env };
+	const environment = guiEnvironment();
 	for (const name of [
 		'MESH_TWO_DEVICE_E2E',
 		'MESH_MULTI_WINDOW_E2E',
@@ -923,7 +943,7 @@ async function launchWindow(workspacePath) {
 	environment[`${environmentPrefix}_NODE_EXECUTABLE`] = process.execPath;
 	let child;
 	try {
-		child = spawn(vscodeExecutablePath, args, {
+		child = await harnessProcesses.launch(vscodeExecutablePath, args, {
 			env: environment,
 			shell: false,
 			stdio: ['ignore', 'pipe', 'pipe'],
@@ -937,6 +957,9 @@ async function launchWindow(workspacePath) {
 	child.once('error', (error) => {
 		record.exit = { error: error.message };
 	});
+	child.once('failure', (error) => {
+		record.exit = { error: error.message };
+	});
 	child.once('exit', (code, signal) => {
 		record.exit = { code, signal };
 	});
@@ -947,7 +970,7 @@ async function launchWindow(workspacePath) {
 	startOwnershipSampler();
 	child.stdout.pipe(output, { end: false });
 	child.stderr.pipe(output, { end: false });
-	refreshOwnedProcesses();
+	await refreshOwnedProcesses();
 }
 
 async function waitForController(workspacePath, launchedAt, timeoutMs) {
@@ -1009,6 +1032,9 @@ async function waitForController(workspacePath, launchedAt, timeoutMs) {
 }
 
 async function request(controller, action, params = {}, timeoutMs = 30_000) {
+	if (signalCleanupStarted && action !== 'host.close' && action !== 'controller.state') {
+		throw new Error('Peer-delegation E2E was interrupted.');
+	}
 	const id = randomUUID();
 	const requestPath = join(controller.controlDirectory, 'requests', `${id}.json`);
 	const temporary = `${requestPath}.${process.pid}.tmp`;
@@ -1777,19 +1803,13 @@ async function assertProjectUnchanged(workspacePath) {
 }
 
 function readProcessTable() {
-	const result = spawnSync(
-		'ps',
-		['-axo', 'pid=,ppid=,pgid=,command='],
-		{ encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 },
-	);
-	if (result.status !== 0) {
-		throw new Error('Unable to inspect exact peer-delegation E2E process ownership.');
-	}
-	return parseProcessTable(result.stdout);
+	return inspectProcesses(parseProcessTable);
 }
 
-function currentOwnedProcesses() {
-	const owned = processTracker.select(readProcessTable());
+async function currentOwnedProcesses() {
+	const owned = process.platform === 'win32'
+		? await harnessProcesses.ownedWindowsProcesses(parseProcessTable)
+		: processTracker.select(readProcessTable());
 	maximumOwnedProcessCount = Math.max(maximumOwnedProcessCount, owned.length);
 	ownedPeaks.vscode = Math.max(
 		ownedPeaks.vscode,
@@ -1806,8 +1826,8 @@ function currentOwnedProcesses() {
 	return owned;
 }
 
-function refreshOwnedProcesses() {
-	currentOwnedProcesses();
+async function refreshOwnedProcesses() {
+	await currentOwnedProcesses();
 }
 
 function startOwnershipSampler() {
@@ -1816,20 +1836,21 @@ function startOwnershipSampler() {
 	}
 	ownershipSamplerStarted = true;
 	ownershipSampler = setInterval(() => {
-		try {
-			currentOwnedProcesses();
-		} catch (error) {
-			ownershipSamplerFailure ??= error;
+		if (ownershipSample === undefined) {
+			ownershipSample = currentOwnedProcesses()
+				.catch((error) => { ownershipSamplerFailure ??= error; })
+				.finally(() => { ownershipSample = undefined; });
 		}
-	}, 100);
+	}, process.platform === 'win32' ? 2_000 : 100);
 	ownershipSampler.unref?.();
 }
 
-function stopOwnershipSampler() {
+async function stopOwnershipSampler() {
 	if (ownershipSampler !== undefined) {
 		clearInterval(ownershipSampler);
 		ownershipSampler = undefined;
 	}
+	await ownershipSample;
 	if (ownershipSamplerFailure !== undefined) {
 		throw ownershipSamplerFailure;
 	}
@@ -1837,6 +1858,7 @@ function stopOwnershipSampler() {
 
 function isVscodeProcess(processInfo) {
 	return /(?:Visual Studio Code|Code Helper|Electron)(?:\s|$)/u.test(processInfo.command)
+		|| /(?:^|[\\/"\s])Code(?: - Insiders)?\.exe(?:["\s]|$)/iu.test(processInfo.command)
 		|| processInfo.command.includes('--extensionDevelopmentPath');
 }
 
@@ -1845,13 +1867,13 @@ function isAgentHostProcess(processInfo) {
 }
 
 function isDevTunnelProcess(processInfo) {
-	return processInfo.command.includes(sentinelPath);
+	return commandContainsPath(processInfo.command, sentinelPath);
 }
 
 async function waitForNoOwnedProcesses(timeoutMs) {
 	const deadline = Date.now() + timeoutMs;
 	do {
-		if (currentOwnedProcesses().length === 0) {
+		if ((await currentOwnedProcesses()).length === 0) {
 			return;
 		}
 		await delay(100);
@@ -1860,14 +1882,18 @@ async function waitForNoOwnedProcesses(timeoutMs) {
 }
 
 async function terminateOwnedProcesses() {
-	let remaining = currentOwnedProcesses();
+	if (process.platform === 'win32') {
+		await harnessProcesses.disposeWindows({ stopLaunching: signalCleanupStarted });
+		return;
+	}
+	let remaining = await currentOwnedProcesses();
 	for (const processInfo of remaining) {
 		killExactProcess(processInfo.pid, 'SIGTERM');
 	}
 	const deadline = Date.now() + 5_000;
 	while (Date.now() < deadline) {
 		await delay(100);
-		remaining = currentOwnedProcesses();
+		remaining = await currentOwnedProcesses();
 		if (remaining.length === 0) {
 			return;
 		}
@@ -1878,6 +1904,9 @@ async function terminateOwnedProcesses() {
 }
 
 function killExactProcess(pid, signal) {
+	if (process.platform === 'win32') {
+		throw new Error('Windows harness cleanup requires Job Object ownership, not numeric PID termination.');
+	}
 	if (testTerminationLogPath !== undefined) {
 		appendFileSync(testTerminationLogPath, `${pid}:${signal}\n`, {
 			encoding: 'utf8',
@@ -1915,8 +1944,7 @@ function performCleanup() {
 
 async function performCleanupOnce() {
 	let finalOwned;
-	let localIpcRemoved = localIpcEndpoint === undefined
-		|| localIpcEndpoint.platform === 'win32';
+	let localIpcRemoved = localIpcEndpoint === undefined;
 	let editorEndpointReleased = codeCliPath === undefined;
 	let sentinelInvoked = false;
 	let sentinelUnchanged = sentinelDigest === undefined;
@@ -1926,14 +1954,17 @@ async function performCleanupOnce() {
 		{
 			name: 'snapshot-owned-processes',
 			run: async () => {
-				currentOwnedProcesses();
+				await currentOwnedProcesses();
 			},
 		},
-		{ name: 'stop-ownership-sampler', run: async () => stopOwnershipSampler() },
+		{ name: 'stop-ownership-sampler', run: stopOwnershipSampler },
 		{ name: 'close-controllers', run: closeControllers },
 		{
 			name: 'owned-processes',
 			run: async () => {
+				if (process.platform === 'win32') {
+					await harnessProcesses.disposeWindows({ stopLaunching: true });
+				}
 				await waitForNoOwnedProcesses(15_000).catch(async () => {
 					await terminateOwnedProcesses();
 					await waitForNoOwnedProcesses(5_000);
@@ -1952,15 +1983,13 @@ async function performCleanupOnce() {
 		{
 			name: 'observe-processes',
 			run: async () => {
-				finalOwned = currentOwnedProcesses();
+				finalOwned = await currentOwnedProcesses();
 			},
 		},
 		{
 			name: 'observe-local-ipc',
 			run: async () => {
-				localIpcRemoved = localIpcEndpoint === undefined
-					|| localIpcEndpoint.platform === 'win32'
-					|| await isAbsent(localIpcEndpoint.address);
+				localIpcRemoved = await ipcEndpointAbsent(localIpcEndpoint);
 			},
 		},
 		{
@@ -2128,10 +2157,15 @@ async function saveSanitizedLogs() {
 }
 
 async function safeEditorEndpointCount(executable, profile) {
-	const result = spawnSync(
-		executable,
-		['agent', 'endpoints', '--user-data-dir', profile],
-		{ encoding: 'utf8', maxBuffer: 1024 * 1024, shell: false },
+	const command = await resolveCodeCommand(executable, ['agent', 'endpoints', '--user-data-dir', profile]);
+	const result = process.platform === 'win32'
+		? await runWindowsHarnessCommand(command.executable, command.args, {
+			env: command.env, timeoutMs: 10_000, maxOutputBytes: 1024 * 1024,
+		})
+		: spawnSync(
+		command.executable,
+		command.args,
+		{ env: command.env, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024, shell: false },
 	);
 	if (result.status !== 0) {
 		return -1;
@@ -2207,13 +2241,15 @@ async function assertUsablePaths() {
 	const canonicalRuntimeBase = await assertNoSymlinkAlias(runtimeBase, 'runtime base');
 	const canonicalRunRoot = await assertNoSymlinkAlias(runRoot, 'run root');
 	const canonicalProfileBase = await assertNoSymlinkAlias(profileBase, 'profile base');
+	await assertNoSymlinkAlias(extensionsDirectory, 'extensions directory');
 	canonicalUserDataDirectory = await assertNoSymlinkAlias(
 		userDataDirectory,
 		'profile user-data directory',
 	);
 	if (
-		canonicalRunRoot !== join(canonicalRuntimeBase, basename(runRoot))
-		|| canonicalUserDataDirectory !== join(canonicalProfileBase, 'user-data')
+		pathKey(canonicalRunRoot) !== pathKey(join(canonicalRuntimeBase, basename(runRoot)))
+		|| !pathsOverlap(canonicalProfileBase, canonicalUserDataDirectory)
+		|| !pathKey(canonicalUserDataDirectory).startsWith(pathKey(canonicalProfileBase))
 	) {
 		throw new Error('The peer-delegation E2E paths do not resolve beneath their owned roots.');
 	}
@@ -2232,7 +2268,7 @@ async function assertUsablePaths() {
 	}
 	await assertSafeTestEvidenceDestination();
 	const mainIpcPath = join(userDataDirectory, '1.13-main.sock');
-	if (!testMode && Buffer.byteLength(mainIpcPath, 'utf8') > 103) {
+	if (!testMode && process.platform === 'darwin' && Buffer.byteLength(mainIpcPath, 'utf8') > 103) {
 		throw new Error('The selected peer E2E profile path exceeds the macOS socket limit.');
 	}
 }
@@ -2330,9 +2366,10 @@ async function assertProfileMutationSafe() {
 }
 
 async function assertNoSymlinkAlias(path, label) {
+	await assertNoPathAliases(path);
 	const resolved = resolve(path);
 	const canonical = await canonicalizePotentialPath(resolved);
-	if (canonical !== resolved) {
+	if (pathKey(canonical) !== pathKey(resolved)) {
 		throw new Error(`The peer-delegation E2E ${label} must not contain a symbolic-link alias.`);
 	}
 	return canonical;
@@ -2361,19 +2398,11 @@ async function canonicalizePotentialPath(path) {
 }
 
 function realVscodeUserDataDirectories() {
-	const home = homedir();
-	return [
-		join(home, 'Library', 'Application Support', 'Code'),
-		join(home, 'Library', 'Application Support', 'Code - Insiders'),
-		join(home, '.config', 'Code'),
-		join(home, '.config', 'Code - Insiders'),
-		join(home, '.vscode'),
-		join(home, '.vscode-insiders'),
-	];
+	return realProfileDirectories();
 }
 
 function isWithin(parent, candidate) {
-	return candidate.startsWith(`${parent}${sep}`);
+	return pathsOverlap(parent, candidate) && pathKey(candidate).startsWith(pathKey(parent));
 }
 
 function parseStringArray(value) {
@@ -2420,9 +2449,17 @@ function runGit(args) {
 	return result.stdout.trim();
 }
 
-function readCodeVersion(executable) {
-	const result = spawnSync(executable, ['--version'], {
+async function readCodeVersion(executable) {
+	const command = await resolveCodeCommand(executable, ['--version']);
+	const result = process.platform === 'win32'
+		? await runWindowsHarnessCommand(command.executable, command.args, {
+			env: command.env, timeoutMs: 10_000, maxOutputBytes: 1024 * 1024,
+		})
+		: spawnSync(command.executable, command.args, {
+		env: command.env,
 		encoding: 'utf8',
+		timeout: 10_000,
+		maxBuffer: 1024 * 1024,
 		shell: false,
 	});
 	if (result.status !== 0) {
@@ -2510,13 +2547,13 @@ function deriveOutcome(value) {
 function initialEvidence() {
 	return {
 		schemaVersion: 1,
-		release: '0.4.0-preview',
+		release: '0.5.0-preview',
 		runId,
 		outcome: 'unverified',
 		gitCommit: '0000000000000000000000000000000000000000',
 		versions: {
-			extension: '0.4.0',
-			vscode: '1.135.0',
+			extension: '0.5.0',
+			vscode: 'not-observed',
 			ahpCommit: 'f19dd8b3942d029744a3bdd31d830f9428e8ea47',
 			ahpClient: '0.9.0',
 			protocolOffer: ['1.0.0'],

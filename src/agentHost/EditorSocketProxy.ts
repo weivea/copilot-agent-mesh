@@ -193,6 +193,7 @@ export class EditorSocketProxy {
 			{
 				env: helperEnvironment(),
 				shell: false,
+				windowsHide: true,
 				stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
 			},
 		);

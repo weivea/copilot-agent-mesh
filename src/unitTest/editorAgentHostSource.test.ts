@@ -11,9 +11,10 @@ import {
 	type Server as NetServer,
 	type Socket,
 } from 'node:net';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
+import { randomUUID } from 'node:crypto';
+import { createRequire } from 'node:module';
 import { test } from 'node:test';
 
 import WebSocket, { WebSocketServer } from 'ws';
@@ -52,7 +53,7 @@ const platformBase: Omit<EditorAgentHostPlatformContext, 'platform' | 'productNa
 };
 const netServerSockets = new WeakMap<NetServer, Set<Socket>>();
 
-test('derives Stable, Insiders, Linux, Windows, and override user-data directories without widening support', () => {
+test('derives Stable, Insiders, Linux, Windows, and override user-data directories with native Windows support', () => {
 	assert.deepEqual(deriveEditorAgentHostUserDataDir({
 		...platformBase,
 		platform: 'darwin',
@@ -90,7 +91,7 @@ test('derives Stable, Insiders, Linux, Windows, and override user-data directori
 		environment: { APPDATA: 'C:\\Users\\mesh\\AppData\\Roaming' },
 	}), {
 		path: 'C:\\Users\\mesh\\AppData\\Roaming\\Code',
-		validatedWorkerHost: false,
+		validatedWorkerHost: true,
 	});
 	assert.deepEqual(deriveEditorAgentHostUserDataDir({
 		...platformBase,
@@ -299,9 +300,7 @@ test('locator normalizes command failure, timeout, and cancellation without sens
 	);
 });
 
-test('Unix socket connector performs authenticated upgrade, scrubs inspectable URL, and isolates concurrent clients', {
-	skip: process.platform === 'win32',
-}, async () => {
+test('local IPC connector performs authenticated upgrade, scrubs inspectable URL, and isolates concurrent clients', async () => {
 	await withSocketPath(async (socketPath) => {
 		const { server, webSockets } = await startWebSocketServer(socketPath, 'connection-token');
 		try {
@@ -318,7 +317,7 @@ test('Unix socket connector performs authenticated upgrade, scrubs inspectable U
 			first.close();
 			await once(first, 'close');
 			assert.equal(second.readyState, second.OPEN);
-			const proxyRoot = await mkdtemp(join(tmpdir(), 'mesh-editor-proxy-test-'));
+			const proxyRoot = await mkdtemp(join(__dirname, 'mesh-editor-proxy-test-'));
 			const proxied = await new UnixSocketWebSocketConnector({
 				timeoutMs: 1_000,
 				proxyRoot,
@@ -338,16 +337,57 @@ test('Unix socket connector performs authenticated upgrade, scrubs inspectable U
 	});
 });
 
-test('editor proxy rejects unauthorized loopback clients without consuming the one-shot bridge', {
-	skip: process.platform === 'win32',
-}, async () => {
+test('local IPC retains its dedicated HTTP agent when the editor injects a default proxy', async (t) => {
+	const load = createRequire(__filename);
+	const http: typeof import('node:http') = load('node:http');
+	const request = http.request;
+	const proxyAgent = new http.Agent();
+	let intercepted = 0;
+	let proxyConnections = 0;
+	proxyAgent.createConnection = () => {
+		proxyConnections += 1;
+		throw new Error('The test proxy must not receive local IPC traffic.');
+	};
+	t.after(() => proxyAgent.destroy());
+	t.mock.method(http, 'request', (...args: unknown[]) => {
+		const options = args[0];
+		if (typeof options !== 'object' || options === null) {
+			throw new Error('The WebSocket client must use HTTP request options.');
+		}
+		intercepted += 1;
+		const supplied: Record<string, unknown> = { ...options };
+		args[0] = { ...supplied, agent: supplied.agent ?? proxyAgent };
+		return Reflect.apply(request, http, args);
+	});
+	await withSocketPath(async (socketPath) => {
+		const { server, webSockets } = await startWebSocketServer(socketPath, 'connection-token');
+		try {
+			const connection = await new UnixSocketWebSocketConnector({ connectionMode: 'directOnly' })
+				.connect(socketPath, 'connection-token');
+			connection.close();
+			await once(connection, 'close');
+			const proxied = await new UnixSocketWebSocketConnector({
+				connectionMode: 'proxyOnly',
+				proxyRoot: join(__dirname, `proxy-override-${randomUUID()}`),
+			}).connect(socketPath, 'connection-token');
+			proxied.close();
+			await once(proxied, 'close');
+			assert.ok(intercepted > 0);
+			assert.equal(proxyConnections, 0);
+		} finally {
+			await closeWebSocketServer(server, webSockets);
+		}
+	});
+});
+
+test('editor proxy rejects unauthorized loopback clients without consuming the one-shot bridge', async () => {
 	await withSocketPath(async (socketPath) => {
 		const {
 			server,
 			webSockets,
 			receivedProxyHeaders,
 		} = await startWebSocketServer(socketPath, 'connection-token');
-		const ownershipMarker = await mkdtemp(join(tmpdir(), 'mesh-editor-proxy-auth-test-'));
+		const ownershipMarker = await mkdtemp(join(__dirname, 'mesh-editor-proxy-auth-test-'));
 		const proxy = await EditorSocketProxy.open({
 			targetPath: socketPath,
 			ownershipMarker,
@@ -387,9 +427,7 @@ test('editor proxy rejects unauthorized loopback clients without consuming the o
 	});
 });
 
-test('Unix socket connector rejects token/status/header failures, timeout, cancellation, and early close safely', {
-	skip: process.platform === 'win32',
-}, async () => {
+test('local IPC connector rejects token/status/header failures, timeout, cancellation, and early close safely', async () => {
 	await withSocketPath(async (socketPath) => {
 		const { server, webSockets } = await startWebSocketServer(socketPath, 'expected-token');
 		try {
@@ -1177,7 +1215,11 @@ function editorEndpoint(options: {
 }
 
 async function withSocketPath(run: (socketPath: string) => Promise<void>): Promise<void> {
-	const root = await mkdtemp(join(tmpdir(), 'mesh-editor-host-'));
+	if (process.platform === 'win32') {
+		await run(`\\\\.\\pipe\\mesh-editor-${randomUUID()}`);
+		return;
+	}
+	const root = await mkdtemp(join(__dirname, 'mesh-editor-host-'));
 	try {
 		await run(join(root, 'editor.sock'));
 	} finally {

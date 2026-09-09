@@ -174,11 +174,11 @@ test('records the global WebSocket transport boundary', () => {
 	assert.doesNotThrow(() => requireGlobalWebSocket());
 });
 
-test('fails closed on Windows without a Job Object controller', () => {
-	assert.throws(
-		() => assertOwnedProcessControlSupported('win32'),
-		/Job Object based process controller/u,
-	);
+test('supports Windows Job Object and existing POSIX process controllers', () => {
+	for (const platform of ['win32', 'darwin', 'linux'] as const) {
+		assert.doesNotThrow(() => assertOwnedProcessControlSupported(platform));
+	}
+	assert.throws(() => assertOwnedProcessControlSupported('aix'), /no owned process controller/u);
 });
 
 test('sanitizes errors without retaining a secret-bearing cause', () => {

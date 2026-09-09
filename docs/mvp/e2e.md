@@ -6,7 +6,42 @@
 
 ## Opt-in boundary
 
-### 0.4.0 Peer Window Delegation
+The 0.5.0 implementation adds Windows x64/ARM64 harness support. The dated
+macOS observations in this document remain historical results, not Windows
+evidence. Ordinary local discovery is now default-on; the real-task harness
+opt-ins below remain necessary because they can consume Copilot quota.
+
+### Windows 0.5.0 diagnostic observation
+
+On 2026-09-09, VS Code 1.136.2 / Windows x64 completed one short editor-backed
+task through two ordinary windows and the local Broker using a dedicated,
+explicitly authenticated test profile. Run
+`238552fd-eee1-4e36-983a-a679ca92c4aa` observed `agentStarted`, output and an
+authoritative `completed` state in about 14.6 seconds. No input was approved
+automatically and no Tunnel was started. Final process/pipe cleanup, profile-lock
+release and owned runtime removal passed.
+
+The original evidence still reports an overall failure: the first concurrent
+allowlist/receive restoration raced on the shared policy revision, and the final
+retry recovered. Cleanup now serializes those mutations and has regression
+coverage. Do not rewrite that evidence as Pass or treat a single-task diagnostic
+as the full UI, physical cross-device, or Windows ARM64 gate.
+
+The run also identified and fixed two real Windows compatibility problems:
+the editor's HTTP proxy injection could intercept a local IPC WebSocket unless
+it had a dedicated HTTP agent, and equivalent drive-letter casing could reject
+the target Session's workspace. Strict provider and folder isolation remain in
+place. Command-scoped Git configuration is removed from test GUI environments,
+not from the user's configuration.
+
+The separate no-model run `88c82a3b-408c-46bf-862b-819401aa7751` passed the full
+transport/lifecycle path on the same Windows/VS Code build: two nodes and one
+Broker, closed-window removal in 202 ms, the same Workspace reclaimed after
+reopening, Broker takeover/reconnect in 896 ms, duplicate-claim rejection, and
+complete owned process/pipe/runtime cleanup. This is lifecycle evidence, not an
+additional model turn or a physical cross-device run.
+
+### Peer Window Delegation
 
 The release gate is exact and default-off:
 
@@ -15,7 +50,7 @@ MESH_PEER_DELEGATION_E2E=1 npm run test:peer-delegation-real
 ```
 
 Without the exact value `1`, the wrapper exits before compiling or launching VS
-Code. An enabled run requires macOS arm64, creates two ordinary windows with one
+Code. An enabled run requires Windows x64/ARM64 or macOS arm64, creates two ordinary windows with one
 dedicated User Data directory and two different temporary non-sensitive projects,
 and removes only resources identified by its own root PIDs, descendants, and
 unique runtime markers. A persistent authenticated profile is optional and must
@@ -35,6 +70,16 @@ When the editor endpoint is selected, it reuses that editor Host's existing
 identity and receives no proactive OAuth token injection. A later editor
 authentication challenge fails explicitly and must be resolved in the editor
 profile.
+
+In Windows PowerShell, set the same explicit opt-in before running the harness:
+
+```powershell
+$env:MESH_PEER_DELEGATION_E2E = '1'
+npm run test:peer-delegation-real
+```
+
+The VSIX contains the Windows process controller. Building from source also
+requires the Go toolchain declared by `native/windows-process-host/go.mod`.
 
 The persistent User Data remains the source of VS Code/Copilot authentication, but
 it is not the Mesh state root for a peer-delegation run. After the development-only

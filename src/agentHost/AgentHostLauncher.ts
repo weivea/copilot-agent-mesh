@@ -17,6 +17,8 @@ import {
 	type RunOwnedCommandOptions,
 } from '../spikes/ownedProcess';
 import { AgentRuntimeError } from './AgentRuntime';
+import { resolveWindowsCommand, windowsCodeCliCandidates } from '../spikes/windowsCodeCli';
+import { WindowsOwnedProcess } from '../spikes/windowsProcessHost';
 import type { AgentHostSource } from './AgentRuntime';
 import type WebSocket from 'ws';
 
@@ -97,6 +99,9 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 	}
 
 	async probe(): Promise<AgentHostProbe> {
+		if (this.disposed) {
+			return { available: false };
+		}
 		try {
 			this.dependencies.assertProcessControlSupported();
 			const result = await discoverCodeCli(
@@ -145,25 +150,40 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 			this.options.configuredCodeCli,
 			signal,
 			(executable, args, options) => this.runCommand(executable, args, options),
-		).catch(() => {
-			throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'A compatible VS Code command-line interface was not found.');
+		).catch((error: unknown) => {
+			throw new AgentRuntimeError(
+				'AGENT_UNAVAILABLE',
+				'A compatible VS Code command-line interface was not found.',
+				false,
+				undefined,
+				error instanceof OwnedCommandError && error.cleanupRequired,
+			);
 		});
 		throwIfLaunchAborted(signal);
 		await mkdir(this.options.storageRoot, { recursive: true });
 		const ownedRoot = await mkdtemp(join(this.options.storageRoot, 'instance-'));
 		const userDataDir = join(ownedRoot, 'user-data');
 		const serverDataDir = join(ownedRoot, 'server-data');
+		const cliDataDir = join(ownedRoot, 'cli-data');
 		const tokenFile = join(ownedRoot, 'connection-token');
 		const token = randomBytes(32).toString('hex');
 		let processGroupId: number | undefined;
-		let host: ChildProcess | undefined;
+		let host: ChildProcess | WindowsOwnedProcess | undefined;
 		let launched: OwnedAgentHost | undefined;
 		let spawnError: Error | undefined;
+		const terminate = async (pid: number, graceMs: number) => {
+			if (host instanceof WindowsOwnedProcess) {
+				await host.dispose();
+			} else {
+				await this.dependencies.terminate(pid, graceMs);
+			}
+		};
 
 		try {
 			await Promise.all([
 				mkdir(userDataDir),
 				mkdir(serverDataDir),
+				...(process.platform === 'win32' ? [mkdir(cliDataDir)] : []),
 				writeFile(tokenFile, token, { encoding: 'utf8', mode: 0o600 }),
 			]);
 			throwIfLaunchAborted(signal);
@@ -176,7 +196,7 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 			);
 			const baselineInstanceIds = new Set(baseline.endpoints.map(({ instanceId }) => instanceId));
 
-			host = spawn(code.executable, [
+			const hostArgs = [
 				'agent',
 				'host',
 				'--new-instance',
@@ -193,12 +213,28 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 				tokenFile,
 				'--log',
 				'error',
-			], {
-				detached: true,
-				shell: false,
-				windowsHide: true,
-				stdio: ['ignore', 'pipe', 'pipe'],
-			});
+			];
+			if (process.platform === 'win32') {
+				const command = await resolveWindowsCommand(
+					code.executable,
+					[...hostArgs, '--cli-data-dir', cliDataDir],
+					{ ...process.env, VSCODE_CLI_DATA_DIR: cliDataDir },
+				);
+				throwIfLaunchAborted(signal);
+				host = new WindowsOwnedProcess(command.executable, command.args, {
+					environment: command.environment,
+				});
+				host.stdout.resume();
+				host.stderr.resume();
+				await host.started;
+			} else {
+				host = spawn(code.executable, hostArgs, {
+					detached: true,
+					shell: false,
+					windowsHide: true,
+					stdio: ['ignore', 'pipe', 'pipe'],
+				});
+			}
 			host.once('error', (error) => {
 				spawnError = error;
 			});
@@ -216,15 +252,17 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 					if (spawnError !== undefined) {
 						throw spawnError;
 					}
-					if (host?.exitCode !== null) {
+					if (host?.exitCode !== null || host?.signalCode !== null) {
 						throw new Error('The Agent Host exited before publishing its endpoint.');
 					}
 					throwIfLaunchAborted(signal);
-					ownedPids = await readOwnedProcessGroup(
-						processGroupId!,
-						signal,
-						(executable, args, options) => this.runCommand(executable, args, options),
-					);
+					ownedPids = host instanceof WindowsOwnedProcess
+						? await host.ownedPids()
+						: await readOwnedProcessGroup(
+							processGroupId!,
+							signal,
+							(executable, args, options) => this.runCommand(executable, args, options),
+						);
 					return discoverEndpoints(
 						code.executable,
 						userDataDir,
@@ -249,7 +287,7 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 				endpoint.registryProtocolVersion,
 				token,
 				{
-					terminate: this.dependencies.terminate,
+					terminate,
 					remove: this.dependencies.remove,
 				},
 				() => this.owned.delete(launched!),
@@ -265,13 +303,13 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 				throw normalizeLaunchError(error, token);
 			}
 			let cleanupError: AgentRuntimeError | undefined;
-			if (processGroupId !== undefined) {
+			if (processGroupId !== undefined || host instanceof WindowsOwnedProcess) {
 				const cleanup = new RetainedLaunchCleanup(
-					processGroupId,
+					processGroupId ?? 0,
 					ownedRoot,
 					token,
 					{
-						terminate: this.dependencies.terminate,
+						terminate,
 						remove: this.dependencies.remove,
 					},
 					() => this.owned.delete(cleanup),
@@ -302,7 +340,16 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 		try {
 			return await this.dependencies.runCommand(executable, args, options);
 		} catch (error) {
-			if (
+			if (error instanceof OwnedCommandError && error.cleanupRequired && error.ownedCleanup !== undefined) {
+				const resource = error.ownedCleanup;
+				const cleanup: OwnedResource = {
+					dispose: async () => {
+						await resource.dispose();
+						this.owned.delete(cleanup);
+					},
+				};
+				this.owned.add(cleanup);
+			} else if (
 				error instanceof OwnedCommandError
 				&& error.cleanupRequired
 				&& error.processGroupId !== undefined
@@ -358,9 +405,14 @@ export class OwnedAgentHost implements LaunchedAgentHost {
 	private disposal: Promise<void> | undefined;
 	private processTerminated = false;
 	private tempDirRemoved = false;
+	private exitError: AgentRuntimeError | undefined;
 
 	constructor(
-		private readonly child: ChildProcess,
+		private readonly child: {
+			readonly exitCode: number | null;
+			readonly signalCode: NodeJS.Signals | null;
+			once(event: 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
+		},
 		private readonly processGroupId: number,
 		private readonly ownedRoot: string,
 		readonly endpoint: URL,
@@ -370,7 +422,7 @@ export class OwnedAgentHost implements LaunchedAgentHost {
 		private readonly cleanup: AgentHostCleanupDependencies,
 		private readonly didDispose: () => void,
 	) {
-		child.once('exit', (code, signal) => {
+		const exited = (code: number | null, signal: NodeJS.Signals | null) => {
 			if (this.disposing) {
 				return;
 			}
@@ -379,14 +431,27 @@ export class OwnedAgentHost implements LaunchedAgentHost {
 				'TASK_RECOVERY_UNAVAILABLE',
 				`The owned Agent Host exited unexpectedly (${detail}).`,
 			);
+			this.exitError = error;
 			for (const listener of this.exitListeners) {
 				listener(error);
 			}
-		});
+		};
+		child.once('exit', exited);
+		if (child.exitCode !== null || child.signalCode !== null) {
+			exited(child.exitCode, child.signalCode);
+		}
 	}
 
 	onExit(listener: (error: AgentRuntimeError) => void): { dispose(): void } {
 		this.exitListeners.add(listener);
+		if (this.exitError !== undefined) {
+			const error = this.exitError;
+			queueMicrotask(() => {
+				if (this.exitListeners.has(listener)) {
+					listener(error);
+				}
+			});
+		}
 		return { dispose: () => this.exitListeners.delete(listener) };
 	}
 
@@ -547,7 +612,10 @@ export async function discoverCodeCli(
 					architecture: lines[2],
 				};
 			}
-		} catch {
+		} catch (error) {
+			if (error instanceof OwnedCommandError && error.cleanupRequired) {
+				throw error;
+			}
 			continue;
 		}
 	}
@@ -556,6 +624,8 @@ export async function discoverCodeCli(
 
 function defaultCodeCliCandidates(): readonly string[] {
 	switch (process.platform) {
+		case 'win32':
+			return windowsCodeCliCandidates();
 		case 'darwin':
 			return ['/usr/local/bin/code', '/opt/homebrew/bin/code', 'code'];
 		case 'linux':

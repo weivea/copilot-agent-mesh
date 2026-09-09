@@ -25,11 +25,10 @@ import { TaskToolFacadeError } from '../tools/taskToolFacade';
 import type { AgentMeshExtensionApi } from '../composition/createApplication';
 
 suite('Copilot Agent Mesh', () => {
-	test('cold host keeps contributed Tools unavailable while Preview is off', async () => {
+	test('registers task tools by default and preserves an explicit opt-out', async () => {
 		const extension = getExtension();
 		const manifestTools = extension.packageJSON.contributes.languageModelTools as Array<{ name: string }>;
 
-		assert.strictEqual(extension.isActive, false);
 		assert.deepStrictEqual(
 			extension.packageJSON.activationEvents,
 			['onStartupFinished'],
@@ -44,27 +43,24 @@ suite('Copilot Agent Mesh', () => {
 			assert.ok(!vscode.lm.tools.some((tool) => tool.name === removed));
 		}
 
-		const cancellation = new vscode.CancellationTokenSource();
-		try {
-			const invocation = vscode.lm.invokeTool(MESH_TOOL_NAMES.listWorkers, {
-				input: {},
-				toolInvocationToken: undefined,
-			}, cancellation.token);
-			setTimeout(() => cancellation.cancel(), 0);
-			await invocation;
-		} catch (error) {
-			assert.match(String(error), /does not have an implementation registered/i);
-		} finally {
-			cancellation.dispose();
-		}
-
+		await extension.activate();
+		await waitForToolRegistration(MESH_TOOL_NAMES.listWorkers);
 		assert.strictEqual(extension.isActive, true);
 		assert.ok(MESH_RUNTIME_TOOL_NAMES.every(
 			(name) => vscode.lm.tools.some((tool) => tool.name === name),
 		));
 
 		const configuration = vscode.workspace.getConfiguration('copilotAgentMesh');
+		assert.strictEqual(configuration.get('experimental.peerDelegation'), true);
+		const previous = configuration.inspect<boolean>('experimental.peerDelegation')?.globalValue;
 		try {
+			await configuration.update(
+				'experimental.peerDelegation',
+				false,
+				vscode.ConfigurationTarget.Global,
+			);
+			assert.strictEqual(vscode.workspace.getConfiguration('copilotAgentMesh').get('experimental.peerDelegation'), false);
+			await waitForToolRegistration(MESH_TOOL_NAMES.listWorkers, false);
 			await configuration.update(
 				'experimental.peerDelegation',
 				true,
@@ -74,7 +70,7 @@ suite('Copilot Agent Mesh', () => {
 		} finally {
 			await configuration.update(
 				'experimental.peerDelegation',
-				false,
+				previous,
 				vscode.ConfigurationTarget.Global,
 			);
 		}
@@ -96,12 +92,12 @@ suite('Copilot Agent Mesh', () => {
 		assert.deepStrictEqual(manifest.extensionKind, ['ui']);
 	});
 
-	test('requires no separate Agent Host flag while delegation remains default-off', () => {
+	test('enables peer delegation by default without a separate Agent Host flag', () => {
 		const manifest = getExtension().packageJSON;
 		const properties = manifest.contributes.configuration.properties as Record<string, { default?: unknown }>;
 
 		assert.strictEqual(properties['copilotAgentMesh.experimental.agentHost'], undefined);
-		assert.strictEqual(properties['copilotAgentMesh.experimental.peerDelegation']?.default, false);
+		assert.strictEqual(properties['copilotAgentMesh.experimental.peerDelegation']?.default, true);
 		assert.strictEqual(properties['copilotAgentMesh.agentHost.userDataDir']?.default, '');
 		assert.strictEqual(
 			(properties['copilotAgentMesh.agentHost.userDataDir'] as { scope?: unknown } | undefined)?.scope,
@@ -340,7 +336,7 @@ function getExtension(): vscode.Extension<unknown> {
 	return extension;
 }
 
-async function waitForToolRegistration(name: string): Promise<void> {
+async function waitForToolRegistration(name: string, expected = true): Promise<void> {
 	for (let attempt = 0; attempt < 50; attempt += 1) {
 		const cancellation = new vscode.CancellationTokenSource();
 		try {
@@ -348,17 +344,18 @@ async function waitForToolRegistration(name: string): Promise<void> {
 				input: {},
 				toolInvocationToken: undefined,
 			}, cancellation.token);
-			return;
+			if (expected) { return; }
 		} catch (error: unknown) {
 			if (!/does not have an implementation registered/i.test(String(error))) {
 				throw error;
 			}
+			if (!expected) { return; }
 		} finally {
 			cancellation.dispose();
 		}
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
-	assert.fail(`Tool ${name} did not register after enabling Peer Delegation Preview.`);
+	assert.fail(`Tool ${name} did not ${expected ? 'register' : 'unregister'} after the peer delegation setting changed.`);
 }
 
 function createTaskToolFacade(): TaskToolFacade {

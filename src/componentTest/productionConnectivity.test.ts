@@ -8,11 +8,11 @@ import type * as vscode from 'vscode';
 
 import { LOCAL_BROKER_METHODS, LOCAL_BROKER_NOTIFICATIONS, connectivitySnapshotSchema, remotePolicyDashboardSchema, dashboardNodeDirectoryResultSchema } from '../../shared/protocol';
 import { LocalDesktopWorkspaceGuard } from '../application/LocalDesktopWorkspaceGuard';
-import { getWorkerPlatformSupport } from '../application/WorkerPlatformSupport';
+import { getWorkerPlatformSupport, type WorkerPlatformSupport } from '../application/WorkerPlatformSupport';
 import { ProductionBrokerRuntime } from '../composition/ProductionBrokerRuntime';
 import { LOCAL_BROKER_KEY_SECRET } from '../composition/SharedBrokerIdentity';
 import { InMemorySecretStore } from '../gateway/SecretStore';
-import { LocalIpcClient } from '../ipc';
+import { LocalIpcClient, LocalIpcRemoteError } from '../ipc';
 import { StructuredLogger } from '../logging/StructuredLogger';
 import { VscodeSecretStore } from '../storage/VscodeStorageAdapters';
 import { TestOwnership, uuid } from '../unitTest/artifactStoreTestSupport';
@@ -54,7 +54,6 @@ test('production Dashboard automatically removes closed windows and reuses only 
 	const f = await productionFixture();
 	t.after(() => f.dispose());
 	await f.runtime.start();
-	f.settings.set('experimental.peerDelegation', true);
 	const source = await f.connect();
 	const target = await f.connect();
 	t.after(() => { source.client.dispose(); target.client.dispose(); });
@@ -96,6 +95,47 @@ test('production Dashboard automatically removes closed windows and reuses only 
 	assert.equal(f.runtime.listener.snapshot().state, 'stopped');
 });
 
+test('unsupported platforms reject connections before account selection or SDK hosting', async (t) => {
+	const host = new ConnectionHost();
+	const f = await productionFixture({ host, workerPlatform: getWorkerPlatformSupport('linux', 'x64') });
+	t.after(() => f.dispose());
+	await f.runtime.start();
+	const local = await f.connect();
+	t.after(() => local.client.dispose());
+	await assert.rejects(
+		local.session.request(LOCAL_BROKER_METHODS.connectivityAction, { ...local.identity, action: 'enableConnectivity' }),
+		LocalIpcRemoteError,
+	);
+	const snapshot = connectivitySnapshotSchema.parse(
+		await local.session.request(LOCAL_BROKER_METHODS.connectivitySnapshot, local.identity),
+	);
+	assert.equal(snapshot.error, 'PLATFORM_UNSUPPORTED');
+	assert.equal(snapshot.connectionState, 'error');
+	assert.equal(snapshot.enabled, false);
+	assert.equal(f.authentication.requests.length, 0);
+	assert.equal(f.picker.count, 0);
+	assert.deepEqual(host.created, []);
+	assert.equal(f.runtime.listener.snapshot().state, 'stopped');
+});
+
+test('Windows starts and stops private SDK connections without a platform opt-in', async (t) => {
+	const host = new ConnectionHost();
+	const f = await productionFixture({ host, workerPlatform: getWorkerPlatformSupport('win32', 'x64') });
+	t.after(() => f.dispose());
+	await f.runtime.start();
+	const local = await f.connect();
+	t.after(() => local.client.dispose());
+	await local.session.request(LOCAL_BROKER_METHODS.connectivityAction, { ...local.identity, action: 'enableConnectivity' });
+	assert.equal(f.runtime.listener.snapshot().state, 'running');
+	assert.equal(host.created.length, 1);
+	assert.equal(f.settings.get('experimental.peerDelegation'), undefined);
+	assert.equal(f.runtime.tunnel.lifecycleMetrics().loadAttempts, 0);
+	await local.session.request(LOCAL_BROKER_METHODS.connectivityAction, { ...local.identity, action: 'disableConnectivity' });
+	assert.equal(f.runtime.listener.snapshot().state, 'stopped');
+	assert.deepEqual(host.deleted, host.created);
+	assert.equal(f.runtime.connectivity.settings.snapshot().enabled, false);
+});
+
 test('corrupt new remote state blocks only remote initialization, not the production local Broker or claims', async (t) => {
 	const f = await productionFixture({ corrupt: true });
 	t.after(() => f.dispose());
@@ -116,6 +156,7 @@ test('corrupt new remote state blocks only remote initialization, not the produc
 
 test('strict activation persists across a real Broker restart and remote receive works while local delegation stays off', async (t) => {
 	const f = await productionFixture({ strict: true });
+	f.settings.set('experimental.peerDelegation', false);
 	t.after(() => f.dispose());
 	await f.runtime.start();
 	await f.enablePolicy();
@@ -128,7 +169,7 @@ test('strict activation persists across a real Broker restart and remote receive
 	let snapshot = connectivitySnapshotSchema.parse(await local.session.request(LOCAL_BROKER_METHODS.connectivitySnapshot, local.identity));
 	assert.equal(snapshot.receivingWorkspaceCount, 1);
 	assert.equal(snapshot.strictPolicyActivated, true);
-	assert.equal(f.settings.get('experimental.peerDelegation'), undefined);
+	assert.equal(f.settings.get('experimental.peerDelegation'), false);
 	local.client.dispose();
 	await f.runtime.dispose();
 	await f.runtime.connectivity.settings.update((value) => ({ ...value, enabled: false }));
@@ -608,7 +649,7 @@ class ConnectionHost {
 	}
 }
 
-async function productionFixture(options: { corrupt?: boolean; strict?: boolean; host?: ConnectionHost } = {}) {
+async function productionFixture(options: { corrupt?: boolean; strict?: boolean; host?: ConnectionHost; workerPlatform?: WorkerPlatformSupport } = {}) {
 	const root = await mkdtemp(join(tmpdir(), 'mesh-connectivity-composition-'));
 	const state = new ConnectivityMemoryState();
 	const ownership = new TestOwnership();
@@ -668,9 +709,7 @@ async function productionFixture(options: { corrupt?: boolean; strict?: boolean;
 		}),
 		generation: ownership.generation,
 		identityFor: (deviceId) => ({ userIdentity: root, deviceId }),
-		guard, workerPlatform: options.host === undefined
-			? getWorkerPlatformSupport(process.platform, process.arch)
-			: getWorkerPlatformSupport('darwin', 'arm64'),
+		guard, workerPlatform: options.workerPlatform ?? getWorkerPlatformSupport('darwin', 'arm64'),
 		logger: new StructuredLogger({
 			name: 'Connectivity test', appendLine: () => undefined, append: () => undefined,
 			replace: () => undefined, clear: () => undefined, show: () => undefined, hide: () => undefined, dispose: () => undefined,

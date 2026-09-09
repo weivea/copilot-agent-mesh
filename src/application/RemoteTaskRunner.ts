@@ -163,7 +163,7 @@ export class RemoteTaskRunner implements TaskService {
 			return this.snapshot(existing);
 		}
 		const probe = await this.runtime.probe();
-		if (!probe.featureEnabled || !probe.available) {
+		if (!probe.featureEnabled || (!probe.available && probe.canStart !== true)) {
 			throw new AgentRuntimeError(
 				probe.reason ?? 'AGENT_UNAVAILABLE',
 				'The production Agent Host runtime is unavailable or disabled.',

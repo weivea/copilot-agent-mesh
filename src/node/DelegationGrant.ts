@@ -1,5 +1,5 @@
 import { lstat, realpath } from 'node:fs/promises';
-import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, posix, relative, resolve, sep, win32 } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { z } from 'zod';
@@ -183,20 +183,20 @@ export async function canAutoApproveToolConfirmation(
 		return false;
 	}
 	try {
-		const workspaceInputPath = parseFileUri(workspace.uri);
+		const workspaceInputPath = parseDelegatedFileUri(workspace.uri);
 		const workspacePath = await canonicalExistingPath(workspaceInputPath);
 		for (const edit of evidence.data.fileEdits) {
 			const uriPaths = [
 				...(edit.beforeUri === undefined
 					? []
 					: [{
-						input: parseFileUri(edit.beforeUri),
+						input: parseDelegatedFileUri(edit.beforeUri),
 						canonicalize: canonicalExistingPath,
 					}]),
 				...(edit.afterUri === undefined
 					? []
 					: [{
-						input: parseFileUri(edit.afterUri),
+						input: parseDelegatedFileUri(edit.afterUri),
 						canonicalize: canonicalPotentialPath,
 					}]),
 			];
@@ -222,7 +222,7 @@ export async function canAutoApproveToolConfirmation(
 	}
 }
 
-function parseFileUri(value: string): string {
+export function parseDelegatedFileUri(value: string, platform: NodeJS.Platform = process.platform): string {
 	if (
 		typeof value !== 'string'
 		|| encodedUnsafePath.test(value)
@@ -233,14 +233,17 @@ function parseFileUri(value: string): string {
 	const uri = new URL(value);
 	if (
 		uri.protocol !== 'file:'
-		|| (uri.hostname !== '' && uri.hostname !== 'localhost')
+		|| (platform !== 'win32' && uri.hostname !== '' && uri.hostname !== 'localhost')
+		|| uri.search !== ''
+		|| uri.hash !== ''
 	) {
 		throw new Error('Unsupported file URI.');
 	}
-	const filePath = fileURLToPath(uri);
+	const filePath = fileURLToPath(uri, { windows: platform === 'win32' });
+	const paths = platform === 'win32' ? win32 : posix;
 	if (
-		!isAbsolute(filePath)
-		|| (process.platform !== 'win32' && windowsDrivePath.test(filePath))
+		!paths.isAbsolute(filePath)
+		|| (platform !== 'win32' && windowsDrivePath.test(filePath))
 	) {
 		throw new Error('Ambiguous file path.');
 	}

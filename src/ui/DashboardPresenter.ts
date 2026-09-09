@@ -47,6 +47,7 @@ export class DashboardPresenter {
 				name: redactRemoteText(snapshot.device.name),
 				platform: redactRemoteText(snapshot.device.platform),
 				architecture: redactRemoteText(snapshot.device.architecture),
+				workerSupported: snapshot.device.workerSupported,
 				vscodeVersion: redactRemoteText(snapshot.device.vscodeVersion),
 				extensionVersion: redactRemoteText(snapshot.device.extensionVersion),
 			},

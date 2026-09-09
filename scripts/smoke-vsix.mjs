@@ -1,5 +1,4 @@
-import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,10 +8,15 @@ import {
 	resolveCliArgsFromVSCodeExecutablePath,
 	runTests,
 } from '@vscode/test-electron';
+import { require as tsxRequire } from 'tsx/cjs/api';
+
+const { runOwnedCommand, OwnedCommandError } = tsxRequire('../src/spikes/ownedProcess.ts', import.meta.url);
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptDirectory, '..');
-const vsixPath = resolve(process.argv[2] ?? join(repositoryRoot, 'artifacts/copilot-agent-mesh-0.4.0-preview.vsix'));
+const manifest = JSON.parse(readFileSync(join(repositoryRoot, 'package.json'), 'utf8'));
+const extensionIdentity = `${manifest.publisher}.${manifest.name}@${manifest.version}`;
+const vsixPath = resolve(process.argv[2] ?? join(repositoryRoot, 'artifacts', `${manifest.name}-${manifest.version}-preview.vsix`));
 const temporaryRoot = process.platform === 'win32' ? tmpdir() : '/tmp';
 const root = mkdtempSync(join(temporaryRoot, 'cam-vsix-'));
 const userDataDirectory = join(root, 'user-data');
@@ -37,24 +41,24 @@ try {
 		? resolve(process.env.VSCODE_EXECUTABLE_PATH)
 		: await downloadAndUnzipVSCode(process.env.VSCODE_VERSION ?? 'stable');
 	const [cli, ...cliPrefix] = resolveCliArgsFromVSCodeExecutablePath(vscodeExecutablePath, {
-		reuseMachineInstall: Boolean(process.env.VSCODE_EXECUTABLE_PATH),
+		reuseMachineInstall: true,
 	});
 
-	runCli(cli, [
+	await runCli(cli, [
 		...cliPrefix,
 		'--user-data-dir', userDataDirectory,
 		'--extensions-dir', extensionsDirectory,
 		'--install-extension', vsixPath,
 		'--force',
 	]);
-	const listing = runCli(cli, [
+	const listing = await runCli(cli, [
 		...cliPrefix,
 		'--user-data-dir', userDataDirectory,
 		'--extensions-dir', extensionsDirectory,
 		'--list-extensions',
 		'--show-versions',
 	]);
-	if (!listing.split(/\r?\n/u).includes('weivea.copilot-agent-mesh@0.4.0')) {
+	if (!listing.split(/\r?\n/u).includes(extensionIdentity)) {
 		throw new Error(`Installed extension was not present in the isolated profile:\n${listing}`);
 	}
 
@@ -66,6 +70,7 @@ try {
 		extensionTestsEnv: {
 			...process.env,
 			MESH_SMOKE_EXTENSIONS_DIR: extensionsDirectory,
+			MESH_SMOKE_EXTENSION_VERSION: manifest.version,
 		},
 		launchArgs: [
 			repositoryRoot,
@@ -77,23 +82,24 @@ try {
 		],
 	});
 } finally {
-	rmSync(root, { recursive: true, force: true });
+	rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 }
 
-function runCli(command, args) {
-	const result = spawnSync(command, args, {
-		encoding: 'utf8',
-		shell: process.platform === 'win32',
-		stdio: ['ignore', 'pipe', 'pipe'],
-	});
-	if (result.status !== 0) {
-		throw new Error(`VS Code CLI failed (${result.status}):\n${result.stdout}\n${result.stderr}`);
+async function runCli(command, args) {
+	try {
+		const output = await runOwnedCommand(command, args, { timeoutMs: 120_000, maxOutputBytes: 8 * 1024 * 1024 });
+		if (output) {
+			process.stdout.write(output);
+		}
+		return output;
+	} catch (error) {
+		if (error instanceof OwnedCommandError && error.cleanupRequired && error.ownedCleanup !== undefined) {
+			try {
+				await error.ownedCleanup.dispose();
+			} catch (cleanupError) {
+				throw new AggregateError([error, cleanupError], 'VS Code CLI failed and native process cleanup remains unconfirmed.');
+			}
+		}
+		throw error;
 	}
-	if (result.stdout) {
-		process.stdout.write(result.stdout);
-	}
-	if (result.stderr) {
-		process.stderr.write(result.stderr);
-	}
-	return result.stdout;
 }

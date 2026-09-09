@@ -169,6 +169,9 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			&& isE2eCapabilityEnabled(e2eCapability)
 			? peerDelegationRunContext(process.env.MESH_PEER_DELEGATION_E2E_NONCE)
 			: undefined;
+		const editorOnlyE2e = requestedE2eScenario === 'multiWindow'
+			&& isE2eCapabilityEnabled(e2eCapability)
+			&& process.env.MESH_MULTI_WINDOW_E2E_DIAGNOSTIC === '1';
 		const rawState = peerDelegationRun === undefined
 			? persistentState
 			: new PeerDelegationE2eStateStore(persistentState, peerDelegationRun.nonce);
@@ -286,6 +289,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 						: join(peerDelegationRun.controlRoot, 'editor-proxy'),
 					peerDelegationRun?.nodeExecutable,
 					peerDelegationRun === undefined ? 0 : 80_000,
+					editorOnlyE2e,
 				);
 				sourceStatusSubscription = runtime.onDidSourceStatusChange(() => changeEvents.fire());
 				return new WindowNodeTaskExecutor({
@@ -387,10 +391,12 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			ownerRuntime: () => currentOwnerRuntime,
 			capability: e2eCapability,
 			localIpcEndpoint: deriveLocalIpcEndpoint(nodeIdentity),
+			editorOnly: editorOnlyE2e,
 		});
 		const twoDeviceE2e = requestedE2eScenario === 'twoDevice'
 			? gatedE2e
 			: undefined;
+		addApplicationCleanup(cleanup, () => gatedE2e?.dispose?.());
 		const multiWindowE2e = requestedE2eScenario === 'multiWindow'
 			? gatedE2e
 			: undefined;
@@ -418,7 +424,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		let meshTools: vscode.Disposable | undefined;
 		const syncMeshTools = (): void => {
 			const enabled = vscode.workspace.getConfiguration('copilotAgentMesh')
-				.get<boolean>('experimental.peerDelegation', false);
+				.get<boolean>('experimental.peerDelegation', true);
 			if (enabled && meshTools === undefined) {
 				meshTools = peerDelegationRecorder === undefined
 					? registerMeshTaskTools(localTasks, { delegatedToolInvocations })

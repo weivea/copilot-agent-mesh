@@ -1,7 +1,7 @@
 # Compatibility Matrix
 
-> Status: 0.4.0 Preview implemented; Peer Window Delegation objective gate 8/12, full gate Unverified<br>
-> Evidence date: 2026-09-05 (cross-device implementation); earlier live Agent evidence retains its original scope<br>
+> Status: 0.5.0 Preview adds Windows x64/ARM64 implementation and default-on local peer features<br>
+> Updated: 2026-09-09; earlier live Agent evidence retains its original OS/version scope<br>
 > Mesh protocol: v2; v1 peers incompatible
 
 This document is the release gate for external platform compatibility. Installed
@@ -16,11 +16,13 @@ with a GitHub authentication session and exact resource/provider/scopes mapping.
 The production path emitted `agentStarted` and five real output events, invoked
 `AgentTaskHandle.cancel()`, reached authoritative `cancelled`, and cleaned every
 owned Agent Host, VS Code, Tunnel, and local IPC resource. This decision does not
-extend Worker support beyond macOS arm64 or authorize publication.
+establish live Worker evidence beyond macOS arm64 or authorize publication.
+The 0.5.0 Windows implementation is tracked separately below; it does not
+retroactively broaden any of these dated results.
 
 | Capability | Declared or detected | Validated | Status |
 | --- | --- | --- | --- |
-| Package | `0.4.0` Preview VSIX | Package/version documentation and implementation-time package checks | Preview; not published |
+| Package | `0.5.0` Preview VSIX with Windows x64/ARM64 process helpers | Package allowlist includes only the exact helper binaries and their Go license alongside the extension | Preview; not published |
 | Mesh protocol | v2 | Local Broker/Node and remote routing schemas | v2 only; v1 peers incompatible |
 | VS Code minimum | `1.103.0` in `package.json` | Offline API/build coverage | Preview range; real minimum not yet proven |
 | VS Code tested | `1.135.0` and `1.136.1`, macOS arm64 | 1.135.0: real ordinary same-user-data windows and authenticated production AHP turn with offer/selection `["1.0.0"]`/`1.0.0`. 1.136.1: dedicated-profile editor discovery, Unix-socket WebSocket upgrade, dual offer `["1.0.0","0.9.0"]`, selected `0.9.0`, and authoritative short no-tool `chat/turnComplete` | 1.135.0 Pass for scoped Preview; 1.136.1 editor/AHP compatibility Pass |
@@ -58,20 +60,30 @@ cross-device Agent execution, live expiry/renewal, or ordinary Chat UI.
 
 ## Preview platform support
 
-The 0.4.0 package does not claim Marketplace publication or cross-platform Worker
-hosting. All ordinary windows are active Window Nodes, but the ability to host
-the listener and execute real AHP tasks remains platform-gated.
+The 0.5.0 package adds Windows Worker implementation without claiming Marketplace
+publication. All ordinary windows are active Window Nodes. Local discovery,
+tools and policy controls are default-on; receiving and authorizing tasks are
+still explicit. Hosting remains platform-gated to Windows x64/ARM64 and macOS
+arm64.
 
 | OS | Architecture | Evidence | Preview support |
 | --- | --- | --- | --- |
 | macOS | arm64 | Authenticated production AHP execution on VS Code 1.135.0 and dedicated-profile production-path Session/Turn completion on VS Code 1.136.1; existing exact-build Tunnel evidence | Worker candidate and active Window Node; G0 Go for scoped Preview |
 | macOS | x64 | No owned Worker lifecycle evidence | Active client Window Node; Worker host unsupported |
-| Windows | x64 | Named-pipe and offline coverage; no Job Object-based real Agent Host/Tunnel gate | Active client Window Node; Worker host unsupported |
+| Windows | x64 | VS Code 1.136.2 diagnostic `238552fd-eee1-4e36-983a-a679ca92c4aa` observed two ordinary windows, one Broker and one real editor-backed task completing in about 14.6 seconds; final owned process/pipe/Tunnel counts were zero | Real task path observed; original overall run remains failed because the first test-grant restoration raced before retry recovery. Full UI/cross-device qualification is separate |
+| Windows | arm64 | Native ARM64 process helper is cross-compiled; no physical ARM64 task result is claimed | Worker implementation and active Window Node; physical ARM64 gate pending |
+| Windows | x86 | No packaged process controller; current VS Code Windows targets are x64/ARM64 | Worker host unsupported |
 | Linux | x64 | Unix IPC and offline coverage; no validated real Tunnel/Worker gate | Active client Window Node; Worker host unsupported |
 
+Windows lifecycle run `88c82a3b-408c-46bf-862b-819401aa7751` separately passed
+closed-window removal, same-Workspace reclaim, Broker takeover in 896 ms,
+duplicate-claim rejection and full owned cleanup without a model turn or Tunnel.
+
 The P6 user-data strategy has offline Stable/Insiders/Linux/Windows/override tests.
-Those strategies do not change the support rows above: Windows, Linux, and macOS x64
-Worker Host execution and editor endpoint discovery remain unsupported/unverified.
+The 0.5.0 Windows runtime adds native process ownership rather than relying on
+user-data path derivation alone. Linux and macOS x64 Worker hosting remain
+unsupported. Missing helpers or unsupported CLI/Host capabilities fail explicitly;
+there is no unsafe process-killing fallback.
 
 ## Migration and unsupported environments
 

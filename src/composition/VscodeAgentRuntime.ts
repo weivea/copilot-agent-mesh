@@ -58,8 +58,15 @@ import {
 	isE2eCapabilityEnabled,
 	type E2eCapability,
 } from './E2eCapability';
+import { userDataDirectoryFromGlobalStorage } from './VscodeUserDataDirectory';
+import { redactRemoteText } from '../ui/DashboardRedaction';
 
 const configurationSection = 'copilotAgentMesh';
+
+export interface RuntimeFailureDiagnostic {
+	readonly code: string;
+	readonly message: string;
+}
 
 export class VscodeLocalTaskApproval implements LocalTaskConfirmation, FirstTaskConfirmation {
 	private readonly preapprovedTasks = new Map<string, Map<string, PreapprovedTask>>();
@@ -204,8 +211,14 @@ export function createVscodeAgentRuntime(
 	editorProxyRoot?: string,
 	editorProxyNodeExecutable?: string,
 	editorInitialReadinessDelayMs = 0,
-): AgentRuntime & AgentHostSourceStatusProvider {
+	editorOnly = false,
+): AgentRuntime & AgentHostSourceStatusProvider & { failureDiagnostic(): RuntimeFailureDiagnostic | undefined } {
 	const configuration = vscodeApi.workspace.getConfiguration(configurationSection);
+	const configuredUserDataDir = configuration.get<unknown>('agentHost.userDataDir');
+	const editorUserDataDir = configuredUserDataDir === undefined
+		|| (typeof configuredUserDataDir === 'string' && configuredUserDataDir.trim() === '')
+		? userDataDirectoryFromGlobalStorage(context.globalStorageUri.fsPath)
+		: configuredUserDataDir;
 	const launcher = new AgentHostLauncher({
 		storageRoot: standaloneStorageRoot
 			?? vscodeApi.Uri.joinPath(context.globalStorageUri, 'agent-host').fsPath,
@@ -234,7 +247,7 @@ export function createVscodeAgentRuntime(
 		launcher: new EditorAgentHostLauncher(
 			new EditorAgentHostLocator({
 				configuredCodeCli: configuration.get<string>('codePath') || undefined,
-				configuredUserDataDir: configuration.get<unknown>('agentHost.userDataDir'),
+				configuredUserDataDir: editorUserDataDir,
 				platform: { productName: vscodeApi.env.appName },
 			}),
 			new UnixSocketWebSocketConnector({
@@ -253,7 +266,7 @@ export function createVscodeAgentRuntime(
 	const runtime = new AgentHostSourceSelector({
 		preferEditor: () => vscodeApi.workspace
 			.getConfiguration(configurationSection)
-			.get<boolean>('experimental.peerDelegation', false),
+			.get<boolean>('experimental.peerDelegation', true),
 		editor,
 		standalone,
 		confirmation: approval,
@@ -261,14 +274,16 @@ export function createVscodeAgentRuntime(
 		approvalCapabilities,
 		editorInitialReadinessDelayMs,
 	});
-	return new GuardedAgentRuntime(runtime, guard, workerPlatform);
+	return new GuardedAgentRuntime(runtime, guard, workerPlatform, editorOnly);
 }
 
 class GuardedAgentRuntime implements AgentRuntime, AgentHostSourceStatusProvider {
+	private diagnostic: RuntimeFailureDiagnostic | undefined;
 	public constructor(
 		private readonly delegate: AgentRuntime & AgentHostSourceStatusProvider,
 		private readonly guard: LocalDesktopWorkspaceGuard,
 		private readonly workerPlatform: WorkerPlatformSupport,
+		private readonly editorOnly: boolean,
 	) {}
 
 	public async probe(request?: Pick<AgentTaskRequest, 'requireEditor'>): Promise<AgentRuntimeProbe> {
@@ -280,7 +295,7 @@ class GuardedAgentRuntime implements AgentRuntime, AgentHostSourceStatusProvider
 				reason: this.workerPlatform.agentCode,
 			};
 		}
-		return this.delegate.probe(request);
+		return this.delegate.probe(this.editorOnly ? { ...request, requireEditor: true } : request);
 	}
 
 	public async prepareStart(request?: Pick<AgentTaskRequest, 'requireEditor'>): Promise<void> {
@@ -292,7 +307,7 @@ class GuardedAgentRuntime implements AgentRuntime, AgentHostSourceStatusProvider
 			);
 		}
 		this.guard.assertAllowed();
-		await this.delegate.prepareStart?.(request);
+		await this.delegate.prepareStart?.(this.editorOnly ? { ...request, requireEditor: true } : request);
 	}
 
 	public async start(request: AgentTaskRequest): Promise<AgentTaskHandle> {
@@ -305,7 +320,24 @@ class GuardedAgentRuntime implements AgentRuntime, AgentHostSourceStatusProvider
 			);
 		}
 		this.guard.assertAllowed();
-		return this.delegate.start(request);
+		this.diagnostic = undefined;
+		try {
+			return await this.delegate.start(this.editorOnly ? { ...request, requireEditor: true } : request);
+		} catch (error: unknown) {
+			if (this.editorOnly && error instanceof AgentRuntimeError) {
+				const message = [request.prompt, request.title].filter((value) => value.length > 0)
+					.reduce((value, sensitive) => value.replaceAll(sensitive, '<task text>'), error.message);
+				this.diagnostic = {
+					code: error.code,
+					message: redactRemoteText(message),
+				};
+			}
+			throw error;
+		}
+	}
+
+	public failureDiagnostic(): RuntimeFailureDiagnostic | undefined {
+		return this.diagnostic;
 	}
 
 	public dispose(): Promise<void> {

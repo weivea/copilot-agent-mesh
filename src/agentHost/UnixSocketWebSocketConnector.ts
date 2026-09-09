@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { Agent } from 'node:http';
 import { connect as connectSocket } from 'node:net';
 
 import WebSocket from 'ws';
@@ -122,6 +123,7 @@ export class UnixSocketWebSocketConnector {
 		return new Promise((resolve, reject) => {
 			const rawSocket = connectSocket({ path: socketPath });
 			let webSocket: WebSocket | undefined;
+			let localAgent: Agent | undefined;
 			let settled = false;
 			let upgradeValidated = false;
 			let rawConnected = false;
@@ -172,9 +174,9 @@ export class UnixSocketWebSocketConnector {
 				if (webSocket !== undefined) {
 					webSocket.once('error', () => undefined);
 					webSocket.terminate();
-				} else {
-					rawSocket.destroy();
 				}
+				localAgent?.destroy();
+				rawSocket.destroy();
 				reject(error);
 			};
 			const handleAbort = (): void => settleFailure(cancelled());
@@ -196,7 +198,15 @@ export class UnixSocketWebSocketConnector {
 			const handleUnexpectedResponse = (
 				_request: import('node:http').ClientRequest,
 				response: import('node:http').IncomingMessage,
-			): void => settleFailure(unexpectedResponse(response.statusCode));
+			): void => settleFailure(response.socket !== rawSocket
+				? new UnixSocketWebSocketError(
+					'INVALID_RESPONSE',
+					'The HTTP layer did not use the authenticated local socket.',
+					response.statusCode,
+					undefined,
+					'local',
+				)
+				: unexpectedResponse(response.statusCode));
 			const handleWebSocketError = (error: Error & { code?: unknown }): void =>
 				settleFailure(webSocketFailure(error));
 			const handleWebSocketClose = (): void => settleFailure(new UnixSocketWebSocketError(
@@ -204,7 +214,7 @@ export class UnixSocketWebSocketConnector {
 				'The editor Agent Host WebSocket closed before opening.',
 			));
 			const handleUpgrade = (response: import('node:http').IncomingMessage): void => {
-				if (!validateUpgradeResponse(response)) {
+				if (response.socket !== rawSocket || !validateUpgradeResponse(response)) {
 					settleFailure(new UnixSocketWebSocketError(
 						'INVALID_RESPONSE',
 						'The editor Agent Host returned an invalid WebSocket upgrade response.',
@@ -231,7 +241,12 @@ export class UnixSocketWebSocketConnector {
 				const remainingMs = Math.max(1, this.timeoutMs - (Date.now() - startedAt));
 				const target = `ws://localhost/?tkn=${encodeURIComponent(connectionToken)}`;
 				try {
+					// VS Code can replace the default HTTP agent with a proxy agent.
+					localAgent = new Agent();
+					localAgent.createConnection = () => rawSocket;
 					webSocket = new WebSocket(target, {
+						agent: localAgent,
+						socketPath,
 						createConnection: () => rawSocket,
 						followRedirects: false,
 						handshakeTimeout: remainingMs,
@@ -329,6 +344,7 @@ export class UnixSocketWebSocketConnector {
 			let settled = false;
 			let upgradeValidated = false;
 			let webSocket: WebSocket | undefined;
+			const localAgent = new Agent();
 			const timer = setTimeout(() => {
 				settleFailure(new UnixSocketWebSocketError(
 					'UPGRADE_TIMEOUT',
@@ -364,6 +380,7 @@ export class UnixSocketWebSocketConnector {
 				scrub();
 				webSocket?.once('error', () => undefined);
 				webSocket?.terminate();
+				localAgent.destroy();
 				reject(fingerprintError(error, endpointFingerprint));
 			};
 			const handleAbort = (): void => settleFailure(cancelled());
@@ -404,6 +421,7 @@ export class UnixSocketWebSocketConnector {
 				webSocket = new WebSocket(
 					`ws://127.0.0.1:${proxy.port}/?tkn=${encodeURIComponent(connectionToken)}`,
 					{
+						agent: localAgent,
 						headers: {
 							'X-Mesh-Editor-Proxy': proxy.authenticationToken,
 						},

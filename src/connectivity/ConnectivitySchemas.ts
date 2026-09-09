@@ -88,10 +88,12 @@ export type ConnectivityCode =
 	| 'DISABLED' | 'AUTH_REQUIRED' | 'ACCOUNT_CHANGED' | 'SCOPES_CHANGED'
 	| 'OFFLINE' | 'DISCOVERY_UNAVAILABLE' | 'RATE_LIMITED' | 'TIMEOUT'
 	| 'CANCELLED' | 'INVALID_ENDPOINT' | 'BINDING_CHANGED' | 'POLICY_DENIED'
-	| 'PRIVATE_ACCESS_REQUIRED' | 'CLEANUP_FAILED' | 'MIGRATION_REQUIRED' | 'PROTOCOL_INCOMPATIBLE';
+	| 'PRIVATE_ACCESS_REQUIRED' | 'CLEANUP_FAILED' | 'MIGRATION_REQUIRED' | 'PROTOCOL_INCOMPATIBLE'
+	| 'PLATFORM_UNSUPPORTED';
 
 const messages: Record<ConnectivityCode, string> = {
 	DISABLED: 'Cross-device connectivity is disabled.',
+	PLATFORM_UNSUPPORTED: 'Cross-device connections require Windows x64/ARM64 or macOS arm64.',
 	AUTH_REQUIRED: 'Authorize the selected account for Microsoft Dev Tunnels.',
 	ACCOUNT_CHANGED: 'The selected discovery account is no longer available.',
 	SCOPES_CHANGED: 'The selected account does not provide the exact Dev Tunnels scopes.',

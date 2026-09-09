@@ -6,6 +6,31 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [Unreleased]
 
+## [0.5.0 Preview] - 2026-09-09
+
+- Enable same-device discovery, Mesh task tools, window naming and policy
+  controls by default, while retaining an explicit opt-out. Incoming reception,
+  directional authorization, cross-device connections and sensitive approvals
+  are not enabled automatically.
+- Add Windows x64/ARM64 Worker and SDK hosting support, with packaged Job Object
+  process controllers and Windows-aware VS Code CLI execution. Users need no
+  extra platform settings or build tools.
+- Show receive-policy unavailability in the current Workspace pane and reject
+  unsupported hosting before native sign-in rather than treating it as a
+  discovery failure.
+- Keep editor IPC and its loopback bridge on dedicated HTTP agents, preventing
+  VS Code's default proxy injection from redirecting the connection. Normalize
+  Windows drive-letter casing for strict Session workspace matching without
+  relaxing provider, folder-isolation or directory-scope checks.
+- Package the two Windows helpers and their Go license in the universal VSIX;
+  add Go to the build/CI prerequisites. Existing dated macOS evidence retains
+  its original scope.
+- Observe one real Windows x64 editor-backed task on VS Code 1.136.2, including
+  authoritative output/completion and final resource cleanup. Preserve the
+  run's original overall failure: an initial concurrent test-grant restoration
+  raced, then recovered. Serialize those test cleanup mutations; do not relabel
+  this observation as a complete release qualification.
+
 - Remove the redundant `experimental.agentHost` setting and obsolete AHP-gate
   guidance. Execution remains on demand behind Workspace grants and task approval.
   Show on-demand and failed runtime states in Current window, not Transport diagnostics.

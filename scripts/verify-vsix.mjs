@@ -2,7 +2,8 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
-const archivePath = resolve(process.argv[2] ?? 'artifacts/copilot-agent-mesh-0.4.0-preview.vsix');
+const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+const archivePath = resolve(process.argv[2] ?? `artifacts/copilot-agent-mesh-${manifest.version}-preview.vsix`);
 const archive = readFileSync(archivePath);
 const entries = readCentralDirectory(archive).sort();
 
@@ -14,6 +15,9 @@ const expected = [
 	'extension/changelog.md',
 	'extension/dist/extension.js',
 	'extension/dist/THIRD_PARTY_NOTICES.txt',
+	'extension/dist/windows/LICENSE-go.txt',
+	'extension/dist/windows/mesh-process-host-arm64.exe',
+	'extension/dist/windows/mesh-process-host-x64.exe',
 	'extension/docs/mvp/release.md',
 	'extension/media/agent-mesh.svg',
 	'extension/media/dashboard.css',

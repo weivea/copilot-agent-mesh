@@ -107,7 +107,6 @@ for (const [signal, expectedExitCode] of [
 for (const scenario of ['lock-conflict', 'idle-conflict'] as const) {
 	test(
 		`persistent profile ${scenario} never kills a foreign profile process`,
-		{ skip: process.platform === 'win32' ? 'POSIX process ownership is the supported real harness boundary.' : false },
 		async () => {
 			const fixture = await persistentProfileFixture(scenario);
 			try {
@@ -145,7 +144,6 @@ for (const scenario of ['lock-conflict', 'idle-conflict'] as const) {
 for (const injection of ['schema', 'safety'] as const) {
 	test(
 		`invalid ${injection} evidence leaves a separately valid diagnostic artifact`,
-		{ skip: process.platform === 'win32' ? 'POSIX process ownership is the supported real harness boundary.' : false },
 		async () => {
 			const fixture = await persistentProfileFixture('idle-conflict', injection);
 			try {
@@ -174,7 +172,6 @@ for (const injection of ['schema', 'safety'] as const) {
 
 test(
 	'test mode records actual platform and dirty/unsupported simulation without release evidence',
-	{ skip: process.platform === 'win32' ? 'POSIX process ownership is the supported real harness boundary.' : false },
 	async () => {
 		const fixture = await persistentProfileFixture(
 			'lock-conflict',
@@ -237,6 +234,7 @@ test(
 	'unsupported actual platform rejects before touching stable evidence',
 	{
 		skip: process.platform === 'darwin' && process.arch === 'arm64'
+			|| process.platform === 'win32' && ['x64', 'arm64'].includes(process.arch)
 			? 'This runner is the supported release platform.'
 			: false,
 	},

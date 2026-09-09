@@ -12,7 +12,7 @@ function fixture() {
 	const other = { nodeId: uuid(5), nodeInstanceId: uuid(6) };
 	const remote = { deviceId: uuid(10), nodeId: uuid(11), nodeInstanceId: uuid(12), workspaceId: uuid(13), profileId: uuid(14) };
 	const snapshot: DashboardSnapshot = {
-		device: { deviceId: uuid(1), name: 'Mac A', platform: 'macOS', architecture: 'arm64', vscodeVersion: '1.136.1', extensionVersion: '0.4.0' },
+		device: { deviceId: uuid(1), name: 'Mac A', platform: 'macOS', architecture: 'arm64', workerSupported: true, vscodeVersion: '1.136.1', extensionVersion: '0.5.0' },
 		thisWindow: {
 			name: 'shared-name', workspaceName: 'shared-project', claimStatus: 'claimed', previewEnabled: true,
 			canRename: true, acceptsIncoming: true, canSetAcceptIncoming: true, acceptActionHandle: 'r'.repeat(32),
