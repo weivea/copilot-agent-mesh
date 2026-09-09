@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { access, mkdtemp, rm } from 'node:fs/promises';
 import {
 	createServer as createHttpServer,
 	request as httpRequest,
@@ -11,7 +11,7 @@ import {
 	type Server as NetServer,
 	type Socket,
 } from 'node:net';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
@@ -298,6 +298,31 @@ test('locator normalizes command failure, timeout, and cancellation without sens
 		locator.locate(controller.signal),
 		(error: unknown) => error instanceof EditorAgentHostLocatorError && error.code === 'CANCELLED',
 	);
+});
+
+test('POSIX socket fixtures stay short and clean up after success or failure', {
+	skip: process.platform === 'win32',
+}, async () => {
+	for (const shouldFail of [false, true]) {
+		let fixturePath: string | undefined;
+		const failure = new Error('Socket fixture callback failed.');
+		const operation = withSocketPath(async (socketPath) => {
+			fixturePath = socketPath;
+			assert.ok(Buffer.byteLength(socketPath, 'utf8') <= 103);
+			assert.equal(socketPath.startsWith(`${__dirname}/`), false);
+			await access(dirname(socketPath));
+			if (shouldFail) {
+				throw failure;
+			}
+		});
+		if (shouldFail) {
+			await assert.rejects(operation, (error: unknown) => error === failure);
+		} else {
+			await operation;
+		}
+		assert.ok(fixturePath !== undefined);
+		await assert.rejects(access(dirname(fixturePath)), { code: 'ENOENT' });
+	}
 });
 
 test('local IPC connector performs authenticated upgrade, scrubs inspectable URL, and isolates concurrent clients', async () => {
@@ -1219,7 +1244,8 @@ async function withSocketPath(run: (socketPath: string) => Promise<void>): Promi
 		await run(`\\\\.\\pipe\\mesh-editor-${randomUUID()}`);
 		return;
 	}
-	const root = await mkdtemp(join(__dirname, 'mesh-editor-host-'));
+	// Unix socket paths must fit macOS's 104-byte sun_path, regardless of checkout depth.
+	const root = await mkdtemp(join('/tmp', 'mesh-editor-host-'));
 	try {
 		await run(join(root, 'editor.sock'));
 	} finally {

@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveGoLicensePath } from './go-license.mjs';
 
 function runGo(args, options) {
 	try {
@@ -37,6 +38,7 @@ try {
 	const goroot = runGo(['env', 'GOROOT'], {
 		env: buildEnvironment, encoding: 'utf8', windowsHide: true,
 	}).trim();
+	const license = resolveGoLicensePath(goroot);
 	for (const [architecture, goarch, machine] of [['x64', 'amd64', 0x8664], ['arm64', 'arm64', 0xaa64]]) {
 		const binary = join(output, `mesh-process-host-${architecture}.exe`);
 		runGo([
@@ -50,7 +52,7 @@ try {
 		});
 		validatePeMachine(binary, architecture, machine);
 	}
-	copyFileSync(join(goroot, 'LICENSE'), join(output, 'LICENSE-go.txt'));
+	copyFileSync(license, join(output, 'LICENSE-go.txt'));
 } finally {
 	rmSync(work, { recursive: true, force: true });
 }
