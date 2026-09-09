@@ -1,6 +1,13 @@
 # Cross-device implementation and validation
 
-## Current SDK-only workflow (2026-09-06)
+## Current SDK-only workflow (updated 2026-09-09)
+
+Version 0.5.0 adds Windows x64/ARM64 hosting implementation and default-on local
+peer discovery/policy controls. Cross-device connections remain an explicit
+account-authenticated opt-in. Unsupported platforms are rejected before account
+selection; the Dashboard v9 model carries the local Worker-platform capability.
+This implementation update does not turn the historical macOS runs below into
+Windows or physical cross-device evidence.
 
 Use **Enable cross-device connections** in the Dashboard on every participating
 device, selecting the same account through native VS Code authentication. The

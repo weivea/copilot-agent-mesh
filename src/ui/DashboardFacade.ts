@@ -11,6 +11,7 @@ import {
 	type TaskStatus,
 } from '../../shared/protocol';
 import { validateWindowName } from '../broker/WindowName';
+import { getWorkerPlatformSupport } from '../application/WorkerPlatformSupport';
 import type { DashboardDeviceTree } from './DashboardTree';
 export {
 	DashboardActionError,
@@ -34,6 +35,7 @@ export interface DashboardSnapshot {
 		readonly name: string;
 		readonly platform: string;
 		readonly architecture: string;
+		readonly workerSupported: boolean;
 		readonly vscodeVersion: string;
 		readonly extensionVersion: string;
 	};
@@ -452,13 +454,14 @@ export class UnavailableDashboardFacade implements DashboardFacade {
 				name: configuredName.length > 0 ? configuredName : 'Not configured',
 				platform: platformLabel(process.platform),
 				architecture: process.arch,
+				workerSupported: getWorkerPlatformSupport().supported,
 				vscodeVersion: vscode.version,
 				extensionVersion: extensionVersion ?? 'Unavailable',
 			},
 			listener: {
 				state: 'unavailable',
 				gateway: unavailableComponent('Gateway service is not connected.', 'Complete service wiring'),
-				tunnel: unavailableComponent('Dev Tunnel service is not connected.', 'Install or sign in to devtunnel'),
+				tunnel: unavailableComponent('Dev Tunnel service is not connected.', 'Reconnect the Broker before enabling cross-device connections.'),
 				agentHost: unavailableComponent('The execution runtime is not connected.', 'Reconnect this VS Code window.'),
 				canStart: false,
 				canStop: false,

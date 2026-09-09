@@ -8,7 +8,7 @@ import {
 	utf8ByteLength,
 } from '../../shared/protocol';
 
-export const DASHBOARD_MESSAGE_VERSION = 8 as const;
+export const DASHBOARD_MESSAGE_VERSION = 9 as const;
 
 export const DASHBOARD_ACTIONS = [
 	'configureDevice',
@@ -196,10 +196,11 @@ function assertDashboardViewModel(model: unknown): asserts model is DashboardVie
 	);
 	assertExactRecord(
 		model.device,
-		['name', 'platform', 'architecture', 'vscodeVersion', 'extensionVersion'],
+		['name', 'platform', 'architecture', 'workerSupported', 'vscodeVersion', 'extensionVersion'],
 		[],
 	);
 	assertStrings(model.device, ['name', 'platform', 'architecture', 'vscodeVersion', 'extensionVersion']);
+	assertBoolean(model.device.workerSupported);
 
 	assertExactRecord(
 		model.listener,
@@ -391,7 +392,7 @@ function assertConnectivity(value: unknown): void {
 			'DISABLED', 'AUTH_REQUIRED', 'ACCOUNT_CHANGED', 'SCOPES_CHANGED', 'OFFLINE',
 			'DISCOVERY_UNAVAILABLE', 'RATE_LIMITED', 'TIMEOUT', 'CANCELLED', 'INVALID_ENDPOINT',
 			'BINDING_CHANGED', 'POLICY_DENIED', 'PRIVATE_ACCESS_REQUIRED', 'CLEANUP_FAILED',
-			'MIGRATION_REQUIRED', 'PROTOCOL_INCOMPATIBLE',
+			'MIGRATION_REQUIRED', 'PROTOCOL_INCOMPATIBLE', 'PLATFORM_UNSUPPORTED',
 		]);
 	}
 	assertArray(value.candidates, 10);

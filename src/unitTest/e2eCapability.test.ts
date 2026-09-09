@@ -119,6 +119,10 @@ test('development mode rejects wrong nonce or role and authorizes only the match
 	);
 	assert.ok(api);
 	api.authorize({ nonce, role: 'worker' });
+	await assert.rejects(
+		api.execute({ nonce, role: 'worker' }, 'task.start', { requireEditor: true }),
+		/editor-only/u,
+	);
 	assert.throws(
 		() => api.authorize({ nonce, role: 'coordinator' }),
 		/rejected/u,

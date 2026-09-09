@@ -6,6 +6,12 @@ dist/extension.js. Development-only packages are not distributed in the VSIX.
 The production bundle also includes dist/THIRD_PARTY_NOTICES.txt, generated
 from the exact packages included by the bundler, with their license texts.
 
+The Windows process helper executables in dist/windows are built from this
+project's native/windows-process-host sources under the project MIT license.
+They statically include the Go standard library and runtime, whose BSD-style
+license is distributed as dist/windows/LICENSE-go.txt.
+Go source: https://go.dev/
+
 @microsoft/dev-tunnels-contracts 1.3.56
 @microsoft/dev-tunnels-management 1.3.56
 @microsoft/dev-tunnels-connections 1.3.56

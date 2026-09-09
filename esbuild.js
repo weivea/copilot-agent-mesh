@@ -1,6 +1,7 @@
 const esbuild = require("esbuild");
 const { rmSync, existsSync, readFileSync, readdirSync, lstatSync, writeFileSync } = require("node:fs");
 const { dirname, join, resolve, sep } = require("node:path");
+const { execFileSync } = require("node:child_process");
 
 const production = process.argv.includes('--production');
 const watch = process.argv.includes('--watch');
@@ -32,6 +33,7 @@ async function main() {
 	if (production) {
 		rmSync('dist', { recursive: true, force: true });
 	}
+	execFileSync(process.execPath, ['scripts/build-windows-process-host.mjs'], { stdio: 'inherit' });
 	const ctx = await esbuild.context({
 		entryPoints: [
 			'src/extension.ts'

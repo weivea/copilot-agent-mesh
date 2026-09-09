@@ -75,18 +75,24 @@ export class EditorSessionPolicy {
 			|| snapshot.resource !== this.identity.uri
 			|| !isRecord(snapshot.state)
 		) {
-			throw sessionFailure();
+			throw sessionFailure('resource');
 		}
 		const value = snapshot.state;
+		if (value.resource !== undefined && value.resource !== this.identity.uri) {
+			throw sessionFailure('resource');
+		}
+		if (value.provider !== this.identity.provider) {
+			throw sessionFailure('provider');
+		}
 		if (
-			(value.resource !== undefined && value.resource !== this.identity.uri)
-			|| value.provider !== this.identity.provider
-			|| !isRecord(value.config)
+			!isRecord(value.config)
 			|| !isRecord(value.config.values)
 			|| value.config.values.isolation !== 'folder'
-			|| !matchesEditorSessionWorkspace(value.workingDirectories, this.workspaceUri)
 		) {
-			throw sessionFailure();
+			throw sessionFailure('isolation');
+		}
+		if (!matchesEditorSessionWorkspace(value.workingDirectories, this.workspaceUri)) {
+			throw sessionFailure('workspace');
 		}
 		this.values = { ...value.config.values };
 		this.workingDirectories = [...value.workingDirectories];
@@ -108,16 +114,18 @@ export class EditorSessionPolicy {
 			}
 			case 'session/workingDirectorySet':
 				this.assertCurrentState();
-				this.acceptDirectories([...new Set([...this.workingDirectories!, action.directory])]);
+				this.acceptDirectories(this.workingDirectories!.some((directory) => sameDirectory(directory, action.directory))
+					? this.workingDirectories!
+					: [...this.workingDirectories!, action.directory]);
 				break;
 			case 'session/workingDirectoryRemoved':
 				this.assertCurrentState();
-				this.acceptDirectories(this.workingDirectories!.filter((directory) => directory !== action.directory));
+				this.acceptDirectories(this.workingDirectories!.filter((directory) => !sameDirectory(directory, action.directory)));
 				break;
 			case 'session/workingDirectoryReplaced':
 				this.assertCurrentState();
 				this.acceptDirectories([...new Set(this.workingDirectories!.map((directory) =>
-					directory === action.directory ? action.replacement : directory,
+					sameDirectory(directory, action.directory) ? action.replacement : directory,
 				))]);
 				break;
 		}
@@ -151,18 +159,28 @@ function normalizedDirectoryUri(value: unknown): string | undefined {
 		|| uri.password !== ''
 		|| uri.search !== ''
 		|| uri.hash !== ''
-		|| (uri.hostname !== '' && uri.hostname !== 'localhost')
+		|| (process.platform !== 'win32' && uri.hostname !== '' && uri.hostname !== 'localhost')
 	) {
 		return undefined;
 	}
 	try {
-		return pathToFileURL(resolve(fileURLToPath(uri))).href;
+		const directory = resolve(fileURLToPath(uri));
+		// Drive letters are case-insensitive even on case-sensitive Windows directories.
+		const normalized = process.platform === 'win32'
+			? directory.replace(/^[A-Z]:/u, (drive) => drive.toLowerCase())
+			: directory;
+		return pathToFileURL(normalized).href;
 	} catch (error: unknown) {
 		if (error instanceof TypeError) {
 			return undefined;
 		}
 		throw error;
 	}
+}
+
+function sameDirectory(left: string, right: string): boolean {
+	const normalized = normalizedDirectoryUri(left);
+	return normalized !== undefined && normalized === normalizedDirectoryUri(right);
 }
 
 function configurationFailure(): AgentRuntimeError {
@@ -173,16 +191,16 @@ function configurationFailure(): AgentRuntimeError {
 }
 
 export class EditorSessionPolicyError extends AgentRuntimeError {
-	public constructor() {
+	public constructor(readonly reason: 'resource' | 'provider' | 'isolation' | 'workspace' | 'state' = 'state') {
 		super(
 			'TASK_EXECUTION_FAILED',
-			'The editor Agent Session does not match its provider, folder isolation, or target workspace.',
+			`The editor Agent Session does not match its provider, folder isolation, or target workspace (${reason}).`,
 		);
 	}
 }
 
-function sessionFailure(): EditorSessionPolicyError {
-	return new EditorSessionPolicyError();
+function sessionFailure(reason?: EditorSessionPolicyError['reason']): EditorSessionPolicyError {
+	return new EditorSessionPolicyError(reason);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

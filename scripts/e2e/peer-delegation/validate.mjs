@@ -5,7 +5,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
-const repositoryRoot = resolve(scriptDirectory, '../../..');
+const repositoryRoot = resolve(scriptDirectory, '..', '..', '..');
 const defaultEvidencePath = resolve(
 	repositoryRoot,
 	'artifacts',
@@ -16,10 +16,11 @@ const argumentsWithoutFlags = process.argv.slice(2).filter((argument) => !argume
 const evidencePath = resolve(argumentsWithoutFlags[0] ?? defaultEvidencePath);
 const requirePass = process.argv.includes('--require-pass');
 const require = createRequire(import.meta.url);
+require('tsx/cjs');
 const {
 	assertPassingPeerDelegationEvidence,
 	parsePeerDelegationEvidenceArtifact,
-} = require(resolve(repositoryRoot, 'out/src/e2e/PeerDelegationEvidence.js'));
+} = require(resolve(repositoryRoot, 'src', 'e2e', 'PeerDelegationEvidence.ts'));
 
 const serialized = await readFile(evidencePath, 'utf8');
 if (Buffer.byteLength(serialized, 'utf8') > 1024 * 1024) {

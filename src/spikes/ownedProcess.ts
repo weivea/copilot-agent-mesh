@@ -1,4 +1,6 @@
 import { spawn } from 'node:child_process';
+import { resolveWindowsCommand } from './windowsCodeCli';
+import { WindowsOwnedProcess, type OwnedProcessCleanup } from './windowsProcessHost';
 
 const defaultMaxOutputBytes = 1024 * 1024;
 const defaultTerminationGraceMs = 250;
@@ -10,9 +12,14 @@ export class OwnedCommandError extends Error {
 		message: string,
 		readonly processGroupId?: number,
 		readonly cleanupRequired = false,
+		readonly ownedCleanup?: OwnedProcessCleanup,
 	) {
 		super(message);
 		this.name = 'OwnedCommandError';
+		Object.defineProperty(this, 'ownedCleanup', {
+			value: ownedCleanup,
+			enumerable: false,
+		});
 	}
 }
 
@@ -22,16 +29,16 @@ export interface RunOwnedCommandOptions {
 	terminationGraceMs?: number;
 	platform?: NodeJS.Platform;
 	signal?: AbortSignal;
+	environment?: NodeJS.ProcessEnv;
+	cwd?: string;
 }
 
 export function assertOwnedProcessControlSupported(
 	platform: NodeJS.Platform = process.platform,
 ): void {
-	if (platform !== 'darwin' && platform !== 'linux') {
+	if (platform !== 'darwin' && platform !== 'linux' && platform !== 'win32') {
 		throw new Error(
-			platform === 'win32'
-				? 'Agent Host spike is unavailable on Windows until a Job Object based process controller is implemented.'
-				: `Agent Host spike has no owned process-group controller for platform ${platform}.`,
+			`Agent Host spike has no owned process controller for platform ${platform}.`,
 		);
 	}
 }
@@ -42,6 +49,12 @@ export function runOwnedCommand(
 	options: RunOwnedCommandOptions,
 ): Promise<string> {
 	assertOwnedProcessControlSupported(options.platform);
+	if (options.signal?.aborted) {
+		return Promise.reject(new OwnedCommandError('The owned command was cancelled before starting.'));
+	}
+	if ((options.platform ?? process.platform) === 'win32') {
+		return runWindowsOwnedCommand(executable, args, options);
+	}
 	const maxOutputBytes = options.maxOutputBytes ?? defaultMaxOutputBytes;
 	const terminationGraceMs = options.terminationGraceMs ?? defaultTerminationGraceMs;
 
@@ -51,6 +64,8 @@ export function runOwnedCommand(
 			shell: false,
 			stdio: ['ignore', 'pipe', 'pipe'],
 			windowsHide: true,
+			env: options.environment,
+			cwd: options.cwd,
 		});
 		const processGroupId = child.pid;
 		const stdoutChunks: Buffer[] = [];
@@ -202,6 +217,9 @@ export async function terminateOwnedProcessGroup(
 	processGroupId: number,
 	graceMs: number,
 ): Promise<void> {
+	if (process.platform === 'win32') {
+		throw new OwnedCommandError('Windows cleanup requires the retained Job Object controller, not a process-group PID.');
+	}
 	const groupExisted = signalProcessGroup(processGroupId, 'SIGTERM');
 	if (!groupExisted) {
 		return;
@@ -226,6 +244,73 @@ export async function terminateOwnedProcessGroup(
 			processGroupId,
 		);
 	}
+}
+
+async function runWindowsOwnedCommand(
+	executable: string,
+	args: readonly string[],
+	options: RunOwnedCommandOptions,
+): Promise<string> {
+	const command = await resolveWindowsCommand(executable, args, options.environment);
+	if (options.signal?.aborted) {
+		throw new OwnedCommandError('The owned command was cancelled before starting.');
+	}
+	const child = new WindowsOwnedProcess(command.executable, command.args, {
+		environment: command.environment,
+		cwd: options.cwd,
+		maxOutputBytes: options.maxOutputBytes ?? defaultMaxOutputBytes,
+	});
+	const chunks: Buffer[] = [];
+	child.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
+	child.stderr.resume();
+	let timer: NodeJS.Timeout | undefined;
+	let abort: (() => void) | undefined;
+	let failure: unknown;
+	try {
+		const interrupted = new Promise<never>((_resolve, reject) => {
+			timer = setTimeout(() => reject(new OwnedCommandError(
+				`The owned command timed out after ${options.timeoutMs}ms.`,
+			)), options.timeoutMs);
+			abort = () => reject(new OwnedCommandError('The owned command was cancelled.'));
+			options.signal?.addEventListener('abort', abort, { once: true });
+			if (options.signal?.aborted) {
+				abort();
+			}
+		});
+		const code = await Promise.race([child.completion, interrupted]);
+		if (code !== 0) {
+			throw new OwnedCommandError(`The owned command exited with ${code}.`, child.pid);
+		}
+	} catch (error) {
+		failure = error;
+	} finally {
+		clearTimeout(timer);
+		if (abort !== undefined) {
+			options.signal?.removeEventListener('abort', abort);
+		}
+	}
+	try {
+		await child.dispose();
+	} catch {
+		throw new OwnedCommandError(
+			'The owned Windows command could not confirm Job Object cleanup and remains available for retry.',
+			child.pid, true, child,
+		);
+	} finally {
+		child.stdout.destroy();
+		child.stderr.destroy();
+	}
+	if (failure !== undefined) {
+		throw failure instanceof OwnedCommandError
+			? failure
+			: new OwnedCommandError(
+				failure instanceof Error && failure.message.includes('output_limit')
+					? `The owned command exceeded the ${options.maxOutputBytes ?? defaultMaxOutputBytes} byte output limit.`
+					: 'The owned Windows command failed.',
+				child.pid,
+			);
+	}
+	return Buffer.concat(chunks).toString('utf8');
 }
 
 function signalProcessGroup(processGroupId: number, signal: NodeJS.Signals): boolean {

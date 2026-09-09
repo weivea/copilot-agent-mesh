@@ -55,7 +55,7 @@ const workspaceUri = pathToFileURL(join(fixtureRoot, 'workspace')).href;
 const firstWorkspaceUri = pathToFileURL(join(fixtureRoot, 'one')).href;
 const secondWorkspaceUri = pathToFileURL(join(fixtureRoot, 'two')).href;
 
-test('real loopback composes pairing, workspace, accepted task, input, get, and cancellation', async () => {
+test('real loopback composes pairing, on-demand runtime, accepted task, input, get, and cancellation', async () => {
 	const state = new MemoryState();
 	const leases = new WorkspaceLeaseManager();
 	const registry = new WorkspaceRegistry(
@@ -76,6 +76,7 @@ test('real loopback composes pairing, workspace, accepted task, input, get, and 
 	});
 	const tasks = new FileTaskStore(files);
 	const runtime = new StubAgentRuntime(inputId);
+	runtime.probe = async () => ({ available: false, featureEnabled: true, canStart: true });
 	let liveGateway: GatewayServer | undefined;
 	const guard = new LocalDesktopWorkspaceGuard(() => ({
 		remoteName: undefined,

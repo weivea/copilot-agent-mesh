@@ -40,12 +40,14 @@ const peerId = '00000000-0000-4000-8000-000000000001';
 const deviceId = '00000000-0000-4000-8000-000000000002';
 const workspaceId = '00000000-0000-4000-8000-000000000003';
 
-test('Worker Preview platform gate supports only macOS arm64', () => {
+test('Worker platform gate supports Windows x64/ARM64 and macOS arm64', () => {
 	assert.equal(getWorkerPlatformSupport('darwin', 'arm64').supported, true);
+	assert.equal(getWorkerPlatformSupport('win32', 'x64').supported, true);
+	assert.equal(getWorkerPlatformSupport('win32', 'arm64').supported, true);
 	for (const [platform, architecture] of [
 		['darwin', 'x64'],
 		['linux', 'x64'],
-		['win32', 'x64'],
+		['win32', 'ia32'],
 	] as const) {
 		const support = getWorkerPlatformSupport(platform, architecture);
 		assert.equal(support.supported, false);

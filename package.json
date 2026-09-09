@@ -1,8 +1,8 @@
 {
   "name": "copilot-agent-mesh",
   "displayName": "Copilot Agent Mesh",
-  "description": "Preview mesh coordinator; experimental Worker hosting is limited to macOS arm64.",
-  "version": "0.4.0",
+  "description": "Preview agent mesh with Worker hosting on Windows x64/ARM64 and macOS arm64.",
+  "version": "0.5.0",
   "preview": true,
   "publisher": "weivea",
   "license": "MIT",
@@ -47,7 +47,7 @@
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": false,
-      "description": "Copilot Agent Mesh can delegate coding tasks. Worker Preview execution is supported only on macOS arm64."
+      "description": "Copilot Agent Mesh can delegate coding tasks. Worker execution requires a trusted local workspace on Windows x64/ARM64 or macOS arm64."
     },
     "virtualWorkspaces": {
       "supported": false,
@@ -551,19 +551,19 @@
           "type": "string",
           "default": "",
           "scope": "machine",
-          "markdownDescription": "Optional VS Code CLI path used by the macOS arm64 Worker Preview Agent Host runtime. Other platforms are Coordinator-only."
+          "markdownDescription": "Optional VS Code CLI path for the Worker Agent Host runtime. Windows x64/ARM64 and macOS arm64 are supported; the current installation is discovered automatically."
         },
         "copilotAgentMesh.experimental.peerDelegation": {
           "type": "boolean",
-          "default": false,
+          "default": true,
           "scope": "machine",
-          "markdownDescription": "Enable Preview same-device peer window discovery, policy configuration, and incoming task routing. Authorization remains default-deny."
+          "markdownDescription": "Enable same-device peer window discovery, policy configuration, and task tools. Enabled by default; disable to opt out. Incoming task reception and directional Workspace authorization remain default-deny."
         },
         "copilotAgentMesh.agentHost.userDataDir": {
           "type": "string",
           "default": "",
           "scope": "machine",
-          "markdownDescription": "Override the current VS Code instance user-data directory for editor Agent Host discovery. Leave empty for platform/product derivation. The 0.4.0 Worker Host support claim remains macOS arm64 only."
+          "markdownDescription": "Override the current VS Code instance user-data directory for editor Agent Host discovery. Leave empty for automatic platform/product derivation."
         },
         "copilotAgentMesh.experimental.authenticationProviders": {
           "type": "object",
@@ -606,19 +606,20 @@
   },
   "scripts": {
     "ahp:build": "node scripts/build-agent-host-protocol.mjs",
+    "windows:build": "node scripts/build-windows-process-host.mjs",
     "prepare": "node scripts/build-agent-host-protocol.mjs",
     "precheck-types": "npm run ahp:build",
-    "precompile-tests": "npm run ahp:build",
+    "precompile-tests": "npm run ahp:build && npm run windows:build",
     "vscode:prepublish": "npm run bundle",
     "compile": "npm run check-types && npm run lint && node esbuild.js",
     "bundle": "npm run check-types && npm run lint && node esbuild.js --production",
     "watch": "npm-run-all -p watch:*",
     "watch:esbuild": "node esbuild.js --watch",
     "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
-    "package:vsix": "node -e \"require('node:fs').mkdirSync('artifacts',{recursive:true})\" && vsce package --pre-release --no-dependencies --out artifacts/copilot-agent-mesh-0.4.0-preview.vsix && npm run verify:vsix",
+    "package:vsix": "node -e \"require('node:fs').mkdirSync('artifacts',{recursive:true})\" && vsce package --pre-release --no-dependencies --out artifacts/copilot-agent-mesh-0.5.0-preview.vsix && npm run verify:vsix",
     "vsix:list": "vsce ls --no-dependencies",
-    "verify:vsix": "npm run vsix:list && node scripts/verify-vsix.mjs artifacts/copilot-agent-mesh-0.4.0-preview.vsix",
-    "smoke:vsix": "node scripts/smoke-vsix.mjs artifacts/copilot-agent-mesh-0.4.0-preview.vsix",
+    "verify:vsix": "npm run vsix:list && node scripts/verify-vsix.mjs artifacts/copilot-agent-mesh-0.5.0-preview.vsix",
+    "smoke:vsix": "node scripts/smoke-vsix.mjs artifacts/copilot-agent-mesh-0.5.0-preview.vsix",
     "audit:release": "npm audit --audit-level=high",
     "compile-tests": "tsc -p . --outDir out",
     "watch-tests": "tsc -p . -w --outDir out",

@@ -9,6 +9,7 @@ import {
 	type RemotePolicyActionParams, type RemotePolicyDashboard, type TaskTarget,
 } from '../../shared/protocol';
 import type { ListenerService } from '../application/ListenerService';
+import type { WorkerPlatformSupport } from '../application/WorkerPlatformSupport';
 import type { NodeRegistry } from '../broker/NodeRegistry';
 import type { PeerPolicyService } from '../broker/PeerPolicyService';
 import { RemotePeerPolicyService } from '../broker/RemotePeerPolicyService';
@@ -47,6 +48,7 @@ import { resolveWindowDisplayName } from '../broker/WindowName';
 
 interface ConnectivityOptions {
 	readonly vscodeApi: typeof vscode;
+	readonly workerPlatform: WorkerPlatformSupport;
 	readonly files: AtomicFileStore;
 	readonly fence: DocumentFence;
 	readonly deviceId: string;
@@ -207,7 +209,8 @@ export class ProductionConnectivity implements BrokerConnectivity {
 	public isReady(): boolean { return this.ready; }
 	public strict(): boolean { return true; }
 	public connectionsEnabled(): boolean {
-		return this.ready && this.currentSettings().enabled && !this.stopRequested && !this.disposed;
+		return this.options.workerPlatform.supported && this.ready
+			&& this.currentSettings().enabled && !this.stopRequested && !this.disposed;
 	}
 	public beginShutdown(): void {
 		this.disposed = true;
@@ -673,6 +676,11 @@ export class ProductionConnectivity implements BrokerConnectivity {
 		interactive: boolean, validateCaller: () => void, chooseAccount = false, stopEpoch = this.stopEpoch,
 	): Promise<void> {
 		if (stopEpoch !== this.stopEpoch) { throw new ConnectivityError('CANCELLED'); }
+		if (!this.options.workerPlatform.supported) {
+			this.clearRecovery();
+			this.connectionState = 'error';
+			throw new ConnectivityError('PLATFORM_UNSUPPORTED');
+		}
 		if (this.connectionsEnabled() && this.connectionState === 'online' && !chooseAccount) { return; }
 		this.assertReady();
 		this.stopRequested = false;

@@ -260,6 +260,63 @@ suite('Dashboard', () => {
 		assert.strictEqual(media.messages.filter(({ type }) => type === 'action').length, 3);
 	});
 
+	test('Windows exposes the receive checkbox without granting reception automatically', async () => {
+		const media = await createDashboardMediaHarness();
+		const source = snapshot();
+		media.receive({
+			version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view', type: 'dashboard.snapshot',
+			model: new DashboardPresenter().present({
+				...source,
+				device: { ...source.device, platform: 'Windows', architecture: 'x64', workerSupported: true },
+			}),
+		});
+		const receive = media.checkbox('Accept incoming tasks for this Workspace');
+		assert.strictEqual(receive.disabled, false);
+		assert.strictEqual(receive.checked, false);
+		assert.strictEqual(media.messages.length, 1);
+	});
+
+	test('an explicitly disabled peer policy explains the unavailable checkbox in Workspace details', async () => {
+		const media = await createDashboardMediaHarness();
+		const source = snapshot();
+		const tree = structuredClone(source.deviceTree!);
+		const workspace = tree[0].nodes[0].workspaces[0];
+		delete workspace.receiveAction;
+		delete workspace.receiveActionHandle;
+		media.receive({
+			version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view', type: 'dashboard.snapshot',
+			model: new DashboardPresenter().present({
+				...source, deviceTree: tree,
+				thisWindow: {
+					...source.thisWindow, previewEnabled: false, canRename: false,
+					canSetAcceptIncoming: false, acceptActionHandle: undefined,
+					detail: 'Local peer delegation is disabled in VS Code settings.',
+				},
+			}),
+		});
+		assert.strictEqual(media.checkbox('Accept incoming tasks for this Workspace').disabled, true);
+		assert.match(media.element('selectionDetails').text, /peer delegation is disabled in VS Code settings/u);
+	});
+
+	test('unsupported platforms cannot start account connections but retain cleanup controls', async () => {
+		const media = await createDashboardMediaHarness();
+		const source = snapshot();
+		media.receive({
+			version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view', type: 'dashboard.snapshot',
+			model: new DashboardPresenter().present({
+				...source, device: { ...source.device, workerSupported: false },
+				connectivity: {
+					...DISABLED_CONNECTIVITY_SNAPSHOT, connectionState: 'cleanupPending',
+					migrationPending: true, error: 'PLATFORM_UNSUPPORTED',
+				},
+			}),
+		});
+		assert.strictEqual(media.button('Enable cross-device connections').disabled, true);
+		assert.strictEqual(media.button('Retry Tunnel cleanup').disabled, false);
+		assert.match(media.element('connectivity').text, /Windows x64\/ARM64 or macOS arm64/u);
+		assert.strictEqual(media.messages.length, 1);
+	});
+
 	test('renders startup, authentication, stopping, and cleanup states without duplicate Listener controls', async () => {
 		const media = await createDashboardMediaHarness();
 		const source = connectivitySnapshot();
@@ -2270,6 +2327,22 @@ suite('Dashboard', () => {
 		} finally { fixture.bindings.dispose(); }
 	});
 
+	test('fresh production settings enable window policy controls without accepting tasks or signing in', async () => {
+		const fixture = createConnectivityBindings();
+		fixture.state.previewEnabled = undefined;
+		try {
+			const source = await fixture.bindings.getSnapshot();
+			assert.strictEqual(source.thisWindow.previewEnabled, true);
+			assert.strictEqual(source.thisWindow.canRename, true);
+			assert.strictEqual(source.thisWindow.canSetAcceptIncoming, true);
+			assert.ok(source.thisWindow.acceptActionHandle);
+			assert.strictEqual(source.thisWindow.acceptsIncoming, false);
+			assert.strictEqual(source.connectivity?.enabled, false);
+			assert.deepStrictEqual(fixture.mutations, []);
+			assert.ok(!fixture.calls.includes('native'));
+		} finally { fixture.bindings.dispose(); }
+	});
+
 	test('Production connectivity uses authenticated local IPC from non-owner windows and never refreshes cloud state on render', async () => {
 		const fixture = createConnectivityBindings();
 		try {
@@ -2884,6 +2957,7 @@ function snapshot(): DashboardSnapshot {
 			deviceId: 'device-1',
 			name: 'test-device',
 			platform: 'test-platform',
+			workerSupported: true,
 			architecture: 'test-architecture',
 			vscodeVersion: '1.0.0',
 			extensionVersion: '1.0.0',
@@ -3550,6 +3624,7 @@ function createConnectivityBindings(): {
 		previewEnabled?: boolean;
 		localAcceptsIncoming?: boolean;
 	} = {
+		previewEnabled: false,
 		connectivity: DISABLED_CONNECTIVITY_SNAPSHOT,
 		remotePolicy: {
 			workspaces: [{
@@ -3597,7 +3672,7 @@ function createConnectivityBindings(): {
 			},
 			authentication: { getSession: native },
 			workspace: {
-				getConfiguration: () => ({ get: () => state.previewEnabled ?? false }),
+				getConfiguration: () => ({ get: (_key: string, fallback?: unknown) => state.previewEnabled ?? fallback }),
 				getWorkspaceFolder: () => undefined,
 			},
 			commands: {
@@ -3697,10 +3772,10 @@ function createConnectivityBindings(): {
 		},
 		runtime: () => {
 			calls.push('runtime');
-			assert.ok(state.previewEnabled || state.connectivity.delegationEnabled, 'Default-off rendering must not probe or start hosting.');
+			assert.ok((state.previewEnabled ?? true) || state.connectivity.delegationEnabled, 'Default-off rendering must not probe or start hosting.');
 			return {
 				probe: async (options?: { requireEditor?: true }) => {
-					if (!state.previewEnabled) {
+					if (state.previewEnabled === false) {
 						assert.deepStrictEqual(options, { requireEditor: true });
 						calls.push('passiveEditorProbe');
 					}

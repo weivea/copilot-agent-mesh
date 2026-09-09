@@ -95,6 +95,31 @@ test('folder policy preserves other options and accepts a read-only folder resul
 	assert.throws(() => policy.assertResolvedConfiguration(incompatible, { isolation: 'folder' }), AgentRuntimeError);
 });
 
+test('Windows workspace matching normalizes drive letters and URI escapes without widening directory scope', {
+	skip: process.platform !== 'win32',
+}, async () => {
+	const { ActionType } = await import('@microsoft/agent-host-protocol');
+	const expected = 'file:///f%3A/projects/Repo';
+	const returned = 'file:///F:/projects/Repo';
+	assert.equal(matchesEditorSessionWorkspace([returned], expected), true);
+	assert.equal(matchesEditorSessionWorkspace(['file:///F:/projects/Other'], expected), false);
+	assert.equal(matchesEditorSessionWorkspace(['file:///F:/projects/repo'], expected), false);
+	assert.equal(matchesEditorSessionWorkspace(['file://server/share/Repo'], 'file://server/share/Repo'), true);
+	const policy = new EditorSessionPolicy(identity, expected);
+	policy.acceptSnapshot({
+		...sessionSnapshot(),
+		state: { ...sessionSnapshot().state, workingDirectories: [returned] },
+	});
+	policy.acceptAction({ type: ActionType.SessionWorkingDirectorySet, directory: expected });
+	policy.assertCurrentState();
+	policy.acceptAction({ type: ActionType.SessionWorkingDirectoryReplaced, directory: expected, replacement: returned });
+	policy.assertCurrentState();
+	assert.throws(
+		() => policy.acceptAction({ type: ActionType.SessionWorkingDirectoryRemoved, directory: expected }),
+		EditorSessionPolicyError,
+	);
+});
+
 test('native Session snapshots use the envelope identity without a duplicate state resource', () => {
 	const policy = new EditorSessionPolicy(identity, workspace);
 	const snapshot = sessionSnapshot();

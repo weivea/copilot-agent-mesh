@@ -56,12 +56,12 @@ const experimentStatus = z.enum(['pass', 'fail', 'unverified', 'unsupported']);
 
 export const peerDelegationEvidenceSchema = z.strictObject({
 	schemaVersion: z.literal(1),
-	release: z.literal('0.4.0-preview'),
+	release: z.enum(['0.4.0-preview', '0.5.0-preview']),
 	runId: uuid,
 	outcome: status,
 	gitCommit: z.string().regex(/^[a-f0-9]{40}$/u),
 	versions: z.strictObject({
-		extension: z.literal('0.4.0'),
+		extension: z.enum(['0.4.0', '0.5.0']),
 		vscode: z.string().min(1).max(64),
 		ahpCommit: z.literal('f19dd8b3942d029744a3bdd31d830f9428e8ea47'),
 		ahpClient: z.literal('0.9.0'),
@@ -71,10 +71,10 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 	startedAt: timestamp,
 	finishedAt: timestamp,
 	durationMs: nonNegativeInteger,
-	platform: z.strictObject({
-		os: z.literal('darwin'),
-		architecture: z.literal('arm64'),
-	}),
+	platform: z.union([
+		z.strictObject({ os: z.literal('darwin'), architecture: z.literal('arm64') }),
+		z.strictObject({ os: z.literal('win32'), architecture: z.enum(['x64', 'arm64']) }),
+	]),
 	topology: z.strictObject({
 		ordinaryWindows: z.strictObject({
 			status,
@@ -287,6 +287,16 @@ export const peerDelegationEvidenceSchema = z.strictObject({
 		message: z.string().min(1).max(512),
 	}).optional(),
 }).superRefine((evidence, context) => {
+	if (
+		evidence.release !== `${evidence.versions.extension}-preview`
+		|| (evidence.release === '0.4.0-preview' && evidence.platform.os !== 'darwin')
+	) {
+		context.addIssue({
+			code: 'custom',
+			path: ['release'],
+			message: 'Release metadata must match the extension version; historical 0.4.0 evidence is macOS-only.',
+		});
+	}
 	if (
 		evidence.versions.selectedProtocolVersion !== undefined
 		&& !evidence.versions.protocolOffer.some(
@@ -509,7 +519,7 @@ export type PeerDelegationEvidenceTerminalState = typeof terminalStateValues[num
 export const peerDelegationDiagnosticEvidenceSchema = z.strictObject({
 	schemaVersion: z.literal(1),
 	kind: z.literal('diagnostic'),
-	release: z.literal('0.4.0-preview'),
+	release: z.enum(['0.4.0-preview', '0.5.0-preview']),
 	runId: uuid,
 	outcome: z.literal('fail'),
 	gitCommit: z.string().regex(/^[a-f0-9]{40}$/u),
@@ -532,7 +542,7 @@ export const peerDelegationTestDiagnosticEvidenceSchema = z.strictObject({
 	schemaVersion: z.literal(1),
 	kind: z.literal('test-diagnostic'),
 	testMode: z.literal(true),
-	release: z.literal('0.4.0-preview'),
+	release: z.enum(['0.4.0-preview', '0.5.0-preview']),
 	runId: uuid,
 	outcome: z.literal('fail'),
 	gitCommit: z.string().regex(/^[a-f0-9]{40}$/u),
@@ -600,7 +610,7 @@ export function createPeerDelegationDiagnosticEvidence(input: {
 	return peerDelegationDiagnosticEvidenceSchema.parse({
 		schemaVersion: 1,
 		kind: 'diagnostic',
-		release: '0.4.0-preview',
+		release: '0.5.0-preview',
 		runId: input.runId,
 		outcome: 'fail',
 		gitCommit: input.gitCommit,
@@ -639,7 +649,7 @@ export function createPeerDelegationTestDiagnosticEvidence(input: {
 		schemaVersion: 1,
 		kind: 'test-diagnostic',
 		testMode: true,
-		release: '0.4.0-preview',
+		release: '0.5.0-preview',
 		runId: input.runId,
 		outcome: 'fail',
 		gitCommit: input.gitCommit,

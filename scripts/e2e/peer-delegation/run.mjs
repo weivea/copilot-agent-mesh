@@ -20,7 +20,7 @@ if (process.env.MESH_PEER_DELEGATION_E2E_TEST_MODE === '1') {
 	throw new Error('Internal peer-delegation test mode cannot run through the release command.');
 }
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
-const repositoryRoot = resolve(scriptDirectory, '../../..');
+const repositoryRoot = resolve(scriptDirectory, '..', '..', '..');
 const evidence = await resolvePeerDelegationEvidenceDestination({
 	repositoryRoot,
 	configuredRoot: process.env.MESH_PEER_DELEGATION_E2E_EVIDENCE_DIR,
@@ -36,8 +36,12 @@ assertCleanCommittedReleaseSnapshot({
 	statusBefore,
 	statusAfter,
 });
-if (process.platform !== 'darwin' || process.arch !== 'arm64') {
-	throw new Error('The real peer-delegation E2E requires supported macOS arm64 Worker hardware.');
+const { resolveNpmCommand, supportsWorker } = await import('../multi-window/platform.mjs');
+if (!supportsWorker()) {
+	throw new Error('The real peer-delegation E2E requires Windows x64/ARM64 or macOS arm64 Worker hardware.');
+}
+if (!process.env.MESH_PEER_DELEGATION_E2E_PROFILE_DIR) {
+	throw new Error('MESH_PEER_DELEGATION_E2E_PROFILE_DIR must explicitly select a dedicated E2E profile.');
 }
 await resolvePeerDelegationEvidenceDestination({
 	repositoryRoot,
@@ -50,7 +54,8 @@ await resolvePeerDelegationEvidenceDestination({
 });
 rmSync(evidence.summaryPath, { force: true });
 for (const script of ['compile-tests', 'compile']) {
-	const result = spawnSync(npmCommand(), ['run', script], {
+	const command = await resolveNpmCommand(['run', script]);
+	const result = spawnSync(command.executable, command.args, {
 		cwd: repositoryRoot,
 		env: process.env,
 		shell: false,
@@ -79,8 +84,4 @@ function runGit(args) {
 		throw new Error(`git ${args.join(' ')} failed with exit code ${result.status ?? 'unknown'}.`);
 	}
 	return result.stdout.trim();
-}
-
-function npmCommand() {
-	return process.platform === 'win32' ? 'npm.cmd' : 'npm';
 }

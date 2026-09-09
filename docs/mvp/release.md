@@ -1,6 +1,6 @@
 # Preview release engineering
 
-> Version: `0.4.0` Preview
+> Version: `0.5.0` Preview
 > Gate status: historical G0 Go; Peer Window Delegation requires its own real evidence gate
 
 This document describes a reproducible evaluation package. It does not authorize
@@ -11,9 +11,10 @@ availability.
 
 | Platform | Window Node / Broker client | Worker host |
 | --- | --- | --- |
-| macOS arm64 | Preview | Experimental candidate; disabled by default |
+| macOS arm64 | Preview | On demand after Workspace/task authorization |
 | macOS x64 and other macOS architectures | Preview | Unsupported |
-| Windows | Preview | Unsupported |
+| Windows x64 / ARM64 | Preview | On demand after Workspace/task authorization |
+| Windows x86 | Preview | Unsupported |
 | Linux | Preview | Unsupported |
 
 Every ordinary window under the same User Data is an active Window Node and may
@@ -36,7 +37,8 @@ There is no separate Agent Host feature switch. Runtime connections are created
 on demand; no standalone provider, account, resource, or scope is inferred.
 A successful real turn may consume Copilot quota.
 
-Cross-device hosting remains macOS arm64-only, SDK-only and default-off. Enable **cross-device
+Cross-device hosting supports Windows x64/ARM64 and macOS arm64, and remains
+SDK-only and default-off. Enable **cross-device
 connections** in the Dashboard on every participating device and use native
 VS Code account selection/sign-in; no Dev Tunnel CLI installation or login is
 required. Same-account device trust does not grant Workspace or task permission.
@@ -50,7 +52,10 @@ workflow adds no physical-device, platform, production or SLA validation.
 
 ## Build and verify
 
-Use Node.js 22 or newer:
+Use Node.js 22 or newer and the Go version declared in
+`native/windows-process-host/go.mod` or newer. Go is needed only to build the
+bundled Windows helpers, including when packaging on macOS or Linux. Extension
+users do not need Go or any new platform opt-in:
 
 ```sh
 git submodule update --init --recursive
@@ -63,7 +68,7 @@ npm run verify
 The package command creates:
 
 ```text
-artifacts/copilot-agent-mesh-0.4.0-preview.vsix
+artifacts/copilot-agent-mesh-0.5.0-preview.vsix
 ```
 
 The production bundle is separate from VSIX creation:
@@ -75,8 +80,9 @@ npm run package:vsix
 
 `package:vsix` invokes `vsce package --pre-release --no-dependencies`, prints
 `vsce ls`, and verifies the ZIP central directory against an exact allowlist.
-Only the production bundle, media, extension manifest, release documents,
-project notices, and the AHP license are permitted. AHP runtime code is already
+Only the production bundle, the two exact Windows process-helper binaries and
+their Go license, media, extension manifest, release documents, project notices,
+and the AHP license are permitted. AHP runtime code is already
 in the esbuild output, so the AHP source submodule and every nested archive are
 excluded alongside source, tests, shared TypeScript, build output, test
 downloads, source maps, credentials, and external CLIs.
@@ -85,13 +91,23 @@ Inspect and hash the result independently:
 
 ```sh
 npx vsce ls --no-dependencies
-unzip -Z1 artifacts/copilot-agent-mesh-0.4.0-preview.vsix
-shasum -a 256 artifacts/copilot-agent-mesh-0.4.0-preview.vsix
+unzip -Z1 artifacts/copilot-agent-mesh-0.5.0-preview.vsix
+shasum -a 256 artifacts/copilot-agent-mesh-0.5.0-preview.vsix
 ```
+
+On Windows, install the same universal VSIX from PowerShell:
+
+```powershell
+code --install-extension ".\artifacts\copilot-agent-mesh-0.5.0-preview.vsix" --force
+```
+
+Local discovery, policy controls, and Mesh tools are enabled by default.
+An existing explicit `experimental.peerDelegation: false` remains an opt-out;
+saved receive switches, allowlists, and account choices are not broadened.
 
 ## Real multi-window verification
 
-Run the 0.4.0 Peer Window Delegation release gate separately:
+Run the Peer Window Delegation release gate separately:
 
 ```sh
 MESH_PEER_DELEGATION_E2E=1 npm run test:peer-delegation-real
@@ -175,12 +191,13 @@ npm run smoke:vsix
 
 Set `VSCODE_EXECUTABLE_PATH` to reuse a specific VS Code executable; otherwise
 `@vscode/test-electron` downloads or reuses its stable test build. The fresh
-profile keeps listener auto-start and experimental Agent Host disabled, so the
-smoke does not create a public tunnel or run a model task.
+profile keeps cross-device connections and task reception off. Local discovery
+is enabled, but activation alone never starts an Agent task or a Tunnel.
 
 ## CI boundary
 
-The `preview-package.yml` matrix runs on Linux, macOS, and Windows. It performs
+The `preview-package.yml` matrix runs on Linux, macOS, and Windows, installs the
+Go build toolchain, and packages both Windows helper architectures. It performs
 clean install, audit, type checking, lint, offline unit/component tests,
 Extension Host tests, package verification, installed-VSIX activation smoke,
 and artifact upload. Linux runs both Extension Host phases under `xvfb`. A smoke

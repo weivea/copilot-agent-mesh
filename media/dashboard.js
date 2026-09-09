@@ -3,7 +3,7 @@
 
 	const vscode = acquireVsCodeApi();
 	const uiInstanceId = document.body.dataset.uiInstanceId;
-	const version = 8;
+	const version = 9;
 
 	const controls = new Set();
 	const controlActions = new WeakMap();
@@ -104,6 +104,7 @@
 			model.connectivity,
 			!model.errors.some((error) =>
 				error.code === 'CONNECTIVITY_UNAVAILABLE' || error.code === 'DASHBOARD_SERVICES_UNAVAILABLE'),
+			model.device.workerSupported,
 		);
 		renderCollection('localNodes', model.localNodes, renderLocalNode, peerEmptyMessage(model.thisWindow));
 		renderCollection(
@@ -476,8 +477,11 @@
 		if (current) {
 			root.append(
 				propertyRow('Agent Host', model.thisWindow.agentHost.label),
-				renderReceiveControl(workspace),
+				renderReceiveControl(workspace, model.thisWindow),
 			);
+			if (model.thisWindow.agentHost.detail) {
+				root.append(textElement('p', model.thisWindow.agentHost.detail, 'detail'));
+			}
 			if (workspace.incomingPeers.length > 0) {
 				root.append(sectionHeading('Incoming device approvals'));
 				for (const peer of workspace.incomingPeers) {
@@ -527,7 +531,7 @@
 		root.append(actions);
 	}
 
-	function renderReceiveControl(workspace) {
+	function renderReceiveControl(workspace, thisWindow) {
 		const action = workspace.receiveAction;
 		const actionHandle = workspace.receiveActionHandle;
 		const available = typeof action === 'string' && typeof actionHandle === 'string';
@@ -559,6 +563,13 @@
 			),
 		);
 		container.append(label);
+		if (!available) {
+			container.append(textElement(
+				'p',
+				thisWindow.detail ?? 'This Workspace receive policy is unavailable. Refresh after the Broker reconnects.',
+				'action-hint',
+			));
+		}
 		if (action === 'setRemoteReceive') {
 			container.append(textElement(
 				'p',
@@ -678,7 +689,7 @@
 		);
 	}
 
-	function renderConnectivity(connectivity, statusAvailable) {
+	function renderConnectivity(connectivity, statusAvailable, workerSupported) {
 		const root = reset(document.getElementById('connectivity'));
 		const setting = (value) => statusAvailable ? String(value) : 'Unknown';
 		root.append(
@@ -693,6 +704,9 @@
 		);
 		if (!statusAvailable) {
 			root.append(textElement('p', 'Connection status is unavailable. Local tasks and cancellation remain available.', 'detail'));
+		}
+		if (!workerSupported) {
+			root.append(textElement('p', connectivityErrorMessage('PLATFORM_UNSUPPORTED'), 'action-hint'));
 		}
 		if (connectivity.connectionState === 'cleanupPending' || connectivity.migrationPending) {
 			root.append(textElement('p', 'Connections are stopped, but Tunnel cleanup is incomplete. Retry with the account that owns this device’s Tunnel.', 'action-hint'));
@@ -717,7 +731,7 @@
 		if (!starting && !stopping && connectivity.connectionState !== 'online') {
 			actions.append(actionButton(
 				connectivity.connectionState === 'authRequired' ? 'Sign in and connect' : 'Enable cross-device connections',
-				'enableConnectivity', undefined, !statusAvailable,
+				'enableConnectivity', undefined, !statusAvailable || !workerSupported,
 			));
 		}
 		if (connectivity.enabled || starting || awaitingStartup) {
@@ -1354,6 +1368,7 @@
 			SCOPES_CHANGED: 'Sign in again to grant the permissions required for private cross-device connections.',
 			OFFLINE: 'The private connection is offline. Mesh retries temporarily; use Enable cross-device connections to retry.',
 			DISCOVERY_UNAVAILABLE: 'Device discovery or connection status is unavailable. Local windows remain available.',
+			PLATFORM_UNSUPPORTED: 'Cross-device connections and Worker tasks require Windows x64/ARM64 or macOS arm64. Local window configuration remains available.',
 			RATE_LIMITED: 'Dev Tunnels temporarily rate limited this account. Wait before retrying.',
 			TIMEOUT: 'The connectivity operation timed out. Check local status before retrying.',
 			CANCELLED: 'The connectivity operation was cancelled.',
@@ -1402,6 +1417,8 @@
 				'device', 'listener', 'broker', 'thisWindow', 'connectivity', 'deviceTree',
 				'localNodes', 'savedAuthorizations', 'outgoingTasks', 'incomingTasks', 'errors',
 			])
+			&& isExactRecord(value.model.device, ['name', 'platform', 'architecture', 'workerSupported', 'vscodeVersion', 'extensionVersion'])
+			&& typeof value.model.device.workerSupported === 'boolean'
 			&& isConnectivityViewModel(value.model.connectivity)
 			&& isDeviceTree(value.model.deviceTree);
 	}
@@ -1532,7 +1549,7 @@
 				'DISABLED', 'AUTH_REQUIRED', 'ACCOUNT_CHANGED', 'SCOPES_CHANGED', 'OFFLINE',
 				'DISCOVERY_UNAVAILABLE', 'RATE_LIMITED', 'TIMEOUT', 'CANCELLED', 'INVALID_ENDPOINT',
 				'BINDING_CHANGED', 'POLICY_DENIED', 'PRIVATE_ACCESS_REQUIRED', 'CLEANUP_FAILED',
-				'MIGRATION_REQUIRED', 'PROTOCOL_INCOMPATIBLE',
+				'MIGRATION_REQUIRED', 'PROTOCOL_INCOMPATIBLE', 'PLATFORM_UNSUPPORTED',
 			].includes(value.error))
 			|| !Array.isArray(value.candidates) || value.candidates.length > 10
 			|| !Array.isArray(value.incomingPeers) || value.incomingPeers.length > 256

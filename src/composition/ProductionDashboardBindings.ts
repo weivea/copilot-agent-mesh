@@ -397,6 +397,7 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 				name: profile.name,
 				platform: platformLabel(profile.platform),
 				architecture: profile.architecture,
+				workerSupported: this.options.workerPlatform.supported,
 				vscodeVersion: profile.vscodeVersion,
 				extensionVersion: profile.extensionVersion,
 			},
@@ -902,7 +903,7 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 			canSetAcceptIncoming,
 			agentHost: unavailableAgentHostSnapshot(),
 			...(previewEnabled ? {} : {
-				detail: 'Enable copilotAgentMesh.experimental.peerDelegation to rename this window.',
+				detail: 'Local peer delegation is disabled in VS Code settings. Re-enable copilotAgentMesh.experimental.peerDelegation to rename this window or configure incoming tasks.',
 			}),
 		};
 	}
@@ -916,7 +917,7 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 
 	private peerDelegationEnabled(): boolean {
 		return this.options.vscodeApi.workspace.getConfiguration('copilotAgentMesh')
-			.get<boolean>('experimental.peerDelegation', false);
+			.get<boolean>('experimental.peerDelegation', true);
 	}
 
 	private requirePolicySelection(): Extract<
@@ -1216,7 +1217,7 @@ function agentHostSnapshot(
 	failure?: AgentHostSourceFailure,
 ): DashboardSnapshot['listener']['agentHost'] {
 	if (!platform.supported) {
-		return { state: 'unavailable', label: 'Unsupported', detail: platform.agentMessage, action: 'Use macOS arm64 for task execution.' };
+		return { state: 'unavailable', label: 'Unsupported', detail: platform.agentMessage, action: 'Use Windows x64/ARM64 or macOS arm64 for task execution.' };
 	}
 	if (probe.available) {
 		return probe.source === 'editor'

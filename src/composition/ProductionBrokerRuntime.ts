@@ -254,7 +254,7 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 		const peerPolicies = new PeerPolicyService(peerPolicyStore, registry, {
 			enabled: () => options.vscodeApi.workspace
 				.getConfiguration('copilotAgentMesh')
-				.get<boolean>('experimental.peerDelegation', false),
+				.get<boolean>('experimental.peerDelegation', true),
 			onDidChange: options.onDidChange,
 		});
 		const taskRoutes = new TaskRouteCatalog(fencedState);
@@ -297,6 +297,7 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 		let remoteTasks: ProductionRemoteTaskAdapter;
 		connectivity = new ProductionConnectivity({
 			vscodeApi: options.vscodeApi, files,
+			workerPlatform: options.workerPlatform,
 			fence: { ownership: options.ownership, generation: options.generation },
 			deviceId: profile.deviceId, profiles: peerProfiles, records: pairingRecords,
 			secrets: options.secrets, registry, localPolicies: peerPolicies, tasks,

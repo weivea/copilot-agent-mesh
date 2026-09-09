@@ -212,8 +212,8 @@ async function renameCurrentWindow(
 	return { renamed: true };
 }
 
-async function setAcceptIncoming(
-	options: PeerDelegationE2eApiOptions,
+export async function setAcceptIncoming(
+	options: Pick<PeerDelegationE2eApiOptions, 'bindings'>,
 	enabled: boolean,
 ): Promise<{ readonly acceptsIncoming: boolean }> {
 	const snapshot = await options.bindings.getSnapshot();
@@ -225,23 +225,35 @@ async function setAcceptIncoming(
 	return { acceptsIncoming: enabled };
 }
 
-async function setPeerAllowed(
-	options: PeerDelegationE2eApiOptions,
+export async function setPeerAllowed(
+	options: Pick<PeerDelegationE2eApiOptions, 'bindings'>,
 	windowLabel: string,
 	allowed: boolean,
+	target?: { readonly nodeId: string; readonly nodeInstanceId: string },
 ): Promise<{ readonly allowed: boolean }> {
+	const snapshot = await options.bindings.getSnapshot();
+	const handle = selectE2ePeerPolicyHandle(snapshot.policyCandidates, windowLabel, target);
+	await options.bindings.setPeerAllowed(handle, allowed);
+	return { allowed };
+}
+
+export function selectE2ePeerPolicyHandle(
+	candidates: Awaited<ReturnType<ProductionDashboardBindings['getSnapshot']>>['policyCandidates'],
+	windowLabel: string,
+	target?: { readonly nodeId: string; readonly nodeInstanceId: string },
+): string {
 	if (!safeWindowLabel.test(windowLabel)) {
 		throw new TypeError('The target E2E window label is invalid.');
 	}
-	const snapshot = await options.bindings.getSnapshot();
-	const candidates = snapshot.policyCandidates?.filter(
-		(candidate) => !candidate.self && candidate.windowLabel === windowLabel,
+	const matches = candidates?.filter(
+		(candidate) => !candidate.self && candidate.canToggle && candidate.windowLabel === windowLabel
+			&& (target === undefined
+				|| (candidate.nodeId === target.nodeId && candidate.nodeInstanceId === target.nodeInstanceId)),
 	) ?? [];
-	if (candidates.length !== 1 || candidates[0]?.actionHandle === undefined) {
+	if (matches.length !== 1 || matches[0]?.actionHandle === undefined) {
 		throw new Error('The peer-policy candidate is unavailable or ambiguous.');
 	}
-	await options.bindings.setPeerAllowed(candidates[0].actionHandle, allowed);
-	return { allowed };
+	return matches[0].actionHandle;
 }
 
 function claimFingerprint(node: WindowNodeClient): {
