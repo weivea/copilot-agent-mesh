@@ -23,6 +23,7 @@ import type { BrokerConnectivity } from '../connectivity/BrokerConnectivity';
 import {
 	ConnectivityError, EMPTY_CONNECTIVITY_SETTINGS, connectivitySettingsSchema,
 	tunnelResourceSchema, type AccountBinding, type ConnectivityCode, type ConnectivitySettings,
+	type ConnectivityDiagnosticsReporter,
 } from '../connectivity/ConnectivitySchemas';
 import { DevTunnelDiscoveryProvider } from '../connectivity/DevTunnelDiscoveryProvider';
 import { DevTunnelEndpointResolver } from '../connectivity/DevTunnelEndpointResolver';
@@ -64,6 +65,7 @@ interface ConnectivityOptions {
 	readonly cli: LazyVscodeDevTunnelProvider;
 	readonly changed: () => void;
 	readonly report: (code: ConnectivityCode) => void;
+	readonly reportDiscovery?: ConnectivityDiagnosticsReporter;
 }
 
 interface ActionBinding {
@@ -132,11 +134,13 @@ export class ProductionConnectivity implements BrokerConnectivity {
 		this.remotePolicyStore = new RemotePeerPolicyStore(files, fence);
 		this.account = new AccountSessionProvider(options.vscodeApi.authentication, fence);
 		this.identity = new AccountDeviceIdentityStore(files, fence, options.secrets, options.deviceId);
+		const diagnostics: ConnectivityDiagnosticsReporter = (message, fields) =>
+			options.reportDiscovery?.(message, { localDeviceMarker: options.deviceId.slice(0, 8), ...fields });
 		this.management = new DevTunnelManagement(this.account, fence, () =>
-			this.ready && this.account.current() !== undefined);
-		this.discovery = new DiscoveryService(new DevTunnelDiscoveryProvider(this.management), fence,
+			this.ready && this.account.current() !== undefined, { diagnostics });
+		this.discovery = new DiscoveryService(new DevTunnelDiscoveryProvider(this.management, diagnostics), fence,
 			() => this.connectionsEnabled() && this.connectionState === 'online',
-			() => this.account.current() !== undefined, options.changed);
+			() => this.account.current() !== undefined, options.changed, Date.now, diagnostics);
 		this.revocations = new PeerRevocationService(files, fence, options.records, options.secrets,
 			(peerId) => options.listener()?.closePeer(peerId),
 			async (peerId) => {

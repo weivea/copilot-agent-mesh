@@ -202,6 +202,15 @@ Devices are symmetric: there is no master or hub. Remote traffic uses outbound
 private WSS through the target device's Tunnel cloud relay. Windows on the same
 device use the local Broker's authenticated IPC, not the Tunnel.
 
+If the Dashboard is Online but shows no other devices, inspect **Output -> Copilot
+Agent Mesh** in the Broker owner window. Discovery diagnostics distinguish HTTP
+region results, SDK Tunnel counts, eligible endpoints, cancellation and refresh
+scheduling. They omit account credentials, Tunnel capabilities and raw responses.
+Global listings can omit cross-region port details. Mesh reads the exact listed
+resource's details when port metadata is incomplete, within the same discovery
+timeout and resource limit, before validating its advertisement and endpoints.
+A successful detail read alone never proves account ownership or grants task access.
+
 **Device trust is not Workspace or task authorization.** In **Manage devices and
 permissions…** or the selected Workspace's controls, B separately grants the
 trusted device its target Workspace and enables receive. A separately allowlists

@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { assertDocumentFence, type DocumentFence } from '../storage/FencedDocumentStore';
-import { ConnectivityError, type ConnectivityCode } from './ConnectivitySchemas';
+import { ConnectivityError, type ConnectivityCode, type ConnectivityDiagnosticsReporter } from './ConnectivitySchemas';
 import type { DevTunnelDiscoveryProvider, DiscoveredEndpoint } from './DevTunnelDiscoveryProvider';
 
 export interface DiscoverySnapshot {
@@ -23,7 +23,7 @@ export class DiscoveryService {
 	private candidates = new Map<string, { endpoint: DiscoveredEndpoint; observedAt: number }>();
 	private controller = new AbortController();
 	private timer: NodeJS.Timeout | undefined;
-	private refreshing: Promise<void> | undefined;
+	private refreshing: { readonly controller: AbortController; readonly operation: Promise<void> } | undefined;
 	private nextRequestAt = 0;
 	private truncated = false;
 	private disposed = false;
@@ -36,6 +36,7 @@ export class DiscoveryService {
 		private readonly accountAvailable: () => boolean,
 		private readonly changed: () => void,
 		private readonly now: () => number = Date.now,
+		private readonly diagnostics?: ConnectivityDiagnosticsReporter,
 	) {}
 
 	public endpoints(): readonly DiscoveredEndpoint[] {
@@ -76,6 +77,9 @@ export class DiscoveryService {
 	}
 
 	public invalidate(): void {
+		this.diagnostics?.('Discovery cache invalidated.', {
+			enabled: this.enabled(), accountAvailable: this.accountAvailable(), refreshInFlight: this.refreshing !== undefined,
+		});
 		this.controller.abort();
 		this.controller = new AbortController();
 		this.candidates.clear();
@@ -90,28 +94,39 @@ export class DiscoveryService {
 	}
 
 	public refresh(): Promise<void> {
-		if (this.refreshing !== undefined) {
-			return this.refreshing;
+		if (this.disposed) { return Promise.reject(new ConnectivityError('CANCELLED')); }
+		const controller = this.controller;
+		const previous = this.refreshing;
+		if (previous?.controller === controller) {
+			this.diagnostics?.('Reusing an in-flight discovery request.', { state: this.state });
+			return previous.operation;
 		}
-		const operation = this.refreshCore().finally(() => {
-			if (this.refreshing === operation) {
+		const start = () => this.refreshCore(controller);
+		// Wait for cancelled work to release its budget, but never reuse it for a new generation.
+		const operation = (previous?.operation ?? Promise.resolve()).then(start, start).finally(() => {
+			if (this.refreshing?.operation === operation) {
 				this.refreshing = undefined;
 			}
 		});
-		this.refreshing = operation;
+		this.refreshing = { controller, operation };
 		return operation;
 	}
 
 	public async dispose(): Promise<void> {
 		this.disposed = true;
 		this.invalidate();
-		await this.refreshing;
+		await this.refreshing?.operation;
 		this.listeners.clear();
 	}
 
-	private async refreshCore(): Promise<void> {
-		if (this.disposed) {
-			throw new ConnectivityError('CANCELLED');
+	private isCurrent(controller: AbortController): boolean {
+		return !this.disposed && this.controller === controller && !controller.signal.aborted;
+	}
+
+	private async refreshCore(controller: AbortController): Promise<void> {
+		if (!this.isCurrent(controller)) {
+			this.diagnostics?.('Discovery request cancelled before starting.', {});
+			return;
 		}
 		if (!this.enabled()) {
 			throw new ConnectivityError('DISABLED');
@@ -119,21 +134,26 @@ export class DiscoveryService {
 		if (!this.accountAvailable()) {
 			this.state = 'authRequired';
 			this.code = 'AUTH_REQUIRED';
+			this.diagnostics?.('Discovery requires authentication.', { code: this.code });
 			this.changed();
 			return;
 		}
 		await assertDocumentFence(this.fence);
+		if (!this.isCurrent(controller)) {
+			this.diagnostics?.('Discovery request cancelled before starting.', {});
+			return;
+		}
 		if (this.now() < this.nextRequestAt) {
 			return;
 		}
-		const controller = this.controller;
 		this.state = 'discovering';
 		this.nextRequestAt = this.now() + 10_000;
+		this.diagnostics?.('Requesting the account tunnel directory.', {});
 		this.changed();
 		try {
 			const result = await this.provider.list(controller.signal);
 			await assertDocumentFence(this.fence);
-			if (controller.signal.aborted || this.controller !== controller) {
+			if (!this.isCurrent(controller)) {
 				throw new ConnectivityError('CANCELLED');
 			}
 			this.candidates = new Map(result.endpoints.map((endpoint) => [
@@ -144,7 +164,8 @@ export class DiscoveryService {
 			this.code = undefined;
 			for (const listener of this.listeners) { listener(); }
 		} catch (error: unknown) {
-			if (controller.signal.aborted) {
+			if (!this.isCurrent(controller)) {
+				this.diagnostics?.('Discovery request cancelled.', { invalidated: this.controller !== controller });
 				return;
 			}
 			const normalized = error instanceof ConnectivityError ? error : new ConnectivityError('DISCOVERY_UNAVAILABLE');
@@ -152,22 +173,27 @@ export class DiscoveryService {
 			this.state = ['AUTH_REQUIRED', 'ACCOUNT_CHANGED', 'SCOPES_CHANGED'].includes(normalized.code)
 				? 'authRequired' : 'error';
 			this.nextRequestAt = this.now() + (normalized.retryAfterMs ?? 60_000);
+			this.diagnostics?.('Discovery request failed.', { code: this.code, state: this.state });
 			if (this.state === 'authRequired') {
 				this.candidates.clear();
 			}
 		} finally {
-			if (!controller.signal.aborted && !this.disposed) {
+			if (this.isCurrent(controller)) {
 				if (this.timer !== undefined) {
 					clearTimeout(this.timer);
 				}
+				const delayMs = Math.max(15_000 + Math.floor(Math.random() * 3000), this.nextRequestAt - this.now());
 				this.timer = setTimeout(() => {
+					if (!this.isCurrent(controller)) { return; }
 					this.timer = undefined;
 					void this.refresh().catch(() => {
+						if (!this.isCurrent(controller)) { return; }
 						this.state = 'error';
 						this.code = 'DISCOVERY_UNAVAILABLE';
 						this.changed();
 					});
-				}, Math.max(15_000 + Math.floor(Math.random() * 3000), this.nextRequestAt - this.now()));
+				}, delayMs);
+				this.diagnostics?.('Discovery refresh scheduled.', { state: this.state, candidateCount: this.candidates.size, delayMs });
 				this.timer.unref();
 				this.changed();
 			}

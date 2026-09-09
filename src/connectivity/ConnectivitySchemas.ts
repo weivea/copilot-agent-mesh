@@ -9,6 +9,10 @@ export const ADVERTISEMENT_PREFIX = 'mesh-ad-';
 export const REMOTE_POLICY_CAPABILITY = 'mesh.remote-policy.v1';
 export const ACCOUNT_IDENTITY_PREFIX = 'mesh-account-v1:';
 
+export type ConnectivityDiagnosticsReporter = (
+	message: string, fields: Readonly<Record<string, unknown>>,
+) => void;
+
 export const accountDeviceIdentitySchema = z.strictObject({
 	deviceId: uuidSchema,
 	publicKey: z.string().regex(/^[A-Za-z0-9_-]{59}$/u),

@@ -46,6 +46,23 @@ test('same-account public-key discovery automatically establishes both real Mesh
 	assert.ok(directory.requests.filter((url) => url.pathname === '/tunnels').every((url) => !url.searchParams.has('tokenScopes')));
 });
 
+test('cross-region summaries without ports still establish both authenticated Mesh connections', async (t) => {
+	const directory = new AccountDirectory();
+	directory.omitCrossRegionPorts = true;
+	const a = await accountDevice(directory, 931, 'jpe1');
+	const b = await accountDevice(directory, 932, 'asse');
+	t.after(async () => { await a.dispose(); await b.dispose(); });
+	await Promise.all([a.sync(), b.sync()]);
+	assert.equal(a.peers.listConnections()[0]?.snapshot().state, 'online');
+	assert.equal(b.peers.listConnections()[0]?.snapshot().state, 'online');
+	assert.equal((await a.records.listInvitations()).length, 0);
+	assert.equal((await b.records.listInvitations()).length, 0);
+	assert.ok(directory.requests.some((url) => url.hostname.startsWith('jpe1.') && url.pathname === `/tunnels/${a.tunnel.tunnelId}`));
+	assert.ok(directory.requests.some((url) => url.hostname.startsWith('asse.') && url.pathname === `/tunnels/${b.tunnel.tunnelId}`));
+	assert.equal(a.endpoints.get(a.peers.listConnections()[0].profileId)?.locator.clusterId, 'asse');
+	assert.equal(b.endpoints.get(b.peers.listConnections()[0].profileId)?.locator.clusterId, 'jpe1');
+});
+
 test('a replacement Tunnel rebinds the authenticated peer without replacing profile, generation, or saved credentials', async (t) => {
 	const directory = new AccountDirectory();
 	const a = await accountDevice(directory, 912);
@@ -185,24 +202,30 @@ class AccountDirectory {
 	public readonly sockets = new Map<string, number>();
 	public readonly hidden = new Set<string>();
 	public readonly requests: URL[] = [];
-	public readonly adapter: AxiosAdapter = async (config) => {
-		const url = new URL(config.url!);
-		this.requests.push(url);
-		if (url.pathname === '/tunnels') {
-			return sdkResponse(config, { value: [{ value: [...this.tunnels.values()].filter((tunnel) => !this.hidden.has(tunnel.tunnelId!)) }] });
-		}
-		const tunnel = this.tunnels.get(url.pathname.split('/')[2]);
-		if (tunnel === undefined || this.hidden.has(tunnel.tunnelId!)) {
-			throw new AxiosError('Not found', 'ERR_BAD_RESPONSE', config, undefined, sdkResponse(config, {}, 404));
-		}
-		if (url.pathname.includes('/ports/')) {
-			return sdkResponse(config, { ...tunnel.ports![0], accessTokens: { connect: syntheticCapability() } });
-		}
-		return sdkResponse(config, tunnel);
-	};
+	public omitCrossRegionPorts = false;
+
+	public adapter(clusterId: string): AxiosAdapter {
+		return async (config) => {
+			const url = new URL(config.url!);
+			this.requests.push(url);
+			if (url.pathname === '/tunnels') {
+				const tunnels = [...this.tunnels.values()].filter((tunnel) => !this.hidden.has(tunnel.tunnelId!));
+				return sdkResponse(config, JSON.stringify({ value: [{ value: tunnels.map((tunnel) =>
+					this.omitCrossRegionPorts && tunnel.clusterId !== clusterId ? { ...tunnel, ports: [] } : tunnel) }] }));
+			}
+			const tunnel = this.tunnels.get(url.pathname.split('/')[2]);
+			if (tunnel === undefined || this.hidden.has(tunnel.tunnelId!)) {
+				throw new AxiosError('Not found', 'ERR_BAD_RESPONSE', config, undefined, sdkResponse(config, {}, 404));
+			}
+			if (url.pathname.includes('/ports/')) {
+				return sdkResponse(config, { ...tunnel.ports![0], accessTokens: { connect: syntheticCapability() } });
+			}
+			return sdkResponse(config, tunnel);
+		};
+	}
 }
 
-async function accountDevice(directory: AccountDirectory, index: number) {
+async function accountDevice(directory: AccountDirectory, index: number, clusterId = 'use2') {
 	const base = connectivityFixture();
 	const deviceId = uuid(index);
 	base.account.setBinding({ ...base.account.current()!, accountRef: uuid(index + 100) });
@@ -214,7 +237,7 @@ async function accountDevice(directory: AccountDirectory, index: number) {
 	const profiles = new InMemoryPeerProfileStore();
 	const endpoints = new EndpointBindingStore(base.files, base.fence);
 	await endpoints.initialize();
-	const management = new DevTunnelManagement(base.account, base.fence, () => true, { adapter: directory.adapter });
+	const management = new DevTunnelManagement(base.account, base.fence, () => true, { adapter: directory.adapter(clusterId) });
 	const discovery = new DevTunnelDiscoveryProvider(management);
 	let enrollment!: AccountPeerEnrollment;
 	const transport = new BoundPeerTransport(endpoints, new DevTunnelEndpointResolver(management), base.account, base.fence, () => true, {
@@ -262,9 +285,9 @@ async function accountDevice(directory: AccountDirectory, index: number) {
 	const publish = (suffix: string) => {
 		if (tunnel !== undefined) { directory.tunnels.delete(tunnel.tunnelId!); }
 		const tunnelId = `mesh-${index}-${suffix}`;
-		const origin = `https://${tunnelId}-43121.use2.devtunnels.ms`;
+		const origin = `https://${tunnelId}-43121.${clusterId}.devtunnels.ms`;
 		tunnel = {
-			clusterId: 'use2', tunnelId, description: `${ACCOUNT_IDENTITY_PREFIX}${JSON.stringify(publicIdentity)}`,
+			clusterId, tunnelId, description: `${ACCOUNT_IDENTITY_PREFIX}${JSON.stringify(publicIdentity)}`,
 			labels: [...DISCOVERY_LABELS, PRIVATE_LABEL, `${ADVERTISEMENT_PREFIX}${uuid(index + suffix.length + 200)}`],
 			status: { hostConnectionCount: 1 },
 			ports: [{ portNumber: 43121, protocol: 'http', portForwardingUris: [origin] }],
