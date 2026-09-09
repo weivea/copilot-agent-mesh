@@ -156,6 +156,7 @@ export interface DelegationIntentInput {
 	 * payload; omitting it always creates a fresh delegation.
 	 */
 	readonly delegationRequestId?: string;
+	readonly continueFromTaskId?: string;
 	readonly deviceId: string;
 	readonly nodeId: string;
 	readonly nodeInstanceId: string;

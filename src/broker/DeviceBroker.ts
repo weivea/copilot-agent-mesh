@@ -857,6 +857,7 @@ export class DeviceBroker {
 				const routeInput: RoutedTaskStartParams = {
 					delegationRequestId: input.delegationRequestId,
 					taskId: input.taskId,
+					...(input.continueFromTaskId === undefined ? {} : { continueFromTaskId: input.continueFromTaskId }),
 					target: input.target,
 					sourceNodeId: strict ? binding.nodeId : input.sourceNodeId,
 					sourceWorkspaceIdentity: sourceScope,

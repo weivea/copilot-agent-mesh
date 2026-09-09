@@ -111,6 +111,7 @@ export function canonicalRoutedTaskRequest(request: OwnedRoutedTaskStart): strin
 		String(normalized.acceptanceCriteria.length),
 		...normalized.acceptanceCriteria,
 		normalized.workerDeadline,
+		...(normalized.continueFromTaskId === undefined ? [] : ['continueFromTaskId', normalized.continueFromTaskId]),
 	];
 	return fields.map(lengthPrefix).join('');
 }
@@ -153,6 +154,7 @@ export function createAcceptedRoutedTask(
 		schemaVersion: 2,
 		taskId: normalized.taskId,
 		delegationRequestId: normalized.delegationRequestId,
+		...(normalized.continueFromTaskId === undefined ? {} : { continueFromTaskId: normalized.continueFromTaskId }),
 		requestHash: canonicalRoutedTaskRequestHash(normalized),
 		peerId: normalized.peerId,
 		workspaceId: normalized.target.workspaceId,
@@ -262,6 +264,7 @@ export function matchIdempotentRoutedStart(
 		|| match.taskId !== normalized.taskId
 		|| match.requestHash !== expectedHash
 		|| match.workspaceId !== normalized.target.workspaceId
+		|| (match.schemaVersion === 2 ? match.continueFromTaskId : undefined) !== normalized.continueFromTaskId
 		|| !targetMatches
 	) {
 		throw new MeshDomainError(

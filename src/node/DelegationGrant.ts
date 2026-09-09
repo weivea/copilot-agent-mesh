@@ -139,6 +139,7 @@ export function assertDelegationGrantBinding(
 	const requestHash = canonicalRoutedTaskRequestHash({
 		delegationRequestId: params.delegationRequestId,
 		taskId: params.taskId,
+		...(params.continueFromTaskId === undefined ? {} : { continueFromTaskId: params.continueFromTaskId }),
 		target: params.target,
 		...(params.sourceNodeId === undefined ? {} : { sourceNodeId: params.sourceNodeId }),
 		...(params.sourceWorkspaceIdentity === undefined

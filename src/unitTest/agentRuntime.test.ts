@@ -638,6 +638,254 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 		assert.equal(transport.listSessionsCalls, 2);
 	});
 
+	test('explicit continuation starts a new task and turn in the retained editor Session and Chat', async (t) => {
+		const catalog = new FakeAhpHostCatalog();
+		const first = new FakeAhpTransport(catalog);
+		first.completeAfterTurnDispatch = true;
+		const continued = new FakeAhpTransport(catalog);
+		const fresh = new FakeAhpTransport(catalog);
+		fresh.completeAfterTurnDispatch = true;
+		const runtime = createRuntime(editorLauncher(), new FakeConnectionFactory([first, continued, fresh]));
+		t.after(() => runtime.dispose());
+		const original = await runtime.start(taskRequest());
+		for await (const event of original.events) {
+			if (event.type !== 'progress') { assert.equal(event.type, 'completed'); }
+		}
+		await original.dispose();
+		continued.created = first.created;
+		const previousTurnId = currentTurnId(first);
+		continued.chatSnapshotOverrides = {
+			turns: [{
+				id: previousTurnId, state: 'complete',
+				responseParts: [{ kind: 'markdown', id: 'old-output', content: 'Previous answer' }],
+			}],
+		};
+		continued.sessionDefaultChat = 'ahp-chat:/changed-default';
+		continued.sessionSnapshotOverrides = {
+			chats: [{ resource: original.recovery.chatUri }],
+		};
+		const handle = await runtime.start({
+			...taskRequest(), taskId: 'task-follow-up', prompt: 'Build on the previous answer.',
+			continuation: { sessionUri: original.recovery.sessionUri, chatUri: original.recovery.chatUri },
+		});
+		assert.equal(handle.taskId, 'task-follow-up');
+		assert.equal(handle.recovery.sessionUri, original.recovery.sessionUri);
+		assert.equal(handle.recovery.chatUri, original.recovery.chatUri);
+		assert.notEqual(handle.recovery.clientId, original.recovery.clientId);
+		assert.notEqual(currentTurnId(continued), previousTurnId);
+		assert.equal(continued.createSessionCalls, 0);
+		assert.equal(continued.resolveConfigCalls, 0);
+		const joined = continued.dispatched.find(({ action }) => action.type === 'session/activeClientSet');
+		assert.deepEqual(joined?.action.activeClient, {
+			clientId: handle.recovery.clientId, displayName: 'Copilot Agent Mesh', tools: [],
+		});
+		const started = continued.dispatched.find(({ action }) => action.type === 'chat/turnStarted');
+		assert.equal(started?.channel, original.recovery.chatUri);
+		assert.match(JSON.stringify(started?.action.message), /Build on the previous answer/);
+		assert.equal((await nextEvent(handle.events)).type, 'progress');
+		await continued.emitChat({ type: 'chat/delta', turnId: previousTurnId, partId: 'old-output', content: 'Old output' });
+		await continued.emitChat({ type: 'chat/turnComplete', turnId: previousTurnId, duration: 0 });
+		await continued.emitChat({
+			type: 'chat/delta', turnId: currentTurnId(continued), partId: 'new-output', content: 'New answer',
+		});
+		assert.deepEqual(await nextEvent(handle.events), { type: 'output', text: 'New answer' });
+		await continued.emitChat({ type: 'chat/turnComplete', turnId: currentTurnId(continued), duration: 0 });
+		assert.equal((await nextEvent(handle.events)).type, 'completed');
+		await handle.dispose();
+		assert.equal(continued.disposeSessionCalls, 0);
+		assert.equal(catalog.session(handle.recovery.sessionUri)?.activeClientCount, 0);
+		const independent = await runtime.start({ ...taskRequest(), taskId: 'task-independent' });
+		assert.notEqual(independent.recovery.sessionUri, original.recovery.sessionUri);
+		assert.equal(fresh.createSessionCalls, 1);
+		for await (const event of independent.events) {
+			if (event.type !== 'progress') { assert.equal(event.type, 'completed'); }
+		}
+		await independent.dispose();
+	});
+
+	for (const [name, sessionOverrides, chatOverrides] of [
+		['busy Session', { status: 8 }, {}],
+		['archived Session', { status: 65 }, {}],
+		['another active client', { activeClients: [{ clientId: 'other-client' }] }, {}],
+		['missing original Chat', { defaultChat: 'ahp-chat:/different', chats: [] }, {}],
+		['changed workspace', { workingDirectories: ['file:///outside'] }, {}],
+		['changed folder isolation', { config: { values: { isolation: 'worktree' } } }, {}],
+		['changed provider', { provider: 'another-provider' }, {}],
+		['active Chat turn', {}, { activeTurn: { id: 'another-turn' } }],
+		['queued Chat message', {}, { queuedMessages: [{ id: 'queued' }] }],
+		['busy Chat', {}, { status: 8 }],
+	] as const) {
+		test(`continuation rejects ${name} without creating or deleting a Session`, async (t) => {
+			const transport = retainedTransport();
+			transport.sessionSnapshotOverrides = sessionOverrides;
+			transport.chatSnapshotOverrides = chatOverrides;
+			const runtime = createRuntime(editorLauncher(), new FakeConnectionFactory([transport]));
+			t.after(() => runtime.dispose());
+			await assert.rejects(runtime.start({
+				...taskRequest(),
+				continuation: { sessionUri: transport.created!.sessionUri, chatUri: transport.sessionDefaultChat },
+			}), (error: unknown) => error instanceof AgentRuntimeError);
+			assert.equal(transport.createSessionCalls, 0);
+			assert.equal(transport.disposeSessionCalls, 0);
+			assert.equal(transport.dispatched.some(({ action }) => action.type === 'chat/turnStarted'), false);
+			assert.equal(transport.shutdownCalls, 1);
+		});
+	}
+
+	test('continuation requires a retained snapshot and never falls back to Session creation', async (t) => {
+		const transport = retainedTransport();
+		transport.missingSessionSnapshot = true;
+		const runtime = createRuntime(editorLauncher(), new FakeConnectionFactory([transport]));
+		t.after(() => runtime.dispose());
+		await assert.rejects(runtime.start({
+			...taskRequest(),
+			continuation: { sessionUri: transport.created!.sessionUri, chatUri: transport.sessionDefaultChat },
+		}), (error: unknown) => error instanceof AgentRuntimeError && error.code === 'TASK_RECOVERY_UNAVAILABLE');
+		assert.equal(transport.createSessionCalls, 0);
+		assert.equal(transport.disposeSessionCalls, 0);
+	});
+
+	test('continuation uses SDK-supported actions on an editor negotiating AHP 0.9', async (t) => {
+		const { isActionKnownToVersion } = await import('@microsoft/agent-host-protocol');
+		const transport = retainedTransport();
+		transport.protocolPolicy = { offer: AHP_EDITOR_0_9_PROTOCOL_OFFER };
+		transport.selectedProtocolVersion = '0.9.0';
+		transport.completeAfterTurnDispatch = true;
+		transport.assertActionSupported = (action, version) =>
+			assertOutboundAhpActionSupported(action, version, isActionKnownToVersion);
+		const launcher = editorLauncher();
+		launcher.host.registryProtocolVersion = '0.9.0';
+		const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+		t.after(() => runtime.dispose());
+		const handle = await runtime.start({
+			...taskRequest(),
+			continuation: { sessionUri: transport.created!.sessionUri, chatUri: transport.sessionDefaultChat },
+		});
+		const events: AgentRuntimeEvent[] = [];
+		for await (const event of handle.events) { events.push(event); }
+		assert.equal(events.at(-1)?.type, 'completed');
+		assert.equal(transport.createSessionCalls, 0);
+		await handle.dispose();
+		assert.equal(transport.disposeSessionCalls, 0);
+	});
+
+	test('continuation refuses a standalone Host and binds runtime approval to the session', async (t) => {
+		const transport = retainedTransport();
+		const runtime = createRuntime(new FakeLauncher(), new FakeConnectionFactory([transport]));
+		t.after(() => runtime.dispose());
+		const request = {
+			...taskRequest(),
+			continuation: { sessionUri: transport.created!.sessionUri, chatUri: transport.sessionDefaultChat },
+		};
+		const approvals = new AgentRuntimeApprovalCapabilityIssuer();
+		const capability = approvals.issue(request);
+		assert.equal(approvals.accepts({ ...request, approvalCapability: capability }), true);
+		assert.equal(approvals.accepts({ ...taskRequest(), approvalCapability: capability }), false);
+		assert.equal(approvals.accepts({
+			...request, continuation: { ...request.continuation, chatUri: 'ahp-chat:/different' },
+			approvalCapability: capability,
+		}), false);
+		await assert.rejects(runtime.start(request), (error: unknown) =>
+			error instanceof AgentRuntimeError && error.code === 'TASK_RECOVERY_UNAVAILABLE');
+		assert.equal(transport.createSessionCalls, 0);
+	});
+
+	for (const code of [-32001, -32008]) {
+		test(`continuation maps missing retained resources (${code}) without replacing the session`, async (t) => {
+			const transport = retainedTransport();
+			const subscribe = transport.subscribe.bind(transport);
+			transport.subscribe = async (uri, signal) => {
+				if (uri === (code === -32001 ? transport.created!.sessionUri : transport.sessionDefaultChat)) {
+					throw Object.assign(new Error('Retained resource missing.'), { code });
+				}
+				return subscribe(uri, signal);
+			};
+			const runtime = createRuntime(editorLauncher(), new FakeConnectionFactory([transport]));
+			t.after(() => runtime.dispose());
+			await assert.rejects(runtime.start({
+				...taskRequest(),
+				continuation: { sessionUri: transport.created!.sessionUri, chatUri: transport.sessionDefaultChat },
+			}), (error: unknown) => error instanceof AgentRuntimeError && error.code === 'TASK_RECOVERY_UNAVAILABLE');
+			assert.equal(transport.createSessionCalls, 0);
+			assert.equal(transport.disposeSessionCalls, 0);
+		});
+	}
+
+	test('continuation stops if another turn starts after the idle snapshot but before dispatch', async (t) => {
+		const transport = retainedTransport();
+		const dispatch = transport.dispatch.bind(transport);
+		transport.dispatch = (channel, action, clientSeq) => {
+			if (typeof action === 'object' && action !== null && 'type' in action && action.type === 'session/activeClientSet') {
+				void transport.emitChat({ type: 'chat/turnStarted', turnId: 'another-turn' });
+			}
+			return dispatch(channel, action, clientSeq);
+		};
+		const runtime = createRuntime(editorLauncher(), new FakeConnectionFactory([transport]));
+		t.after(() => runtime.dispose());
+		await assert.rejects(runtime.start({
+			...taskRequest(),
+			continuation: { sessionUri: transport.created!.sessionUri, chatUri: transport.sessionDefaultChat },
+		}), (error: unknown) => error instanceof AgentRuntimeError && error.code === 'TASK_RECOVERY_UNAVAILABLE');
+		assert.equal(transport.dispatched.some(({ action }) => action.type === 'chat/turnStarted'), false);
+		assert.equal(transport.disposeSessionCalls, 0);
+	});
+
+	for (const stop of ['dispose', 'cancel-and-dispose'] as const) {
+		test(`continuation ${stop} stops only its own turn and keeps the original session`, async (t) => {
+			const transport = retainedTransport();
+			const runtime = createRuntime(editorLauncher(), new FakeConnectionFactory([transport]));
+			t.after(() => runtime.dispose());
+			const handle = await runtime.start({
+				...taskRequest(),
+				continuation: { sessionUri: transport.created!.sessionUri, chatUri: transport.sessionDefaultChat },
+			});
+			await nextEvent(handle.events);
+			if (stop === 'dispose') { await handle.dispose(); }
+			else { await Promise.all([handle.cancel(), handle.dispose()]); }
+			const cancellations = transport.dispatched.filter(({ action }) => action.type === 'chat/turnCancelled');
+			assert.equal(cancellations.length, 1);
+			assert.equal(cancellations[0].channel, handle.recovery.chatUri);
+			assert.equal(cancellations[0].action.turnId, currentTurnId(transport));
+			assert.equal(transport.disposeSessionCalls, 0);
+			assert.equal(transport.shutdownCalls, 1);
+			const events: AgentRuntimeEvent[] = [];
+			for await (const event of handle.events) { events.push(event); }
+			assert.equal(events.at(-1)?.type, 'cancelled');
+		});
+	}
+
+	test('continuation reports unconfirmed cancellation instead of deleting shared history or claiming cleanup succeeded', async (t) => {
+		const transport = retainedTransport();
+		const runtime = createRuntime(editorLauncher(), new FakeConnectionFactory([transport]));
+		t.after(() => assert.rejects(runtime.dispose()));
+		const handle = await runtime.start({
+			...taskRequest(),
+			continuation: { sessionUri: transport.created!.sessionUri, chatUri: transport.sessionDefaultChat },
+		});
+		transport.rejectDispatchType = 'chat/turnCancelled';
+		await assert.rejects(handle.dispose(), (error: unknown) =>
+			error instanceof AgentRuntimeError && error.code === 'TASK_CANCELLATION_UNCONFIRMED');
+		assert.equal(transport.disposeSessionCalls, 0);
+		assert.equal(transport.shutdownCalls, 1);
+	});
+
+	test('continuation policy failure cancels its exact turn without deleting the original session', async (t) => {
+		const transport = retainedTransport();
+		const runtime = createRuntime(editorLauncher(), new FakeConnectionFactory([transport]));
+		t.after(() => runtime.dispose());
+		const handle = await runtime.start({
+			...taskRequest(),
+			continuation: { sessionUri: transport.created!.sessionUri, chatUri: transport.sessionDefaultChat },
+		});
+		await nextEvent(handle.events);
+		await transport.emitSession({ type: 'session/configChanged', config: { isolation: 'worktree' } });
+		assert.equal((await nextEvent(handle.events)).type, 'failed');
+		await handle.dispose();
+		assert.ok(transport.dispatched.some(({ action }) =>
+			action.type === 'chat/turnCancelled' && action.turnId === currentTurnId(transport)));
+		assert.equal(transport.disposeSessionCalls, 0);
+	});
+
 	test('bounded Session catalog listing omits optional limit after Host internal error', async () => {
 		const catalog = new FakeAhpHostCatalog();
 		catalog.addMaterialized('ahp-session:/retained');
@@ -3766,6 +4014,18 @@ function editorLauncher(): FakeLauncher {
 	return launcher;
 }
 
+function retainedTransport(): FakeAhpTransport {
+	const transport = new FakeAhpTransport();
+	transport.created = {
+		sessionUri: 'dynamic-provider:/00000000-0000-4000-8000-000000000001',
+		provider: transport.providerId,
+		workingDirectories: [workspaceUri],
+		config: { isolation: 'folder', model: 'test-model' },
+		clientId: 'prior-client',
+	};
+	return transport;
+}
+
 function createRuntime(
 		launcher: FakeLauncher,
 		connections: AhpConnectionFactory,
@@ -4070,6 +4330,15 @@ class FakeAhpHostCatalog {
 			return;
 		}
 		if (
+			action.type === 'session/activeClientSet'
+			&& typeof action.activeClient === 'object'
+			&& action.activeClient !== null
+			&& 'clientId' in action.activeClient
+			&& typeof action.activeClient.clientId === 'string'
+		) {
+			session.activeClients.add(action.activeClient.clientId);
+		}
+		if (
 			action.type === 'session/activeClientRemoved'
 			&& typeof action.clientId === 'string'
 		) {
@@ -4126,6 +4395,8 @@ class FakeAhpTransport implements AhpConnection {
 	};
 	resolvedConfigOverrides: Readonly<Record<string, unknown>> = {};
 	sessionSnapshotOverrides: Readonly<Record<string, unknown>> = {};
+	chatSnapshotOverrides: Readonly<Record<string, unknown>> = {};
+	missingSessionSnapshot = false;
 	sessionSnapshotReads = 0;
 	readonly configRequests: Readonly<Record<string, unknown>>[] = [];
 	initialized = false;
@@ -4322,6 +4593,9 @@ class FakeAhpTransport implements AhpConnection {
 		}
 		this.subscribedUris.push(uri);
 		if (uri === this.created?.sessionUri) {
+			if (this.missingSessionSnapshot) {
+				return { subscription: this.queue(uri) };
+			}
 			const resource = this.sessionSnapshotResource ?? uri;
 			return {
 				snapshot: {
@@ -4370,6 +4644,7 @@ class FakeAhpTransport implements AhpConnection {
 					status: 1,
 					modifiedAt: new Date(0).toISOString(),
 					turns: [],
+					...this.chatSnapshotOverrides,
 				},
 			} as Snapshot,
 			subscription: this.queue(uri),

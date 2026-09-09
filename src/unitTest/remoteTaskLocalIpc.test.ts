@@ -1,24 +1,39 @@
 import * as assert from 'node:assert/strict';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { mkdir, rm } from 'node:fs/promises';
-import { test } from 'node:test';
+import { join } from 'node:path';
+import { test, type TestContext } from 'node:test';
+import { pathToFileURL } from 'node:url';
 
 import {
 	GATEWAY_NOTIFICATIONS,
+	LOCAL_BROKER_METHODS,
 	MESH_ERROR_CODES,
 	MESH_PROTOCOL_VERSION,
+	nodeRegistrationResultSchema,
+	routedTaskStartParamsSchema,
 	type NodeDirectoryResult,
 	type NodeHeartbeatParams,
 	type NodeRegisterParams,
+	type NodeTaskStartParams,
 	type RoutedTaskStartParams,
 	type TaskSnapshot,
 	type WindowNodeDescriptor,
 } from '../../shared/protocol';
+import type { DelegationIntentInput } from '../../shared/toolProtocol';
 import {
+	AgentRuntimeApprovalCapabilityIssuer,
+	createAgentRuntimeEventQueue,
+	type AgentRuntime,
+	type AgentRuntimeProbe,
+	type AgentTaskHandle,
+	type AgentTaskRequest,
+} from '../agentHost/AgentRuntime';
+import {
+	BrokerTaskService,
 	DeviceBroker,
+	NodeRegistry,
 	TaskRouteCatalog,
-	type BrokerTaskService,
-	type NodeRegistry,
 	type PeerPolicyService,
 } from '../broker';
 import {
@@ -27,6 +42,8 @@ import {
 } from '../composition/ProductionRemoteTaskAdapter';
 import { MeshDomainError } from '../domain/errors';
 import type { StateStore } from '../domain/ports';
+import type { TaskRecord } from '../domain/task';
+import { GatewayRouter } from '../gateway/GatewayRouter';
 import {
 	LocalIpcClient,
 	LocalIpcRemoteError,
@@ -36,10 +53,18 @@ import {
 import {
 	LocalIpcRemoteTaskAdapter,
 	WindowNodeClient,
+	WindowNodeTaskExecutor,
+	type WindowNodeClientOptions,
+	type WindowNodeTaskConfirmationRequest,
 } from '../node';
 import type { PeerConnectionManager } from '../peer/PeerConnectionManager';
 import type { PeerProfile, PeerProfileStore } from '../peer/PeerProfile';
+import { PeerRpcError } from '../peer/WebSocketPeerTransport';
+import { AtomicFileStore, NodeAtomicFileSystem } from '../storage/AtomicFileStore';
+import { FileTaskStore } from '../tasks/FileTaskStore';
+import { WorkspaceLeaseManager } from '../tasks/WorkspaceLeaseManager';
 import { LocalBrokerTaskFacade } from '../tools/LocalBrokerTaskFacade';
+import { TaskToolFacadeError } from '../tools/taskToolFacade';
 
 const LOCAL_DEVICE_ID = '00000000-0000-4000-8000-000000000001';
 const LOCAL_NODE_ID = '00000000-0000-4000-8000-000000000002';
@@ -437,6 +462,232 @@ test('non-owner Window Node multiplexes remote v2 tasks over authenticated local
 	}
 });
 
+test('continuation crosses local IPC and the production peer gateway into a separately approved target turn', async (t) => {
+	const fixture = await createContinuationFixture(t);
+	const first = await fixture.facade.persistDelegationIntent(continuationIntent(DELEGATION_ID));
+	await waitForTargetTask(fixture, first.taskId, 'running');
+	const predecessor = await completeRemoteTask(fixture, first.taskId);
+	assert.ok(predecessor.recoveryDescriptor);
+	assert.notEqual(fixture.source.broker.taskRoutes.get(first.taskId)?.state, 'completed');
+
+	const intent = continuationIntent(routeUuid(80_001), first.taskId);
+	const continued = await fixture.facade.persistDelegationIntent(intent);
+	const record = await waitForTargetTask(fixture, continued.taskId, 'running');
+	assert.notEqual(continued.taskId, first.taskId);
+	assert.notEqual(continued.delegationRequestId, first.delegationRequestId);
+	assert.equal(record.schemaVersion, 2);
+	assert.equal(record.schemaVersion === 2 && record.continueFromTaskId, first.taskId);
+	assert.deepStrictEqual(record.recoveryDescriptor, predecessor.recoveryDescriptor);
+	assert.equal(new TaskRouteCatalog(fixture.source.state).get(continued.taskId)?.continueFromTaskId, first.taskId);
+
+	const gatewayStart = fixture.connection.starts[1]!;
+	assert.equal(gatewayStart.continueFromTaskId, first.taskId);
+	assert.equal(gatewayStart.sourceWorkspaceIdentity, fixture.sourceNode.delegationSourceScopeIdentity());
+	for (const field of ['sourceNodeId', 'continuation', 'sessionUri', 'chatUri', 'recoveryDescriptor']) {
+		assert.equal(Object.hasOwn(gatewayStart, field), false, field);
+	}
+	const continuation = {
+		sessionUri: predecessor.recoveryDescriptor.sessionId,
+		chatUri: predecessor.recoveryDescriptor.conversationId,
+	};
+	assert.deepStrictEqual(fixture.nodeStarts[1]!.continuation, continuation);
+	assert.equal(fixture.nodeStarts[1]!.continueFromTaskId, first.taskId);
+	assert.equal(fixture.nodeStarts[1]!.requireEditor, true);
+	assert.deepStrictEqual(fixture.runtime.requests[1]!.continuation, continuation);
+	assert.equal(fixture.runtime.requests[1]!.requireEditor, true);
+	assert.notStrictEqual(
+		fixture.runtime.requests[1]!.approvalCapability,
+		fixture.runtime.requests[0]!.approvalCapability,
+	);
+	assert.notEqual(
+		fixture.nodeStarts[1]!.delegatedExecutionContext.capability,
+		fixture.nodeStarts[0]!.delegatedExecutionContext.capability,
+	);
+	assert.equal(fixture.confirmations.length, 2);
+	assert.equal(fixture.confirmations[1]!.continueFromTaskId, first.taskId);
+	assert.equal(record.pendingInput, undefined);
+	assert.equal((await fixture.target.store.getOwned(LOCAL_DEVICE_ID, first.taskId))?.eventSeq, predecessor.eventSeq);
+
+	const retried = await fixture.facade.persistDelegationIntent(intent);
+	assert.equal(retried.taskId, continued.taskId);
+	assert.equal(retried.recovered, true);
+	const { continueFromTaskId: _continueFromTaskId, ...withoutContinuation } = intent;
+	for (const changed of [
+		withoutContinuation,
+		{ ...intent, continueFromTaskId: routeUuid(80_002) },
+	]) {
+		await assert.rejects(
+			fixture.facade.persistDelegationIntent(changed),
+			(error: unknown) => error instanceof TaskToolFacadeError && error.code === 'IDEMPOTENCY_CONFLICT',
+		);
+	}
+	assert.equal(fixture.connection.startCalls, 2);
+	assert.equal(fixture.runtime.requests.length, 2);
+	assert.equal(fixture.confirmations.length, 2);
+
+	await completeRemoteTask(fixture, continued.taskId);
+	const fresh = await fixture.facade.persistDelegationIntent(continuationIntent(routeUuid(80_003)));
+	const freshRecord = await waitForTargetTask(fixture, fresh.taskId, 'running');
+	for (const start of [fixture.connection.starts[0]!, fixture.connection.starts[2]!, fixture.nodeStarts[2]!]) {
+		assert.equal(Object.hasOwn(start, 'continueFromTaskId'), false);
+		assert.equal(Object.hasOwn(start, 'continuation'), false);
+	}
+	assert.equal(Object.hasOwn(fixture.runtime.requests[2]!, 'continuation'), false);
+	assert.notEqual(freshRecord.recoveryDescriptor?.sessionId, predecessor.recoveryDescriptor.sessionId);
+	assert.equal(fixture.confirmations.length, 3);
+	assert.equal(Object.hasOwn(fixture.confirmations[2]!, 'continueFromTaskId'), false);
+	await completeRemoteTask(fixture, fresh.taskId);
+});
+
+test('continuation ownership rejects another source window even on the same peer and workspace', async (t) => {
+	const fixture = await createContinuationFixture(t);
+	const first = await fixture.facade.persistDelegationIntent(continuationIntent(DELEGATION_ID));
+	await waitForTargetTask(fixture, first.taskId, 'running');
+	await completeRemoteTask(fixture, first.taskId);
+	const sourceWorkspaceIdentity = fixture.sourceNode.delegationSourceScopeIdentity();
+	const changedScope = {
+		...continuationIntent(routeUuid(81_001), first.taskId),
+		sourceWorkspaceIdentity: `sha256:${'X'.repeat(43)}`,
+	};
+	const changedTarget = {
+		...continuationIntent(routeUuid(81_002), first.taskId),
+		workspaceId: OTHER_WORKSPACE_ID,
+	};
+	for (const [intent, code] of [
+		[changedScope, 'TASK_NOT_FOUND'],
+		[changedTarget, 'TASK_RECOVERY_UNAVAILABLE'],
+	] as const) {
+		await assert.rejects(
+			fixture.facade.persistDelegationIntent(intent),
+			(error: unknown) => error instanceof TaskToolFacadeError && error.code === code,
+		);
+		assert.equal(fixture.source.broker.taskRoutes.get(fixture.facade.identifyDelegation(intent).taskId), undefined);
+	}
+
+	await fixture.sourceNode.dispose();
+	const replacement = await fixture.createSourceWindow(RAW_NODE_ID, RAW_INSTANCE_ID);
+	assert.equal(replacement.node.delegationSourceScopeIdentity(), sourceWorkspaceIdentity);
+	const intent = continuationIntent(routeUuid(81_003), first.taskId);
+	await assert.rejects(
+		replacement.facade.persistDelegationIntent(intent),
+		(error: unknown) => error instanceof TaskToolFacadeError && error.code === 'TASK_NOT_FOUND',
+	);
+	assert.equal(fixture.source.broker.taskRoutes.get(replacement.facade.identifyDelegation(intent).taskId), undefined);
+	assert.equal(fixture.connection.startCalls, 1);
+	assert.equal(remoteRoutes(fixture.source.state).length, 1);
+	assert.equal(fixture.runtime.requests.length, 1);
+	assert.equal((await fixture.target.store.list()).length, 1);
+});
+
+test('continuation retries bind the production remote adapter hash across restoration', async (t) => {
+	const fixture = await createContinuationFixture(t);
+	const first = await fixture.facade.persistDelegationIntent(continuationIntent(DELEGATION_ID));
+	await waitForTargetTask(fixture, first.taskId, 'running');
+	await completeRemoteTask(fixture, first.taskId);
+	const continued = await fixture.facade.persistDelegationIntent(continuationIntent(routeUuid(82_001), first.taskId));
+	await waitForTargetTask(fixture, continued.taskId, 'running');
+	await completeRemoteTask(fixture, continued.taskId);
+	const restored = new ProductionRemoteTaskAdapter(
+		fixture.peers as unknown as PeerConnectionManager,
+		profileStore([remoteProfile()]),
+		fixture.source.state,
+		() => new Date(CREATED_AT),
+	);
+	const original = fixture.connection.starts[1]!;
+	assert.equal((await restored.startTask(original, { peerId: PEER_ID })).taskId, continued.taskId);
+	assert.equal(fixture.connection.startCalls, 3);
+	const { continueFromTaskId: _continueFromTaskId, ...withoutContinuation } = original;
+	for (const changed of [
+		withoutContinuation,
+		{ ...original, continueFromTaskId: routeUuid(82_002) },
+		{ ...fixture.connection.starts[0]!, continueFromTaskId: continued.taskId },
+	]) {
+		await assert.rejects(
+			restored.startTask(changed, { peerId: PEER_ID }),
+			(error: unknown) => error instanceof MeshDomainError && error.reason === 'IDEMPOTENCY_CONFLICT',
+		);
+	}
+	assert.equal(fixture.connection.startCalls, 3);
+	assert.equal((await restored.startTask(fixture.connection.starts[0]!, { peerId: PEER_ID })).taskId, first.taskId);
+	assert.equal(Object.hasOwn(fixture.connection.starts[3]!, 'continueFromTaskId'), false);
+	assert.equal(fixture.runtime.requests.length, 2);
+	assert.equal(fixture.confirmations.length, 2);
+	assert.equal(remoteRoutes(fixture.source.state).length, 2);
+});
+
+test('continuation requires authoritative target completion despite a completed source cache', async (t) => {
+	const fixture = await createContinuationFixture(t);
+	const first = await fixture.facade.persistDelegationIntent(continuationIntent(DELEGATION_ID));
+	await waitForTargetTask(fixture, first.taskId, 'running');
+	const running = await fixture.target.service.get(LOCAL_DEVICE_ID, first.taskId);
+	await fixture.source.broker.taskRoutes.markSnapshot({ ...running, state: 'completed' });
+
+	const intent = continuationIntent(routeUuid(83_001), first.taskId);
+	await assert.rejects(
+		fixture.facade.persistDelegationIntent(intent),
+		(error: unknown) => error instanceof TaskToolFacadeError && error.code === 'TASK_RECOVERY_UNAVAILABLE',
+	);
+	const taskId = fixture.facade.identifyDelegation(intent).taskId;
+	assert.equal(fixture.source.broker.taskRoutes.get(first.taskId)?.state, 'completed');
+	assert.equal((await fixture.target.store.getOwned(LOCAL_DEVICE_ID, first.taskId))?.state, 'running');
+	assert.equal(await fixture.target.store.getOwned(LOCAL_DEVICE_ID, taskId), undefined);
+	assert.equal(fixture.target.broker.taskRoutes.get(taskId), undefined);
+	assert.equal(fixture.connection.startCalls, 2);
+	assert.equal(fixture.connection.starts[1]!.continueFromTaskId, first.taskId);
+	assert.equal(fixture.runtime.requests.length, 1);
+	assert.equal(fixture.confirmations.length, 1);
+	await completeRemoteTask(fixture, first.taskId);
+});
+
+test('continuation descriptors cannot be injected over authenticated local IPC', async (t) => {
+	const fixture = await createContinuationFixture(t);
+	const client = new LocalIpcClient({
+		identity: fixture.source.identity,
+		brokerKey: fixture.key,
+		clientId: RAW_INSTANCE_ID,
+		requestTimeoutMs: 2_000,
+	});
+	t.after(() => client.dispose());
+	const session = await client.connect();
+	const registration = nodeRegistrationResultSchema.parse(await session.request(LOCAL_BROKER_METHODS.register, {
+		nodeId: RAW_NODE_ID,
+		nodeInstanceId: RAW_INSTANCE_ID,
+		label: 'Raw source',
+		capabilities: ['tasks'],
+		status: 'online',
+		startedAt: CREATED_AT,
+	}));
+	const input = {
+		...remoteStartParams(routeUuid(84_001), routeUuid(84_002)),
+		continueFromTaskId: routeUuid(84_003),
+		sourceNodeId: RAW_NODE_ID,
+		delegationPrincipal: registration.delegationPrincipal,
+	};
+	for (const injected of [
+		{ continuation: { sessionUri: 'retained-session', chatUri: 'retained-chat' } },
+		{ sessionUri: 'retained-session' },
+		{ chatUri: 'retained-chat' },
+		{ sessionId: 'retained-session' },
+		{ conversationId: 'retained-chat' },
+		{ recoveryDescriptor: { adapter: 'ahp', sessionId: 'retained-session', conversationId: 'retained-chat' } },
+	]) {
+		for (const method of [LOCAL_BROKER_METHODS.taskStart, LOCAL_BROKER_METHODS.remoteTaskStart]) {
+			await assert.rejects(
+				session.request(method, JSON.parse(JSON.stringify({
+					...input,
+					...(method === LOCAL_BROKER_METHODS.remoteTaskStart ? { peerId: PEER_ID } : {}),
+					...injected,
+				}))),
+				(error: unknown) => error instanceof LocalIpcRemoteError && error.code === -32602,
+			);
+		}
+	}
+	assert.equal(fixture.source.broker.taskRoutes.get(input.taskId), undefined);
+	assert.equal(remoteRoutes(fixture.source.state).length, 0);
+	assert.equal(fixture.connection.startCalls, 0);
+	assert.equal(fixture.runtime.requests.length, 0);
+});
+
 test('remote route catalog rejects unknown and corrupt persisted versions', async () => {
 	const profiles = profileStore([]);
 	const emptyManager = {
@@ -687,13 +938,290 @@ test('valid persisted v1 peer identity remains visible without treating its dire
 	});
 });
 
+class GatewayRemoteConnection extends FakeRemoteConnection {
+	public readonly starts: RoutedTaskStartParams[] = [];
+
+	public constructor(state: StateStore, private readonly router: GatewayRouter) {
+		super(state);
+	}
+
+	public override async request(method: string, params: Record<string, unknown>): Promise<unknown> {
+		this.methods.push(method);
+		const wire = JSON.parse(JSON.stringify(params)) as Record<string, unknown>;
+		if (method === 'task.start') {
+			this.startCalls += 1;
+			this.lastStart = wire;
+			this.starts.push(routedTaskStartParamsSchema.parse(wire));
+		}
+		try {
+			return JSON.parse(JSON.stringify(await this.router.dispatch(LOCAL_DEVICE_ID, method, wire)));
+		} catch (error: unknown) {
+			if (error instanceof MeshDomainError) {
+				throw new PeerRpcError(error.reason, error.retryable, error.message);
+			}
+			throw error;
+		}
+	}
+}
+
+class ContinuationHandle implements AgentTaskHandle {
+	public readonly events = createAgentRuntimeEventQueue();
+	public readonly recovery;
+
+	public constructor(public readonly taskId: string, request: AgentTaskRequest) {
+		this.recovery = {
+			clientId: `client-${taskId}`,
+			sessionUri: request.continuation?.sessionUri ?? `copilotcli:/${taskId}`,
+			chatUri: request.continuation?.chatUri ?? `ahp-chat:/${taskId}`,
+			lastSeenServerSeq: 1,
+		};
+	}
+
+	public async cancel(): Promise<void> {}
+	public async answer(): Promise<void> {}
+	public async dispose(): Promise<void> {
+		this.events.close();
+	}
+}
+
+class ContinuationRuntime implements AgentRuntime {
+	public readonly requests: AgentTaskRequest[] = [];
+	public readonly handles: ContinuationHandle[] = [];
+
+	public async probe(): Promise<AgentRuntimeProbe> {
+		return { available: true, featureEnabled: true };
+	}
+
+	public async start(request: AgentTaskRequest): Promise<AgentTaskHandle> {
+		this.requests.push(request);
+		const handle = new ContinuationHandle(request.taskId, request);
+		this.handles.push(handle);
+		return handle;
+	}
+
+	public async dispose(): Promise<void> {}
+}
+
+interface RoutingBrokerFixture {
+	readonly broker: DeviceBroker;
+	readonly service: BrokerTaskService;
+	readonly store: FileTaskStore;
+	readonly identity: LocalIpcIdentity;
+	readonly state: MemoryState;
+}
+
+interface ContinuationFixture {
+	readonly source: RoutingBrokerFixture;
+	readonly target: RoutingBrokerFixture;
+	readonly sourceNode: WindowNodeClient;
+	readonly facade: LocalBrokerTaskFacade;
+	readonly key: Buffer;
+	readonly connection: GatewayRemoteConnection;
+	readonly peers: FakePeerManager;
+	readonly runtime: ContinuationRuntime;
+	readonly nodeStarts: NodeTaskStartParams[];
+	readonly confirmations: WindowNodeTaskConfirmationRequest[];
+	createSourceWindow(nodeId: string, nodeInstanceId: string): Promise<{
+		readonly node: WindowNodeClient;
+		readonly facade: LocalBrokerTaskFacade;
+	}>;
+}
+
+async function createContinuationFixture(t: TestContext): Promise<ContinuationFixture> {
+	const root = `.ipc-continuation-${randomBytes(6).toString('hex')}`;
+	const nodes: WindowNodeClient[] = [];
+	const brokers: DeviceBroker[] = [];
+	await mkdir(root, { mode: 0o700 });
+	t.after(async () => {
+		const results = [
+			...await Promise.allSettled(nodes.map((node) => node.dispose())),
+			...await Promise.allSettled(brokers.map((broker) => broker.dispose())),
+		];
+		await rm(root, { recursive: true, force: true });
+		assert.deepStrictEqual(results.filter((result) => result.status === 'rejected'), []);
+	});
+	const key = Buffer.alloc(32, 0x6e);
+	const clock = { now: () => new Date(CREATED_AT) };
+	const workspaceSource = {
+		list: () => [{
+			localUri: pathToFileURL(process.cwd()).href,
+			name: 'Repository',
+			capabilityTags: ['typescript'],
+		}],
+	};
+	const createRoutingBroker = async (
+		deviceId: string,
+		workspaceId: string,
+		directory: string,
+		state: MemoryState,
+		remoteTasks?: ProductionRemoteTaskAdapter,
+	): Promise<RoutingBrokerFixture> => {
+		const identity: LocalIpcIdentity = {
+			userIdentity: randomBytes(16),
+			deviceId,
+			tempDirectory: join(root, directory),
+		};
+		await mkdir(identity.tempDirectory!, { mode: 0o700 });
+		const store = new FileTaskStore(
+			new AtomicFileStore(identity.tempDirectory!, new NodeAtomicFileSystem(), { next: randomUUID }),
+			clock,
+		);
+		const registry = await NodeRegistry.create({
+			deviceId,
+			state,
+			ids: { next: () => workspaceId },
+			clock,
+			workspaceLeases: new WorkspaceLeaseManager(),
+			scheduler: { repeat: () => ({ dispose: () => undefined }) },
+		});
+		const service = new BrokerTaskService(deviceId, registry, store, clock);
+		await service.initialize();
+		const broker = await createBroker(identity, key, remoteTasks, state, { registry, taskService: service });
+		brokers.push(broker);
+		return { broker, service, store, identity, state };
+	};
+
+	const target = await createRoutingBroker(REMOTE_DEVICE_ID, REMOTE_WORKSPACE_ID, 'target', new MemoryState());
+	const runtime = new ContinuationRuntime();
+	const nodeStarts: NodeTaskStartParams[] = [];
+	const confirmations: WindowNodeTaskConfirmationRequest[] = [];
+	const targetNode = createWindowNode(target.identity, key, {
+		nodeId: REMOTE_NODE_ID,
+		nodeInstanceId: REMOTE_INSTANCE_ID,
+		label: 'Target Window',
+		workspaceSource,
+		clock,
+		executor: ({ workspaceResolver, eventSink }) => {
+			const executor = new WindowNodeTaskExecutor({
+				nodeId: REMOTE_NODE_ID,
+				nodeInstanceId: REMOTE_INSTANCE_ID,
+				nodeLabel: 'Target Window',
+				runtime,
+				workspaceResolver,
+				eventSink,
+				confirmationHost: {
+					confirm: async (request) => {
+						confirmations.push(request);
+						return 'once';
+					},
+				},
+				approvalCapabilities: new AgentRuntimeApprovalCapabilityIssuer(),
+				ids: { next: randomUUID },
+				clock,
+			});
+			return {
+				start: (input) => {
+					nodeStarts.push(structuredClone(input));
+					return executor.start(input);
+				},
+				answer: (input) => executor.answer(input),
+				cancel: (input) => executor.cancel(input),
+				disposeTask: (input) => executor.disposeTask(input),
+				dispose: () => executor.dispose(),
+			};
+		},
+	});
+	nodes.push(targetNode);
+	await targetNode.start();
+
+	const state = new MemoryState();
+	// Only the peer transport and Agent host are simulated; both brokers, IPC hops,
+	// the gateway, the durable task store, and the target executor are production code.
+	const connection = new GatewayRemoteConnection(state, new GatewayRouter({
+		getInfo: async () => ({
+			deviceId: REMOTE_DEVICE_ID,
+			name: 'Target Device',
+			platform: 'darwin',
+			architecture: 'arm64',
+			vscodeVersion: '1.103.0',
+			extensionVersion: '0.2.0',
+			protocolVersion: MESH_PROTOCOL_VERSION,
+		}),
+	}, target.broker));
+	const peers = new FakePeerManager(connection);
+	const remoteTasks = new ProductionRemoteTaskAdapter(
+		peers as unknown as PeerConnectionManager,
+		profileStore([remoteProfile()]),
+		state,
+		clock.now,
+	);
+	const source = await createRoutingBroker(LOCAL_DEVICE_ID, routeUuid(85_000), 'source', state, remoteTasks);
+	const createSourceWindow = async (nodeId: string, nodeInstanceId: string) => {
+		const node = createWindowNode(source.identity, key, { nodeId, nodeInstanceId, workspaceSource, clock });
+		nodes.push(node);
+		await node.start();
+		const facade = new LocalBrokerTaskFacade(node, {
+			deviceName: 'Source Device',
+			remoteAdapter: new LocalIpcRemoteTaskAdapter(node),
+			sourceWorkspaceIdentity: () => node.delegationSourceScopeIdentity(),
+			now: clock.now,
+		});
+		return { node, facade };
+	};
+	const sourceWindow = await createSourceWindow(LOCAL_NODE_ID, LOCAL_INSTANCE_ID);
+	return {
+		source,
+		target,
+		sourceNode: sourceWindow.node,
+		facade: sourceWindow.facade,
+		key,
+		connection,
+		peers,
+		runtime,
+		nodeStarts,
+		confirmations,
+		createSourceWindow,
+	};
+}
+
+function continuationIntent(delegationRequestId: string, continueFromTaskId?: string): DelegationIntentInput {
+	return {
+		delegationRequestId,
+		...(continueFromTaskId === undefined ? {} : { continueFromTaskId }),
+		deviceId: REMOTE_DEVICE_ID,
+		nodeId: REMOTE_NODE_ID,
+		nodeInstanceId: REMOTE_INSTANCE_ID,
+		workspaceId: REMOTE_WORKSPACE_ID,
+		peerId: PEER_ID,
+		title: 'Continue remote work',
+		prompt: 'Implement the next change.',
+		acceptanceCriteria: ['Tests pass.'],
+		timeoutMinutes: 60,
+	};
+}
+
+async function waitForTargetTask(
+	fixture: ContinuationFixture,
+	taskId: string,
+	state: TaskSnapshot['state'],
+): Promise<TaskRecord> {
+	const deadline = Date.now() + 2_000;
+	let record: TaskRecord | undefined;
+	do {
+		record = await fixture.target.store.getOwned(LOCAL_DEVICE_ID, taskId);
+		if (record?.state === state) {
+			return record;
+		}
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	} while (Date.now() < deadline);
+	assert.fail(`Task ${taskId} did not reach ${state}; last state: ${record?.state}; failure: ${record?.failure?.code}`);
+}
+
+async function completeRemoteTask(fixture: ContinuationFixture, taskId: string): Promise<TaskRecord> {
+	const handle = fixture.runtime.handles.find((candidate) => candidate.taskId === taskId);
+	assert.ok(handle);
+	await handle.events.push({ type: 'completed' });
+	return waitForTargetTask(fixture, taskId, 'completed');
+}
+
 async function createBroker(
 	identity: LocalIpcIdentity,
 	key: Buffer,
-	remoteTasks: ProductionRemoteTaskAdapter,
+	remoteTasks: ProductionRemoteTaskAdapter | undefined,
 	state: StateStore,
+	services?: { readonly registry: NodeRegistry; readonly taskService: BrokerTaskService },
 ): Promise<DeviceBroker> {
-	const registry = new FakeRegistry() as unknown as NodeRegistry;
+	const registry = services?.registry ?? new FakeRegistry() as unknown as NodeRegistry;
 	const broker = new DeviceBroker({
 		identity,
 		brokerKey: key,
@@ -711,7 +1239,7 @@ async function createBroker(
 			listAuthorized: () => registry.list(),
 			onDidChange: () => ({ dispose: () => undefined }),
 		} as unknown as PeerPolicyService,
-		taskService: new FakeLocalTaskService() as unknown as BrokerTaskService,
+		taskService: services?.taskService ?? new FakeLocalTaskService() as unknown as BrokerTaskService,
 		remoteTaskService: remoteTasks,
 		taskRoutes: new TaskRouteCatalog(state, () => new Date(CREATED_AT)),
 		requestTimeoutMs: 2_000,
@@ -720,7 +1248,11 @@ async function createBroker(
 	return broker;
 }
 
-function createWindowNode(identity: LocalIpcIdentity, key: Buffer): WindowNodeClient {
+function createWindowNode(
+	identity: LocalIpcIdentity,
+	key: Buffer,
+	options: Partial<WindowNodeClientOptions> = {},
+): WindowNodeClient {
 	return new WindowNodeClient({
 		nodeId: LOCAL_NODE_ID,
 		nodeInstanceId: LOCAL_INSTANCE_ID,
@@ -742,6 +1274,7 @@ function createWindowNode(identity: LocalIpcIdentity, key: Buffer): WindowNodeCl
 			jitterRatio: 0,
 		},
 		requestTimeoutMs: 2_000,
+		...options,
 	});
 }
 

@@ -140,7 +140,7 @@ model-callable management tools.
 | Tool | Purpose and important options |
 | --- | --- |
 | `#meshListWorkers` | Find authorized targets. `scope` is `local`, `remote`, or `all` (default). Local scope never requests remote directories; all-scope failures are explicit `partial` results when another scope is available. |
-| `#meshDelegateTask` | Prefer a returned `targetHandle`, or supply the legacy exact IDs, never both. `mode: "wait"` is the default; `"submit"` returns after durable acceptance so other targets can be scheduled. |
+| `#meshDelegateTask` | Prefer a returned `targetHandle`, or supply the legacy exact IDs, never both. `mode: "wait"` is the default; `"submit"` returns after durable acceptance so other targets can be scheduled. Optional `continueFromTaskId` reuses an owned completed task's session; omit it for a new session. |
 | `#meshGetTask` | Read an owned task by ID. `waitFor: "snapshot"` reads once; `"change"` or `"outcome"` subscribes to events. Outcome means input is needed or the task reached a terminal state. |
 | `#meshAnswerTask` | Answer the exact current input with a stable `answerId`. Native confirmation shows the current question and a safe answer preview. Then get/wait on the same task ID; do not create a new delegation. |
 | `#meshCancelTask` | Explicitly request cancellation. A `cancelling` receipt is not a confirmed `cancelled` task. |
@@ -150,6 +150,21 @@ For one-to-many work, list targets, submit a separate task to each intended
 Workspace, then inspect or wait on their returned IDs. Each target still needs
 its independent authorization and free Workspace Lease. There is no broadcast
 operation or automatic recursive delegation.
+
+The source window explicitly chooses session reuse by passing
+`continueFromTaskId` with the previous completed task's ID and the same exact
+target. This creates a **new task ID and new turn** in the retained editor
+Session/Chat, preserving conversation context. Without that field, delegation
+still creates a new session. Use a fresh `delegationRequestId` (or omit it) for
+each follow-up; reusing that request ID only retries the identical task.
+
+Continuation requires the same authenticated owner/source scope, target window
+instance and Workspace, a completed task record, and an available idle editor
+session. It does not reopen a completed task, answer pending input, or fork an
+old transcript: later turns already in that session remain part of its history.
+Deleted, archived, busy, incompatible, or standalone sessions cannot be silently
+replaced with a new session. Authorization, Workspace leases, execution deadlines,
+and sensitive-operation approvals still apply independently to every follow-up.
 
 `timeoutMinutes` remains the execution budget (default and maximum 60 minutes).
 Get/wait has a separate `waitSeconds` event-wait budget (default 60, maximum

@@ -117,6 +117,17 @@ test('bounds observations and disables correlation after disposal', () => {
 	assert.equal(registry.consume(delegationInput(33)), undefined);
 });
 
+test('binds delegated invocation correlation to the requested continuation', () => {
+	const registry = new DelegatedToolInvocationRegistry();
+	const input = delegationInput(70);
+	const continuation = { ...input, continueFromTaskId: context.taskId };
+	registry.observe(observation('scope-a', 'call-a', continuation));
+	assert.equal(registry.consume(input), undefined);
+	assert.equal(registry.consume({ ...continuation, continueFromTaskId: input.delegationRequestId }), undefined);
+	assert.deepEqual(registry.consume(continuation), context);
+	registry.dispose();
+});
+
 test('bounds each child scope before applying the global entry cap', () => {
 	const registry = new DelegatedToolInvocationRegistry({
 		entryLimit: 4,

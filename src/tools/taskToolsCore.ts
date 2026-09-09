@@ -50,6 +50,7 @@ export interface ToolDeadlineTimer {
 
 interface DelegateTaskParameters {
 	readonly delegationRequestId?: string;
+	readonly continueFromTaskId?: string;
 	readonly title: string;
 	readonly prompt: string;
 	readonly acceptanceCriteria?: readonly string[];
@@ -243,6 +244,9 @@ export class TaskToolsCore {
 				`Target window: ${windowName}`,
 				`Workspace: ${workspaceName}`,
 				`Task: ${summary}`,
+				...(input.continueFromTaskId === undefined
+					? []
+					: [`Session: reuse completed task ${input.continueFromTaskId}, including its conversation history.`]),
 				...(parsed.mode === 'submit'
 					? ['Submit returns after durable acceptance, before completion. After it returns, stopping Chat does not cancel the task; use #meshCancelTask.']
 					: []),
@@ -1195,6 +1199,7 @@ export function parseDelegateTaskInput(value: unknown): ParsedDelegateTaskInput 
 	const input = expectRecord(value, 'input');
 	expectExactKeys(input, [
 		'delegationRequestId',
+		'continueFromTaskId',
 		'deviceId',
 		'nodeId',
 		'nodeInstanceId',
@@ -1210,6 +1215,9 @@ export function parseDelegateTaskInput(value: unknown): ParsedDelegateTaskInput 
 	const delegationRequestId = input.delegationRequestId === undefined
 		? undefined
 		: expectIdentifier(input.delegationRequestId, 'delegationRequestId');
+	const continueFromTaskId = input.continueFromTaskId === undefined
+		? undefined
+		: expectIdentifier(input.continueFromTaskId, 'continueFromTaskId');
 	if (input.targetHandle !== undefined && ['deviceId', 'nodeId', 'nodeInstanceId', 'workspaceId', 'peerId']
 		.some((key) => Object.hasOwn(input, key))) {
 		throw new Error('Use either a target handle or the explicit routing tuple.');
@@ -1238,6 +1246,7 @@ export function parseDelegateTaskInput(value: unknown): ParsedDelegateTaskInput 
 		);
 	return {
 		...(delegationRequestId === undefined ? {} : { delegationRequestId }),
+		...(continueFromTaskId === undefined ? {} : { continueFromTaskId }),
 		...target,
 		title,
 		prompt,
@@ -1272,6 +1281,7 @@ function delegationIntent(input: ParsedDelegateTaskInput, target: ExplicitToolTa
 		workspaceId: target.workspaceId, ...(target.peerId === undefined ? {} : { peerId: target.peerId }),
 		title: input.title, prompt: input.prompt, acceptanceCriteria: input.acceptanceCriteria,
 		...(input.delegationRequestId === undefined ? {} : { delegationRequestId: input.delegationRequestId }),
+		...(input.continueFromTaskId === undefined ? {} : { continueFromTaskId: input.continueFromTaskId }),
 		...(input.timeoutMinutes === undefined ? {} : { timeoutMinutes: input.timeoutMinutes }),
 	};
 }

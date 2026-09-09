@@ -347,6 +347,144 @@ function nodeEvent(
 	};
 }
 
+for (const locality of ['local', 'remote'] as const) {
+	test(`${locality} continuation resolves a completed task into a new task with the same private session`, async (t) => {
+		const fixture = await createFixture();
+		t.after(() => fixture.dispose());
+		const ownerId = locality === 'local' ? DEVICE_ID : OWNER_ID;
+		const source = { nodeId: SOURCE_ID, nodeInstanceId: INSTANCE_ID };
+		const descriptor = {
+			adapter: 'ahp', sessionId: `copilotcli:/${TASK_ID}`, conversationId: 'ahp-chat:/original',
+		};
+		fixture.session.handler = async (method, input) => {
+			if (method !== 'node.task.start') { return null; }
+			const request = nodeTaskStartParamsSchema.parse(input);
+			if (request.taskId === TASK_ID) {
+				await fixture.service.acceptNodeEvent(fixture.session.asRoute(), nodeEvent({
+					type: 'completed', summary: 'Original completed before start acknowledgement.',
+				}));
+			}
+			return {
+				taskId: request.taskId, nodeId: NODE_ID, nodeInstanceId: INSTANCE_ID,
+				recoveryDescriptor: descriptor,
+			};
+		};
+		const start = (input: RoutedTaskStartParams) => locality === 'local'
+			? fixture.service.startLocal(source, input)
+			: fixture.service.startRemote(ownerId, input);
+		const originalInput = startParams({ sourceWorkspaceIdentity: createOpaqueWorkspaceIdentity('source') });
+		await start(originalInput);
+		await waitFor(async () => (await fixture.store.getOwned(ownerId, TASK_ID))?.state === 'completed');
+		const followUp = startParams({
+			...originalInput, taskId: OTHER_TASK_ID, delegationRequestId: OTHER_DELEGATION_ID,
+			continueFromTaskId: TASK_ID, title: 'Follow-up', prompt: 'Continue with the original context.',
+		});
+		const accepted = await start(followUp);
+		assert.equal(accepted.taskId, OTHER_TASK_ID);
+		assert.equal(accepted.state, 'startingAgent');
+		assert.equal('continuation' in accepted, false);
+		assert.equal('continueFromTaskId' in accepted, false);
+		await waitFor(async () => (await fixture.store.getOwned(ownerId, OTHER_TASK_ID))?.state === 'running');
+		const dispatched = fixture.session.requests
+			.filter(({ method }) => method === 'node.task.start')
+			.map(({ params }) => nodeTaskStartParamsSchema.parse(params));
+		assert.equal(dispatched.length, 2);
+		assert.equal(dispatched[0].continuation, undefined);
+		assert.equal(dispatched[1].continueFromTaskId, TASK_ID);
+		assert.deepEqual(dispatched[1].continuation, { sessionUri: descriptor.sessionId, chatUri: descriptor.conversationId });
+		assert.equal(dispatched[1].requireEditor, true);
+		assert.equal(dispatched[1].delegationGrant.taskId, OTHER_TASK_ID);
+		assert.notEqual(dispatched[1].delegationGrant.requestHash, dispatched[0].delegationGrant.requestHash);
+		assert.notEqual(dispatched[1].delegatedExecutionContext.capability, dispatched[0].delegatedExecutionContext.capability);
+		const original = await fixture.store.getOwned(ownerId, TASK_ID);
+		assert.equal(original?.state, 'completed');
+		assert.deepEqual(original?.recoveryDescriptor, descriptor);
+		const continued = await fixture.store.getOwned(ownerId, OTHER_TASK_ID);
+		assert.equal(continued?.schemaVersion === 2 && continued.continueFromTaskId, TASK_ID);
+		assert.deepEqual(continued?.recoveryDescriptor, descriptor);
+		await start(followUp);
+		for (const continueFromTaskId of [undefined, INPUT_ID]) {
+			await assert.rejects(start({ ...followUp, continueFromTaskId }), (error: unknown) =>
+				isReason(error, 'IDEMPOTENCY_CONFLICT'));
+		}
+		assert.equal(fixture.session.requests.filter(({ method }) => method === 'node.task.start').length, 2);
+		assert.deepEqual(await fixture.store.getOwned(ownerId, TASK_ID), original);
+		await fixture.service.acceptNodeEvent(fixture.session.asRoute(), nodeEvent({
+			type: 'completed', summary: 'Follow-up completed.',
+		}, OTHER_TASK_ID));
+		await fixture.service.dispose();
+		const restored = new BrokerTaskService(DEVICE_ID, fixture.registry, fixture.store, { now: () => new Date(AT) });
+		t.after(() => restored.dispose());
+		await restored.initialize();
+		const next = {
+			...followUp, taskId: indexedUuid(50), delegationRequestId: indexedUuid(51), continueFromTaskId: OTHER_TASK_ID,
+		};
+		if (locality === 'local') { await restored.startLocal(source, next); }
+		else { await restored.startRemote(ownerId, next); }
+		await waitFor(async () => (await fixture.store.getOwned(ownerId, next.taskId))?.state === 'running');
+		const restoredRequest = nodeTaskStartParamsSchema.parse(fixture.session.requests.at(-1)?.params);
+		assert.deepEqual(restoredRequest.continuation, dispatched[1].continuation);
+	});
+}
+
+test('continuation validates ownership, completed state, exact target and recovery metadata before dispatch', async (t) => {
+	const base = createAcceptedRoutedTask({
+		...startParams({ sourceWorkspaceIdentity: createOpaqueWorkspaceIdentity('source') }),
+		peerId: OWNER_ID,
+		workspaceLeaseKey: createOpaqueWorkspaceIdentity('opaque-workspace-identity'),
+	}, AT);
+	let running: TaskRecord = taskReducer(base, { type: 'agentStartRequested', at: AT });
+	running = taskReducer(running, {
+		type: 'agentStarted', at: AT,
+		recoveryDescriptor: { adapter: 'ahp', sessionId: `copilotcli:/${TASK_ID}`, conversationId: 'ahp-chat:/original' },
+	});
+	const completed = taskReducer(running, { type: 'completed', at: AT, summary: 'Original done.' });
+	assert.ok(completed.schemaVersion === 2);
+	const cases: readonly {
+		readonly name: string;
+		readonly record?: TaskRecord;
+		readonly input?: Partial<RoutedTaskStartParams>;
+		readonly reason: string;
+	}[] = [
+		{ name: 'missing', reason: 'TASK_NOT_FOUND' },
+		{ name: 'foreign owner', record: { ...completed, peerId: DEVICE_ID }, reason: 'TASK_NOT_FOUND' },
+		{ name: 'different source scope', record: completed, input: { sourceWorkspaceIdentity: createOpaqueWorkspaceIdentity('other') }, reason: 'TASK_NOT_FOUND' },
+		{ name: 'running', record: running, reason: 'TASK_RECOVERY_UNAVAILABLE' },
+		{ name: 'needs input', record: taskReducer(running, { type: 'inputRequired', at: AT, inputId: INPUT_ID, prompt: 'Proceed?' }), reason: 'TASK_RECOVERY_UNAVAILABLE' },
+		{ name: 'failed', record: taskReducer(running, { type: 'failed', at: AT, code: 'TASK_EXECUTION_FAILED', message: 'Failed.', retryable: false }), reason: 'TASK_RECOVERY_UNAVAILABLE' },
+		{ name: 'no session', record: { ...completed, recoveryDescriptor: undefined }, reason: 'TASK_RECOVERY_UNAVAILABLE' },
+		{ name: 'no chat', record: { ...completed, recoveryDescriptor: { adapter: 'ahp', sessionId: 'session' } }, reason: 'TASK_RECOVERY_UNAVAILABLE' },
+		{ name: 'wrong adapter', record: { ...completed, recoveryDescriptor: { adapter: 'legacy', sessionId: 'session', conversationId: 'chat' } }, reason: 'TASK_RECOVERY_UNAVAILABLE' },
+		{ name: 'new target instance', record: completed, input: { target: { ...startParams().target, nodeInstanceId: INPUT_ID } }, reason: 'TASK_RECOVERY_UNAVAILABLE' },
+		{ name: 'changed workspace identity', record: { ...completed, workspaceLeaseKey: createOpaqueWorkspaceIdentity('changed') }, reason: 'TASK_RECOVERY_UNAVAILABLE' },
+		{ name: 'self continuation', record: completed, input: { continueFromTaskId: OTHER_TASK_ID }, reason: 'TASK_RECOVERY_UNAVAILABLE' },
+	];
+	for (const scenario of cases) {
+		await t.test(scenario.name, async (t) => {
+			const fixture = await createFixture();
+			t.after(() => fixture.dispose());
+			if (scenario.record !== undefined) { await fixture.store.create(scenario.record); }
+			await assert.rejects(fixture.service.startRemote(OWNER_ID, startParams({
+				taskId: OTHER_TASK_ID, delegationRequestId: OTHER_DELEGATION_ID, continueFromTaskId: TASK_ID,
+				sourceWorkspaceIdentity: createOpaqueWorkspaceIdentity('source'), ...scenario.input,
+			})), (error: unknown) => isReason(error, scenario.reason));
+			assert.equal(fixture.session.requests.length, 0);
+			assert.equal(await fixture.store.getOwned(OWNER_ID, OTHER_TASK_ID), undefined);
+			assert.equal(fixture.registry.lookupTaskRoute(OWNER_ID, OTHER_TASK_ID), undefined);
+		});
+	}
+	const local = await createFixture();
+	t.after(() => local.dispose());
+	await local.store.create({
+		...completed, peerId: DEVICE_ID, sourceNodeId: SOURCE_ID,
+	});
+	await assert.rejects(local.service.startLocal({ nodeId: INPUT_ID, nodeInstanceId: INSTANCE_ID }, startParams({
+		taskId: OTHER_TASK_ID, delegationRequestId: OTHER_DELEGATION_ID, continueFromTaskId: TASK_ID,
+		sourceWorkspaceIdentity: createOpaqueWorkspaceIdentity('source'),
+	})), (error: unknown) => isReason(error, 'TASK_NOT_FOUND'));
+	assert.equal(local.session.requests.length, 0);
+});
+
 test('dashboard index excludes a maximum journal and stays small at full capacity', async (t) => {
 	const fixture = await createFixture();
 	t.after(() => fixture.dispose());
@@ -856,7 +994,12 @@ test('keeps an earlier node event authoritative when the start response arrives 
 		'agentStarted',
 		'progress',
 	]);
-	assert.equal(persisted?.recoveryDescriptor, undefined);
+	assert.deepEqual(persisted?.recoveryDescriptor, {
+		adapter: 'ahp', sessionId: 'mesh-session', conversationId: 'mesh-conversation',
+	});
+	await assert.rejects(fixture.store.recordRecoveryDescriptorOwned(OWNER_ID, TASK_ID, {
+		adapter: 'ahp', sessionId: 'different-session', conversationId: 'mesh-conversation',
+	}), (error: unknown) => isReason(error, 'TASK_ID_CONFLICT'));
 });
 
 test('dispose drains a pending start dispatch without releasing its route early', async (t) => {

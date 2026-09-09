@@ -8,7 +8,7 @@ import { test } from 'node:test';
 import type { RoutedTaskStartParams } from '../../shared/protocol';
 import { createAcceptedRoutedTask } from '../domain/task';
 import type { StateStore } from '../domain/ports';
-import { GatewayRouter } from '../gateway/GatewayRouter';
+import { GatewayRouter, GatewayValidationError } from '../gateway/GatewayRouter';
 import type { SecretStore } from '../gateway/SecretStore';
 import {
 	LazyVscodeDevTunnelProvider,
@@ -188,6 +188,7 @@ test('task files reject writes after the captured Broker generation is lost', as
 
 test('v2 Gateway routes node directory and explicit tasks through DeviceBroker', async () => {
 	let started: RoutedTaskStartParams | undefined;
+	let startCalls = 0;
 	const broker = {
 		listNodes: () => ({
 			deviceId: DEVICE_ID,
@@ -196,6 +197,7 @@ test('v2 Gateway routes node directory and explicit tasks through DeviceBroker',
 			totalNodes: 0,
 		}),
 		startRemote: async (_peerId: string, input: RoutedTaskStartParams) => {
+			startCalls += 1;
 			started = input;
 			return { accepted: true };
 		},
@@ -218,10 +220,35 @@ test('v2 Gateway routes node directory and explicit tasks through DeviceBroker',
 	const input = routedTask();
 	await router.dispatch(PEER_ID, 'task.start', input);
 	assert.deepEqual(started, input);
+	assert.equal(Object.hasOwn(started!, 'continueFromTaskId'), false);
+	const continued = {
+		...input,
+		taskId: '00000000-0000-4000-8000-000000000008',
+		delegationRequestId: '00000000-0000-4000-8000-000000000009',
+		continueFromTaskId: input.taskId,
+	};
+	await router.dispatch(PEER_ID, 'task.start', continued);
+	assert.deepEqual(started, continued);
+	for (const injected of [
+		{ continuation: { sessionUri: 'session', chatUri: 'chat' } },
+		{ sessionUri: 'session' },
+		{ chatUri: 'chat' },
+		{ sessionId: 'session' },
+		{ conversationId: 'chat' },
+		{ recoveryDescriptor: { adapter: 'ahp', sessionId: 'session', conversationId: 'chat' } },
+		{ continueFromTaskId: 'not-a-task-id' },
+	]) {
+		await assert.rejects(
+			router.dispatch(PEER_ID, 'task.start', { ...continued, ...injected }),
+			GatewayValidationError,
+		);
+	}
 	await assert.rejects(
 		router.dispatch(PEER_ID, 'task.start', { ...input, sourceNodeId: NODE_ID }),
 		/cannot claim a local source/u,
 	);
+	assert.equal(startCalls, 2);
+	assert.deepEqual(started, continued);
 });
 
 test('local Broker startup and cleanup do not load the Dev Tunnel provider', async () => {

@@ -138,6 +138,7 @@ export interface AgentTaskRequest {
 	readonly workspaceId: string;
 	readonly sourceWindowName?: string;
 	readonly requireEditor?: true;
+	readonly continuation?: AgentSessionContinuation;
 	readonly approvalCapability?: AgentRuntimeApprovalCapability;
 	readonly providerId?: string;
 	readonly allowInteractiveAuthentication?: boolean;
@@ -147,6 +148,11 @@ export interface AgentTaskRequest {
 		readonly workspaceId: string;
 		readonly requestHash: string;
 	};
+}
+
+export interface AgentSessionContinuation {
+	readonly sessionUri: string;
+	readonly chatUri: string;
 }
 
 export interface AgentRuntimeApprovalCapability {
@@ -753,6 +759,7 @@ function approvalFingerprint(request: AgentTaskRequest): string {
 		workspaceId: request.workspaceId,
 		sourceWindowName: request.sourceWindowName,
 		requireEditor: request.requireEditor,
+		continuation: request.continuation,
 		providerId: request.providerId,
 		allowInteractiveAuthentication: request.allowInteractiveAuthentication,
 		delegatedExecutionContext: request.delegatedExecutionContext,

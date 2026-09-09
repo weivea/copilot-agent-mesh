@@ -192,7 +192,7 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 		request: AgentTaskRequest,
 		signal: AbortSignal,
 	): Promise<AgentTaskHandle> {
-		if (!this.options.preferEditor() && request.requireEditor !== true) {
+		if (!this.options.preferEditor() && request.requireEditor !== true && request.continuation === undefined) {
 			const handle = await this.options.standalone.start(request);
 			this.sourceSelected = true;
 			this.setStatus({ source: 'standalone', degraded: false });
@@ -238,12 +238,14 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 			}
 		}
 
-		if (request.requireEditor) {
+		if (request.requireEditor || request.continuation !== undefined) {
 			this.sourceSelected = true;
 			this.setStatus(editorFailureStatus(editorFailure!));
 			throw new AgentRuntimeError(
 				'AGENT_UNAVAILABLE',
-				'Strict cross-device tasks require the existing editor Agent Host. Standalone fallback is disabled.',
+				request.continuation === undefined
+					? 'Strict cross-device tasks require the existing editor Agent Host. Standalone fallback is disabled.'
+					: 'Session continuation requires the existing editor Agent Host. Standalone fallback is disabled.',
 			);
 		}
 		const status = degradedStatus('EDITOR_START_FAILED', editorFailure);

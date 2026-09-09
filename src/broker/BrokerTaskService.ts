@@ -21,6 +21,7 @@ import {
 	workspaceIdentitySchema,
 	type MeshErrorReason,
 	type NodeTaskEventParams,
+	type NodeTaskStartParams,
 	type RoutedTaskStartParams,
 	type TaskSnapshot,
 	type TaskSnapshotAfterEventSeq,
@@ -140,6 +141,7 @@ export type BrokerTaskStartReconciliation =
 interface PreparedStart {
 	readonly route: ResolvedTaskRoute;
 	readonly acknowledgement: TaskSnapshot;
+	readonly continuation?: NodeTaskStartParams['continuation'];
 }
 
 export class BrokerTaskService {
@@ -525,6 +527,7 @@ export class BrokerTaskService {
 			sourceLabel,
 			prepared.route,
 			outcome,
+			prepared.continuation,
 		);
 		return prepared.acknowledgement;
 	}
@@ -535,6 +538,7 @@ export class BrokerTaskService {
 		sourceNode?: { readonly nodeId: string; readonly nodeInstanceId: string },
 	): Promise<PreparedStart | TaskSnapshot> {
 		this.assertActive();
+		await this.awaitContinuationStart(ownerId, params);
 		const records = await this.scanTaskStore();
 		const existing = this.findExistingStart(records, ownerId, params);
 		if (existing !== undefined) {
@@ -543,6 +547,7 @@ export class BrokerTaskService {
 			return this.snapshot(migrated);
 		}
 		this.assertWorkerDeadline(params.workerDeadline);
+		const continuation = this.resolveContinuation(records, ownerId, params);
 
 		const route = await this.registry.acquireTaskRoute({
 			ownerId,
@@ -562,7 +567,7 @@ export class BrokerTaskService {
 			workspaceLeaseKey: route.workspaceLeaseKey,
 			delegatedExecutionContext: route.delegatedExecutionContext,
 			session: route.session,
-			...(sourceNode === undefined && this.options.requiresEditorForRemote?.()
+			...(continuation !== undefined || (sourceNode === undefined && this.options.requiresEditorForRemote?.())
 				? { requireEditor: true as const } : {}),
 		};
 		const request: OwnedRoutedTaskStart = {
@@ -572,6 +577,9 @@ export class BrokerTaskService {
 		};
 		let persisted = false;
 		try {
+			if (continuation !== undefined && continuation.workspaceIdentity !== route.workspaceLeaseKey) {
+				throw new MeshDomainError('TASK_RECOVERY_UNAVAILABLE', 'The continuation Workspace identity changed.');
+			}
 			const at = this.now();
 			const startRequested: TaskDomainEvent = {
 				type: 'agentStartRequested',
@@ -592,6 +600,7 @@ export class BrokerTaskService {
 			return {
 				route: resolved,
 				acknowledgement: this.snapshot(record),
+				...(continuation === undefined ? {} : { continuation: continuation.descriptor }),
 			};
 		} catch (error: unknown) {
 			if (!persisted) {
@@ -622,6 +631,7 @@ export class BrokerTaskService {
 		sourceLabel: string | undefined,
 		route: ResolvedTaskRoute,
 		outcome: BrokerTaskStartOutcome | undefined,
+		continuation: NodeTaskStartParams['continuation'],
 	): void {
 		const key = taskKey(ownerId, params.taskId);
 		if (this.startDispatches.has(key)) {
@@ -630,7 +640,7 @@ export class BrokerTaskService {
 		if (outcome !== undefined) {
 			outcome.nodeRequestAttempted = true;
 		}
-		const operation = this.dispatchStart(ownerId, params, sourceLabel, route);
+		const operation = this.dispatchStart(ownerId, params, sourceLabel, route, continuation);
 		let tracked!: Promise<void>;
 		tracked = operation.catch(() => {
 			this.recordBackgroundFailure(
@@ -659,6 +669,7 @@ export class BrokerTaskService {
 		params: RoutedTaskStartParams,
 		sourceLabel: string | undefined,
 		route: ResolvedTaskRoute,
+		continuation: NodeTaskStartParams['continuation'],
 	): Promise<void> {
 		let result: z.infer<typeof nodeTaskStartedResultSchema>;
 		try {
@@ -675,6 +686,7 @@ export class BrokerTaskService {
 				LOCAL_BROKER_METHODS.taskStart,
 				toJsonValue({
 					...params,
+					...(continuation === undefined ? {} : { continuation }),
 					authenticatedOwnerId: ownerId,
 					...(route.requireEditor ? { requireEditor: true } : {}),
 					...(remoteTaskApproval === undefined ? {} : { remoteTaskApproval }),
@@ -699,6 +711,11 @@ export class BrokerTaskService {
 				result.taskId !== params.taskId
 				|| result.nodeId !== params.target.nodeId
 				|| result.nodeInstanceId !== params.target.nodeInstanceId
+				|| (continuation !== undefined && (
+					result.recoveryDescriptor?.adapter !== 'ahp'
+					|| result.recoveryDescriptor.sessionId !== continuation.sessionUri
+					|| result.recoveryDescriptor.conversationId !== continuation.chatUri
+				))
 			) {
 				throw new Error('The Window Node returned a mismatched task start result.');
 			}
@@ -732,6 +749,9 @@ export class BrokerTaskService {
 						? {}
 						: { recoveryDescriptor: result.recoveryDescriptor }),
 				});
+			} else if (result.recoveryDescriptor !== undefined) {
+				// Node events can finish the task before the start response arrives.
+				await this.store.recordRecoveryDescriptorOwned(ownerId, params.taskId, result.recoveryDescriptor);
 			}
 		});
 	}
@@ -772,11 +792,13 @@ export class BrokerTaskService {
 		sourceNode?: { readonly nodeId: string; readonly nodeInstanceId: string },
 	): Promise<void> {
 		this.assertTargetDevice(params);
+		await this.awaitContinuationStart(ownerId, params);
 		const records = await this.scanTaskStore();
 		if (this.findExistingStart(records, ownerId, params) !== undefined) {
 			return;
 		}
 		this.assertWorkerDeadline(params.workerDeadline);
+		this.resolveContinuation(records, ownerId, params);
 		await this.registry.validateTaskRoute({
 			ownerId,
 			taskId: params.taskId,
@@ -828,6 +850,59 @@ export class BrokerTaskService {
 			throw new MeshDomainError('IDEMPOTENCY_CONFLICT', 'Delegation idempotency semantics conflict.');
 		}
 		return existing;
+	}
+
+	private async awaitContinuationStart(ownerId: string, params: RoutedTaskStartParams): Promise<void> {
+		if (params.continueFromTaskId === undefined) {
+			return;
+		}
+		if (params.continueFromTaskId === params.taskId) {
+			throw new MeshDomainError('TASK_RECOVERY_UNAVAILABLE', 'A continuation requires a new task ID.');
+		}
+		await this.startDispatches.get(taskKey(ownerId, params.continueFromTaskId));
+	}
+
+	private resolveContinuation(
+		records: readonly TaskRecord[],
+		ownerId: string,
+		params: RoutedTaskStartParams,
+	): { readonly descriptor: NonNullable<NodeTaskStartParams['continuation']>; readonly workspaceIdentity: string } | undefined {
+		if (params.continueFromTaskId === undefined) {
+			return undefined;
+		}
+		const previous = records.find((record) => record.taskId === params.continueFromTaskId);
+		if (
+			previous === undefined
+			|| previous.peerId !== ownerId
+			|| (previous.schemaVersion === 2 && (
+				previous.sourceNodeId !== params.sourceNodeId
+				|| previous.sourceWorkspaceIdentity !== params.sourceWorkspaceIdentity
+			))
+		) {
+			throw new MeshDomainError('TASK_NOT_FOUND', 'The continuation task is not owned by this source.');
+		}
+		if (
+			previous.schemaVersion !== 2
+			|| previous.state !== 'completed'
+			|| previous.target.deviceId !== params.target.deviceId
+			|| previous.target.nodeId !== params.target.nodeId
+			|| previous.target.nodeInstanceId !== params.target.nodeInstanceId
+			|| previous.target.workspaceId !== params.target.workspaceId
+			|| previous.recoveryDescriptor?.adapter !== 'ahp'
+			|| previous.recoveryDescriptor.conversationId === undefined
+		) {
+			throw new MeshDomainError(
+				'TASK_RECOVERY_UNAVAILABLE',
+				'Continuation requires a completed task with a retained Session on the original exact target.',
+			);
+		}
+		return {
+			descriptor: {
+				sessionUri: previous.recoveryDescriptor.sessionId,
+				chatUri: previous.recoveryDescriptor.conversationId,
+			},
+			workspaceIdentity: previous.workspaceLeaseKey,
+		};
 	}
 
 	private localStartParams(
@@ -1244,6 +1319,7 @@ export class BrokerTaskService {
 		delete wire.sourceNodeId;
 		delete wire.sourceWorkspaceIdentity;
 		delete wire.timeoutMinutes;
+		delete wire.continueFromTaskId;
 		if (afterEventSeq === undefined) {
 			return taskSnapshotSchema.parse({
 				...wire,

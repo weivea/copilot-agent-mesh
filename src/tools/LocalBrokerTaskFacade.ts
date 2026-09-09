@@ -453,6 +453,7 @@ export class LocalBrokerTaskFacade implements TaskToolFacade {
 			const input: RoutedTaskStartParams = {
 				delegationRequestId,
 				taskId,
+				...(intent.continueFromTaskId === undefined ? {} : { continueFromTaskId: uuidSchema.parse(intent.continueFromTaskId) }),
 				target,
 				sourceNodeId: this.sourceNodeId,
 				sourceWorkspaceIdentity,

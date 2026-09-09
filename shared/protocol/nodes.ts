@@ -222,6 +222,7 @@ export const taskTargetSchema = z.strictObject({
 export const routedTaskStartParamsSchema = z.strictObject({
 	delegationRequestId: uuidSchema,
 	taskId: uuidSchema,
+	continueFromTaskId: uuidSchema.optional(),
 	target: taskTargetSchema,
 	sourceNodeId: uuidSchema.optional(),
 	sourceWorkspaceIdentity: workspaceIdentitySchema.optional(),
@@ -480,12 +481,24 @@ export const remoteTaskApprovalSchema = z.strictObject({
 export type RemoteTaskApproval = z.infer<typeof remoteTaskApprovalSchema>;
 
 export const nodeTaskStartParamsSchema = routedTaskStartParamsSchema.extend({
+	continuation: z.strictObject({
+		sessionUri: utf8String(PROTOCOL_LIMITS.identifierBytes, 'continuation session URI', 1),
+		chatUri: utf8String(PROTOCOL_LIMITS.identifierBytes, 'continuation chat URI', 1),
+	}).optional(),
 	requireEditor: z.literal(true).optional(),
 	remoteTaskApproval: remoteTaskApprovalSchema.optional(),
 	authenticatedOwnerId: uuidSchema,
 	sourceLabel: utf8String(PROTOCOL_LIMITS.nameBytes, 'task source label', 1),
 	delegationGrant: delegationGrantSchema,
 	delegatedExecutionContext: delegatedExecutionContextSchema,
+}).superRefine((params, context) => {
+	if ((params.continueFromTaskId === undefined) !== (params.continuation === undefined)) {
+		context.addIssue({
+			code: 'custom',
+			path: ['continuation'],
+			message: 'Session continuation requires both a prior task ID and a Broker-resolved descriptor',
+		});
+	}
 });
 
 export const nodeTaskCancelParamsSchema = nodeIdentityParamsSchema.extend({

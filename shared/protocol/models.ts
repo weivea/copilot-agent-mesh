@@ -110,6 +110,7 @@ export const persistedTaskRecordV1Schema = z.strictObject({
 export const persistedTaskRecordV2Schema = z.strictObject({
 	schemaVersion: z.literal(2),
 	...persistedTaskRecordCommonFields,
+	continueFromTaskId: uuidSchema.optional(),
 	target: persistedTaskRoutingTargetSchema,
 	sourceNodeId: uuidSchema.optional(),
 	sourceWorkspaceIdentity: utf8String(1_024, 'source workspace identity', 1).optional(),
