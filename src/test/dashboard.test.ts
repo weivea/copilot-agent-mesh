@@ -1,16 +1,20 @@
 import * as assert from 'assert';
 import { readFile } from 'fs/promises';
-import { runInNewContext } from 'node:vm';
+import { createContext, runInContext } from 'node:vm';
 
 import * as vscode from 'vscode';
 
 import {
 	CONNECTIVITY_ACTIONS,
+	DASHBOARD_MANAGEMENT_ACTIONS,
+	MANAGEMENT_BOOLEAN_ACTIONS,
 	connectivitySnapshotSchema,
 	DISABLED_CONNECTIVITY_SNAPSHOT,
 	timestampSchema,
 	type ConnectivityAction,
 	type ConnectivitySnapshot,
+	type DashboardManagement,
+	type DashboardManagementAction,
 	type RemotePolicyAction,
 } from '../../shared/protocol';
 import type { ListenerSnapshot } from '../application/ListenerService';
@@ -36,18 +40,19 @@ import {
 	type DashboardAction,
 } from '../ui/DashboardMessages';
 import { DashboardPresenter } from '../ui/DashboardPresenter';
+import { createDashboardHtml } from '../ui/DashboardHtml';
 
 suite('Dashboard', () => {
 	test('automatic window removal keeps saved policies and never silently selects the reopened instance', async () => {
 		const media = await createDashboardMediaHarness();
-		const source = snapshot();
-		media.receive({
-			version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view', type: 'dashboard.snapshot',
-			model: new DashboardPresenter().present(source),
-		});
-		media.treeItem('tree-5').click();
+		const source = managedSnapshot();
+		media.present(source);
+		media.permissions('manage-target-1').click();
 		const closed: DashboardSnapshot = {
 			...source,
+			management: {
+				...source.management!, targets: source.management!.targets.filter((target) => target.key !== 'manage-target-1'),
+			},
 			deviceTree: source.deviceTree?.map((device) => device.locality !== 'local' ? device : {
 				...device, nodes: device.nodes.filter((node) => node.key !== 'tree-5'),
 			}),
@@ -56,27 +61,29 @@ suite('Dashboard', () => {
 			})),
 		};
 		const closedModel = new DashboardPresenter().present(closed);
-		media.receive({
-			version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view', type: 'dashboard.snapshot', model: closedModel,
-		});
-		assert.doesNotMatch(media.element('deviceTree').text, /Local Window/u);
-		assert.match(media.element('selectionDetails').text, /previous selection is no longer available/u);
+		media.present(closed);
+		assert.match(media.element('pageContent').text, /no longer available|stale|no longer exists/iu);
 		assert.equal(closedModel.savedAuthorizations.length, 1);
 		const reopened: DashboardSnapshot = {
 			...source,
+			management: {
+				...source.management!, targets: source.management!.targets.map((target) =>
+					target.key === 'manage-target-1' ? { ...target, key: 'manage-target-91' } : target),
+			},
 			deviceTree: source.deviceTree?.map((device) => device.locality !== 'local' ? device : {
 				...device, nodes: device.nodes.map((node) => node.key !== 'tree-5' ? node : {
-					...node, key: 'tree-91', workspaces: node.workspaces.map((workspace) => ({ ...workspace, key: 'tree-92' })),
+					...node, key: 'tree-91', workspaces: node.workspaces.map((workspace) => ({
+						...workspace, key: 'tree-92', permissionKey: 'manage-target-91',
+					})),
 				}),
 			}),
 		};
-		media.receive({
-			version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view', type: 'dashboard.snapshot',
-			model: new DashboardPresenter().present(reopened),
-		});
-		assert.match(media.element('selectionDetails').text, /previous selection is no longer available/u);
-		media.treeItem('tree-91').click();
-		assert.match(media.element('selectionSummary').text, /Local Window/u);
+		media.present(reopened);
+		assert.match(media.element('pageContent').text, /no longer available|stale|no longer exists/iu);
+		assert.equal(media.messages.filter(({ type }) => type === 'action').length, 0);
+		media.button('Overview').click();
+		media.permissions('manage-target-91').click();
+		assert.match(media.element('pageContent').text, /Local Window/u);
 	});
 
 	test('configures a script-enabled webview with media-only resources and a strict CSP', () => {
@@ -97,55 +104,46 @@ suite('Dashboard', () => {
 		assert.ok(view.webview.html.includes(view.webview.cspSource));
 		assert.ok(view.webview.html.includes('dashboard.js'));
 		assert.ok(view.webview.html.includes('dashboard.css'));
-		assert.ok(view.webview.html.includes('Workspace targets'));
-		assert.ok(view.webview.html.includes('This device and Other devices'));
-		assert.ok(view.webview.html.includes('id="tasks-heading">Tasks</h2>'));
-		assert.ok(view.webview.html.includes('Settings and diagnostics'));
-		assert.ok(view.webview.html.includes('Discovery candidates — not workers'));
-		assert.strictEqual(view.webview.html.match(/id="connectivity"/gu)?.length, 1);
-		const connectionCard = view.webview.html.indexOf('id="connectivity"');
-		assert.ok(connectionCard < view.webview.html.indexOf('class="workspaceArea"'));
-		assert.ok(
-			connectionCard < view.webview.html.indexOf('id="settingsDrawer"'),
-			'Enabling connections must not require opening Settings.',
-		);
-		const diagnostics = view.webview.html.match(
-			/<details\b([^>]*)>\s*<summary>Transport diagnostics<\/summary>[\s\S]*?<\/details>/u,
-		);
-		assert.ok(diagnostics);
-		assert.doesNotMatch(diagnostics[1], /\bopen\b/u, 'Transport diagnostics must start collapsed.');
-		assert.ok(diagnostics[0].includes('id="listener"'));
+		assert.ok(view.webview.html.includes('dashboard.l10n.js'));
+		for (const route of ['overview', 'history', 'access']) {
+			assert.ok(view.webview.html.includes(`data-route="${route}"`));
+		}
+		assert.ok(view.webview.html.includes('id="pageScroll"'));
+		assert.ok(view.webview.html.includes('id="pageContent"'));
+		assert.doesNotMatch(view.webview.html, /settingsDrawer|selectionDetails|deviceTree/u);
 		provider.dispose();
 	});
 
-	test('refresh preserves policy-control focus instead of moving it back into the tree or out of Settings', async () => {
+	test('refresh preserves permission-control focus and the selected page', async () => {
 		const media = await createDashboardMediaHarness();
 		media.render(DISABLED_CONNECTIVITY_SNAPSHOT);
-		media.treeItem('tree-3').focus();
-		media.checkbox('Accept incoming tasks for this Workspace').focus();
+		media.permissions('manage-workspace-1').click();
+		media.checkbox('Receive incoming tasks').focus();
 		media.render(DISABLED_CONNECTIVITY_SNAPSHOT);
-		assert.strictEqual(media.focusedElement(), media.checkbox('Accept incoming tasks for this Workspace'));
-		media.button('Settings').click();
+		assert.strictEqual(media.focusedElement(), media.checkbox('Receive incoming tasks'));
+		media.button('Task history').click();
 		media.render(DISABLED_CONNECTIVITY_SNAPSHOT);
-		assert.strictEqual(media.focusedElement(), media.button('Settings'));
-		assert.equal(media.element('settingsDrawer').hidden, false);
+		assert.equal(media.button('Task history').attributes['aria-current'], 'page');
+		assert.doesNotMatch(media.element('pageContent').text, /Receive incoming tasks/u);
 	});
 
 	test('a same-named unbound Workspace cannot borrow the current Workspace receive action', async () => {
 		const media = await createDashboardMediaHarness();
-		const source = snapshot();
+		const source = managedSnapshot();
 		const tree = structuredClone(source.deviceTree);
 		assert.ok(tree);
 		const current = tree[0].nodes[0].workspaces[0];
 		tree[0].nodes[0].workspaces.push({
-			...current, key: 'tree-15', receiveAction: undefined, receiveActionHandle: undefined, incomingPeers: [],
+			...current, key: 'tree-15', permissionKey: undefined,
+			receiveAction: undefined, receiveActionHandle: undefined, incomingPeers: [],
 		});
-		media.receive({
-			version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view',
-			type: 'dashboard.snapshot', model: new DashboardPresenter().present({ ...source, deviceTree: tree }),
-		});
-		media.treeItem('tree-15').click();
-		assert.equal(media.checkbox('Accept incoming tasks for this Workspace').disabled, true);
+		media.present({ ...source, deviceTree: tree });
+		const shortcuts = media.element('pageContent').descendants()
+			.filter((element) => element.tagName === 'button' && element.textContent === 'Permissions');
+		assert.equal(shortcuts.length, 5, 'Every Workspace retains a Permissions shortcut, including unavailable entries.');
+		media.permissions('tree-15').click();
+		assert.match(media.element('pageContent').text, /exact workspace.*unavailable or stale/u);
+		assert.throws(() => media.checkbox('Receive incoming tasks'));
 		assert.equal(media.messages.some((message) => message.type === 'action'), false);
 	});
 
@@ -162,7 +160,7 @@ suite('Dashboard', () => {
 			version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view',
 			type: 'dashboard.snapshot', model: new DashboardPresenter().present({ ...source, deviceTree: tree }),
 		});
-		assert.match(media.element('deviceTree').text, /Window 32/u);
+		assert.match(media.element('pageContent').text, /Window 32/u);
 	});
 
 	test('uses textContent rather than innerHTML for remote strings', async () => {
@@ -171,32 +169,44 @@ suite('Dashboard', () => {
 
 		assert.ok(bundle.includes('textContent'));
 		assert.ok(!bundle.includes('innerHTML'));
-		assert.ok(bundle.includes('Remove saved authorization'));
+		assert.ok(bundle.includes('deleteSavedDevice'));
+		assert.doesNotMatch(bundle, /actionButton\([^;\n]*['"]configure(?:Connectivity|RemotePolicy)['"]/u);
 		assert.ok(bundle.includes(`const version = ${DASHBOARD_MESSAGE_VERSION};`));
 	});
 
 	test('renders default-off connectivity without initiating discovery, authentication, or hosting', async () => {
-		const media = await createDashboardMediaHarness();
+		const media = await createDashboardMediaHarness('en', false);
 		assert.deepStrictEqual(media.messages, [{
 			version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view', type: 'ready',
 		}]);
 		media.render(DISABLED_CONNECTIVITY_SNAPSHOT);
 		assert.strictEqual(media.messages.length, 1);
-		assert.match(media.element('connectivity').text, /Status\s+Off/u);
+		assert.match(media.element('connectivity').text, /Cross-device connections.*Off/u);
+		assert.match(media.element('connectivity').text, /0 connected/u);
+		assert.doesNotMatch(media.element('connectivity').text, /anonymous|CLI|invitation/u);
+		assert.equal(media.element('connectivity').querySelectorAll('.error').length, 0, 'Normal off is not an error.');
+		assert.strictEqual(media.button('Enable cross-device connections').disabled, false);
+		media.button('Manage').click();
 		assert.match(media.element('connectivity').text, /Account\s+Choose when enabling/u);
 		assert.match(media.element('connectivity').text, /Connected devices\s+0/u);
-		assert.match(media.element('connectivity').text, /Receiving Workspaces\s+0/u);
-		assert.match(media.element('connectivity').text, /same account connect automatically through private SDK tunnels/u);
-		assert.match(media.element('connectivity').text, /Workspace task permissions stay separate/u);
-		assert.doesNotMatch(media.element('connectivity').text, /anonymous|CLI|invitation/u);
-		assert.match(media.element('discoveryCandidates').text, /discovery is disabled/u);
+		const help = media.element('connectivity').querySelector('button[aria-label="Help: Cross-device connections"]');
+		assert.ok(help);
+		help.click();
+		assert.match(media.element('helpPopover').text, /same account.*private SDK tunnels/u);
+		assert.match(media.element('helpPopover').text, /receiving permission and source-to-target permission are separate/u);
+		media.button('Close help').click();
+		assert.equal(media.focusedElement(), help);
+		assert.equal(media.messages.length, 1, 'Reading help must not prompt for authentication or change permissions.');
 		assert.deepStrictEqual(
 			media.element('connectivity').descendants().filter(({ tagName }) => tagName === 'button')
-				.map(({ textContent }) => textContent),
-			['Enable cross-device connections', 'Manage devices and permissions…'],
+				.filter((button) => button.textContent !== 'ⓘ').map(({ textContent }) => textContent),
+			['Enable cross-device connections', 'Refresh remote devices'],
 		);
 		assert.strictEqual(media.button('Enable cross-device connections').disabled, false);
-		assert.strictEqual(media.button('Manage devices and permissions…').disabled, false);
+		assert.strictEqual(media.button('Refresh remote devices').disabled, true);
+		assert.match(media.element('discoveryCandidates').text, /discovery is disabled/u);
+		assert.match(media.element('diagnostics').text, /Receiving workspaces\s+0/u);
+		assert.equal(media.element('diagnostics').open, false, 'Transport diagnostics must start collapsed.');
 		assert.deepStrictEqual(
 			media.element('listener').descendants().filter(({ tagName }) => tagName === 'button'), [],
 		);
@@ -208,7 +218,7 @@ suite('Dashboard', () => {
 			assert.throws(() => media.button(label), `Removed or inapplicable action: ${label}`);
 		}
 		media.button('Enable cross-device connections').click();
-		assert.match(media.element('operationStatus').text, /VS Code account prompt/u);
+		assert.match(media.element('operationStatus').text, /Action in progress/u);
 		assert.doesNotMatch(media.element('operationStatus').text, /Broker owner/u);
 		assert.deepStrictEqual(media.messages.at(-1), {
 			version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view',
@@ -220,28 +230,28 @@ suite('Dashboard', () => {
 		const media = await createDashboardMediaHarness();
 		const source = { ...connectivitySnapshot(), connectedDeviceCount: 2, receivingWorkspaceCount: 0 };
 		media.render(source);
+		assert.match(media.element('pageContent').text, /Lab Mac/u);
+		media.button('Devices & permissions').click();
 		const candidateText = media.element('discoveryCandidates').text;
 		assert.match(candidateText, /Unknown/u);
 		assert.doesNotMatch(candidateText, /Offline|Ready/u);
-		assert.match(candidateText, /not an executable worker or a task grant/u);
-		assert.match(candidateText, /identity is checked automatically before connecting/u);
+		assert.match(candidateText, /not workers/u);
+		assert.match(candidateText, /Mesh authentication.*required/u);
 		assert.throws(() => media.button('Pair this candidate…'));
-		assert.match(media.element('connectivity').text, /Status\s+Online/u);
-		assert.match(media.element('connectivity').text, /Account\s+Microsoft · Mesh test account/u);
+		assert.match(media.element('connectivity').text, /Cross-device connections.*Online/u);
+		assert.match(media.element('connectivity').text, /Account\s+Mesh test account/u);
 		assert.match(media.element('connectivity').text, /Connected devices\s+2/u);
-		assert.match(media.element('connectivity').text, /Receiving Workspaces\s+0/u);
-		assert.match(media.element('connectivity').text, /Device identity and Workspace permissions are kept/u);
+		assert.match(media.element('diagnostics').text, /Receiving workspaces\s+0/u);
 		assert.match(media.element('incomingPeers').text, /Active/u);
-		assert.strictEqual(media.checkbox(/Automatically accept tasks from Lab Mac/u).checked, false);
 		assert.deepStrictEqual(
 			media.element('connectivity').descendants().filter(({ tagName }) => tagName === 'button')
-				.map(({ textContent }) => textContent),
-			['Disable cross-device connections', 'Manage devices and permissions…'],
+				.filter((button) => button.textContent !== 'ⓘ').map(({ textContent }) => textContent),
+			['Disable cross-device connections', 'Refresh remote devices'],
 		);
 		for (const [label, action] of [
 			['Disable cross-device connections', 'disableConnectivity'],
-			['Manage devices and permissions…', 'configureConnectivity'],
-			['Revoke incoming peer…', 'revokeIncomingPeer'],
+			['Refresh remote devices', 'refreshRemoteTargets'],
+			['Revoke trust', 'revokeDevice'],
 		] as const) {
 			media.render(source);
 			assert.strictEqual(media.button(label).disabled, false);
@@ -255,22 +265,20 @@ suite('Dashboard', () => {
 		}
 
 		media.render({ ...source, accountProvider: 'github', candidates: [] });
-		assert.match(media.element('connectivity').text, /Account\s+GitHub · Mesh test account/u);
-		assert.match(media.element('discoveryCandidates').text, /same account on each device/u);
+		assert.match(media.element('connectivity').text, /Account\s+Mesh test account/u);
+		assert.match(media.element('discoveryCandidates').text, /No discovery candidates/u);
 		assert.strictEqual(media.messages.filter(({ type }) => type === 'action').length, 3);
 	});
 
 	test('Windows exposes the receive checkbox without granting reception automatically', async () => {
 		const media = await createDashboardMediaHarness();
-		const source = snapshot();
-		media.receive({
-			version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view', type: 'dashboard.snapshot',
-			model: new DashboardPresenter().present({
+		const source = managedSnapshot();
+		media.present({
 				...source,
 				device: { ...source.device, platform: 'Windows', architecture: 'x64', workerSupported: true },
-			}),
 		});
-		const receive = media.checkbox('Accept incoming tasks for this Workspace');
+		media.permissions('manage-workspace-1').click();
+		const receive = media.checkbox('Receive incoming tasks');
 		assert.strictEqual(receive.disabled, false);
 		assert.strictEqual(receive.checked, false);
 		assert.strictEqual(media.messages.length, 1);
@@ -278,24 +286,29 @@ suite('Dashboard', () => {
 
 	test('an explicitly disabled peer policy explains the unavailable checkbox in Workspace details', async () => {
 		const media = await createDashboardMediaHarness();
-		const source = snapshot();
+		const source = managedSnapshot();
 		const tree = structuredClone(source.deviceTree!);
 		const workspace = tree[0].nodes[0].workspaces[0];
 		delete workspace.receiveAction;
 		delete workspace.receiveActionHandle;
-		media.receive({
-			version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view', type: 'dashboard.snapshot',
-			model: new DashboardPresenter().present({
+		media.present({
 				...source, deviceTree: tree,
+				management: {
+					...source.management!, workspaces: source.management!.workspaces.map((workspace) => ({
+						...workspace, receiveActionHandle: undefined,
+					})),
+				},
 				thisWindow: {
 					...source.thisWindow, previewEnabled: false, canRename: false,
 					canSetAcceptIncoming: false, acceptActionHandle: undefined,
 					detail: 'Local peer delegation is disabled in VS Code settings.',
 				},
-			}),
 		});
-		assert.strictEqual(media.checkbox('Accept incoming tasks for this Workspace').disabled, true);
-		assert.match(media.element('selectionDetails').text, /peer delegation is disabled in VS Code settings/u);
+		media.permissions('manage-workspace-1').click();
+		assert.strictEqual(media.checkbox('Receive incoming tasks').disabled, true);
+		assert.match(media.element('pageContent').text, /Permission changes are unavailable/u);
+		media.button('Devices & permissions').click();
+		assert.match(media.element('pageContent').text, /peer delegation is disabled in VS Code settings/u);
 	});
 
 	test('unsupported platforms cannot start account connections but retain cleanup controls', async () => {
@@ -318,8 +331,10 @@ suite('Dashboard', () => {
 	});
 
 	test('renders startup, authentication, stopping, and cleanup states without duplicate Listener controls', async () => {
-		const media = await createDashboardMediaHarness();
+		const media = await createDashboardMediaHarness('en', false);
 		const source = connectivitySnapshot();
+		media.render(source);
+		media.button('Devices & permissions').click();
 		for (const [connectionState, status, actionLabel] of [
 			['disabled', 'Off', 'Enable cross-device connections'],
 			['authenticating', 'Waiting for account authorization', 'Cancel connection startup'],
@@ -339,11 +354,12 @@ suite('Dashboard', () => {
 			});
 			assert.match(
 				media.element('connectivity').text,
-				new RegExp(`Status\\s+${status}\\s+Account`, 'u'),
+				new RegExp(`Cross-device connections.*${status}.*Account`, 'u'),
 				connectionState,
 			);
 			assert.strictEqual(media.button(actionLabel).disabled, connectionState === 'stopping');
-			assert.strictEqual(media.button('Manage devices and permissions…').disabled, false);
+			assert.strictEqual(media.button('Devices & permissions').disabled, false);
+			media.button('Devices & permissions').click();
 			assert.deepStrictEqual(
 				media.element('listener').descendants().filter(({ tagName }) => tagName === 'button'), [],
 			);
@@ -361,7 +377,7 @@ suite('Dashboard', () => {
 				});
 			}
 			if (connectionState === 'cleanupPending') {
-				assert.match(media.element('connectivity').text, /Tunnel cleanup is incomplete/u);
+				assert.match(media.element('connectivity').text, /account that owns the Tunnel to finish cleanup/u);
 				assert.strictEqual(media.button('Retry Tunnel cleanup').disabled, false);
 				assert.doesNotMatch(media.element('connectivity').text, /Tunnel (?:was |is )?deleted/u);
 			}
@@ -369,7 +385,7 @@ suite('Dashboard', () => {
 	});
 
 	test('keeps cleanup failure and revocation visible until explicitly retried', async () => {
-		const media = await createDashboardMediaHarness();
+		const media = await createDashboardMediaHarness('en', false);
 		const source = connectivitySnapshot();
 		media.render({
 			...source,
@@ -382,16 +398,17 @@ suite('Dashboard', () => {
 			candidates: [{ ...source.candidates[0], stale: true, hostHint: 'offline', admission: 'legacy-mesh-auth' }],
 			incomingPeers: [{ ...source.incomingPeers[0], state: 'revoked', cleanupPending: true }],
 		});
+		media.button('Devices & permissions').click();
 		assert.match(media.element('discoveryCandidates').text, /Offline/u);
 		assert.match(media.element('discoveryCandidates').text, /stale/iu);
-		assert.match(media.element('discoveryCandidates').text, /Legacy CLI admission/u);
+		assert.match(media.element('discoveryCandidates').text, /Legacy outer port.*Mesh authentication/u);
 		assert.match(media.element('incomingPeers').text, /Revoked/u);
-		assert.match(media.element('incomingPeers').text, /cleanup is still pending/u);
-		assert.match(media.element('connectivity').text, /safe display limit/u);
-		assert.match(media.element('connectivity').text, /Tunnel cleanup is incomplete/u);
+		assert.match(media.element('incomingPeers').text, /cleanup is pending/u);
+		assert.match(media.element('pageContent').text, /safe display limit/u);
+		assert.match(media.element('connectivity').text, /account that owns the Tunnel to finish cleanup/u);
 		assert.match(media.element('connectivity').text, /CLEANUP_FAILED/u);
 		assert.throws(() => media.button('Pair this candidate…'));
-		assert.strictEqual(media.button('Revoke incoming peer…').disabled, true);
+		assert.throws(() => media.button('Revoke incoming peer'));
 		assert.strictEqual(media.button('Retry Tunnel cleanup').disabled, false);
 		assert.strictEqual(media.messages.length, 1, 'Rendering pending cleanup must not retry it.');
 
@@ -410,8 +427,8 @@ suite('Dashboard', () => {
 			});
 		}
 		media.render({ ...DISABLED_CONNECTIVITY_SNAPSHOT, accountProvider: 'microsoft', accountLabel: source.accountLabel });
-		assert.match(media.element('connectivity').text, /Status\s+Off/u);
-		assert.match(media.element('connectivity').text, /Account\s+Microsoft · Mesh test account/u);
+		assert.match(media.element('connectivity').text, /Cross-device connections.*Off/u);
+		assert.match(media.element('connectivity').text, /Account\s+Mesh test account/u);
 		assert.throws(() => media.button('Retry Tunnel cleanup'));
 
 		for (const error of connectivitySnapshotSchema.shape.error.unwrap().options) {
@@ -422,7 +439,7 @@ suite('Dashboard', () => {
 	});
 
 	test('media rejects mismatched versions, cross-view messages, raw Broker handles, and connectivity injection', async () => {
-		const media = await createDashboardMediaHarness();
+		const media = await createDashboardMediaHarness('en', false);
 		media.render(DISABLED_CONNECTIVITY_SNAPSHOT);
 		const original = media.element('connectivity').text;
 		const model = withScopedConnectivity(connectivitySnapshot());
@@ -445,45 +462,47 @@ suite('Dashboard', () => {
 				...model.connectivity, incomingPeers: [{ ...model.connectivity.incomingPeers[0], label: `sha256:${'a'.repeat(43)}` }],
 			} } },
 			{ ...valid, model: { ...model, deviceTree: [{ ...model.deviceTree[0], path: '/private/project' }] } },
+			{ ...valid, model: { ...model, management: { ...model.management, accountId: 'private-account' } } },
+			{ ...valid, model: { ...model, management: {
+				...model.management, accountActionHandle: '00000000-0000-4000-8000-000000000501',
+			} } },
+			{ ...valid, model: { ...model, management: {
+				...model.management, targets: [{ workspaceIdentity: `sha256:${'a'.repeat(43)}` }],
+			} } },
 		]) {
 			media.receive(invalid);
 			assert.strictEqual(media.element('connectivity').text, original);
 		}
 	});
 
-	test('renders the device tree layout with persistent expansion, selection, and keyboard navigation', async () => {
-		const media = await createDashboardMediaHarness();
+	test('navigates independent Overview, history, and permissions pages without native menus', async () => {
+		const media = await createDashboardMediaHarness('en', false);
 		media.render(DISABLED_CONNECTIVITY_SNAPSHOT);
-
-		assert.match(media.element('deviceTree').text, /This device/u);
-		assert.match(media.element('deviceTree').text, /Other devices/u);
-		assert.match(media.selectedTreeLabel() ?? '', /service-workspace/u);
-		assert.match(media.element('selectionSummary').text, /test-device.*This Window.*service-workspace/u);
-		assert.doesNotMatch(media.element('deviceTree').text, /Candidate abcdef01/u);
-
-		media.treeItem('tree-7').click();
-		assert.match(media.element('selectionSummary').text, /Lab Mac/u);
-		media.treeItem('tree-7').click();
-		assert.doesNotMatch(media.element('deviceTree').text, /billing-api/u);
-		media.treeItem('tree-7').keydown('ArrowRight');
-		assert.match(media.selectedTreeLabel() ?? '', /Backend window/u);
-		media.treeItem('tree-8').keydown('ArrowRight');
-		assert.match(media.element('deviceTree').text, /billing-api/u);
-		media.treeItem('tree-8').keydown('ArrowDown');
-		assert.match(media.selectedTreeLabel() ?? '', /orders-api/u);
-		media.treeItem('tree-10').click();
-		assert.match(media.element('selectionSummary').text, /Lab Mac.*Backend window.*billing-api/u);
-
+		assert.match(media.element('pageContent').text, /This device/u);
+		assert.match(media.element('pageContent').text, /service-workspace/u);
+		assert.doesNotMatch(media.element('pageContent').text, /billing-api/u);
+		assert.doesNotMatch(media.element('pageContent').text, /Candidate abcdef01/u);
+		media.button('Task history').click();
+		assert.equal(media.button('Task history').attributes['aria-current'], 'page');
+		assert.doesNotMatch(media.element('pageContent').text, /Implement authentication/u);
+		media.button('Devices & permissions').click();
+		assert.equal(media.button('Devices & permissions').attributes['aria-current'], 'page');
 		media.render(DISABLED_CONNECTIVITY_SNAPSHOT);
-		assert.match(media.selectedTreeLabel() ?? '', /billing-api/u);
-		assert.match(media.element('deviceTree').text, /billing-api/u);
+		assert.equal(media.button('Devices & permissions').attributes['aria-current'], 'page');
+		media.button('Overview').click();
+		assert.match(media.element('pageContent').text, /Implement authentication/u);
+		assert.equal(media.messages.filter(({ type }) => type === 'action').length, 0, 'Navigation never invokes nested native menus.');
 	});
 
 	test('uses stable presentation keys for duplicate labels and does not silently retarget stale selections', async () => {
 		const media = await createDashboardMediaHarness();
-		const source = snapshot();
+		const source = managedSnapshot();
 		const duplicateNames = {
 			...source,
+			management: {
+				...source.management!, targets: source.management!.targets.map((target) =>
+					target.locality === 'remote' ? { ...target, workspaceName: 'shared-target' } : target),
+			},
 			deviceTree: source.deviceTree?.map((device) => device.key !== 'tree-7'
 				? device
 				: {
@@ -497,22 +516,13 @@ suite('Dashboard', () => {
 					})),
 				}),
 		};
-		media.receive({
-			version: DASHBOARD_MESSAGE_VERSION,
-			uiInstanceId: 'media-view',
-			type: 'dashboard.snapshot',
-			model: new DashboardPresenter().present(duplicateNames),
-		});
-		media.treeItem('tree-7').click();
-		media.treeItem('tree-7').keydown('ArrowRight');
-		media.treeItem('tree-8').click();
-		media.treeItem('tree-8').keydown('ArrowRight');
-		media.treeItem('tree-10').click();
-		assert.strictEqual(media.treeItem('tree-10').attributes['aria-selected'], 'true');
-		assert.strictEqual(media.treeItem('tree-9').attributes['aria-selected'], 'false');
+		media.present(duplicateNames);
+		media.permissions('manage-target-3').click();
+		assert.match(media.element('pageContent').text, /shared-target/u);
 
 		const reordered = {
 			...duplicateNames,
+			management: { ...duplicateNames.management, targets: [...duplicateNames.management.targets].reverse() },
 			deviceTree: duplicateNames.deviceTree?.map((device) => device.key !== 'tree-7'
 				? device
 				: {
@@ -523,17 +533,15 @@ suite('Dashboard', () => {
 					})),
 				}),
 		};
-		media.receive({
-			version: DASHBOARD_MESSAGE_VERSION,
-			uiInstanceId: 'media-view',
-			type: 'dashboard.snapshot',
-			model: new DashboardPresenter().present(reordered),
-		});
-		assert.strictEqual(media.treeItem('tree-10').attributes['aria-selected'], 'true');
-		assert.strictEqual(media.treeItem('tree-9').attributes['aria-selected'], 'false');
+		media.present(reordered);
+		assert.match(media.element('pageContent').text, /shared-target/u);
+		assert.equal(media.checkbox('Allow this target').checked, true, 'Exact selected target survives row reordering.');
 
 		const removed = {
 			...reordered,
+			management: {
+				...reordered.management, targets: reordered.management.targets.filter((target) => target.key !== 'manage-target-3'),
+			},
 			deviceTree: reordered.deviceTree?.map((device) => device.key !== 'tree-7'
 				? device
 				: {
@@ -544,64 +552,110 @@ suite('Dashboard', () => {
 					})),
 				}),
 		};
-		media.receive({
-			version: DASHBOARD_MESSAGE_VERSION,
-			uiInstanceId: 'media-view',
-			type: 'dashboard.snapshot',
-			model: new DashboardPresenter().present(removed),
-		});
-		assert.strictEqual(media.selectedTreeLabel(), undefined);
-		assert.match(media.element('selectionDetails').text, /will not silently retarget/u);
+		media.present(removed);
+		assert.match(media.element('pageContent').text, /no longer available|stale|no longer exists/iu);
+		assert.throws(() => media.checkbox('Allow this target'));
+		assert.equal(media.messages.filter(({ type }) => type === 'action').length, 0);
+	});
+
+	test('Overview contains every nonterminal task and history filters every terminal status without deletion', async () => {
+		const media = await createDashboardMediaHarness();
+		const source = snapshot();
+		const activeStates = ['accepted', 'startingAgent', 'running', 'needsInput', 'recovering', 'cancelling'] as const;
+		const terminalStates = ['completed', 'failed', 'cancelled', 'timedOut'] as const;
+		const tasks = (direction: 'incoming' | 'outgoing') => [...activeStates, ...terminalStates].map((state, index) => ({
+			...source.outgoingTasks![0], state, title: `${direction} ${state} task`,
+			shortId: `${direction === 'incoming' ? 'a' : 'b'}${index}`.padEnd(8, 'a'),
+			canCancel: !(terminalStates as readonly string[]).includes(state),
+			actionHandle: (terminalStates as readonly string[]).includes(state) ? undefined : `${direction}${index}`.padEnd(32, 'a'),
+		}));
+		media.present({ ...source, outgoingTasks: tasks('outgoing'), incomingTasks: tasks('incoming') });
+		for (const direction of ['incoming', 'outgoing']) {
+			for (const state of activeStates) { assert.ok(media.element('pageContent').text.includes(`${direction} ${state} task`)); }
+			for (const state of terminalStates) { assert.ok(!media.element('pageContent').text.includes(`${direction} ${state} task`)); }
+		}
+		media.button('Task history').click();
+		for (const direction of ['incoming', 'outgoing']) {
+			for (const state of terminalStates) { assert.ok(media.element('pageContent').text.includes(`${direction} ${state} task`)); }
+			for (const state of activeStates) { assert.ok(!media.element('pageContent').text.includes(`${direction} ${state} task`)); }
+		}
+		const selectWithValue = (value: string) => {
+			const select = media.element('pageContent').querySelectorAll('select').find((candidate) =>
+				candidate.children.some((option) => option.value === value));
+			assert.ok(select, `History filter must support ${value}`);
+			return select;
+		};
+		selectWithValue('incoming').change('incoming');
+		for (const state of terminalStates) {
+			assert.ok(media.element('pageContent').text.includes(`incoming ${state} task`));
+			assert.ok(!media.element('pageContent').text.includes(`outgoing ${state} task`));
+		}
+		for (const state of terminalStates) {
+			selectWithValue(state).change(state);
+			assert.ok(media.element('pageContent').text.includes(`incoming ${state} task`));
+			for (const other of terminalStates.filter((candidate) => candidate !== state)) {
+				assert.ok(!media.element('pageContent').text.includes(`incoming ${other} task`));
+			}
+		}
+		assert.ok(media.element('pageContent').querySelectorAll('button').every((button) => !/delete|remove|cancel task/iu.test(button.text)));
+		assert.equal(media.messages.filter(({ type }) => type === 'action').length, 0);
+	});
+
+	test('uses the VS Code language for page navigation without translating remote display names', async () => {
+		for (const [language, overview, history, access] of [
+			['en', 'Overview', 'Task history', 'Devices & permissions'],
+			['zh-CN', '概览', '任务历史', '设备与权限'],
+		]) {
+			const media = await createDashboardMediaHarness(language, false);
+			media.render(DISABLED_CONNECTIVITY_SNAPSHOT);
+			assert.equal(media.button(overview).attributes['aria-current'], 'page');
+			assert.match(media.element('pageContent').text, /service-workspace/u);
+			assert.ok(media.element('connectivity').text.includes(language === 'en' ? 'Cross-device connections' : '跨设备连接'));
+			assert.ok(media.button(language === 'en' ? 'Refresh local' : '刷新本机'));
+			media.button(history).click();
+			assert.equal(media.button(history).attributes['aria-current'], 'page');
+			media.button(access).click();
+			assert.equal(media.button(access).attributes['aria-current'], 'page');
+			assert.equal(media.messages.length, 1);
+		}
 	});
 
 	test('renders exact remote policy checkboxes and opens Chat drafts without extra modal actions', async () => {
 		const media = await createDashboardMediaHarness();
-		media.render(DISABLED_CONNECTIVITY_SNAPSHOT);
-
-		const autoAccept = media.checkbox(/Automatically accept tasks from Lab Mac/u);
+		media.render(connectivitySnapshot());
+		media.permissions('manage-workspace-1').click();
+		const autoAccept = media.checkbox('Start automatically without asking');
 		assert.strictEqual(autoAccept.checked, false);
-		assert.match(media.element('selectionDetails').text, /Skips task-start confirmation, not sensitive tool approvals/u);
+		assert.match(media.element('pageContent').text, /Ask before starting is the default/u);
 		autoAccept.toggle();
-		assert.deepStrictEqual(media.messages.at(-1), {
-			version: DASHBOARD_MESSAGE_VERSION,
-			uiInstanceId: 'media-view',
-			type: 'action',
-			action: 'setRemoteAutoAccept',
-			actionHandle: 'f'.repeat(32),
-			enabled: true,
-		});
-
-		media.treeItem('tree-7').click();
-		media.treeItem('tree-7').keydown('ArrowRight');
-		media.treeItem('tree-8').click();
-		media.treeItem('tree-8').keydown('ArrowRight');
-		media.treeItem('tree-10').click();
-		assert.match(
-			media.element('selectionDetails').text,
-			/Authorize this window’s claimed source Workspaces for this remote Workspace/u,
-		);
-		assert.match(
-			media.element('selectionDetails').text,
-			/Applies to all claimed source roots in this window/u,
-		);
-		media.button('Delegate from Chat…').click();
+		assert.equal(media.messages.at(-1)?.action, 'setDeviceAutoAccept');
+		assert.equal(media.messages.at(-1)?.enabled, true);
+		assert.ok(parseDashboardInboundMessage(media.messages.at(-1)));
+		const automatic = managedSnapshot();
+		automatic.management!.workspaces[0].incomingPeers[0].autoAccept = true;
+		media.present(automatic);
+		assert.match(media.element('pageContent').text, /Sensitive operations still require confirmation/u);
+		media.render(connectivitySnapshot());
+		media.button('Overview').click();
+		media.permissions('manage-target-3').click();
+		assert.equal(media.checkbox('Allow this target').checked, true);
+		assert.match(media.element('pageContent').text, /receiving permission is controlled on the target device/iu);
+		assert.match(media.element('pageContent').text, /all.*(?:source|Workspace)|whole.window/iu);
+		media.button('Overview').click();
+		media.button('Delegate in Chat').click();
 		assert.deepStrictEqual(media.messages.at(-1), {
 			version: DASHBOARD_MESSAGE_VERSION,
 			uiInstanceId: 'media-view',
 			type: 'action',
 			action: 'openTargetChat',
-			actionHandle: 'j'.repeat(32),
+			actionHandle: 'g'.repeat(32),
 		});
 	});
 
 	test('renders unknown remote device state as cached metadata without guessed availability', async () => {
 		const media = await createDashboardMediaHarness();
-		const value = snapshot();
-		media.receive({
-			version: DASHBOARD_MESSAGE_VERSION,
-			uiInstanceId: 'media-view',
-			type: 'dashboard.snapshot',
-			model: new DashboardPresenter().present({
+		const value = managedSnapshot();
+		media.present({
 				...value,
 				deviceTree: value.deviceTree?.map((device) => device.key !== 'tree-7'
 					? device
@@ -617,13 +671,210 @@ suite('Dashboard', () => {
 							})),
 						})),
 					}),
-			}),
 		});
-		media.treeItem('tree-7').click();
-		assert.match(media.element('selectionDetails').text, /Unknown\/Cached/u);
-		assert.match(media.element('selectionDetails').text, /Refresh connected devices/u);
-		assert.throws(() => media.button('Delegate from Chat…'));
-		assert.doesNotMatch(media.element('selectionDetails').text, /Online|Offline/u);
+		assert.doesNotMatch(media.element('pageContent').text, /Lab Mac|billing-api/u);
+		media.button('Devices & permissions').click();
+		media.button('Saved devices').click();
+		assert.match(media.element('pageContent').text, /Unknown workstation/u);
+		assert.match(media.element('pageContent').text, /unknown/iu);
+		assert.match(media.element('pageContent').text, /Task state is unknown/u);
+		assert.doesNotMatch(media.element('pageContent').text, /Delegate in Chat/u);
+	});
+
+	test('target permissions default to one exact source and require an explicit independent bulk action', async () => {
+		const media = await createDashboardMediaHarness();
+		media.render(connectivitySnapshot());
+		media.permissions('manage-target-3').click();
+		const source = media.element('pageContent').querySelector('select[aria-label="Source workspace"]');
+		assert.ok(source);
+		assert.equal(source.value, 'manage-workspace-1');
+		assert.throws(() => media.checkbox('Receive incoming tasks'), 'Remote receiving remains read-only.');
+		assert.equal(media.checkbox('Allow this target').checked, true);
+		media.checkbox('Allow this target').toggle();
+		const first = media.messages.at(-1)!;
+		assert.equal(first.action, 'setTargetAllowed');
+		assert.equal(first.enabled, false);
+		media.render(connectivitySnapshot());
+		media.element('pageContent').querySelector('select[aria-label="Source workspace"]')!.change('manage-workspace-2');
+		assert.equal(media.checkbox('Allow this target').checked, false);
+		media.checkbox('Allow this target').toggle();
+		const second = media.messages.at(-1)!;
+		assert.equal(second.action, 'setTargetAllowed');
+		assert.equal(second.enabled, true);
+		assert.notEqual(first.actionHandle, second.actionHandle, 'Different roots must not share the exact-source capability.');
+		media.render(connectivitySnapshot());
+		const bulkDisclosure = media.element('pageContent').querySelector('details');
+		assert.ok(bulkDisclosure);
+		assert.equal(bulkDisclosure.open, false);
+		bulkDisclosure.children[0].click();
+		assert.equal(bulkDisclosure.open, true);
+		media.button('Allow all listed workspaces').click();
+		const bulk = media.messages.at(-1)!;
+		assert.equal(bulk.action, 'setWindowTargetAllowed');
+		assert.equal(bulk.enabled, true);
+		assert.notEqual(bulk.actionHandle, first.actionHandle);
+		assert.notEqual(bulk.actionHandle, second.actionHandle);
+		for (const message of [first, second, bulk]) {
+			assert.ok(parseDashboardInboundMessage(message));
+			assert.deepEqual(Object.keys(message).sort(), ['action', 'actionHandle', 'enabled', 'type', 'uiInstanceId', 'version']);
+		}
+	});
+
+	test('supports opaque 64-character management keys and missing offline grant capabilities', async () => {
+		const media = await createDashboardMediaHarness();
+		const expandKey = (value: string) => value.replace(
+			/^(manage-(?:workspace|target|device|peer)-)([1-9][0-9]*)$/u,
+			(_all, prefix: string, suffix: string) => prefix + suffix.padStart(64 - prefix.length, '1'),
+		);
+		const source = JSON.parse(JSON.stringify(managedSnapshot(), (_key, value: unknown) =>
+			typeof value === 'string' ? expandKey(value) : value)) as DashboardSnapshot;
+		const targetKey = expandKey('manage-target-3');
+		const sourceKey = expandKey('manage-workspace-1');
+		assert.equal(targetKey.length, 64);
+		assert.equal(sourceKey.length, 64);
+		media.present(source);
+		media.permissions(targetKey).click();
+		assert.equal(media.element('pageContent').querySelector('select[aria-label="Source workspace"]')?.value, sourceKey);
+		assert.equal(media.checkbox('Allow this target').disabled, false);
+		assert.equal(media.checkbox('Allow this target').checked, true);
+		media.present({
+			...source, management: {
+				...source.management!, targets: source.management!.targets.map((target) => target.key !== targetKey ? target : {
+					...target, online: false, allSourcesActionHandle: undefined,
+					sources: target.sources.map((grant) => ({ ...grant, actionHandle: undefined })),
+				}),
+			},
+		});
+		assert.equal(media.checkbox('Allow this target').disabled, true);
+		assert.equal(media.button('Allow all listed workspaces').disabled, true);
+		assert.equal(media.button('Remove access for all listed workspaces').disabled, true);
+		assert.match(media.element('pageContent').text, /offline or cached/u);
+		assert.equal(media.messages.filter(({ type }) => type === 'action').length, 0);
+		assert.doesNotMatch(JSON.stringify(media.messages), /manage-(?:workspace|target|device|peer)-/u);
+	});
+
+	test('a removed selected source is not replaced by a same-named new Workspace', async () => {
+		const media = await createDashboardMediaHarness();
+		const source = managedSnapshot();
+		media.present(source);
+		media.permissions('manage-target-3').click();
+		media.present({
+			...source,
+			management: {
+				...source.management!,
+				workspaces: source.management!.workspaces.map((workspace) =>
+					workspace.key === 'manage-workspace-1' ? { ...workspace, key: 'manage-workspace-91' } : workspace),
+				targets: source.management!.targets.map((target) => ({
+					...target, sources: target.sources.map((grant) => grant.sourceKey === 'manage-workspace-1'
+						? { ...grant, sourceKey: 'manage-workspace-91' } : grant),
+				})),
+			},
+			deviceTree: source.deviceTree?.map((device) => ({
+				...device, nodes: device.nodes.map((node) => ({
+					...node, workspaces: node.workspaces.map((workspace) => workspace.permissionKey === 'manage-workspace-1'
+						? { ...workspace, key: 'tree-91', permissionKey: 'manage-workspace-91' } : workspace),
+				})),
+			})),
+		});
+		assert.equal(media.checkbox('Allow this target').disabled, true);
+		assert.equal(media.element('pageContent').querySelector('select[aria-label="Source workspace"]')?.value, '');
+		assert.equal(media.messages.filter(({ type }) => type === 'action').length, 0);
+	});
+
+	test('saved-device deletion blocks active and unknown tasks while trust revocation remains separate', async () => {
+		const media = await createDashboardMediaHarness();
+		const source = managedSnapshot();
+		media.present({
+			...source, management: {
+				...source.management!, devices: source.management!.devices.map((device) =>
+					device.key === 'manage-device-1' ? { ...device, state: 'offline' } : device),
+			},
+		});
+		media.button('Saved devices').click();
+		const rows = media.element('savedDevices').querySelectorAll('article');
+		for (const [name, canDelete] of [
+			['Lab Mac', false], ['Saved laptop', true], ['Unknown workstation', false],
+		] as const) {
+			const row = rows.find((row) => row.text.includes(name));
+			assert.ok(row);
+			const deletion = row.querySelectorAll('button').find((button) => button.textContent === 'Delete saved device');
+			const revoke = row.querySelectorAll('button').find((button) => button.textContent === 'Revoke trust');
+			assert.ok(deletion && revoke);
+			assert.equal(deletion.disabled, !canDelete);
+			assert.equal(revoke.disabled, false, 'Revocation remains possible even if tasks are active or unknown.');
+			assert.match(row.text, /Confirmation is required/u);
+			assert.match(row.text, /Task history is preserved/u);
+		}
+		assert.equal(media.messages.filter(({ type }) => type === 'action').length, 0, 'Rendering deletion or revocation never mutates state.');
+		rows.find((row) => row.text.includes('Lab Mac'))!.querySelectorAll('button')
+			.find((button) => button.textContent === 'Revoke trust')!.click();
+		assert.equal(media.messages.at(-1)?.action, 'revokeDevice');
+	});
+
+	test('saved local authorizations offer only removal and never recreate an offline window', async () => {
+		const media = await createDashboardMediaHarness();
+		const source = managedSnapshot();
+		media.present({
+			...source,
+			deviceTree: source.deviceTree?.map((device) => device.locality !== 'local' ? device : {
+				...device, nodes: device.nodes.filter((node) => node.thisWindow),
+			}),
+			policyCandidates: source.policyCandidates?.map((candidate) => ({
+				...candidate, windowLabel: 'Closed Window', online: false, gateState: 'offline',
+			})),
+		});
+		assert.doesNotMatch(media.element('deviceTree').text, /Closed Window|Local Window/u);
+		media.button('Saved devices').click();
+		assert.match(media.element('savedAuthorizations').text, /Closed Window.*not a live window/u);
+		assert.equal(media.element('savedAuthorizations').querySelectorAll('input').length, 0);
+		media.button('Remove saved authorization').click();
+		assert.deepEqual(media.messages.at(-1), {
+			version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view', type: 'action',
+			action: 'setPeerAllowed', actionHandle: 'a'.repeat(32), enabled: false,
+		});
+	});
+
+	test('local refresh, remote refresh, registration, and advanced settings remain independent actions', async () => {
+		const media = await createDashboardMediaHarness();
+		media.render(connectivitySnapshot());
+		media.button('Devices & permissions').click();
+		for (const [label, action] of [
+			['Refresh local', 'refresh'], ['Refresh remote devices', 'refreshRemoteTargets'],
+		]) {
+			media.button(label).click();
+			assert.equal(media.messages.at(-1)?.action, action);
+			media.render(connectivitySnapshot());
+		}
+		media.button('Devices & permissions').click();
+		for (const [label, action] of [
+			['Register current workspace', 'registerWorkspace'], ['Advanced VS Code settings', 'openAdvancedSettings'],
+		]) {
+			media.button(label).click();
+			assert.deepEqual(media.messages.at(-1), {
+				version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view', type: 'action', action,
+			});
+			media.render(connectivitySnapshot());
+		}
+		assert.ok(media.messages.every(({ action }) => action !== 'configureConnectivity' && action !== 'configureRemotePolicy'));
+	});
+
+	test('Back restores the originating Workspace shortcut, disclosure, and scroll position', async () => {
+		const media = await createDashboardMediaHarness();
+		media.render(connectivitySnapshot());
+		const disclosure = media.element('deviceTree').querySelector('details');
+		assert.ok(disclosure);
+		disclosure.children[0].click();
+		assert.equal(disclosure.open, false);
+		media.element('pageScroll').scrollTop = 145;
+		const shortcut = media.permissions('manage-target-3');
+		shortcut.click();
+		assert.equal(media.element('pageScroll').scrollTop, 0);
+		media.button('Back').click();
+		assert.equal(media.element('pageScroll').scrollTop, 145);
+		assert.equal(media.focusedElement(), media.permissions('manage-target-3'));
+		assert.equal(media.button('Overview').attributes['aria-current'], 'page');
+		assert.equal(media.element('deviceTree').querySelector('details')?.open, false);
+		assert.match(media.element('pageContent').text, /billing-api/u);
 	});
 
 	test('validates inbound messages and rejects extra or malformed data', () => {
@@ -697,6 +948,13 @@ suite('Dashboard', () => {
 			action: 'renameWindow',
 			workspaceIdentity: 'sha256:foreign',
 		}), undefined);
+		for (const action of ['openAdvancedSettings', 'registerWorkspace']) {
+			const message = { version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'instance-1', type: 'action', action };
+			assert.deepEqual(parseDashboardInboundMessage(message), message);
+			for (const payload of [{ actionHandle: 'a'.repeat(32) }, { enabled: true }, { workspaceId: 'private-root' }, { path: '/private/project' }]) {
+				assert.equal(parseDashboardInboundMessage({ ...message, ...payload }), undefined);
+			}
+		}
 	});
 
 	test('accepts only exact connectivity actions with kind-specific aliases and no payload', () => {
@@ -788,7 +1046,7 @@ suite('Dashboard', () => {
 		assert.doesNotThrow(() => assertSafeDashboardOutboundMessage(message));
 		assert.throws(() => connectivitySnapshotSchema.parse(model.connectivity));
 		assert.throws(() => assertSafeDashboardOutboundMessage({ ...message, model: presented }));
-		const media = await createDashboardMediaHarness();
+		const media = await createDashboardMediaHarness('en', false);
 		media.receive({ ...message, uiInstanceId: 'media-view' });
 		const original = media.element('connectivity').text;
 
@@ -911,6 +1169,7 @@ suite('Dashboard', () => {
 				} },
 			}));
 		}
+		media.button('Devices & permissions').click();
 		for (const count of [0, 1, 256]) {
 			assert.doesNotThrow(() => assertSafeDashboardOutboundMessage({
 				...message,
@@ -1891,6 +2150,200 @@ suite('Dashboard', () => {
 		provider.dispose();
 	});
 
+	test('management aliases are exact-action, one-view, one-snapshot capabilities without replay', async () => {
+		const facade = new RecordingDashboardFacade();
+		facade.snapshotValue = managedSnapshot();
+		const provider = new AgentMeshViewProvider(facade, getExtension().extensionUri);
+		const first = new TestWebviewView();
+		const second = new TestWebviewView();
+		provider.resolveWebviewView(first);
+		provider.resolveWebviewView(second);
+		const send = (view: TestWebviewView, action: DashboardManagementAction, actionHandle: string) =>
+			view.webview.receive({
+				version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: getUiInstanceId(view.webview.html),
+				type: 'action', action, actionHandle,
+				...(MANAGEMENT_BOOLEAN_ACTIONS.has(action) ? { enabled: true } : {}),
+			});
+		try {
+			for (const view of [first, second]) {
+				await view.webview.receive({
+					version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: getUiInstanceId(view.webview.html), type: 'ready',
+				});
+			}
+			for (const action of DASHBOARD_MANAGEMENT_ACTIONS) {
+				const original = managementHandle(latestModel(first).management, action);
+				const raw = managementHandle(facade.snapshotValue.management!, action);
+				assert.match(original, /^[A-Za-z0-9_-]{32}$/u);
+				assert.notEqual(original, raw);
+				assert.notEqual(original, managementHandle(latestModel(second).management, action));
+				assert.ok(!JSON.stringify(first.webview.sent).includes(raw));
+				const before = facade.calls.length;
+				await send(second, action, original);
+				assert.ok(second.webview.sent.some(({ code }) => code === 'STALE_ACTION'));
+				await send(first, action === 'probeDevice' ? 'revokeDevice' : 'probeDevice', original);
+				assert.ok(first.webview.sent.some(({ code }) => code === 'STALE_ACTION'));
+				assert.equal(facade.calls.length, before, action);
+
+				const refreshed = managementHandle(latestModel(first).management, action);
+				facade.fireChanged();
+				await settle();
+				assert.notEqual(refreshed, managementHandle(latestModel(first).management, action));
+				await send(first, action, refreshed);
+				assert.equal(facade.calls.length, before, `${action}: refresh invalidates settings aliases`);
+				const current = managementHandle(latestModel(first).management, action);
+				await send(first, action, current);
+				await send(first, action, current);
+				assert.deepEqual(facade.calls.slice(before), [
+					`management:${action}:${raw}:${MANAGEMENT_BOOLEAN_ACTIONS.has(action) ? 'true' : ''}`,
+				]);
+			}
+			const disposed = managementHandle(latestModel(first).management, 'revokeDevice');
+			const calls = facade.calls.length;
+			first.dispose();
+			await send(first, 'revokeDevice', disposed);
+			assert.equal(facade.calls.length, calls);
+		} finally { provider.dispose(); }
+	});
+
+	test('saved-device removal cannot be used to enable access or carry caller-supplied identities', async () => {
+		const facade = new RecordingDashboardFacade();
+		facade.snapshotValue = managedSnapshot();
+		const provider = new AgentMeshViewProvider(facade, getExtension().extensionUri);
+		const view = new TestWebviewView();
+		provider.resolveWebviewView(view);
+		const uiInstanceId = getUiInstanceId(view.webview.html);
+		try {
+			await view.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'ready' });
+			const actionHandle = managementHandle(latestModel(view).management, 'deleteSavedDevice');
+			for (const extra of [
+				{ enabled: true }, { deviceId: 'caller-device' }, { peerId: 'caller-peer' },
+				{ workspaceIdentity: `sha256:${'a'.repeat(43)}` }, { sourceKey: 'manage-workspace-1' },
+				{ path: '/private/project' }, { prompt: 'Run caller instructions' },
+				{ accountProvider: 'microsoft' }, { payload: {} },
+			]) {
+				const message = {
+					version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'action',
+					action: 'deleteSavedDevice', actionHandle, ...extra,
+				};
+				assert.equal(parseDashboardInboundMessage(message), undefined);
+				await view.webview.receive(message);
+				assert.equal(facade.calls.length, 0);
+			}
+			await view.webview.receive({
+				version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'action',
+				action: 'setTargetAllowed', actionHandle, enabled: true,
+			});
+			assert.equal(facade.calls.length, 0);
+			assert.ok(view.webview.sent.some(({ code }) => code === 'STALE_ACTION'));
+		} finally { provider.dispose(); }
+	});
+
+	test('unsafe management invalidates existing aliases before any secrets reach the webview', async () => {
+		for (const invalid of [
+			{ accountActionHandle: 'https://example.test/#secret=private-value' },
+			{ accountId: 'private-account' },
+			{ devices: [{ ...managementSnapshot().devices[0], peerId: 'private-peer' }] },
+		]) {
+			const facade = new RecordingDashboardFacade();
+			facade.snapshotValue = managedSnapshot();
+			const provider = new AgentMeshViewProvider(facade, getExtension().extensionUri);
+			const view = new TestWebviewView();
+			provider.resolveWebviewView(view);
+			const uiInstanceId = getUiInstanceId(view.webview.html);
+			try {
+				await view.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'ready' });
+				const actionHandle = managementHandle(latestModel(view).management, 'switchAccount');
+				facade.snapshotValue = {
+					...facade.snapshotValue, management: { ...managementSnapshot(), ...invalid },
+				} as DashboardSnapshot;
+				facade.fireChanged();
+				await settle();
+				assert.equal(view.webview.sent.at(-1)?.code, 'UNSAFE_VIEW_MODEL');
+				assert.doesNotMatch(JSON.stringify(view.webview.sent), /private-value|private-account|private-peer/u);
+				await view.webview.receive({
+					version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'action', action: 'switchAccount', actionHandle,
+				});
+				assert.deepEqual(facade.calls, []);
+				assert.ok(view.webview.sent.some(({ code }) => code === 'STALE_ACTION'));
+			} finally { provider.dispose(); }
+		}
+	});
+
+	test('offline target settings aliases can remove access but cannot enable individual or whole-window grants', async () => {
+		const facade = new RecordingDashboardFacade();
+		const source = managedSnapshot();
+		facade.snapshotValue = {
+			...source, management: {
+				...source.management!, targets: source.management!.targets.map((target) => ({ ...target, online: false })),
+			},
+		};
+		const provider = new AgentMeshViewProvider(facade, getExtension().extensionUri);
+		const view = new TestWebviewView();
+		provider.resolveWebviewView(view);
+		const uiInstanceId = getUiInstanceId(view.webview.html);
+		try {
+			await view.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'ready' });
+			for (const action of ['setTargetAllowed', 'setWindowTargetAllowed'] as const) {
+				const before = facade.calls.length;
+				await view.webview.receive({
+					version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'action', action,
+					actionHandle: managementHandle(latestModel(view).management, action), enabled: true,
+				});
+				assert.equal(facade.calls.length, before);
+				assert.ok(view.webview.sent.some(({ code }) => code === 'POLICY_FORBIDDEN'));
+				await view.webview.receive({
+					version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'action', action,
+					actionHandle: managementHandle(latestModel(view).management, action), enabled: false,
+				});
+				assert.deepEqual(facade.calls.slice(before), [
+					`management:${action}:${managementHandle(source.management!, action)}:false`,
+				]);
+			}
+		} finally { provider.dispose(); }
+	});
+
+	test('pending management prompts preserve live snapshots, disable, and exact task cancellation', async () => {
+		const facade = new RecordingDashboardFacade();
+		facade.snapshotValue = managedSnapshot();
+		let finish!: () => void;
+		const pending = new Promise<void>((resolve) => { finish = resolve; });
+		facade.managementAction = async (action, actionHandle) => {
+			facade.calls.push(`management:${action}:${actionHandle}`);
+			await pending;
+		};
+		const provider = new AgentMeshViewProvider(facade, getExtension().extensionUri);
+		const view = new TestWebviewView();
+		provider.resolveWebviewView(view);
+		const uiInstanceId = getUiInstanceId(view.webview.html);
+		try {
+			await view.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'ready' });
+			const oldHandle = managementHandle(latestModel(view).management, 'revokeDevice');
+			const action = {
+				version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'action',
+				action: 'revokeDevice', actionHandle: oldHandle,
+			};
+			await view.webview.receive(action);
+			await view.webview.receive(action);
+			facade.fireChanged();
+			await settle();
+			assert.deepEqual(view.webview.sent.at(-1)?.pendingActions, ['revokeDevice']);
+			assert.notEqual(managementHandle(latestModel(view).management, 'revokeDevice'), oldHandle);
+			await view.webview.receive({
+				version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'action',
+				action: 'disableConnectivity',
+			});
+			await view.webview.receive({
+				version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'action',
+				action: 'cancelOutgoingTask', actionHandle: latestModel(view).outgoingTasks[0].actionHandle,
+			});
+			assert.equal(facade.calls.filter((call) => call.startsWith('management:')).length, 1);
+			assert.ok(facade.calls.includes('connectivity:disableConnectivity:'));
+			assert.ok(facade.calls.includes(`cancelDashboardTask:outgoing:${'b'.repeat(32)}`));
+			finish();
+			await waitFor(() => (view.webview.sent.at(-1)?.pendingActions as unknown[])?.length === 0);
+		} finally { finish(); provider.dispose(); }
+	});
+
 	test('keeps enable single-flight while allowing disable, live snapshots, and task cancellation', async () => {
 		const facade = new RecordingDashboardFacade();
 		const source = { ...connectivitySnapshot(), enabled: false, connectionState: 'disabled' as const };
@@ -1955,13 +2408,15 @@ suite('Dashboard', () => {
 	test('media preserves native pending state across snapshots without blocking disconnect or task cancellation', async () => {
 		const media = await createDashboardMediaHarness();
 		media.render(connectivitySnapshot());
-		media.button('Manage devices and permissions…').click();
-		media.render(connectivitySnapshot(), ['configureConnectivity']);
-		assert.strictEqual(media.button('Manage devices and permissions…').disabled, true);
-		assert.strictEqual(media.button('Revoke incoming peer…').disabled, true);
+		media.button('Devices & permissions').click();
+		media.button('Switch account').click();
+		media.render(connectivitySnapshot(), ['switchAccount']);
+		assert.strictEqual(media.button('Switch account').disabled, true);
+		assert.strictEqual(media.button('Revoke trust').disabled, true);
 		assert.strictEqual(media.button('Disable cross-device connections').disabled, false);
+		media.button('Overview').click();
 		assert.strictEqual(media.button('Cancel task').disabled, false);
-		assert.match(media.element('operationStatus').text, /native prompts/u);
+		assert.match(media.element('operationStatus').text, /Navigation, task cancellation and disconnect remain available/u);
 		media.button('Disable cross-device connections').click();
 		assert.strictEqual(media.messages.at(-1)?.action, 'disableConnectivity');
 		assert.strictEqual(media.button('Disable cross-device connections').disabled, true);
@@ -1970,18 +2425,21 @@ suite('Dashboard', () => {
 	});
 
 	test('media keeps native-login startup cancellable and does not duplicate pending enable or disable actions', async () => {
-		const media = await createDashboardMediaHarness();
+		const media = await createDashboardMediaHarness('en', false);
 		media.render(DISABLED_CONNECTIVITY_SNAPSHOT);
-		media.button('Enable cross-device connections').click();
-		assert.strictEqual(media.button('Enable cross-device connections').disabled, true);
+		const enable = media.button('Enable cross-device connections');
+		enable.click();
+		enable.click();
+		assert.equal(media.messages.filter(({ action }) => action === 'enableConnectivity').length, 1);
+		assert.throws(() => media.button('Enable cross-device connections'));
 		assert.strictEqual(media.button('Cancel connection startup').disabled, false);
-		assert.strictEqual(media.button('Manage devices and permissions…').disabled, true);
+		assert.strictEqual(media.button('Devices & permissions').disabled, false);
 		assert.throws(() => media.button('Enable cross-device connections').click());
 		media.render({
 			...DISABLED_CONNECTIVITY_SNAPSHOT, connectionState: 'authenticating',
 		}, ['enableConnectivity']);
 		assert.strictEqual(media.button('Cancel connection startup').disabled, false);
-		assert.strictEqual(media.button('Manage devices and permissions…').disabled, true);
+		assert.strictEqual(media.button('Devices & permissions').disabled, false);
 		media.button('Cancel connection startup').click();
 		media.render({
 			...DISABLED_CONNECTIVITY_SNAPSHOT, enabled: true, connectionState: 'starting',
@@ -1994,10 +2452,11 @@ suite('Dashboard', () => {
 		]);
 
 		media.render(DISABLED_CONNECTIVITY_SNAPSHOT, ['enableConnectivity']);
-		assert.strictEqual(media.button('Enable cross-device connections').disabled, true);
+		assert.throws(() => media.button('Enable cross-device connections'));
+		assert.equal(media.button('Cancel connection startup').disabled, false);
 		media.render(DISABLED_CONNECTIVITY_SNAPSHOT);
 		assert.strictEqual(media.button('Enable cross-device connections').disabled, false);
-		assert.strictEqual(media.button('Manage devices and permissions…').disabled, false);
+		assert.strictEqual(media.button('Devices & permissions').disabled, false);
 		assert.strictEqual(media.element('operationStatus').text, '');
 	});
 
@@ -2021,9 +2480,9 @@ suite('Dashboard', () => {
 		for (const message of view.webview.sent) {
 			media.receive({ ...message, uiInstanceId: 'media-view' });
 		}
-		assert.match(media.element('operationStatus').text, /dashboard action failed/u);
+		assert.match(media.element('pageContent').text, /dashboard action failed/u);
 		media.button('Enable cross-device connections').click();
-		assert.match(media.element('operationStatus').text, /VS Code account prompt/u);
+		assert.match(media.element('operationStatus').text, /Action in progress/u);
 		provider.dispose();
 	});
 
@@ -2114,6 +2573,28 @@ suite('Dashboard', () => {
 		});
 		await facade.cancelDashboardTask('a'.repeat(32), 'incoming');
 		assert.deepStrictEqual(order, ['prepare', 'confirm', 'release']);
+	});
+
+	test('forwards management capabilities to native bindings without collecting webview identities or prompts', async () => {
+		const services = new RecordingServiceBindings();
+		const facade = new ServiceDashboardFacade(
+			services,
+			{ confirm: async () => assert.fail('Destructive management confirmations belong to the authoritative native binding.') },
+			{ showInputBox: async () => assert.fail('Management must not collect caller-supplied identities or prompts.') },
+		);
+		for (const action of DASHBOARD_MANAGEMENT_ACTIONS) {
+			const handle = managementHandle(managementSnapshot(), action);
+			const enabled = MANAGEMENT_BOOLEAN_ACTIONS.has(action) ? false : undefined;
+			await facade.managementAction(action, handle, enabled);
+			assert.deepEqual(services.managementCalls.at(-1), {
+				action, actionHandle: handle, ...(enabled === undefined ? {} : { enabled }),
+			});
+		}
+		Object.defineProperty(services, 'managementAction', { value: undefined });
+		await assert.rejects(
+			async () => facade.managementAction('deleteSavedDevice', managementHandle(managementSnapshot(), 'deleteSavedDevice')),
+			/unavailable/u,
+		);
 	});
 
 	test('collects a separate safe task title without placing instructions in the view model', async () => {
@@ -2322,8 +2803,9 @@ suite('Dashboard', () => {
 				version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view', type: 'dashboard.snapshot',
 				model: new DashboardPresenter().present({ ...snapshot(), thisWindow: onDemand.thisWindow }),
 			});
-			assert.match(media.element('thisWindow').text, /On demand/u);
-			assert.doesNotMatch(media.element('listener').text, /Agent Host/u);
+			media.button('Devices & permissions').click();
+			assert.match(media.element('diagnostics').text, /On demand/u);
+			assert.match(media.element('diagnostics').text, /Workspace permissions and task approval/u);
 		} finally { fixture.bindings.dispose(); }
 	});
 
@@ -2355,7 +2837,8 @@ suite('Dashboard', () => {
 			assert.strictEqual(first.outgoingTasks?.length, 1);
 			assert.strictEqual(first.remoteDevices?.[0]?.name, 'Cached remote device');
 			assert.strictEqual(fixture.calls.filter((call) => call === 'connectivitySnapshot').length, 2);
-			assert.strictEqual(fixture.calls.filter((call) => call === 'cachedRemoteDevices').length, 2);
+			assert.strictEqual(fixture.calls.filter((call) => call === 'cachedRemoteDevices').length, 4,
+				'Each snapshot re-reads the local cache after async probes; neither read queries remote devices.');
 			assert.deepStrictEqual(fixture.mutations, []);
 			fixture.state.connectivity = connectivitySnapshot();
 			const enabled = await fixture.bindings.getSnapshot();
@@ -2454,7 +2937,30 @@ suite('Dashboard', () => {
 		}
 	});
 
-	test('Production bindings keep cached remote metadata as unknown without enabling delegation', async () => {
+	test('Production management forwards only scoped capabilities over local IPC without caller-native prompts', async () => {
+		const fixture = createConnectivityBindings();
+		try {
+			for (const action of DASHBOARD_MANAGEMENT_ACTIONS) {
+				const actionHandle = managementHandle(managementSnapshot(), action);
+				const enabled = MANAGEMENT_BOOLEAN_ACTIONS.has(action) ? false : undefined;
+				await fixture.bindings.managementAction(action, actionHandle, enabled);
+				assert.deepEqual(fixture.managementMutations.at(-1), {
+					action, actionHandle, ...(enabled === undefined ? {} : { enabled }),
+				});
+			}
+			assert.equal(fixture.calls.includes('native'), false);
+			assert.equal(fixture.calls.includes('cloud'), false);
+			assert.equal(fixture.calls.includes('ownerRuntime'), false);
+			fixture.state.guardError = new Error('Local guard rejected this operation.');
+			await assert.rejects(
+				fixture.bindings.managementAction('revokeDevice', managementHandle(managementSnapshot(), 'revokeDevice')),
+				/Local guard rejected/u,
+			);
+			assert.equal(fixture.managementMutations.length, DASHBOARD_MANAGEMENT_ACTIONS.length);
+		} finally { fixture.bindings.dispose(); }
+	});
+
+	test('Production bindings retain cached remote metadata without exposing live Workspace targets', async () => {
 		const fixture = createConnectivityBindings();
 		try {
 			fixture.state.connectivity = {
@@ -2471,9 +2977,11 @@ suite('Dashboard', () => {
 				value,
 				(workspace) => workspace.deviceLocality === 'remote' && workspace.name === 'billing-api',
 			);
-			assert.ok(target);
-			assert.strictEqual(target.deviceState, 'unknown');
-			assert.strictEqual(getSnapshotTreeWorkspaceHandle(value, target.key, 'delegateActionHandle'), undefined);
+			assert.equal(target, undefined);
+			assert.equal(value.remoteDevices?.[0]?.name, 'Cached remote device');
+			const cached = value.deviceTree?.find((device) => device.locality === 'remote');
+			assert.equal(cached?.state, 'unknown');
+			assert.deepEqual(cached?.nodes, []);
 		} finally {
 			fixture.bindings.dispose();
 		}
@@ -2521,8 +3029,9 @@ suite('Dashboard', () => {
 				assert.doesNotThrow(() => assertSafeDashboardOutboundMessage(message));
 				assert.doesNotMatch(JSON.stringify(model), /neutral-forwarding|neutral-resource|neutral-owner|00000000-0000-4000-8000-000000000301/u);
 				media.receive(message);
+				media.button('Devices & permissions').click();
 				assert.match(media.element('listener').text, /Listener\s+Running/u);
-				assert.match(media.element('connectivity').text, /Status\s+Off/u);
+				assert.match(media.element('connectivity').text, /Cross-device connections.*Off/u);
 				assert.doesNotMatch(media.element('connectivity').text, /Legacy CLI|hosting backend|outer port is anonymous/u);
 				assert.strictEqual(media.button('Enable cross-device connections').disabled, false);
 				assert.deepStrictEqual(
@@ -2541,7 +3050,7 @@ suite('Dashboard', () => {
 		}
 	});
 
-	test('shows the shared receive gate with local Preview off and changes it only through native remote policy', async () => {
+	test('shows the shared receive gate with local Preview off without exposing unscoped receive controls', async () => {
 		const fixture = createConnectivityBindings();
 		const media = await createDashboardMediaHarness();
 		try {
@@ -2565,17 +3074,11 @@ suite('Dashboard', () => {
 				};
 				assert.doesNotThrow(() => assertSafeDashboardOutboundMessage(message));
 				media.receive(message);
-				assert.match(media.element('connectivity').text, new RegExp(`Receiving Workspaces\\s+${receivingWorkspaceCount}`, 'u'));
-				assert.match(
-					media.element('acceptIncoming').text,
-					receivingWorkspaceCount === 1 ? /Accepting incoming tasks/u : /Not accepting incoming tasks/u,
-				);
-				assert.match(media.element('acceptIncoming').text, /strict remote policy/i);
-				media.button('Manage devices and permissions…').click();
-				assert.deepStrictEqual(media.messages.at(-1), {
-					version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view',
-					type: 'action', action: 'configureConnectivity',
-				});
+				media.button('Devices & permissions').click();
+				assert.match(media.element('diagnostics').text, new RegExp(`Receiving workspaces\\s+${receivingWorkspaceCount}`, 'u'));
+				assert.match(media.element('managementWorkspaces').text, /management is unavailable/u);
+				assert.throws(() => media.checkbox('Receive incoming tasks'));
+				assert.equal(media.messages.filter(({ type }) => type === 'action').length, 0);
 				await fixture.bindings.connectivityAction('configureConnectivity');
 			}
 			assert.deepStrictEqual(fixture.mutations, [
@@ -2645,10 +3148,12 @@ suite('Dashboard', () => {
 				version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view',
 				type: 'dashboard.snapshot', model: new DashboardPresenter().present(failed),
 			});
-			assert.match(media.element('connectivity').text, /Unknown/u);
+			assert.match(media.element('pageContent').text, /CONNECTIVITY_UNAVAILABLE/u);
 			assert.doesNotMatch(media.element('connectivity').text, /outer port is anonymous|Not activated/u);
-			assert.match(media.element('incomingPeers').text, /status is unavailable/u);
-			assert.match(media.element('thisWindow').text, /Source Workspace/u);
+			assert.equal(media.button('Enable cross-device connections').disabled, true);
+			media.button('Devices & permissions').click();
+			assert.match(media.element('pageContent').text, /Source Workspace/u);
+			assert.match(media.element('pageContent').text, /REMOTE_DIRECTORY_UNAVAILABLE/u);
 			fixture.state.connectivityError = undefined;
 			fixture.state.directoryError = undefined;
 			fixture.state.connectivity = {
@@ -2680,6 +3185,7 @@ suite('Dashboard', () => {
 
 		const actions = [
 			{ action: 'configureDevice' },
+			{ action: 'registerWorkspace' },
 			{ action: 'renameWindow' },
 			{ action: 'startListener' },
 			{ action: 'stopListener' },
@@ -2705,6 +3211,7 @@ suite('Dashboard', () => {
 
 		assert.deepStrictEqual(facade.calls, [
 			'configureDevice',
+			'registerWorkspace',
 			'renameWindow',
 			'startListener',
 			'stopListener',
@@ -2761,6 +3268,10 @@ class RecordingDashboardFacade implements DashboardFacade {
 
 	public async remotePolicyAction(action: RemotePolicyAction, actionHandle: string, enabled: boolean): Promise<void> {
 		this.calls.push(`remotePolicy:${action}:${actionHandle}:${enabled}`);
+	}
+
+	public async managementAction(action: DashboardManagementAction, actionHandle: string, enabled?: boolean): Promise<void> {
+		this.calls.push(`management:${action}:${actionHandle}:${enabled ?? ''}`);
 	}
 
 	public async openTargetChat(actionHandle: string): Promise<void> {
@@ -2837,6 +3348,7 @@ class RecordingServiceBindings implements DashboardServiceBindings {
 	public lastWindowName?: string;
 	public readonly connectivityCalls: Array<{ action: ConnectivityAction; actionHandle?: string }> = [];
 	public readonly remotePolicyCalls: Array<{ action: RemotePolicyAction; actionHandle: string; enabled: boolean }> = [];
+	public readonly managementCalls: Array<{ action: DashboardManagementAction; actionHandle: string; enabled?: boolean }> = [];
 	public readonly targetChatCalls: string[] = [];
 	public lastTaskRequest?: {
 		readonly target?: DashboardTaskTarget;
@@ -2863,6 +3375,9 @@ class RecordingServiceBindings implements DashboardServiceBindings {
 	}
 	public async remotePolicyAction(action: RemotePolicyAction, actionHandle: string, enabled: boolean): Promise<void> {
 		this.remotePolicyCalls.push({ action, actionHandle, enabled });
+	}
+	public async managementAction(action: DashboardManagementAction, actionHandle: string, enabled?: boolean): Promise<void> {
+		this.managementCalls.push({ action, actionHandle, ...(enabled === undefined ? {} : { enabled }) });
 	}
 	public async openTargetChat(actionHandle: string): Promise<void> {
 		this.targetChatCalls.push(actionHandle);
@@ -3156,6 +3671,100 @@ function snapshot(): DashboardSnapshot {
 	};
 }
 
+function managementSnapshot(): DashboardManagement {
+	const handle = (index: number) => `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`;
+	return {
+		available: true, truncated: false, accountActionHandle: handle(501),
+		devices: [{
+			key: 'manage-device-1', name: 'Lab Mac', state: 'online', cleanupPending: false,
+			activeTaskCount: 1, deleteBlockedReason: 'Active tasks must finish before deletion.',
+			revokeActionHandle: handle(502), probeActionHandle: handle(503),
+		}, {
+			key: 'manage-device-2', name: 'Saved laptop', state: 'offline', cleanupPending: false,
+			activeTaskCount: 0, lastSeen: '2026-09-01T10:00:00.000Z',
+			deleteActionHandle: handle(504), revokeActionHandle: handle(505), probeActionHandle: handle(506),
+		}, {
+			key: 'manage-device-3', name: 'Unknown workstation', state: 'unknown', cleanupPending: false,
+			deleteBlockedReason: 'Task state is unknown.', revokeActionHandle: handle(507), probeActionHandle: handle(508),
+		}],
+		workspaces: [{
+			key: 'manage-workspace-1', name: 'service-workspace', enabled: true, acceptsIncoming: false,
+			receiveActionHandle: handle(509), enableActionHandle: handle(510), removeActionHandle: handle(511),
+			incomingPeers: [{
+				key: 'manage-peer-1', name: 'Lab Mac', allowed: true, autoAccept: false,
+				allowActionHandle: handle(512), autoAcceptActionHandle: handle(513),
+			}],
+		}, {
+			key: 'manage-workspace-2', name: 'secondary-source', enabled: true, acceptsIncoming: false,
+			receiveActionHandle: handle(514), enableActionHandle: handle(515), incomingPeers: [],
+		}],
+		targets: [{
+			key: 'manage-target-1', deviceName: 'test-device', windowName: 'Local Window', workspaceName: 'local-target',
+			locality: 'local', online: true,
+			sources: [
+				{ sourceKey: 'manage-workspace-1', allowed: true, actionHandle: handle(516) },
+				{ sourceKey: 'manage-workspace-2', allowed: false, actionHandle: handle(517) },
+			],
+			allSourcesAllowed: 'some', allSourcesActionHandle: handle(518),
+		}, {
+			key: 'manage-target-2', deviceName: 'Lab Mac', windowName: 'Backend window', workspaceName: 'orders-api',
+			locality: 'remote', online: true,
+			sources: [{ sourceKey: 'manage-workspace-1', allowed: false, actionHandle: handle(519) }],
+			allSourcesAllowed: 'none', allSourcesActionHandle: handle(520),
+		}, {
+			key: 'manage-target-3', deviceName: 'Lab Mac', windowName: 'Backend window', workspaceName: 'billing-api',
+			locality: 'remote', online: true,
+			sources: [
+				{ sourceKey: 'manage-workspace-1', allowed: true, actionHandle: handle(521) },
+				{ sourceKey: 'manage-workspace-2', allowed: false, actionHandle: handle(522) },
+			],
+			allSourcesAllowed: 'some', allSourcesActionHandle: handle(523),
+		}],
+	};
+}
+
+function managedSnapshot(): DashboardSnapshot {
+	const source = snapshot();
+	const permissionKeys: Record<string, string> = {
+		'tree-3': 'manage-workspace-1', 'tree-6': 'manage-target-1',
+		'tree-9': 'manage-target-2', 'tree-10': 'manage-target-3',
+	};
+	return {
+		...source, connectivity: connectivitySnapshot(), management: managementSnapshot(),
+		deviceTree: source.deviceTree?.map((device) => ({
+			...device, nodes: device.nodes.map((node) => ({
+				...node, workspaces: node.workspaces.map((workspace) => ({
+					...workspace, permissionKey: permissionKeys[workspace.key],
+				})),
+			})),
+		})),
+	};
+}
+
+function managementHandle(value: DashboardManagement, action: DashboardManagementAction): string {
+	const handle = {
+		switchAccount: value.accountActionHandle,
+		probeDevice: value.devices[0]?.probeActionHandle,
+		revokeDevice: value.devices[0]?.revokeActionHandle,
+		deleteSavedDevice: value.devices[1]?.deleteActionHandle,
+		setWorkspaceReceiving: value.workspaces[0]?.receiveActionHandle,
+		setWorkspaceEnabled: value.workspaces[0]?.enableActionHandle,
+		removeManagedWorkspace: value.workspaces[0]?.removeActionHandle,
+		setIncomingDeviceGrant: value.workspaces[0]?.incomingPeers[0]?.allowActionHandle,
+		setDeviceAutoAccept: value.workspaces[0]?.incomingPeers[0]?.autoAcceptActionHandle,
+		setTargetAllowed: value.targets[0]?.sources[0]?.actionHandle,
+		setWindowTargetAllowed: value.targets[0]?.allSourcesActionHandle,
+	}[action];
+	assert.ok(handle, `Missing fixture capability for ${action}`);
+	return handle;
+}
+
+function latestModel(view: TestWebviewView): ReturnType<DashboardPresenter['present']> {
+	const message = view.webview.sent.filter(({ type }) => type === 'dashboard.snapshot').at(-1);
+	assert.ok(message, JSON.stringify(view.webview.sent.at(-1)));
+	return message.model as ReturnType<DashboardPresenter['present']>;
+}
+
 function connectivitySnapshot(): ConnectivitySnapshot {
 	return {
 		...DISABLED_CONNECTIVITY_SNAPSHOT,
@@ -3345,39 +3954,124 @@ function withScopedConnectivity(connectivity: ConnectivitySnapshot): ReturnType<
 }
 
 class DashboardTestElement {
-	public textContent = '';
+	private ownText = '';
 	public className = '';
+	public id = '';
+	public type = '';
+	public value = '';
+	public title = '';
 	public disabled = false;
 	public checked = false;
 	public hidden = false;
+	public open = false;
+	public scrollTop = 0;
+	public parentElement?: DashboardTestElement;
 	public tabIndex = 0;
 	public readonly dataset: Record<string, string> = {};
 	public readonly attributes: Record<string, string> = {};
-	public readonly classList = { remove: (_name: string) => undefined };
+	public readonly style: Record<string, string> = {};
+	public readonly classList = {
+		add: (...names: string[]) => { this.className = [...new Set([...this.className.split(' '), ...names])].join(' ').trim(); },
+		remove: (...names: string[]) => { this.className = this.className.split(' ').filter((name) => !names.includes(name)).join(' '); },
+		toggle: (name: string, force?: boolean) => {
+			const enabled = force ?? !this.classList.contains(name);
+			if (enabled) { this.classList.add(name); } else { this.classList.remove(name); }
+			return enabled;
+		},
+		contains: (name: string) => this.className.split(' ').includes(name),
+	};
 	public readonly children: DashboardTestElement[] = [];
 	private readonly listeners = new Map<string, (...args: unknown[]) => void>();
 	public onFocus?: (element: DashboardTestElement) => void;
 
 	public constructor(public tagName: string) {}
 
+	public get textContent(): string {
+		return this.ownText + this.children.map((child) => child.textContent).join('');
+	}
+
+	public set textContent(value: string) {
+		this.replaceChildren();
+		this.ownText = value;
+	}
+
 	public get text(): string {
-		return [this.textContent, ...this.children.map((child) => child.text)].join(' ');
+		return [this.ownText, ...this.children.map((child) => child.text)].join(' ').replace(/\s+/gu, ' ').trim();
 	}
 
-	public append(...children: DashboardTestElement[]): void {
-		this.children.push(...children);
+	public append(...children: Array<DashboardTestElement | string>): void {
+		for (const child of children) {
+			const element = typeof child === 'string' ? new DashboardTestElement('#text') : child;
+			if (typeof child === 'string') { element.textContent = child; }
+			element.parentElement = this;
+			this.children.push(element);
+		}
 	}
 
-	public replaceChildren(): void {
-		this.textContent = '';
+	public appendChild(child: DashboardTestElement): DashboardTestElement {
+		this.append(child);
+		return child;
+	}
+
+	public replaceChildren(...children: DashboardTestElement[]): void {
+		this.ownText = '';
+		for (const child of this.children) { child.parentElement = undefined; }
 		this.children.length = 0;
+		this.append(...children);
 	}
 
 	public setAttribute(name: string, value: string): void {
 		this.attributes[name] = value;
+		if (name === 'id') { this.id = value; }
+		if (name === 'class') { this.className = value; }
+		if (name === 'value') { this.value = value; }
+		if (name === 'hidden') { this.hidden = true; }
 		if (name.startsWith('data-')) {
 			this.dataset[name.slice(5).replace(/-([a-z])/gu, (_all, letter: string) => letter.toUpperCase())] = value;
 		}
+	}
+
+	public getAttribute(name: string): string | null {
+		return this.attributes[name] ?? null;
+	}
+
+	public removeAttribute(name: string): void {
+		delete this.attributes[name];
+		if (name === 'hidden') { this.hidden = false; }
+	}
+
+	public contains(element: DashboardTestElement): boolean {
+		return this.descendants().includes(element);
+	}
+
+	public matches(selector: string): boolean {
+		return selector.split(',').some((part) => {
+			const token = part.trim();
+			const tag = token.match(/^[a-z][\w-]*/iu)?.[0];
+			if (tag !== undefined && this.tagName.toLowerCase() !== tag.toLowerCase()) { return false; }
+			for (const [, kind, name] of token.matchAll(/([.#])([\w-]+)/gu)) {
+				if (kind === '#' ? this.id !== name : !this.classList.contains(name)) { return false; }
+			}
+			for (const [, name, value] of token.matchAll(/\[([\w-]+)(?:=["']?([^"'\]]+)["']?)?\]/gu)) {
+				const actual = name.startsWith('data-')
+					? this.dataset[name.slice(5).replace(/-([a-z])/gu, (_all, letter: string) => letter.toUpperCase())]
+					: name === 'id' ? this.id : this.attributes[name];
+				if (value === undefined ? actual === undefined : actual !== value) { return false; }
+			}
+			return true;
+		});
+	}
+
+	public querySelectorAll(selector: string): DashboardTestElement[] {
+		return this.descendants().slice(1).filter((element) => element.matches(selector));
+	}
+
+	public querySelector(selector: string): DashboardTestElement | null {
+		return this.querySelectorAll(selector)[0] ?? null;
+	}
+
+	public closest(selector: string): DashboardTestElement | null {
+		return this.matches(selector) ? this : this.parentElement?.closest(selector) ?? null;
 	}
 
 	public addEventListener(event: string, listener: (...args: unknown[]) => void): void {
@@ -3392,14 +4086,31 @@ class DashboardTestElement {
 	public click(): void {
 		assert.strictEqual(this.disabled, false, 'A disabled control cannot be activated.');
 		this.focus();
-		this.listeners.get('click')?.();
+		if (this.tagName === 'summary' && this.parentElement?.tagName === 'details') {
+			this.parentElement.open = !this.parentElement.open;
+			this.parentElement.dispatch('toggle');
+		}
+		this.dispatch('click');
 	}
 
 	public toggle(): void {
 		assert.strictEqual(this.disabled, false, 'A disabled control cannot be activated.');
 		this.focus();
 		this.checked = !this.checked;
-		this.listeners.get('change')?.();
+		this.dispatch('change');
+	}
+
+	public change(value: string): void {
+		this.value = value;
+		this.dispatch('change');
+	}
+
+	private dispatch(type: string): void {
+		const event = { target: this, currentTarget: this as DashboardTestElement, preventDefault: () => undefined, stopPropagation: () => undefined };
+		for (let element: DashboardTestElement | undefined = this; element; element = element.parentElement) {
+			event.currentTarget = element;
+			element.listeners.get(type)?.(event);
+		}
 	}
 
 	public keydown(key: string): void {
@@ -3414,114 +4125,139 @@ class DashboardTestElement {
 	}
 }
 
-async function createDashboardMediaHarness(): Promise<{
+async function createDashboardMediaHarness(language = 'en', includeManagement = true): Promise<{
 	readonly messages: Array<Record<string, unknown>>;
 	element(id: string): DashboardTestElement;
 	button(text: string): DashboardTestElement;
-	treeItem(key: string): DashboardTestElement;
+	permissions(key: string): DashboardTestElement;
 	checkbox(label: string | RegExp): DashboardTestElement;
 	focusedElement(): DashboardTestElement | undefined;
-	selectedTreeLabel(): string | undefined;
 	receive(message: unknown): void;
+	present(value: DashboardSnapshot, pendingActions?: readonly DashboardAction[]): void;
 	render(connectivity: ConnectivitySnapshot, pendingActions?: readonly DashboardAction[]): void;
 }> {
 	const messages: Array<Record<string, unknown>> = [];
 	let activeElement: DashboardTestElement | undefined;
-	const roots = new Map<string, DashboardTestElement>([
-		['refreshButton', new DashboardTestElement('button')],
-		['settingsButton', new DashboardTestElement('button')],
-		['closeSettingsButton', new DashboardTestElement('button')],
-		['deviceTree', new DashboardTestElement('div')],
-		['selectionSummary', new DashboardTestElement('p')],
-		['selectionDetails', new DashboardTestElement('div')],
-		['settingsDrawer', new DashboardTestElement('aside')],
-		...[
-			'device', 'thisWindow', 'acceptIncoming', 'listener', 'connectivity',
-			'discoveryCandidates', 'incomingPeers', 'localNodes', 'savedAuthorizations',
-			'outgoingTasks', 'incomingTasks', 'errors', 'announcement', 'operationStatus',
-		].map((id) => [id, new DashboardTestElement('div')] as const),
-	]);
 	const onFocus = (element: DashboardTestElement) => { activeElement = element; };
-	for (const root of roots.values()) { root.onFocus = onFocus; }
-	const refresh = roots.get('refreshButton');
-	const settings = roots.get('settingsButton');
-	const closeSettings = roots.get('closeSettingsButton');
-	assert.ok(refresh && settings && closeSettings);
-	refresh.textContent = 'Refresh';
-	settings.textContent = 'Settings';
-	closeSettings.textContent = 'Close';
+	const createElement = (tag: string) => {
+		const element = new DashboardTestElement(tag);
+		element.onFocus = onFocus;
+		return element;
+	};
+	const webview = new TestWebview();
+	const mediaRoot = vscode.Uri.joinPath(getExtension().extensionUri, 'media');
+	const html = createDashboardHtml(webview, mediaRoot, 'media-view', 'test-nonce', language);
+	const documentRoot = createElement('document');
+	const stack = [documentRoot];
+	const decode = (value: string) => value.replace(/&(?:amp|quot|lt|gt|#39);/gu, (entity) => ({
+		'&amp;': '&', '&quot;': '"', '&lt;': '<', '&gt;': '>', '&#39;': "'",
+	})[entity]!);
+	for (const token of html.matchAll(/<\/?([a-z][\w-]*)([^>]*)>|([^<]+)/giu)) {
+		const [full, tag, attributes, text] = token;
+		if (text !== undefined) {
+			if (text.trim()) { stack.at(-1)!.append(decode(text.trim())); }
+		} else if (full.startsWith('</')) {
+			assert.equal(stack.pop()?.tagName, tag);
+		} else {
+			const element = createElement(tag);
+			for (const attribute of attributes.matchAll(/([\w-]+)(?:="([^"]*)")?/gu)) {
+				element.setAttribute(attribute[1], decode(attribute[2] ?? ''));
+			}
+			stack.at(-1)!.append(element);
+			if (!['meta', 'link', 'input', 'br', 'hr', 'img'].includes(tag)) { stack.push(element); }
+		}
+	}
+	const body = documentRoot.querySelector('body');
+	assert.ok(body);
 	const element = (id: string): DashboardTestElement => {
-		const result = roots.get(id);
+		const result = documentRoot.descendants().find((element) => element.id === id);
 		assert.ok(result, `Unknown Dashboard element: ${id}`);
 		return result;
 	};
 	let listener: ((event: { data: unknown }) => void) | undefined;
-	const bundle = await readFile(
-		vscode.Uri.joinPath(getExtension().extensionUri, 'media', 'dashboard.js').fsPath,
-		'utf8',
-	);
-	runInNewContext(bundle, {
+	let presented: ReturnType<DashboardPresenter['present']> | undefined;
+	const context = createContext({
 		TextEncoder,
 		document: {
-			body: { dataset: { uiInstanceId: 'media-view' } },
+			body,
 			get activeElement() { return activeElement; },
-			querySelector: () => undefined,
-			getElementById: element,
-			createElement: (tag: string) => {
-				const element = new DashboardTestElement(tag);
-				element.onFocus = onFocus;
-				return element;
-			},
+			querySelector: (selector: string) => documentRoot.querySelector(selector),
+			querySelectorAll: (selector: string) => documentRoot.querySelectorAll(selector),
+			getElementById: (id: string) => documentRoot.descendants().find((element) => element.id === id) ?? null,
+			createElement,
+			addEventListener: () => undefined,
 		},
 		window: {
 			addEventListener: (event: string, callback: (event: { data: unknown }) => void) => {
-				assert.strictEqual(event, 'message');
-				listener = callback;
+				if (event === 'message') { listener = callback; }
 			},
 		},
 		acquireVsCodeApi: () => ({
 			postMessage: (message: unknown) => {
 				messages.push(JSON.parse(JSON.stringify(message)) as Record<string, unknown>);
 			},
+			getState: () => undefined,
+			setState: () => undefined,
 		}),
 	});
+	for (const script of documentRoot.querySelectorAll('script[src]')) {
+		const scriptName = script.attributes.src.split('/').at(-1)!;
+		const bundle = await readFile(vscode.Uri.joinPath(mediaRoot, scriptName).fsPath, 'utf8');
+		runInContext(bundle, context);
+	}
 	const receive = (message: unknown): void => {
 		assert.ok(listener);
 		listener({ data: message });
+	};
+	const present = (value: DashboardSnapshot, pendingActions: readonly DashboardAction[] = []) => {
+		const model = new DashboardPresenter().present(value);
+		presented = model;
+		let index = 0;
+		const scope = (value: unknown): unknown => {
+			if (Array.isArray(value)) { return value.map(scope); }
+			if (typeof value !== 'object' || value === null) { return value; }
+			return Object.fromEntries(Object.entries(value).map(([key, child]) => [
+				key, /actionHandle$/iu.test(key) && typeof child === 'string'
+					? String(++index).padStart(32, 'm') : scope(child),
+			]));
+		};
+		receive({
+			version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view', type: 'dashboard.snapshot',
+			model: { ...model, connectivity: scope(model.connectivity), management: scope(model.management) }, pendingActions,
+		});
 	};
 	return {
 		messages,
 		element,
 		focusedElement: () => activeElement,
 		button: (text: string) => {
-			const result = [...[...roots.values()].flatMap((root) => root.descendants())]
+			const result = documentRoot.descendants()
 				.find((candidate) => candidate.tagName === 'button' && candidate.textContent === text);
 			assert.ok(result, `Missing Dashboard button: ${text}`);
 			return result;
 		},
-		treeItem: (key: string) => {
-			const result = element('deviceTree').descendants().find((candidate) =>
-				candidate.attributes['data-tree-key'] === key);
-			assert.ok(result, `Missing tree item: ${key}`);
+		permissions: (key: string) => {
+			const workspace = presented?.deviceTree.flatMap((device) => device.nodes.flatMap((node) => node.workspaces))
+				.find((workspace) => workspace.permissionKey === key || workspace.key === key);
+			assert.ok(workspace, `Missing exact Workspace permission binding: ${key}`);
+			const row = documentRoot.descendants().find((candidate) => candidate.dataset.workspaceKey === workspace?.key);
+			const result = row?.descendants().find((candidate) => candidate.tagName === 'button' && candidate.textContent === 'Permissions');
+			assert.ok(result, `Missing exact Workspace Permissions shortcut: ${key}`);
 			return result;
 		},
 		checkbox: (label: string | RegExp) => {
 			const matcher = typeof label === 'string'
 				? (value: string | undefined) => value === label
 				: (value: string | undefined) => value !== undefined && label.test(value);
-			const result = [...roots.values()].flatMap((root) => root.descendants()).find((candidate) =>
-				candidate.tagName === 'input' && matcher(candidate.attributes['aria-label']));
+			const result = documentRoot.descendants().find((candidate) =>
+				candidate.tagName === 'input' && matcher(candidate.attributes['aria-label'] ?? candidate.closest('label')?.text));
 			assert.ok(result, `Missing Dashboard checkbox: ${String(label)}`);
 			return result;
 		},
-		selectedTreeLabel: () => element('deviceTree').descendants()
-			.find((candidate) => candidate.attributes['aria-selected'] === 'true')
-			?.text,
 		receive,
-		render: (connectivity: ConnectivitySnapshot, pendingActions: readonly DashboardAction[] = []) => receive({
-			version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'media-view',
-			type: 'dashboard.snapshot', model: withScopedConnectivity(connectivity), pendingActions,
-		}),
+		present,
+		render: (connectivity: ConnectivitySnapshot, pendingActions: readonly DashboardAction[] = []) =>
+			present({ ...(includeManagement ? managedSnapshot() : snapshot()), connectivity }, pendingActions),
 	};
 }
 
@@ -3535,6 +4271,7 @@ function createConnectivityBindings(): {
 	readonly bindings: ProductionDashboardBindings;
 	readonly calls: string[];
 	readonly mutations: Array<{ action: ConnectivityAction; actionHandle?: string }>;
+	readonly managementMutations: Array<{ action: DashboardManagementAction; actionHandle: string; enabled?: boolean }>;
 	readonly commandCalls: Array<{ command: string; args: unknown[] }>;
 	readonly describedTargets: unknown[];
 	readonly state: RuntimePresentationFixture & {
@@ -3582,6 +4319,7 @@ function createConnectivityBindings(): {
 	const disposable = { dispose: () => undefined };
 	const calls: string[] = [];
 	const mutations: Array<{ action: ConnectivityAction; actionHandle?: string }> = [];
+	const managementMutations: Array<{ action: DashboardManagementAction; actionHandle: string; enabled?: boolean }> = [];
 	const commandCalls: Array<{ command: string; args: unknown[] }> = [];
 	const describedTargets: unknown[] = [];
 	const state: RuntimePresentationFixture & {
@@ -3752,6 +4490,12 @@ function createConnectivityBindings(): {
 				};
 			},
 			remotePolicyDashboard: async () => state.remotePolicy,
+			managementSnapshot: async () => ({
+				available: false, truncated: false, devices: [], workspaces: [], targets: [],
+			}),
+			managementAction: async (action: DashboardManagementAction, actionHandle: string, enabled?: boolean) => {
+				managementMutations.push({ action, actionHandle, ...(enabled === undefined ? {} : { enabled }) });
+			},
 			connectivityAction: async (action: ConnectivityAction, actionHandle?: string) => {
 				mutations.push({ action, ...(actionHandle === undefined ? {} : { actionHandle }) });
 			},
@@ -3810,7 +4554,7 @@ function createConnectivityBindings(): {
 			};
 		},
 	} as unknown as ProductionDashboardBindingsOptions);
-	return { bindings, calls, mutations, commandCalls, describedTargets, state };
+	return { bindings, calls, mutations, managementMutations, commandCalls, describedTargets, state };
 }
 
 function withTaskTitle(

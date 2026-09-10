@@ -1,0 +1,19 @@
+{
+  "command.configureDevice": "设置设备名称",
+  "command.refreshDashboard": "刷新概览",
+  "command.registerWorkspace": "注册当前工作区",
+  "command.removeWorkspace": "移除工作区",
+  "command.enableWorkspace": "启用工作区",
+  "command.disableWorkspace": "停用工作区",
+  "command.enableConnections": "开启跨设备连接",
+  "command.disableConnections": "关闭跨设备连接",
+  "command.removePeer": "移除设备连接",
+  "command.runTask": "运行远端任务",
+  "command.cancelTask": "取消任务",
+  "setting.deviceName": "向受信任设备显示的本机名称。",
+  "setting.codePath": "可选的 VS Code 命令行程序路径，供执行任务的 Agent Host 使用。支持 Windows x64/ARM64 和 macOS arm64；留空时自动查找当前安装。",
+  "setting.peerDelegation": "启用同一设备上的窗口发现、权限设置和任务工具。默认开启，可关闭以退出。接收任务和向其他工作区发送任务的授权仍默认拒绝。",
+  "setting.userDataDir": "指定用于发现编辑器 Agent Host 的 VS Code 用户数据目录。留空时根据当前平台和产品自动确定。",
+  "setting.authenticationProviders": "将 AHP 受保护资源或授权服务器地址映射到 VS Code 身份验证提供方和明确的权限范围。不自动推断提供方或权限。",
+  "setting.capabilityTags": "新注册工作区发布的能力标签。请勿在标签中填写路径或凭据。"
+}

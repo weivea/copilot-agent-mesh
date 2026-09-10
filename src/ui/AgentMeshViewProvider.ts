@@ -17,10 +17,18 @@ import {
 	parseDashboardInboundMessage,
 } from './DashboardMessages';
 import { DashboardPresenter, type DashboardViewModel } from './DashboardPresenter';
-import { CONNECTIVITY_ACTIONS, REMOTE_POLICY_ACTIONS } from '../../shared/protocol';
+import {
+	CONNECTIVITY_ACTIONS,
+	REMOTE_POLICY_ACTIONS,
+	DASHBOARD_MANAGEMENT_ACTIONS,
+	type DashboardManagementAction,
+} from '../../shared/protocol';
+import { createDashboardHtml as renderDashboardHtml } from './DashboardHtml';
+import { createDashboardActionHandle } from './DashboardActionHandle';
 
-const promptActions = new Set<string>([...CONNECTIVITY_ACTIONS, ...REMOTE_POLICY_ACTIONS]
+const promptActions = new Set<string>([...CONNECTIVITY_ACTIONS, ...REMOTE_POLICY_ACTIONS, ...DASHBOARD_MANAGEMENT_ACTIONS]
 	.filter((action) => action !== 'disableConnectivity'));
+const managementActions = new Set<string>(DASHBOARD_MANAGEMENT_ACTIONS);
 
 interface ScopedDashboardAction {
 	readonly action: DashboardAction;
@@ -154,7 +162,21 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 		instance: ViewInstance,
 		message: Extract<DashboardInboundMessage, { type: 'action' }>,
 	): Promise<void> {
+		if (isManagementAction(message.action)) {
+			const binding = this.consumeAction(instance, message);
+			if (this.facade.managementAction === undefined) {
+				throw new DashboardActionError('POLICY_FORBIDDEN', 'Device and Workspace settings are unavailable.');
+			}
+			await this.facade.managementAction(message.action, binding.brokerHandle, message.enabled);
+			return;
+		}
 		switch (message.action) {
+			case 'openAdvancedSettings':
+				await vscode.commands.executeCommand('workbench.action.openSettings', '@ext:weivea.copilot-agent-mesh');
+				return;
+			case 'registerWorkspace':
+				await this.facade.registerCurrentWorkspace();
+				return;
 			case 'configureDevice':
 				await this.facade.configureDeviceName();
 				return;
@@ -294,7 +316,7 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 			uiInstanceId: instance.id,
 			type: 'dashboard.error',
 			code,
-			message,
+			message: vscode.l10n.t(message),
 		});
 	}
 
@@ -345,9 +367,7 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 				? stableTaskAliases.get(`${action}:${brokerHandle}`)
 				: undefined;
 			if (handle === undefined) {
-				do {
-					handle = randomBytes(24).toString('base64url');
-				} while (instance.actions.has(handle));
+				handle = createDashboardActionHandle((candidate) => instance.actions.has(candidate));
 			}
 			instance.actions.set(handle, {
 				action,
@@ -376,6 +396,37 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 				incomingPeers: model.connectivity.incomingPeers.map((peer) => ({
 					...peer,
 					actionHandle: scope('revokeIncomingPeer', peer.actionHandle)!,
+				})),
+			},
+			management: {
+				...model.management,
+				accountActionHandle: scope('switchAccount', model.management.accountActionHandle),
+				devices: model.management.devices.map((device) => ({
+					...device,
+					revokeActionHandle: scope('revokeDevice', device.revokeActionHandle),
+					deleteActionHandle: scope('deleteSavedDevice', device.deleteActionHandle),
+					probeActionHandle: scope('probeDevice', device.probeActionHandle),
+				})),
+				workspaces: model.management.workspaces.map((workspace) => ({
+					...workspace,
+					receiveActionHandle: scope('setWorkspaceReceiving', workspace.receiveActionHandle),
+					enableActionHandle: scope('setWorkspaceEnabled', workspace.enableActionHandle),
+					removeActionHandle: scope('removeManagedWorkspace', workspace.removeActionHandle),
+					incomingPeers: workspace.incomingPeers.map((peer) => ({
+						...peer,
+						allowActionHandle: scope('setIncomingDeviceGrant', peer.allowActionHandle),
+						autoAcceptActionHandle: scope('setDeviceAutoAccept', peer.autoAcceptActionHandle),
+					})),
+				})),
+				targets: model.management.targets.map((target) => ({
+					...target,
+					allSourcesActionHandle: scope('setWindowTargetAllowed', target.allSourcesActionHandle,
+						target.online ? {} : { requiredEnabled: false }),
+					sources: target.sources.map((source) => ({
+						...source,
+						actionHandle: scope('setTargetAllowed', source.actionHandle,
+							target.online ? {} : { requiredEnabled: false }),
+					})),
 				})),
 			},
 			localNodes: model.localNodes.map((candidate) => ({
@@ -438,6 +489,9 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 				'This Dashboard action is stale. Refresh and try again.',
 			);
 		}
+		if (action.requiredEnabled !== undefined && action.requiredEnabled !== message.enabled) {
+			throw new DashboardActionError('POLICY_FORBIDDEN', 'An offline saved authorization can only be removed.');
+		}
 		return action;
 	}
 }
@@ -448,105 +502,11 @@ export function createDashboardHtml(
 	uiInstanceId: string,
 	nonce: string,
 ): string {
-	const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, 'dashboard.js'));
-	const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, 'dashboard.css'));
-	return `<!DOCTYPE html>
-<html lang="en">
-<head>
-	<meta charset="UTF-8">
-	<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource}; script-src 'nonce-${nonce}' ${webview.cspSource};">
-	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<link rel="stylesheet" href="${styleUri}">
-	<title>Copilot Agent Mesh</title>
-</head>
-<body data-ui-instance-id="${uiInstanceId}">
-	<header class="dashboardHeader">
-		<div class="headerCopy">
-			<h1>Copilot Agent Mesh</h1>
-			<p class="detail">Select a device, window, or Workspace to review status and actions.</p>
-		</div>
-		<div class="headerActions">
-			<button id="refreshButton" data-action="refresh" title="Refresh local status without account discovery">Refresh</button>
-			<button id="settingsButton" type="button" aria-expanded="false" aria-controls="settingsDrawer">Settings</button>
-		</div>
-	</header>
-	<p id="operationStatus" class="detail"></p>
-	<section class="connectivity" aria-labelledby="connectivity-heading">
-		<h2 id="connectivity-heading">Cross-device connections</h2>
-		<div id="connectivity" class="card loading">Loading...</div>
-	</section>
-	<div class="workspaceArea">
-	<main class="dashboardLayout">
-		<section class="panel" aria-labelledby="targets-heading">
-			<div class="panelHeader">
-				<h2 id="targets-heading">Workspace targets</h2>
-				<p class="detail">This device and Other devices</p>
-			</div>
-			<div id="deviceTree" class="card treePanel loading">Loading...</div>
-		</section>
-		<section class="panel" aria-labelledby="details-heading">
-			<div class="panelHeader">
-				<h2 id="details-heading">Selection</h2>
-				<p id="selectionSummary" class="detail">Loading...</p>
-			</div>
-			<div id="selectionDetails" class="card loading">Loading...</div>
-		</section>
-	</main>
-	<aside id="settingsDrawer" class="drawer" hidden aria-labelledby="settings-heading">
-		<div class="drawerHeader">
-			<h2 id="settings-heading">Settings and diagnostics</h2>
-			<button id="closeSettingsButton" type="button">Close</button>
-		</div>
-		<section aria-labelledby="device-heading"><h3 id="device-heading">This device</h3><div id="device" class="card loading">Loading...</div></section>
-		<section aria-labelledby="this-window-heading"><h3 id="this-window-heading">Current window</h3><div id="thisWindow" class="card loading">Loading...</div></section>
-		<section aria-labelledby="accept-heading"><h3 id="accept-heading">Receive summary</h3><div id="acceptIncoming" class="card loading">Loading...</div></section>
-		<details class="drawerDisclosure">
-			<summary>Transport diagnostics</summary>
-			<div id="listener" class="card loading">Loading...</div>
-		</details>
-		<details class="drawerDisclosure">
-			<summary>Discovery candidates — not workers</summary>
-			<p class="detail">Discovery hints never imply worker readiness or Workspace permission.</p>
-			<div id="discoveryCandidates" class="stack loading"></div>
-		</details>
-		<details class="drawerDisclosure">
-			<summary>Incoming peers on this device</summary>
-			<div id="incomingPeers" class="stack loading"></div>
-		</details>
-		<details class="drawerDisclosure">
-			<summary>Local directional allowlist</summary>
-			<div id="localNodes" class="stack loading"></div>
-		</details>
-		<details class="drawerDisclosure">
-			<summary>Saved authorizations</summary>
-			<div id="savedAuthorizations" class="stack loading"></div>
-		</details>
-		<details class="drawerDisclosure">
-			<summary>Diagnostic errors</summary>
-			<div id="errors" class="stack"></div>
-		</details>
-	</aside>
-	</div>
-	<section class="panel taskPanel" aria-labelledby="tasks-heading">
-		<div class="panelHeader">
-			<h2 id="tasks-heading">Tasks</h2>
-			<p class="detail">Task status and cancellation stay available while Settings is open.</p>
-		</div>
-		<div class="taskColumns">
-			<section aria-labelledby="outgoing-heading">
-				<h3 id="outgoing-heading">Outgoing</h3>
-				<div id="outgoingTasks" class="stack loading">Loading...</div>
-			</section>
-			<section aria-labelledby="incoming-heading">
-				<h3 id="incoming-heading">Incoming</h3>
-				<div id="incomingTasks" class="stack loading">Loading...</div>
-			</section>
-		</div>
-	</section>
-	<div id="announcement" role="status" aria-live="polite"></div>
-	<script nonce="${nonce}" src="${scriptUri}"></script>
-</body>
-</html>`;
+	return renderDashboardHtml(webview, mediaRoot, uiInstanceId, nonce, vscode.env.language);
+}
+
+function isManagementAction(action: DashboardAction): action is DashboardManagementAction {
+	return managementActions.has(action);
 }
 
 function getOwnExtensionUri(): vscode.Uri {

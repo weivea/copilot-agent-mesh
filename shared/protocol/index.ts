@@ -1,6 +1,7 @@
 export * from './constants';
 export * from './connectivity';
 export * from './remotePolicy';
+export * from './dashboardManagement';
 export * from './artifacts';
 export * from './envelopes';
 export * from './errors';

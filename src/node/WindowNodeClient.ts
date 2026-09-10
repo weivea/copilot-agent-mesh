@@ -22,6 +22,10 @@ import {
 	type BrokerRemoteListResult,
 	remotePolicyDashboardSchema,
 	remotePolicyActionParamsSchema,
+	dashboardManagementSnapshotSchema,
+	dashboardManagementActionParamsSchema,
+	type DashboardManagement,
+	type DashboardManagementAction,
 	type RemotePolicyAction,
 	type RemotePolicyDashboard,
 	LOCAL_BROKER_NOTIFICATIONS,
@@ -433,6 +437,23 @@ export class WindowNodeClient implements WorkspaceResolver {
 		return this.request(LOCAL_BROKER_METHODS.remotePolicyDashboard, {
 			nodeId: this.nodeId, nodeInstanceId: this.nodeInstanceId,
 		}, remotePolicyDashboardSchema);
+	}
+
+	public managementSnapshot(): Promise<DashboardManagement> {
+		return this.request(LOCAL_BROKER_METHODS.managementSnapshot, {
+			nodeId: this.nodeId, nodeInstanceId: this.nodeInstanceId,
+		}, dashboardManagementSnapshotSchema);
+	}
+
+	public async managementAction(action: DashboardManagementAction, actionHandle: string, enabled?: boolean): Promise<void> {
+		const params = dashboardManagementActionParamsSchema.parse({
+			nodeId: this.nodeId, nodeInstanceId: this.nodeInstanceId, action, actionHandle,
+			...(enabled === undefined ? {} : { enabled }),
+		});
+		await this.requireConnected().request(LOCAL_BROKER_METHODS.managementAction, toJsonValue(params), 180_000);
+		if (action === 'setWorkspaceEnabled' || action === 'removeManagedWorkspace') {
+			await this.refreshWorkspaces();
+		}
 	}
 
 	public async remotePolicyAction(action: RemotePolicyAction, actionHandle: string, enabled: boolean): Promise<void> {

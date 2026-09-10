@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { PROTOCOL_LIMITS, utf8ByteLength, utf8String } from './limits';
 import { connectivityActionParamsSchema, connectivitySnapshotParamsSchema } from './connectivity';
 import { remotePolicyActionParamsSchema, remotePolicyDashboardParamsSchema } from './remotePolicy';
+import { dashboardManagementActionParamsSchema, dashboardManagementParamsSchema } from './dashboardManagement';
 import {
 	deviceInfoSchema,
 	recoveryDescriptorSchema,
@@ -625,6 +626,8 @@ export const LOCAL_BROKER_METHODS = {
 	connectivitySnapshot: 'broker.connectivity.snapshot',
 	connectivityAction: 'broker.connectivity.action',
 	remotePolicyDashboard: 'broker.remote.policy.dashboard',
+	managementSnapshot: 'node.management.snapshot',
+	managementAction: 'node.management.action',
 	remotePolicyAction: 'broker.remote.policy.action',
 	remoteTaskStart: 'broker.remote.task.start',
 	remoteTaskGet: 'broker.remote.task.get',
@@ -675,6 +678,8 @@ export const localBrokerMethodParamsSchemas = {
 	[LOCAL_BROKER_METHODS.connectivityAction]: connectivityActionParamsSchema,
 	[LOCAL_BROKER_METHODS.remotePolicyDashboard]: remotePolicyDashboardParamsSchema,
 	[LOCAL_BROKER_METHODS.remotePolicyAction]: remotePolicyActionParamsSchema,
+	[LOCAL_BROKER_METHODS.managementSnapshot]: dashboardManagementParamsSchema,
+	[LOCAL_BROKER_METHODS.managementAction]: dashboardManagementActionParamsSchema,
 	[LOCAL_BROKER_METHODS.remoteTaskStart]: brokerRemoteTaskStartParamsSchema,
 	[LOCAL_BROKER_METHODS.remoteTaskGet]: brokerRemoteTaskGetParamsSchema,
 	[LOCAL_BROKER_METHODS.remoteTaskCancel]: brokerRemoteTaskCancelParamsSchema,

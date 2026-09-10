@@ -3,10 +3,11 @@ import type * as vscode from 'vscode';
 import { isAxiosError } from 'axios';
 
 import {
-	ACTIVE_TASK_STATUSES, connectivitySnapshotSchema,
+	connectivitySnapshotSchema,
 	type ConnectivityActionParams, type ConnectivitySnapshot, type NodeIdentityParams,
 	remotePolicyDashboardSchema,
 	type RemotePolicyActionParams, type RemotePolicyDashboard, type TaskTarget,
+	type DashboardManagement, type DashboardManagementActionParams, TERMINAL_TASK_STATUSES,
 } from '../../shared/protocol';
 import type { ListenerService } from '../application/ListenerService';
 import type { WorkerPlatformSupport } from '../application/WorkerPlatformSupport';
@@ -46,6 +47,8 @@ import { SdkDevTunnelExposureProvider } from '../tunnel/SdkDevTunnelExposureProv
 import type { LazyVscodeDevTunnelProvider } from './LazyVscodeDevTunnelProvider';
 import type { ProductionRemoteTaskAdapter } from './ProductionRemoteTaskAdapter';
 import { resolveWindowDisplayName } from '../broker/WindowName';
+import { ProductionDashboardManagement } from './ProductionDashboardManagement';
+import { localize } from './ProductionLocalization';
 
 interface ConnectivityOptions {
 	readonly vscodeApi: typeof vscode;
@@ -60,8 +63,11 @@ interface ConnectivityOptions {
 	readonly localPolicies: PeerPolicyService;
 	readonly tasks: FileTaskStore;
 	readonly cancelTask: (peerId: string, taskId: string) => Promise<unknown>;
+	readonly incomingAdmissionBarrier?: <T>(operation: () => Promise<T>) => Promise<T>;
 	readonly listener: () => ListenerService | undefined;
 	readonly remoteTasks: () => ProductionRemoteTaskAdapter;
+	readonly legacyTasks?: () => readonly { taskId: string; profileId: string; state: string }[];
+	readonly cancelLegacyTask?: (taskId: string) => Promise<unknown>;
 	readonly cli: LazyVscodeDevTunnelProvider;
 	readonly changed: () => void;
 	readonly report: (code: ConnectivityCode) => void;
@@ -110,6 +116,7 @@ export class ProductionConnectivity implements BrokerConnectivity {
 	public readonly exposure: SdkDevTunnelExposureProvider;
 	public readonly identity: AccountDeviceIdentityStore;
 	public readonly enrollment: AccountPeerEnrollment;
+	public readonly dashboardManagement: ProductionDashboardManagement;
 	private ready = false;
 	private settingsLoaded = false;
 	private disposed = false;
@@ -148,7 +155,7 @@ export class ProductionConnectivity implements BrokerConnectivity {
 					this.remotePolicyStore.removePeer(peerId),
 					(async () => {
 						const tasks = (await options.tasks.list()).filter((task) =>
-							task.peerId === peerId && (ACTIVE_TASK_STATUSES as readonly string[]).includes(task.state));
+							task.peerId === peerId && !(TERMINAL_TASK_STATUSES as readonly string[]).includes(task.state));
 						const cancelled = await Promise.allSettled(tasks.map((task) => options.cancelTask(peerId, task.taskId)));
 						if (cancelled.some((result) => result.status === 'rejected')) {
 							throw new Error('Revoked peer task cancellation requires retry.');
@@ -164,6 +171,7 @@ export class ProductionConnectivity implements BrokerConnectivity {
 				assertAllowed: (peerId) => {
 					this.assertReady();
 					this.revocations.assertAllowed(peerId);
+					this.dashboardManagement.assertPeerAllowed(peerId);
 					if (!this.enrollment.permitsIncoming(peerId)) {
 						throw new MeshDomainError('AUTH_FAILED', 'Enable same-account connections before authenticating this device.');
 					}
@@ -179,7 +187,7 @@ export class ProductionConnectivity implements BrokerConnectivity {
 				enabled: () => this.connectionsEnabled(),
 				ready: () => this.ready,
 				draining: () => this.stopRequested || this.currentSettings().cleanupPending,
-				assertPeerAllowed: (id) => this.revocations.assertAllowed(id),
+				assertPeerAllowed: (id) => { this.revocations.assertAllowed(id); this.dashboardManagement.assertPeerAllowed(id); },
 				assertPeerActive: (id) => this.pairing.assertActivePeer(id),
 			},
 		);
@@ -199,6 +207,7 @@ export class ProductionConnectivity implements BrokerConnectivity {
 			options.profiles, options.secrets, this.endpoints, this.transport, this.peers, {
 				enabled: () => this.connectionsEnabled(),
 				isRevoked: (peerId) => this.revocations.snapshot().some((entry) => entry.peerId === peerId),
+				isDeviceDenied: (deviceId) => this.dashboardManagement.deviceDenied(deviceId),
 				report: (code) => this.recordError(code),
 			},
 		);
@@ -208,6 +217,20 @@ export class ProductionConnectivity implements BrokerConnectivity {
 			identity: () => this.identity.current(this.account.current()?.accountRef),
 		});
 		this.exposure = this.sdkExposure;
+		this.dashboardManagement = new ProductionDashboardManagement({
+			...options, remotePolicies: this.remotePolicies, remotePolicyStore: this.remotePolicyStore,
+			peers: this.peers, endpoints: this.endpoints, enrollment: this.enrollment, revocations: this.revocations,
+			ready: () => this.ready,
+			assertCaller: (caller, session) => this.assertCaller(caller, session),
+			confirm: (message) => this.confirm(message),
+			translate: (message, ...args) => localize(options.vscodeApi, message, ...args),
+			switchAccount: (validate) => this.switchAccount(validate),
+			probe: (profileId, validate) => this.probeDevice(profileId, validate),
+			revokePeer: (peerId) => this.revokeDevice(peerId),
+			incomingAdmissionBarrier: options.incomingAdmissionBarrier ?? (async () => {
+				throw new MeshDomainError('POLICY_FORBIDDEN', 'Device lifecycle admission fencing is unavailable.');
+			}),
+		});
 	}
 
 	public isReady(): boolean { return this.ready; }
@@ -243,6 +266,7 @@ export class ProductionConnectivity implements BrokerConnectivity {
 				this.endpoints.initialize(), this.remotePolicyStore.initialize(),
 				this.revocations.initialize(), this.sdkExposure.initialize(),
 				this.identity.initialize(), this.enrollment.initialize(),
+				this.dashboardManagement.initialize(),
 			]);
 			this.account.initialize();
 			this.account.setBinding(this.currentSettings().account);
@@ -374,6 +398,7 @@ export class ProductionConnectivity implements BrokerConnectivity {
 				state: state === 'rePairRequired' ? 'authFailed' : state,
 			});
 		}
+
 		let truncated = false;
 		for (const device of remote.cachedDevices().devices) {
 			if (device.peerId === undefined) { continue; }
@@ -395,6 +420,16 @@ export class ProductionConnectivity implements BrokerConnectivity {
 			}
 		}
 		return remotePolicyDashboardSchema.parse({ workspaces, remoteTargets, peerStates, truncated });
+	}
+
+	public managementSnapshot(caller: NodeIdentityParams, session: LocalIpcSession): Promise<DashboardManagement> {
+		return this.dashboardManagement.snapshot(caller, session);
+	}
+
+	public managementAction(caller: NodeIdentityParams, input: DashboardManagementActionParams, session: LocalIpcSession): Promise<void> {
+		const operation = this.actionQueue.then(() => this.dashboardManagement.act(caller, input, session));
+		this.actionQueue = operation.then(() => undefined, () => undefined);
+		return operation;
 	}
 
 	public policyAction(caller: NodeIdentityParams, input: RemotePolicyActionParams, session: LocalIpcSession): Promise<void> {
@@ -434,6 +469,12 @@ export class ProductionConnectivity implements BrokerConnectivity {
 			} else if (binding.action === 'setRemoteReceive') {
 				await this.remotePolicies.setReceive(caller, binding.workspaceIdentity, input.enabled);
 			} else {
+				const sources = this.remotePolicies.sources(caller);
+				if (sources.length > 1 && !await this.confirm(
+					localize(this.options.vscodeApi, 'Apply this target permission to ALL source Workspaces: {0}?',
+						sources.map((source) => `"${resolveWindowDisplayName(undefined, source.name, caller.nodeId)}"`).join(', ')),
+				)) { return; }
+				await validate();
 				if (input.enabled) {
 					const remote = this.options.remoteTasks();
 					await remote.listDevices(new AbortController().signal);
@@ -554,18 +595,10 @@ export class ProductionConnectivity implements BrokerConnectivity {
 		this.assertCaller(caller, session);
 		switch (picked.id) {
 			case 'account':
-				if (this.currentSettings().enabled && !await this.confirm(
-					'Switch the cross-device account? Current connections will close and this device\'s Tunnel will be deleted. Workspace permissions are not transferred to a different account.',
-				)) { return; }
-				if (stopEpoch !== this.stopEpoch) { throw new ConnectivityError('CANCELLED'); }
-				if (this.currentSettings().cleanupPending) {
-					await this.ensureAccount(true, async () => {
-						this.assertCaller(caller, session);
-						if (stopEpoch !== this.stopEpoch) { throw new ConnectivityError('CANCELLED'); }
-					}, true);
-				}
-				await this.disableConnections();
-				await this.enableConnections(true, () => this.assertCaller(caller, session), true, stopEpoch);
+				await this.switchAccount(async () => {
+					this.assertCaller(caller, session);
+					if (stopEpoch !== this.stopEpoch) { throw new ConnectivityError('CANCELLED'); }
+				});
 				break;
 			case 'workspace': await this.configurePolicy(caller, session); break;
 			case 'revokePeer': {
@@ -578,6 +611,7 @@ export class ProductionConnectivity implements BrokerConnectivity {
 					this.assertCaller(caller, session);
 					await this.revokeDevice(peer.peerId);
 				}
+
 				break;
 			}
 			case 'probe': {
@@ -598,6 +632,45 @@ export class ProductionConnectivity implements BrokerConnectivity {
 				break;
 			}
 		}
+	}
+
+	private async switchAccount(validate: () => Promise<void>): Promise<void> {
+		const stopEpoch = this.stopEpoch;
+		if (this.currentSettings().enabled && !await this.confirm(
+			localize(this.options.vscodeApi, 'Switch the cross-device account? Current connections will close and this device\'s Tunnel will be deleted. Workspace permissions are not transferred to a different account.'),
+		)) { return; }
+		const check = async () => {
+			await validate();
+			if (stopEpoch !== this.stopEpoch) { throw new ConnectivityError('CANCELLED'); }
+		};
+		await check();
+		if (this.currentSettings().cleanupPending) { await this.ensureAccount(true, check, true); }
+		await this.disableConnections();
+		await check();
+		await this.enableConnections(true, check, true, stopEpoch);
+	}
+
+	private async probeDevice(profileId: string, validate: () => Promise<void>): Promise<void> {
+		const connection = this.peers.get(profileId);
+		const authentication = connection?.authenticatedBinding();
+		const endpoint = this.endpoints.get(profileId);
+		if (connection?.snapshot().state !== 'online' || authentication === undefined
+			|| endpoint?.profileGeneration !== authentication.profileGeneration || endpoint?.expectedWorkerDeviceId !== authentication.deviceId) {
+			throw new ConnectivityError('OFFLINE');
+		}
+		if (!await this.confirm(localize(this.options.vscodeApi, 'Send at most 100 Mesh pings, 1 MiB application traffic and 60 seconds to this exact authenticated device? Timeout closes this connection. This does not run an Agent task.'))) { return; }
+		const check = async () => {
+			await validate();
+			if (this.peers.get(profileId) !== connection || connection.snapshot().state !== 'online'
+				|| connection.authenticatedBinding()?.connectionGeneration !== authentication.connectionGeneration
+				|| this.endpoints.get(profileId)?.profileGeneration !== authentication.profileGeneration) { throw new ConnectivityError('BINDING_CHANGED'); }
+		};
+		await check();
+		const result = await probeConnectedPeer(connection, check);
+		await this.options.vscodeApi.window.showInformationMessage(
+			localize(this.options.vscodeApi, 'Mesh protocol v2: {0} ping replies, at most {1} application bytes in {2} ms. Physical topology, Agent execution and Chat UI remain separately unverified.',
+				result.replies, result.applicationBytesUpperBound, result.durationMs),
+		);
 	}
 
 	private async configurePolicy(caller: NodeIdentityParams, session: LocalIpcSession): Promise<void> {
@@ -677,7 +750,7 @@ export class ProductionConnectivity implements BrokerConnectivity {
 	}
 
 	private async enableConnections(
-		interactive: boolean, validateCaller: () => void, chooseAccount = false, stopEpoch = this.stopEpoch,
+		interactive: boolean, validateCaller: () => void | Promise<void>, chooseAccount = false, stopEpoch = this.stopEpoch,
 	): Promise<void> {
 		if (stopEpoch !== this.stopEpoch) { throw new ConnectivityError('CANCELLED'); }
 		if (!this.options.workerPlatform.supported) {
@@ -699,7 +772,7 @@ export class ProductionConnectivity implements BrokerConnectivity {
 		const validate = async (): Promise<void> => {
 			await assertDocumentFence(this.options.fence);
 			this.assertReady();
-			validateCaller();
+			await validateCaller();
 			if (this.stopRequested || stopEpoch !== this.stopEpoch) { throw new ConnectivityError('CANCELLED'); }
 		};
 		let hostAttempted = false;
@@ -864,13 +937,13 @@ export class ProductionConnectivity implements BrokerConnectivity {
 			const selected = await this.options.vscodeApi.window.showQuickPick([
 				...accounts,
 				...providers.map((provider) => ({
-					label: `Sign in with ${provider === 'github' ? 'GitHub' : 'Microsoft'}`,
-					description: 'Use a different account', providerId: provider,
+					label: localize(this.options.vscodeApi, 'Sign in with {0}', provider === 'github' ? 'GitHub' : 'Microsoft'),
+					description: localize(this.options.vscodeApi, 'Use a different account'), providerId: provider,
 					account: undefined,
 				})),
 			], {
-				title: 'Enable cross-device connections',
-				placeHolder: 'Your devices using this account connect automatically. Workspace task permissions stay separate.',
+				title: localize(this.options.vscodeApi, 'Enable cross-device connections'),
+				placeHolder: localize(this.options.vscodeApi, 'Your devices using this account connect automatically. Workspace task permissions stay separate.'),
 			});
 			if (selected === undefined) { throw new ConnectivityError('CANCELLED'); }
 			providerId = selected.providerId;
@@ -963,7 +1036,8 @@ export class ProductionConnectivity implements BrokerConnectivity {
 		);
 	}
 	private confirm(message: string): Promise<boolean> {
-		return Promise.resolve(this.options.vscodeApi.window.showWarningMessage(message, { modal: true }, 'Continue')).then((answer) => answer === 'Continue');
+		const action = localize(this.options.vscodeApi, 'Continue');
+		return Promise.resolve(this.options.vscodeApi.window.showWarningMessage(message, { modal: true }, action)).then((answer) => answer === action);
 	}
 
 	private assertCaller(caller: NodeIdentityParams, session: LocalIpcSession): void {

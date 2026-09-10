@@ -97,4 +97,14 @@ export class RemotePeerPolicyStore {
 			})),
 		}));
 	}
+
+	public async removeProfiles(profileIds: readonly string[]): Promise<void> {
+		const ids = new Set(profileIds.map((id) => uuidSchema.parse(id)));
+		await this.document.update((document) => ({
+			...document,
+			entries: document.entries.map((entry) => ({
+				...entry, allowlist: entry.allowlist.filter((target) => !ids.has(target.profileId)),
+			})),
+		}));
+	}
 }

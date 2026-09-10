@@ -211,10 +211,12 @@ resource's details when port metadata is incomplete, within the same discovery
 timeout and resource limit, before validating its advertisement and endpoints.
 A successful detail read alone never proves account ownership or grants task access.
 
-**Device trust is not Workspace or task authorization.** In **Manage devices and
-permissions…** or the selected Workspace's controls, B separately grants the
-trusted device its target Workspace and enables receive. A separately allowlists
-that authenticated remote Workspace from every claimed source root. These gates
+**Device trust is not Workspace or task authorization.** In **Devices & permissions**,
+or through a Workspace's **Permissions** shortcut on Overview, B separately grants
+the trusted device its target Workspace and enables receive. A separately allows
+the authenticated remote target from the selected source Workspace. Applying an
+authorization to every Workspace in the window is a separate, explicit action
+that identifies the affected Workspaces before confirmation. These gates
 default to deny; B still confirms each task unless its scoped automatic-acceptance
 policy is explicitly enabled. Use the Mesh task tools with target handles or
 explicit Device/Node/Workspace IDs. Strict remote tasks require B's existing editor
@@ -238,9 +240,21 @@ The old CLI hosting settings and UI are removed. A recorded legacy CLI-owned
 Tunnel can be retired only through exact SDK ownership proof with its native
 account, not a CLI login or a name/prefix-based deletion sweep.
 
-The Dashboard groups **This device / Other devices -> Window -> Workspace**.
-Select a Workspace for its controls; tasks stay in the task dock, the connection
-switch stays visible, and transport diagnostics remain collapsed in Settings.
+The Dashboard separates **Overview**, **Task history**, and **Devices & permissions**.
+Overview contains this device, confirmed connected devices and nonterminal tasks.
+Each Workspace has a **Permissions** shortcut that opens its exact settings without
+another target picker. Remote Workspace pages edit the selected local source's
+sending authorization; receiving permission is managed in the target window.
+Completed, failed, cancelled and timed-out tasks are kept in Task history, with
+status and direction filters. A lost connection does not move an active task to
+history. Task visibility and ownership are unchanged.
+
+Account, Workspace and device management are page controls rather than nested
+configuration menus. Advanced VS Code settings and existing Workspace commands
+remain available. Transport and Agent Host diagnostics are collapsed by default;
+errors and reasons an action is unavailable remain visible. The interface follows
+VS Code's language, with Chinese and English text. Informational explanations use
+closable, keyboard-accessible info popovers instead of taking up the main page.
 **Delegate from Chat…** opens an
 unsubmitted Agent Chat draft for that exact target. A has no additional Mesh
 task-start dialog; Copilot's existing tool-confirmation behavior is unchanged.
@@ -248,9 +262,15 @@ Refreshing the tree only reads cached/local state. **Refresh connected devices**
 explicitly refreshes trusted peers; account discovery runs automatically while
 connections are enabled.
 
-Offline windows disappear from the tree automatically. Reopening the same
+Offline windows disappear from Overview automatically. Reopening the same
 repository creates a new Window Node, while its saved Workspace configuration
-and authorizations remain. Paired remote devices stay listed when offline.
+and authorizations remain. Offline and unconfirmed remote devices appear under
+**Saved devices**, not as live targets. Deleting a saved device revokes its trust
+and related permissions while retaining task history and durable revocation
+records. Deletion is blocked while associated tasks are nonterminal or their
+state cannot be established. **Revoke trust** remains a separate confirmed action,
+including for connected devices with active tasks; it disconnects the device and
+requests cancellation without pretending those requests are completed tasks.
 The Broker keeps a short in-memory reconnect grace period (30 seconds by
 default); expired window records are reclaimed automatically, but task cleanup
 bindings and their leases are retained until the existing task lifecycle releases
@@ -268,7 +288,7 @@ peer clears its saved automatic acceptance; granting it again does not restore i
 
 The unified connection switch defaults off. Disabling connections never restores
 legacy authorization or clears Workspace policy. Receive/grant removal does not
-cancel accepted tasks; **Revoke incoming peer** additionally closes connections
+cancel accepted tasks; **Revoke trust** additionally closes connections
 and requests authoritative target-side cancellation. Cleanup failure remains
 visible and never restores permission.
 

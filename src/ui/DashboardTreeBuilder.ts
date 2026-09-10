@@ -1,7 +1,8 @@
-import { utf8ByteLength, type RemotePolicyAction, type RemotePolicyDashboard } from '../../shared/protocol';
+import { PROTOCOL_LIMITS, utf8ByteLength, type RemotePolicyAction, type RemotePolicyDashboard } from '../../shared/protocol';
 import type { DashboardSnapshot, DashboardTaskTarget } from './DashboardFacade';
 import { DASHBOARD_TREE_BYTES, dashboardDeviceTreeSchema, type DashboardDeviceTree, type DashboardTreeWorkspace } from './DashboardTree';
 import { redactRemoteText } from './DashboardRedaction';
+import { managementKey } from '../broker/DashboardManagementKey';
 
 export class DashboardTreeBuilder {
 	private readonly keys = new Map<string, string>();
@@ -28,6 +29,16 @@ export class DashboardTreeBuilder {
 			return value;
 		};
 		const tree: DashboardDeviceTree = [];
+		const remoteRows = new Map<string, DashboardDeviceTree[number]>();
+		let truncated = false;
+		const reportTruncated = () => {
+			if (!truncated) { options.onTruncated?.(); truncated = true; }
+		};
+		const permissions = new Set([
+			...snapshot.management?.workspaces.map((workspace) => workspace.key) ?? [],
+			...snapshot.management?.targets.map((target) => target.key) ?? [],
+		]);
+		const permission = (value: string) => permissions.has(value) ? { permissionKey: value } : {};
 		const sources = (snapshot.localNodes ?? []).filter((node) => node.status !== 'offline');
 		tree.push({
 			key: key('local-device'),
@@ -56,6 +67,8 @@ export class DashboardTreeBuilder {
 							: current && snapshot.thisWindow.canSetAcceptIncoming ? snapshot.thisWindow.acceptActionHandle : undefined;
 						return {
 							key: key(`${identity}:${workspace.workspaceId}`),
+							...permission(node.thisWindow ? managementKey('workspace', workspace.workspaceId)
+								: managementKey('target', 'local', node.nodeId, node.nodeInstanceId, workspace.workspaceId)),
 							name: redactRemoteText(workspace.name),
 							claimStatus: workspace.claimStatus,
 							enabled: workspace.enabled,
@@ -87,12 +100,32 @@ export class DashboardTreeBuilder {
 		});
 		for (const device of snapshot.remoteDevices ?? []) {
 			const identity = `remote:${device.peerId}:${device.deviceId}`;
-			const state = policy.peerStates.find((entry) => entry.profileId === device.peerId && entry.deviceId === device.deviceId)?.state ?? 'unknown';
-			tree.push({
-				key: key(identity),
-				name: redactRemoteText(device.name),
-				locality: 'remote', state,
-				nodes: (state === 'online' || state === 'unknown' ? device.nodes : []).filter((node) => node.status !== 'offline').map((node) => ({
+			const deviceKey = managementKey('device', device.deviceId);
+			const managed = snapshot.management?.devices.find((entry) => entry.key === deviceKey);
+			const profileState = policy.peerStates.find((entry) => entry.profileId === device.peerId && entry.deviceId === device.deviceId)?.state ?? 'unknown';
+			const state = managed?.state === 'revoked' || managed?.state === 'pending' ? 'offline'
+				: managed?.state ?? profileState;
+			if (snapshot.management?.available && !managed && !snapshot.management.truncated) { continue; }
+			let row = remoteRows.get(deviceKey);
+			if (row === undefined) {
+				if (tree.length >= 33) { reportTruncated(); continue; }
+				row = {
+					key: key(`managed:${deviceKey}`),
+					...(managed ? { managementKey: managed.key } : {}),
+					name: redactRemoteText(managed?.name ?? device.name),
+					locality: 'remote', state, nodes: [],
+				};
+				remoteRows.set(deviceKey, row);
+				tree.push(row);
+			} else {
+				const priority = ['online', 'busy', 'connecting', 'authFailed', 'incompatible', 'offline', 'unknown'];
+				if (priority.indexOf(state) < priority.indexOf(row.state)) { row.state = state; }
+			}
+			const live = ['online', 'busy'].includes(state) && ['online', 'busy'].includes(profileState);
+			const nodes = (live ? device.nodes : []).filter((node) => node.status !== 'offline');
+			const capacity = PROTOCOL_LIMITS.nodeListCount - row.nodes.length;
+			if (nodes.length > capacity) { reportTruncated(); }
+			row.nodes.push(...nodes.slice(0, capacity).map((node) => ({
 					key: key(`${identity}:${node.nodeId}:${node.nodeInstanceId}`),
 					label: redactRemoteText(node.label),
 					thisWindow: false, status: node.status,
@@ -102,15 +135,16 @@ export class DashboardTreeBuilder {
 							&& entry.nodeId === node.nodeId && entry.nodeInstanceId === node.nodeInstanceId
 							&& entry.workspaceId === workspace.workspaceId);
 						const canDelegate = target?.canDelegate === true && workspace.enabled && !workspace.busy
-							&& workspace.claimStatus === 'claimed' && state === 'online'
+							&& workspace.claimStatus === 'claimed' && live
 							&& ['online', 'busy'].includes(node.status) && node.workspaces.length === 1;
-						const gateState = state === 'unknown' ? 'unavailable' : state !== 'online' || node.status === 'offline' ? 'offline'
+						const gateState = !live || node.status === 'offline' ? 'offline'
 							: node.workspaces.length !== 1 ? 'multiWorkspace'
 								: workspace.claimStatus !== 'claimed' || !workspace.enabled ? 'notClaimed'
 									: target === undefined ? 'unavailable' : !target.allowlisted ? 'notAllowed'
 										: !target.acceptsIncoming ? 'notAccepting' : 'allowed';
 						return {
 							key: key(`${identity}:${node.nodeId}:${node.nodeInstanceId}:${workspace.workspaceId}`),
+							...permission(managementKey('target', device.peerId, node.nodeId, node.nodeInstanceId, workspace.workspaceId)),
 							name: redactRemoteText(workspace.name), claimStatus: workspace.claimStatus,
 							enabled: workspace.enabled, busy: workspace.busy, acceptsIncoming: target?.acceptsIncoming ?? false,
 							allowlisted: target?.allowlisted ?? false, gateState, canDelegate, incomingPeers: [],
@@ -121,7 +155,15 @@ export class DashboardTreeBuilder {
 							...(target?.actionHandle ? { allowActionHandle: options.remoteAction('setRemoteAllowed', target.actionHandle) } : {}),
 						};
 					}),
-				})),
+				})));
+		}
+		for (const device of snapshot.management?.devices ?? []) {
+			if (!['online', 'busy'].includes(device.state)
+				|| tree.some((entry) => entry.managementKey === device.key)) { continue; }
+			if (tree.length >= 33) { reportTruncated(); break; }
+			tree.push({
+				key: key(`managed:${device.key}`), name: redactRemoteText(device.name), locality: 'remote',
+				state: device.state === 'busy' ? 'busy' : 'online', managementKey: device.key, nodes: [],
 			});
 		}
 		for (const identity of this.keys.keys()) {
@@ -130,7 +172,7 @@ export class DashboardTreeBuilder {
 		if (utf8ByteLength(JSON.stringify(tree)) <= DASHBOARD_TREE_BYTES) {
 			return dashboardDeviceTreeSchema.parse(tree);
 		}
-		options.onTruncated?.();
+		reportTruncated();
 		return dashboardDeviceTreeSchema.parse(boundTree(tree));
 	}
 

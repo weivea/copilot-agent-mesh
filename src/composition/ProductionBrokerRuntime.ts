@@ -52,6 +52,7 @@ import { createTaskNotificationSink } from './TaskNotificationPublisher';
 import { ProductionRemoteTaskAdapter } from './ProductionRemoteTaskAdapter';
 import { ensureOwnedBrokerKey } from './SharedBrokerIdentity';
 import { ProductionConnectivity } from './ProductionConnectivity';
+import { ProductionLegacyTaskCoordinator } from './ProductionLegacyTaskCoordinator';
 
 export interface ProductionBrokerRuntimeOptions {
 	readonly vscodeApi: typeof vscode;
@@ -295,6 +296,7 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 			stateStore: new VscodeDevTunnelStateStore(fencedState),
 		});
 		let remoteTasks: ProductionRemoteTaskAdapter;
+		let coordinator: ProductionLegacyTaskCoordinator;
 		connectivity = new ProductionConnectivity({
 			vscodeApi: options.vscodeApi, files,
 			workerPlatform: options.workerPlatform,
@@ -302,6 +304,11 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 			deviceId: profile.deviceId, profiles: peerProfiles, records: pairingRecords,
 			secrets: options.secrets, registry, localPolicies: peerPolicies, tasks,
 			cancelTask: (peerId, taskId) => brokerTasks!.cancel(peerId, taskId),
+			incomingAdmissionBarrier: (operation) => brokerTasks!.withAdmissionBarrier(() => coordinator.withAdmissionBarrier(operation)),
+			legacyTasks: () => coordinator.listKnownTasks().map((task) => ({
+				taskId: task.intent.taskId, profileId: task.intent.peerId, state: task.snapshot?.state ?? 'unknown',
+			})),
+			cancelLegacyTask: (taskId) => coordinator.cancelOwnedTask({ taskId }, new AbortController().signal),
 			listener: () => listener, remoteTasks: () => remoteTasks, cli: tunnel,
 			changed: () => {
 				options.onDidChange();
@@ -313,7 +320,7 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 		registry.setPeerRouteAuthorizer(connectivity.remotePolicies);
 		const pairing = connectivity.pairing;
 		const peers = connectivity.peers;
-		const coordinator = new TaskCoordinator(
+		coordinator = new ProductionLegacyTaskCoordinator([
 			peers,
 			peerProfiles,
 			fencedState,
@@ -321,11 +328,13 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 			randomUUID,
 			() => new Date(),
 			options.ownership,
-		);
+		], (profileId) => connectivity!.dashboardManagement.assertProfileAllowed(profileId));
 		remoteTasks = new ProductionRemoteTaskAdapter(
 			peers,
 			peerProfiles,
 			fencedState,
+			() => new Date(),
+			(deviceId) => connectivity!.dashboardManagement.assertDeviceAllowed(deviceId),
 		);
 		broker = new DeviceBroker({
 			identity: options.identityFor(profile.deviceId),

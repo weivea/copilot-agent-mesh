@@ -33,6 +33,8 @@ export interface PeerProfileDeleteCondition {
 
 export interface PeerProfileStore {
 	get(id: string): Promise<PeerProfile | undefined>;
+	/** Local cache fencing fails closed when a store cannot synchronously validate the profile. */
+	peek?(id: string): PeerProfile | undefined;
 	list(): Promise<readonly PeerProfile[]>;
 	store(profile: PeerProfile): Promise<void>;
 	storeIfAbsent?(profile: PeerProfile): Promise<boolean>;
@@ -45,6 +47,10 @@ export class InMemoryPeerProfileStore implements PeerProfileStore {
 
 	public async get(id: string): Promise<PeerProfile | undefined> {
 		return this.profiles.get(id);
+	}
+	public peek(id: string): PeerProfile | undefined {
+		const profile = this.profiles.get(id);
+		return profile === undefined ? undefined : structuredClone(profile);
 	}
 	public async list(): Promise<readonly PeerProfile[]> {
 		return [...this.profiles.values()];

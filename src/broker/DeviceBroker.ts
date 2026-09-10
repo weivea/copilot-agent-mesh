@@ -13,6 +13,8 @@ import {
 	connectivityActionParamsSchema,
 	remotePolicyDashboardParamsSchema,
 	remotePolicyActionParamsSchema,
+	dashboardManagementParamsSchema,
+	dashboardManagementActionParamsSchema,
 	brokerRemoteTaskAnswerParamsSchema,
 	brokerRemoteTaskCancelParamsSchema,
 	brokerRemoteTaskGetParamsSchema,
@@ -548,6 +550,24 @@ export class DeviceBroker {
 
 		const binding = this.requireRegistration(session);
 		switch (method) {
+			case LOCAL_BROKER_METHODS.managementSnapshot: {
+				const input = dashboardManagementParamsSchema.parse(params);
+				this.assertIdentity(binding, input);
+				if (!this.options.connectivity?.managementSnapshot) {
+					throw new MeshDomainError('POLICY_FORBIDDEN', 'Dashboard management is unavailable.');
+				}
+				return toJsonValue(await this.options.connectivity.managementSnapshot(binding, session));
+			}
+			case LOCAL_BROKER_METHODS.managementAction: {
+				const input = dashboardManagementActionParamsSchema.parse(params);
+				this.assertIdentity(binding, input);
+				if (!this.options.connectivity?.managementAction) {
+					throw new MeshDomainError('POLICY_FORBIDDEN', 'Dashboard management is unavailable.');
+				}
+				await this.options.connectivity.managementAction(binding, input, session);
+				this.notifyDashboardChanged();
+				return null;
+			}
 			case LOCAL_BROKER_METHODS.remotePolicyDashboard: {
 				const input = remotePolicyDashboardParamsSchema.parse(params);
 				this.assertIdentity(binding, input);

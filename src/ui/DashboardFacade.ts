@@ -7,12 +7,15 @@ import {
 	type ConnectivityAction,
 	type ConnectivitySnapshot,
 	type RemotePolicyAction,
+	type DashboardManagement,
+	type DashboardManagementAction,
 	type DashboardTaskDirection,
 	type TaskStatus,
 } from '../../shared/protocol';
 import { validateWindowName } from '../broker/WindowName';
 import { getWorkerPlatformSupport } from '../application/WorkerPlatformSupport';
 import type { DashboardDeviceTree } from './DashboardTree';
+import { DashboardActionError } from './DashboardActionError';
 export {
 	DashboardActionError,
 	type DashboardActionErrorCode,
@@ -79,6 +82,7 @@ export interface DashboardSnapshot {
 		readonly detail?: string;
 	};
 	readonly connectivity?: ConnectivitySnapshot;
+	readonly management?: DashboardManagement;
 	readonly deviceTree?: DashboardDeviceTree;
 	readonly policyCandidates?: readonly DashboardPolicyCandidateSnapshot[];
 	readonly outgoingTasks?: readonly DashboardTaskSummarySnapshot[];
@@ -209,6 +213,7 @@ export interface DashboardFacade {
 	setPeerAllowed(actionHandle: string, allowed: boolean): Promise<void>;
 	connectivityAction(action: ConnectivityAction, actionHandle?: string): Promise<void>;
 	remotePolicyAction?(action: RemotePolicyAction, actionHandle: string, enabled: boolean): Promise<void>;
+	managementAction?(action: DashboardManagementAction, actionHandle: string, enabled?: boolean): Promise<void>;
 	openTargetChat?(actionHandle: string): Promise<void>;
 	cancelDashboardTask(actionHandle: string, direction: DashboardTaskDirection): Promise<void>;
 	registerCurrentWorkspace(): Promise<void>;
@@ -231,6 +236,7 @@ export interface DashboardServiceBindings {
 	setPeerAllowed(actionHandle: string, allowed: boolean): Promise<void>;
 	connectivityAction(action: ConnectivityAction, actionHandle?: string): Promise<void>;
 	remotePolicyAction?(action: RemotePolicyAction, actionHandle: string, enabled: boolean): Promise<void>;
+	managementAction?(action: DashboardManagementAction, actionHandle: string, enabled?: boolean): Promise<void>;
 	openTargetChat?(actionHandle: string): Promise<void>;
 	prepareDashboardTaskCancellation(
 		actionHandle: string,
@@ -283,11 +289,11 @@ export class ServiceDashboardFacade implements DashboardFacade {
 	public async configureDeviceName(): Promise<void> {
 		const snapshot = await this.services.getSnapshot();
 		const name = await this.inputs.showInputBox({
-			title: 'Configure Copilot Agent Mesh Device',
-			prompt: 'Choose a recognizable name for this device.',
+			title: vscode.l10n.t('Configure Copilot Agent Mesh Device'),
+			prompt: vscode.l10n.t('Choose a recognizable name for this device.'),
 			value: snapshot.device.name === 'Not configured' ? '' : snapshot.device.name,
 			ignoreFocusOut: true,
-			validateInput: (candidate) => candidate.trim().length > 0 ? undefined : 'A device name is required.',
+			validateInput: (candidate) => candidate.trim().length > 0 ? undefined : vscode.l10n.t('A device name is required.'),
 		});
 		if (name !== undefined) {
 			await this.services.configureDeviceName(name.trim());
@@ -297,8 +303,8 @@ export class ServiceDashboardFacade implements DashboardFacade {
 	public async renameCurrentWindow(): Promise<void> {
 		const session = await this.services.prepareWindowRename();
 		const name = await this.inputs.showInputBox({
-			title: 'Rename This Window',
-			prompt: 'Choose a device-wide unique display name for the current Workspace.',
+			title: vscode.l10n.t('Rename This Window'),
+			prompt: vscode.l10n.t('Choose a device-wide unique display name for the current Workspace.'),
 			value: session.currentName,
 			ignoreFocusOut: true,
 			validateInput: validateWindowNameInput,
@@ -325,6 +331,13 @@ export class ServiceDashboardFacade implements DashboardFacade {
 			throw new Error('Remote Workspace policy is unavailable.');
 		}
 		return this.services.remotePolicyAction(action, actionHandle, enabled);
+	}
+
+	public managementAction(action: DashboardManagementAction, actionHandle: string, enabled?: boolean): Promise<void> {
+		if (this.services.managementAction === undefined) {
+			throw new DashboardActionError('POLICY_FORBIDDEN', 'Device and Workspace settings are unavailable.');
+		}
+		return this.services.managementAction(action, actionHandle, enabled);
 	}
 
 	public openTargetChat(actionHandle: string): Promise<void> {
@@ -616,8 +629,9 @@ function platformLabel(platform: NodeJS.Platform): string {
 
 class VscodeDashboardConfirmationHost implements DashboardConfirmationHost {
 	public async confirm(message: string, action: string): Promise<boolean> {
-		const selected = await vscode.window.showWarningMessage(message, { modal: true }, action);
-		return selected === action;
+		const translatedAction = vscode.l10n.t(action);
+		const selected = await vscode.window.showWarningMessage(vscode.l10n.t(message), { modal: true }, translatedAction);
+		return selected === translatedAction;
 	}
 }
 
@@ -660,6 +674,6 @@ function validateWindowNameInput(candidate: string): string | undefined {
 		validateWindowName(candidate);
 		return undefined;
 	} catch (error: unknown) {
-		return error instanceof Error ? error.message : 'The window name is invalid.';
+		return vscode.l10n.t(error instanceof Error ? error.message : 'The window name is invalid.');
 	}
 }

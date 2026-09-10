@@ -1,0 +1,19 @@
+{
+  "command.configureDevice": "Configure Device Name",
+  "command.refreshDashboard": "Refresh Dashboard",
+  "command.registerWorkspace": "Register Current Workspace",
+  "command.removeWorkspace": "Remove Workspace",
+  "command.enableWorkspace": "Enable Workspace",
+  "command.disableWorkspace": "Disable Workspace",
+  "command.enableConnections": "Enable Cross-device Connections",
+  "command.disableConnections": "Disable Cross-device Connections",
+  "command.removePeer": "Remove Peer",
+  "command.runTask": "Run Remote Task",
+  "command.cancelTask": "Cancel Task",
+  "setting.deviceName": "The name used to identify this device to trusted peers.",
+  "setting.codePath": "Optional VS Code CLI path for the Worker Agent Host runtime. Windows x64/ARM64 and macOS arm64 are supported; the current installation is discovered automatically.",
+  "setting.peerDelegation": "Enable same-device peer window discovery, policy configuration, and task tools. Enabled by default; disable to opt out. Incoming task reception and directional Workspace authorization remain default-deny.",
+  "setting.userDataDir": "Override the current VS Code instance user-data directory for editor Agent Host discovery. Leave empty for automatic platform/product derivation.",
+  "setting.authenticationProviders": "Maps an AHP protected-resource or authorization-server URL to a VS Code authentication provider ID and exact scopes. No provider or scope is inferred.",
+  "setting.capabilityTags": "Capability tags published for newly registered workspaces. Paths and credentials must not be used as tags."
+}

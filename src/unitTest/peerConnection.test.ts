@@ -51,12 +51,15 @@ test('PeerConnection makes concurrent connection attempts single-flight', async 
 	const first = connection.connect();
 	const second = connection.connect();
 	assert.strictEqual(first, second);
+	assert.equal(connection.authenticatedBinding(), undefined);
 	release();
 	await Promise.all([first, second]);
 	assert.equal(connectCalls, 1);
+	assert.equal(typeof connection.authenticatedBinding()?.connectionGeneration, 'string');
 
 	await connection.disconnect();
 	assert.equal(closeCalls, 1);
+	assert.equal(connection.authenticatedBinding(), undefined);
 });
 
 test('PeerConnection serializes reconnect behind an in-progress disconnect', async () => {
@@ -97,14 +100,19 @@ test('PeerConnection serializes reconnect behind an in-progress disconnect', asy
 		() => undefined,
 	);
 	await connection.connect();
+	const firstAuthentication = connection.authenticatedBinding()!;
 
 	const disconnect = connection.disconnect();
 	const reconnect = connection.connect();
 	assert.equal(connectCalls, 1);
+	assert.equal(connection.authenticatedBinding(), undefined);
+	await profiles.store({ ...(await profiles.get('peer-profile'))!, generation: 'replacement-profile-generation' });
 	releaseClose();
 	await Promise.all([disconnect, reconnect]);
 
 	assert.equal(connectCalls, 2);
 	assert.equal(connection.snapshot().state, 'online');
+	assert.notEqual(connection.authenticatedBinding()?.connectionGeneration, firstAuthentication.connectionGeneration);
+	assert.equal(connection.authenticatedBinding()?.profileGeneration, 'replacement-profile-generation');
 	await connection.disconnect();
 });

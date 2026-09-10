@@ -56,6 +56,7 @@ export class AccountPeerEnrollment {
 		private readonly options: {
 			readonly enabled: () => boolean;
 			readonly isRevoked: (peerId: string) => boolean;
+			readonly isDeviceDenied?: (deviceId: string) => boolean;
 			readonly report: (code: ConnectivityCode) => void;
 		},
 	) {
@@ -74,6 +75,7 @@ export class AccountPeerEnrollment {
 		return this.initialized && this.options.enabled()
 			&& this.document.snapshot().entries.some((entry) =>
 				entry.accountRef === accountRef && !entry.blocked
+				&& this.options.isDeviceDenied?.(entry.deviceId) !== true
 				&& (entry.incomingPeerId === peerId || entry.legacyIncomingPeerIds.includes(peerId)));
 	}
 
@@ -82,6 +84,7 @@ export class AccountPeerEnrollment {
 		return this.initialized && this.options.enabled()
 			&& this.document.snapshot().entries.some((entry) =>
 				entry.accountRef === accountRef && entry.profileId === profileId && !entry.blocked
+				&& this.options.isDeviceDenied?.(entry.deviceId) !== true
 				&& !this.options.isRevoked(entry.incomingPeerId));
 	}
 
@@ -105,8 +108,21 @@ export class AccountPeerEnrollment {
 		if (entry !== undefined) { await this.peers.disconnect(entry.profileId); }
 	}
 
+	public async blockDevice(deviceId: string): Promise<void> {
+		this.lifetime.abort();
+		this.lifetime = new AbortController();
+		await this.document.update((value) => ({
+			...value, entries: value.entries.map((entry) => entry.deviceId === deviceId ? { ...entry, blocked: true } : entry),
+		}));
+		await this.syncing;
+	}
+
 	public incomingForProfile(profileId: string): string | undefined {
 		return this.initialized ? this.document.snapshot().entries.find((entry) => entry.profileId === profileId)?.incomingPeerId : undefined;
+	}
+
+	public entries(): readonly AccountPeerEntry[] {
+		return this.initialized ? this.document.snapshot().entries : [];
 	}
 
 	/** Input is exclusively the management SDK's caller-owned list, not discovery hints sent over RPC. */
@@ -154,8 +170,8 @@ export class AccountPeerEnrollment {
 			await validate();
 			const existing = this.document.snapshot().entries.find((entry) =>
 				entry.accountRef === account.accountRef && entry.deviceId === deviceId);
-			if (existing?.blocked || (existing !== undefined && this.options.isRevoked(existing.incomingPeerId))) {
-				await this.peers.disconnect(existing.profileId);
+			if (this.options.isDeviceDenied?.(deviceId) || existing?.blocked || (existing !== undefined && this.options.isRevoked(existing.incomingPeerId))) {
+				if (existing !== undefined) { await this.peers.disconnect(existing.profileId); }
 				continue;
 			}
 			if (new Set(candidates.map((candidate) => candidate.accountIdentity!.publicKey)).size !== 1

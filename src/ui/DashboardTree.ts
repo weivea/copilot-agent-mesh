@@ -12,6 +12,7 @@ export const dashboardTreeWorkspaceSchema = z.strictObject({
 	key,
 	name: label,
 	claimStatus: z.enum(['claimed', 'readOnly', 'conflict']),
+	permissionKey: z.string().regex(/^manage-(?:workspace|target)-[1-9][0-9]*$/u).max(64).optional(),
 	enabled: z.boolean(),
 	busy: z.boolean(),
 	acceptsIncoming: z.boolean(),
@@ -34,6 +35,7 @@ export const dashboardDeviceTreeSchema = z.array(z.strictObject({
 	key,
 	name: label,
 	locality: z.enum(['local', 'remote']),
+	managementKey: z.string().regex(/^manage-device-[1-9][0-9]*$/u).max(64).optional(),
 	state: z.enum(['connecting', 'online', 'busy', 'offline', 'authFailed', 'incompatible', 'unknown']),
 	nodes: z.array(z.strictObject({
 		key,
