@@ -118,6 +118,7 @@
 			'Cancel task': '取消任务',
 			'Device name': '设备名称',
 			'Rename device': '重命名设备',
+			'Edit device name': '编辑设备名称',
 			'Rename this window': '重命名当前窗口',
 			'Switch account': '切换账号',
 			'Account changes are unavailable. Enable connections or refresh status.': '当前无法切换账号。请启用连接或刷新状态。',

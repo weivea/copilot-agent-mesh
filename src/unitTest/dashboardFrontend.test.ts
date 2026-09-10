@@ -137,6 +137,29 @@ test('workspace permissions use exact keys and back restores scroll and triggeri
 	assert.equal(browser.activeElement?.dataset.focusKey, 'permission-tree-4');
 });
 
+test('device naming is an accessible inline edit next to the value, not a standalone action', () => {
+	for (const language of ['en', 'zh']) {
+		const browser = createDashboardBrowserHarness(language);
+		const data = model();
+		data.device.name = 'My device';
+		browser.render(data);
+		browser.button(language === 'en' ? 'Devices & permissions' : '设备与权限').click();
+		const edit = browser.control('rename-device');
+		assert.equal(edit.parentElement?.className, 'editableValue');
+		assert.equal(edit.parentElement?.children[0].text, 'My device');
+		assert.equal(edit.parentElement?.parentElement?.className, 'propertyRow');
+		assert.equal(edit.attributes['aria-label'], language === 'en' ? 'Edit device name' : '编辑设备名称');
+		assert.equal(edit.title, edit.attributes['aria-label']);
+		assert.throws(() => browser.button(language === 'en' ? 'Rename device' : '重命名设备'));
+		edit.click();
+		assert.deepEqual(browser.messages.at(-1), {
+			version: 10, uiInstanceId: 'media-view', type: 'action', action: 'configureDevice',
+		});
+		browser.render(data);
+		assert.equal(browser.activeElement?.dataset.focusKey, 'rename-device');
+	}
+});
+
 test('selected-source access is separate from explicit all-workspace access', () => {
 	const browser = createDashboardBrowserHarness();
 	browser.render(model());

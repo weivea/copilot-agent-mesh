@@ -127,6 +127,65 @@ suite('Dashboard', () => {
 		assert.doesNotMatch(media.element('pageContent').text, /Receive incoming tasks/u);
 	});
 
+	test('native connection color follows confirmed status rather than enable intent or cached errors', async () => {
+		const facade = new RecordingDashboardFacade();
+		const source = { ...snapshot(), connectivity: connectivitySnapshot() };
+		facade.snapshotValue = source;
+		const context: boolean[] = [];
+		const provider = new AgentMeshViewProvider(facade, getExtension().extensionUri,
+			async (online) => { context.push(online); });
+		const view = new TestWebviewView();
+		provider.resolveWebviewView(view);
+		const uiInstanceId = getUiInstanceId(view.webview.html);
+		try {
+			await view.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'ready' });
+			assert.equal(context.at(-1), true);
+			for (const connectionState of ['disabled', 'authenticating', 'starting', 'stopping', 'authRequired', 'error', 'cleanupPending'] as const) {
+				facade.snapshotValue = {
+					...source, connectivity: { ...source.connectivity, enabled: true, connectionState },
+				};
+				facade.fireChanged();
+				await settle();
+				assert.equal(context.at(-1), false, connectionState);
+			}
+			facade.snapshotValue = {
+				...source, errors: [{ code: 'CONNECTIVITY_UNAVAILABLE', message: 'Connection status is unavailable.' }],
+			};
+			facade.fireChanged();
+			await settle();
+			assert.equal(context.at(-1), false);
+			facade.snapshotValue = source;
+			facade.fireChanged();
+			await settle();
+			assert.equal(context.at(-1), true);
+			facade.snapshotValue = {
+				...source, connectivity: { ...source.connectivity, connectedDeviceCount: -1 },
+			};
+			facade.fireChanged();
+			await settle();
+			assert.equal(context.at(-1), false);
+			assert.ok(view.webview.sent.some((message) => message.code === 'UNSAFE_VIEW_MODEL'));
+		} finally { provider.dispose(); }
+	});
+
+	test('native toolbar updates do not block Dashboard snapshots', async () => {
+		const facade = new RecordingDashboardFacade();
+		let finish!: () => void;
+		const pending = new Promise<void>((resolve) => { finish = resolve; });
+		const provider = new AgentMeshViewProvider(facade, getExtension().extensionUri, () => pending);
+		const view = new TestWebviewView();
+		provider.resolveWebviewView(view);
+		const uiInstanceId = getUiInstanceId(view.webview.html);
+		try {
+			await view.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'ready' });
+			assert.equal(latestModel(view).connectivity.connectionState, 'disabled');
+			facade.snapshotValue = { ...snapshot(), connectivity: connectivitySnapshot() };
+			facade.fireChanged();
+			await settle();
+			assert.equal(latestModel(view).connectivity.connectionState, 'online');
+		} finally { finish(); provider.dispose(); }
+	});
+
 	test('a same-named unbound Workspace cannot borrow the current Workspace receive action', async () => {
 		const media = await createDashboardMediaHarness();
 		const source = managedSnapshot();

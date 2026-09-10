@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { test } from 'node:test';
 import ts from 'typescript';
+import { z } from 'zod';
 
 const root = resolve(__dirname, '../../..');
 const readJson = (name: string): unknown => JSON.parse(readFileSync(resolve(root, name), 'utf8'));
@@ -36,6 +37,36 @@ test('all localized command and configuration references have English and Chines
 		assert.ok(Object.hasOwn(chinese, key), `Chinese reference missing: ${key}`);
 	}
 	assert.deepEqual(Object.keys(chinese).sort(), Object.keys(english).sort());
+});
+
+test('native toolbar shows the connection switch first and reserves color for the online command', () => {
+	const manifest = z.object({
+		contributes: z.object({
+			commands: z.array(z.object({ command: z.string(), icon: z.unknown().optional() })),
+			menus: z.object({
+				'view/title': z.array(z.object({ command: z.string(), when: z.string(), group: z.string() })),
+			}),
+		}),
+	}).parse(readJson('package.json'));
+	const actions = manifest.contributes.menus['view/title'];
+	assert.equal(actions.some((action) => action.command === 'copilotAgentMesh.configureDevice'), false);
+	assert.deepEqual(actions.map((action) => action.group), ['navigation@1', 'navigation@1', 'navigation@2', 'navigation@9']);
+	assert.equal(actions[0].command, 'copilotAgentMesh.startListener');
+	assert.equal(actions[1].command, 'copilotAgentMesh.stopListener');
+	assert.match(actions[0].when, /!copilotAgentMesh\.connectionsOnline/u);
+	assert.match(actions[1].when, /&& copilotAgentMesh\.connectionsOnline$/u);
+	const start = manifest.contributes.commands.find((command) => command.command === actions[0].command);
+	const stop = manifest.contributes.commands.find((command) => command.command === actions[1].command);
+	assert.equal(start?.icon, '$(radio-tower)');
+	const paths = z.object({ dark: z.string(), light: z.string() }).parse(stop?.icon);
+	for (const [theme, path] of Object.entries(paths)) {
+		assert.equal(path, `media/connections-enabled-${theme}.svg`);
+		const svg = readFileSync(resolve(root, path), 'utf8');
+		assert.match(svg, /viewBox="0 0 16 16"/u);
+		assert.match(svg, theme === 'dark' ? /stroke="#73c991"/u : /stroke="#16825d"/u);
+	}
+	assert.ok(manifest.contributes.commands.some((command) => command.command === 'copilotAgentMesh.configureDevice'),
+		'The palette command remains available even though the redundant toolbar button is removed.');
 });
 
 test('native Chinese messages preserve format arguments', () => {

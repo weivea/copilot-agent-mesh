@@ -53,6 +53,8 @@ export const DASHBOARD_COMMANDS = {
 	refresh: 'copilotAgentMesh.refreshDashboard',
 } as const;
 
+export const DASHBOARD_CONNECTIONS_CONTEXT = 'copilotAgentMesh.connectionsOnline';
+
 export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
 	public static readonly viewType = 'copilotAgentMesh.dashboard';
 
@@ -63,6 +65,8 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 	public constructor(
 		private readonly facade: DashboardFacade = new UnavailableDashboardFacade(),
 		extensionUri?: vscode.Uri,
+		private readonly setConnectionContext: (online: boolean) => Thenable<unknown> = (online) =>
+			vscode.commands.executeCommand('setContext', DASHBOARD_CONNECTIONS_CONTEXT, online),
 	) {
 		this.extensionUri = extensionUri ?? getOwnExtensionUri();
 	}
@@ -326,6 +330,25 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 		}
 		const outbound: DashboardOutboundMessage = { ...message, pendingActions: [...instance.pendingActions] };
 		assertSafeDashboardOutboundMessage(outbound);
+		let online: boolean | undefined;
+		if (outbound.type === 'dashboard.snapshot') {
+			const { connectivity, errors } = outbound.model;
+			online = connectivity.enabled && connectivity.connectionState === 'online'
+				&& !errors.some((error) => error.code === 'CONNECTIVITY_UNAVAILABLE'
+					|| error.code === 'DASHBOARD_SERVICES_UNAVAILABLE');
+		} else if (outbound.code === 'UNSAFE_VIEW_MODEL') {
+			online = false;
+		}
+		if (online !== undefined) {
+			const current = online;
+			// Toolbar IPC must not delay snapshots or task cancellation.
+			void Promise.resolve().then(() => {
+				if (!instance.disposed) { return this.setConnectionContext(current); }
+				return undefined;
+			}).catch((error: unknown) => {
+				console.error('Unable to update the Dashboard connection indicator.', error);
+			});
+		}
 		await instance.view.webview.postMessage(outbound);
 	}
 

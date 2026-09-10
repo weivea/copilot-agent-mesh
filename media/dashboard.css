@@ -62,6 +62,9 @@ select {
 .propertyRow { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; padding: 3px 0; font-size: 11px; overflow-wrap: anywhere; }
 .propertyRow > :last-child { text-align: right; min-width: 0; }
 .propertyRow > :first-child { color: var(--vscode-descriptionForeground); flex-shrink: 0; max-width: 48%; }
+.editableValue { display: flex; flex: 1; justify-content: flex-end; align-items: center; gap: 6px; min-width: 0; }
+.editableValue > span { min-width: 0; overflow-wrap: anywhere; }
+.fieldEdit { flex: none; padding: 0 4px; width: 24px; min-height: 24px; border: 0; background: transparent; color: var(--vscode-icon-foreground, var(--vscode-foreground)); font-size: 16px; }
 details { margin-top: 8px; }
 summary { cursor: pointer; font-size: 12px; padding: 5px 0; overflow-wrap: anywhere; }
 .device { border-bottom: 1px solid var(--vscode-widget-border); }

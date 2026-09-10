@@ -341,10 +341,14 @@
 		pageHeading('Devices & permissions', 'permissionsHelp');
 		content.append(renderConnectivity(model));
 		const device = section('This device');
-		device.append(property('Device name', model.device.name), property('This window', model.thisWindow.name),
+		const editName = actionButton('Edit device name', 'configureDevice', undefined, false, 'rename-device');
+		editName.className = 'fieldEdit';
+		editName.setAttribute('aria-label', t('Edit device name'));
+		editName.title = t('Edit device name');
+		editName.textContent = '✎';
+		device.append(property('Device name', model.device.name, editName), property('This window', model.thisWindow.name),
 			property('Current workspace', model.thisWindow.workspaceName));
 		device.append(actionRow(
-			actionButton('Rename device', 'configureDevice', undefined, false, 'rename-device'),
 			actionButton('Rename this window', 'renameWindow', undefined, !model.thisWindow.canRename, 'rename-window'),
 			actionButton('Switch account', 'switchAccount', { actionHandle: model.management.accountActionHandle },
 				false, 'switch-account'),
@@ -761,9 +765,12 @@
 	}
 	function badge(text, attention) { return el('span', text, attention ? 'badge attention' : 'badge'); }
 	function notice(text, error) { return el('p', text, error ? 'error' : 'warning'); }
-	function property(label, value) {
+	function property(label, value, edit) {
 		const row = el('div', undefined, 'propertyRow');
-		row.append(tr('span', label), el('span', value));
+		const text = el('span', value);
+		const valueElement = edit ? el('div', undefined, 'editableValue') : text;
+		if (edit) { valueElement.append(text, edit); }
+		row.append(tr('span', label), valueElement);
 		return row;
 	}
 	function actionRow(...children) { const row = el('div', undefined, 'actions'); row.append(...children); return row; }

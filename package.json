@@ -505,7 +505,10 @@
         "command": "copilotAgentMesh.stopListener",
         "title": "%command.disableConnections%",
         "category": "Copilot Agent Mesh",
-        "icon": "$(debug-stop)"
+        "icon": {
+          "dark": "media/connections-enabled-dark.svg",
+          "light": "media/connections-enabled-light.svg"
+        }
       },
       {
         "command": "copilotAgentMesh.removePeer",
@@ -527,19 +530,19 @@
     "menus": {
       "view/title": [
         {
-          "command": "copilotAgentMesh.configureDevice",
-          "when": "view == copilotAgentMesh.dashboard",
+          "command": "copilotAgentMesh.startListener",
+          "when": "view == copilotAgentMesh.dashboard && !copilotAgentMesh.connectionsOnline",
+          "group": "navigation@1"
+        },
+        {
+          "command": "copilotAgentMesh.stopListener",
+          "when": "view == copilotAgentMesh.dashboard && copilotAgentMesh.connectionsOnline",
           "group": "navigation@1"
         },
         {
           "command": "copilotAgentMesh.registerWorkspace",
           "when": "view == copilotAgentMesh.dashboard",
           "group": "navigation@2"
-        },
-        {
-          "command": "copilotAgentMesh.startListener",
-          "when": "view == copilotAgentMesh.dashboard",
-          "group": "navigation@3"
         },
         {
           "command": "copilotAgentMesh.refreshDashboard",

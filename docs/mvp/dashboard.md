@@ -43,6 +43,10 @@ The page follows VS Code's Chinese or English locale, with English fallback.
 Explanatory copy is placed in closable, keyboard-accessible info popovers.
 Operational errors, denied-action reasons and dangerous consequences are not
 hidden in help text. Page navigation remains available during pending actions.
+The native title bar places the connection switch first: it is neutral until
+connections are confirmed online, then uses a green icon and the disable action.
+Device-name editing sits beside the displayed name instead of a separate toolbar
+gear or action-row button. Its existing command remains available in the palette.
 
 ## Cross-device connection control
 
