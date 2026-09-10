@@ -44,6 +44,7 @@ import { MeshDomainError } from '../domain/errors';
 import type { StateStore } from '../domain/ports';
 import type { TaskRecord } from '../domain/task';
 import { GatewayRouter } from '../gateway/GatewayRouter';
+import { InMemorySecretStore } from '../gateway/SecretStore';
 import {
 	LocalIpcClient,
 	LocalIpcRemoteError,
@@ -58,9 +59,11 @@ import {
 	type WindowNodeTaskConfirmationRequest,
 } from '../node';
 import type { PeerConnectionManager } from '../peer/PeerConnectionManager';
-import type { PeerProfile, PeerProfileStore } from '../peer/PeerProfile';
+import { PeerConnection } from '../peer/PeerConnection';
+import { InMemoryPeerProfileStore, type PeerProfile, type PeerProfileStore } from '../peer/PeerProfile';
 import { PeerRpcError } from '../peer/WebSocketPeerTransport';
 import { AtomicFileStore, NodeAtomicFileSystem } from '../storage/AtomicFileStore';
+import { VscodePeerProfileStore } from '../storage/VscodeStorageAdapters';
 import { FileTaskStore } from '../tasks/FileTaskStore';
 import { WorkspaceLeaseManager } from '../tasks/WorkspaceLeaseManager';
 import { LocalBrokerTaskFacade } from '../tools/LocalBrokerTaskFacade';
@@ -102,12 +105,20 @@ class FakeRemoteConnection {
 	public startCalls = 0;
 	public lastStart: Record<string, unknown> | undefined;
 	public answers: Record<string, unknown>[] = [];
+	public online = true;
+	public connectionGeneration = 1;
+	public profileGeneration: string | undefined;
 	private snapshotValue: TaskSnapshot | undefined;
 
 	public constructor(private readonly state: StateStore) {}
 
-	public snapshot(): { readonly state: 'online' } {
-		return { state: 'online' };
+	public snapshot(): { readonly state: 'online' | 'offline' } {
+		return { state: this.online ? 'online' : 'offline' };
+	}
+
+	public authenticatedBinding() {
+		return this.online ? { connectionGeneration: String(this.connectionGeneration),
+			profileGeneration: this.profileGeneration, deviceId: REMOTE_DEVICE_ID } : undefined;
 	}
 
 	public async request(method: string, params: Record<string, unknown>): Promise<unknown> {
@@ -729,6 +740,169 @@ test('remote route catalog rejects unknown and corrupt persisted versions', asyn
 	);
 });
 
+test('cached remote nodes require the exact authenticated connection and profile generation without implicit queries', async () => {
+	const state = new MemoryState();
+	const profiles = new InMemoryPeerProfileStore();
+	const profile = { ...remoteProfile(), generation: routeUuid(45000) };
+	await profiles.store(profile);
+	let connection = new FakeRemoteConnection(state);
+	connection.profileGeneration = profile.generation;
+	const manager = {
+		get: () => connection, isEnabled: () => true, listConnections: () => [connection],
+	} as unknown as PeerConnectionManager;
+	const adapter = new ProductionRemoteTaskAdapter(manager, profiles, state);
+	const route = remoteStartParams(routeUuid(45001), routeUuid(45002)).target;
+	assert.equal((await adapter.listDevices(new AbortController().signal)).devices[0].nodes.length, 1);
+	assert.ok(adapter.lookupTarget(PEER_ID, route));
+	const queries = connection.methods.length;
+	connection.online = false;
+	assert.deepEqual(adapter.cachedDevices().devices[0].nodes, []);
+	connection.online = true;
+	connection.connectionGeneration += 1;
+	assert.deepEqual(adapter.cachedDevices().devices[0].nodes, []);
+	assert.equal(adapter.lookupTarget(PEER_ID, route), undefined);
+	assert.equal(connection.methods.length, queries, 'Snapshot reads must not refresh remote metadata.');
+	await adapter.listDevices(new AbortController().signal);
+	assert.ok(adapter.lookupTarget(PEER_ID, route));
+	await profiles.store({ ...profile, generation: routeUuid(45003) });
+	assert.deepEqual(adapter.cachedDevices().devices[0].nodes, []);
+	assert.equal(adapter.lookupTarget(PEER_ID, route), undefined);
+	connection.profileGeneration = routeUuid(45003);
+	assert.deepEqual(adapter.cachedDevices().devices[0].nodes, []);
+	assert.equal(adapter.lookupTarget(PEER_ID, route), undefined);
+	const beforeMismatch = connection.methods.length;
+	await profiles.store(profile);
+	await adapter.listDevices(new AbortController().signal);
+	assert.equal(connection.methods.length, beforeMismatch, 'A mismatched authenticated profile is rejected before querying.');
+	await profiles.store({ ...profile, generation: connection.profileGeneration });
+	await adapter.listDevices(new AbortController().signal);
+	assert.ok(adapter.lookupTarget(PEER_ID, route));
+	const replacement = new FakeRemoteConnection(state);
+	replacement.connectionGeneration = connection.connectionGeneration;
+	replacement.profileGeneration = connection.profileGeneration;
+	connection = replacement;
+	assert.deepEqual(adapter.cachedDevices().devices[0].nodes, []);
+	assert.equal(adapter.lookupTarget(PEER_ID, route), undefined);
+	assert.equal(connection.methods.length, 0);
+});
+
+test('production peer epochs and synchronous persisted profile reads invalidate a live directory without remote discovery', async (t) => {
+	const state = new MemoryState();
+	const profiles = new VscodePeerProfileStore(state);
+	const profile = { ...remoteProfile(), generation: routeUuid(45010) };
+	await profiles.store(profile);
+	const responder = new FakeRemoteConnection(state);
+	const connection = new PeerConnection(PEER_ID, LOCAL_DEVICE_ID, profiles, new InMemorySecretStore(), {
+		connect: async (authenticatedProfile) => ({
+			profile: authenticatedProfile,
+			request: (method, params) => responder.request(method, params),
+			onClose: () => () => undefined,
+			close: async () => undefined,
+		}),
+	}, () => undefined);
+	t.after(() => connection.disconnect());
+	const manager = {
+		get: () => connection, isEnabled: () => true, listConnections: () => [connection],
+	} as unknown as PeerConnectionManager;
+	const adapter = new ProductionRemoteTaskAdapter(manager, profiles, state);
+	await connection.connect();
+	await adapter.listDevices(new AbortController().signal);
+	assert.equal(adapter.cachedDevices().devices[0].nodes.length, 1);
+	const firstGeneration = connection.authenticatedBinding()!.connectionGeneration;
+	const queryCount = responder.methods.length;
+	await connection.disconnect();
+	await connection.connect();
+	assert.notEqual(connection.authenticatedBinding()!.connectionGeneration, firstGeneration);
+	assert.deepEqual(adapter.cachedDevices().devices[0].nodes, []);
+	assert.equal(responder.methods.length, queryCount);
+	await adapter.listDevices(new AbortController().signal);
+	assert.equal(adapter.cachedDevices().devices[0].nodes.length, 1);
+	await profiles.store({ ...profile, generation: routeUuid(45011) });
+	assert.deepEqual(adapter.cachedDevices().devices[0].nodes, []);
+	assert.equal(responder.methods.length, queryCount + 2);
+});
+
+test('an older directory response cannot overwrite a newer authenticated connection directory', async () => {
+	const state = new MemoryState();
+	const connection = new FakeRemoteConnection(state);
+	const profile = { ...remoteProfile(), generation: routeUuid(45100) };
+	connection.profileGeneration = profile.generation;
+	let show!: () => void;
+	let release!: () => void;
+	const shown = new Promise<void>((resolve) => { show = resolve; });
+	const released = new Promise<void>((resolve) => { release = resolve; });
+	const request = connection.request.bind(connection);
+	let directoryReads = 0;
+	connection.request = async (method, params) => {
+		if (method !== 'node.list') { return request(method, params); }
+		if (++directoryReads === 1) { show(); await released; return remoteDirectory(); }
+		const directory = remoteDirectory();
+		return { ...directory, nodes: directory.nodes.map((node) => ({ ...node, nodeInstanceId: routeUuid(45101) })) };
+	};
+	const adapter = new ProductionRemoteTaskAdapter(
+		new FakePeerManager(connection) as unknown as PeerConnectionManager, profileStore([profile]), state,
+	);
+	const older = adapter.listDevices(new AbortController().signal);
+	await shown;
+	connection.connectionGeneration += 1;
+	const newer = await adapter.listDevices(new AbortController().signal);
+	assert.equal(newer.devices[0].nodes[0].nodeInstanceId, routeUuid(45101));
+	release();
+	await older;
+	assert.equal(adapter.cachedDevices().devices[0].nodes[0].nodeInstanceId, routeUuid(45101));
+	assert.equal(adapter.lookupTarget(PEER_ID, remoteStartParams(routeUuid(45102), routeUuid(45103)).target), undefined);
+	assert.equal(directoryReads, 2);
+});
+
+test('saved-device admission denial wins after reservation and before remote dispatch without erasing history', async () => {
+	const state = new MemoryState();
+	const connection = new FakeRemoteConnection(state);
+	let denied = false;
+	const adapter = new ProductionRemoteTaskAdapter(
+		new FakePeerManager(connection) as unknown as PeerConnectionManager,
+		profileStore([remoteProfile()]), state, () => new Date(CREATED_AT),
+		(deviceId) => {
+			assert.equal(deviceId, REMOTE_DEVICE_ID);
+			if (denied) { throw new MeshDomainError('POLICY_FORBIDDEN', 'Saved device denied.'); }
+		},
+	);
+	await assert.rejects(adapter.startTask(remoteStartParams(routeUuid(40000), routeUuid(40003)), {
+		peerId: PEER_ID, assertAuthorized: async () => { denied = true; },
+	}), /Saved device denied/u);
+	assert.equal(connection.startCalls, 0);
+	assert.deepEqual(remoteRoutes(state), []);
+	denied = false;
+	await adapter.startTask(remoteStartParams(routeUuid(40000), routeUuid(40003)), { peerId: PEER_ID });
+	const before = adapter.associatedTasks(REMOTE_DEVICE_ID, []);
+	assert.equal(before.length, 1);
+	denied = true;
+	await assert.rejects(adapter.startTask(remoteStartParams(routeUuid(40001), routeUuid(40002)), { peerId: PEER_ID }), /Saved device denied/u);
+	assert.deepEqual(adapter.associatedTasks(REMOTE_DEVICE_ID, []), before);
+	assert.equal(connection.startCalls, 1);
+});
+
+test('device deletion admission barrier rejects a queued start before it can reserve a route', async () => {
+	const state = new MemoryState();
+	const connection = new FakeRemoteConnection(state);
+	let denied = false;
+	const adapter = new ProductionRemoteTaskAdapter(
+		new FakePeerManager(connection) as unknown as PeerConnectionManager,
+		profileStore([remoteProfile()]), state, () => new Date(CREATED_AT),
+		() => { if (denied) { throw new MeshDomainError('POLICY_FORBIDDEN', 'Saved device denied.'); } },
+	);
+	let entered!: () => void;
+	let release!: () => void;
+	const reached = new Promise<void>((resolve) => { entered = resolve; });
+	const released = new Promise<void>((resolve) => { release = resolve; });
+	const barrier = adapter.withAdmissionBarrier(async () => { entered(); await released; denied = true; });
+	await reached;
+	const rejected = assert.rejects(adapter.startTask(remoteStartParams(routeUuid(40000), routeUuid(40003)), { peerId: PEER_ID }), /Saved device denied/u);
+	release();
+	await Promise.all([barrier, rejected]);
+	assert.equal(connection.startCalls, 0);
+	assert.deepEqual(remoteRoutes(state), []);
+});
+
 test('remote route capacity prunes oldest terminal tombstones and rejects active saturation', async () => {
 	const terminalState = new MemoryState();
 	await terminalState.update(REMOTE_TASK_ROUTE_STATE_KEY, remoteRouteState('completed'));
@@ -1281,6 +1455,7 @@ function createWindowNode(
 function profileStore(profiles: readonly PeerProfile[]): PeerProfileStore {
 	return {
 		get: async (id) => profiles.find((profile) => profile.id === id),
+		peek: (id) => profiles.find((profile) => profile.id === id),
 		list: async () => profiles,
 		store: async () => undefined,
 		delete: async () => false,

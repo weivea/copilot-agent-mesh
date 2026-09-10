@@ -6,6 +6,13 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [Unreleased]
 
+- Separate current devices and active tasks from task history and saved devices.
+  Replace the settings drawer and nested management menus with focused pages,
+  exact Workspace permission shortcuts, Chinese/English text and compact help.
+- Preserve connection recovery, diagnostics and advanced settings; add explicit
+  selected-source and whole-window authorization controls. Saved-device deletion
+  waits for associated tasks to finish, while independent trust revocation remains
+  available with confirmation and authoritative cancellation requests.
 - Add explicit `meshDelegateTask.continueFromTaskId` session reuse for completed
   tasks on the same authorized target. Follow-ups get independent task IDs,
   grants and turns while retaining editor conversation context; omitted input

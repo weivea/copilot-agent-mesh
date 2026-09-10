@@ -1,14 +1,18 @@
 import { DashboardViewModel } from './DashboardPresenter';
 import { containsUnsafeDashboardText } from './DashboardRedaction';
 import { dashboardDeviceTreeSchema } from './DashboardTree';
+import { z } from 'zod';
 import {
 	CONNECTIVITY_ACTIONS,
+	DASHBOARD_MANAGEMENT_ACTIONS,
+	MANAGEMENT_BOOLEAN_ACTIONS,
+	createDashboardManagementSchema,
 	REMOTE_POLICY_ACTIONS,
 	TASK_STATUSES,
 	utf8ByteLength,
 } from '../../shared/protocol';
 
-export const DASHBOARD_MESSAGE_VERSION = 9 as const;
+export const DASHBOARD_MESSAGE_VERSION = 10 as const;
 
 export const DASHBOARD_ACTIONS = [
 	'configureDevice',
@@ -23,6 +27,9 @@ export const DASHBOARD_ACTIONS = [
 	'cancelOutgoingTask',
 	'cancelIncomingTask',
 	...CONNECTIVITY_ACTIONS,
+	...DASHBOARD_MANAGEMENT_ACTIONS,
+	'openAdvancedSettings',
+	'registerWorkspace',
 	'refresh',
 ] as const;
 
@@ -74,6 +81,7 @@ export type DashboardOutboundMessage =
 
 const actions = new Set<string>(DASHBOARD_ACTIONS);
 const booleanActions = new Set<DashboardAction>([
+	...MANAGEMENT_BOOLEAN_ACTIONS,
 	'setAcceptIncoming',
 	'setPeerAllowed',
 	'setRemoteAutoAccept',
@@ -81,6 +89,7 @@ const booleanActions = new Set<DashboardAction>([
 	'setRemoteAllowed',
 ]);
 const handleActions = new Set<DashboardAction>([
+	...DASHBOARD_MANAGEMENT_ACTIONS,
 	'setAcceptIncoming',
 	'setPeerAllowed',
 	'openTargetChat',
@@ -92,6 +101,7 @@ const handleActions = new Set<DashboardAction>([
 	'pairDiscoveredPeer',
 	'revokeIncomingPeer',
 ]);
+const managementViewSchema = createDashboardManagementSchema(z.string().regex(/^[A-Za-z0-9_-]{32}$/u));
 
 export function parseDashboardInboundMessage(value: unknown): DashboardInboundMessage | undefined {
 	if (!isRecord(value) || value.version !== DASHBOARD_MESSAGE_VERSION || !isIdentifier(value.uiInstanceId)) {
@@ -185,6 +195,7 @@ function assertDashboardViewModel(model: unknown): asserts model is DashboardVie
 			'broker',
 			'thisWindow',
 			'connectivity',
+			'management',
 			'deviceTree',
 			'localNodes',
 			'savedAuthorizations',
@@ -282,6 +293,7 @@ function assertDashboardViewModel(model: unknown): asserts model is DashboardVie
 	assertOptionalString(model.thisWindow.agentHost.detail);
 
 	assertConnectivity(model.connectivity);
+	managementViewSchema.parse(model.management);
 	dashboardDeviceTreeSchema.parse(model.deviceTree);
 
 	assertArray(model.localNodes, 128);

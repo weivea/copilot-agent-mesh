@@ -121,6 +121,26 @@ test('revoked account devices remain blocked across rediscovery and enrollment-s
 	await restored.suspend();
 });
 
+test('deleted-device denial prevents profile recreation from rediscovery and survives enrollment restart', async (t) => {
+	const directory = new AccountDirectory();
+	const a = await accountDevice(directory, 941);
+	const b = await accountDevice(directory, 942);
+	t.after(async () => { await a.dispose(); await b.dispose(); });
+	await Promise.all([a.sync(), b.sync()]);
+	const profile = (await a.profiles.list())[0];
+	a.deniedDevices.add(b.deviceId);
+	await a.enrollment.blockDevice(b.deviceId);
+	await a.peers.remove(profile.id);
+	assert.equal((await a.profiles.list()).length, 0);
+	assert.equal(a.enrollment.permitsOutgoing(profile.id), false);
+	const restored = a.createEnrollment();
+	await restored.initialize();
+	await restored.synchronize((await a.discovery.list(new AbortController().signal)).endpoints);
+	assert.equal((await a.profiles.list()).length, 0);
+	assert.ok(restored.entries().every((entry) => entry.blocked));
+	await restored.suspend();
+});
+
 test('revocation wins against enrollment paused between endpoint preparation and connection', async (t) => {
 	const directory = new AccountDirectory();
 	const a = await accountDevice(directory, 921);
@@ -263,9 +283,11 @@ async function accountDevice(directory: AccountDirectory, index: number, cluster
 		},
 	});
 	const errors: ConnectivityCode[] = [];
+	const deniedDevices = new Set<string>();
 	const createEnrollment = () => new AccountPeerEnrollment(
 		base.files, base.fence, deviceId, base.account, identity, pairing, records, profiles, secrets, endpoints, transport, peers, {
 			enabled: () => true, isRevoked: (id) => revocations.snapshot().some((entry) => entry.peerId === id),
+			isDeviceDenied: (id) => deniedDevices.has(id),
 			report: (code) => errors.push(code),
 		},
 	);
@@ -298,7 +320,7 @@ async function accountDevice(directory: AccountDirectory, index: number, cluster
 	publish('initial');
 	return {
 		...base, deviceId, publicIdentity, records, profiles, secrets, identity, enrollment, peers, endpoints, pairing, errors,
-		discovery, transport, createEnrollment, publish, get tunnel() { return tunnel; },
+		discovery, transport, createEnrollment, publish, deniedDevices, get tunnel() { return tunnel; },
 		sync: async () => enrollment.synchronize((await discovery.list(new AbortController().signal)).endpoints),
 		dispose: async () => {
 			await enrollment.suspend();

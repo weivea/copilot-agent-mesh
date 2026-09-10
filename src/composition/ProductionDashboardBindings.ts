@@ -16,6 +16,9 @@ import {
 	type RemotePolicyAction,
 	type RemotePolicyDashboard,
 	type DashboardTaskDirection,
+	dashboardManagementSnapshotSchema,
+	type DashboardManagement,
+	type DashboardManagementAction,
 } from '../../shared/protocol';
 import type {
 	MeshDeviceToolSummary,
@@ -51,6 +54,8 @@ import type { WindowNodeClient } from '../node/WindowNodeClient';
 import type { LocalIpcRemoteTaskAdapter } from '../node/LocalIpcRemoteTaskAdapter';
 import type { ProductionBrokerRuntime } from './ProductionBrokerRuntime';
 import { DashboardTreeBuilder } from '../ui/DashboardTreeBuilder';
+import { managementKey } from '../broker/DashboardManagementKey';
+import { localize } from './ProductionLocalization';
 
 const activeTaskStates = new Set<string>(ACTIVE_TASK_STATUSES);
 
@@ -192,12 +197,11 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 				action: 'Choose from the visible explicit targets or reduce directory metadata.',
 			});
 		}
-		const remoteDevices: NonNullable<DashboardSnapshot['remoteDevices']> = remoteDirectory.devices.map(
-			(device) => ({
+		const projectRemoteDevice = (device: MeshDeviceToolSummary): NonNullable<DashboardSnapshot['remoteDevices']>[number] => ({
 			deviceId: device.deviceId,
 			peerId: device.peerId!,
 			name: device.deviceName,
-			state: device.status === 'incompatible' ? 'incompatible' : 'online',
+			state: device.status === 'incompatible' ? 'incompatible' : 'offline',
 			nodes: device.nodes.map((node) => ({
 				nodeId: node.nodeId,
 				nodeInstanceId: node.nodeInstanceId,
@@ -213,8 +217,8 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 					claimStatus: workspace.claimStatus,
 				})),
 			})),
-			}),
-		);
+		});
+		const remoteDevices = remoteDirectory.devices.map(projectRemoteDevice);
 
 		const runtimePreviewEnabled = thisWindowBase.previewEnabled || connectivity.delegationEnabled;
 		const runtime = runtimePreviewEnabled ? this.options.runtime() : undefined;
@@ -442,11 +446,39 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 			}
 		}
 		const generation = this.currentRemoteHandleGeneration();
+		let management: DashboardManagement = { available: false, truncated: false, devices: [], workspaces: [], targets: [] };
+		try {
+			management = dashboardManagementSnapshotSchema.parse(await this.options.node.managementSnapshot());
+		} catch {
+			errors.push({ code: 'MANAGEMENT_UNAVAILABLE',
+				message: localize(this.options.vscodeApi, 'Devices and permissions could not be read.'),
+				action: localize(this.options.vscodeApi, 'Refresh after Broker reconnection.') });
+		}
+		let currentRemoteDevices: typeof remoteDevices = [];
+		try {
+			// Re-read only the local, connection-fenced cache after the other asynchronous probes.
+			currentRemoteDevices = (await this.options.node.cachedRemoteDevices()).devices.map(projectRemoteDevice);
+		} catch {
+			errors.push({ code: 'REMOTE_DIRECTORY_UNAVAILABLE',
+				message: 'Cached remote Device and Node status is unavailable.',
+				action: 'Refresh local status after Broker reconnection. Use Mesh Tools for an explicit worker refresh.' });
+		}
+		const authoritativeRemoteDevices = currentRemoteDevices.filter((device) =>
+			!management.available || management.truncated
+			|| management.devices.some((entry) => entry.key === managementKey('device', device.deviceId)))
+			.map((device) => {
+				const current = management.devices.find((entry) => entry.key === managementKey('device', device.deviceId))?.state
+					?? policy.peerStates.find((entry) => entry.profileId === device.peerId && entry.deviceId === device.deviceId)?.state;
+				const state = current === 'online' || current === 'busy' || current === 'connecting'
+					|| current === 'authFailed' || current === 'incompatible' ? current : 'offline' as const;
+				return { ...device, state, nodes: state === 'online' || state === 'busy' ? device.nodes : [] };
+			});
 		const treeSnapshot = {
 			...snapshot,
+			management,
 			remoteDevices: [
-				...remoteDevices,
-				...policy.peerStates.filter((peer) => !remoteDevices.some((device) =>
+				...authoritativeRemoteDevices,
+				...policy.peerStates.filter((peer) => !authoritativeRemoteDevices.some((device) =>
 					device.peerId === peer.profileId && device.deviceId === peer.deviceId))
 					.map((peer) => ({
 						deviceId: peer.deviceId, peerId: peer.profileId,
@@ -456,6 +488,12 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 		};
 		return {
 			...snapshot,
+			management,
+			remoteDevices: authoritativeRemoteDevices,
+			peers: authoritativeRemoteDevices.map((device) => ({
+				peerId: device.peerId, name: device.name, state: device.state,
+				workspaceCount: device.nodes.reduce((count, node) => count + node.workspaces.length, 0),
+			})),
 			deviceTree: this.treeBuilder.build(treeSnapshot, policy, {
 				currentPolicyWorkspaceId: policySelection.kind === 'selected' ? policySelection.workspaceId : undefined,
 				delegate: (target) => this.issueBindingHandle(this.targetChatActions, { target, generation }),
@@ -478,6 +516,12 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 			this.options.vscodeApi.ConfigurationTarget.Global,
 		);
 		await owner.device.rename(name);
+		this.options.changed.fire();
+	}
+
+	public async managementAction(action: DashboardManagementAction, actionHandle: string, enabled?: boolean): Promise<void> {
+		this.options.guard.assertAllowed({ requireWorkspace: false });
+		await this.options.node.managementAction(action, actionHandle, enabled);
 		this.options.changed.fire();
 	}
 
@@ -772,7 +816,16 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 	}
 
 	public async removePeer(peerId: string): Promise<void> {
-		await this.requireOwner().peers.remove(peerId);
+		this.options.guard.assertAllowed({ requireWorkspace: false });
+		const profile = await this.requireOwner().peerProfiles.get(peerId);
+		if (!profile) { throw new DashboardActionError('STALE_ACTION', localize(this.options.vscodeApi, 'The saved device changed. Refresh before deleting it.')); }
+		const management = await this.options.node.managementSnapshot();
+		const device = management.devices.find((entry) => entry.key === managementKey('device', profile.workerDeviceId));
+		if (!device?.deleteActionHandle) {
+			throw new DashboardActionError('POLICY_FORBIDDEN', device?.deleteBlockedReason
+				?? localize(this.options.vscodeApi, 'Saved device deletion is unavailable. Refresh before continuing.'));
+		}
+		await this.options.node.managementAction('deleteSavedDevice', device.deleteActionHandle);
 		this.options.changed.fire();
 	}
 

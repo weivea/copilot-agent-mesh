@@ -3,6 +3,51 @@
 The dashboard is a secure presentation and command surface. It does not own device,
 listener, tunnel, workspace, peer, or task state.
 
+## Pages and preserved settings
+
+**Overview** shows this device, positively connected remote devices and nonterminal
+tasks. Directories from an earlier authenticated connection or profile are never
+promoted to live by reconnecting. Workspace listings describe the last confirmed
+read on the current connection; explicit remote refresh updates them. Multiple
+profiles for one device share one device row, with profile-specific routing kept
+separate. **Task history** contains completed, failed, cancelled and timed-out tasks
+with status and incoming/outgoing filters. Moving records between pages does not
+change task ownership, persistence or cancellation semantics.
+
+**Devices & permissions** contains account controls and exact Workspace settings.
+Every visible Workspace has a Permissions shortcut. Navigation uses stable
+presentation keys, not display-name matching, and a disappearing selection does
+not silently switch to another Workspace. Incoming reception, device grants,
+automatic task acceptance, local sending authorization and remote sending
+authorization remain separate. The selected source Workspace is the default;
+applying a remote authorization to all Workspaces in the current window is an
+explicit confirmed operation, fenced to the displayed source scope.
+
+**Saved devices** separates offline and unconfirmed records from current devices.
+Deletion revokes trust and related policies, preserves task history and revocation
+denials, and is blocked for associated nonterminal tasks or unproven task state.
+Independent device revocation is available even for connected devices with active
+tasks: after confirmation it withdraws access, closes connections and requests
+authoritative cancellation. It is not the same as deleting a saved record.
+Cleanup errors remain visible and retryable.
+
+The existing Workspace registration, enable/disable and removal commands remain
+available; Workspace enablement must not be confused with receiving tasks.
+Advanced VS Code settings retain the same-device delegation opt-out, executable
+and user-data directory overrides, standalone authentication mappings and
+Workspace capability tags. Local and remote offline authorizations remain
+removable. Native account login and destructive confirmations are retained, not
+the old multi-level configuration menus.
+
+The page follows VS Code's Chinese or English locale, with English fallback.
+Explanatory copy is placed in closable, keyboard-accessible info popovers.
+Operational errors, denied-action reasons and dangerous consequences are not
+hidden in help text. Page navigation remains available during pending actions.
+The native title bar places the connection switch first: it is neutral until
+connections are confirmed online, then uses a green icon and the disable action.
+Device-name editing sits beside the displayed name instead of a separate toolbar
+gear or action-row button. Its existing command remains available in the palette.
+
 ## Cross-device connection control
 
 The default-off **Enable cross-device connections** / **Disable cross-device
@@ -10,9 +55,11 @@ connections** control uses native VS Code account selection and SDK-only private
 Tunnels. Enabled devices automatically discover and authenticate same-account
 devices; Workspace grants, receive and task approval remain separate. Status,
 Account, Connected devices and Receiving Workspaces are shown without exposing
-credentials or endpoints. **Manage devices and permissions…** opens native
-configuration; transport diagnostics stay collapsed in Settings. There are no
+credentials or endpoints. **Devices & permissions** opens in-page configuration;
+transport and Agent Host diagnostics stay collapsed until requested. There are no
 separate Listener start/stop, connection-URL or candidate-pairing buttons.
+Local refresh remains separate from the explicit remote-device refresh.
+Per-device connection diagnostics retain the bounded probe and its confirmation.
 
 Agent Host status belongs to Current window, not Transport diagnostics. It shows
 **Not in use** when task features are off and **On demand** before an authorized
@@ -151,7 +198,8 @@ composition root should adapt the real stores and application services to
 | `configureDeviceName` | Collect the name in Extension Host UI and persist it through the device service |
 | `prepareWindowRename` / `renameCurrentWindow` | Capture one owned Workspace before collecting a bounded name, revalidate it on submit, then invoke the authenticated policy RPC |
 | `registerCurrentWorkspace` / `removeWorkspace` | Register the active local workspace or confirm and remove by `workspaceId` |
-| `connectivityAction` | Route `enableConnectivity` / `disableConnectivity` and native management actions through the authenticated Broker IPC, including from non-owner windows |
+| `connectivityAction` | Route enable/disable, explicit remote refresh and cleanup recovery through authenticated Broker IPC, including from non-owner windows |
+| `managementAction` | Redeem a caller-bound, one-time action for an exact device, Workspace or source/target authorization; confirm dangerous or whole-window changes before revalidation and commit |
 | `startListener` / `stopListener` | Compatibility aliases for unified enable/disable; stop adds no extra confirmation |
 | `copyConnectionUrl` | Legacy API only, absent from normal UI; never return or post an invitation to the webview |
 | `addPeer` / `removePeer` | Legacy enrollment/revocation API; automatic same-account connections do not require invitation import |

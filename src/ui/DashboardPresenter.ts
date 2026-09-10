@@ -2,9 +2,11 @@ import { DashboardSnapshot } from './DashboardFacade';
 import { redactRemoteText } from './DashboardRedaction';
 import {
 	connectivitySnapshotSchema,
+	dashboardManagementSnapshotSchema,
 	DISABLED_CONNECTIVITY_SNAPSHOT,
 	timestampSchema,
 	type ConnectivitySnapshot,
+	type DashboardManagement,
 } from '../../shared/protocol';
 import { dashboardDeviceTreeSchema, type DashboardDeviceTree } from './DashboardTree';
 
@@ -16,6 +18,7 @@ export interface DashboardViewModel {
 	readonly broker: NonNullable<DashboardSnapshot['broker']>;
 	readonly thisWindow: DashboardSnapshot['thisWindow'];
 	readonly connectivity: DashboardConnectivityViewModel;
+	readonly management: DashboardManagement;
 	readonly deviceTree: DashboardDeviceTree;
 	readonly localNodes: readonly DashboardLocalNodeViewModel[];
 	readonly savedAuthorizations: readonly DashboardSavedAuthorizationViewModel[];
@@ -79,6 +82,7 @@ export class DashboardPresenter {
 				},
 			},
 			connectivity: presentConnectivity(snapshot.connectivity ?? DISABLED_CONNECTIVITY_SNAPSHOT),
+			management: presentManagement(snapshot.management),
 			deviceTree: presentDeviceTree(snapshot.deviceTree ?? []),
 			localNodes: policyCandidates
 				.filter(isOnlinePolicyCandidate)
@@ -95,6 +99,34 @@ export class DashboardPresenter {
 			errors: snapshot.errors.map(redactError),
 		};
 	}
+}
+
+function presentManagement(snapshot: DashboardManagement | undefined): DashboardManagement {
+	const value = dashboardManagementSnapshotSchema.parse(snapshot ?? {
+		available: false, truncated: false, devices: [], workspaces: [], targets: [],
+	});
+	return {
+		...value,
+		devices: value.devices.map((device) => ({
+			...device,
+			name: redactRemoteText(device.name),
+			...(device.lastSeen === undefined ? {} : { lastSeen: normalizeDashboardTimestamp(device.lastSeen) }),
+			...(device.deleteBlockedReason === undefined ? {} : { deleteBlockedReason: redactRemoteText(device.deleteBlockedReason) }),
+		})),
+		workspaces: value.workspaces.map((workspace) => ({
+			...workspace,
+			name: redactRemoteText(workspace.name),
+			incomingPeers: workspace.incomingPeers.map((peer) => ({
+				...peer, name: redactRemoteText(peer.name),
+			})),
+		})),
+		targets: value.targets.map((target) => ({
+			...target,
+			deviceName: redactRemoteText(target.deviceName),
+			windowName: redactRemoteText(target.windowName),
+			workspaceName: redactRemoteText(target.workspaceName),
+		})),
+	};
 }
 
 function presentDeviceTree(value: DashboardDeviceTree): DashboardDeviceTree {

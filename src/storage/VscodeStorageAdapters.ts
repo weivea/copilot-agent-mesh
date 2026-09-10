@@ -224,6 +224,10 @@ export class VscodePeerProfileStore implements PeerProfileStore {
 		return this.read().find((profile) => profile.id === id);
 	}
 
+	public peek(id: string): PeerProfile | undefined {
+		return this.read().find((profile) => profile.id === id);
+	}
+
 	public async list(): Promise<readonly PeerProfile[]> {
 		return this.read();
 	}

@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 import type { SecretStore } from '../gateway/SecretStore';
 import type {
 	PeerConnectionState,
@@ -18,6 +20,12 @@ export interface PeerConnectionSnapshot {
 	readonly latencyMs?: number;
 }
 
+export interface PeerAuthenticationBinding {
+	readonly connectionGeneration: string;
+	readonly profileGeneration: string | undefined;
+	readonly deviceId: string;
+}
+
 export class PeerConnection {
 	private readonly listeners = new Set<(snapshot: PeerConnectionSnapshot) => void>();
 	private readonly notificationListeners = new Set<(
@@ -30,6 +38,7 @@ export class PeerConnection {
 	private disconnecting: Promise<void> | undefined;
 	private state: PeerConnectionState = 'offline';
 	private intentionalClose = false;
+	private authenticationBinding: PeerAuthenticationBinding | undefined;
 
 	public constructor(
 		public readonly profileId: string,
@@ -52,6 +61,12 @@ export class PeerConnection {
 	public onStateChanged(listener: (snapshot: PeerConnectionSnapshot) => void): () => void {
 		this.listeners.add(listener);
 		return () => this.listeners.delete(listener);
+	}
+
+	/** Internal cache fence, invalid as soon as disconnect begins and renewed after every authentication. */
+	public authenticatedBinding(): PeerAuthenticationBinding | undefined {
+		if (this.session === undefined || this.intentionalClose || this.state !== 'online') { return undefined; }
+		return this.authenticationBinding === undefined ? undefined : { ...this.authenticationBinding };
 	}
 
 	public onNotification(
@@ -106,6 +121,11 @@ export class PeerConnection {
 				return;
 			}
 			this.session = session;
+			this.authenticationBinding = {
+				connectionGeneration: randomUUID(),
+				profileGeneration: session.profile.generation,
+				deviceId: session.profile.workerDeviceId,
+			};
 			session.onNotification?.((method, params) => {
 				for (const listener of this.notificationListeners) {
 					listener(method, params);

@@ -33,10 +33,13 @@
     "onStartupFinished"
   ],
   "main": "./dist/extension.js",
+  "l10n": "./l10n",
   "files": [
     "dist/**",
     "media/**",
     "package.json",
+    "package.nls*.json",
+    "l10n/**",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
@@ -461,82 +464,85 @@
     "commands": [
       {
         "command": "copilotAgentMesh.configureDevice",
-        "title": "Configure Device Name",
+        "title": "%command.configureDevice%",
         "category": "Copilot Agent Mesh",
         "icon": "$(gear)"
       },
       {
         "command": "copilotAgentMesh.refreshDashboard",
-        "title": "Refresh Dashboard",
+        "title": "%command.refreshDashboard%",
         "category": "Copilot Agent Mesh",
         "icon": "$(refresh)"
       },
       {
         "command": "copilotAgentMesh.registerWorkspace",
-        "title": "Register Current Workspace",
+        "title": "%command.registerWorkspace%",
         "category": "Copilot Agent Mesh",
         "icon": "$(add)"
       },
       {
         "command": "copilotAgentMesh.removeWorkspace",
-        "title": "Remove Workspace",
+        "title": "%command.removeWorkspace%",
         "category": "Copilot Agent Mesh"
       },
       {
         "command": "copilotAgentMesh.enableWorkspace",
-        "title": "Enable Workspace",
+        "title": "%command.enableWorkspace%",
         "category": "Copilot Agent Mesh"
       },
       {
         "command": "copilotAgentMesh.disableWorkspace",
-        "title": "Disable Workspace",
+        "title": "%command.disableWorkspace%",
         "category": "Copilot Agent Mesh"
       },
       {
         "command": "copilotAgentMesh.startListener",
-        "title": "Enable Cross-device Connections",
+        "title": "%command.enableConnections%",
         "category": "Copilot Agent Mesh",
         "icon": "$(radio-tower)"
       },
       {
         "command": "copilotAgentMesh.stopListener",
-        "title": "Disable Cross-device Connections",
+        "title": "%command.disableConnections%",
         "category": "Copilot Agent Mesh",
-        "icon": "$(debug-stop)"
+        "icon": {
+          "dark": "media/connections-enabled-dark.svg",
+          "light": "media/connections-enabled-light.svg"
+        }
       },
       {
         "command": "copilotAgentMesh.removePeer",
-        "title": "Remove Peer",
+        "title": "%command.removePeer%",
         "category": "Copilot Agent Mesh"
       },
       {
         "command": "copilotAgentMesh.runTask",
-        "title": "Run Remote Task",
+        "title": "%command.runTask%",
         "category": "Copilot Agent Mesh",
         "icon": "$(play)"
       },
       {
         "command": "copilotAgentMesh.cancelTask",
-        "title": "Cancel Task",
+        "title": "%command.cancelTask%",
         "category": "Copilot Agent Mesh"
       }
     ],
     "menus": {
       "view/title": [
         {
-          "command": "copilotAgentMesh.configureDevice",
-          "when": "view == copilotAgentMesh.dashboard",
+          "command": "copilotAgentMesh.startListener",
+          "when": "view == copilotAgentMesh.dashboard && !copilotAgentMesh.connectionsOnline",
+          "group": "navigation@1"
+        },
+        {
+          "command": "copilotAgentMesh.stopListener",
+          "when": "view == copilotAgentMesh.dashboard && copilotAgentMesh.connectionsOnline",
           "group": "navigation@1"
         },
         {
           "command": "copilotAgentMesh.registerWorkspace",
           "when": "view == copilotAgentMesh.dashboard",
           "group": "navigation@2"
-        },
-        {
-          "command": "copilotAgentMesh.startListener",
-          "when": "view == copilotAgentMesh.dashboard",
-          "group": "navigation@3"
         },
         {
           "command": "copilotAgentMesh.refreshDashboard",
@@ -552,25 +558,25 @@
           "type": "string",
           "default": "",
           "scope": "machine",
-          "markdownDescription": "The name used to identify this device to trusted peers."
+          "markdownDescription": "%setting.deviceName%"
         },
         "copilotAgentMesh.codePath": {
           "type": "string",
           "default": "",
           "scope": "machine",
-          "markdownDescription": "Optional VS Code CLI path for the Worker Agent Host runtime. Windows x64/ARM64 and macOS arm64 are supported; the current installation is discovered automatically."
+          "markdownDescription": "%setting.codePath%"
         },
         "copilotAgentMesh.experimental.peerDelegation": {
           "type": "boolean",
           "default": true,
           "scope": "machine",
-          "markdownDescription": "Enable same-device peer window discovery, policy configuration, and task tools. Enabled by default; disable to opt out. Incoming task reception and directional Workspace authorization remain default-deny."
+          "markdownDescription": "%setting.peerDelegation%"
         },
         "copilotAgentMesh.agentHost.userDataDir": {
           "type": "string",
           "default": "",
           "scope": "machine",
-          "markdownDescription": "Override the current VS Code instance user-data directory for editor Agent Host discovery. Leave empty for automatic platform/product derivation."
+          "markdownDescription": "%setting.userDataDir%"
         },
         "copilotAgentMesh.experimental.authenticationProviders": {
           "type": "object",
@@ -595,7 +601,7 @@
             ],
             "additionalProperties": false
           },
-          "markdownDescription": "Maps an AHP protected-resource or authorization-server URL to a VS Code authentication provider ID and exact scopes. No provider or scope is inferred."
+          "markdownDescription": "%setting.authenticationProviders%"
         },
         "copilotAgentMesh.workspace.capabilityTags": {
           "type": "array",
@@ -606,7 +612,7 @@
             "type": "string",
             "maxLength": 64
           },
-          "markdownDescription": "Capability tags published for newly registered workspaces. Paths and credentials must not be used as tags."
+          "markdownDescription": "%setting.capabilityTags%"
         }
       }
     }

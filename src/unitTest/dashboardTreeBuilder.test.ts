@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import type { RemotePolicyDashboard } from '../../shared/protocol';
+import { PROTOCOL_LIMITS, type RemotePolicyDashboard } from '../../shared/protocol';
 import type { DashboardSnapshot, DashboardTaskTarget } from '../ui/DashboardFacade';
 import { DashboardTreeBuilder } from '../ui/DashboardTreeBuilder';
 import { dashboardDeviceTreeSchema } from '../ui/DashboardTree';
 import { uuid } from './artifactStoreTestSupport';
+import { managementKey } from '../broker/DashboardManagementKey';
 
 function fixture() {
 	const current = { nodeId: uuid(2), nodeInstanceId: uuid(3) };
@@ -100,17 +101,110 @@ test('duplicate names and reordered snapshots cannot transfer tree selection to 
 	assert.equal(changed[0].nodes[1].key, first[0].nodes[1].key);
 });
 
+test('permission navigation joins private identities and connected devices without visible targets keep their management link', () => {
+	const f = fixture();
+	const ownKey = managementKey('workspace', uuid(4));
+	const remoteKey = managementKey('target', f.remote.profileId, f.remote.nodeId, f.remote.nodeInstanceId, f.remote.workspaceId);
+	const deviceKey = managementKey('device', f.remote.deviceId);
+	const management: NonNullable<DashboardSnapshot['management']> = {
+		available: true, truncated: false,
+		devices: [{ key: deviceKey, name: 'Lab Mac', state: 'online', cleanupPending: false }],
+		workspaces: [{ key: ownKey, name: 'Same name', enabled: true, acceptsIncoming: true, incomingPeers: [] }],
+		targets: [{ key: remoteKey, deviceName: 'Same name', windowName: 'Same name', workspaceName: 'Same name',
+			locality: 'remote', online: true, sources: [], allSourcesAllowed: 'none' }],
+	};
+	const builder = new DashboardTreeBuilder();
+	const snapshot = { ...f.snapshot, management };
+	const tree = builder.build(snapshot, f.policy, f.options);
+	assert.equal(tree[0].nodes[0].workspaces[0].permissionKey, ownKey);
+	assert.equal(tree[0].nodes[1].workspaces[0].permissionKey, undefined);
+	assert.equal(tree[1].nodes[0].workspaces[0].permissionKey, remoteKey);
+	assert.equal(tree[1].managementKey, deviceKey);
+	const withoutTargets = builder.build({ ...snapshot, remoteDevices: [] }, { ...f.policy, peerStates: [], remoteTargets: [] }, f.options);
+	assert.equal(withoutTargets[1].state, 'online');
+	assert.equal(withoutTargets[1].key, tree[1].key);
+	assert.equal(withoutTargets[1].managementKey, deviceKey);
+	assert.deepEqual(withoutTargets[1].nodes, []);
+});
+
 test('cached unknown state is not online readiness, and disconnected devices have no executable stale children', () => {
 	const f = fixture();
 	const builder = new DashboardTreeBuilder();
 	const unknown = builder.build(f.snapshot, { ...f.policy, peerStates: [] }, f.options);
 	assert.equal(unknown[1].state, 'unknown');
-	assert.equal(unknown[1].nodes[0].workspaces[0].canDelegate, false);
+	assert.deepEqual(unknown[1].nodes, []);
 	const offline = builder.build(f.snapshot, {
 		...f.policy, peerStates: [{ ...f.policy.peerStates[0], state: 'offline' }],
 	}, f.options);
 	assert.deepEqual(offline[1].nodes, []);
 	assert.equal(offline[1].state, 'offline');
+});
+
+test('multiple profiles share one device row without merging their routing identities', () => {
+	for (const managed of [false, true]) {
+		const f = fixture();
+		const secondProfile = uuid(90);
+		const device = f.snapshot.remoteDevices![0];
+		const devices = [device, { ...device, peerId: secondProfile }];
+		const snapshot: DashboardSnapshot = {
+			...f.snapshot, remoteDevices: devices,
+			...(managed ? { management: {
+				available: true, truncated: false, workspaces: [], targets: [],
+				devices: [{
+					key: managementKey('device', device.deviceId), name: 'Lab Mac',
+					state: 'online' as const, cleanupPending: false,
+				}],
+			} } : {}),
+		};
+		const policy: RemotePolicyDashboard = {
+			...f.policy,
+			peerStates: [...f.policy.peerStates, { ...f.policy.peerStates[0], profileId: secondProfile }],
+			remoteTargets: [...f.policy.remoteTargets, { ...f.policy.remoteTargets[0], profileId: secondProfile }],
+		};
+		const builder = new DashboardTreeBuilder();
+		const first = builder.build(snapshot, policy, f.options);
+		assert.equal(first.length, 2);
+		assert.equal(first[1].nodes.length, 2);
+		assert.notEqual(first[1].nodes[0].key, first[1].nodes[1].key);
+		assert.deepEqual(new Set(f.delegates.flatMap((target) => target.peerId ? [target.peerId] : [])),
+			new Set([f.remote.profileId, secondProfile]));
+		assert.equal(dashboardDeviceTreeSchema.safeParse(first).success, true);
+		const reordered = builder.build({ ...snapshot, remoteDevices: [...devices].reverse() }, policy, f.options);
+		assert.equal(reordered[1].key, first[1].key);
+		assert.deepEqual(new Set(reordered[1].nodes.map((node) => node.key)), new Set(first[1].nodes.map((node) => node.key)));
+		f.delegates.length = 0;
+		const disconnected = builder.build(snapshot, {
+			...policy, peerStates: [{ ...policy.peerStates[0], state: 'offline' }, policy.peerStates[1]],
+		}, f.options);
+		assert.equal(disconnected[1].state, 'online');
+		assert.equal(disconnected[1].nodes.length, 1);
+		assert.equal(disconnected[1].nodes[0].key, first[1].nodes[1].key);
+		assert.deepEqual(f.delegates.filter((target) => target.peerId !== undefined).map((target) => target.peerId), [secondProfile]);
+	}
+});
+
+test('aggregated profile nodes stay within the per-device limit with one truncation notice', () => {
+	const f = fixture();
+	const first = f.snapshot.remoteDevices![0];
+	const second = { ...first, peerId: uuid(90) };
+	let warnings = 0;
+	const tree = new DashboardTreeBuilder().build({
+		...f.snapshot,
+		remoteDevices: [first, second].map((device, profileIndex) => ({
+			...device,
+			nodes: Array.from({ length: 100 }, (_, index) => ({
+				...device.nodes[0],
+				nodeId: uuid(300 + profileIndex * 100 + index),
+				nodeInstanceId: uuid(600 + profileIndex * 100 + index),
+			})),
+		})),
+	}, {
+		...f.policy, peerStates: [...f.policy.peerStates, { ...f.policy.peerStates[0], profileId: second.peerId }],
+	}, { ...f.options, onTruncated: () => { warnings++; } });
+	assert.equal(tree.length, 2);
+	assert.equal(tree[1].nodes.length, PROTOCOL_LIMITS.nodeListCount);
+	assert.equal(warnings, 1);
+	assert.equal(dashboardDeviceTreeSchema.safeParse(tree).success, true);
 });
 
 test('multi-Workspace targets remain visible but cannot be delegated to, and display paths are redacted', () => {

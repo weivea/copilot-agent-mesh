@@ -32,6 +32,7 @@ import type {
 import { MeshDomainError } from '../domain/errors';
 import type { StateStore } from '../domain/ports';
 import type { PeerConnectionManager } from '../peer/PeerConnectionManager';
+import type { PeerAuthenticationBinding, PeerConnection } from '../peer/PeerConnection';
 import {
 	isUsablePeerProfile,
 	type PeerProfile,
@@ -126,13 +127,19 @@ export class ProductionRemoteTaskAdapter implements RemoteTaskRouteAdapter {
 	private routeMutation = Promise.resolve();
 	private nextRouteAttemptId = 1;
 	private directory: MeshRemoteDirectorySnapshot = { devices: [], truncated: false, totalDevices: 0 };
-	private readonly authenticatedCatalog = new Map<string, { generation: string; directory: NodeDirectoryResult }>();
+	private directoryReadGeneration = 0;
+	private readonly authenticatedCatalog = new Map<string, {
+		connection: PeerConnection;
+		authentication: PeerAuthenticationBinding;
+		directory: NodeDirectoryResult;
+	}>();
 
 	public constructor(
 		private readonly peers: PeerConnectionManager,
 		private readonly profiles: PeerProfileStore,
 		state: StateStore = new VolatileStateStore(),
 		now: () => Date = () => new Date(),
+		private readonly assertDeviceAllowed: (deviceId: string) => void = () => undefined,
 	) {
 		this.state = state;
 		this.now = now;
@@ -143,6 +150,7 @@ export class ProductionRemoteTaskAdapter implements RemoteTaskRouteAdapter {
 
 	public async listDevices(signal: AbortSignal): Promise<MeshRemoteDirectorySnapshot> {
 		throwIfAborted(signal);
+		const readGeneration = ++this.directoryReadGeneration;
 		const profiles = (await this.profiles.list()).filter(isUsablePeerProfile);
 		const connections = new Map(
 			this.peers.listConnections().map((connection) => [connection.profileId, connection]),
@@ -152,10 +160,15 @@ export class ProductionRemoteTaskAdapter implements RemoteTaskRouteAdapter {
 				const incompatible = incompatibleDevice(profile);
 				const connection = connections.get(profile.id);
 				const state = connection?.snapshot().state;
+				const authentication = connection?.authenticatedBinding?.();
+				if (readGeneration !== this.directoryReadGeneration) { return undefined; }
 				if (
 					connection === undefined
 					|| !this.peers.isEnabled(profile.id)
 					|| state !== 'online'
+					|| authentication === undefined
+					|| authentication.profileGeneration !== profile.generation
+					|| authentication.deviceId !== profile.workerDeviceId
 				) {
 					this.authenticatedCatalog.delete(profile.id);
 					return incompatible;
@@ -167,13 +180,15 @@ export class ProductionRemoteTaskAdapter implements RemoteTaskRouteAdapter {
 					]);
 					const device = deviceInfoSchema.parse(deviceValue);
 					const directory = nodeDirectoryResultSchema.parse(nodesValue);
-					if (directory.deviceId !== device.deviceId || device.deviceId !== profile.workerDeviceId) {
+					const currentProfile = await this.profiles.get(profile.id);
+					if (readGeneration !== this.directoryReadGeneration) { return undefined; }
+					if (directory.deviceId !== device.deviceId || device.deviceId !== profile.workerDeviceId
+						|| currentProfile?.generation !== profile.generation || currentProfile?.workerDeviceId !== profile.workerDeviceId
+						|| currentProfile.cleanupPending || !this.matchesAuthentication(profile.id, connection, authentication)) {
 						this.authenticatedCatalog.delete(profile.id);
 						return incompatible;
 					}
-					if (profile.generation !== undefined) {
-						this.authenticatedCatalog.set(profile.id, { generation: profile.generation, directory });
-					}
+					this.authenticatedCatalog.set(profile.id, { connection, authentication, directory });
 					return {
 						deviceId: device.deviceId,
 						deviceName: device.name,
@@ -198,7 +213,7 @@ export class ProductionRemoteTaskAdapter implements RemoteTaskRouteAdapter {
 						})),
 					};
 				} catch (error: unknown) {
-					this.authenticatedCatalog.delete(profile.id);
+					if (readGeneration === this.directoryReadGeneration) { this.authenticatedCatalog.delete(profile.id); }
 					if (signal.aborted) {
 						throw error;
 					}
@@ -206,23 +221,73 @@ export class ProductionRemoteTaskAdapter implements RemoteTaskRouteAdapter {
 				}
 			},
 		));
-		this.directory = budgetRemoteDirectory(devices.filter((device) => device !== undefined));
+		if (readGeneration === this.directoryReadGeneration) {
+			this.directory = budgetRemoteDirectory(devices.filter((device): device is MeshDeviceToolSummary =>
+				device !== undefined && this.deviceAllowed(device.deviceId)));
+		}
 		return this.cachedDevices();
 	}
 
 	public cachedDevices(): MeshRemoteDirectorySnapshot {
-		return structuredClone(this.directory);
+		const devices = this.directory.devices.filter((device) => this.deviceAllowed(device.deviceId)).map((device) => {
+			const catalog = device.peerId === undefined ? undefined : this.authenticatedCatalog.get(device.peerId);
+			if (device.peerId !== undefined && catalog?.directory.deviceId === device.deviceId
+				&& this.matchesAuthentication(device.peerId, catalog.connection, catalog.authentication)) { return device; }
+			return { ...device, nodes: [], nodesTruncated: false, totalNodes: 0 };
+		});
+		return structuredClone({ ...this.directory, devices,
+			totalDevices: this.directory.totalDevices - (this.directory.devices.length - devices.length) });
+	}
+
+	public forgetDevice(deviceId: string): void {
+		const profiles = this.directory.devices.filter((device) => device.deviceId === deviceId)
+			.flatMap((device) => device.peerId === undefined ? [] : [device.peerId]);
+		for (const profileId of profiles) { this.authenticatedCatalog.delete(profileId); }
+		const devices = this.directory.devices.filter((device) => device.deviceId !== deviceId);
+		this.directory = { ...this.directory, devices,
+			totalDevices: this.directory.totalDevices - (this.directory.devices.length - devices.length) };
+	}
+
+	public associatedTasks(deviceId: string, profileIds: readonly string[]) {
+		return [...this.taskRoutes.values()].filter((route) =>
+			route.target.deviceId === deviceId || profileIds.includes(route.peerId))
+			.map((route) => ({ taskId: route.taskId, state: route.state }));
+	}
+
+	public withAdmissionBarrier<T>(operation: () => Promise<T>): Promise<T> {
+		return this.serializeRoute(operation);
 	}
 
 	public lookupTarget(profileId: string, target: TaskTarget): AuthenticatedRemoteTarget | undefined {
+		if (!this.deviceAllowed(target.deviceId)) { return undefined; }
 		const catalog = this.authenticatedCatalog.get(profileId);
 		const node = catalog?.directory.nodes.find((value) =>
 			value.nodeId === target.nodeId && value.nodeInstanceId === target.nodeInstanceId);
 		if (catalog === undefined || node === undefined || catalog.directory.deviceId !== target.deviceId
-			|| this.peers.get(profileId)?.snapshot().state !== 'online') {
+			|| catalog.authentication.profileGeneration === undefined
+			|| !this.matchesAuthentication(profileId, catalog.connection, catalog.authentication)) {
 			return undefined;
 		}
-		return { profileId, profileGeneration: catalog.generation, deviceId: catalog.directory.deviceId, node: structuredClone(node) };
+		return { profileId, profileGeneration: catalog.authentication.profileGeneration, deviceId: catalog.directory.deviceId, node: structuredClone(node) };
+	}
+
+	private matchesAuthentication(profileId: string, connection: PeerConnection, expected: PeerAuthenticationBinding): boolean {
+		if (this.peers.get(profileId) !== connection || !this.peers.isEnabled(profileId)
+			|| connection.snapshot().state !== 'online') { return false; }
+		let profile: PeerProfile | undefined;
+		try {
+			profile = this.profiles.peek?.(profileId);
+			if (profile === undefined || !isUsablePeerProfile(profile)) { return false; }
+		} catch { return false; }
+		if (profile.generation !== expected.profileGeneration
+			|| profile.workerDeviceId !== expected.deviceId) { return false; }
+		const current = connection.authenticatedBinding?.();
+		return current !== undefined && current.connectionGeneration === expected.connectionGeneration
+			&& current.profileGeneration === expected.profileGeneration && current.deviceId === expected.deviceId;
+	}
+
+	private deviceAllowed(deviceId: string): boolean {
+		try { this.assertDeviceAllowed(deviceId); return true; } catch { return false; }
 	}
 
 	public async startTask(
@@ -231,6 +296,7 @@ export class ProductionRemoteTaskAdapter implements RemoteTaskRouteAdapter {
 		outcome?: RemoteTaskStartOutcome,
 	): Promise<TaskSnapshot> {
 		const params = routedTaskStartParamsSchema.parse(input);
+		this.assertDeviceAllowed(params.target.deviceId);
 		const peerId = uuidSchema.safeParse(route.peerId);
 		if (!peerId.success) {
 			throw new MeshDomainError(
@@ -259,6 +325,7 @@ export class ProductionRemoteTaskAdapter implements RemoteTaskRouteAdapter {
 		const dispatch = outcome ?? { taskStartRequestAttempted: false };
 		try {
 			await route.assertAuthorized?.();
+			this.assertDeviceAllowed(params.target.deviceId);
 			if (this.requireOnline(peerId.data) !== connection) {
 				throw new MeshDomainError(
 					'TUNNEL_UNAVAILABLE',
@@ -384,6 +451,7 @@ export class ProductionRemoteTaskAdapter implements RemoteTaskRouteAdapter {
 		peerId: string,
 	): Promise<RemoteRouteReservation> {
 		const operation = async (): Promise<RemoteRouteReservation> => {
+			this.assertDeviceAllowed(input.target.deviceId);
 			const catalog = this.readCatalog();
 			const existing = catalog.routes.find((route) => route.taskId === input.taskId);
 			if (existing !== undefined) {

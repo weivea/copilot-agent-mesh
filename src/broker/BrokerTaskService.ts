@@ -188,6 +188,10 @@ export class BrokerTaskService {
 		return this.trackOperation(this.initializeCore());
 	}
 
+	public withAdmissionBarrier<T>(operation: () => Promise<T>): Promise<T> {
+		return this.serializeStart(operation);
+	}
+
 	public startRemote(
 		authenticatedPeerId: string,
 		input: RoutedTaskStartParams,

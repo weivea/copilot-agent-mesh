@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import type * as vscode from 'vscode';
 
-import { LOCAL_BROKER_METHODS, LOCAL_BROKER_NOTIFICATIONS, connectivitySnapshotSchema, remotePolicyDashboardSchema, dashboardNodeDirectoryResultSchema } from '../../shared/protocol';
+import { LOCAL_BROKER_METHODS, LOCAL_BROKER_NOTIFICATIONS, connectivitySnapshotSchema, remotePolicyDashboardSchema, dashboardNodeDirectoryResultSchema, dashboardManagementSnapshotSchema } from '../../shared/protocol';
 import { LocalDesktopWorkspaceGuard } from '../application/LocalDesktopWorkspaceGuard';
 import { getWorkerPlatformSupport, type WorkerPlatformSupport } from '../application/WorkerPlatformSupport';
 import { ProductionBrokerRuntime } from '../composition/ProductionBrokerRuntime';
@@ -32,6 +32,7 @@ import type { Tunnel } from '@microsoft/dev-tunnels-contracts';
 import { DevTunnelManagement } from '../connectivity/DevTunnelManagement';
 import type { TunnelMetadata } from '../tunnel/DevTunnelProvider';
 import { sdkResponse } from '../unitTest/connectivityTestSupport';
+import { formatMessage, type MessageTranslator } from '../composition/ProductionLocalization';
 
 test('real production owner composition defaults off and serves authenticated local IPC without auth/discovery/hosting', async (t) => {
 	const f = await productionFixture();
@@ -48,6 +49,108 @@ test('real production owner composition defaults off and serves authenticated lo
 	assert.equal(f.runtime.listener.snapshot().state, 'stopped');
 	const directory = await local.session.request(LOCAL_BROKER_METHODS.dashboardList, local.identity);
 	assert.ok(directory);
+});
+
+test('production management IPC serves every authenticated window and fences caller-scoped one-time actions without discovery', async (t) => {
+	const f = await productionFixture();
+	t.after(() => f.dispose());
+	await f.runtime.start();
+	const local = await f.connect();
+	const other = await f.connect();
+	t.after(() => { local.client.dispose(); other.client.dispose(); });
+	const workspaceId = uuid(980);
+	const workspaceIdentity = createOpaqueWorkspaceIdentity('management-ipc-source');
+	await local.session.request(LOCAL_BROKER_METHODS.claimWorkspace, {
+		...local.identity, workspaceId, workspaceIdentity, name: 'Management source', capabilityTags: [],
+	});
+	const snapshot = dashboardManagementSnapshotSchema.parse(
+		await local.session.request(LOCAL_BROKER_METHODS.managementSnapshot, local.identity),
+	);
+	assert.equal(snapshot.available, true);
+	assert.equal(snapshot.workspaces.length, 1);
+	assert.doesNotMatch(JSON.stringify(snapshot), /workspaceIdentity|nodeInstanceId|sha256:/u);
+	const otherSnapshot = dashboardManagementSnapshotSchema.parse(
+		await other.session.request(LOCAL_BROKER_METHODS.managementSnapshot, other.identity),
+	);
+	assert.equal(otherSnapshot.available, true);
+	assert.deepEqual(otherSnapshot.workspaces, []);
+	const receiveActionHandle = snapshot.workspaces[0].receiveActionHandle;
+	assert.ok(receiveActionHandle);
+	const action = { action: 'setWorkspaceReceiving', actionHandle: receiveActionHandle, enabled: true };
+	await assert.rejects(other.session.request(LOCAL_BROKER_METHODS.managementAction, { ...other.identity, ...action }), LocalIpcRemoteError);
+	await assert.rejects(local.session.request(LOCAL_BROKER_METHODS.managementAction, { ...other.identity, ...action }), LocalIpcRemoteError);
+	await local.session.request(LOCAL_BROKER_METHODS.managementAction, { ...local.identity, ...action });
+	assert.equal(f.runtime.peerPolicies.acceptsIncoming(workspaceIdentity), true);
+	await assert.rejects(local.session.request(LOCAL_BROKER_METHODS.managementAction, { ...local.identity, ...action }), LocalIpcRemoteError);
+	assert.equal(f.authentication.requests.length, 0);
+	assert.equal(f.runtime.listener.snapshot().state, 'stopped');
+	assert.equal(f.runtime.tunnel.lifecycleMetrics().loadAttempts, 0);
+});
+
+test('production saved-device deletion removes an offline profile and persists denial across Broker restart', async (t) => {
+	const f = await productionFixture();
+	t.after(() => f.dispose());
+	await f.runtime.start();
+	let local = await f.connect();
+	const deviceId = uuid(981);
+	const profileId = uuid(982);
+	await f.runtime.peerProfiles.store({
+		id: profileId, generation: uuid(983), workerDeviceId: deviceId,
+		rpcEndpoint: 'wss://example.invalid/mesh', peerId: uuid(984), credentialKeyRef: `mesh.remotePeer.${profileId}`,
+	});
+	let snapshot = dashboardManagementSnapshotSchema.parse(
+		await local.session.request(LOCAL_BROKER_METHODS.managementSnapshot, local.identity),
+	);
+	assert.equal(snapshot.devices[0].state, 'offline');
+	assert.equal(snapshot.devices[0].activeTaskCount, 0);
+	const deleteActionHandle = snapshot.devices[0].deleteActionHandle;
+	assert.ok(deleteActionHandle);
+	await local.session.request(LOCAL_BROKER_METHODS.managementAction, {
+		...local.identity, action: 'deleteSavedDevice', actionHandle: deleteActionHandle,
+	});
+	assert.equal(await f.runtime.peerProfiles.get(profileId), undefined);
+	assert.equal(f.runtime.connectivity.dashboardManagement.deviceDenied(deviceId), true);
+	local.client.dispose();
+	await f.runtime.dispose();
+	await f.restart();
+	local = await f.connect();
+	t.after(() => local.client.dispose());
+	snapshot = dashboardManagementSnapshotSchema.parse(
+		await local.session.request(LOCAL_BROKER_METHODS.managementSnapshot, local.identity),
+	);
+	assert.deepEqual(snapshot.devices, []);
+	assert.equal(f.runtime.connectivity.dashboardManagement.deviceDenied(deviceId), true);
+	assert.equal(f.authentication.requests.length, 0);
+	assert.equal(f.runtime.listener.snapshot().state, 'stopped');
+});
+
+test('native management confirmations use translated placeholders and the translated confirmation action', async (t) => {
+	const keys: string[] = [];
+	const f = await productionFixture({ translate: (message, ...args) => {
+		keys.push(message);
+		return `Localized ${formatMessage(message, ...args)}`;
+	} });
+	t.after(() => f.dispose());
+	await f.runtime.start();
+	const local = await f.connect();
+	t.after(() => local.client.dispose());
+	const profileId = uuid(985);
+	await f.runtime.peerProfiles.store({
+		id: profileId, generation: uuid(986), workerDeviceId: uuid(987),
+		rpcEndpoint: 'wss://example.invalid/mesh', peerId: uuid(988), credentialKeyRef: `mesh.remotePeer.${profileId}`,
+	});
+	const snapshot = dashboardManagementSnapshotSchema.parse(
+		await local.session.request(LOCAL_BROKER_METHODS.managementSnapshot, local.identity),
+	);
+	const deleteActionHandle = snapshot.devices[0].deleteActionHandle;
+	assert.ok(deleteActionHandle);
+	await local.session.request(LOCAL_BROKER_METHODS.managementAction, {
+		...local.identity, action: 'deleteSavedDevice', actionHandle: deleteActionHandle,
+	});
+	assert.ok(keys.includes('Continue'));
+	assert.ok(keys.includes('Delete saved device "{0}" ({1})? Trust and related permissions will be revoked. Task history is retained.'));
+	assert.match(f.confirmations[0], /^Localized Delete saved device "Localized Saved device" \(Localized Offline\)/u);
+	assert.equal(await f.runtime.peerProfiles.get(profileId), undefined);
 });
 
 test('production Dashboard automatically removes closed windows and reuses only the reopened Workspace permissions', async (t) => {
@@ -341,6 +444,41 @@ test('disable from another window cancels pending account selection without crea
 	assert.equal(f.authentication.requests.length, 0);
 	assert.equal(f.runtime.connectivity.settings.snapshot().enabled, false);
 	assert.equal(f.runtime.listener.snapshot().state, 'stopped');
+});
+
+test('direct localized account switching leaves same-session task cancellation and disable intent responsive during its prompt', async (t) => {
+	const host = new ConnectionHost();
+	const f = await productionFixture({ host, translate: (message, ...args) => `Localized: ${formatMessage(message, ...args)}` });
+	t.after(() => f.dispose());
+	await f.runtime.start();
+	const local = await f.connect();
+	t.after(() => local.client.dispose());
+	let show!: () => void;
+	let release!: () => void;
+	const shown = new Promise<void>((resolve) => { show = resolve; });
+	const released = new Promise<void>((resolve) => { release = resolve; });
+	t.after(() => release());
+	f.picker.wait = async () => { show(); await released; };
+	const snapshot = dashboardManagementSnapshotSchema.parse(
+		await local.session.request(LOCAL_BROKER_METHODS.managementSnapshot, local.identity),
+	);
+	const accountActionHandle = snapshot.accountActionHandle;
+	assert.ok(accountActionHandle);
+	const switching = assert.rejects(local.session.request(LOCAL_BROKER_METHODS.managementAction, {
+		...local.identity, action: 'switchAccount', actionHandle: accountActionHandle,
+	}));
+	await shown;
+	assert.equal(await local.session.request(LOCAL_BROKER_METHODS.remoteTaskCancel, { taskId: uuid(989) }, 1000), null);
+	const stopping = local.session.request(LOCAL_BROKER_METHODS.connectivityAction, { ...local.identity, action: 'disableConnectivity' });
+	const disabled = connectivitySnapshotSchema.parse(
+		await local.session.request(LOCAL_BROKER_METHODS.connectivitySnapshot, local.identity, 1000),
+	);
+	assert.equal(disabled.delegationEnabled, false);
+	release();
+	await Promise.all([switching, stopping]);
+	assert.equal(host.created.length, 0);
+	assert.equal(f.authentication.requests.length, 0);
+	assert.equal(f.runtime.connectivity.settings.snapshot().enabled, false);
 });
 
 test('a later disable supersedes an enable queued behind a management prompt', async (t) => {
@@ -649,7 +787,7 @@ class ConnectionHost {
 	}
 }
 
-async function productionFixture(options: { corrupt?: boolean; strict?: boolean; host?: ConnectionHost; workerPlatform?: WorkerPlatformSupport } = {}) {
+async function productionFixture(options: { corrupt?: boolean; strict?: boolean; host?: ConnectionHost; workerPlatform?: WorkerPlatformSupport; translate?: MessageTranslator } = {}) {
 	const root = await mkdtemp(join(tmpdir(), 'mesh-connectivity-composition-'));
 	const state = new ConnectivityMemoryState();
 	const ownership = new TestOwnership();
@@ -665,6 +803,7 @@ async function productionFixture(options: { corrupt?: boolean; strict?: boolean;
 		update: async (key: string, value: unknown) => { settings.set(key, value); },
 	};
 	const api = {
+		...(options.translate ? { l10n: { t: options.translate } } : {}),
 		version: '1.136.1',
 		Uri: { joinPath: (uri: { fsPath: string }, ...parts: string[]) => ({ fsPath: join(uri.fsPath, ...parts) }) },
 		workspace: {
@@ -679,10 +818,10 @@ async function productionFixture(options: { corrupt?: boolean; strict?: boolean;
 				await picker.wait?.();
 				return picker.cancel ? undefined : items[picker.indexes.shift() ?? 0];
 			},
-			showWarningMessage: async (message: string) => {
+			showWarningMessage: async (message: string, _options: unknown, action: string) => {
 				confirmations.push(message);
 				await confirmation.wait?.();
-				return 'Continue';
+				return action;
 			},
 		},
 	};
