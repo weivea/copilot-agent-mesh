@@ -1,6 +1,6 @@
 # Preview release engineering
 
-> Version: `0.5.0` Preview
+> Version: `0.5.4` Preview
 > Gate status: historical G0 Go; Peer Window Delegation requires its own real evidence gate
 
 This document describes a reproducible evaluation package. It does not authorize
@@ -16,6 +16,7 @@ availability.
 | Windows x64 / ARM64 | Preview | On demand after Workspace/task authorization |
 | Windows x86 | Preview | Unsupported |
 | Linux | Preview | Unsupported |
+| Linux Codespace attached to desktop VS Code | Desktop-owned Window Node proxy | Mesh-owned remote AHP after explicit companion/runtime setup; real deployment gate separate |
 
 Every ordinary window under the same User Data is an active Window Node and may
 use the Device Broker; non-owner windows are not read-only. Unsupported platforms
@@ -70,7 +71,8 @@ npm run verify
 The package command creates:
 
 ```text
-artifacts/copilot-agent-mesh-0.5.0-preview.vsix
+artifacts/copilot-agent-mesh-0.5.4-preview.vsix
+artifacts/copilot-agent-mesh-codespaces-0.5.4-preview.vsix
 ```
 
 The production bundle is separate from VSIX creation:
@@ -84,8 +86,11 @@ npm run package:vsix
 `vsce ls`, and verifies the ZIP central directory against an exact allowlist.
 Only the production bundle, the two exact Windows process-helper binaries and
 their Go license, media, extension manifest, release documents, project notices,
-and the AHP license are permitted. AHP runtime code is already
-in the esbuild output, so the AHP source submodule and every nested archive are
+and the AHP license are permitted. The single exact nested
+`dist/codespaces-companion.vsix` is built and allowlist-checked separately; the
+main setup action installs that matching workspace companion in the attached
+Codespace. Native VS Code CLI downloads are never packaged. AHP runtime code is already
+in the esbuild output, so the AHP source submodule and all other nested archives are
 excluded alongside source, tests, shared TypeScript, build output, test
 downloads, source maps, credentials, and external CLIs.
 
@@ -93,19 +98,35 @@ Inspect and hash the result independently:
 
 ```sh
 npx vsce ls --no-dependencies
-unzip -Z1 artifacts/copilot-agent-mesh-0.5.0-preview.vsix
-shasum -a 256 artifacts/copilot-agent-mesh-0.5.0-preview.vsix
+unzip -Z1 artifacts/copilot-agent-mesh-0.5.4-preview.vsix
+shasum -a 256 artifacts/copilot-agent-mesh-0.5.4-preview.vsix
 ```
 
 On Windows, install the same universal VSIX from PowerShell:
 
 ```powershell
-code --install-extension ".\artifacts\copilot-agent-mesh-0.5.0-preview.vsix" --force
+code --install-extension ".\artifacts\copilot-agent-mesh-0.5.4-preview.vsix" --force
 ```
 
 Local discovery, policy controls, and Mesh tools are enabled by default.
 An existing explicit `experimental.peerDelegation: false` remains an opt-out;
 saved receive switches, allowlists, and account choices are not broadened.
+
+For a desktop-attached Codespace, run **Prepare Codespaces Runtime** in the
+Dashboard toolbar. Confirm companion installation and, separately, native CLI
+download/license acceptance. Reload the window when prompted. The helper also
+supports an explicitly configured remote absolute native CLI path through
+`copilotAgentMesh.codespaces.codePath`; the terminal's `code` wrapper is not
+compatible. Runtime setup does not execute a task or change Workspace grants.
+The companion uses a fixed GitHub protected-resource mapping for
+`https://api.github.com` (`github`, `read:user`, `user:email`); user-configured exact
+mappings take precedence and other resources fail closed.
+
+The UI extension and companion must have matching extension versions and bridge
+protocol versions. Both VSIXs are emitted by `package:vsix`; the separate
+companion artifact can also be installed manually with **Install from VSIX** in
+the attached Codespace. See [the design](../desktop-codespaces.md) for lifecycle
+and live qualification requirements.
 
 ## Real multi-window verification
 

@@ -2,7 +2,7 @@
   "name": "copilot-agent-mesh",
   "displayName": "Copilot Agent Mesh",
   "description": "Preview agent mesh with Worker hosting on Windows x64/ARM64 and macOS arm64.",
-  "version": "0.5.0",
+  "version": "0.5.4",
   "preview": true,
   "publisher": "weivea",
   "license": "MIT",
@@ -35,7 +35,10 @@
   "main": "./dist/extension.js",
   "l10n": "./l10n",
   "files": [
-    "dist/**",
+    "dist/extension.js",
+    "dist/THIRD_PARTY_NOTICES.txt",
+    "dist/windows/**",
+    "dist/codespaces-companion.vsix",
     "media/**",
     "package.json",
     "package.nls*.json",
@@ -45,6 +48,7 @@
     "LICENSE",
     "NOTICE",
     "docs/mvp/release.md",
+    "docs/desktop-codespaces.md",
     "third_party/agent-host-protocol/LICENSE"
   ],
   "capabilities": {
@@ -463,6 +467,12 @@
     },
     "commands": [
       {
+        "command": "copilotAgentMesh.codespaces.setup",
+        "title": "%command.setupCodespaces%",
+        "category": "Copilot Agent Mesh",
+        "icon": "$(cloud-download)"
+      },
+      {
         "command": "copilotAgentMesh.configureDevice",
         "title": "%command.configureDevice%",
         "category": "Copilot Agent Mesh",
@@ -528,6 +538,12 @@
       }
     ],
     "menus": {
+      "commandPalette": [
+        {
+          "command": "copilotAgentMesh.codespaces.setup",
+          "when": "remoteName == codespaces && !isWeb"
+        }
+      ],
       "view/title": [
         {
           "command": "copilotAgentMesh.startListener",
@@ -543,6 +559,11 @@
           "command": "copilotAgentMesh.registerWorkspace",
           "when": "view == copilotAgentMesh.dashboard",
           "group": "navigation@2"
+        },
+        {
+          "command": "copilotAgentMesh.codespaces.setup",
+          "when": "view == copilotAgentMesh.dashboard && remoteName == codespaces && !isWeb",
+          "group": "navigation@3"
         },
         {
           "command": "copilotAgentMesh.refreshDashboard",
@@ -625,14 +646,15 @@
     "precompile-tests": "npm run ahp:build && npm run windows:build",
     "vscode:prepublish": "npm run bundle",
     "compile": "npm run check-types && npm run lint && node esbuild.js",
-    "bundle": "npm run check-types && npm run lint && node esbuild.js --production",
+    "bundle": "npm run check-types && npm run lint && node esbuild.js --production && node scripts/package-codespaces-companion.mjs",
+    "package:companion": "npm run bundle",
     "watch": "npm-run-all -p watch:*",
     "watch:esbuild": "node esbuild.js --watch",
     "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
-    "package:vsix": "node -e \"require('node:fs').mkdirSync('artifacts',{recursive:true})\" && vsce package --pre-release --no-dependencies --out artifacts/copilot-agent-mesh-0.5.0-preview.vsix && npm run verify:vsix",
+    "package:vsix": "node -e \"require('node:fs').mkdirSync('artifacts',{recursive:true})\" && vsce package --pre-release --no-dependencies --out artifacts/copilot-agent-mesh-0.5.4-preview.vsix && npm run verify:vsix",
     "vsix:list": "vsce ls --no-dependencies",
-    "verify:vsix": "npm run vsix:list && node scripts/verify-vsix.mjs artifacts/copilot-agent-mesh-0.5.0-preview.vsix",
-    "smoke:vsix": "node scripts/smoke-vsix.mjs artifacts/copilot-agent-mesh-0.5.0-preview.vsix",
+    "verify:vsix": "npm run vsix:list && node scripts/verify-vsix.mjs artifacts/copilot-agent-mesh-0.5.4-preview.vsix",
+    "smoke:vsix": "node scripts/smoke-vsix.mjs artifacts/copilot-agent-mesh-0.5.4-preview.vsix",
     "audit:release": "npm audit --audit-level=high",
     "compile-tests": "tsc -p . --outDir out",
     "watch-tests": "tsc -p . -w --outDir out",

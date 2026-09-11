@@ -73,7 +73,7 @@ export interface DashboardSnapshot {
 		readonly canSetAcceptIncoming: boolean;
 		readonly acceptActionHandle?: string;
 		readonly agentHost: {
-			readonly source: 'editor' | 'standalone' | 'unavailable';
+			readonly source: 'editor' | 'standalone' | 'codespace-owned' | 'unavailable';
 			readonly label: string;
 			readonly degraded: boolean;
 			readonly reason?: 'EDITOR_DISCOVERY_FAILED' | 'EDITOR_START_FAILED' | 'STANDALONE_START_FAILED';

@@ -1,4 +1,5 @@
 {
+  "command.setupCodespaces": "准备 Codespaces 运行时",
   "command.configureDevice": "设置设备名称",
   "command.refreshDashboard": "刷新概览",
   "command.registerWorkspace": "注册当前工作区",

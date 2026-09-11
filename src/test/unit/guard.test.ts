@@ -31,6 +31,30 @@ describe('LocalDesktopWorkspaceGuard', () => {
 		);
 	});
 
+	test('allows only a desktop UI host with one Codespace authority', () => {
+		const codespace: Partial<LocalDesktopEnvironment> = {
+			remoteName: 'codespaces',
+			uiKind: 'desktop',
+			extensionKind: 'ui',
+			workspaceFolders: [{ uriScheme: 'vscode-remote', uriAuthority: 'codespaces+example' }],
+		};
+		assert.doesNotThrow(() => guard(codespace).assertAllowed());
+		for (const override of [
+			{ uiKind: 'web' as const },
+			{ uiKind: undefined },
+			{ extensionKind: 'workspace' as const },
+			{ workspaceFolders: [{ uriScheme: 'file' }] },
+			{ workspaceFolders: [{ uriScheme: 'vscode-remote', uriAuthority: 'ssh-remote+example' }] },
+			{ workspaceFolders: [
+				{ uriScheme: 'vscode-remote', uriAuthority: 'codespaces+example' },
+				{ uriScheme: 'vscode-remote', uriAuthority: 'codespaces+different' },
+			] },
+		]) {
+			rejectsWith('REMOTE_WORKSPACE_UNSUPPORTED', () => guard({ ...codespace, ...override }).assertAllowed());
+		}
+		rejectsWith('WORKSPACE_UNTRUSTED', () => guard({ ...codespace, isTrusted: false }).assertAllowed());
+	});
+
 	test('rejects untrusted workspaces with a stable code', () => {
 		rejectsWith('WORKSPACE_UNTRUSTED', () =>
 			guard({ isTrusted: false }).assertAllowed(),

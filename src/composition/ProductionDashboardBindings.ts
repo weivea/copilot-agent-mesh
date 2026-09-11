@@ -56,6 +56,7 @@ import type { ProductionBrokerRuntime } from './ProductionBrokerRuntime';
 import { DashboardTreeBuilder } from '../ui/DashboardTreeBuilder';
 import { managementKey } from '../broker/DashboardManagementKey';
 import { localize } from './ProductionLocalization';
+import { codespaceFileUri } from '../codespaces/CodespaceEnvironment';
 
 const activeTaskStates = new Set<string>(ACTIVE_TASK_STATUSES);
 
@@ -259,7 +260,8 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 				degraded: false,
 				detail: 'The execution runtime is selected only when an authorized task needs it.',
 			} : {
-				source: runtimeProbe.source === 'editor'
+				source: runtimeProbe.source === 'codespace-owned'
+					? 'codespace-owned' : runtimeProbe.source === 'editor'
 					? 'editor'
 					: runtimeProbe.source === 'standalone' ? 'standalone' : 'unavailable',
 				label: listener.agentHost.label,
@@ -963,9 +965,12 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 
 	private activeWorkspaceUri(): string | undefined {
 		const documentUri = this.options.vscodeApi.window.activeTextEditor?.document.uri;
-		return documentUri === undefined
+		const folder = documentUri === undefined
 			? undefined
-			: this.options.vscodeApi.workspace.getWorkspaceFolder(documentUri)?.uri.toString();
+			: this.options.vscodeApi.workspace.getWorkspaceFolder(documentUri)?.uri;
+		return folder?.scheme === 'vscode-remote' && this.options.vscodeApi.env.remoteName === 'codespaces'
+			? codespaceFileUri(folder.toString(), folder.authority)
+			: folder?.toString();
 	}
 
 	private peerDelegationEnabled(): boolean {
@@ -1269,10 +1274,13 @@ function agentHostSnapshot(
 	platform: WorkerPlatformSupport,
 	failure?: AgentHostSourceFailure,
 ): DashboardSnapshot['listener']['agentHost'] {
-	if (!platform.supported) {
+	if (!platform.supported && probe.source !== 'codespace-owned') {
 		return { state: 'unavailable', label: 'Unsupported', detail: platform.agentMessage, action: 'Use Windows x64/ARM64 or macOS arm64 for task execution.' };
 	}
 	if (probe.available) {
+		if (probe.source === 'codespace-owned') {
+			return { state: 'ready', label: 'Codespace', detail: 'Tasks use a Mesh-owned Agent Host in the attached Codespace.' };
+		}
 		return probe.source === 'editor'
 			? { state: 'ready', label: 'Editor', detail: 'Tasks use the current VS Code instance Agent Host.' }
 			: probe.degradation === undefined
@@ -1296,6 +1304,12 @@ function agentHostSnapshot(
 		return {
 			state: 'stopped', label: 'On demand',
 			detail: 'An authorized task connects to the Agent Host when needed. Workspace permissions and task approval still apply.',
+		};
+	}
+	if (probe.source === 'codespace-owned') {
+		return {
+			state: 'unavailable', label: 'Codespaces setup required',
+			detail: 'Use Prepare Codespaces Runtime in the Dashboard toolbar or Command Palette, then retry.',
 		};
 	}
 	return {

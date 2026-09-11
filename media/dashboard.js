@@ -885,7 +885,7 @@
 			|| !booleans(current, ['previewEnabled', 'canRename', 'acceptsIncoming', 'canSetAcceptIncoming'])
 			|| !actionableHandle(current.canSetAcceptIncoming, current.acceptActionHandle)
 			|| !isExactRecord(current.agentHost, ['source', 'label', 'degraded'], ['reason', 'detail'])
-			|| !['editor', 'standalone', 'unavailable'].includes(current.agentHost.source)
+			|| !['editor', 'standalone', 'codespace-owned', 'unavailable'].includes(current.agentHost.source)
 			|| !isText(current.agentHost.label) || typeof current.agentHost.degraded !== 'boolean'
 			|| !optionalText(current.agentHost.detail)
 			|| (current.agentHost.reason !== undefined && !['EDITOR_DISCOVERY_FAILED', 'EDITOR_START_FAILED', 'STANDALONE_START_FAILED'].includes(current.agentHost.reason))) { return false; }

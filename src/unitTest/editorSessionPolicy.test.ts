@@ -12,6 +12,7 @@ import {
 	EditorSessionPolicy,
 	EditorSessionPolicyError,
 	matchesEditorSessionWorkspace,
+	usesFolderSessionPolicy,
 } from '../agentHost/EditorSessionPolicy';
 
 const workspace = pathToFileURL(join(tmpdir(), 'mesh policy # workspace')).href;
@@ -39,18 +40,39 @@ function schema(readOnly = false): SessionConfigSchema {
 	};
 }
 
-test('Editor identities use the selected provider while standalone keeps its existing scheme', () => {
+test('Editor and Codespace-owned identities use the selected provider while standalone keeps its existing scheme', () => {
 	assert.deepEqual(identity, { provider: 'copilotcli', uri: 'copilotcli:/logical-session' });
 	assert.equal(createAgentSessionIdentity('editor', 'claude', 'other').uri, 'claude:/other');
+	assert.equal(createAgentSessionIdentity('codespace-owned', 'copilotcli', 'owned').uri, 'copilotcli:/owned');
 	assert.equal(createAgentSessionIdentity('standalone', 'copilotcli', 'legacy').uri, 'ahp-session:/legacy');
 	assert.equal(createAgentSessionIdentity(undefined, 'copilotcli', 'legacy').uri, 'ahp-session:/legacy');
 	assert.equal(Object.isFrozen(identity), true);
-	for (const provider of ['', '9provider', 'agent/name', 'copilot:other', 'agent name']) {
-		assert.throws(
-			() => createAgentSessionIdentity('editor', provider, 'id'),
-			(error: unknown) => error instanceof AgentRuntimeError && error.code === 'AGENT_CONFIG_REQUIRED',
-		);
+	for (const source of ['editor', 'codespace-owned'] as const) {
+		assert.equal(usesFolderSessionPolicy(source), true);
+		for (const provider of ['', '9provider', 'agent/name', 'copilot:other', 'agent name']) {
+			assert.throws(
+				() => createAgentSessionIdentity(source, provider, 'id'),
+				(error: unknown) => error instanceof AgentRuntimeError && error.code === 'AGENT_CONFIG_REQUIRED',
+			);
+		}
 	}
+	assert.equal(usesFolderSessionPolicy('standalone'), false);
+	assert.equal(usesFolderSessionPolicy(undefined), false);
+});
+
+test('Codespace-owned policy failures identify the owned source without exposing its provider or workspace', () => {
+	const policy = new EditorSessionPolicy(identity, workspace, 'codespace-owned');
+	assert.throws(() => policy.acceptSnapshot({
+		...sessionSnapshot(),
+		state: { ...sessionSnapshot().state, workingDirectories: [otherWorkspace] },
+	}), (error: unknown) => {
+		assert.ok(error instanceof EditorSessionPolicyError);
+		assert.match(error.message, /Codespace-owned/u);
+		assert.doesNotMatch(error.message, /editor/u);
+		assert.equal(error.message.includes(workspace), false);
+		assert.equal(error.message.includes(otherWorkspace), false);
+		return true;
+	});
 });
 
 test('workspace matching uses the complete local URI and rejects missing or widened scopes', () => {

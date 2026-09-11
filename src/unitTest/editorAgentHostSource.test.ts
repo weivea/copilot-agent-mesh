@@ -1207,6 +1207,250 @@ test('source selector disposal aborts a pending approval without starting either
 	assert.equal(standalone.starts, 0);
 });
 
+for (const preferEditor of [true, false]) {
+	test(`source selector scoped startup cancellation forwards the task identity without disposing ${preferEditor ? 'editor' : 'standalone'} runtimes`, async (t) => {
+		const editor = new PendingStartupRuntime();
+		const standalone = new PendingStartupRuntime();
+		const selected = preferEditor ? editor : standalone;
+		const selector = new AgentHostSourceSelector(selectorOptions({ preferEditor: () => preferEditor, editor, standalone }));
+		t.after(() => selector.dispose());
+		const running = await selector.start({ ...taskRequest(), taskId: 'unrelated-task' });
+		let runningCancelled = false;
+		let runningDisposed = false;
+		running.cancel = async () => { runningCancelled = true; };
+		running.dispose = async () => { runningDisposed = true; };
+		const starting = assert.rejects(selector.start(taskRequest()), AgentRuntimeError);
+		await selected.entered.promise;
+		const cancellation = selector.cancelStart('task-id');
+		assert.equal(selector.cancelStart('task-id'), cancellation);
+		await cancellation;
+		await starting;
+		assert.deepEqual(editor.cancelledStarts, ['task-id']);
+		assert.deepEqual(standalone.cancelledStarts, ['task-id']);
+		assert.equal(runningCancelled, false);
+		assert.equal(runningDisposed, false);
+		assert.equal(editor.disposals, 0);
+		assert.equal(standalone.disposals, 0);
+		assert.equal(preferEditor ? standalone.starts : editor.starts, 0);
+		assert.equal(selected.starts, 2);
+		await running.dispose();
+	});
+}
+
+test('source selector startup cancellation interrupts approval without selecting either source', async (t) => {
+	const editor = new FakeRuntime();
+	const standalone = new FakeRuntime();
+	const entered = sourceStartBarrier();
+	const approval = sourceStartBarrier();
+	const selector = new AgentHostSourceSelector({
+		...selectorOptions({ preferEditor: () => true, editor, standalone }),
+		confirmation: { confirm: async () => { entered.resolve(); await approval.promise; return 'once'; } },
+	});
+	t.after(() => selector.dispose());
+	const starting = assert.rejects(selector.start(taskRequest()), AgentRuntimeError);
+	await entered.promise;
+	await selector.cancelStart('task-id');
+	await starting;
+	approval.resolve();
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(editor.starts, 0);
+	assert.equal(standalone.starts, 0);
+	assert.equal(editor.disposals, 0);
+	assert.equal(standalone.disposals, 0);
+});
+
+test('source selector cancellation during shared initial readiness leaves another task waiting on the same readiness generation', async (t) => {
+	const editor = new FakeRuntime();
+	const standalone = new FakeRuntime();
+	const entered = sourceStartBarrier();
+	const readiness = sourceStartBarrier();
+	let waits = 0;
+	let readinessSignal: AbortSignal | undefined;
+	const selector = new AgentHostSourceSelector({
+		...selectorOptions({ preferEditor: () => true, editor, standalone }),
+		editorInitialReadinessDelayMs: 10_000,
+		waitForEditorRetry: async (_delay, signal) => {
+			waits += 1;
+			readinessSignal = signal;
+			entered.resolve();
+			await readiness.promise;
+		},
+	});
+	t.after(() => selector.dispose());
+	const first = assert.rejects(selector.start(taskRequest()), AgentRuntimeError);
+	await entered.promise;
+	const second = selector.start({ ...taskRequest(), taskId: 'unrelated-task' });
+	await selector.cancelStart('task-id');
+	await first;
+	assert.equal(readinessSignal?.aborted, false);
+	assert.equal(editor.starts, 0);
+	readiness.resolve();
+	const handle = await second;
+	assert.equal(handle.taskId, 'unrelated-task');
+	assert.equal(waits, 1);
+	assert.equal(editor.starts, 1);
+	assert.equal(standalone.starts, 0);
+});
+
+test('source selector scoped cancellation during a retry never retries or falls back', async (t) => {
+	const editor = new FakeRuntime();
+	editor.startError = new AgentRuntimeError(
+		'AGENT_UNAVAILABLE', 'The Agent Host connection could not be established.', false,
+		new UnixSocketWebSocketError('CONNECT_FAILED', 'Synthetic refusal.', undefined, 'ECONNREFUSED'),
+	);
+	const standalone = new FakeRuntime();
+	const waiting = sourceStartBarrier();
+	const selector = new AgentHostSourceSelector({
+		...selectorOptions({ preferEditor: () => true, editor, standalone }),
+		editorConnectionRetryDelaysMs: [10_000],
+		waitForEditorRetry: (_delay, signal) => new Promise<void>((_resolve, reject) => {
+			waiting.resolve();
+			signal.addEventListener('abort', () => reject(new DOMException('Cancelled.', 'AbortError')), { once: true });
+		}),
+	});
+	t.after(() => selector.dispose());
+	const starting = assert.rejects(selector.start(taskRequest()), (error: unknown) =>
+		error instanceof DOMException && error.name === 'AbortError');
+	await waiting.promise;
+	await selector.cancelStart('task-id');
+	await starting;
+	assert.equal(editor.starts, 1);
+	assert.equal(standalone.starts, 0);
+	assert.equal(editor.disposals, 0);
+	assert.equal(standalone.disposals, 0);
+});
+
+test('source selector checks cancellation again at the standalone fallback boundary', async (t) => {
+	const editor = new FakeRuntime();
+	editor.startError = new AgentRuntimeError('AGENT_UNAVAILABLE', 'Synthetic editor failure.');
+	const standalone = new FakeRuntime();
+	const selector = new AgentHostSourceSelector(selectorOptions({ preferEditor: () => true, editor, standalone }));
+	t.after(() => selector.dispose());
+	let cancellation: Promise<void> | undefined;
+	selector.onDidSourceStatusChange((status) => {
+		if (status.source === 'standalone' && status.degraded) {
+			cancellation = selector.cancelStart('task-id');
+		}
+	});
+	await assert.rejects(selector.start(taskRequest()), AgentRuntimeError);
+	assert.ok(cancellation);
+	await cancellation;
+	assert.equal(editor.starts, 1);
+	assert.equal(standalone.starts, 0);
+});
+
+test('source selector surfaces scoped startup cleanup failure and preserves it on the failed start', async (t) => {
+	const editor = new PendingStartupRuntime();
+	const standalone = new PendingStartupRuntime();
+	const failure = new AgentRuntimeError('AGENT_UNAVAILABLE', 'Synthetic cleanup failure.', false, undefined, true);
+	editor.cancellationFailure = failure;
+	const selector = new AgentHostSourceSelector(selectorOptions({ preferEditor: () => true, editor, standalone }));
+	t.after(() => selector.dispose());
+	const starting = assert.rejects(selector.start(taskRequest()), (error: unknown) => error === failure);
+	await editor.entered.promise;
+	await assert.rejects(selector.cancelStart('task-id'), (error: unknown) => {
+		assert.ok(error instanceof AgentRuntimeError);
+		assert.equal(error.code, 'TASK_CANCELLATION_UNCONFIRMED');
+		assert.equal(error.cleanupFailed, true);
+		assert.ok(error.cause instanceof AggregateError);
+		assert.ok(error.cause.errors.includes(failure));
+		return true;
+	});
+	await starting;
+	assert.equal(editor.starts, 1);
+	assert.equal(standalone.starts, 0);
+	assert.equal(editor.disposals, 0);
+	editor.cancellationFailure = undefined;
+	await selector.cancelStart('task-id');
+	assert.equal(editor.starts, 1);
+});
+
+test('source selector reports unconfirmed cancellation when a pending backend does not support scoped cancellation', async (t) => {
+	const editor = new FakeRuntime();
+	const standalone = new FakeRuntime();
+	const entered = sourceStartBarrier();
+	let rejectStart!: (error: Error) => void;
+	editor.start = async () => {
+		editor.starts += 1;
+		entered.resolve();
+		return new Promise<AgentTaskHandle>((_resolve, reject) => { rejectStart = reject; });
+	};
+	const selector = new AgentHostSourceSelector(selectorOptions({ preferEditor: () => true, editor, standalone }));
+	t.after(() => selector.dispose());
+	const starting = assert.rejects(selector.start(taskRequest()), AgentRuntimeError);
+	await entered.promise;
+	await assert.rejects(selector.cancelStart('task-id'), (error: unknown) =>
+		error instanceof AgentRuntimeError && error.code === 'TASK_CANCELLATION_UNCONFIRMED' && error.cleanupFailed);
+	rejectStart(new AgentRuntimeError('AGENT_UNAVAILABLE', 'The unsupported backend eventually stopped.'));
+	await starting;
+	assert.equal(standalone.starts, 0);
+	assert.equal(editor.disposals, 0);
+});
+
+test('source selector does not hide a cleanup failure merely because backend cancelStart returned successfully', async (t) => {
+	const entered = sourceStartBarrier();
+	const failure = new AgentRuntimeError('AGENT_UNAVAILABLE', 'Synthetic start cleanup failure.', false, undefined, true);
+	let rejectStart!: (error: AgentRuntimeError) => void;
+	const editor: AgentRuntime = {
+		probe: async () => ({ available: true, featureEnabled: true }),
+		start: async () => {
+			entered.resolve();
+			return new Promise<AgentTaskHandle>((_resolve, reject) => { rejectStart = reject; });
+		},
+		cancelStart: async () => { rejectStart(failure); },
+		dispose: async () => undefined,
+	};
+	const standalone = new FakeRuntime();
+	const selector = new AgentHostSourceSelector(selectorOptions({ preferEditor: () => true, editor, standalone }));
+	t.after(() => selector.dispose());
+	const starting = assert.rejects(selector.start(taskRequest()), (error: unknown) => error === failure);
+	await entered.promise;
+	await assert.rejects(selector.cancelStart('task-id'), (error: unknown) =>
+		error instanceof AgentRuntimeError && error.code === 'TASK_CANCELLATION_UNCONFIRMED' && error.cleanupFailed);
+	await starting;
+	assert.equal(standalone.starts, 0);
+});
+
+test('source selector transfers an already-produced late handle to Node instead of discarding it on cancellation', async (t) => {
+	const base = new FakeRuntime();
+	const entered = sourceStartBarrier();
+	const returned = sourceStartBarrier();
+	let produced: AgentTaskHandle | undefined;
+	let cancelled = false;
+	let disposed = false;
+	const editor: AgentRuntime = {
+		probe: () => base.probe(),
+		start: async (request) => {
+			produced = await base.start(request);
+			produced.cancel = async () => { cancelled = true; };
+			produced.dispose = async () => { disposed = true; };
+			entered.resolve();
+			await returned.promise;
+			return produced;
+		},
+		cancelStart: async () => { returned.resolve(); },
+		dispose: () => base.dispose(),
+	};
+	const standalone = new FakeRuntime();
+	const selector = new AgentHostSourceSelector(selectorOptions({ preferEditor: () => true, editor, standalone }));
+	t.after(() => selector.dispose());
+	const starting = selector.start(taskRequest());
+	await entered.promise;
+	await selector.cancelStart('task-id');
+	const handle = await starting;
+	assert.equal(handle, produced);
+	assert.equal(cancelled, false);
+	assert.equal(disposed, false);
+	assert.equal(standalone.starts, 0);
+	await handle.dispose();
+});
+
+function sourceStartBarrier(): { readonly promise: Promise<void>; readonly resolve: () => void } {
+	let resolve!: () => void;
+	const promise = new Promise<void>((complete) => { resolve = complete; });
+	return { promise, resolve };
+}
+
 function createLocator(
 	document: string,
 	overrides: {
@@ -1453,6 +1697,27 @@ class FakeRuntime implements AgentRuntime {
 		if (error !== undefined) {
 			throw error;
 		}
+	}
+}
+
+class PendingStartupRuntime extends FakeRuntime {
+	readonly entered = sourceStartBarrier();
+	readonly cancelledStarts: string[] = [];
+	cancellationFailure: AgentRuntimeError | undefined;
+	private readonly pending = new Map<string, (error: AgentRuntimeError) => void>();
+
+	public override async start(request: AgentTaskRequest): Promise<AgentTaskHandle> {
+		if (request.taskId !== 'task-id') { return super.start(request); }
+		this.starts += 1;
+		this.entered.resolve();
+		return new Promise<AgentTaskHandle>((_resolve, reject) => { this.pending.set(request.taskId, reject); });
+	}
+
+	public async cancelStart(taskId: string): Promise<void> {
+		this.cancelledStarts.push(taskId);
+		this.pending.get(taskId)?.(this.cancellationFailure ?? new AgentRuntimeError('AGENT_UNAVAILABLE', 'Startup cancelled.'));
+		this.pending.delete(taskId);
+		if (this.cancellationFailure !== undefined) { throw this.cancellationFailure; }
 	}
 }
 

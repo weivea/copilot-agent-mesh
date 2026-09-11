@@ -6,6 +6,50 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [Unreleased]
 
+## [0.5.4 Preview] - 2026-09-11
+
+- Handle the native CLI supervisor's fixed `0.1.0` registry marker for
+  Mesh-owned Codespaces Hosts, then negotiate only implemented AHP `1.0.0` or
+  `0.9.0`. This does not enable AHP `0.1.0`, relax editor endpoint validation,
+  or accept an unsupported negotiated version.
+- Reproduce the previous rejection and confirm native CLI installation, owned
+  Host startup and AHP `0.9.0` initialization on isolated Ubuntu 24.04 with
+  CLI 1.137.0. This is unauthenticated control-plane evidence, not a cloud
+  Codespace or real model-task qualification.
+- Log the selected AHP version without credentials and offer reload when a
+  just-updated companion's old version is still active.
+
+## [0.5.3 Preview] - 2026-09-11
+
+- Accept the native VS Code CLI's one-line `code <version> (commit <sha>)`
+  version banner as well as the desktop CLI's existing three-line output.
+  Codespace targets no longer reject an installed native CLI solely because its
+  version output differs from the desktop wrapper. Native banners do not
+  advertise architecture; Mesh does not invent one.
+- Record deduplicated, sanitized runtime failure stages in the companion Output
+  and cover local-to-Codespaces delegation with the production version parser.
+  Workspace grants, independent accounts, and Agent authentication are unchanged.
+
+## [0.5.2 Preview] - 2026-09-11
+
+- Detect Codespaces system glibc using a bounded `getconf GNU_LIBC_VERSION`
+  query instead of treating a missing Node diagnostic-report field as an
+  unsupported container. Unknown detection and confirmed old libc are separate
+  failures; minimum platform requirements and owned cleanup remain enforced.
+- Report the exact companion-installation/runtime-preparation stage and a safe
+  localized error code across extension hosts. Keep Codespace connection, Mesh
+  Dev Tunnel and Copilot execution accounts independent.
+
+## [0.5.1 Preview] - 2026-09-11
+
+- Add a desktop Codespaces execution companion behind the existing Device Broker
+  and six Mesh tools, with explicit native runtime setup and no public Codespace
+  port or additional Tunnel.
+- Add generation-bound remote task routing, retained Mesh-owned AHP sessions,
+  continuation, remote workspace identity and folder-policy enforcement.
+- Keep local editor execution and default-deny authorization unchanged. Native
+  Chat session sharing, browser clients and cross-generation replay are outside
+  this feature; real Codespace deployment qualification remains separate.
 - Separate current devices and active tasks from task history and saved devices.
   Replace the settings drawer and nested management menus with focused pages,
   exact Workspace permission shortcuts, Chinese/English text and compact help.

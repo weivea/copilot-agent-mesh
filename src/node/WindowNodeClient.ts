@@ -794,6 +794,12 @@ export class WindowNodeClient implements WorkspaceResolver {
 		await this.claimCurrentWorkspaces(session);
 	}
 
+	public invalidateExecutor(executor: WindowNodeExecutor): void {
+		if (!this.disposed && this.executor === executor) {
+			this.session?.close();
+		}
+	}
+
 	public async publishTaskEvent(event: NodeTaskEventParams): Promise<void> {
 		const params = nodeTaskEventParamsSchema.parse(event);
 		if (

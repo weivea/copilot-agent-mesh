@@ -48,6 +48,10 @@
 	window.dashboardL10n = {
 		en: help,
 		zh: {
+			'Codespace': 'Codespace',
+			'Codespaces setup required': '需要配置 Codespaces 运行时',
+			'Tasks use a Mesh-owned Agent Host in the attached Codespace.': '任务使用当前 Codespace 中由 Mesh 管理的 Agent Host。',
+			'Use Prepare Codespaces Runtime in the Dashboard toolbar or Command Palette, then retry.': '请在仪表盘工具栏或命令面板中运行“准备 Codespaces 运行时”，然后重试。',
 			overviewHelp: '概览仅显示本机、已确认在线的远程设备，以及所有尚未终结的任务。已保存或状态未知的设备不是在线目标。打开工作区的“权限”可管理其准确范围。',
 			tasksHelp: '委派任务独立于聊天运行。停止聊天不会取消已提交的任务。请使用“取消任务”；恢复中、等待输入和等待取消确认的任务仍属于未结束任务。',
 			historyHelp: '历史仅包含此窗口有权查看、且已确认完成、失败、取消或超时的任务。筛选不会扩大可见范围，此处不能删除记录。',

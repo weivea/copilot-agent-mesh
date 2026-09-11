@@ -14,20 +14,26 @@ export interface AgentSessionIdentity {
 	readonly uri: string;
 }
 
+type FolderSessionSource = Extract<AgentHostSource, 'editor' | 'codespace-owned'>;
+
+export function usesFolderSessionPolicy(source: AgentHostSource | undefined): source is FolderSessionSource {
+	return source === 'editor' || source === 'codespace-owned';
+}
+
 export function createAgentSessionIdentity(
 	source: AgentHostSource | undefined,
 	provider: string,
 	id: string,
 ): AgentSessionIdentity {
-	if (source === 'editor' && !/^[a-z][a-z0-9+.-]*$/iu.test(provider)) {
+	if (usesFolderSessionPolicy(source) && !/^[a-z][a-z0-9+.-]*$/iu.test(provider)) {
 		throw new AgentRuntimeError(
 			'AGENT_CONFIG_REQUIRED',
-			'The editor Agent provider cannot be represented by a native Session URI.',
+			`The ${sessionSourceLabel(source)} Agent provider cannot be represented by a native Session URI.`,
 		);
 	}
 	return Object.freeze({
 		provider,
-		uri: `${source === 'editor' ? provider : 'ahp-session'}:/${id}`,
+		uri: `${usesFolderSessionPolicy(source) ? provider : 'ahp-session'}:/${id}`,
 	});
 }
 
@@ -49,6 +55,7 @@ export class EditorSessionPolicy {
 	public constructor(
 		private readonly identity: AgentSessionIdentity,
 		private readonly workspaceUri: string,
+		private readonly source: FolderSessionSource = 'editor',
 	) {}
 
 	public constrainConfiguration(values: Readonly<Record<string, unknown>>): Readonly<Record<string, unknown>> {
@@ -61,11 +68,11 @@ export class EditorSessionPolicy {
 	): void {
 		const isolation = schema.properties.isolation;
 		if (isolation === undefined) {
-			throw configurationFailure();
+			throw configurationFailure(this.source);
 		}
 		validateSessionConfigValue('isolation', isolation, 'folder');
 		if (values.isolation !== 'folder') {
-			throw configurationFailure();
+			throw configurationFailure(this.source);
 		}
 	}
 
@@ -75,24 +82,24 @@ export class EditorSessionPolicy {
 			|| snapshot.resource !== this.identity.uri
 			|| !isRecord(snapshot.state)
 		) {
-			throw sessionFailure('resource');
+			throw this.sessionFailure('resource');
 		}
 		const value = snapshot.state;
 		if (value.resource !== undefined && value.resource !== this.identity.uri) {
-			throw sessionFailure('resource');
+			throw this.sessionFailure('resource');
 		}
 		if (value.provider !== this.identity.provider) {
-			throw sessionFailure('provider');
+			throw this.sessionFailure('provider');
 		}
 		if (
 			!isRecord(value.config)
 			|| !isRecord(value.config.values)
 			|| value.config.values.isolation !== 'folder'
 		) {
-			throw sessionFailure('isolation');
+			throw this.sessionFailure('isolation');
 		}
 		if (!matchesEditorSessionWorkspace(value.workingDirectories, this.workspaceUri)) {
-			throw sessionFailure('workspace');
+			throw this.sessionFailure('workspace');
 		}
 		this.values = { ...value.config.values };
 		this.workingDirectories = [...value.workingDirectories];
@@ -103,11 +110,11 @@ export class EditorSessionPolicy {
 			case 'session/configChanged': {
 				this.assertCurrentState();
 				if (!isRecord(action.config)) {
-					throw sessionFailure();
+					throw this.sessionFailure();
 				}
 				const values = action.replace ? { ...action.config } : { ...this.values, ...action.config };
 				if (values.isolation !== 'folder') {
-					throw sessionFailure();
+					throw this.sessionFailure();
 				}
 				this.values = values;
 				break;
@@ -136,15 +143,19 @@ export class EditorSessionPolicy {
 			this.values?.isolation !== 'folder'
 			|| !matchesEditorSessionWorkspace(this.workingDirectories, this.workspaceUri)
 		) {
-			throw sessionFailure();
+			throw this.sessionFailure();
 		}
 	}
 
 	private acceptDirectories(directories: readonly string[]): void {
 		if (!matchesEditorSessionWorkspace(directories, this.workspaceUri)) {
-			throw sessionFailure();
+			throw this.sessionFailure();
 		}
 		this.workingDirectories = directories;
+	}
+
+	private sessionFailure(reason?: EditorSessionPolicyError['reason']): EditorSessionPolicyError {
+		return new EditorSessionPolicyError(reason, this.source);
 	}
 }
 
@@ -183,24 +194,27 @@ function sameDirectory(left: string, right: string): boolean {
 	return normalized !== undefined && normalized === normalizedDirectoryUri(right);
 }
 
-function configurationFailure(): AgentRuntimeError {
+function configurationFailure(source: FolderSessionSource): AgentRuntimeError {
 	return new AgentRuntimeError(
 		'AGENT_CONFIG_REQUIRED',
-		'The editor Agent Host must support folder isolation in the target workspace.',
+		`The ${sessionSourceLabel(source)} Agent Host must support folder isolation in the target workspace.`,
 	);
 }
 
 export class EditorSessionPolicyError extends AgentRuntimeError {
-	public constructor(readonly reason: 'resource' | 'provider' | 'isolation' | 'workspace' | 'state' = 'state') {
+	public constructor(
+		readonly reason: 'resource' | 'provider' | 'isolation' | 'workspace' | 'state' = 'state',
+		source: FolderSessionSource = 'editor',
+	) {
 		super(
 			'TASK_EXECUTION_FAILED',
-			`The editor Agent Session does not match its provider, folder isolation, or target workspace (${reason}).`,
+			`The ${sessionSourceLabel(source)} Agent Session does not match its provider, folder isolation, or target workspace (${reason}).`,
 		);
 	}
 }
 
-function sessionFailure(reason?: EditorSessionPolicyError['reason']): EditorSessionPolicyError {
-	return new EditorSessionPolicyError(reason);
+function sessionSourceLabel(source: FolderSessionSource): string {
+	return source === 'editor' ? 'editor' : 'Codespace-owned';
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

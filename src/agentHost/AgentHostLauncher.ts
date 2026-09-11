@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 
 import {
 	parseEndpointDocument,
@@ -21,6 +21,7 @@ import { resolveWindowsCommand, windowsCodeCliCandidates } from '../spikes/windo
 import { WindowsOwnedProcess } from '../spikes/windowsProcessHost';
 import type { AgentHostSource } from './AgentRuntime';
 import type WebSocket from 'ws';
+import { parseCodeCliVersion, type CodeCliVersion } from './CodeCliVersion';
 
 const commandTimeoutMs = 10_000;
 const startupTimeoutMs = 30_000;
@@ -50,6 +51,7 @@ export interface AgentHostLauncherOptions {
 	readonly storageRoot: string;
 	readonly configuredCodeCli?: string;
 	readonly startupTimeoutMs?: number;
+	readonly cliDataDirectory?: string;
 }
 
 export interface AgentHostLauncherDependencies {
@@ -89,6 +91,9 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 		private readonly options: AgentHostLauncherOptions,
 		dependencies: Partial<AgentHostLauncherDependencies> = {},
 	) {
+		if (options.cliDataDirectory !== undefined && !isAbsolute(options.cliDataDirectory)) {
+			throw new TypeError('The owned CLI data directory must be absolute.');
+		}
 		this.dependencies = {
 			assertProcessControlSupported: assertOwnedProcessControlSupported,
 			runCommand: runOwnedCommand,
@@ -164,7 +169,8 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 		const ownedRoot = await mkdtemp(join(this.options.storageRoot, 'instance-'));
 		const userDataDir = join(ownedRoot, 'user-data');
 		const serverDataDir = join(ownedRoot, 'server-data');
-		const cliDataDir = join(ownedRoot, 'cli-data');
+		const cliDataDir = this.options.cliDataDirectory ?? join(ownedRoot, 'cli-data');
+		const usePrivateCliData = process.platform === 'win32' || this.options.cliDataDirectory !== undefined;
 		const tokenFile = join(ownedRoot, 'connection-token');
 		const token = randomBytes(32).toString('hex');
 		let processGroupId: number | undefined;
@@ -183,7 +189,7 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 			await Promise.all([
 				mkdir(userDataDir),
 				mkdir(serverDataDir),
-				...(process.platform === 'win32' ? [mkdir(cliDataDir)] : []),
+				...(usePrivateCliData ? [mkdir(cliDataDir, { recursive: true })] : []),
 				writeFile(tokenFile, token, { encoding: 'utf8', mode: 0o600 }),
 			]);
 			throwIfLaunchAborted(signal);
@@ -214,10 +220,13 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 				'--log',
 				'error',
 			];
+			if (usePrivateCliData) {
+				hostArgs.push('--cli-data-dir', cliDataDir);
+			}
 			if (process.platform === 'win32') {
 				const command = await resolveWindowsCommand(
 					code.executable,
-					[...hostArgs, '--cli-data-dir', cliDataDir],
+					hostArgs,
 					{ ...process.env, VSCODE_CLI_DATA_DIR: cliDataDir },
 				);
 				throwIfLaunchAborted(signal);
@@ -233,6 +242,9 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 					shell: false,
 					windowsHide: true,
 					stdio: ['ignore', 'pipe', 'pipe'],
+					...(this.options.cliDataDirectory === undefined ? {} : {
+						env: { ...process.env, VSCODE_CLI_DATA_DIR: cliDataDir },
+					}),
 				});
 			}
 			host.once('error', (error) => {
@@ -338,7 +350,10 @@ export class AgentHostLauncher implements AgentHostLauncherLike {
 		options: RunOwnedCommandOptions,
 	): Promise<string> {
 		try {
-			return await this.dependencies.runCommand(executable, args, options);
+			return await this.dependencies.runCommand(executable, args, this.options.cliDataDirectory === undefined ? options : {
+				...options,
+				environment: { ...process.env, ...options.environment, VSCODE_CLI_DATA_DIR: this.options.cliDataDirectory },
+			});
 		} catch (error) {
 			if (error instanceof OwnedCommandError && error.cleanupRequired && error.ownedCleanup !== undefined) {
 				const resource = error.ownedCleanup;
@@ -589,33 +604,28 @@ export async function discoverCodeCli(
 	runCommand: OwnedCommandRunner = runOwnedCommand,
 ): Promise<{
 	readonly executable: string;
-	readonly version: string;
-	readonly commit: string;
-	readonly architecture: string;
-}> {
+} & CodeCliVersion> {
 	const candidates = configuredCodeCli === undefined
 		? defaultCodeCliCandidates()
 		: [configuredCodeCli];
 	for (const executable of candidates) {
 		throwIfLaunchAborted(signal);
 		try {
-			const lines = (await runCommand(executable, ['--version'], {
+			const output = await runCommand(executable, ['--version'], {
 				timeoutMs: commandTimeoutMs,
 				maxOutputBytes: 16 * 1024,
 				signal,
-			})).trim().split(/\r?\n/u);
-			if (lines.length >= 3 && lines[0] && lines[1] && lines[2]) {
-				return {
-					executable,
-					version: lines[0],
-					commit: lines[1],
-					architecture: lines[2],
-				};
+			});
+			throwIfLaunchAborted(signal);
+			const version = parseCodeCliVersion(output);
+			if (version !== undefined) {
+				return { executable, ...version };
 			}
 		} catch (error) {
 			if (error instanceof OwnedCommandError && error.cleanupRequired) {
 				throw error;
 			}
+			throwIfLaunchAborted(signal);
 			continue;
 		}
 	}

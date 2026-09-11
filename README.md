@@ -1,6 +1,6 @@
 # Copilot Agent Mesh
 
-Copilot Agent Mesh 0.5.0 Preview provides **Peer Window Delegation** for ordinary
+Copilot Agent Mesh 0.5.4 Preview provides **Peer Window Delegation** for ordinary
 VS Code windows on Windows x64/ARM64 and macOS arm64. Local discovery, task tools,
 window naming, and policy controls are enabled by default. In Agent mode, Copilot can use
 six Mesh tools to discover an explicitly authorized peer window, delegate tasks,
@@ -33,6 +33,28 @@ x64/ARM64 and macOS arm64**. Linux, macOS x64, and Windows x86 remain
 Coordinator-only. The VSIX includes the Windows process controller; no Go
 installation or additional Windows feature setting is needed by users.
 
+**Desktop Codespaces:** a trusted Linux x64/ARM64 Codespace attached to desktop
+VS Code can use the same six Mesh tools through the matching workspace companion.
+The desktop retains its Broker, policies and task history; execution uses a
+Mesh-owned AHP Host inside the Codespace, not the native Chat Host. Browser
+Codespaces are not included. See [setup and design](./docs/desktop-codespaces.md).
+
+In the attached desktop window, choose **Prepare Codespaces Runtime** from the
+Mesh Dashboard toolbar. This explicitly installs the bundled companion and
+offers native CLI download/license confirmation. Reload when prompted, then
+authorize target Workspaces and incoming tasks as usual. No public Codespace
+port, additional Dev Tunnel, PAT setting, or shell login is required.
+Unknown Agent protected resources still require an explicit provider mapping.
+Mesh-owned sessions support continuation within the same live execution
+generation; they do not promise native Chat history visibility or recovery after
+Host replacement. Live Codespace qualification remains a separate release gate.
+
+The Codespace connection account, Mesh Dev Tunnel account, and Copilot execution
+account may differ. Installing the runtime does not require a shared account.
+If setup reports a libc error, run `getconf GNU_LIBC_VERSION` in the Codespace
+terminal and inspect **Output: Copilot Agent Mesh - Codespaces**. Setup now
+distinguishes an undetected libc version from a confirmed unsupported platform.
+
 ## Preview prerequisites and limitations
 
 - VS Code 1.103 or newer is required.
@@ -48,11 +70,13 @@ installation or additional Windows feature setting is needed by users.
 - A borrowed editor Agent Host reuses that editor profile's established identity;
   Mesh never pushes a separate OAuth token into it. If the editor later reports an
   authentication challenge, authenticate in that editor profile and retry.
-  `copilotAgentMesh.experimental.authenticationProviders` applies only to the
-  owned standalone Agent Host path, where every protected-resource or
+  `copilotAgentMesh.experimental.authenticationProviders` applies to
+  owned Agent Host paths, where every protected-resource or
   authorization-server URL must map to an installed VS Code authentication
   provider and exact scopes. Missing standalone mappings fail with
-  `AGENT_AUTH_REQUIRED`.
+  `AGENT_AUTH_REQUIRED`. The Codespaces companion additionally supplies the
+  documented exact GitHub resource mapping; it never infers mappings for unknown
+  resources or changes the borrowed editor's identity.
 - Cross-device connections use the Dev Tunnels SDK and native GitHub or Microsoft
   authentication in VS Code. No Dev Tunnel CLI installation, CLI login, or
   hosting-backend setting is required.
@@ -219,8 +243,9 @@ authorization to every Workspace in the window is a separate, explicit action
 that identifies the affected Workspaces before confirmation. These gates
 default to deny; B still confirms each task unless its scoped automatic-acceptance
 policy is explicitly enabled. Use the Mesh task tools with target handles or
-explicit Device/Node/Workspace IDs. Strict remote tasks require B's existing editor
-Host, without standalone fallback.
+explicit Device/Node/Workspace IDs. Strict remote tasks use B's target-selected
+backend: the existing editor Host for ordinary windows, or the explicitly bound
+Mesh-owned Host for desktop Codespaces. There is no silent standalone fallback.
 
 **Disable cross-device connections** is the one-click off path: it stops discovery,
 outbound peers and the Listener, and deletes **only this Broker's exact owned
@@ -303,7 +328,7 @@ initialization; do not delete policy or revocation files to force a downgrade.
 git submodule update --init --recursive
 npm ci
 npm run package:vsix
-code --install-extension artifacts/copilot-agent-mesh-0.4.0-preview.vsix
+code --install-extension artifacts/copilot-agent-mesh-0.5.4-preview.vsix
 ```
 
 Project documents:

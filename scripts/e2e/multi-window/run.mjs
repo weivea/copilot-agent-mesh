@@ -171,7 +171,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
 }
 let evidence = {
 	schemaVersion: 1,
-	release: '0.5.0-preview',
+	release: '0.5.4-preview',
 	platform: { os: process.platform, architecture: process.arch },
 	runId,
 	mode: diagnosticTask ? 'single-task-diagnostic' : realTaskEnabled ? 'transport-and-ahp' : 'transport-lifecycle',

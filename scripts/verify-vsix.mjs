@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { readCentralDirectory } from './vsix-archive.mjs';
 
 const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 const archivePath = resolve(process.argv[2] ?? `artifacts/copilot-agent-mesh-${manifest.version}-preview.vsix`);
@@ -15,10 +16,12 @@ const expected = [
 	'extension/changelog.md',
 	'extension/dist/extension.js',
 	'extension/dist/THIRD_PARTY_NOTICES.txt',
+	'extension/dist/codespaces-companion.vsix',
 	'extension/dist/windows/LICENSE-go.txt',
 	'extension/dist/windows/mesh-process-host-arm64.exe',
 	'extension/dist/windows/mesh-process-host-x64.exe',
 	'extension/docs/mvp/release.md',
+	'extension/docs/desktop-codespaces.md',
 	'extension/l10n/bundle.l10n.zh-cn.json',
 	'extension/media/agent-mesh.svg',
 	'extension/media/connections-enabled-dark.svg',
@@ -43,7 +46,8 @@ const prohibited = [
 
 const unexpected = entries.filter((entry) => !expected.includes(entry));
 const missing = expected.filter((entry) => !entries.includes(entry));
-const prohibitedEntries = entries.filter((entry) => prohibited.some((pattern) => pattern.test(entry)));
+const prohibitedEntries = entries.filter((entry) => entry !== 'extension/dist/codespaces-companion.vsix'
+	&& prohibited.some((pattern) => pattern.test(entry)));
 
 if (unexpected.length || missing.length || prohibitedEntries.length) {
 	throw new Error([
@@ -57,39 +61,3 @@ if (unexpected.length || missing.length || prohibitedEntries.length) {
 const sha256 = createHash('sha256').update(archive).digest('hex');
 console.log(entries.join('\n'));
 console.log(`sha256  ${sha256}  ${archivePath}`);
-
-function readCentralDirectory(buffer) {
-	const endSignature = 0x06054b50;
-	const centralSignature = 0x02014b50;
-	const minimumEndSize = 22;
-	const earliestEnd = Math.max(0, buffer.length - 0xffff - minimumEndSize);
-	let endOffset = -1;
-
-	for (let offset = buffer.length - minimumEndSize; offset >= earliestEnd; offset -= 1) {
-		if (buffer.readUInt32LE(offset) === endSignature) {
-			endOffset = offset;
-			break;
-		}
-	}
-	if (endOffset < 0) {
-		throw new Error('VSIX end-of-central-directory record was not found.');
-	}
-
-	const entryCount = buffer.readUInt16LE(endOffset + 10);
-	let offset = buffer.readUInt32LE(endOffset + 16);
-	const names = [];
-
-	for (let index = 0; index < entryCount; index += 1) {
-		if (buffer.readUInt32LE(offset) !== centralSignature) {
-			throw new Error(`Invalid central-directory entry at offset ${offset}.`);
-		}
-		const nameLength = buffer.readUInt16LE(offset + 28);
-		const extraLength = buffer.readUInt16LE(offset + 30);
-		const commentLength = buffer.readUInt16LE(offset + 32);
-		const nameStart = offset + 46;
-		names.push(buffer.toString('utf8', nameStart, nameStart + nameLength));
-		offset = nameStart + nameLength + extraLength + commentLength;
-	}
-
-	return names;
-}

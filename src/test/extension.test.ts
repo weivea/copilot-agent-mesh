@@ -23,8 +23,21 @@ import {
 import { DelegatedToolInvocationRegistry } from '../tools/DelegatedToolInvocationRegistry';
 import { TaskToolFacadeError } from '../tools/taskToolFacade';
 import type { AgentMeshExtensionApi } from '../composition/createApplication';
+import { codespaceFileUri, desktopCodespaceBinding } from '../codespaces/CodespaceEnvironment';
 
 suite('Copilot Agent Mesh', () => {
+	test('maps actual VS Code remote URI serialization to the Codespace filesystem', () => {
+		const uri = vscode.Uri.from({
+			scheme: 'vscode-remote', authority: 'codespaces+example', path: '/workspaces/a b%file',
+		});
+		assert.strictEqual(codespaceFileUri(uri.toString(), uri.authority), 'file:///workspaces/a%20b%25file');
+		assert.deepStrictEqual(desktopCodespaceBinding({
+			remoteName: 'codespaces', uiKind: 'desktop', extensionKind: 'ui', isTrusted: true,
+			workspaceFolders: [{ uriScheme: uri.scheme, uriAuthority: uri.authority }],
+		}, [{ uri: uri.toString(), name: 'Example' }]), {
+			authority: uri.authority, expectedFolders: ['file:///workspaces/a%20b%25file'],
+		});
+	});
 	test('registers task tools by default and preserves an explicit opt-out', async () => {
 		const extension = getExtension();
 		const manifestTools = extension.packageJSON.contributes.languageModelTools as Array<{ name: string }>;

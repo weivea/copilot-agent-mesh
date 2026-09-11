@@ -10,7 +10,7 @@ export const AGENT_RUNTIME_ERROR_CODES = [
 
 export type AgentRuntimeErrorCode = typeof AGENT_RUNTIME_ERROR_CODES[number];
 
-export type AgentHostSource = 'editor' | 'standalone';
+export type AgentHostSource = 'editor' | 'standalone' | 'codespace-owned';
 export type AhpProtocolVersion = '1.0.0' | '0.9.0';
 export type AhpProtocolOffer =
 	| readonly ['1.0.0']
@@ -55,6 +55,11 @@ export type AgentHostSourceStatus =
 	| {
 		readonly source: 'standalone';
 		readonly degraded: false;
+	}
+	| {
+		readonly source: 'codespace-owned';
+		readonly degraded: false;
+		readonly failure?: AgentHostSourceFailure;
 	}
 	| {
 		readonly source: 'standalone';
@@ -138,6 +143,7 @@ export interface AgentTaskRequest {
 	readonly workspaceId: string;
 	readonly sourceWindowName?: string;
 	readonly requireEditor?: true;
+	readonly executionBackend?: 'editor' | 'codespace-owned';
 	readonly continuation?: AgentSessionContinuation;
 	readonly approvalCapability?: AgentRuntimeApprovalCapability;
 	readonly providerId?: string;
@@ -276,6 +282,7 @@ export interface AgentRuntime {
 	probe(request?: Pick<AgentTaskRequest, 'requireEditor'>): Promise<AgentRuntimeProbe>;
 	prepareStart?(request?: Pick<AgentTaskRequest, 'requireEditor'>): Promise<void>;
 	start(request: AgentTaskRequest): Promise<AgentTaskHandle>;
+	cancelStart?(taskId: string): Promise<void>;
 	dispose(): Promise<void>;
 }
 
@@ -759,6 +766,7 @@ function approvalFingerprint(request: AgentTaskRequest): string {
 		workspaceId: request.workspaceId,
 		sourceWindowName: request.sourceWindowName,
 		requireEditor: request.requireEditor,
+		executionBackend: request.executionBackend,
 		continuation: request.continuation,
 		providerId: request.providerId,
 		allowInteractiveAuthentication: request.allowInteractiveAuthentication,

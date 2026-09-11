@@ -195,6 +195,7 @@ async function createFixture(
 	},
 	serviceOptions: Omit<BrokerTaskServiceOptions, 'notificationSink'> = {},
 	clock = { now: () => new Date(AT) },
+	capabilities: readonly string[] = ['tasks'],
 ): Promise<Fixture> {
 	const memory = new MemoryFileSystem();
 	let temporaryId = 0;
@@ -220,7 +221,7 @@ async function createFixture(
 		nodeId: NODE_ID,
 		nodeInstanceId: INSTANCE_ID,
 		label: 'Window Node',
-		capabilities: ['tasks'],
+		capabilities: [...capabilities],
 		status: 'online',
 		startedAt: AT,
 	}, session.asRoute());
@@ -295,6 +296,58 @@ test('Broker derives remote auto-accept approval after acceptance and never acce
 		...startParams(), remoteTaskApproval: dispatched.remoteTaskApproval,
 	}));
 	assert.equal(fixture.session.requests.filter((request) => request.method === 'node.task.start').length, 1);
+});
+
+test('Broker selects owned Codespaces execution only from the authenticated target Node', async (t) => {
+	const fixture = await createFixture(undefined, {
+		requiresEditorForRemote: () => true,
+		approveRemoteTaskStart: async (peerId, _target, workspaceIdentity, taskId) => ({
+			kind: 'remoteAutoAccept', peerId, workspaceIdentity, taskId, policyRevision: 1,
+		}),
+	}, undefined, ['tasks', 'codespace-owned']);
+	t.after(() => fixture.dispose());
+	await fixture.service.startRemote(OWNER_ID, startParams());
+	for (let index = 0; fixture.session.requests.length === 0 && index < 20; index += 1) {
+		await new Promise((resolve) => setImmediate(resolve));
+	}
+	const dispatched = nodeTaskStartParamsSchema.parse(fixture.session.requests[0]?.params);
+	assert.equal(dispatched.executionBackend, 'codespace-owned');
+	assert.equal(dispatched.requireEditor, undefined);
+	assert.equal(dispatched.remoteTaskApproval?.peerId, OWNER_ID);
+	assert.equal(fixture.registry.lookupTaskRoute(OWNER_ID, TASK_ID)?.executionBackend, 'codespace-owned');
+	assert.equal(nodeTaskStartParamsSchema.safeParse({ ...dispatched, requireEditor: true }).success, false);
+	await assert.rejects(async () => fixture.service.startRemote(OWNER_ID, {
+		...startParams(), executionBackend: 'codespace-owned',
+	} as RoutedTaskStartParams));
+});
+
+test('cancellation before remote admission completes prevents any later Node dispatch', async (t) => {
+	let finishApproval!: () => void;
+	let entered = false;
+	const fixture = await createFixture(undefined, {
+		requiresEditorForRemote: () => true,
+		approveRemoteTaskStart: async () => {
+			entered = true;
+			await new Promise<void>((resolve) => { finishApproval = resolve; });
+			return undefined;
+		},
+	});
+	t.after(() => fixture.dispose());
+	await fixture.service.startRemote(OWNER_ID, startParams());
+	for (let index = 0; !entered && index < 20; index += 1) {
+		await new Promise((resolve) => setImmediate(resolve));
+	}
+	assert.equal(entered, true);
+	try {
+		const cancelled = await fixture.service.cancel(OWNER_ID, TASK_ID);
+		assert.equal(cancelled.state, 'cancelled');
+		assert.equal(fixture.session.requests.length, 0);
+	} finally { finishApproval(); }
+	for (let index = 0; index < 20; index += 1) {
+		await new Promise((resolve) => setImmediate(resolve));
+	}
+	assert.equal(fixture.session.requests.length, 0);
+	assert.equal((await fixture.service.get(OWNER_ID, TASK_ID)).state, 'cancelled');
 });
 
 test('a remote approval policy failure prevents Node dispatch after durable task acceptance', async (t) => {

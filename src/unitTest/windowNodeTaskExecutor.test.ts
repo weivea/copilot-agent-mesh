@@ -164,6 +164,32 @@ class InterruptibleStartRuntime implements AgentRuntime {
 	}
 }
 
+class ScopedStartRuntime extends TestRuntime {
+	public readonly cancelledStarts: string[] = [];
+	private readonly pending = new Map<string, (error: Error) => void>();
+
+	public override start(request: AgentTaskRequest): Promise<AgentTaskHandle> {
+		if (request.taskId !== TASK_ID) {
+			return super.start(request);
+		}
+		this.requests.push(request);
+		return new Promise((_resolve, reject) => { this.pending.set(request.taskId, reject); });
+	}
+
+	public async cancelStart(taskId: string): Promise<void> {
+		this.cancelledStarts.push(taskId);
+		this.pending.get(taskId)?.(new AgentRuntimeError('TASK_EXECUTION_FAILED', 'Startup cancelled.'));
+		this.pending.delete(taskId);
+	}
+
+	public override async dispose(): Promise<void> {
+		for (const reject of this.pending.values()) {
+			reject(new AgentRuntimeError('AGENT_UNAVAILABLE', 'Runtime disposed.'));
+		}
+		this.pending.clear();
+	}
+}
+
 class RetryCleanupRuntime implements AgentRuntime {
 	public readonly handle = new TestHandle(TASK_ID);
 	public disposeCalls = 0;
@@ -665,6 +691,156 @@ test('a bound Broker auto-accept approval skips only the remote task-start promp
 		await waitFor(() => fixture.events.some((event) => event.event.type === 'inputRequired'));
 		assert.equal(fixture.runtime.handles[0].answers.length, 0);
 	} finally { await fixture.executor.dispose(); }
+});
+
+test('Codespaces backend is target-bound and retains owned continuation without requiring an editor', async () => {
+	const fixture = createFixture({ executionBackend: 'codespace-owned' });
+	const desktop = createFixture();
+	try {
+		assert.throws(() => fixture.executor.start(startParams()), { reason: 'AUTH_FAILED' });
+		assert.throws(() => desktop.executor.start(startParams({ executionBackend: 'codespace-owned' })), { reason: 'AUTH_FAILED' });
+		await fixture.executor.start(startParams({
+			sourceNodeId: undefined, executionBackend: 'codespace-owned',
+			remoteTaskApproval: {
+				kind: 'remoteAutoAccept', peerId: OWNER_ID, taskId: TASK_ID,
+				workspaceIdentity: WORKSPACE_IDENTITY, policyRevision: 1,
+			},
+		}));
+		assert.equal(fixture.confirmations.length, 0);
+		assert.equal(fixture.runtime.requests[0].executionBackend, 'codespace-owned');
+		assert.equal(fixture.runtime.requests[0].requireEditor, undefined);
+		await fixture.runtime.handles[0].events.push({ type: 'completed' });
+		await waitFor(() => fixture.runtime.handles[0].disposeCalls === 1);
+		await fixture.executor.start(startParams({
+			executionBackend: 'codespace-owned',
+			taskId: INPUT_ID, delegationRequestId: SECOND_INPUT_ID, continueFromTaskId: TASK_ID,
+			continuation: { sessionUri: 'session', chatUri: 'conversation' },
+		}));
+		assert.equal(fixture.runtime.requests[1].executionBackend, 'codespace-owned');
+		assert.equal(fixture.runtime.requests[1].requireEditor, undefined);
+		assert.deepEqual(fixture.runtime.requests[1].continuation, { sessionUri: 'session', chatUri: 'conversation' });
+	} finally {
+		await fixture.executor.dispose();
+		await desktop.executor.dispose();
+	}
+});
+
+test('startup cancellation is task-scoped and publishes cancellation before rejecting the start', async () => {
+	const runtime = new ScopedStartRuntime();
+	const fixture = createFixture({ runtime, executionBackend: 'codespace-owned' });
+	try {
+		await fixture.executor.start(startParams({
+			executionBackend: 'codespace-owned', taskId: SECOND_INPUT_ID, delegationRequestId: ANSWER_ID,
+		}));
+		const starting = fixture.executor.start(startParams({ executionBackend: 'codespace-owned' }));
+		const rejected = assert.rejects(starting, () => {
+			assert.ok(fixture.events.some((event) => event.taskId === TASK_ID && event.event.type === 'cancelled'));
+			return true;
+		});
+		await waitFor(() => runtime.requests.some((request) => request.taskId === TASK_ID));
+		const cancel = { taskId: TASK_ID, nodeId: NODE_ID, nodeInstanceId: NODE_INSTANCE_ID };
+		await fixture.executor.cancel(cancel);
+		await fixture.executor.cancel(cancel);
+		await rejected;
+		assert.deepEqual(runtime.cancelledStarts, [TASK_ID]);
+		assert.equal(runtime.handles[0].cancelCalls, 0);
+		assert.equal(runtime.handles[0].disposeCalls, 0);
+		assert.equal(fixture.events.filter((event) => event.taskId === TASK_ID && event.event.type === 'cancelled').length, 1);
+		await assert.rejects(fixture.executor.start(startParams({ executionBackend: 'codespace-owned' })));
+		assert.equal(runtime.requests.filter((request) => request.taskId === TASK_ID).length, 1);
+	} finally { await fixture.executor.dispose(); }
+});
+
+test('successful scoped cleanup supersedes an earlier startup cleanup error', async () => {
+	let rejectStart!: (error: Error) => void;
+	let entered = false;
+	const runtime: AgentRuntime = {
+		probe: async () => ({ available: true, featureEnabled: true }),
+		start: async () => {
+			entered = true;
+			return new Promise((_resolve, reject) => { rejectStart = reject; });
+		},
+		cancelStart: async () => {
+			rejectStart(new AgentRuntimeError('TASK_EXECUTION_FAILED', 'Initial cleanup failed before its retry succeeded.', false, undefined, true));
+		},
+		dispose: async () => {},
+	};
+	const fixture = createFixture({ runtime, executionBackend: 'codespace-owned' });
+	const rejected = assert.rejects(fixture.executor.start(startParams({ executionBackend: 'codespace-owned' })));
+	try {
+		await waitFor(() => entered);
+		await fixture.executor.cancel({ taskId: TASK_ID, nodeId: NODE_ID, nodeInstanceId: NODE_INSTANCE_ID });
+		await rejected;
+		assert.equal(fixture.events.at(-1)?.event.type, 'cancelled');
+	} finally { await fixture.executor.dispose(); }
+});
+
+test('internal disposal fences a pending start without publishing into an already released Broker route', async () => {
+	const runtime = new ScopedStartRuntime();
+	const fixture = createFixture({ runtime, executionBackend: 'codespace-owned' });
+	const starting = fixture.executor.start(startParams({ executionBackend: 'codespace-owned' }));
+	const rejected = assert.rejects(starting);
+	try {
+		await waitFor(() => runtime.requests.length === 1);
+		const input = { taskId: TASK_ID, nodeId: NODE_ID, nodeInstanceId: NODE_INSTANCE_ID };
+		await fixture.executor.disposeTask(input);
+		await fixture.executor.disposeTask(input);
+		await rejected;
+		assert.deepEqual(runtime.cancelledStarts, [TASK_ID]);
+		assert.equal(fixture.events.length, 0);
+		await assert.rejects(fixture.executor.cancel(input), { reason: 'TASK_NOT_CANCELLABLE' });
+	} finally { await fixture.executor.dispose(); }
+});
+
+test('cancelling an unanswered task-start confirmation never starts the Agent', async () => {
+	let confirmationSignal: AbortSignal | undefined;
+	const fixture = createFixture({
+		confirmationHost: { confirm: (_request, signal) => {
+			confirmationSignal = signal;
+			return new Promise((_resolve, reject) => signal?.addEventListener('abort', () => reject(new Error('Cancelled.')), { once: true }));
+		} },
+	});
+	const starting = fixture.executor.start(startParams({ sourceNodeId: undefined, requireEditor: true }));
+	const rejected = assert.rejects(starting);
+	try {
+		await waitFor(() => confirmationSignal !== undefined);
+		await fixture.executor.cancel({ taskId: TASK_ID, nodeId: NODE_ID, nodeInstanceId: NODE_INSTANCE_ID });
+		await rejected;
+		assert.equal(confirmationSignal?.aborted, true);
+		assert.equal(fixture.runtime.requests.length, 0);
+		assert.equal(fixture.events.at(-1)?.event.type, 'cancelled');
+	} finally { await fixture.executor.dispose(); }
+});
+
+test('Codespaces inputs and pending answers revalidate the current workspace identity', async () => {
+	for (const changeBeforeInput of [true, false]) {
+		let identity = WORKSPACE_IDENTITY;
+		const fixture = createFixture({
+			executionBackend: 'codespace-owned',
+			workspaceResolver: { resolve: async (workspaceId) => ({
+				workspaceId, workspaceIdentity: identity, displayName: 'Codespace', uri: 'file:///workspace',
+			}) },
+		});
+		try {
+			await fixture.executor.start(startParams({ executionBackend: 'codespace-owned' }));
+			const handle = fixture.runtime.handles[0];
+			if (changeBeforeInput) { identity = `sha256:${'b'.repeat(43)}`; }
+			await handle.events.push({
+				type: 'inputRequired', request: { requestId: 'question', kind: 'chatInput', prompt: 'Continue?' },
+			});
+			await waitFor(() => fixture.events.some((event) => event.event.type === (changeBeforeInput ? 'failed' : 'inputRequired')));
+			if (!changeBeforeInput) {
+				identity = `sha256:${'b'.repeat(43)}`;
+				await assert.rejects(fixture.executor.answer({
+					nodeId: NODE_ID, nodeInstanceId: NODE_INSTANCE_ID, taskId: TASK_ID,
+					inputId: INPUT_ID, answerId: ANSWER_ID, answer: 'Continue.',
+				}), { reason: 'WORKSPACE_NOT_FOUND' });
+			} else {
+				assert.ok(!fixture.events.some((event) => event.event.type === 'inputRequired'));
+			}
+			assert.equal(handle.answers.length, 0);
+		} finally { await fixture.executor.dispose(); }
+	}
 });
 
 test('remote task-start approval rejects wrong task, peer, Workspace, local-source and non-editor routes', async () => {

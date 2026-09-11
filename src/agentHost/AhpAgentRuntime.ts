@@ -19,6 +19,7 @@ import {
 	createAgentSessionIdentity,
 	EditorSessionPolicy,
 	EditorSessionPolicyError,
+	usesFolderSessionPolicy,
 	type AgentSessionIdentity,
 } from './EditorSessionPolicy';
 import {
@@ -50,8 +51,9 @@ import type { AuthBroker, ProtectedResource } from './AuthBroker';
 
 const rootUri = 'ahp-root://';
 export const AHP_PROTOCOL_OFFER: readonly ['1.0.0'] = Object.freeze(['1.0.0']);
-export const AHP_EDITOR_0_9_PROTOCOL_OFFER: readonly ['1.0.0', '0.9.0'] =
+export const AHP_RETAINED_0_9_PROTOCOL_OFFER: readonly ['1.0.0', '0.9.0'] =
 	Object.freeze(['1.0.0', '0.9.0']);
+export const AHP_EDITOR_0_9_PROTOCOL_OFFER = AHP_RETAINED_0_9_PROTOCOL_OFFER;
 const sessionDefaultChatTimeoutMs = 60_000;
 const cancellationTimeoutMs = 15_000;
 const actionAcknowledgementTimeoutMs = 10_000;
@@ -156,18 +158,23 @@ export interface AhpProtocolPolicy {
 export function ahpProtocolPolicyForHost(
 	host: Pick<LaunchedAgentHost, 'registryProtocolVersion' | 'source'>,
 ): AhpProtocolPolicy {
-	if (host.source !== 'editor') {
+	if (host.source === 'codespace-owned' && host.registryProtocolVersion === '0.1.0') {
+		// The native CLI supervisor publishes this fixed registry marker independently of its backend.
+		// Negotiate only implemented wire versions; this does not enable AHP 0.1.
+		return { offer: AHP_RETAINED_0_9_PROTOCOL_OFFER };
+	}
+	if (!usesFolderSessionPolicy(host.source)) {
 		return { offer: AHP_PROTOCOL_OFFER };
 	}
 	switch (host.registryProtocolVersion) {
 		case '1.0.0':
 			return { offer: AHP_PROTOCOL_OFFER };
 		case '0.9.0':
-			return { offer: AHP_EDITOR_0_9_PROTOCOL_OFFER };
+			return { offer: AHP_RETAINED_0_9_PROTOCOL_OFFER };
 		default:
 			throw new AgentRuntimeError(
 				'AGENT_UNAVAILABLE',
-				'The editor Agent Host registry protocol version is unsupported.',
+				`The ${host.source === 'editor' ? 'editor' : 'Codespace-owned'} Agent Host registry protocol version is unsupported.`,
 			);
 	}
 }
@@ -244,10 +251,23 @@ export interface AhpAgentRuntimeOptions {
 	readonly lifecycleObserver?: AgentRuntimeLifecycleObserver;
 }
 
+interface RetainedOwnedSession {
+	readonly endpointFingerprint: string;
+	readonly provider: string;
+	readonly chatUri: string;
+	readonly workspaceId: string;
+	readonly workspaceIdentity?: string;
+	readonly workspaceUri: string;
+}
+
 export class AhpAgentRuntime implements AgentRuntime {
 	private readonly tasks = new Set<AhpTask>();
+	private readonly retainedOwnedSessions = new Map<string, RetainedOwnedSession>();
 	private readonly failedStartCleanups = new Set<{ dispose(): Promise<void> }>();
+	private readonly failedStartCleanupTasks = new WeakMap<{ dispose(): Promise<void> }, string>();
+	private readonly startCancellations = new Map<string, Promise<void>>();
 	private readonly inFlightStarts = new Set<{
+		readonly taskId: string;
 		readonly controller: AbortController;
 		readonly operation: Promise<AgentTaskHandle>;
 	}>();
@@ -280,6 +300,7 @@ export class AhpAgentRuntime implements AgentRuntime {
 		});
 		this.startQueueTail = predecessor.then(() => turn, () => turn);
 		let tracked!: {
+			readonly taskId: string;
 			readonly controller: AbortController;
 			readonly operation: Promise<AgentTaskHandle>;
 		};
@@ -290,9 +311,74 @@ export class AhpAgentRuntime implements AgentRuntime {
 			releaseTurn,
 		)
 			.finally(() => this.inFlightStarts.delete(tracked));
-		tracked = { controller, operation };
+		tracked = { taskId: request.taskId, controller, operation };
 		this.inFlightStarts.add(tracked);
 		return operation;
+	}
+
+	public cancelStart(taskId: string): Promise<void> {
+		const existing = this.startCancellations.get(taskId);
+		if (existing !== undefined) { return existing; }
+		const operation = withTimeout(
+			this.cancelTrackedStart(taskId),
+			this.options.cancellationTimeoutMs ?? cancellationTimeoutMs,
+			'The Agent Host did not confirm startup cancellation before the deadline.',
+		).catch((error: unknown) => {
+			throw new AgentRuntimeError(
+				'TASK_CANCELLATION_UNCONFIRMED',
+				'The task startup could not be confirmed stopped and cleaned up.',
+				false,
+				error,
+				true,
+			);
+		}).finally(() => {
+			if (this.startCancellations.get(taskId) === operation) {
+				this.startCancellations.delete(taskId);
+			}
+		});
+		this.startCancellations.set(taskId, operation);
+		return operation;
+	}
+
+	private async cancelTrackedStart(taskId: string): Promise<void> {
+		const starts = [...this.inFlightStarts].filter((start) => start.taskId === taskId);
+		for (const start of starts) {
+			start.controller.abort();
+		}
+		const owners = new Set([
+			...[...this.tasks].filter((task) => starts.length > 0 && task.taskId === taskId),
+			...[...this.failedStartCleanups].filter((owner) => this.failedStartCleanupTasks.get(owner) === taskId),
+		]);
+		const cleanup = Promise.allSettled([...owners].map(async (owner) => {
+			try {
+				if (owner instanceof AhpTask) {
+					await owner.cancelStartup();
+				} else {
+					await owner.dispose();
+				}
+				this.failedStartCleanups.delete(owner);
+			} catch (error: unknown) {
+				this.retainFailedStartCleanup(owner, taskId);
+				throw error;
+			}
+		}));
+		const [results, cleanups] = await Promise.all([
+			Promise.allSettled(starts.map(({ operation }) => operation)),
+			cleanup,
+		]);
+		if (
+			cleanups.some(({ status }) => status === 'rejected')
+			|| results.some((result) => result.status === 'rejected'
+				&& result.reason instanceof AgentRuntimeError && result.reason.cleanupFailed)
+		) {
+			throw new AgentRuntimeError(
+				'TASK_CANCELLATION_UNCONFIRMED',
+				'Startup cancellation left task resources that require cleanup retry.',
+				false,
+				undefined,
+				true,
+			);
+		}
 	}
 
 	public async prepareStart(): Promise<void> {
@@ -311,8 +397,8 @@ export class AhpAgentRuntime implements AgentRuntime {
 		predecessor: Promise<void>,
 		releaseTurn: () => void,
 	): Promise<AgentTaskHandle> {
-		await predecessor.catch(() => undefined);
 		try {
+			await abortableStartOperation(predecessor.catch(() => undefined), signal);
 			return await this.startTracked(request, signal);
 		} finally {
 			releaseTurn();
@@ -326,40 +412,58 @@ export class AhpAgentRuntime implements AgentRuntime {
 		if (this.disposed || !this.options.enabled()) {
 			throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'The production Agent Host runtime is disabled.');
 		}
-		await this.retryFailedStartCleanup();
-		this.throwIfDisposed();
+		await abortableStartOperation(this.retryFailedStartCleanup(), signal);
+		this.assertStartActive(signal);
 		validateRequest(request);
-		const workspace = await this.options.workspaceResolver.resolve(request.workspaceId);
-		this.throwIfDisposed();
+		const workspace = await abortableStartOperation(this.options.workspaceResolver.resolve(request.workspaceId), signal);
+		this.assertStartActive(signal);
 		if (workspace === undefined) {
 			throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'The requested workspace is not registered on this device.');
 		}
 		validateWorkspace(request.workspaceId, workspace);
+		if (request.executionBackend === 'codespace-owned' && (
+			typeof workspace.workspaceIdentity !== 'string'
+			|| workspace.workspaceIdentity.length === 0
+		)) {
+			throw new AgentRuntimeError(
+				request.continuation === undefined ? 'AGENT_UNAVAILABLE' : 'TASK_RECOVERY_UNAVAILABLE',
+				'Codespace-owned tasks require the current canonical workspace identity.',
+			);
+		}
 		const resolvedRequest: ResolvedAgentTaskRequest = { ...request, workspace };
 		if (
 			this.options.approvalCapabilities?.accepts(request) !== true
-			&& await this.options.confirmation.confirm(resolvedRequest) !== 'once'
+			&& await abortableStartOperation(this.options.confirmation.confirm(resolvedRequest), signal) !== 'once'
 		) {
 			throw new AgentRuntimeError('TASK_EXECUTION_FAILED', 'The local user denied this task.');
 		}
-		this.throwIfDisposed();
+		this.assertStartActive(signal);
 
-		const host = await this.options.launcher.launch(signal);
-		if (this.disposed) {
+		let host: LaunchedAgentHost;
+		try {
+			host = await this.options.launcher.launch(signal);
+		} catch (error: unknown) {
+			if (request.executionBackend === 'codespace-owned' && error instanceof AgentRuntimeError && error.cleanupFailed) {
+				this.retainFailedStartCleanup({ dispose: () => this.options.launcher.dispose() }, request.taskId);
+			}
+			throw error;
+		}
+		if (this.disposed || signal.aborted) {
 			const cleanupOwner = new DetachedAgentHostCleanup(host, undefined);
 			let cleanup: AgentRuntimeError | undefined;
 			try {
 				await cleanupOwner.dispose();
 			} catch (error) {
-				this.failedStartCleanups.add(cleanupOwner);
+				this.retainFailedStartCleanup(cleanupOwner, request.taskId);
 				cleanup = normalizeRuntimeError(error);
 			}
-			const error = new AgentRuntimeError('AGENT_UNAVAILABLE', 'The production Agent Host runtime was disposed during startup.');
+			const error = new AgentRuntimeError('AGENT_UNAVAILABLE', 'The Agent Host task startup was stopped.');
 			throw cleanup === undefined ? error : combineRuntimeErrors(error, cleanup);
 		}
 		let connection: AhpConnection | undefined;
 		let task: AhpTask | undefined;
 		try {
+			this.claimOwnedContinuation(resolvedRequest, host);
 			try {
 				connection = await this.options.connections.connect(host, signal);
 			} catch (error) {
@@ -370,7 +474,7 @@ export class AhpAgentRuntime implements AgentRuntime {
 					error instanceof UnixSocketWebSocketError ? error : undefined,
 				);
 			}
-			this.throwIfDisposed();
+			this.assertStartActive(signal);
 			const createdTask = new AhpTask(
 				resolvedRequest,
 				host,
@@ -383,12 +487,24 @@ export class AhpAgentRuntime implements AgentRuntime {
 				this.options.subscriptionPumpSettleTimeoutMs ?? subscriptionPumpSettleTimeoutMs,
 				this.options.delegatedToolInvocations,
 				this.options.lifecycleObserver,
+				(identity, chatUri) => {
+					if (host.source === 'codespace-owned' && !this.disposed) {
+						this.retainedOwnedSessions.set(identity.uri, {
+							endpointFingerprint: host.endpointFingerprint!,
+							provider: identity.provider,
+							chatUri,
+							workspaceId: workspace.workspaceId,
+							workspaceIdentity: workspace.workspaceIdentity,
+							workspaceUri: workspace.uri,
+						});
+					}
+				},
 				() => this.tasks.delete(createdTask),
 			);
 			task = createdTask;
 			this.tasks.add(createdTask);
-			await createdTask.start();
-			this.throwIfDisposed();
+			await abortableStartOperation(createdTask.start(), signal);
+			this.assertStartActive(signal);
 			return createdTask;
 		} catch (error) {
 			const primary = normalizeRuntimeError(error);
@@ -397,11 +513,55 @@ export class AhpAgentRuntime implements AgentRuntime {
 			try {
 				await cleanupOwner.dispose();
 			} catch (cleanup) {
-				this.failedStartCleanups.add(cleanupOwner);
+				this.retainFailedStartCleanup(cleanupOwner, request.taskId);
 				cleanupError = normalizeRuntimeError(cleanup);
 			}
 			throw cleanupError === undefined ? primary : combineRuntimeErrors(primary, cleanupError);
 		}
+	}
+
+	private retainFailedStartCleanup(owner: { dispose(): Promise<void> }, taskId: string): void {
+		this.failedStartCleanups.add(owner);
+		this.failedStartCleanupTasks.set(owner, taskId);
+	}
+
+	private assertStartActive(signal: AbortSignal): void {
+		this.throwIfDisposed();
+		if (signal.aborted) {
+			throw new AgentRuntimeError('TASK_EXECUTION_FAILED', 'The Agent Host task startup was cancelled.');
+		}
+	}
+
+	private claimOwnedContinuation(request: ResolvedAgentTaskRequest, host: LaunchedAgentHost): void {
+		if (host.source !== 'codespace-owned') { return; }
+		if (
+			request.executionBackend !== 'codespace-owned'
+			|| request.requireEditor === true
+			|| host.preserveTerminalSession !== true
+			|| !host.endpointFingerprint
+		) {
+			throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'The task requires an explicit retained Codespace-owned backend.');
+		}
+		ahpProtocolPolicyForHost(host);
+		const continuation = request.continuation;
+		if (continuation === undefined) { return; }
+		const retained = this.retainedOwnedSessions.get(continuation.sessionUri);
+		if (
+			retained === undefined
+			|| retained.endpointFingerprint !== host.endpointFingerprint
+			|| retained.chatUri !== continuation.chatUri
+			|| retained.workspaceId !== request.workspace.workspaceId
+			|| retained.workspaceIdentity !== request.workspace.workspaceIdentity
+			|| retained.workspaceUri !== request.workspace.uri
+			|| (request.providerId !== undefined && retained.provider !== request.providerId)
+		) {
+			throw new AgentRuntimeError(
+				'TASK_RECOVERY_UNAVAILABLE',
+				'Continuation requires a completed task in this live owned Host and the same provider, Chat, and workspace identity.',
+			);
+		}
+		// A failed or uncertain continuation is not permission to replay its start.
+		this.retainedOwnedSessions.delete(continuation.sessionUri);
 	}
 
 	private retryFailedStartCleanup(): Promise<void> {
@@ -453,6 +613,7 @@ export class AhpAgentRuntime implements AgentRuntime {
 
 	private async disposeResources(): Promise<void> {
 		this.disposed = true;
+		this.retainedOwnedSessions.clear();
 		for (const start of this.inFlightStarts) {
 			start.controller.abort();
 		}
@@ -480,7 +641,15 @@ export class AhpAgentRuntime implements AgentRuntime {
 			failures,
 		);
 		await collectCleanupFailures([
-			{ label: 'dispose Agent Host launcher', run: () => this.options.launcher.dispose() },
+			{
+				label: 'dispose Agent Host launcher',
+				run: async () => {
+					await this.options.launcher.dispose();
+					for (const task of this.tasks) {
+						task.notifyOwnedHostDisposed();
+					}
+				},
+			},
 		], failures);
 		if (failures.length > 0) {
 			throw cleanupFailure(failures);
@@ -496,6 +665,7 @@ export class AhpAgentRuntime implements AgentRuntime {
 
 export class SdkAhpConnectionFactory implements AhpConnectionFactory {
 	async connect(host: LaunchedAgentHost, signal?: AbortSignal): Promise<AhpConnection> {
+		const protocolPolicy = ahpProtocolPolicyForHost(host);
 		const socket = host.openWebSocket === undefined
 			? await connectWebSocket(host.endpoint, 10_000, signal)
 			: await host.openWebSocket(signal);
@@ -515,7 +685,7 @@ export class SdkAhpConnectionFactory implements AhpConnectionFactory {
 		client.connect();
 		return new SdkAhpConnection(
 			client,
-			ahpProtocolPolicyForHost(host),
+			protocolPolicy,
 			isActionKnownToVersion,
 			() => socket.terminate(),
 		);
@@ -762,6 +932,8 @@ class AhpTask implements AgentTaskHandle {
 	private sessionDefaultChatState: 'unknown' | 'available' | 'cleared' = 'unknown';
 	private sessionDefaultChatRevision = 0;
 	private sessionCreated = false;
+	private pendingSessionCreation: Promise<void> | undefined;
+	private uncertainSessionCreation = false;
 	private hostSessionObserved = false;
 	private lastSeenServerSeq = 0;
 	private terminal = false;
@@ -782,6 +954,7 @@ class AhpTask implements AgentTaskHandle {
 	private defaultChatReject: ((error: Error) => void) | undefined;
 	private cancellationTimer: NodeJS.Timeout | undefined;
 	private exitSubscription: { dispose(): void } | undefined;
+	private hostExited = false;
 	private disposePromise: Promise<void> | undefined;
 	private readonly authenticationInFlight = new WeakMap<AhpConnection, Map<string, AuthenticationInFlight>>();
 	private readonly pendingAuthNotifications = new Set<Promise<void>>();
@@ -837,6 +1010,7 @@ class AhpTask implements AgentTaskHandle {
 		private readonly pumpSettleTimeoutMs: number,
 		private readonly delegatedToolInvocations: DelegatedToolInvocationRegistry | undefined,
 		private readonly lifecycleObserver: AgentRuntimeLifecycleObserver | undefined,
+		private readonly didCompleteRetainedSession: (identity: AgentSessionIdentity, chatUri: string) => void,
 		private readonly didDispose: () => void,
 	) {
 		let resolveTurnTerminalProcessed!: () => void;
@@ -876,7 +1050,10 @@ class AhpTask implements AgentTaskHandle {
 	}
 
 	async start(): Promise<void> {
-		this.exitSubscription = this.host.onExit((error) => this.fail(error));
+		this.exitSubscription = this.host.onExit((error) => {
+			this.hostExited = true;
+			this.fail(error);
+		});
 		const rootSubscription = this.connection.attachSubscription(rootUri);
 		this.subscriptions.set(rootUri, rootSubscription);
 		let initialized: AhpInitializeResult;
@@ -893,6 +1070,9 @@ class AhpTask implements AgentTaskHandle {
 			this.connection.protocolPolicy,
 			initialized.protocolVersion,
 		);
+		if (this.host.source === 'codespace-owned') {
+			requireSelectedAhpProtocol(ahpProtocolPolicyForHost(this.host), this.negotiatedProtocolVersion);
+		}
 		this.lifecycleObserver?.observeLifecycle({
 			taskId: this.request.taskId,
 			eventType: 'protocol/negotiated',
@@ -918,8 +1098,8 @@ class AhpTask implements AgentTaskHandle {
 		this.provider = selectProvider(root.agents, retainedIdentity?.provider ?? this.request.providerId);
 		this.sessionIdentity = retainedIdentity
 			?? createAgentSessionIdentity(this.host.source, this.provider.provider, this.sessionId);
-		if (this.host.source === 'editor') {
-			this.editorSessionPolicy = new EditorSessionPolicy(this.sessionIdentity, this.request.workspace.uri);
+		if (usesFolderSessionPolicy(this.host.source)) {
+			this.editorSessionPolicy = new EditorSessionPolicy(this.sessionIdentity, this.request.workspace.uri, this.host.source);
 		}
 		this.rootTerminals = root.terminals ?? [];
 		this.startSubscription(rootUri, rootSubscription, this.generation);
@@ -933,7 +1113,7 @@ class AhpTask implements AgentTaskHandle {
 		if (continuation === undefined) {
 			const config = await this.resolveConfig();
 			this.throwIfTerminalError();
-			await this.withAuthenticationRetry(
+			const creation = this.withAuthenticationRetry(
 				() => this.connection.createSession({
 					sessionUri: this.sessionUri,
 					provider: this.provider!.provider,
@@ -943,7 +1123,14 @@ class AhpTask implements AgentTaskHandle {
 				}),
 				'challenge',
 			);
-			this.sessionCreated = true;
+			this.pendingSessionCreation = creation;
+			this.uncertainSessionCreation = this.host.source === 'codespace-owned';
+			try {
+				await creation;
+				this.sessionCreated = true;
+			} finally {
+				this.pendingSessionCreation = undefined;
+			}
 			this.throwIfTerminalError();
 		}
 
@@ -1035,7 +1222,7 @@ class AhpTask implements AgentTaskHandle {
 		this.assertWritable();
 		this.clearDelegatedToolInvocations();
 		await this.events.push({ type: 'progress', message: 'Cancellation requested.' });
-		if (this.request.continuation !== undefined) {
+		if (this.request.continuation !== undefined || this.host.source === 'codespace-owned') {
 			await this.cancelContinuedTurn();
 			return;
 		}
@@ -1079,15 +1266,39 @@ class AhpTask implements AgentTaskHandle {
 		return this.disposePromise;
 	}
 
+	public notifyOwnedHostDisposed(): void {
+		if (this.host.source === 'codespace-owned') {
+			this.hostExited = true;
+			// Confirmed process cleanup releases resources, not an authoritative
+			// task cancellation result. Previously published failures stay failed.
+			this.continuationStopFailure = undefined;
+		}
+	}
+
+	public async cancelStartup(): Promise<void> {
+		await this.dispose();
+		if (this.turnId !== undefined && !this.turnEnded) {
+			throw new AgentRuntimeError(
+				'TASK_CANCELLATION_UNCONFIRMED',
+				'The Agent Host did not confirm that the startup turn stopped.',
+			);
+		}
+	}
+
 	private async disposeResources(): Promise<void> {
 		// A retained Session owns prior history; stop only this task's new turn.
-		if (this.request.continuation !== undefined && this.turnId !== undefined && !this.turnEnded) {
+		if (
+			(this.request.continuation !== undefined || this.host.source === 'codespace-owned')
+			&& this.turnId !== undefined
+			&& !this.turnEnded
+			&& !(this.host.source === 'codespace-owned' && this.hostExited)
+		) {
 			try {
 				await this.cancelContinuedTurn();
 			} catch (error: unknown) {
 				this.continuationStopFailure = new AgentRuntimeError(
 					'TASK_CANCELLATION_UNCONFIRMED',
-					'The continued turn could not be confirmed stopped before detaching its client.',
+					'The retained Session turn could not be confirmed stopped before detaching its client.',
 					false,
 					error,
 					true,
@@ -1117,6 +1328,12 @@ class AhpTask implements AgentTaskHandle {
 		}
 		this.unacknowledgedDispatches.clear();
 		this.events.close();
+		// Keep the client attached until an in-flight create settles, so a late
+		// successful mutation is still disposed instead of orphaning its Session.
+		if (this.pendingSessionCreation !== undefined) {
+			this.uncertainSessionCreation = true;
+			await this.pendingSessionCreation.catch(() => undefined);
+		}
 		if (recovery !== undefined) {
 			await runCleanupPhase([{
 				label: 'stop in-flight AHP recovery',
@@ -1139,6 +1356,15 @@ class AhpTask implements AgentTaskHandle {
 				}]);
 			}
 			this.terminalUpdatesSettled = true;
+		}
+		if (this.host.source === 'codespace-owned' && this.hostExited && !this.connectionShutdown) {
+			await runCleanupPhase([{
+				label: 'close exited owned Host connection',
+				run: async () => {
+					await this.shutdownConnection(this.connection);
+					this.connectionShutdown = true;
+				},
+			}]);
 		}
 
 		this.subscriptionCleanup ??= new Map([...this.subscriptions].map(([uri, subscription]) => [
@@ -1211,18 +1437,25 @@ class AhpTask implements AgentTaskHandle {
 		if (!this.sessionDisposed && this.shutdownConnections.has(this.connection)) {
 			this.sessionDisposed = true;
 		}
-		if (!this.sessionCreated) {
+		if (!this.sessionCreated && !this.uncertainSessionCreation) {
 			this.sessionDisposed = true;
 		}
 		if (
 			!this.sessionDisposed
 			&& this.request.continuation === undefined
+			&& !(this.host.source === 'codespace-owned' && this.continuationStopFailure !== undefined)
 			&& !(this.authoritativeTurnTerminal && this.host.preserveTerminalSession === true)
 		) {
 			await runCleanupPhase([{
 				label: 'dispose AHP session',
 				run: async () => {
-					await this.connection.disposeSession(this.sessionUri);
+					try {
+						await this.connection.disposeSession(this.sessionUri);
+					} catch (error: unknown) {
+						if (!this.uncertainSessionCreation || !isRpcResourceNotFound(error)) {
+							throw error;
+						}
+					}
 					this.sessionDisposed = true;
 				},
 			}]);
@@ -1297,22 +1530,31 @@ class AhpTask implements AgentTaskHandle {
 
 	private cancelContinuedTurn(): Promise<void> {
 		if (this.turnEnded) {
-			return withTimeout(this.turnTerminalProcessed, this.cancelTimeoutMs, 'The continued turn did not finish detaching.');
+			return withTimeout(this.turnTerminalProcessed, this.cancelTimeoutMs, 'The retained Session turn did not finish detaching.');
 		}
 		if (this.continuationCancellation === undefined) {
 			if (this.chatUri === undefined) {
-				throw new AgentRuntimeError('TASK_CANCELLATION_UNCONFIRMED', 'The continued turn has no Chat to cancel.');
+				throw new AgentRuntimeError('TASK_CANCELLATION_UNCONFIRMED', 'The retained Session turn has no Chat to cancel.');
 			}
-			const acknowledged = this.dispatchAcknowledged(this.chatUri, {
-				type: 'chat/turnCancelled',
-				turnId: this.currentTurnId(),
-				duration: 0,
-			}, 'The Agent Host did not acknowledge cancellation of the continued turn.');
-			this.continuationCancellation = withTimeout(
-				Promise.all([acknowledged, this.turnTerminalProcessed]).then(() => undefined),
-				this.cancelTimeoutMs,
-				'The Agent Host did not confirm the continued turn stopped.',
-			);
+			this.continuationCancellation = Promise.resolve().then(async () => {
+				const acknowledged = this.dispatchAcknowledged(this.chatUri!, {
+					type: 'chat/turnCancelled',
+					turnId: this.currentTurnId(),
+					duration: 0,
+				}, 'The Agent Host did not acknowledge cancellation of the retained Session turn.');
+				await withTimeout(
+					Promise.all([acknowledged, this.turnTerminalProcessed]).then(() => undefined),
+					this.cancelTimeoutMs,
+					'The Agent Host did not confirm the retained Session turn stopped.',
+				);
+			}).catch((error: unknown) => {
+				throw new AgentRuntimeError(
+					'TASK_CANCELLATION_UNCONFIRMED',
+					'The Agent Host did not confirm the retained Session turn stopped.',
+					false,
+					error,
+				);
+			});
 		}
 		return this.continuationCancellation;
 	}
@@ -1325,6 +1567,7 @@ class AhpTask implements AgentTaskHandle {
 				() => this.connection.resolveSessionConfig(provider.provider, this.request.workspace.uri, config),
 				'challenge',
 			);
+			this.throwIfTerminalError();
 			this.editorSessionPolicy?.assertResolvedConfiguration(resolved.schema, resolved.values);
 			const missing = resolved.schema.required?.filter((id) => resolved.values[id] === undefined) ?? [];
 			if (missing.length === 0) {
@@ -1910,7 +2153,7 @@ class AhpTask implements AgentTaskHandle {
 					scanSignal,
 				),
 				this.terminalMaterializationTimeoutMs,
-				'The editor Agent Host did not materialize the terminal Session.',
+				'The retained Agent Host did not materialize the terminal Session.',
 				this.terminalPreparationAbort.signal,
 			);
 		}
@@ -1954,14 +2197,17 @@ class AhpTask implements AgentTaskHandle {
 			const snapshot = await withAbortableTimeout(
 				(signal) => abortableConfigurationResolution(connection.readSessionSnapshot(this.sessionUri), signal),
 				actionAcknowledgementTimeoutMs,
-				'The editor Agent Session workspace policy could not be refreshed.',
+				'The retained Agent Session workspace policy could not be refreshed.',
 				this.terminalPreparationAbort.signal,
 			);
 			if (this.sessionPolicyFailure !== undefined) {
 				throw this.sessionPolicyFailure;
 			}
 			if (snapshot?.resource !== this.sessionUri) {
-				throw new EditorSessionPolicyError();
+				throw new EditorSessionPolicyError(
+					'resource',
+					this.host.source === 'codespace-owned' ? 'codespace-owned' : 'editor',
+				);
 			}
 			this.assertContinuationSessionSnapshot(snapshot);
 			policy.acceptSnapshot(snapshot);
@@ -2139,6 +2385,9 @@ class AhpTask implements AgentTaskHandle {
 			if (terminal) {
 				this.terminal = true;
 				this.authoritativeTurnTerminal = authoritativeTurnTerminal;
+				if (event.type === 'completed' && authoritativeTurnTerminal && this.host.preserveTerminalSession === true) {
+					this.didCompleteRetainedSession(this.sessionIdentity!, this.chatUri!);
+				}
 				await this.events.pushAndClose(event);
 				this.finishTerminal();
 				return;
@@ -3104,12 +3353,12 @@ function retainedSessionIdentity(
 		? /^([a-z][a-z0-9+.-]*):\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.exec(sessionUri)
 		: null;
 	if (
-		host.source !== 'editor'
+		!usesFolderSessionPolicy(host.source)
 		|| host.preserveTerminalSession !== true
 		|| match === null
 		|| (providerId !== undefined && providerId !== match[1])
 	) {
-		throw new AgentRuntimeError('TASK_RECOVERY_UNAVAILABLE', 'The task requires its retained native editor Session.');
+		throw new AgentRuntimeError('TASK_RECOVERY_UNAVAILABLE', 'The task requires its retained provider-scoped Session.');
 	}
 	return { provider: match[1], uri: sessionUri };
 }
@@ -3532,6 +3781,17 @@ function connectWebSocket(endpoint: URL, timeoutMs: number, signal?: AbortSignal
 		socket.addEventListener('close', handleClose);
 		signal?.addEventListener('abort', handleAbort, { once: true });
 	});
+}
+
+async function abortableStartOperation<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+	try {
+		return await abortableConfigurationResolution(promise, signal);
+	} catch (error: unknown) {
+		if (error instanceof RecoveryStoppedCause && signal.aborted) {
+			throw new AgentRuntimeError('TASK_EXECUTION_FAILED', 'The Agent Host task startup was cancelled.');
+		}
+		throw error;
+	}
 }
 
 function throwIfAborted(signal?: AbortSignal): void {

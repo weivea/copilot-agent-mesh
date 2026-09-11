@@ -50,7 +50,9 @@ test('native toolbar shows the connection switch first and reserves color for th
 	}).parse(readJson('package.json'));
 	const actions = manifest.contributes.menus['view/title'];
 	assert.equal(actions.some((action) => action.command === 'copilotAgentMesh.configureDevice'), false);
-	assert.deepEqual(actions.map((action) => action.group), ['navigation@1', 'navigation@1', 'navigation@2', 'navigation@9']);
+	assert.deepEqual(actions.map((action) => action.group), ['navigation@1', 'navigation@1', 'navigation@2', 'navigation@3', 'navigation@9']);
+	assert.equal(actions[3].command, 'copilotAgentMesh.codespaces.setup');
+	assert.match(actions[3].when, /remoteName == codespaces && !isWeb/u);
 	assert.equal(actions[0].command, 'copilotAgentMesh.startListener');
 	assert.equal(actions[1].command, 'copilotAgentMesh.stopListener');
 	assert.match(actions[0].when, /!copilotAgentMesh\.connectionsOnline/u);

@@ -150,6 +150,7 @@ export class BrokerTaskService {
 	private readonly taskQueues = new Map<string, Promise<void>>();
 	private readonly operations = new Set<Promise<unknown>>();
 	private readonly startDispatches = new Map<string, Promise<void>>();
+	private readonly startAdmissions = new Map<string, { dispatched: boolean; cancelled: boolean }>();
 	private readonly cancellationTimers = new Map<string, NodeJS.Timeout>();
 	private readonly workerDeadlineTimers = new Map<string, NodeJS.Timeout>();
 	private readonly backgroundFailures: Error[] = [];
@@ -571,7 +572,9 @@ export class BrokerTaskService {
 			workspaceLeaseKey: route.workspaceLeaseKey,
 			delegatedExecutionContext: route.delegatedExecutionContext,
 			session: route.session,
-			...(continuation !== undefined || (sourceNode === undefined && this.options.requiresEditorForRemote?.())
+			...(route.executionBackend === undefined ? {} : { executionBackend: route.executionBackend }),
+			...(route.executionBackend !== 'codespace-owned'
+				&& (continuation !== undefined || (sourceNode === undefined && this.options.requiresEditorForRemote?.()))
 				? { requireEditor: true as const } : {}),
 		};
 		const request: OwnedRoutedTaskStart = {
@@ -599,6 +602,7 @@ export class BrokerTaskService {
 			if (!result.created) {
 				return this.snapshot(result.record);
 			}
+			this.startAdmissions.set(taskKey(ownerId, params.taskId), { dispatched: false, cancelled: false });
 			this.scheduleWorkerDeadline(ownerId, params.taskId, params.workerDeadline);
 			await this.publishAcceptedStart(record, startRequested);
 			return {
@@ -607,6 +611,7 @@ export class BrokerTaskService {
 				...(continuation === undefined ? {} : { continuation: continuation.descriptor }),
 			};
 		} catch (error: unknown) {
+			this.startAdmissions.delete(taskKey(ownerId, params.taskId));
 			if (!persisted) {
 				this.registry.releaseTaskRoute(ownerId, params.taskId);
 				throw error;
@@ -653,6 +658,10 @@ export class BrokerTaskService {
 		}).finally(() => {
 			if (this.startDispatches.get(key) === tracked) {
 				this.startDispatches.delete(key);
+				const admission = this.startAdmissions.get(key);
+				if (admission?.cancelled !== true || admission.dispatched) {
+					this.startAdmissions.delete(key);
+				}
 			}
 		});
 		this.startDispatches.set(key, tracked);
@@ -686,6 +695,16 @@ export class BrokerTaskService {
 					);
 				}
 			}
+			const admission = this.startAdmissions.get(taskKey(ownerId, params.taskId));
+			if (admission === undefined) {
+				throw new MeshDomainError('TASK_RECOVERY_UNAVAILABLE', 'The task start admission is no longer current.');
+			}
+			if (admission.cancelled) {
+				return;
+			}
+			this.assertWorkerDeadline(params.workerDeadline);
+			// No await may separate this marker from enqueueing the RPC: cancellation uses it as no-dispatch proof.
+			admission.dispatched = true;
 			const rawResult = await route.session.request(
 				LOCAL_BROKER_METHODS.taskStart,
 				toJsonValue({
@@ -693,6 +712,7 @@ export class BrokerTaskService {
 					...(continuation === undefined ? {} : { continuation }),
 					authenticatedOwnerId: ownerId,
 					...(route.requireEditor ? { requireEditor: true } : {}),
+					...(route.executionBackend === undefined ? {} : { executionBackend: route.executionBackend }),
 					...(remoteTaskApproval === undefined ? {} : { remoteTaskApproval }),
 					sourceLabel: sourceLabel ?? params.sourceNodeId ?? ownerId,
 					delegationGrant: createDelegationGrant({
@@ -701,9 +721,7 @@ export class BrokerTaskService {
 						targetNodeInstanceId: route.nodeInstanceId,
 						workspaceIdentity: route.workspaceLeaseKey,
 						requestHash: canonicalRoutedTaskRequestHash({
-							...params,
-							peerId: ownerId,
-							workspaceLeaseKey: route.workspaceLeaseKey,
+							...params, peerId: ownerId, workspaceLeaseKey: route.workspaceLeaseKey,
 						}),
 					}),
 					delegatedExecutionContext: route.delegatedExecutionContext,
@@ -947,6 +965,11 @@ export class BrokerTaskService {
 				return { record, route: undefined };
 			}
 			const route = await this.requireLiveRoute(record);
+			const admission = this.startAdmissions.get(taskKey(ownerId, taskId));
+			const preventDispatch = admission !== undefined && !admission.dispatched;
+			if (preventDispatch) {
+				admission.cancelled = true;
+			}
 			const cancellationDeadline = new Date(
 				this.clock.now().valueOf() + this.cancellationDeadlineMs,
 			).toISOString();
@@ -955,6 +978,12 @@ export class BrokerTaskService {
 				at: this.now(),
 				cancellationDeadline,
 			});
+			if (preventDispatch) {
+				const cancelled = await this.persistEvent(ownerId, taskId, {
+					type: 'cancelConfirmed', at: this.now(), summary: 'Cancelled before dispatch to the target Window Node.',
+				});
+				return { record: cancelled, route: undefined };
+			}
 			this.scheduleCancellationDeadline(ownerId, taskId, cancellationDeadline);
 			return { record: updated, route };
 		});
@@ -1182,6 +1211,9 @@ export class BrokerTaskService {
 		const before = await this.store.getOwned(ownerId, taskId);
 		const record = await this.store.transitionOwned(ownerId, taskId, event);
 		this.rememberDashboardRecord(record);
+		if (terminalStates.has(record.state)) {
+			this.startAdmissions.delete(taskKey(ownerId, taskId));
+		}
 		if (before?.eventSeq === record.eventSeq) {
 			if (terminalStates.has(record.state)) {
 				this.clearCancellationDeadline(ownerId, taskId);

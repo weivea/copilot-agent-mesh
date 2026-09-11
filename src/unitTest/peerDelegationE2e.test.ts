@@ -869,7 +869,7 @@ test('peer-delegation Tool clock shortens only minute-scale budget timers', () =
 	assert.equal(clock.snapshot().timersDisposed, 2);
 });
 
-test('0.5.0 enables local peer discovery without enabling real-turn harnesses', () => {
+test('0.5.4 enables local peer discovery without enabling real-turn harnesses', () => {
 	const root = resolve('.');
 	const manifest = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8'));
 	const wrapper = readFileSync(
@@ -892,7 +892,7 @@ test('0.5.0 enables local peer discovery without enabling real-turn harnesses', 
 		resolve(root, 'src/composition/ProductionBrokerRuntime.ts'),
 		'utf8',
 	);
-	assert.equal(manifest.version, '0.5.0');
+	assert.equal(manifest.version, '0.5.4');
 	assert.equal(
 		manifest.scripts['test:peer-delegation-real'],
 		'node scripts/e2e/peer-delegation/run.mjs',
@@ -907,7 +907,7 @@ test('0.5.0 enables local peer discovery without enabling real-turn harnesses', 
 		].default,
 		true,
 	);
-	assert.match(manifest.scripts['package:vsix'], /copilot-agent-mesh-0\.5\.0-preview\.vsix/u);
+	assert.match(manifest.scripts['package:vsix'], /copilot-agent-mesh-0\.5\.4-preview\.vsix/u);
 	assert.doesNotMatch(JSON.stringify(manifest.scripts), /0\.3\.0-preview\.vsix/u);
 	assert.ok(
 		wrapper.indexOf(`process.env[environmentVariable] !== '1'`)
@@ -987,36 +987,38 @@ test('0.5.0 enables local peer discovery without enabling real-turn harnesses', 
 	assert.match(validator, /status\.length !== 0/u);
 });
 
-test('0.5.0 evidence records supported Windows hardware without upgrading historical evidence', () => {
+test('0.5.x evidence records supported Windows hardware without upgrading historical evidence', () => {
 	const historical = unverifiedEvidence();
 	assert.equal(parsePeerDelegationEvidence(historical).platform.os, 'darwin');
-	for (const architecture of ['x64', 'arm64'] as const) {
-		const current = {
-			...historical,
-			release: '0.5.0-preview',
-			versions: { ...historical.versions, extension: '0.5.0' },
-			platform: { os: 'win32', architecture },
-		};
-		assert.equal(parsePeerDelegationEvidence(current).outcome, 'unverified');
-		assert.throws(() => assertPassingPeerDelegationEvidence(current));
-		assert.throws(() => parsePeerDelegationEvidence({
-			...historical, platform: current.platform,
-		}));
-		assert.throws(() => parsePeerDelegationEvidence({
-			...current, versions: historical.versions,
-		}));
-	}
-	for (const platform of [
-		{ os: 'linux', architecture: 'x64' },
-		{ os: 'darwin', architecture: 'x64' },
-		{ os: 'win32', architecture: 'ia32' },
-	]) {
-		assert.throws(() => parsePeerDelegationEvidence({
-			...historical,
-			release: '0.5.0-preview',
-			versions: { ...historical.versions, extension: '0.5.0' },
-			platform,
-		}));
+	for (const extension of ['0.5.0', '0.5.1', '0.5.2', '0.5.3', '0.5.4']) {
+		for (const architecture of ['x64', 'arm64'] as const) {
+			const current = {
+				...historical,
+				release: `${extension}-preview`,
+				versions: { ...historical.versions, extension },
+				platform: { os: 'win32', architecture },
+			};
+			assert.equal(parsePeerDelegationEvidence(current).outcome, 'unverified');
+			assert.throws(() => assertPassingPeerDelegationEvidence(current));
+			assert.throws(() => parsePeerDelegationEvidence({
+				...historical, platform: current.platform,
+			}));
+			assert.throws(() => parsePeerDelegationEvidence({
+				...current, versions: historical.versions,
+			}));
+		}
+		for (const platform of [
+			{ os: 'linux', architecture: 'x64' },
+			{ os: 'darwin', architecture: 'x64' },
+			{ os: 'win32', architecture: 'ia32' },
+		]) {
+			assert.throws(() => parsePeerDelegationEvidence({
+				...historical,
+				release: `${extension}-preview`,
+				versions: { ...historical.versions, extension },
+				platform,
+			}));
+		}
 	}
 });
 

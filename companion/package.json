@@ -1,0 +1,71 @@
+{
+  "name": "copilot-agent-mesh-codespaces",
+  "displayName": "Copilot Agent Mesh - Codespaces",
+  "description": "Workspace-side execution companion for desktop Copilot Agent Mesh.",
+  "publisher": "weivea",
+  "version": "0.5.4",
+  "preview": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/weivea/copilot-agent-mesh.git"
+  },
+  "engines": {
+    "vscode": "^1.103.0"
+  },
+  "extensionKind": [
+    "workspace"
+  ],
+  "api": "none",
+  "main": "./dist/extension.js",
+  "l10n": "./l10n",
+  "activationEvents": [
+    "onCommand:copilotAgentMesh.codespaces.connect",
+    "onCommand:copilotAgentMesh.codespaces.prepareRuntime"
+  ],
+  "files": [
+    "dist/**",
+    "l10n/**",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Mesh execution requires a trusted Codespace."
+    },
+    "virtualWorkspaces": {
+      "supported": false,
+      "description": "Mesh execution requires the Codespace filesystem."
+    }
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "copilotAgentMesh.codespaces.prepareRuntime",
+        "title": "Prepare Codespaces Execution Runtime",
+        "category": "Copilot Agent Mesh"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "copilotAgentMesh.codespaces.prepareRuntime",
+          "when": "remoteName == codespaces && !isWeb"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Copilot Agent Mesh - Codespaces",
+      "properties": {
+        "copilotAgentMesh.codespaces.codePath": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "markdownDescription": "Optional absolute path to a native Linux VS Code CLI inside this Codespace. Leave empty to use the explicitly installed Mesh runtime. The remote terminal's `code` wrapper is not supported."
+        }
+      }
+    }
+  }
+}
