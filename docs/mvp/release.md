@@ -1,6 +1,6 @@
 # Preview release engineering
 
-> Version: `0.5.4` Preview
+> Version: `0.5.5` Preview
 > Gate status: historical G0 Go; Peer Window Delegation requires its own real evidence gate
 
 This document describes a reproducible evaluation package. It does not authorize
@@ -71,8 +71,8 @@ npm run verify
 The package command creates:
 
 ```text
-artifacts/copilot-agent-mesh-0.5.4-preview.vsix
-artifacts/copilot-agent-mesh-codespaces-0.5.4-preview.vsix
+artifacts/copilot-agent-mesh-0.5.5-preview.vsix
+artifacts/copilot-agent-mesh-codespaces-0.5.5-preview.vsix
 ```
 
 The production bundle is separate from VSIX creation:
@@ -98,14 +98,14 @@ Inspect and hash the result independently:
 
 ```sh
 npx vsce ls --no-dependencies
-unzip -Z1 artifacts/copilot-agent-mesh-0.5.4-preview.vsix
-shasum -a 256 artifacts/copilot-agent-mesh-0.5.4-preview.vsix
+unzip -Z1 artifacts/copilot-agent-mesh-0.5.5-preview.vsix
+shasum -a 256 artifacts/copilot-agent-mesh-0.5.5-preview.vsix
 ```
 
 On Windows, install the same universal VSIX from PowerShell:
 
 ```powershell
-code --install-extension ".\artifacts\copilot-agent-mesh-0.5.4-preview.vsix" --force
+code --install-extension ".\artifacts\copilot-agent-mesh-0.5.5-preview.vsix" --force
 ```
 
 Local discovery, policy controls, and Mesh tools are enabled by default.
@@ -121,6 +121,33 @@ compatible. Runtime setup does not execute a task or change Workspace grants.
 The companion uses a fixed GitHub protected-resource mapping for
 `https://api.github.com` (`github`, `read:user`, `user:email`); user-configured exact
 mappings take precedence and other resources fail closed.
+
+The 0.5.5 companion requires desktop VS Code 1.137+. For the native Chat/Sessions
+POC, fully quit desktop VS Code and launch it explicitly:
+
+```powershell
+code --enable-proposed-api weivea.copilot-agent-mesh-codespaces
+```
+
+Reconnect to the Codespace. The companion alone declares `chatSessionsProvider`
+and `chatParticipantPrivate`; the main UI extension does not acquire proposed
+API privileges. This companion is for private VSIX evaluation, not normal
+Marketplace publication. Setup does not silently modify desktop runtime
+arguments. Without opt-in, the Mesh execution channel still works.
+
+Run `npm run test:native-chat` for the isolated native renderer/restart-history
+gate; optionally set `VSCODE_EXECUTABLE_PATH` to a desktop installation. The
+harness explicitly enables proposals only in temporary profiles, uses synthetic
+task events rather than a model, and writes a scoped JSON artifact. It does not
+replace live Codespace acceptance. Native free-form target input remains
+read-only; source input/continuation tools and target Mesh cancellation preserve the
+existing authorization/execution route.
+
+To smoke-test both installed packages rather than only the desktop extension,
+set `MESH_SMOKE_COMPANION_VSIX` to the exact companion VSIX path before running
+`npm run smoke:vsix`. Both are installed only into the harness's temporary
+profile; local companion activation must report `unsupportedEnvironment`
+without starting a Codespace runtime.
 
 The UI extension and companion must have matching extension versions and bridge
 protocol versions. Both VSIXs are emitted by `package:vsix`; the separate

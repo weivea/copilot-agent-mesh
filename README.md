@@ -1,6 +1,6 @@
 # Copilot Agent Mesh
 
-Copilot Agent Mesh 0.5.4 Preview provides **Peer Window Delegation** for ordinary
+Copilot Agent Mesh 0.5.5 Preview provides **Peer Window Delegation** for ordinary
 VS Code windows on Windows x64/ARM64 and macOS arm64. Local discovery, task tools,
 window naming, and policy controls are enabled by default. In Agent mode, Copilot can use
 six Mesh tools to discover an explicitly authorized peer window, delegate tasks,
@@ -46,8 +46,20 @@ authorize target Workspaces and incoming tasks as usual. No public Codespace
 port, additional Dev Tunnel, PAT setting, or shell login is required.
 Unknown Agent protected resources still require an explicit provider mapping.
 Mesh-owned sessions support continuation within the same live execution
-generation; they do not promise native Chat history visibility or recovery after
-Host replacement. Live Codespace qualification remains a separate release gate.
+generation. The **0.5.5 native Chat POC** adds target-side streaming in the
+native Chat editor and retained entries in Sessions, without another model call.
+It requires VS Code 1.137+ and explicit desktop opt-in: fully quit VS Code,
+launch `code --enable-proposed-api weivea.copilot-agent-mesh-codespaces`, then
+reconnect. **Native Codespaces Chat Setup (POC)** provides the instructions
+without changing your runtime arguments.
+
+Native conversation input is read-only in this POC; continue through the source
+Mesh tools, including `#meshAnswerTask` for questions. The target-side Mesh cancel button uses the existing task channel,
+and closing Chat does not cancel execution. History survives a window restart,
+not necessarily deletion/rebuilding of the Codespace, and is not permission to
+replay after Host replacement. This proposed-API companion is for private VSIX
+evaluation, not normal Marketplace publishing. Actual cloud/UI qualification
+remains distinct from the isolated native UI harness.
 
 The Codespace connection account, Mesh Dev Tunnel account, and Copilot execution
 account may differ. Installing the runtime does not require a shared account.
@@ -57,7 +69,7 @@ distinguishes an undetected libc version from a confirmed unsupported platform.
 
 ## Preview prerequisites and limitations
 
-- VS Code 1.103 or newer is required.
+- Local desktop windows require VS Code 1.103 or newer; the Codespaces companion and native Chat POC require 1.137 or newer.
 - Real Worker execution is experimental, requires Workspace/task authorization, and may consume Copilot quota.
 - The Agent Host connects on demand for an authorized task. There is no separate runtime feature switch; merely enabling connections or opening the Dashboard does not start an Agent task.
 - Same-device discovery and policy controls work without an extra settings step.
@@ -328,7 +340,7 @@ initialization; do not delete policy or revocation files to force a downgrade.
 git submodule update --init --recursive
 npm ci
 npm run package:vsix
-code --install-extension artifacts/copilot-agent-mesh-0.5.4-preview.vsix
+code --install-extension artifacts/copilot-agent-mesh-0.5.5-preview.vsix
 ```
 
 Project documents:

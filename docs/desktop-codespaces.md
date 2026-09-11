@@ -7,8 +7,12 @@ six existing Mesh tools, target handles, `wait`/`submit`, task ownership,
 idempotency, input/answer, cancellation, and `continueFromTaskId`. Local desktop
 workspaces keep their existing editor-first execution path.
 
-This feature does not borrow the Codespace window's native Agent Host or promise
-that Mesh sessions appear in its native Chat Sessions list. It does not create,
+Starting with **0.5.5 Preview**, an explicitly enabled POC projects these
+Mesh-owned tasks into the target window's **native Chat editor and Sessions**.
+It preserves real execution, tool progress, input state and retained history;
+it does not replace the working execution route or invoke another model.
+
+This feature still does not borrow the Codespace window's native Agent Host. It does not create,
 start, or keep a Codespace alive, support browser clients, or automatically resume
 execution after a Host/extension-instance replacement. A lost execution
 generation is not permission to submit the same work again.
@@ -22,6 +26,10 @@ flowchart LR
     node <-->|VS Code command RPC| helper[Codespace companion extension]
     helper --> host[Mesh-owned AHP Host]
     host --> workspace[Codespace workspace and tools]
+    helper --> observer[Single execution observer]
+    observer --> history[Private durable transcript store]
+    history --> provider[Proposed native session provider]
+    provider --> chat[Native Chat editor and Sessions]
 ```
 
 The main extension remains a UI extension. A separately identified workspace
@@ -143,6 +151,137 @@ previous task's exact Session/Chat, and require:
 Host replacement invalidates retained identities. Never reopen an unrelated
 session, replay an uncertain start, or substitute a new Session for continuation.
 
+## Native Chat and Sessions POC
+
+### Decision and compatibility
+
+The owned Host is retained because Codespaces execution already works through
+the six Mesh tools. UI parity is an additional presentation adapter, not a
+migration to an undocumented Server socket. The workspace companion contributes
+the distinct `agent-mesh-codespaces` session type and a Mesh participant; it never
+impersonates the built-in Copilot provider or writes to Copilot's private database.
+
+The POC targets desktop **VS Code 1.137+**, with its API contract pinned to
+`645f29cc3176500b4b5762ba887cf2a7f0ffdf2c` (1.137.0):
+
+- [`chatSessionsProvider`](https://github.com/microsoft/vscode/blob/645f29cc3176500b4b5762ba887cf2a7f0ffdf2c/src/vscode-dts/vscode.proposed.chatSessionsProvider.d.ts)
+  provides the native item provider, content provider, commit event and active response.
+- [`chatParticipantPrivate`](https://github.com/microsoft/vscode/blob/645f29cc3176500b4b5762ba887cf2a7f0ffdf2c/src/vscode-dts/vscode.proposed.chatParticipantPrivate.d.ts)
+  provides constructible request/response history turns.
+- The pinned native workbench `openSessionInEditorGroup` action opens the Chat
+  editor without submitting a prompt. This action and the proposed interfaces
+  are experimental dependencies, not a stable Marketplace API contract.
+
+This is a **private VSIX POC**. Do not publish the proposed-API companion as a
+normal Marketplace extension. Later VS Code builds require renewed UI checks.
+Ordinary local windows retain their existing editor-backed path and do not
+require these proposed APIs.
+
+The live UI check found that updating a modern item controller does **not**
+refresh a completed Chat model when a source tool starts another turn. The POC
+therefore uses the proposal's older item-provider/commit event: each turn has an
+opaque view-revision URI, and VS Code replaces the exact old editor with the new
+projection in place. Only one latest item is listed; the durable conversation,
+workspace binding and AHP Session/Chat remain the same. Older view URIs identify
+their historical prefixes, not separate model sessions. This deprecated API is
+an explicit POC dependency; native archive/pin state belongs to VS Code and the
+view revision exposes the preceding resource for state migration.
+
+### Explicit enablement
+
+Install the matching 0.5.5 packages and run the normal Codespaces runtime setup.
+Then **fully quit desktop VS Code**, launch from a desktop terminal, and
+reconnect to the Codespace:
+
+```powershell
+code --enable-proposed-api weivea.copilot-agent-mesh-codespaces
+```
+
+Reloading a window alone does not grant new proposed-API permissions to an
+already-running desktop process. For persistent opt-in, use **Preferences:
+Configure Runtime Arguments**, merge the companion ID into the existing array,
+and restart:
+
+```json
+{
+  "enable-proposed-api": ["weivea.copilot-agent-mesh-codespaces"]
+}
+```
+
+Do not overwrite other runtime arguments or existing extension IDs. **Copilot
+Agent Mesh: Native Codespaces Chat Setup (POC)** reports the activation state
+and can copy the launch command or open the runtime arguments; it never edits
+them, signs in, grants workspace access, or starts a task.
+
+`copilotAgentMesh.codespaces.nativeChat.enabled` defaults to `true` but only
+operates when VS Code grants the proposed APIs; set it to `false` and reload to
+opt out. `codespaces.nativeChat.autoOpen` defaults to `true`; set it to `false`
+to keep incoming tasks in Sessions without stealing focus. **Open Codespaces
+Session** also opens retained history. Missing permissions leave the existing
+Mesh execution route available and report native UI as unavailable.
+
+### Execution, controls and persistence
+
+The adapter observes the actual authorized runtime start and the executor's
+single event consumer. It preserves local Markdown/paths in text output rather
+than reusing the flattened, bounded cross-device result summary. Tool/terminal
+progress and pending questions come from the existing task event channel.
+Completion/cancellation status is recorded only after its event is acknowledged
+by the Broker. Opening or reopening a view reads the transcript; it never starts
+or replays a task.
+
+Each first task creates one durable session record. A valid tool continuation
+appends a new turn to the same record, bound to the same workspace, live helper
+generation and exact AHP Session/Chat. The native conversation input is
+**read-only in this POC**: use `continueFromTaskId` in the original source window
+to continue. This avoids bypassing ownership, grants and workspace leases with
+an independent Chat-triggered execution.
+
+The target's **Cancel Mesh task** button addresses the existing executor and
+revalidates the current task/generation after confirmation. Pending questions
+are displayed in Chat but answered through **#meshAnswerTask in the source
+window**: directly answering at the target would bypass the Broker's
+source-owned input-state transition. The executor observes accepted source
+answers before releasing subsequent output/queued questions, so the saved
+transcript stays ordered. Native Chat's
+active-response cancellation token is also cancelled when VS Code releases the
+view, so it **only detaches observation**; it must never cancel the underlying
+task. Use the explicit Mesh button to stop execution.
+
+History lives in the companion's private `chat-history` directory under its
+global storage, separate from temporary Host user-data. Files use an atomic
+per-session format, owner-only permissions where supported, validated IDs and
+schema/size checks. The initial limits are 100 sessions, 2 MiB per session,
+100 turns per session and 4096 entries per turn. Output truncation is visible;
+session/turn capacity errors are explicit rather than silently deleting history.
+Native archive state persists in VS Code without cancelling work.
+
+An ownership-validated exclusive root lock covers read/mutate/atomic publication,
+including session-count admission across extension-host processes. Contention
+is bounded at five seconds. Locks are never stolen or removed on an assumption
+that their writer died: an abandoned lock leaves existing history readable but
+subsequent writes fail explicitly with `STORAGE_LOCKED`. Storage repair requires
+confirming that no writer is active; normal activation does not delete lock data.
+
+Registered secrets and credential-bearing text are redacted before storage.
+Output is buffered across line/chunk boundaries to avoid persisting split
+credentials; oversized individual text is explicitly omitted. Input answers
+are represented by a generic acknowledgement, not stored credential values.
+Session/task labels contain no capabilities or authentication objects.
+
+Reload/restart can restore readable history while the Codespace and its private
+storage still exist. A stopped/replaced Host is not automatically resumable:
+detached history is labelled as such, and clean generation shutdown marks
+unfinished turns interrupted, never successfully completed. Deleting/rebuilding
+the Codespace may remove this local archive; cross-Codespace/cloud backup is
+not included. UI/storage failures are explicitly reported and do not rewrite
+the authoritative result of a Mesh task already acknowledged by the Broker.
+
+The POC does not reproduce every built-in Copilot surface: free-form target
+follow-ups, model picking, native edit-review cards/checkpoints and built-in
+Stop semantics are not claimed. The first parity target is the real running
+conversation and retained native Sessions, not a custom Webview.
+
 Folder isolation and authoritative provider/workspace snapshot checks apply to
 both borrowed editor and retained owned Sessions. Resolve configuration from the
 actual provider schema and fail if `folder` cannot be honored. Negotiate only
@@ -260,6 +399,7 @@ closure is not an unattended execution feature.
 | `src/node/WindowNodeClient.ts` | Remote executor lifecycle and workspace adapter integration. |
 | `src/broker/`, `shared/protocol/nodes.ts` | Target-selected backend policy and existing authorization boundaries. |
 | `src/agentHost/` | Retained owned Host leases, continuation, folder policy, and protocol negotiation. |
+| `src/codespaces/nativeChat/` | Proposed native Sessions provider, actual-execution observation, safe controls and durable target-local transcript catalog. |
 | `src/ui/`, `media/` | Honest remote runtime status and setup actions. |
 | `companion/`, build/package scripts | A workspace-only companion VSIX alongside the UI extension. |
 
@@ -271,6 +411,17 @@ all six tools' unchanged contracts, one-to-many submit/wait, continuation,
 idempotency conflicts, wrong capabilities/generations/workspaces, policy denial,
 input/answer, cancellation, bounded event delivery, lease expiry, shutdown, and
 packaged entry points. Existing local editor behavior must remain intact.
+
+`npm run test:native-chat` starts isolated desktop profiles with the companion's
+proposals explicitly enabled, opens the actual native Chat editor, checks
+rendered streamed content through the local renderer, closes/reopens the view,
+and restarts VS Code against the same transcript store. This harness uses
+synthetic task events and does not authenticate or run a model. It is separate
+from an actual Codespace deployment test; its evidence must not be relabelled as
+a cloud/model acceptance result.
+Native cancellation dispatch tests inject only the confirmation decision because
+VS Code's Extension Host test mode deliberately refuses modal prompts; the
+production service still uses the native modal confirmation.
 
 Real Codespaces qualification additionally records the exact desktop/server/CLI
 versions, Linux architecture, native account authorization, a real remote task

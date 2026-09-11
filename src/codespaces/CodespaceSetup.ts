@@ -11,6 +11,7 @@ import {
 	codespacePreparedSchema,
 	CodespacePreparationError,
 } from './CodespaceSetupProtocol';
+import { NATIVE_CHAT_HELP_COMMAND, NATIVE_CHAT_STATUS_COMMAND, nativeChatStatusSchema } from './nativeChat/NativeChatApi';
 
 export function registerCodespaceSetup(
 	api: typeof vscode,
@@ -68,6 +69,18 @@ export function registerCodespaceSetup(
 				}
 				if (prepared.error !== undefined) {
 					throw new CodespacePreparationError(prepared.error.code);
+				}
+				return;
+			}
+			stage = api.l10n.t('checking native Chat setup');
+			const nativeChat = nativeChatStatusSchema.parse(await api.commands.executeCommand(NATIVE_CHAT_STATUS_COMMAND));
+			if (nativeChat.state !== 'enabled') {
+				const help = api.l10n.t('Native Chat setup');
+				if (await api.window.showInformationMessage(
+					api.l10n.t('The execution runtime is ready. Native Chat POC is not enabled ({0}); it requires explicit desktop proposed-API setup.', nativeChat.state),
+					help,
+				) === help) {
+					await api.commands.executeCommand(NATIVE_CHAT_HELP_COMMAND);
 				}
 				return;
 			}

@@ -13,7 +13,29 @@ Preparing the runtime does not start an Agent task or grant workspace access.
 Use the same six Mesh tools, Workspace permissions, and incoming-task controls as
 for other windows. Tasks run in the Codespace filesystem. Completed task sessions
 can be continued on the same live execution generation; they are Mesh-owned
-sessions, not the window's native Chat history.
+sessions, not the window's built-in Copilot Host sessions.
+
+**0.5.5 native Chat POC:** the companion requires desktop VS Code 1.137 or newer.
+Fully quit desktop VS Code, launch it with
+`code --enable-proposed-api weivea.copilot-agent-mesh-codespaces`, and reconnect.
+The explicitly enabled `chatSessionsProvider` and `chatParticipantPrivate`
+proposals put real incoming Mesh tasks in the native **Chat editor and Sessions**.
+**Native Codespaces Chat Setup (POC)** explains the opt-in without editing your
+desktop runtime arguments.
+
+Incoming tasks open automatically; disable
+`copilotAgentMesh.codespaces.nativeChat.autoOpen` to keep Sessions without
+taking focus. Native Chat is a read-only task transcript in this POC, with
+an explicit **Cancel Mesh task** control. Answer questions with **#meshAnswerTask**
+and continue completed sessions through the original source's Mesh tools. Closing Chat only
+detaches observation; it does not cancel work.
+
+Bounded, redacted history is saved separately from temporary Host data and
+reopens after window reload/restart. Saved history does not make a stopped
+runtime resumable. UI/history errors are visible and leave the existing Mesh
+execution channel authoritative. Without proposed-API permissions the tool
+workflow still works, but native Chat is unavailable. This is a private VSIX
+POC, not a stable Marketplace integration.
 
 The companion obtains Agent authentication through VS Code's native account
 provider. It does not read shell credentials or another Agent Host's tokens.

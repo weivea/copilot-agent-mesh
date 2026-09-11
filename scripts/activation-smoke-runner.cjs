@@ -1,5 +1,5 @@
 const assert = require('node:assert/strict');
-const { access } = require('node:fs/promises');
+const { access, readFile } = require('node:fs/promises');
 const path = require('node:path');
 const vscode = require('vscode');
 
@@ -26,6 +26,23 @@ async function run() {
 	await extension.activate();
 	assert.equal(extension.isActive, true);
 	console.log(`Activated installed Preview extension from ${extension.extensionPath}`);
+	if (process.env.MESH_SMOKE_COMPANION_VERSION) {
+		const companion = vscode.extensions.getExtension('weivea.copilot-agent-mesh-codespaces');
+		assert.ok(companion, 'The installed Codespaces companion was not found.');
+		const companionRelative = path.relative(process.env.MESH_SMOKE_EXTENSIONS_DIR, companion.extensionPath);
+		assert.ok(companionRelative !== '' && !path.isAbsolute(companionRelative)
+			&& companionRelative !== '..' && !companionRelative.startsWith(`..${path.sep}`));
+		assert.equal(companion.packageJSON.version, process.env.MESH_SMOKE_COMPANION_VERSION);
+		assert.deepEqual(companion.packageJSON.extensionKind, ['workspace']);
+		const companionManifest = JSON.parse(await readFile(path.join(companion.extensionPath, 'package.json'), 'utf8'));
+		assert.deepEqual(companionManifest.enabledApiProposals, ['chatSessionsProvider', 'chatParticipantPrivate']);
+		assert.equal(companion.packageJSON.contributes.languageModelTools, undefined);
+		await companion.activate();
+		assert.equal(companion.isActive, true);
+		assert.deepEqual(await vscode.commands.executeCommand('copilotAgentMesh.codespaces.nativeChatStatus'),
+			{ state: 'unsupportedEnvironment' });
+		console.log(`Activated installed companion without starting a Codespace runtime: ${companion.extensionPath}`);
+	}
 }
 
 module.exports = { run };

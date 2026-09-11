@@ -20,6 +20,7 @@ import { RemoteExecutionServer } from './RemoteExecutionServer';
 import { canonicalCodespaceStorageBase } from './CodespaceStorage';
 import { codespacePreparationFailure, CODESPACE_PREPARATION_MESSAGES, type CodespacePreparedResult } from './CodespaceSetupProtocol';
 import { MeshDomainError } from '../domain/errors';
+import { createNativeChatService } from './nativeChat/NativeChatService';
 
 export interface CompanionApplication {
 	dispose(): Promise<void>;
@@ -61,6 +62,8 @@ export function createCompanionApplication(
 			throw error;
 		});
 	const identityResolver = new NodeFileIdentityResolver();
+	const nativeChat = createNativeChatService(api, context, (error) =>
+		logger.error('codespaces', 'Native Chat presentation or history is unavailable.', error));
 	const server = new RemoteExecutionServer({
 		extensionVersion,
 		assertAllowed,
@@ -72,7 +75,9 @@ export function createCompanionApplication(
 				uri: folder.uri.toString(), name: folder.name, capabilityTags: tags,
 			})), identityResolver);
 		},
-		createExecutor: async ({ nodeId, nodeInstanceId, nodeLabel, workspaceResolver, eventSink }) => {
+		createExecutor: async (execution) => {
+			const { nodeId, nodeInstanceId, nodeLabel, workspaceResolver, eventSink } = execution;
+			const observation = await nativeChat.observe(execution);
 			const { runtime, approvalCapabilities } = await createCodespaceRuntime(
 				api, context, workspaceResolver, resolveCli,
 				{ observeLifecycle: (event) => {
@@ -102,15 +107,16 @@ export function createCompanionApplication(
 			const executor = new WindowNodeTaskExecutor({
 				nodeId, nodeInstanceId, nodeLabel,
 				executionBackend: 'codespace-owned',
-				runtime,
+				runtime: observation?.runtime(runtime) ?? runtime,
 				workspaceResolver,
 				approvalCapabilities,
-				eventSink,
+				eventSink: observation?.eventSink(eventSink) ?? eventSink,
+				observeInputAnswer: observation?.observeInputAnswer,
 				confirmationHost: new VscodeWindowNodeTaskConfirmation(api),
 				ids: randomUUID,
 				clock: () => new Date(),
 			});
-			return { executor, probe: () => runtime.probe() };
+			return { executor: observation?.attach(executor) ?? executor, probe: () => runtime.probe() };
 		},
 		reportError: (error: Error) => logger.error('codespaces', 'Codespaces execution failed safely.', error),
 	});
@@ -155,6 +161,8 @@ export function createCompanionApplication(
 			const results = await Promise.allSettled([server.dispose(), setup ?? Promise.resolve()]);
 			const failures = results.flatMap((result, index) =>
 				result.status === 'rejected' && !(index === 1 && isExpectedCancellation(result.reason)) ? [result.reason] : []);
+			const nativeCleanup = await Promise.allSettled([nativeChat.dispose()]);
+			failures.push(...nativeCleanup.flatMap((result) => result.status === 'rejected' ? [result.reason] : []));
 			if (setupFailure !== undefined) {
 				failures.push(setupFailure);
 			}

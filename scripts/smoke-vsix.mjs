@@ -51,6 +51,16 @@ try {
 		'--install-extension', vsixPath,
 		'--force',
 	]);
+	const companionVsix = process.env.MESH_SMOKE_COMPANION_VSIX;
+	if (companionVsix !== undefined) {
+		await runCli(cli, [
+			...cliPrefix,
+			'--user-data-dir', userDataDirectory,
+			'--extensions-dir', extensionsDirectory,
+			'--install-extension', resolve(companionVsix),
+			'--force',
+		]);
+	}
 	const listing = await runCli(cli, [
 		...cliPrefix,
 		'--user-data-dir', userDataDirectory,
@@ -71,6 +81,7 @@ try {
 			...process.env,
 			MESH_SMOKE_EXTENSIONS_DIR: extensionsDirectory,
 			MESH_SMOKE_EXTENSION_VERSION: manifest.version,
+			MESH_SMOKE_COMPANION_VERSION: companionVsix === undefined ? '' : manifest.version,
 		},
 		launchArgs: [
 			repositoryRoot,

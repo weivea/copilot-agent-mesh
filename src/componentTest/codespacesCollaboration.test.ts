@@ -31,6 +31,8 @@ import { TaskToolsCore } from '../tools/taskToolsCore';
 import { MemoryAtomicFileSystem, TestOwnership } from '../unitTest/artifactStoreTestSupport';
 import { NodeFileIdentityResolver } from '../workspaces/NodeFileIdentityResolver';
 import { AgentHostLauncher } from '../agentHost/AgentHostLauncher';
+import { NativeChatControlRegistry, NativeChatExecution } from '../codespaces/nativeChat/NativeChatExecution';
+import { NativeChatStore } from '../codespaces/nativeChat/NativeChatStore';
 
 const directorySchema = z.object({
 	status: z.literal('ok'),
@@ -97,12 +99,20 @@ test('six existing tools collaborate through the real Broker, Codespaces bridge 
 		sessionUri: handle.recovery.sessionUri, chatUri: handle.recovery.chatUri,
 	});
 	assert.equal(f.remote.requests[1].requireEditor, undefined);
+	await waitFor(() => f.remoteStarted.has(nextId));
 	assert.equal((await f.sourceTools.cancelTask({ taskId: nextId })).status, 'ok');
 	const cancelled = taskReadSchema.parse(await f.sourceTools.getTask({ taskId: nextId, waitFor: 'outcome', waitSeconds: 5 }));
 	assert.equal(cancelled.snapshot.status, 'cancelled');
 	assert.equal(f.remote.handles.get(nextId)!.cancelCalls, 1);
+	await waitFor(() => f.nativeStore.sessionForTask(nextId)?.turns.at(-1)?.status === 'cancelled');
+	const transcript = f.nativeStore.sessionForTask(nextId)!;
+	assert.equal(transcript.id, taskId);
+	assert.equal(transcript.turns.length, 2);
+	assert.equal(transcript.turns[0].status, 'completed');
+	assert.ok(transcript.turns[0].entries.some((entry) => entry.kind === 'input'));
+	assert.ok(transcript.turns[0].entries.some((entry) => entry.text.includes('Remote result.')));
 	assert.equal(f.brokerStarts, 1);
-	assert.equal(f.errors.length, 0);
+	assert.deepEqual(f.errors, []);
 });
 
 test('a Codespaces window uses the unchanged tools to delegate back to a desktop window', async (t) => {
@@ -182,6 +192,90 @@ test('cancel interrupts an outstanding Codespaces start without a phantom failed
 	await waitFor(() => f.remote.handles.has(nextId));
 	await f.remote.handles.get(nextId)!.events.push({ type: 'completed' });
 	assert.equal(taskReadSchema.parse(await f.sourceTools.getTask({ taskId: nextId, waitFor: 'outcome', waitSeconds: 5 })).snapshot.status, 'completed');
+});
+
+test('native cancellation rejects stale generations while input remains source-owned', async (t) => {
+	const f = await fixture(t);
+	await f.authorizeBothDirections();
+	const targetHandle = await handleFor(f.sourceTools, f.target.nodeId);
+	const submitted = await f.sourceTools.delegateTask({
+		targetHandle, delegationRequestId: randomUUID(), title: 'Native controls', prompt: 'Ask the target user.', mode: 'submit',
+	});
+	const taskId = z.string().parse(submitted.t);
+	await waitFor(() => f.remote.handles.has(taskId));
+	const handle = f.remote.handles.get(taskId)!;
+	await handle.events.push({
+		type: 'inputRequired', request: { requestId: 'native-question', kind: 'chatInput', prompt: 'Continue?' },
+	});
+	await waitFor(() => f.nativeStore.sessionForTask(taskId)?.turns.at(-1)?.pendingInput !== undefined);
+	const session = f.nativeStore.sessionForTask(taskId)!;
+	const inputId = session.turns.at(-1)!.pendingInput!.inputId;
+	await assert.rejects(f.nativeControls.cancel(randomUUID(), taskId), /no longer live/);
+	assert.equal((await f.sourceTools.answerTask({ taskId, inputId, answerId: randomUUID(), answer: 'Continue.' })).status, 'ok');
+	assert.equal(handle.answers.length, 1);
+	assert.equal(taskReadSchema.parse(await f.sourceTools.getTask({ taskId, waitFor: 'outcome', waitSeconds: 5 })).snapshot.status, 'completed');
+	await waitFor(() => !f.nativeControls.isLive(session.generation, taskId));
+	await assert.rejects(f.nativeControls.cancel(session.generation, taskId), /no longer live/);
+	const next = await f.sourceTools.delegateTask({
+		targetHandle, delegationRequestId: randomUUID(), title: 'Native cancel', prompt: 'Wait for cancellation.', mode: 'submit',
+	});
+	const nextId = z.string().parse(next.t);
+	await waitFor(() => f.remoteStarted.has(nextId));
+	await f.nativeControls.cancel(f.nativeStore.sessionForTask(nextId)!.generation, nextId);
+	assert.equal(taskReadSchema.parse(await f.sourceTools.getTask({ taskId: nextId, waitFor: 'outcome', waitSeconds: 5 })).snapshot.status, 'cancelled');
+	assert.equal(f.remote.handles.get(nextId)!.cancelCalls, 1);
+	assert.equal(f.errors.length, 0);
+});
+
+test('cancellation during native history admission cannot start a later Agent turn', async (t) => {
+	const f = await fixture(t);
+	await f.authorizeBothDirections();
+	const begin = f.nativeStore.beginTask.bind(f.nativeStore);
+	let release!: () => void;
+	const pending = new Promise<void>((resolve) => { release = resolve; });
+	let entered = false;
+	f.nativeStore.beginTask = async (input) => {
+		entered = true;
+		await pending;
+		return begin(input);
+	};
+	try {
+		const submitted = await f.sourceTools.delegateTask({
+			targetHandle: await handleFor(f.sourceTools, f.target.nodeId),
+			delegationRequestId: randomUUID(), title: 'Pending history', prompt: 'Do not start after cancellation.', mode: 'submit',
+		});
+		const taskId = z.string().parse(submitted.t);
+		await waitFor(() => entered);
+		const cancellation = f.sourceTools.cancelTask({ taskId });
+		await waitFor(() => f.remote.cancelledStarts.includes(taskId));
+		release();
+		await cancellation;
+		assert.equal(taskReadSchema.parse(await f.sourceTools.getTask({ taskId, waitFor: 'outcome', waitSeconds: 5 })).snapshot.status, 'cancelled');
+		assert.equal(f.remote.requests.length, 0);
+		assert.equal(f.remote.handles.size, 0);
+	} finally { release(); }
+});
+
+test('a reported native history failure does not rewrite the acknowledged Mesh task result or retry execution', async (t) => {
+	const f = await fixture(t);
+	await f.authorizeBothDirections();
+	const submitted = await f.sourceTools.delegateTask({
+		targetHandle: await handleFor(f.sourceTools, f.target.nodeId),
+		delegationRequestId: randomUUID(), title: 'History failure', prompt: 'Return a result once.', mode: 'submit',
+	});
+	const taskId = z.string().parse(submitted.t);
+	await waitFor(() => f.remote.handles.has(taskId));
+	const append = f.nativeStore.append.bind(f.nativeStore);
+	f.nativeStore.append = async () => { throw new Error('Injected transcript write failure.'); };
+	const handle = f.remote.handles.get(taskId)!;
+	await handle.events.push({ type: 'output', text: 'The actual Agent result.\n\n' });
+	await handle.events.push({ type: 'completed' });
+	assert.equal(taskReadSchema.parse(await f.sourceTools.getTask({ taskId, waitFor: 'outcome', waitSeconds: 5 })).snapshot.status, 'completed');
+	await waitFor(() => f.errors.length > 0);
+	f.nativeStore.append = append;
+	assert.match(f.errors[0].message, /history could not be saved/);
+	assert.equal(f.remote.requests.length, 1);
+	assert.notEqual(f.nativeStore.sessionForTask(taskId)?.turns.at(-1)?.status, 'completed');
 });
 
 class RuntimeHandle implements AgentTaskHandle {
@@ -295,18 +389,41 @@ async function fixture(t: TestContext) {
 	const reportError = (error: Error) => { if (!stopping) { errors.push(error); } };
 	const local = new Runtime();
 	const remote = new Runtime();
+	const nativeStore = new NativeChatStore({ rootDirectory: join(root, 'native-history') });
+	await nativeStore.initialize();
+	const nativeControls = new NativeChatControlRegistry();
+	const remoteStarted = new Set<string>();
+	cleanups.push(() => nativeStore.flush());
 	const server = new RemoteExecutionServer({
 		extensionVersion: '0.5.0', assertAllowed() {},
 		readWorkspaces: (remoteAuthority) => describeCodespaceWorkspaces(remoteAuthority, [
 			{ uri: targetUri, name: 'Codespace repository' },
 		], new NodeFileIdentityResolver()),
-		createExecutor: (context) => ({
-			executor: new WindowNodeTaskExecutor({
-				...context, executionBackend: 'codespace-owned', runtime: remote,
+		createExecutor: (context) => {
+			const observation = new NativeChatExecution({
+				generation: context.helperInstanceId, nodeId: context.nodeId, nodeInstanceId: context.nodeInstanceId,
+				workspaceResolver: context.workspaceResolver, store: nativeStore, controls: nativeControls,
+				reportError: (error) => reportError(error instanceof Error ? error : new Error('Native history failed.')),
+			});
+			const executor = new WindowNodeTaskExecutor({
+				...context, executionBackend: 'codespace-owned', runtime: observation.runtime(remote),
+				eventSink: observation.eventSink(context.eventSink),
+				observeInputAnswer: observation.observeInputAnswer,
 				confirmationHost: { confirm: async () => 'once' }, ids: randomUUID, clock,
-			}),
-			probe: () => remote.probe(),
-		}),
+			});
+			const observed = observation.attach(executor);
+			return {
+				executor: {
+					...observed,
+					start: async (params) => {
+						const result = await observed.start(params);
+						remoteStarted.add(params.taskId);
+						return result;
+					},
+				},
+				probe: () => remote.probe(),
+			};
+		},
 		reportError,
 	});
 	cleanups.push(() => server.dispose());
@@ -370,7 +487,7 @@ async function fixture(t: TestContext) {
 	});
 	cleanups.push(async () => { sourceFacade.dispose(); targetFacade.dispose(); });
 	return {
-		source, target, remote, local, errors, brokerStarts: 1,
+		source, target, remote, local, errors, brokerStarts: 1, nativeStore, nativeControls, remoteStarted,
 		sourceTools: new TaskToolsCore(sourceFacade), targetTools: new TaskToolsCore(targetFacade),
 		authorizeBothDirections: async () => {
 			await source.setPeerPolicy({

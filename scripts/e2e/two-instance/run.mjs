@@ -453,7 +453,7 @@ if (hostFailures.length > 0) {
 
 const evidence = {
 	schemaVersion: 1,
-	release: '0.5.4-preview',
+	release: '0.5.5-preview',
 	platform: { os: process.platform, architecture: process.arch },
 	devTunnel: {
 		build: '1.0.2030+fc9273aa0f',

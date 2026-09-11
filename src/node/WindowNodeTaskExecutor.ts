@@ -71,6 +71,7 @@ export interface WindowNodeTaskExecutorOptions {
 	readonly confirmationHost: WindowNodeTaskConfirmationHost;
 	readonly approvalCapabilities?: AgentRuntimeApprovalCapabilityIssuer;
 	readonly eventSink: WindowNodeTaskEventSink;
+	readonly observeInputAnswer?: (taskId: string, inputId: string, answer: () => Promise<void>) => Promise<void>;
 	readonly ids: IdGenerator | (() => string);
 	readonly clock: Clock | (() => Date);
 }
@@ -303,7 +304,12 @@ export class WindowNodeTaskExecutor {
 			if (active.terminal || active.pendingInputs.get(params.inputId) !== pending) {
 				throw new MeshDomainError('INPUT_NOT_PENDING', 'The input changed while its workspace was being resolved.');
 			}
-			await active.handle.answer(toAgentAnswer(pending.request, params.answer));
+			const applyAnswer = () => active.handle.answer(toAgentAnswer(pending.request, params.answer));
+			if (this.options.observeInputAnswer === undefined) {
+				await applyAnswer();
+			} else {
+				await this.options.observeInputAnswer(params.taskId, params.inputId, applyAnswer);
+			}
 			active.pendingInputs.delete(params.inputId);
 			active.answeredInputs.set(params.inputId, params.answerId);
 			await this.publishNextInput(record, active);

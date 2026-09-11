@@ -6,6 +6,22 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [Unreleased]
 
+## [0.5.5 Preview] - 2026-09-11
+
+- Add a private-VSIX POC for native Codespace target Chat and Sessions, using
+  explicitly enabled `chatSessionsProvider` and `chatParticipantPrivate` APIs
+  on desktop VS Code 1.137+. Keep the existing Broker, Mesh-owned execution,
+  account separation and six source tools unchanged.
+- Observe real execution once; retain bounded, redacted per-session transcripts
+  outside temporary Host data. Tool continuations share history, while Host
+  replacement never triggers task replay.
+- Add target-native cancellation with current generation/task checks.
+  View disposal only detaches observation. Questions and follow-ups still use
+  source tools; target Chat stays read-only so it cannot bypass Broker input
+  state, source ownership, grants or workspace leases.
+- Add explicit opt-in guidance and a native renderer/restart-history harness.
+  Synthetic native UI checks are not a live Codespace or model qualification.
+
 ## [0.5.4 Preview] - 2026-09-11
 
 - Handle the native CLI supervisor's fixed `0.1.0` registry marker for

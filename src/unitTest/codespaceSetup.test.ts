@@ -5,8 +5,9 @@ import { LocalDesktopWorkspaceGuard } from '../application/LocalDesktopWorkspace
 import { registerCodespaceSetup } from '../codespaces/CodespaceSetup';
 import { CODESPACES_PREPARE_RUNTIME_COMMAND, CODESPACES_SETUP_COMMAND } from '../codespaces/CodespaceEnvironment';
 import type { StructuredLogger } from '../logging/StructuredLogger';
+import { NATIVE_CHAT_HELP_COMMAND, NATIVE_CHAT_STATUS_COMMAND } from '../codespaces/nativeChat/NativeChatApi';
 
-function fixture(options: { cancel?: boolean; declineReload?: boolean; failInstall?: boolean; result?: unknown } = {}) {
+function fixture(options: { cancel?: boolean; declineReload?: boolean; failInstall?: boolean; result?: unknown; nativeChatState?: string } = {}) {
 	const calls: { command: string; args: readonly unknown[] }[] = [];
 	const errors: unknown[] = [];
 	const messages: string[] = [];
@@ -27,6 +28,7 @@ function fixture(options: { cancel?: boolean; declineReload?: boolean; failInsta
 				if (command === 'workbench.extensions.installExtension' && options.failInstall) {
 					throw new Error('Installation refused.');
 				}
+				if (command === NATIVE_CHAT_STATUS_COMMAND) { return { state: options.nativeChatState ?? 'enabled' }; }
 				return command === CODESPACES_PREPARE_RUNTIME_COMMAND ? options.result ?? { ready: true } : undefined;
 			},
 		},
@@ -65,10 +67,21 @@ test('registration performs no setup; an explicit accepted action installs only 
 	assert.deepEqual(f.calls.map((call) => call.command), [
 		'workbench.extensions.installExtension',
 		CODESPACES_PREPARE_RUNTIME_COMMAND,
+		NATIVE_CHAT_STATUS_COMMAND,
 		'workbench.action.reloadWindow',
 	]);
 	assert.deepEqual(f.calls[0].args, [{ path: 'dist/codespaces-companion.vsix' }]);
 	assert.deepEqual(f.calls[1].args, [{ extensionVersion: '0.5.0' }]);
+});
+
+test('setup distinguishes execution readiness from missing native UI permissions without changing accounts or arguments', async (t) => {
+	const f = fixture({ nativeChatState: 'permissionRequired' });
+	t.after(() => f.registration.dispose());
+	await f.run();
+	assert.match(f.messages.at(-1)!, /runtime is ready.*Native Chat POC is not enabled/);
+	assert.ok(f.calls.some(({ command }) => command === NATIVE_CHAT_HELP_COMMAND));
+	assert.ok(!f.calls.some(({ command }) => command === 'workbench.action.reloadWindow'));
+	assert.equal(f.errors.length, 0);
 });
 
 test('setup reports the exact preparation failure without blaming native or Tunnel accounts', async (t) => {

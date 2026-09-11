@@ -3,7 +3,7 @@
   "displayName": "Copilot Agent Mesh - Codespaces",
   "description": "Workspace-side execution companion for desktop Copilot Agent Mesh.",
   "publisher": "weivea",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "preview": true,
   "license": "MIT",
   "repository": {
@@ -11,15 +11,20 @@
     "url": "https://github.com/weivea/copilot-agent-mesh.git"
   },
   "engines": {
-    "vscode": "^1.103.0"
+    "vscode": "^1.137.0"
   },
   "extensionKind": [
     "workspace"
   ],
   "api": "none",
+  "enabledApiProposals": [
+    "chatSessionsProvider",
+    "chatParticipantPrivate"
+  ],
   "main": "./dist/extension.js",
   "l10n": "./l10n",
   "activationEvents": [
+    "onStartupFinished",
     "onCommand:copilotAgentMesh.codespaces.connect",
     "onCommand:copilotAgentMesh.codespaces.prepareRuntime"
   ],
@@ -41,10 +46,39 @@
     }
   },
   "contributes": {
+    "chatSessions": [
+      {
+        "type": "agent-mesh-codespaces",
+        "name": "mesh-codespaces",
+        "displayName": "Agent Mesh - Codespaces",
+        "description": "Real Mesh-owned Codespace tasks and retained history. Start and continue tasks with the source Mesh tools.",
+        "icon": "remote",
+        "canDelegate": false,
+        "when": "remoteName == codespaces && !isWeb"
+      }
+    ],
+    "chatParticipants": [
+      {
+        "id": "weivea.copilot-agent-mesh-codespaces.session",
+        "name": "meshCodespaces",
+        "fullName": "Agent Mesh - Codespaces",
+        "description": "Native display for authorized Mesh tasks, not a separate model invocation."
+      }
+    ],
     "commands": [
       {
         "command": "copilotAgentMesh.codespaces.prepareRuntime",
         "title": "Prepare Codespaces Execution Runtime",
+        "category": "Copilot Agent Mesh"
+      },
+      {
+        "command": "copilotAgentMesh.codespaces.nativeChatHelp",
+        "title": "Native Codespaces Chat Setup (POC)",
+        "category": "Copilot Agent Mesh"
+      },
+      {
+        "command": "copilotAgentMesh.codespaces.openSession",
+        "title": "Open Codespaces Session",
         "category": "Copilot Agent Mesh"
       }
     ],
@@ -53,12 +87,32 @@
         {
           "command": "copilotAgentMesh.codespaces.prepareRuntime",
           "when": "remoteName == codespaces && !isWeb"
+        },
+        {
+          "command": "copilotAgentMesh.codespaces.nativeChatHelp",
+          "when": "remoteName == codespaces && !isWeb"
+        },
+        {
+          "command": "copilotAgentMesh.codespaces.openSession",
+          "when": "remoteName == codespaces && !isWeb"
         }
       ]
     },
     "configuration": {
       "title": "Copilot Agent Mesh - Codespaces",
       "properties": {
+        "copilotAgentMesh.codespaces.nativeChat.enabled": {
+          "type": "boolean",
+          "default": true,
+          "scope": "machine",
+          "markdownDescription": "POC: show authorized Codespace tasks in native Chat and Sessions when the desktop explicitly enables this companion's proposed APIs. Reload after changing. Does not change Mesh task authorization or start a second Agent."
+        },
+        "copilotAgentMesh.codespaces.nativeChat.autoOpen": {
+          "type": "boolean",
+          "default": true,
+          "scope": "window",
+          "markdownDescription": "Open the target window's native Chat editor when an authorized Mesh task starts. Turning this off keeps the session in Sessions without taking focus."
+        },
         "copilotAgentMesh.codespaces.codePath": {
           "type": "string",
           "default": "",
