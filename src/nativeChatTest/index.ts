@@ -2,13 +2,18 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { homedir } from 'node:os';
+import { parse as parseJsonc } from 'jsonc-parser';
 import * as vscode from 'vscode';
 import { z } from 'zod';
 
-import { NATIVE_CHAT_CANCEL_COMMAND, NATIVE_CHAT_EXTENSION_ID } from '../codespaces/nativeChat/NativeChatApi';
+import { NATIVE_CHAT_CANCEL_COMMAND, NATIVE_CHAT_EXTENSION_ID, NATIVE_CHAT_TYPE } from '../codespaces/nativeChat/NativeChatApi';
+import { persistNativeChatPermission } from '../codespaces/nativeChat/NativeChatPermissionSetup';
 import { NativeChatControlRegistry } from '../codespaces/nativeChat/NativeChatExecution';
 import { NativeChatProvider } from '../codespaces/nativeChat/NativeChatProvider';
 import { NativeChatStore, type NativeChatTaskStart } from '../codespaces/nativeChat/NativeChatStore';
+import { createAgentRuntimeEventQueue } from '../agentHost/AgentRuntime';
+import { runNativeServiceScenario } from './serviceScenario';
 
 const firstTask = '30000000-0000-4000-8000-000000000001';
 const nextTask = '30000000-0000-4000-8000-000000000002';
@@ -17,16 +22,54 @@ const generation = '30000000-0000-4000-8000-000000000003';
 const recovery = { sessionUri: 'copilot:/30000000-0000-4000-8000-000000000004', chatUri: 'copilot:/30000000-0000-4000-8000-000000000004/chats/main' };
 const marker = 'NATIVE_MESH_STREAM_RENDERED_5739';
 const nextMarker = 'NATIVE_MESH_CONTINUATION_RENDERED_8743';
+const streamedStory = Array.from({ length: 90 }, (_, index) =>
+	`STREAM_${index.toString().padStart(3, '0')}_中文与表情🙂全部保留。\n`).join('');
+const nativeWorkbenchCommand = `workbench.action.chat.openNewChatSessionExternal.${NATIVE_CHAT_TYPE}`;
 let context: vscode.ExtensionContext | undefined;
 
-export function activate(value: vscode.ExtensionContext): void { context = value; }
+export function activate(value: vscode.ExtensionContext): void {
+	context = value;
+	context.subscriptions.push(vscode.commands.registerCommand('copilotAgentMesh.test.nativeChat.run', run));
+}
 
 export async function run(): Promise<void> {
 	const root = z.string().min(1).parse(process.env.CAM_NATIVE_CHAT_TEST_ROOT);
-	const phase = z.enum(['live', 'restored']).parse(process.env.CAM_NATIVE_CHAT_TEST_PHASE);
+	const phase = z.enum(['configure', 'live', 'restored', 'service', 'service-restored']).parse(process.env.CAM_NATIVE_CHAT_TEST_PHASE);
 	const port = z.coerce.number().int().min(1).max(65535).parse(process.env.CAM_NATIVE_CHAT_TEST_PORT);
 	await vscode.extensions.getExtension(NATIVE_CHAT_EXTENSION_ID)!.activate();
 	assert.ok(context);
+	assert.equal(homedir(), join(root, 'home'), 'The actual user home must never be used for this test.');
+	if (phase === 'configure') {
+		assert.equal(vscode.env.appName, 'Visual Studio Code', 'Permission enforcement must be tested in a built Stable host, not an automatically privileged development host.');
+		const nativeAction = nativeWorkbenchCommand;
+		assert.ok(!(await vscode.commands.getCommands(true)).includes(nativeAction), 'The workbench must deny native session contributions before persistence.');
+		const baseline = z.record(z.string(), z.unknown()).parse(parseJsonc(await readFile(join(root, 'home', '.vscode', 'argv.json'), 'utf8')));
+		assert.deepEqual(await persistNativeChatPermission(vscode).catch(async (error: unknown) => {
+			const contents = await readFile(join(root, 'home', '.vscode', 'argv.json'), 'utf8');
+			throw new Error(`Persistent setup rejected the isolated fixture: ${JSON.stringify(contents)}`, { cause: error });
+		}), { state: 'restartRequired', changed: true });
+		const contents = await readFile(join(root, 'home', '.vscode', 'argv.json'), 'utf8');
+		assert.ok(contents.includes('// Preserve the user runtime configuration.'));
+		assert.deepEqual(parseJsonc(contents), {
+			...baseline,
+			'disable-hardware-acceleration': true,
+			'enable-proposed-api': ['example.existing', NATIVE_CHAT_EXTENSION_ID],
+		});
+		assert.deepEqual(await persistNativeChatPermission(vscode), { state: 'restartRequired', changed: false });
+		assert.ok(!(await vscode.commands.getCommands(true)).includes(nativeAction), 'Saved permissions must not self-grant in the current workbench process.');
+		await writeFile(join(root, 'configure.json'), JSON.stringify({
+			passed: true, vscodeVersion: vscode.version, at: new Date().toISOString(),
+			manualLaunchFlags: false, restartRequired: true, unrelatedConfigPreserved: true,
+		}));
+		return;
+	}
+	if (phase === 'service' || phase === 'service-restored') {
+		const cdp = await connectCdp(port);
+		try {
+			await runNativeServiceScenario(vscode, context, root, phase, (text) => rendered(cdp, text), (title) => sessionListed(cdp, title));
+		} finally { cdp.dispose(); }
+		return;
+	}
 	const workspace = vscode.workspace.workspaceFolders?.[0];
 	assert.ok(workspace);
 	const store = new NativeChatStore({ rootDirectory: join(root, 'history') });
@@ -45,6 +88,8 @@ export async function run(): Promise<void> {
 		reportError: (error) => { errors.push(error); },
 		reportActionError: (error) => { actionErrors.push(error); },
 	});
+	assert.ok((await vscode.commands.getCommands(true)).includes(nativeWorkbenchCommand),
+		'Normal restart must activate native session contributions using only the saved permission.');
 	const input: NativeChatTaskStart = {
 		taskId: firstTask,
 		title: 'Native Mesh Chat integration POC',
@@ -70,6 +115,22 @@ export async function run(): Promise<void> {
 			await store.append(firstTask, { kind: 'progress', text: 'Native Mesh tool progress is visible.' });
 			await store.append(firstTask, { kind: 'output', text: `${marker}\n\n` });
 			await rendered(cdp, marker);
+			const queue = createAgentRuntimeEventQueue();
+			const consumption = (async () => {
+				for await (const event of queue) {
+					assert.notEqual(event.type, 'outputTruncated');
+					if (event.type === 'output') {
+						await new Promise((resolve) => setTimeout(resolve, 20));
+						await store.append(firstTask, { kind: 'output', text: event.text });
+					}
+				}
+			})();
+			for (const character of streamedStory) { await queue.push({ type: 'output', text: character }); }
+			await queue.pushAndClose({ type: 'completed' });
+			await consumption;
+			assert.ok(store.get(firstTask)!.turns[0].entries
+				.filter((entry) => entry.kind === 'output').map((entry) => entry.text).join('').includes(streamedStory));
+			for (const fragment of ['STREAM_000_', 'STREAM_045_', 'STREAM_089_']) { await rendered(cdp, fragment); }
 			await vscode.commands.executeCommand('agentSessions.showAgentSessionsSidebar');
 			await sessionListed(cdp, input.title);
 			await vscode.commands.executeCommand('workbench.action.closeActiveEditor');
@@ -136,6 +197,8 @@ export async function run(): Promise<void> {
 			await sessionListed(cdp, input.title);
 			assert.equal(provider.diagnostics.activeViews, 0);
 			assert.equal(store.get(cancelledTask)?.turns.at(-1)?.status, 'cancelled');
+			assert.ok(store.get(firstTask)!.turns[0].entries
+				.filter((entry) => entry.kind === 'output').map((entry) => entry.text).join('').includes(streamedStory));
 		}
 		assert.deepEqual(errors, []);
 		await store.flush();
@@ -143,7 +206,8 @@ export async function run(): Promise<void> {
 			passed: true, vscodeVersion: vscode.version, at: new Date().toISOString(),
 			phase, ...provider.diagnostics,
 			turns: store.get(firstTask)?.turns.length,
-			cancellations, modelCalls: 0, cancellationConfirmation: 'injected decision; VS Code extension tests refuse modal prompts',
+			cancellations, modelCalls: 0, streamedUnicodeBytes: Buffer.byteLength(streamedStory, 'utf8'),
+			cancellationConfirmation: 'injected decision; VS Code extension tests refuse modal prompts',
 		}));
 	} finally {
 		provider.dispose();
@@ -208,7 +272,7 @@ async function rendered(cdp: CdpClient, text: string): Promise<void> {
 				expression: 'document.body.innerText', returnByValue: true,
 			}));
 			body = result.result.value;
-			return body.includes(text);
+			return body.replaceAll('\u00a0', ' ').includes(text);
 		});
 	} catch (error: unknown) {
 		throw new Error(`Native Chat did not render ${text}. Workbench text: ${body.slice(-7000)}`, { cause: error });

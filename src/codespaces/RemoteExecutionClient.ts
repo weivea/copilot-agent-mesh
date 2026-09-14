@@ -57,8 +57,15 @@ export interface RemoteExecutionClientOptions {
 	readonly eventSink: WindowNodeTaskEventSink;
 	onDisconnect(error: Error): void | Promise<void>;
 	readonly reportError?: (error: Error) => void;
+	readonly reportFailure?: (diagnostic: RemoteExecutionFailureDiagnostic) => void;
 	readonly budgets?: Partial<RemoteExecutionBudgets>;
 	readonly timing?: Partial<RemoteExecutionTiming>;
+}
+
+export interface RemoteExecutionFailureDiagnostic {
+	readonly operation: RemoteExecutionOperation['kind'] | 'brokerEventAck';
+	readonly budgetMs: number;
+	readonly elapsedMs: number;
 }
 
 type InvocationLane = 'normal' | 'control' | 'events' | 'heartbeat' | 'connect';
@@ -458,6 +465,7 @@ export class RemoteExecutionClient implements WindowNodeExecutor {
 		admission?: TaskAdmission,
 	): Promise<T> {
 		await this.connect();
+		const startedAt = this.timing.now();
 		const helper = this.assertConnected();
 		const input = parseRemoteValue(remoteExecutionCallSchema, {
 			...this.authorization(helper), requestId, operation,
@@ -476,6 +484,7 @@ export class RemoteExecutionClient implements WindowNodeExecutor {
 				await remoteDeadline(raw, timeoutMs, this.timing, this.lifetime.signal), this.budgets.maxResponseBytes);
 			this.assertConnected();
 		} catch (error: unknown) {
+			this.reportFailure(operation.kind, timeoutMs, startedAt);
 			this.report(error);
 			const failure = bridgeError('TASK_RECOVERY_UNAVAILABLE');
 			this.fail(failure);
@@ -526,16 +535,18 @@ export class RemoteExecutionClient implements WindowNodeExecutor {
 		if (admission.disposed) {
 			return;
 		}
+		const startedAt = this.timing.now();
 		try {
 			await remoteDeadline(Promise.resolve().then(() => {
 				if (!admission.disposed) {
 					return this.options.eventSink.publish(event);
 				}
-			}), this.budgets.callTimeoutMs, this.timing,
+			}), this.budgets.eventDeliveryTimeoutMs, this.timing,
 			AbortSignal.any([this.lifetime.signal, admission.deliveryAbort.signal]));
 		} catch (error: unknown) {
 			// Explicit disposal revokes this exact delivery route; draining its in-flight frames is cleanup.
 			if (!admission.disposed) {
+				this.reportFailure('brokerEventAck', this.budgets.eventDeliveryTimeoutMs, startedAt);
 				throw error;
 			}
 		}
@@ -677,6 +688,16 @@ export class RemoteExecutionClient implements WindowNodeExecutor {
 			this.options.reportError?.(error instanceof Error ? error : bridgeError('TASK_EXECUTION_FAILED'));
 		} catch {
 			// Reporting must not prevent capability revocation or leak an asynchronous rejection.
+		}
+	}
+
+	private reportFailure(operation: RemoteExecutionFailureDiagnostic['operation'], budgetMs: number, startedAt: number): void {
+		try {
+			this.options.reportFailure?.({
+				operation, budgetMs, elapsedMs: Math.max(0, this.timing.now() - startedAt),
+			});
+		} catch {
+			// Diagnostics cannot change transport cleanup or capability revocation.
 		}
 	}
 }

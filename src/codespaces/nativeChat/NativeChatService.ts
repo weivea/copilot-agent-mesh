@@ -4,7 +4,8 @@ import type * as vscode from 'vscode';
 
 import { canonicalCodespaceStorageBase } from '../CodespaceStorage';
 import {
-	hasNativeChatApi, NATIVE_CHAT_EXTENSION_ID, NATIVE_CHAT_HELP_COMMAND, NATIVE_CHAT_OPEN_COMMAND, NATIVE_CHAT_STATUS_COMMAND,
+	hasNativeChatApi, NATIVE_CHAT_ENABLE_COMMAND, NATIVE_CHAT_HELP_COMMAND, NATIVE_CHAT_OPEN_COMMAND, NATIVE_CHAT_STATUS_COMMAND,
+	nativeChatEnableResultSchema,
 	type NativeChatStatus,
 } from './NativeChatApi';
 import { NativeChatControlRegistry, NativeChatExecution } from './NativeChatExecution';
@@ -26,8 +27,10 @@ export function createNativeChatService(
 	let state: NativeChatStatus['state'] = 'disabled';
 	let provider: NativeChatProvider | undefined;
 	let store: NativeChatStore | undefined;
+	let storeReady = false;
 	let disposed = false;
 	let warned = false;
+	let presentationWarned = false;
 	let workspaceUris: ReadonlySet<string> = new Set();
 	let workspaceRevision = 0;
 	const controls = new NativeChatControlRegistry();
@@ -50,6 +53,7 @@ export function createNativeChatService(
 		const base = await canonicalCodespaceStorageBase(context.globalStorageUri.fsPath);
 		store = new NativeChatStore({ rootDirectory: join(base, 'chat-history') });
 		await store.initialize();
+		storeReady = true;
 		await updateWorkspaces();
 		if (disposed) { return; }
 		try {
@@ -71,7 +75,6 @@ export function createNativeChatService(
 			if (error instanceof Error && /proposal/i.test(error.message)
 				&& /chatSessionsProvider|chatParticipantPrivate/.test(error.message)) {
 				state = 'permissionRequired';
-				reportError(error);
 				return;
 			}
 			throw error;
@@ -81,6 +84,7 @@ export function createNativeChatService(
 		state = 'initializationFailed';
 		reportHistoryError(error);
 	});
+	let automaticSetup: Promise<void> = Promise.resolve();
 	const subscriptions = [
 		api.commands.registerCommand(NATIVE_CHAT_OPEN_COMMAND, async (resource?: unknown) => {
 			await ready;
@@ -89,24 +93,25 @@ export function createNativeChatService(
 		}),
 		api.commands.registerCommand(NATIVE_CHAT_STATUS_COMMAND, async () => {
 			await ready;
+			await automaticSetup;
 			return { state } satisfies NativeChatStatus;
 		}),
 		api.commands.registerCommand(NATIVE_CHAT_HELP_COMMAND, async () => {
 			await ready;
-			const copy = api.l10n.t('Copy launch command');
-			const configure = api.l10n.t('Open runtime arguments');
-			const choice = await api.window.showInformationMessage(
-				api.l10n.t('Native Mesh Chat is a POC using proposed VS Code APIs ({0}).', state),
-				{
-					modal: true,
-					detail: api.l10n.t('Use desktop VS Code 1.137 or newer. Fully quit VS Code, then start it with --enable-proposed-api weivea.copilot-agent-mesh-codespaces and reconnect to the Codespace. Alternatively, add this extension ID to the existing enable-proposed-api array in the desktop runtime arguments and restart. This command does not change your settings or start a task.'),
-				},
-				copy, configure,
-			);
-			if (choice === copy) {
-				await api.env.clipboard.writeText(`code --enable-proposed-api ${NATIVE_CHAT_EXTENSION_ID}`);
-			} else if (choice === configure) {
-				await api.commands.executeCommand('workbench.action.configureRuntimeArguments');
+			await automaticSetup;
+			if (state === 'permissionRequired') {
+				await enablePermission();
+			} else if (state === 'restartRequired') {
+				void api.window.showInformationMessage(api.l10n.t(
+					'Native Codespaces Chat permission is saved. Fully quit all VS Code windows and reopen once. No command-line parameters are needed.',
+				));
+			} else if (state === 'enabled') {
+				void api.window.showInformationMessage(api.l10n.t('Native Codespaces Chat is enabled. No command-line parameters are needed.'));
+			} else {
+				void api.window.showInformationMessage(api.l10n.t(
+					'Native Chat is unavailable ({0}). Use desktop VS Code 1.137 or newer with nativeChat.enabled turned on; see the Codespaces Output for errors.',
+					state,
+				));
 			}
 		}),
 		api.workspace.onDidChangeWorkspaceFolders(() => {
@@ -117,11 +122,30 @@ export function createNativeChatService(
 			void ready.then(updateWorkspaces).catch(reportHistoryError);
 		}),
 	];
+	automaticSetup = ready.then(async () => {
+		if (!disposed && (state === 'permissionRequired' || state === 'enabled')) { await enablePermission(); }
+	}).catch((error: unknown) => {
+		reportError(error);
+		if (!disposed) {
+			void api.window.showErrorMessage(api.l10n.t(
+				'Automatic native Chat setup did not complete. Run Enable Native Codespaces Chat to retry; see Output: Copilot Agent Mesh.',
+			));
+		}
+	});
 	return {
 		status: () => ({ state }),
 		observe: async (execution) => {
 			await ready;
-			return store === undefined || provider === undefined || disposed ? undefined : new NativeChatExecution({
+			if (store === undefined || !storeReady || disposed) { return undefined; }
+			if (provider === undefined && !presentationWarned) {
+				presentationWarned = true;
+				void api.window.showWarningMessage(api.l10n.t(
+					state === 'permissionRequired' || state === 'restartRequired'
+						? 'Mesh is saving this task history, but native Chat is waiting for a full VS Code restart. Fully quit all VS Code windows and reopen; no launch parameters are needed.'
+						: 'Mesh is saving this task history, but native Chat is unavailable. See Output: Copilot Agent Mesh - Codespaces.',
+				));
+			}
+			return new NativeChatExecution({
 				generation: execution.helperInstanceId,
 				nodeId: execution.nodeId,
 				nodeInstanceId: execution.nodeInstanceId,
@@ -135,10 +159,26 @@ export function createNativeChatService(
 			disposed = true;
 			for (const subscription of subscriptions) { subscription.dispose(); }
 			await ready;
+			await automaticSetup;
 			provider?.dispose();
 			await store?.flush();
 		},
 	};
+
+	async function enablePermission(): Promise<void> {
+		const alreadyEnabled = state === 'enabled';
+		const result = nativeChatEnableResultSchema.parse(await api.commands.executeCommand(NATIVE_CHAT_ENABLE_COMMAND, {
+			extensionVersion: String(context.extension.packageJSON.version),
+		}));
+		if (!disposed && !alreadyEnabled) {
+			state = result.state;
+			if (!result.changed) {
+				void api.window.showInformationMessage(api.l10n.t(
+					'Native Codespaces Chat permission is saved. Fully quit all VS Code windows and reopen once. No command-line parameters are needed.',
+				));
+			}
+		}
+	}
 
 	async function updateWorkspaces(): Promise<void> {
 		const revision = ++workspaceRevision;

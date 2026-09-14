@@ -15,13 +15,16 @@ for other windows. Tasks run in the Codespace filesystem. Completed task session
 can be continued on the same live execution generation; they are Mesh-owned
 sessions, not the window's built-in Copilot Host sessions.
 
-**0.5.5 native Chat POC:** the companion requires desktop VS Code 1.137 or newer.
-Fully quit desktop VS Code, launch it with
-`code --enable-proposed-api weivea.copilot-agent-mesh-codespaces`, and reconnect.
-The explicitly enabled `chatSessionsProvider` and `chatParticipantPrivate`
+**0.5.12 native Chat POC:** the companion requires desktop VS Code 1.137 or newer.
+On first activation it asks the desktop Mesh extension to automatically save
+its API permission. Fully quit all VS Code windows and reopen once, then
+reconnect. **No launch parameters or manual configuration edits are needed.**
+The `chatSessionsProvider` and `chatParticipantPrivate`
 proposals put real incoming Mesh tasks in the native **Chat editor and Sessions**.
-**Native Codespaces Chat Setup (POC)** explains the opt-in without editing your
-desktop runtime arguments.
+Existing desktop runtime preferences, comments and other extension permissions
+are preserved. **Enable Native Codespaces Chat** retries a blocked automatic
+save; an unsaved or invalid user configuration is never overwritten. A native
+Chat opt-out disables automatic setup, and no VS Code installation file is changed.
 
 Incoming tasks open automatically; disable
 `copilotAgentMesh.codespaces.nativeChat.autoOpen` to keep Sessions without
@@ -36,6 +39,24 @@ runtime resumable. UI/history errors are visible and leave the existing Mesh
 execution channel authoritative. Without proposed-API permissions the tool
 workflow still works, but native Chat is unavailable. This is a private VSIX
 POC, not a stable Marketplace integration.
+
+0.5.8 removes an incorrect startup check that could dispose a registered native
+provider when an optional workbench menu command was absent. Incoming tasks
+remain recorded while native permission is awaiting a full restart, and a
+warning explains why the UI is not yet available. Previously unrecorded tasks
+are not replayed to fabricate history.
+
+Token-sized output is coalesced losslessly into bounded batches before slow
+consumers can fill the event-count limit. Normal task summaries use a separate
+16 KiB limit rather than the 2 KiB error-message limit. Actual queue/storage and
+tool-result budgets remain enforced; upgrading cannot reconstruct output
+already dropped by an older version.
+
+Broker event acknowledgement has a separate bounded stall budget; a brief
+desktop Extension Host pause does not immediately retire an otherwise healthy
+Codespace execution generation. Companion heartbeat/cancellation paths remain
+separate, and real connection loss or task deadlines still stop execution.
+No uncertain task is automatically retried.
 
 The companion obtains Agent authentication through VS Code's native account
 provider. It does not read shell credentials or another Agent Host's tokens.

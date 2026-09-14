@@ -78,6 +78,10 @@ export function createCompanionApplication(
 		createExecutor: async (execution) => {
 			const { nodeId, nodeInstanceId, nodeLabel, workspaceResolver, eventSink } = execution;
 			const observation = await nativeChat.observe(execution);
+			logger.log('info', 'codespaces', 'Native Chat execution observation prepared.', {
+				state: nativeChat.status().state,
+				recording: observation !== undefined,
+			});
 			const { runtime, approvalCapabilities } = await createCodespaceRuntime(
 				api, context, workspaceResolver, resolveCli,
 				{ observeLifecycle: (event) => {

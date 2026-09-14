@@ -3,6 +3,7 @@ import { performance } from 'node:perf_hooks';
 import { z } from 'zod';
 
 import {
+	LOCAL_BROKER_REQUEST_TIMEOUT_MS,
 	MESH_ERROR_CODES,
 	PROTOCOL_LIMITS,
 	nodeTaskAnswerParamsSchema,
@@ -265,6 +266,7 @@ export function remoteExecutionTiming(input: Partial<RemoteExecutionTiming> = {}
 export interface RemoteExecutionBudgets {
 	readonly connectTimeoutMs: number;
 	readonly callTimeoutMs: number;
+	readonly eventDeliveryTimeoutMs: number;
 	readonly startTimeoutMs: number;
 	readonly cleanupTimeoutMs: number;
 	readonly leaseMs: number;
@@ -294,6 +296,7 @@ export function remoteExecutionBudgets(input: Partial<RemoteExecutionBudgets> = 
 	const defaults: RemoteExecutionBudgets = {
 		connectTimeoutMs: 5_000,
 		callTimeoutMs: 15_000,
+		eventDeliveryTimeoutMs: LOCAL_BROKER_REQUEST_TIMEOUT_MS + 5_000,
 		startTimeoutMs: 180_000,
 		cleanupTimeoutMs: 15_000,
 		leaseMs: 30_000,
@@ -301,7 +304,7 @@ export function remoteExecutionBudgets(input: Partial<RemoteExecutionBudgets> = 
 		pollWaitMs: 10_000,
 		idlePollDelayMs: 10,
 		eventBackpressureTimeoutMs: 20_000,
-		eventAcknowledgementTimeoutMs: 30_000,
+		eventAcknowledgementTimeoutMs: LOCAL_BROKER_REQUEST_TIMEOUT_MS + 30_000,
 		maxConnectBytes: 65_536,
 		maxRequestBytes: PROTOCOL_LIMITS.frameBytes,
 		maxResponseBytes: PROTOCOL_LIMITS.frameBytes,

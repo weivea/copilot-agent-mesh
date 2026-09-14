@@ -4,6 +4,7 @@ import { hostname } from 'node:os';
 import { join } from 'node:path';
 
 import type * as vscode from 'vscode';
+import { LOCAL_BROKER_HEARTBEAT_TTL_MS, LOCAL_BROKER_REQUEST_TIMEOUT_MS } from '../../shared/protocol';
 
 import { DeviceService } from '../application/DeviceService';
 import { ListenerService } from '../application/ListenerService';
@@ -242,6 +243,7 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 			ids,
 			clock: systemClock,
 			workspaceLeases: leases,
+			heartbeatTtlMs: LOCAL_BROKER_HEARTBEAT_TTL_MS,
 			onNodeTasksLost: (bindings: readonly NodeTaskBinding[]) => {
 				void brokerTasks?.handleNodeTasksLost(bindings).catch((error: unknown) => {
 					options.logger.error(
@@ -338,6 +340,7 @@ export class ProductionBrokerRuntime implements BrokerRuntime {
 		);
 		broker = new DeviceBroker({
 			identity: options.identityFor(profile.deviceId),
+			requestTimeoutMs: LOCAL_BROKER_REQUEST_TIMEOUT_MS,
 			brokerKey,
 			ownership: options.ownership,
 			registry,

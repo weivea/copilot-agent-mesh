@@ -48,6 +48,7 @@ async function main() {
 		platform: 'node',
 		outdir: 'dist',
 		external: ['vscode'],
+		alias: { 'jsonc-parser': 'jsonc-parser/lib/esm/main.js' },
 		logLevel: 'silent',
 		plugins: [
 			/* add to the end of plugins array */

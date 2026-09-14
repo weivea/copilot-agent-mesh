@@ -187,38 +187,57 @@ their historical prefixes, not separate model sessions. This deprecated API is
 an explicit POC dependency; native archive/pin state belongs to VS Code and the
 view revision exposes the preceding resource for state migration.
 
-### Explicit enablement
+### Automatic first-run enablement
 
-Install the matching 0.5.5 packages and run the normal Codespaces runtime setup.
-Then **fully quit desktop VS Code**, launch from a desktop terminal, and
-reconnect to the Codespace:
+Install the matching 0.5.12 packages and run the normal Codespaces runtime setup.
+On first companion activation, the desktop extension automatically saves the
+companion's permission, then asks the user to **fully quit all VS Code windows
+and reopen once**. Reconnect normally. No launch flags or manual JSON edits are
+required, including on a new device. Existing command-line grants are also
+persisted so later normal launches do not depend on them.
 
-```powershell
-code --enable-proposed-api weivea.copilot-agent-mesh-codespaces
-```
+The workspace companion never edits desktop paths remotely. It invokes the
+version-checked `enableNativeChat` command in the desktop UI extension. That
+extension opens VS Code's own **Configure Runtime Arguments** editor and merges
+only `weivea.copilot-agent-mesh-codespaces` into the `enable-proposed-api` array
+in the user `argv.json`. Stable, Insiders and portable locations are validated;
+an unrelated workspace file named `argv.json` is never modified. JSONC comments,
+formatting, other settings and existing IDs are retained. No wildcard, extra
+extension grant or VS Code installation-file modification is used.
 
-Reloading a window alone does not grant new proposed-API permissions to an
-already-running desktop process. For persistent opt-in, use **Preferences:
-Configure Runtime Arguments**, merge the companion ID into the existing array,
-and restart:
+The write uses a version-checked native editor edit, native save/conflict handling,
+and a read-back check. Dirty, invalid, oversized or concurrently changed files
+stop automatic setup with an actionable error rather than overwriting user
+work. A saved permission is idempotent and does not reopen the config editor
+on every activation. **Enable Native Codespaces Chat** retries an unsuccessful
+save; **Native Codespaces Chat Setup (POC)** reports the current state.
 
-```json
-{
-  "enable-proposed-api": ["weivea.copilot-agent-mesh-codespaces"]
-}
-```
+VS Code reads this permission at desktop process startup. Window reload alone
+is insufficient, and the extension reports `restartRequired`, not `enabled`,
+when actual native API registration still requires permission. It never restarts the
+application without user action. API availability, workspace authorization,
+runtime download/license consent and Copilot authentication remain separate.
 
-Do not overwrite other runtime arguments or existing extension IDs. **Copilot
-Agent Mesh: Native Codespaces Chat Setup (POC)** reports the activation state
-and can copy the launch command or open the runtime arguments; it never edits
-them, signs in, grants workspace access, or starts a task.
+In 0.5.7 an additional startup check incorrectly treated absence of an internal
+workbench menu command as proof that permission was denied, then disposed the
+already-registered provider. 0.5.8 removes that check: menu enumeration is not a
+provider-capability contract. Actual API registration failures still report
+permission or compatibility problems. Automatic permission persistence never
+unregisters an accepted provider.
 
 `copilotAgentMesh.codespaces.nativeChat.enabled` defaults to `true` but only
 operates when VS Code grants the proposed APIs; set it to `false` and reload to
-opt out. `codespaces.nativeChat.autoOpen` defaults to `true`; set it to `false`
+opt out, including from automatic permission setup. Existing saved permissions
+are not automatically removed. `codespaces.nativeChat.autoOpen` defaults to `true`; set it to `false`
 to keep incoming tasks in Sessions without stealing focus. **Open Codespaces
 Session** also opens retained history. Missing permissions leave the existing
-Mesh execution route available and report native UI as unavailable.
+Mesh execution route available and report native UI as unavailable. Once the
+history store is initialized, recording is independent of presentation:
+incoming tasks while waiting for a full restart still save transcripts and show
+an explicit warning. They can be opened after the native UI becomes available.
+Earlier tasks that ran without an observer are not automatically reconstructed
+or replayed. The companion logs native presentation state and whether execution
+recording is attached, without prompt text or credentials.
 
 ### Execution, controls and persistence
 
@@ -366,8 +385,129 @@ without allowing archive or manifest paths to follow arbitrary symlinks.
 
 ## Failure and lifecycle semantics
 
+### Stream delivery and output limits
+
+The 0.5.6 fix addresses two independent truncation paths. The runtime queue
+previously treated every tiny model delta as a separate item, so a short Chinese
+response could exhaust 256 items while far below the 512 KiB byte budget.
+Consecutive output deltas now concatenate losslessly into at most 8 KiB batches,
+without crossing progress, tool, input or terminal boundaries. The existing
+queue limits and nondroppable control-event behavior are unchanged. This reduces
+per-token bridge acknowledgements and native history writes without introducing
+an unbounded backlog or another model invocation.
+
+Normal summaries and event text in source `wait`/`getTask` results use the
+existing 16 KiB task-text budget, not the unrelated 2 KiB error-message budget.
+The overall Tool byte/token budgets still apply, and read-result contraction
+retains its truncation metadata. Delta-boundary whitespace is retained when
+forming the source completion summary. True queue-overflow clipping does not
+split Unicode surrogate pairs.
+
+`Agent output was truncated while the consumer was catching up` still reports
+actual bounded-queue loss under sustained overload; it is not suppressed.
+The native archive's 2 MiB/session limit and source summary limits are distinct.
+Previously dropped deltas are not recoverable by rereading the old Mesh task:
+the update prevents new loss but never replays an old task to fabricate history.
+
 The Broker remains the durable task authority. A start receipt is not proof of
 execution or completion. Event acknowledgements follow Broker acceptance.
+
+### Bounded shared-host pauses
+
+The desktop Broker currently shares VS Code's Extension Host with other
+extensions. A CPU-heavy Copilot initialization or repository scan can therefore
+pause its responses without the Codespace companion or Agent actually failing.
+The 0.5.9 transport budgets distinguish ordinary companion RPC latency from
+waiting for this desktop Broker:
+
+| Boundary | Production bound |
+| --- | --- |
+| Window Node / Broker ordinary IPC | 60 seconds |
+| Node heartbeat freshness at Broker | 90 seconds; actual socket closure still removes the node immediately |
+| Ordinary Codespaces command RPC | 15 seconds, unchanged |
+| Desktop delivery of a companion event to Broker | 65 seconds |
+| Companion wait for event acknowledgement | 90 seconds |
+| Companion heartbeat / execution lease | 5 / 30 seconds, unchanged |
+| Agent task startup | At most 180 seconds and the existing absolute task deadline, unchanged |
+
+An event awaiting Broker acceptance does not block the independent companion
+heartbeat/control lanes. Queues, pending calls and tasks keep their existing
+bounds. Actual socket loss, invalid capability/generation, unconfirmed cleanup
+and an exceeded delivery deadline still fail explicitly. A longer liveness
+grace is not permission to replay the task or extend its worker deadline.
+Failure diagnostics include the operation, configured budget and elapsed time,
+not prompt text, credentials or arbitrary request payloads.
+
+Regression coverage includes a real 31-second delayed Broker acknowledgement
+through the actual local IPC, Broker, Window Nodes and Codespaces bridge: the
+first task completes once and both nodes remain registered. Separately, an
+over-budget acknowledgement still retires its exact generation and a real
+transport close remains immediate. This mitigates stalls; full process
+isolation from unrelated extension CPU work is not claimed.
+
+### Dashboard refresh and reconnection
+
+Each Webview retains its last successfully validated display and action
+bindings while an ordinary background read is pending. Refresh-in-progress is
+not proof of lost authority. It neither disables controls nor publishes an
+intermediate refreshing model. A confirmed unavailable read or invalid model
+revokes actions; a read that has not returned for ten seconds also enters a
+read-only reconnecting state. Without any previous valid snapshot,
+`DASHBOARD_CONNECTING` claims neither live rows nor a saved connection preference.
+
+Readonly queries no longer clear action registries at entry. Desktop, Broker
+candidate, connectivity, policy and management producers collect asynchronous
+data first, then synchronously mint/publish a bounded next registry. Exact
+unchanged, unconsumed JSON-data bindings reuse their opaque handles. Removed or
+changed bindings are pruned, and a handle consumed during a read cannot be
+resurrected by that read. Per-view aliases likewise reuse only currently live
+exact bindings, never aliases from a read-only display cache.
+
+This is not cached authorization: native actions still validate caller/session,
+Broker generation, Workspace identity/claims, policy revision, device/target
+state and any post-confirmation conditions before effects. Handles remain
+one-use and cannot cross actions or windows. A change in authority is distinct
+from a refresh of unchanged data.
+
+Local navigation and explicit Refresh remain usable. Displayed saved
+enable/disable preferences are retained instead of translating an unread
+Broker setting into "connections off". The native title-bar Enable/Disable
+action uses the last authoritative saved `enabled` preference, not an `online`
+health indicator. Pending, reconnecting or invalid reads do not switch it.
+Context updates are deduplicated and serialized so a late update cannot race a
+newer preference. The body and reconnect notice separately report liveness.
+Host-side action checks and disabled frontend
+controls both enforce read-only state. A fresh validated snapshot restores
+controls and clears the notice; genuine data-validation and configuration
+faults are not converted into success.
+
+The display cache exists only for that Webview instance, until recovery,
+invalidation or disposal. One owned stalled-read timer never starts extra reads
+or resets on every outage refresh. Existing revision coalescing suppresses late
+results. Aliases invalidated by confirmed loss, stalling or invalid data are not
+resurrected after recovery. Opening **Delegate in Chat** still rechecks the exact
+target and only prepares a partial prompt; it does not start or retry an Agent.
+
+0.5.10 corrects the 0.5.9 toolbar regression: publishing a temporary refresh
+notice previously set the `connectionsOnline` context to false and a completed
+refresh set it back to true. That context selected Enable versus Disable, so
+the toolbar could alternate indefinitely even while the saved preference and
+actual connection stayed unchanged. The action now uses `connectionsEnabled`;
+this fix does not change account, network or task state.
+
+0.5.11 corrects the separate refreshing-banner regression. The one-second grace
+had only delayed the stronger reconnecting message; the earlier Updating message
+was still rendered on every healthy read. The renderer now keeps that internal
+marker silent while retaining its stale-action checks. English and Chinese
+regressions repeat twenty short refresh cycles and assert no banner, unchanged
+row DOM identity and recovery of controls after each valid snapshot.
+
+0.5.12 fixes the underlying action-lifetime regression, beyond the earlier
+banner-only correction. Normal refreshes keep Delegate and other still-valid
+actions continuously usable. Tests actually click Delegate while the production
+bindings refresh is blocked, and execute a management action while a backend
+snapshot is waiting; both complete without a stale-action error, and consumed
+handles remain rejected on replay.
 
 On transient transport loss, stop admission and reconcile the exact existing
 request/task IDs. On a changed helper generation, retire the old execution
@@ -412,8 +552,11 @@ idempotency conflicts, wrong capabilities/generations/workspaces, policy denial,
 input/answer, cancellation, bounded event delivery, lease expiry, shutdown, and
 packaged entry points. Existing local editor behavior must remain intact.
 
-`npm run test:native-chat` starts isolated desktop profiles with the companion's
-proposals explicitly enabled, opens the actual native Chat editor, checks
+`npm run test:native-chat` isolates both the desktop user home and profile (the
+runtime permission file is not scoped by `--user-data-dir`). A first run checks
+that the workbench contribution is unavailable, saves permission via the native
+editor, and confirms a restart is still required. Later runs pass no proposed-API
+launch flag, open the actual native Chat editor, and check
 rendered streamed content through the local renderer, closes/reopens the view,
 and restarts VS Code against the same transcript store. This harness uses
 synthetic task events and does not authenticate or run a model. It is separate
@@ -422,6 +565,14 @@ a cloud/model acceptance result.
 Native cancellation dispatch tests inject only the confirmation decision because
 VS Code's Extension Host test mode deliberately refuses modal prompts; the
 production service still uses the native modal confirmation.
+
+The 0.5.8 native harness also runs the **production NativeChatService and
+WindowNodeTaskExecutor** with only the Codespaces environment tag and a
+filtered/empty command list simulated. Actual provider registration, live native
+rendering, Sessions enumeration and reopening after a process restart are
+checked. Directly constructing `NativeChatProvider` alone does not cover the
+service's activation/eligibility logic and was insufficient for the 0.5.7
+regression. The synthetic runtime does not make this a real cloud/model test.
 
 Real Codespaces qualification additionally records the exact desktop/server/CLI
 versions, Linux architecture, native account authorization, a real remote task

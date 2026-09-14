@@ -49,6 +49,7 @@ import type { ProductionRemoteTaskAdapter } from './ProductionRemoteTaskAdapter'
 import { resolveWindowDisplayName } from '../broker/WindowName';
 import { ProductionDashboardManagement } from './ProductionDashboardManagement';
 import { localize } from './ProductionLocalization';
+import { snapshotActionIssuer } from '../ui/SnapshotActionIssuer';
 
 interface ConnectivityOptions {
 	readonly vscodeApi: typeof vscode;
@@ -306,15 +307,16 @@ export class ProductionConnectivity implements BrokerConnectivity {
 		const discovery = this.discovery.snapshot(this.options.deviceId);
 		const claimed = this.options.registry.peerNode(caller)?.workspaces.filter((workspace) => workspace.status === 'claimed') ?? [];
 		const error = this.error ?? discovery.error;
+		const catalog = this.ready ? await this.incomingPeers() : [];
+		this.assertCaller(caller, session);
 		const handles = new Map<string, ActionBinding>();
-		this.actions.set(session, handles);
-		const issue = (kind: ActionBinding['kind'], id: string): string => {
-			const handle = randomUUID(); handles.set(handle, { kind, id }); return handle;
-		};
+		const issueBinding = snapshotActionIssuer(this.actions.get(session), handles, (binding) => {
+			const handle = randomUUID(); handles.set(handle, binding); return handle;
+		});
+		const issue = (kind: ActionBinding['kind'], id: string): string => issueBinding({ kind, id });
 		const incoming: ConnectivitySnapshot['incomingPeers'] = [];
 		let incomingTruncated = false;
 		if (this.ready) {
-			const catalog = await this.incomingPeers();
 			incomingTruncated = catalog.length > 256;
 			for (const peer of catalog.slice(0, 256)) {
 				incoming.push({
@@ -324,7 +326,7 @@ export class ProductionConnectivity implements BrokerConnectivity {
 			}
 
 		}
-		return connectivitySnapshotSchema.parse({
+		const result = connectivitySnapshotSchema.parse({
 			enabled: settings.enabled,
 			connectionState: !this.ready ? 'error' : this.connectionState,
 			accountLabel: settings.account?.accountLabel,
@@ -344,23 +346,26 @@ export class ProductionConnectivity implements BrokerConnectivity {
 				...candidate, actionHandle: issue('candidate', candidateHandle),
 			})),
 		});
+		this.actions.set(session, handles);
+		return result;
 	}
 
 	public async policySnapshot(caller: NodeIdentityParams, session: LocalIpcSession): Promise<RemotePolicyDashboard> {
 		this.assertCaller(caller, session);
 		this.remotePolicies.requireEnabled();
-		const handles = new Map<string, PolicyActionBinding>();
-		this.policyActions.set(session, handles);
 		const peers = await this.options.records.listPeers();
+		const profiles = await this.options.profiles.list();
 		this.assertCaller(caller, session);
+		this.remotePolicies.requireEnabled();
+		const handles = new Map<string, PolicyActionBinding>();
 		const revoked = new Set(this.revocations.snapshot().map((entry) => entry.peerId));
 		const sources = this.remotePolicies.sources(caller);
 		const revision = this.remotePolicies.revision();
-		const issue = (binding: PolicyActionBinding) => {
+		const issue = snapshotActionIssuer(this.policyActions.get(session), handles, (binding: PolicyActionBinding) => {
 			const handle = randomUUID();
 			handles.set(handle, binding);
 			return handle;
-		};
+		});
 		const workspaces = sources.map((workspace) => {
 			const policy = this.remotePolicies.policy(workspace.workspaceIdentity);
 			const name = resolveWindowDisplayName(undefined, workspace.name, caller.nodeId);
@@ -389,7 +394,7 @@ export class ProductionConnectivity implements BrokerConnectivity {
 		const remote = this.options.remoteTasks();
 		const remoteTargets: RemotePolicyDashboard['remoteTargets'] = [];
 		const peerStates: RemotePolicyDashboard['peerStates'] = [];
-		for (const profile of (await this.options.profiles.list()).filter((entry) =>
+		for (const profile of profiles.filter((entry) =>
 			!entry.cleanupPending && entry.peerId !== undefined && entry.credentialKeyRef !== undefined
 			&& entry.invitationId === undefined && entry.pendingEnrollmentId === undefined).slice(0, 32)) {
 			const state = this.peers.get(profile.id)?.snapshot().state ?? 'offline';
@@ -419,7 +424,9 @@ export class ProductionConnectivity implements BrokerConnectivity {
 				}
 			}
 		}
-		return remotePolicyDashboardSchema.parse({ workspaces, remoteTargets, peerStates, truncated });
+		const result = remotePolicyDashboardSchema.parse({ workspaces, remoteTargets, peerStates, truncated });
+		this.policyActions.set(session, handles);
+		return result;
 	}
 
 	public managementSnapshot(caller: NodeIdentityParams, session: LocalIpcSession): Promise<DashboardManagement> {

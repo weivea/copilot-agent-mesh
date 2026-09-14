@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { test, type TestContext } from 'node:test';
 import { z } from 'zod';
+import { LOCAL_BROKER_HEARTBEAT_TTL_MS, LOCAL_BROKER_REQUEST_TIMEOUT_MS } from '../../shared/protocol';
 
 import {
 	createAgentRuntimeEventQueue,
@@ -48,6 +49,7 @@ const taskReadSchema = z.object({
 	snapshot: z.object({
 		taskId: z.string(),
 		status: z.string(),
+		summary: z.string().optional(),
 		pendingInput: z.object({ inputId: z.string() }).optional(),
 	}),
 });
@@ -112,6 +114,57 @@ test('six existing tools collaborate through the real Broker, Codespaces bridge 
 	assert.ok(transcript.turns[0].entries.some((entry) => entry.kind === 'input'));
 	assert.ok(transcript.turns[0].entries.some((entry) => entry.text.includes('Remote result.')));
 	assert.equal(f.brokerStarts, 1);
+	assert.deepEqual(f.errors, []);
+});
+
+test('slow Codespaces output acknowledgement preserves the full Chinese response in source and native history', async (t) => {
+	const f = await fixture(t, { outputDelayMs: 40 });
+	await f.authorizeBothDirections();
+	const submitted = await f.sourceTools.delegateTask({
+		targetHandle: await handleFor(f.sourceTools, f.target.nodeId),
+		delegationRequestId: randomUUID(), title: 'Streaming response', prompt: 'Return the complete response.', mode: 'submit',
+	});
+	const taskId = z.string().parse(submitted.t);
+	await waitFor(() => f.remoteStarted.has(taskId));
+	const body = '逐字发送的中文和表情🙂，每一段都要按顺序完整返回。\n'.repeat(60);
+	const text = `First word ${body}Final ending.`;
+	const handle = f.remote.handles.get(taskId)!;
+	await handle.events.push({ type: 'output', text: 'First word ' });
+	for (const character of `${body}Final ending.`) { await handle.events.push({ type: 'output', text: character }); }
+	await handle.events.push({ type: 'completed' });
+	const result = taskReadSchema.parse(await f.sourceTools.getTask({ taskId, waitFor: 'outcome', waitSeconds: 5 }));
+	assert.equal(result.snapshot.status, 'completed');
+	await waitFor(() => f.nativeStore.sessionForTask(taskId)?.turns.at(-1)?.status === 'completed');
+	const entries = f.nativeStore.sessionForTask(taskId)!.turns.at(-1)!.entries;
+	assert.equal(entries.filter((entry) => entry.kind === 'output').map((entry) => entry.text).join(''), text);
+	assert.ok(!entries.some((entry) => entry.text.includes('consumer was catching up')));
+	assert.equal(result.snapshot.summary, text.replace(/\s+/gu, ' ').trim());
+	assert.equal(f.remote.requests.length, 1, 'Recovering output must not execute another model turn.');
+	assert.deepEqual(f.errors, []);
+});
+
+test('the first task survives a 31-second Broker acknowledgement pause with production budgets', { timeout: 60_000 }, async (t) => {
+	const f = await fixture(t, { productionTiming: true, brokerEventDelayMs: 31_000 });
+	await f.authorizeBothDirections();
+	const startedAt = Date.now();
+	const waiting = f.sourceTools.delegateTask({
+		targetHandle: await handleFor(f.sourceTools, f.target.nodeId),
+		delegationRequestId: randomUUID(), title: 'Slow Broker first task', prompt: 'Complete once after the Broker resumes.',
+	});
+	await waitFor(() => f.remote.requests.length === 1 && f.remoteStarted.has(f.remote.requests[0].taskId));
+	const taskId = f.remote.requests[0].taskId;
+	const handle = f.remote.handles.get(taskId)!;
+	await handle.events.push({ type: 'output', text: 'The first task completed without replay.\n' });
+	await handle.events.push({ type: 'completed' });
+	const result = await waiting;
+	assert.equal(result.s, 0);
+	assert.equal(result.t, taskId);
+	assert.equal(taskReadSchema.parse(await f.sourceTools.getTask({ taskId })).snapshot.status, 'completed');
+	assert.ok(Date.now() - startedAt >= 31_000);
+	assert.equal(f.source.snapshot().registered, true);
+	assert.equal(f.target.snapshot().registered, true);
+	assert.equal(f.remote.requests.length, 1);
+	await waitFor(() => f.nativeStore.sessionForTask(taskId)?.turns.at(-1)?.status === 'completed');
 	assert.deepEqual(f.errors, []);
 });
 
@@ -344,7 +397,7 @@ class Ownership extends TestOwnership implements BrokerOwnership {
 	public async dispose(): Promise<void> {}
 }
 
-async function fixture(t: TestContext) {
+async function fixture(t: TestContext, options: { outputDelayMs?: number; productionTiming?: boolean; brokerEventDelayMs?: number } = {}) {
 	const root = await mkdtemp(join(tmpdir(), 'mesh-codespaces-tools-'));
 	const cleanups: Array<() => Promise<void>> = [() => rm(root, { recursive: true, force: true })];
 	let stopping = false;
@@ -371,6 +424,7 @@ async function fixture(t: TestContext) {
 	const registry = await NodeRegistry.create({
 		deviceId: identity.deviceId, state: new State(), ids: { next: randomUUID }, clock,
 		workspaceLeases: new WorkspaceLeaseManager(),
+		...(options.productionTiming ? { heartbeatTtlMs: LOCAL_BROKER_HEARTBEAT_TTL_MS } : {}),
 	});
 	const policies = new PeerPolicyService(peerStore, registry, { enabled: () => true });
 	registry.setPeerRouteAuthorizer(policies);
@@ -378,10 +432,22 @@ async function fixture(t: TestContext) {
 	const service = new BrokerTaskService(identity.deviceId, registry, new FileTaskStore(files, clock), clock, {
 		onTaskSnapshot: (snapshot, sourceNodeId) => broker.publishTaskSnapshot(snapshot, sourceNodeId),
 	});
+	if (options.brokerEventDelayMs !== undefined) {
+		const accept = service.acceptNodeEvent.bind(service);
+		let delayed = false;
+		service.acceptNodeEvent = async (...args) => {
+			if (!delayed && args[1].event.type === 'output') {
+				delayed = true;
+				await new Promise((resolve) => setTimeout(resolve, options.brokerEventDelayMs));
+			}
+			return accept(...args);
+		};
+	}
 	await service.initialize();
 	broker = new DeviceBroker({
 		identity, brokerKey, ownership, registry, peerPolicies: policies, taskService: service,
-		taskRoutes: new TaskRouteCatalog(new State(), clock.now), requestTimeoutMs: 5_000,
+		taskRoutes: new TaskRouteCatalog(new State(), clock.now),
+		requestTimeoutMs: options.productionTiming ? LOCAL_BROKER_REQUEST_TIMEOUT_MS : 5_000,
 	});
 	cleanups.push(() => broker.dispose());
 	await broker.start();
@@ -407,7 +473,14 @@ async function fixture(t: TestContext) {
 			});
 			const executor = new WindowNodeTaskExecutor({
 				...context, executionBackend: 'codespace-owned', runtime: observation.runtime(remote),
-				eventSink: observation.eventSink(context.eventSink),
+				eventSink: observation.eventSink({
+					publish: async (event) => {
+						if (event.event.type === 'output' && options.outputDelayMs !== undefined) {
+							await new Promise((resolve) => setTimeout(resolve, options.outputDelayMs));
+						}
+						await context.eventSink.publish(event);
+					},
+				}),
 				observeInputAnswer: observation.observeInputAnswer,
 				confirmationHost: { confirm: async () => 'once' }, ids: randomUUID, clock,
 			});
@@ -432,6 +505,7 @@ async function fixture(t: TestContext) {
 	const source = new WindowNodeClient({
 		identity, brokerKey, nodeId: sourceNodeId, nodeInstanceId: sourceInstanceId,
 		label: 'Desktop', capabilities: ['agentRuntime', 'tasks'],
+		...(options.productionTiming ? { requestTimeoutMs: LOCAL_BROKER_REQUEST_TIMEOUT_MS } : {}),
 		workspaceSource: () => [{ localUri: sourceUri, name: 'Desktop repository' }],
 		executor: (context) => new WindowNodeTaskExecutor({
 			...context, nodeId: sourceNodeId, nodeInstanceId: sourceInstanceId, nodeLabel: 'Desktop',
@@ -446,6 +520,7 @@ async function fixture(t: TestContext) {
 	target = new WindowNodeClient({
 		identity, brokerKey, nodeId: targetNodeId, nodeInstanceId: targetInstanceId,
 		label: 'Codespace', capabilities: ['agentRuntime', 'tasks', 'codespace-owned'],
+		...(options.productionTiming ? { requestTimeoutMs: LOCAL_BROKER_REQUEST_TIMEOUT_MS } : {}),
 		workspaceSource: () => execution.listWorkspaces(),
 		fileIdentityResolver: { resolve: (uri) => execution.resolveIdentity(uri) },
 		executor: (context) => {

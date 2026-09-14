@@ -23,7 +23,7 @@ import {
 	ProductionDashboardBindings,
 	ProductionDashboardBindingsOptions,
 } from '../composition/ProductionDashboardBindings';
-import { AgentMeshViewProvider } from '../ui/AgentMeshViewProvider';
+import { AgentMeshViewProvider, DASHBOARD_REFRESH_GRACE_MS } from '../ui/AgentMeshViewProvider';
 import {
 	DashboardActionError,
 	DashboardFacade,
@@ -127,7 +127,7 @@ suite('Dashboard', () => {
 		assert.doesNotMatch(media.element('pageContent').text, /Receive incoming tasks/u);
 	});
 
-	test('native connection color follows confirmed status rather than enable intent or cached errors', async () => {
+	test('native Enable/Disable follows the saved preference, not connection liveness or unread status', async () => {
 		const facade = new RecordingDashboardFacade();
 		const source = { ...snapshot(), connectivity: connectivitySnapshot() };
 		facade.snapshotValue = source;
@@ -146,25 +146,66 @@ suite('Dashboard', () => {
 				};
 				facade.fireChanged();
 				await settle();
-				assert.equal(context.at(-1), false, connectionState);
+				assert.equal(context.at(-1), true, connectionState);
 			}
 			facade.snapshotValue = {
 				...source, errors: [{ code: 'CONNECTIVITY_UNAVAILABLE', message: 'Connection status is unavailable.' }],
 			};
 			facade.fireChanged();
 			await settle();
-			assert.equal(context.at(-1), false);
+			assert.equal(context.at(-1), true);
 			facade.snapshotValue = source;
 			facade.fireChanged();
 			await settle();
 			assert.equal(context.at(-1), true);
+			assert.deepEqual(context, [true], 'Readiness changes must not rewrite the saved-preference context.');
+			facade.snapshotValue = { ...source, connectivity: DISABLED_CONNECTIVITY_SNAPSHOT };
+			facade.fireChanged();
+			await settle();
+			assert.deepEqual(context, [true, false], 'Only a confirmed disabled preference changes the action.');
 			facade.snapshotValue = {
 				...source, connectivity: { ...source.connectivity, connectedDeviceCount: -1 },
 			};
 			facade.fireChanged();
 			await settle();
 			assert.equal(context.at(-1), false);
+			assert.deepEqual(context, [true, false], 'An unsafe read must not invent or rewrite a preference.');
 			assert.ok(view.webview.sent.some((message) => message.code === 'UNSAFE_VIEW_MODEL'));
+		} finally { provider.dispose(); }
+	});
+
+	test('periodic healthy refreshes keep both toolbar and Delegate actions continuously usable', async () => {
+		const facade = new DeferredDashboardFacade();
+		const clock = new DashboardDisplayClock();
+		const context: boolean[] = [];
+		const provider = new AgentMeshViewProvider(facade, getExtension().extensionUri,
+			async (enabled) => { context.push(enabled); }, clock.schedule);
+		const view = new TestWebviewView();
+		const media = await createDashboardMediaHarness();
+		provider.resolveWebviewView(view);
+		const uiInstanceId = getUiInstanceId(view.webview.html);
+		try {
+			await view.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'ready' });
+			assert.deepEqual(context, [], 'Initial unread fallback data is not an off preference.');
+			facade.resolveNext(managedSnapshot());
+			await settle();
+			media.receive({ ...view.webview.sent.at(-1), uiInstanceId: 'media-view' });
+			const delegateHandle = latestModel(view).deviceTree[0].nodes[1].workspaces[0].delegateActionHandle;
+			assert.deepEqual(context, [true]);
+			for (let index = 0; index < 20; index++) {
+				const publications = view.webview.sent.length;
+				facade.fireChanged();
+				await settle();
+				assert.equal(view.webview.sent.length, publications, 'A pending healthy read must not emit a readonly model.');
+				assert.equal(media.button('Delegate in Chat').disabled, false);
+				assert.deepEqual(context, [true], `Pending refresh ${index} must keep Disable.`);
+				facade.resolveNext(managedSnapshot());
+				await settle();
+				media.receive({ ...view.webview.sent.at(-1), uiInstanceId: 'media-view' });
+				assert.equal(media.button('Delegate in Chat').disabled, false);
+				assert.equal(latestModel(view).deviceTree[0].nodes[1].workspaces[0].delegateActionHandle, delegateHandle);
+				assert.deepEqual(context, [true], `Completed refresh ${index} must not resend the same context.`);
+			}
 		} finally { provider.dispose(); }
 	});
 
@@ -184,6 +225,48 @@ suite('Dashboard', () => {
 			await settle();
 			assert.equal(latestModel(view).connectivity.connectionState, 'online');
 		} finally { finish(); provider.dispose(); }
+	});
+
+	test('native toolbar writes are serialized and coalesce superseded saved preferences', async () => {
+		const facade = new RecordingDashboardFacade();
+		const enabled = { ...snapshot(), connectivity: connectivitySnapshot() };
+		facade.snapshotValue = enabled;
+		const writes: { enabled: boolean; finish(): void }[] = [];
+		const applied: boolean[] = [];
+		const provider = new AgentMeshViewProvider(facade, getExtension().extensionUri,
+			(value) => new Promise<void>((resolve) => {
+				writes.push({ enabled: value, finish: () => { applied.push(value); resolve(); } });
+			}));
+		const view = new TestWebviewView();
+		provider.resolveWebviewView(view);
+		const uiInstanceId = getUiInstanceId(view.webview.html);
+		try {
+			await view.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'ready' });
+			await settle();
+			assert.deepEqual(writes.map((write) => write.enabled), [true]);
+			facade.snapshotValue = { ...enabled, connectivity: DISABLED_CONNECTIVITY_SNAPSHOT };
+			facade.fireChanged();
+			await settle();
+			assert.equal(latestModel(view).connectivity.enabled, false);
+			assert.equal(writes.length, 1, 'A second context write must not race the first.');
+			facade.snapshotValue = enabled;
+			facade.fireChanged();
+			await settle();
+			writes[0].finish();
+			await settle();
+			assert.deepEqual(applied, [true]);
+			assert.equal(writes.length, 1, 'The intermediate disabled preference was superseded before it was sent.');
+			facade.snapshotValue = { ...enabled, connectivity: DISABLED_CONNECTIVITY_SNAPSHOT };
+			facade.fireChanged();
+			await settle();
+			assert.deepEqual(writes.map((write) => write.enabled), [true, false]);
+			writes[1].finish();
+			await settle();
+			assert.deepEqual(applied, [true, false]);
+		} finally {
+			provider.dispose();
+			for (const write of writes) { write.finish(); }
+		}
 	});
 
 	test('a same-named unbound Workspace cannot borrow the current Workspace receive action', async () => {
@@ -1883,7 +1966,12 @@ suite('Dashboard', () => {
 		};
 
 		facade.fireChanged();
-		await waitFor(() => first.webview.sent.length >= 2 && second.webview.sent.length >= 2);
+		await waitFor(() => [first, second].every((view) => {
+			const message = view.webview.sent.at(-1);
+			return message !== undefined && message.type === 'dashboard.snapshot'
+				&& getCollectionLength(message, 'localNodes') === 0
+				&& getCollectionLength(message, 'savedAuthorizations') === 1;
+		}));
 		let latest = first.webview.sent[first.webview.sent.length - 1];
 		assert.equal(getCollectionLength(latest, 'localNodes'), 0);
 		assert.equal(getCollectionLength(latest, 'savedAuthorizations'), 1);
@@ -2071,10 +2159,11 @@ suite('Dashboard', () => {
 		provider.dispose();
 	});
 
-	test('keeps active task UI handles stable across refresh and removes them at terminal state', async () => {
+	test('keeps active task UI handles stable across healthy refresh and removes them at terminal state', async () => {
 		const extension = getExtension();
 		const facade = new RecordingDashboardFacade();
-		const provider = new AgentMeshViewProvider(facade, extension.extensionUri);
+		const clock = new DashboardDisplayClock();
+		const provider = new AgentMeshViewProvider(facade, extension.extensionUri, async () => undefined, clock.schedule);
 		const view = new TestWebviewView();
 		provider.resolveWebviewView(view);
 		const uiInstanceId = getUiInstanceId(view.webview.html);
@@ -2117,7 +2206,7 @@ suite('Dashboard', () => {
 		provider.dispose();
 	});
 
-	test('scopes connectivity aliases to one view, one action, and one snapshot without replay', async () => {
+	test('scopes connectivity aliases to one view and exact binding without replay or refresh-driven revocation', async () => {
 		const facade = new RecordingDashboardFacade();
 		const connectivity = connectivitySnapshot();
 		facade.snapshotValue = { ...snapshot(), connectivity };
@@ -2169,6 +2258,15 @@ suite('Dashboard', () => {
 		const stale = getConnectivityActionHandle(first, 'candidates');
 		facade.fireChanged();
 		await settle();
+		assert.strictEqual(stale, getConnectivityActionHandle(first, 'candidates'));
+		facade.snapshotValue = {
+			...snapshot(), connectivity: {
+				...connectivity,
+				candidates: [{ ...connectivity.candidates[0], actionHandle: '00000000-0000-4000-8000-000000000999' }],
+			},
+		};
+		facade.fireChanged();
+		await settle();
 		assert.notStrictEqual(stale, getConnectivityActionHandle(first, 'candidates'));
 		await send(first, 'pairDiscoveredPeer', stale);
 		assert.strictEqual(facade.calls.length, 2);
@@ -2209,7 +2307,7 @@ suite('Dashboard', () => {
 		provider.dispose();
 	});
 
-	test('management aliases are exact-action, one-view, one-snapshot capabilities without replay', async () => {
+	test('management aliases are exact-action and one-view capabilities retained across unchanged reads without replay', async () => {
 		const facade = new RecordingDashboardFacade();
 		facade.snapshotValue = managedSnapshot();
 		const provider = new AgentMeshViewProvider(facade, getExtension().extensionUri);
@@ -2246,12 +2344,9 @@ suite('Dashboard', () => {
 				const refreshed = managementHandle(latestModel(first).management, action);
 				facade.fireChanged();
 				await settle();
-				assert.notEqual(refreshed, managementHandle(latestModel(first).management, action));
+				assert.equal(refreshed, managementHandle(latestModel(first).management, action));
 				await send(first, action, refreshed);
-				assert.equal(facade.calls.length, before, `${action}: refresh invalidates settings aliases`);
-				const current = managementHandle(latestModel(first).management, action);
-				await send(first, action, current);
-				await send(first, action, current);
+				await send(first, action, refreshed);
 				assert.deepEqual(facade.calls.slice(before), [
 					`management:${action}:${raw}:${MANAGEMENT_BOOLEAN_ACTIONS.has(action) ? 'true' : ''}`,
 				]);
@@ -2438,7 +2533,7 @@ suite('Dashboard', () => {
 			assert.deepStrictEqual(facade.calls, ['enableConnectivity']);
 			assert.ok(view.webview.sent.length > 1, 'Local task status must keep updating during native prompts.');
 			assert.deepStrictEqual(view.webview.sent.at(-1)?.pendingActions, ['enableConnectivity']);
-			assert.notStrictEqual(oldHandle, getConnectivityActionHandle(view, 'candidates'));
+			assert.strictEqual(oldHandle, getConnectivityActionHandle(view, 'candidates'));
 
 			await send('disableConnectivity');
 			await send('disableConnectivity');
@@ -2565,6 +2660,405 @@ suite('Dashboard', () => {
 		assert.strictEqual(message.type, 'dashboard.snapshot');
 		assert.strictEqual(getSnapshotDeviceName(message), 'new-device');
 		provider.dispose();
+	});
+
+	test('transient Broker refresh keeps last-known rows without an error flash and revokes every old capability until recovery', async () => {
+		const facade = new DeferredDashboardFacade();
+		const clock = new DashboardDisplayClock();
+		const context: boolean[] = [];
+		const provider = new AgentMeshViewProvider(facade, getExtension().extensionUri,
+			async (online) => { context.push(online); }, clock.schedule);
+		const view = new TestWebviewView();
+		const media = await createDashboardMediaHarness();
+		const renderLatest = () => {
+			const message = view.webview.sent.filter(({ type }) => type === 'dashboard.snapshot').at(-1);
+			assert.ok(message);
+			media.receive({ ...message, uiInstanceId: 'media-view' });
+		};
+		provider.resolveWebviewView(view);
+		const uiInstanceId = getUiInstanceId(view.webview.html);
+		try {
+			await view.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'ready' });
+			const source = managedSnapshot();
+			facade.resolveNext({ ...source, incomingTasks: source.outgoingTasks });
+			await settle();
+			const fresh = latestModel(view);
+			renderLatest();
+			assert.equal(clock.pendingCount, 0);
+			assert.equal(context.at(-1), true);
+			const staleActions: Array<{ action: DashboardAction; actionHandle?: string; enabled?: boolean }> = [
+				{ action: 'openTargetChat', actionHandle: fresh.deviceTree[0].nodes[1].workspaces[0].delegateActionHandle },
+				{ action: 'setTargetAllowed', actionHandle: fresh.management.targets[0].sources[0].actionHandle, enabled: true },
+				{ action: 'switchAccount', actionHandle: fresh.management.accountActionHandle },
+				{ action: 'setAcceptIncoming', actionHandle: fresh.thisWindow.acceptActionHandle, enabled: true },
+				{ action: 'setPeerAllowed', actionHandle: fresh.localNodes[0].actionHandle, enabled: true },
+				{ action: 'cancelOutgoingTask', actionHandle: fresh.outgoingTasks[0].actionHandle },
+				{ action: 'cancelIncomingTask', actionHandle: fresh.incomingTasks[0].actionHandle },
+				{ action: 'enableConnectivity' }, { action: 'disableConnectivity' }, { action: 'configureDevice' },
+				{ action: 'renameWindow' }, { action: 'registerWorkspace' }, { action: 'startListener' },
+				{ action: 'stopListener' }, { action: 'copyConnectionUrl' },
+			];
+			facade.fireChanged();
+			await settle();
+			assert.equal(facade.pendingCount, 1);
+			assert.equal(clock.pendingCount, 1);
+			assert.deepEqual(latestModel(view).errors, []);
+			assert.equal(context.at(-1), true, 'Refreshing must not change the last confirmed enabled preference.');
+			renderLatest();
+			assert.equal(media.element('pageContent').querySelectorAll('.error').length, 0);
+			assert.equal(media.element('pageContent').querySelectorAll('#dashboardFreshness').length, 0,
+				'A brief refresh must not insert a visible status banner.');
+			assert.doesNotMatch(media.element('pageContent').text, /Updating live status/u);
+			assert.doesNotMatch(media.element('pageContent').text, /Reconnecting/u);
+			assert.equal(media.button('Delegate in Chat').disabled, false);
+			assert.equal(media.button('Cancel task').disabled, false);
+			assert.deepEqual(facade.calls, []);
+			assert.equal(facade.pendingCount, 1, 'Rejected stale clicks must not start extra snapshot reads.');
+			assert.equal(media.element('pageContent').querySelectorAll('.error').length, 0);
+			clock.advance(DASHBOARD_REFRESH_GRACE_MS - 1);
+			facade.resolveNext(disconnectedDashboardSnapshot());
+			await settle();
+			assert.deepEqual(latestModel(view).errors.map(({ code }) => code), ['DASHBOARD_RECONNECTING']);
+			clock.advance(1);
+			await settle();
+			renderLatest();
+			const stale = latestModel(view);
+			assert.deepEqual(stale.errors.map(({ code }) => code), ['DASHBOARD_RECONNECTING']);
+			assert.deepEqual(stale.deviceTree, fresh.deviceTree);
+			assert.deepEqual(stale.outgoingTasks, fresh.outgoingTasks);
+			assert.deepEqual(stale.management, fresh.management);
+			assert.deepEqual(stale.connectivity, fresh.connectivity, 'Unread state must not become connections off.');
+			for (const action of staleActions) {
+				await view.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'action', ...action });
+				assert.equal(view.webview.sent.at(-1)?.code, 'STALE_ACTION', action.action);
+				media.receive({ ...view.webview.sent.at(-1), uiInstanceId: 'media-view' });
+			}
+			assert.equal(media.element('pageContent').querySelectorAll('.error').length, 0);
+			assert.equal(media.element('pageContent').querySelectorAll('#dashboardFreshness').length, 1);
+			assert.match(media.element('connectivity').text, /Online.*1 connected/u);
+			assert.ok(media.element('activeTasks').text.includes(fresh.outgoingTasks[0].title));
+			await view.webview.receive({
+				version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'action', ...staleActions[0],
+			});
+			assert.equal(view.webview.sent.at(-1)?.code, 'STALE_ACTION');
+			assert.deepEqual(facade.calls, []);
+			assert.equal(media.button('Refresh local').disabled, false);
+			media.button('Devices & permissions').click();
+			assert.equal(media.element('pageContent').querySelector('button[aria-label="Edit device name"]')?.disabled, true);
+			assert.equal(media.button('Disable cross-device connections').disabled, true);
+			clock.advance(30_000);
+			assert.equal(facade.pendingCount, 0, 'The display timer must not retry models or start work.');
+			assert.equal(clock.pendingCount, 0);
+			assert.match(media.element('dashboardFreshness').text, /Reconnecting/u);
+
+			const recovered = withDeviceName(managedSnapshot(), 'recovered-device');
+			facade.fireChanged();
+			await settle();
+			assert.equal(clock.pendingCount, 0, 'Continued outage refreshes do not restart the grace period.');
+			facade.fireChanged();
+			assert.equal(facade.pendingCount, 1, 'Refresh events share one serialized snapshot read.');
+			facade.resolveNext(withDeviceName(managedSnapshot(), 'superseded-recovery'));
+			await settle();
+			assert.equal(facade.pendingCount, 1);
+			assert.equal(context.at(-1), true);
+			assert.deepEqual(latestModel(view).errors.map(({ code }) => code), ['DASHBOARD_RECONNECTING']);
+			assert.doesNotMatch(JSON.stringify(view.webview.sent), /superseded-recovery/u);
+			facade.resolveNext(recovered);
+			await settle();
+			renderLatest();
+			assert.equal(latestModel(view).device.name, 'recovered-device');
+			assert.deepEqual(latestModel(view).errors, []);
+			assert.equal(context.at(-1), true);
+			assert.equal(media.element('pageContent').querySelectorAll('#dashboardFreshness').length, 0);
+			assert.equal(media.element('pageContent').querySelector('button[aria-label="Edit device name"]')?.disabled, false);
+			assert.notEqual(latestModel(view).outgoingTasks[0].actionHandle, fresh.outgoingTasks[0].actionHandle);
+			assert.notEqual(latestModel(view).management.accountActionHandle, fresh.management.accountActionHandle);
+			media.button('Overview').click();
+			assert.equal(media.button('Delegate in Chat').disabled, false);
+			assert.equal(media.button('Cancel task').disabled, false);
+			await view.webview.receive({
+				version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'action', action: 'openTargetChat',
+				actionHandle: latestModel(view).deviceTree[0].nodes[1].workspaces[0].delegateActionHandle,
+			});
+			assert.deepEqual(facade.calls, [`openTargetChat:${'g'.repeat(32)}`]);
+			assert.ok(!facade.calls.some((call) => call.startsWith('runTask')));
+			facade.resolveNext(recovered);
+			await settle();
+		} finally { provider.dispose(); }
+	});
+
+	test('a brief successful refresh clears its owned grace timer without ever announcing a reconnect', async () => {
+		const facade = new DeferredDashboardFacade();
+		const clock = new DashboardDisplayClock();
+		const provider = new AgentMeshViewProvider(facade, getExtension().extensionUri, async () => undefined, clock.schedule);
+		const view = new TestWebviewView();
+		provider.resolveWebviewView(view);
+		try {
+			await view.webview.receive({
+				version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: getUiInstanceId(view.webview.html), type: 'ready',
+			});
+			const source = managedSnapshot();
+			const active = { ...source, incomingTasks: source.outgoingTasks };
+			facade.resolveNext(active);
+			await settle();
+			const previous = latestModel(view);
+			facade.fireChanged();
+			await settle();
+			clock.advance(DASHBOARD_REFRESH_GRACE_MS - 1);
+			facade.resolveNext(withDeviceName(active, 'fresh-device'));
+			await settle();
+			assert.equal(clock.pendingCount, 0);
+			const publications = view.webview.sent.length;
+			clock.advance(DASHBOARD_REFRESH_GRACE_MS);
+			await settle();
+			assert.equal(view.webview.sent.length, publications);
+			assert.equal(latestModel(view).device.name, 'fresh-device');
+			assert.equal(latestModel(view).outgoingTasks[0].actionHandle, previous.outgoingTasks[0].actionHandle);
+			assert.equal(latestModel(view).incomingTasks[0].actionHandle, previous.incomingTasks[0].actionHandle);
+			assert.equal(latestModel(view).management.accountActionHandle, previous.management.accountActionHandle);
+			assert.doesNotMatch(JSON.stringify(view.webview.sent), /DASHBOARD_RECONNECTING|dashboard\.error/u);
+		} finally { provider.dispose(); }
+	});
+
+	test('cancellation aliases revoked by an unavailable read, grace expiry or invalid data never revive after healthy recovery', async () => {
+		for (const loss of ['unavailable', 'grace', 'invalid'] as const) {
+			const facade = new DeferredDashboardFacade();
+			const clock = new DashboardDisplayClock();
+			const provider = new AgentMeshViewProvider(facade, getExtension().extensionUri, async () => undefined, clock.schedule);
+			const view = new TestWebviewView();
+			provider.resolveWebviewView(view);
+			const uiInstanceId = getUiInstanceId(view.webview.html);
+			const source = managedSnapshot();
+			const active = { ...source, incomingTasks: source.outgoingTasks };
+			const aliases = () => [latestModel(view).outgoingTasks[0].actionHandle, latestModel(view).incomingTasks[0].actionHandle];
+			try {
+				await view.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'ready' });
+				facade.resolveNext(active);
+				await settle();
+				const previous = aliases();
+				facade.fireChanged();
+				await settle();
+				if (loss === 'grace') {
+					clock.advance(DASHBOARD_REFRESH_GRACE_MS);
+					await settle();
+					assert.deepEqual(latestModel(view).errors.map(({ code }) => code), ['DASHBOARD_RECONNECTING']);
+				} else {
+					facade.resolveNext(loss === 'unavailable' ? disconnectedDashboardSnapshot() : {
+						...active, connectivity: { ...active.connectivity!, connectedDeviceCount: -1 },
+					});
+					await settle();
+					if (loss === 'unavailable') {
+						assert.deepEqual(latestModel(view).errors.map(({ code }) => code), ['DASHBOARD_RECONNECTING'],
+							'A confirmed unavailable read revokes actions immediately.');
+					} else {
+						assert.equal(view.webview.sent.at(-1)?.code, 'UNSAFE_VIEW_MODEL');
+					}
+					facade.fireChanged();
+					await settle();
+				}
+				await view.webview.receive({
+					version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'action',
+					action: 'cancelOutgoingTask', actionHandle: previous[0],
+				});
+				assert.equal(view.webview.sent.at(-1)?.code, 'STALE_ACTION');
+				assert.deepEqual(facade.calls, [], 'Confirmed loss or a stalled read must revoke cancellation aliases.');
+				facade.resolveNext(active);
+				await settle();
+				const recovered = aliases();
+				assert.notEqual(recovered[0], previous[0], loss);
+				assert.notEqual(recovered[1], previous[1], loss);
+				facade.fireChanged();
+				await settle();
+				facade.resolveNext(active);
+				await settle();
+				assert.deepEqual(aliases(), recovered, 'Only the newly issued cancellation aliases regain healthy stability.');
+				for (const [index, action] of ['cancelOutgoingTask', 'cancelIncomingTask'].entries()) {
+					await view.webview.receive({
+						version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'action', action, actionHandle: previous[index],
+					});
+					assert.ok(view.webview.sent.some(({ code }) => code === 'STALE_ACTION'));
+					assert.deepEqual(facade.calls, [], `${loss}: a revoked ${action} must never invoke its original Broker handle.`);
+					facade.resolveNext(active);
+					await settle();
+					assert.deepEqual(aliases(), recovered);
+				}
+				await view.webview.receive({
+					version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'action',
+					action: 'cancelOutgoingTask', actionHandle: recovered[0],
+				});
+				assert.deepEqual(facade.calls, [`cancelDashboardTask:outgoing:${'b'.repeat(32)}`]);
+				facade.resolveNext(active);
+				await settle();
+			} finally { provider.dispose(); }
+			assert.equal(clock.pendingCount, 0);
+		}
+	});
+
+	test('a first unresolved or disconnected read shows only honest connecting status and never borrows another view cache', async () => {
+		const facade = new DeferredDashboardFacade();
+		const clock = new DashboardDisplayClock();
+		const provider = new AgentMeshViewProvider(facade, getExtension().extensionUri, async () => undefined, clock.schedule);
+		const first = new TestWebviewView();
+		const second = new TestWebviewView();
+		const media = await createDashboardMediaHarness();
+		provider.resolveWebviewView(first);
+		try {
+			await first.webview.receive({
+				version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: getUiInstanceId(first.webview.html), type: 'ready',
+			});
+			assert.equal(first.webview.sent.length, 0);
+			clock.advance(DASHBOARD_REFRESH_GRACE_MS);
+			await settle();
+			assert.deepEqual(latestModel(first).errors.map(({ code }) => code), ['DASHBOARD_CONNECTING']);
+			assert.deepEqual(latestModel(first).deviceTree, []);
+			media.receive({ ...first.webview.sent.at(-1), uiInstanceId: 'media-view' });
+			assert.match(media.element('pageContent').text, /have not been read/u);
+			assert.throws(() => media.element('connectivity'));
+			assert.throws(() => media.element('deviceTree'));
+			facade.resolveNext(managedSnapshot());
+			await settle();
+			assert.equal(latestModel(first).device.name, 'test-device');
+			provider.resolveWebviewView(second);
+			await second.webview.receive({
+				version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: getUiInstanceId(second.webview.html), type: 'ready',
+			});
+			assert.equal(second.webview.sent.length, 0, 'A different view has no last-known data.');
+			facade.resolveNext(disconnectedDashboardSnapshot());
+			await settle();
+			assert.deepEqual(latestModel(second).errors.map(({ code }) => code), ['DASHBOARD_CONNECTING']);
+			media.receive({ ...second.webview.sent.at(-1), uiInstanceId: 'media-view' });
+			assert.equal(media.element('pageContent').querySelectorAll('.error').length, 0);
+			assert.doesNotMatch(media.element('pageContent').text, /test-device|service-workspace|\bOff\b/u);
+		} finally { provider.dispose(); }
+		assert.equal(clock.pendingCount, 0);
+	});
+
+	test('Broker reconnect suppression preserves genuine configuration, authentication and runtime faults', async () => {
+		const facade = new RecordingDashboardFacade();
+		facade.snapshotValue = managedSnapshot();
+		const clock = new DashboardDisplayClock();
+		const provider = new AgentMeshViewProvider(facade, getExtension().extensionUri, async () => undefined, clock.schedule);
+		const view = new TestWebviewView();
+		const media = await createDashboardMediaHarness();
+		provider.resolveWebviewView(view);
+		try {
+			await view.webview.receive({
+				version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: getUiInstanceId(view.webview.html), type: 'ready',
+			});
+			const unavailable = disconnectedDashboardSnapshot();
+			facade.snapshotValue = {
+				...unavailable,
+				errors: [...unavailable.errors.filter(({ code }) => code !== 'CONNECTIVITY_UNAVAILABLE'),
+					{ code: 'CONFIGURATION_INVALID', message: 'The configured listener port is invalid.' }],
+				broker: { ...unavailable.broker!, error: { code: 'BROKER_AUTH_FAILED', message: 'Broker authentication failed.' } },
+				connectivity: { ...connectivitySnapshot(), connectionState: 'authRequired', error: 'ACCOUNT_CHANGED' },
+				listener: { ...unavailable.listener, gateway: { state: 'error', label: 'Gateway validation failed.' } },
+			};
+			facade.fireChanged();
+			await settle();
+			clock.advance(DASHBOARD_REFRESH_GRACE_MS);
+			await settle();
+			media.receive({ ...view.webview.sent.at(-1), uiInstanceId: 'media-view' });
+			const text = media.element('pageContent').text;
+			assert.match(text, /CONFIGURATION_INVALID/u);
+			assert.match(text, /BROKER_AUTH_FAILED/u);
+			assert.match(text, /ACCOUNT_CHANGED/u);
+			assert.match(text, /Gateway validation failed/u);
+			assert.match(text, /Reconnecting/u);
+			assert.doesNotMatch(text, /LOCAL_BROKER_UNAVAILABLE|MANAGEMENT_UNAVAILABLE|DASHBOARD_TASKS_UNAVAILABLE/u);
+		} finally { provider.dispose(); }
+	});
+
+	test('an invalid snapshot with disconnected-read codes is still rejected and cannot replace or revive cached capabilities', async () => {
+		const facade = new RecordingDashboardFacade();
+		facade.snapshotValue = managedSnapshot();
+		const clock = new DashboardDisplayClock();
+		const provider = new AgentMeshViewProvider(facade, getExtension().extensionUri, async () => undefined, clock.schedule);
+		const view = new TestWebviewView();
+		const media = await createDashboardMediaHarness();
+		provider.resolveWebviewView(view);
+		const uiInstanceId = getUiInstanceId(view.webview.html);
+		try {
+			await view.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'ready' });
+			const handle = latestModel(view).management.accountActionHandle;
+			const invalid = disconnectedDashboardSnapshot();
+			facade.snapshotValue = {
+				...invalid, connectivity: { ...invalid.connectivity!, connectedDeviceCount: -1 },
+			};
+			facade.fireChanged();
+			await settle();
+			assert.equal(view.webview.sent.at(-1)?.code, 'UNSAFE_VIEW_MODEL');
+			assert.equal(clock.pendingCount, 0);
+			const publications = view.webview.sent.length;
+			clock.advance(DASHBOARD_REFRESH_GRACE_MS);
+			assert.equal(view.webview.sent.length, publications);
+			for (const message of view.webview.sent) { media.receive({ ...message, uiInstanceId: 'media-view' }); }
+			assert.match(media.element('pageContent').text, /UNSAFE_VIEW_MODEL/u);
+			assert.throws(() => media.element('deviceTree'));
+			await view.webview.receive({
+				version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'action', action: 'switchAccount', actionHandle: handle,
+			});
+			assert.deepEqual(facade.calls, []);
+			facade.snapshotValue = disconnectedDashboardSnapshot();
+			facade.fireChanged();
+			await settle();
+			assert.deepEqual(latestModel(view).errors.map(({ code }) => code), ['DASHBOARD_CONNECTING'], 'A rejected model clears the old cache.');
+			facade.snapshotValue = managedSnapshot();
+			facade.fireChanged();
+			await settle();
+			media.receive({ ...view.webview.sent.at(-1), uiInstanceId: 'media-view' });
+			assert.doesNotMatch(media.element('pageContent').text, /UNSAFE_VIEW_MODEL|Reconnecting/u);
+			assert.equal(media.button('Delegate in Chat').disabled, false);
+			assert.notEqual(latestModel(view).management.accountActionHandle, handle);
+		} finally { provider.dispose(); }
+	});
+
+	test('disposing or replacing a view during grace cancels its timer and fences late snapshots and aliases', async () => {
+		const facade = new DeferredDashboardFacade();
+		const clock = new DashboardDisplayClock();
+		const context: boolean[] = [];
+		const provider = new AgentMeshViewProvider(facade, getExtension().extensionUri,
+			async (online) => { context.push(online); }, clock.schedule);
+		const view = new TestWebviewView();
+		provider.resolveWebviewView(view);
+		const oldId = getUiInstanceId(view.webview.html);
+		try {
+			await view.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: oldId, type: 'ready' });
+			facade.resolveNext(managedSnapshot());
+			await settle();
+			const oldAlias = latestModel(view).management.accountActionHandle;
+			facade.fireChanged();
+			await settle();
+			assert.equal(clock.pendingCount, 1);
+			view.dispose();
+			assert.equal(clock.pendingCount, 0);
+			const count = view.webview.sent.length;
+			clock.advance(DASHBOARD_REFRESH_GRACE_MS);
+			await settle();
+			assert.equal(view.webview.sent.length, count);
+			provider.resolveWebviewView(view);
+			const newId = getUiInstanceId(view.webview.html);
+			assert.notEqual(newId, oldId);
+			await view.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: newId, type: 'ready' });
+			facade.resolveNext(withDeviceName(managedSnapshot(), 'late-old-view'));
+			await settle();
+			assert.equal(view.webview.sent.length, count);
+			assert.equal(context.at(-1), true, 'A replaced view must not invent a disabled preference.');
+			facade.resolveNext(withDeviceName(managedSnapshot(), 'new-view'));
+			await settle();
+			assert.equal(latestModel(view).device.name, 'new-view');
+			assert.equal(clock.pendingCount, 0);
+			assert.notEqual(latestModel(view).management.accountActionHandle, oldAlias);
+			await view.webview.receive({
+				version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: newId, type: 'action', action: 'switchAccount', actionHandle: oldAlias,
+			});
+			assert.deepEqual(facade.calls, []);
+			assert.ok(view.webview.sent.some(({ code }) => code === 'STALE_ACTION'));
+			assert.doesNotMatch(JSON.stringify(view.webview.sent), /late-old-view/u);
+			facade.resolveNext(managedSnapshot());
+			await settle();
+		} finally { provider.dispose(); }
+		assert.equal(clock.pendingCount, 0);
 	});
 
 	test('stops through the compatibility Listener facade without a second confirmation', async () => {
@@ -2728,6 +3222,7 @@ suite('Dashboard', () => {
 		const view = new TestWebviewView();
 		provider.resolveWebviewView(view);
 		const uiInstanceId = getUiInstanceId(view.webview.html);
+		await view.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'ready' });
 
 		await view.webview.receive({
 			version: DASHBOARD_MESSAGE_VERSION,
@@ -2736,10 +3231,10 @@ suite('Dashboard', () => {
 			action: 'renameWindow',
 		});
 
-		assert.strictEqual(view.webview.sent[0]?.type, 'dashboard.error');
-		assert.strictEqual(view.webview.sent[0]?.code, 'WINDOW_NAME_CONFLICT');
+		const error = view.webview.sent.find(({ type }) => type === 'dashboard.error');
+		assert.strictEqual(error?.code, 'WINDOW_NAME_CONFLICT');
 		assert.strictEqual(
-			view.webview.sent[0]?.message,
+			error?.message,
 			'Another Workspace already uses an equivalent window name.',
 		);
 		provider.dispose();
@@ -2985,15 +3480,66 @@ suite('Dashboard', () => {
 			assert.ok(secondTarget);
 			const staleHandle = getSnapshotTreeWorkspaceHandle(second, secondTarget.key, 'delegateActionHandle');
 			assert.match(staleHandle ?? '', /^[A-Za-z0-9_-]{32}$/u);
-			await fixture.bindings.getSnapshot();
+			const unchanged = await fixture.bindings.getSnapshot();
+			assert.equal(getSnapshotTreeWorkspaceHandle(unchanged, secondTarget.key, 'delegateActionHandle'), staleHandle);
+			await fixture.bindings.openTargetChat(staleHandle!);
 			await assert.rejects(
 				fixture.bindings.openTargetChat(staleHandle!),
 				(error: unknown) => error instanceof DashboardActionError && error.code === 'STALE_ACTION',
 			);
-			assert.strictEqual(fixture.commandCalls.length, 1);
+			assert.strictEqual(fixture.commandCalls.length, 2);
 		} finally {
 			fixture.bindings.dispose();
 		}
+	});
+
+	test('Delegate in Chat stays clickable and opens the exact draft while a real bindings refresh is pending', async () => {
+		const fixture = createConnectivityBindings();
+		fixture.state.connectivity = { ...connectivitySnapshot(), delegationEnabled: true, strictPolicyActivated: true };
+		const facade = new RecordingDashboardFacade();
+		facade.getSnapshot = () => fixture.bindings.getSnapshot();
+		facade.openTargetChat = (handle) => fixture.bindings.openTargetChat(handle);
+		const clock = new DashboardDisplayClock();
+		const provider = new AgentMeshViewProvider(facade, getExtension().extensionUri, async () => undefined, clock.schedule);
+		const view = new TestWebviewView();
+		const media = await createDashboardMediaHarness();
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		provider.resolveWebviewView(view);
+		const uiInstanceId = getUiInstanceId(view.webview.html);
+		try {
+			await view.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'ready' });
+			const fresh = latestModel(view);
+			const target = fresh.deviceTree.find((device) => device.locality === 'remote')?.nodes
+				.flatMap((node) => node.workspaces).find((workspace) => workspace.name === 'billing-api');
+			assert.ok(target?.delegateActionHandle);
+			const initialMessages = view.webview.sent.length;
+			media.receive({ ...view.webview.sent.at(-1), uiInstanceId: 'media-view' });
+			fixture.state.snapshotReadGate = gate;
+			facade.fireChanged();
+			await settle();
+			clock.advance(DASHBOARD_REFRESH_GRACE_MS - 1);
+			await settle();
+			assert.equal(view.webview.sent.length, initialMessages, 'A healthy background read must not publish an unavailable phase.');
+			assert.equal(media.button('Delegate in Chat').disabled, false);
+			const clicked = view.webview.receive({
+				version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'action',
+				action: 'openTargetChat', actionHandle: target.delegateActionHandle,
+			});
+			await waitFor(() => fixture.commandCalls.length === 1);
+			assert.equal(fixture.commandCalls[0].command, 'workbench.action.chat.open');
+			assert.equal((fixture.commandCalls[0].args[0] as { isPartialQuery: boolean }).isPartialQuery, true);
+			fixture.state.snapshotReadGate = undefined;
+			release();
+			await clicked;
+			assert.ok(!view.webview.sent.some((message) => message.type === 'dashboard.error'));
+			await view.webview.receive({
+				version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'action',
+				action: 'openTargetChat', actionHandle: target.delegateActionHandle,
+			});
+			assert.ok(view.webview.sent.some((message) => message.code === 'STALE_ACTION'));
+			assert.equal(fixture.commandCalls.length, 1);
+		} finally { fixture.state.snapshotReadGate = undefined; release(); provider.dispose(); fixture.bindings.dispose(); }
 	});
 
 	test('Production management forwards only scoped capabilities over local IPC without caller-native prompts', async () => {
@@ -3241,6 +3787,12 @@ suite('Dashboard', () => {
 		const view = new TestWebviewView();
 		provider.resolveWebviewView(view);
 		const uiInstanceId = getUiInstanceId(view.webview.html);
+		await view.webview.receive({
+			version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'action', action: 'configureDevice',
+		});
+		assert.deepStrictEqual(facade.calls, [], 'No service action is authorized before the first validated snapshot.');
+		assert.strictEqual(view.webview.sent.at(-1)?.code, 'STALE_ACTION');
+		await view.webview.receive({ version: DASHBOARD_MESSAGE_VERSION, uiInstanceId, type: 'ready' });
 
 		const actions = [
 			{ action: 'configureDevice' },
@@ -3396,6 +3948,28 @@ class DeferredDashboardFacade extends RecordingDashboardFacade {
 		const resolve = this.pending.shift();
 		assert.ok(resolve);
 		resolve(value);
+	}
+}
+
+class DashboardDisplayClock {
+	private now = 0;
+	private readonly pending = new Map<() => void, number>();
+
+	public readonly schedule = (callback: () => void, delayMs: number): vscode.Disposable => {
+		this.pending.set(callback, this.now + delayMs);
+		return new vscode.Disposable(() => { this.pending.delete(callback); });
+	};
+
+	public get pendingCount(): number { return this.pending.size; }
+
+	public advance(milliseconds: number): void {
+		this.now += milliseconds;
+		for (const [callback, due] of this.pending) {
+			if (due <= this.now) {
+				this.pending.delete(callback);
+				callback();
+			}
+		}
 	}
 }
 
@@ -3797,6 +4371,21 @@ function managedSnapshot(): DashboardSnapshot {
 				})),
 			})),
 		})),
+	};
+}
+
+function disconnectedDashboardSnapshot(): DashboardSnapshot {
+	const value = snapshot();
+	return {
+		...value,
+		connectivity: { ...DISABLED_CONNECTIVITY_SNAPSHOT, state: 'error', error: 'DISCOVERY_UNAVAILABLE' },
+		management: { available: false, truncated: false, devices: [], workspaces: [], targets: [] },
+		deviceTree: [], policyCandidates: [], outgoingTasks: [], incomingTasks: [],
+		errors: [
+			'LOCAL_BROKER_UNAVAILABLE', 'CONNECTIVITY_UNAVAILABLE', 'REMOTE_DIRECTORY_UNAVAILABLE',
+			'DASHBOARD_TASKS_UNAVAILABLE', 'MANAGEMENT_UNAVAILABLE', 'PEER_POLICY_UNAVAILABLE',
+			'PEER_CANDIDATES_UNAVAILABLE', 'REMOTE_POLICY_UNAVAILABLE',
+		].map((code) => ({ code, message: 'The local Broker is reconnecting.' })),
 	};
 }
 
@@ -4321,6 +4910,7 @@ async function createDashboardMediaHarness(language = 'en', includeManagement = 
 }
 
 interface RuntimePresentationFixture {
+	snapshotReadGate?: Promise<void>;
 	runtimeProbe?: AgentRuntimeProbe;
 	runtimeStatus?: AgentHostSourceStatus;
 	runtimeError?: Error;
@@ -4549,9 +5139,10 @@ function createConnectivityBindings(): {
 				};
 			},
 			remotePolicyDashboard: async () => state.remotePolicy,
-			managementSnapshot: async () => ({
-				available: false, truncated: false, devices: [], workspaces: [], targets: [],
-			}),
+			managementSnapshot: async () => {
+				await state.snapshotReadGate;
+				return { available: false, truncated: false, devices: [], workspaces: [], targets: [] };
+			},
 			managementAction: async (action: DashboardManagementAction, actionHandle: string, enabled?: boolean) => {
 				managementMutations.push({ action, actionHandle, ...(enabled === undefined ? {} : { enabled }) });
 			},

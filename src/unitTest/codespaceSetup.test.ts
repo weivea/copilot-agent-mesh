@@ -5,7 +5,7 @@ import { LocalDesktopWorkspaceGuard } from '../application/LocalDesktopWorkspace
 import { registerCodespaceSetup } from '../codespaces/CodespaceSetup';
 import { CODESPACES_PREPARE_RUNTIME_COMMAND, CODESPACES_SETUP_COMMAND } from '../codespaces/CodespaceEnvironment';
 import type { StructuredLogger } from '../logging/StructuredLogger';
-import { NATIVE_CHAT_HELP_COMMAND, NATIVE_CHAT_STATUS_COMMAND } from '../codespaces/nativeChat/NativeChatApi';
+import { NATIVE_CHAT_ENABLE_COMMAND, NATIVE_CHAT_HELP_COMMAND, NATIVE_CHAT_STATUS_COMMAND } from '../codespaces/nativeChat/NativeChatApi';
 
 function fixture(options: { cancel?: boolean; declineReload?: boolean; failInstall?: boolean; result?: unknown; nativeChatState?: string } = {}) {
 	const calls: { command: string; args: readonly unknown[] }[] = [];
@@ -74,14 +74,30 @@ test('registration performs no setup; an explicit accepted action installs only 
 	assert.deepEqual(f.calls[1].args, [{ extensionVersion: '0.5.0' }]);
 });
 
-test('setup distinguishes execution readiness from missing native UI permissions without changing accounts or arguments', async (t) => {
+test('setup saves native permission directly without asking for a launch flag or reloading only the window', async (t) => {
 	const f = fixture({ nativeChatState: 'permissionRequired' });
 	t.after(() => f.registration.dispose());
 	await f.run();
-	assert.match(f.messages.at(-1)!, /runtime is ready.*Native Chat POC is not enabled/);
-	assert.ok(f.calls.some(({ command }) => command === NATIVE_CHAT_HELP_COMMAND));
+	assert.ok(f.calls.some(({ command }) => command === NATIVE_CHAT_ENABLE_COMMAND));
 	assert.ok(!f.calls.some(({ command }) => command === 'workbench.action.reloadWindow'));
 	assert.equal(f.errors.length, 0);
+});
+
+test('persisted native permission asks for a full restart and never resaves or starts a task', async (t) => {
+	const f = fixture({ nativeChatState: 'restartRequired' });
+	t.after(() => f.registration.dispose());
+	await f.run();
+	assert.match(f.messages.at(-1)!, /Fully quit all VS Code windows/);
+	assert.match(f.messages.at(-1)!, /No command-line parameters/);
+	assert.ok(!f.calls.some(({ command }) => command === NATIVE_CHAT_ENABLE_COMMAND || command === 'workbench.action.reloadWindow'));
+});
+
+test('setup respects a native Chat opt-out instead of granting permission automatically', async (t) => {
+	const f = fixture({ nativeChatState: 'disabled' });
+	t.after(() => f.registration.dispose());
+	await f.run();
+	assert.ok(!f.calls.some(({ command }) => command === NATIVE_CHAT_ENABLE_COMMAND));
+	assert.ok(f.calls.some(({ command }) => command === NATIVE_CHAT_HELP_COMMAND));
 });
 
 test('setup reports the exact preparation failure without blaming native or Tunnel accounts', async (t) => {

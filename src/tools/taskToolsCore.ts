@@ -472,6 +472,7 @@ export class TaskToolsCore {
 				value,
 				TASK_TOOL_LIMITS.errorMessageBytes,
 			),
+			sanitizeSummary: (value) => safeDelegationText(value, TASK_TOOL_LIMITS.summaryBytes),
 		});
 		return this.fitDelegationResult(this.compactDelegationOutcome(
 			await waiter.wait(),
@@ -905,7 +906,7 @@ export class TaskToolsCore {
 					: {
 						summary: safeDelegationText(
 							read.snapshot.summary,
-							TASK_TOOL_LIMITS.errorMessageBytes,
+							TASK_TOOL_LIMITS.summaryBytes,
 						),
 					}),
 				...(read.snapshot.validation === undefined
@@ -918,7 +919,7 @@ export class TaskToolsCore {
 								: {
 									summary: safeDelegationText(
 										read.snapshot.validation.summary,
-										TASK_TOOL_LIMITS.errorMessageBytes,
+										TASK_TOOL_LIMITS.summaryBytes,
 									),
 								}),
 						},
@@ -985,7 +986,7 @@ export class TaskToolsCore {
 				at: event.at,
 				summary: safeDelegationText(
 					event.summary,
-					TASK_TOOL_LIMITS.errorMessageBytes,
+					TASK_TOOL_LIMITS.summaryBytes,
 				),
 			})),
 			...(read.eventGap === undefined ? {} : { eventGap: { ...read.eventGap } }),
@@ -1613,7 +1614,7 @@ function parseTaskSnapshot(value: unknown): TaskToolSnapshot {
 	]);
 	const status = expectTaskStatus(snapshot.status);
 	const phase = optionalString(snapshot.phase, 'phase', 256);
-	const summary = optionalString(snapshot.summary, 'summary', 16 * 1024);
+	const summary = optionalString(snapshot.summary, 'summary', TASK_TOOL_LIMITS.summaryBytes);
 	const validation = snapshot.validation === undefined ? undefined : parseValidation(snapshot.validation);
 	const artifacts = snapshot.artifacts === undefined
 		? undefined
@@ -1653,7 +1654,7 @@ function parseTaskEvent(value: unknown): TaskToolEvent {
 		sequence: expectInteger(event.sequence, 'sequence', 1, Number.MAX_SAFE_INTEGER),
 		type: expectString(event.type, 'event type', 128),
 		at: expectTimestamp(event.at, 'event time'),
-		summary: expectString(event.summary, 'event summary', 16 * 1024),
+		summary: expectString(event.summary, 'event summary', TASK_TOOL_LIMITS.summaryBytes),
 	};
 }
 
@@ -1682,7 +1683,7 @@ function parseValidation(value: unknown): TaskValidationSummary {
 	if (validation.status !== 'passed' && validation.status !== 'failed' && validation.status !== 'notRun') {
 		throw new Error('validation status is invalid.');
 	}
-	const summary = optionalString(validation.summary, 'validation summary', 16 * 1024);
+	const summary = optionalString(validation.summary, 'validation summary', TASK_TOOL_LIMITS.summaryBytes);
 	return {
 		status: validation.status,
 		...(summary === undefined ? {} : { summary }),

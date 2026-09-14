@@ -26,6 +26,7 @@ import type { FileTaskStore } from '../tasks/FileTaskStore';
 import { redactRemoteText } from '../ui/DashboardRedaction';
 import type { ProductionRemoteTaskAdapter } from './ProductionRemoteTaskAdapter';
 import { formatMessage, type MessageArgument, type MessageTranslator } from './ProductionLocalization';
+import { snapshotActionIssuer } from '../ui/SnapshotActionIssuer';
 
 const savedDeviceSchema = z.strictObject({
 	deviceId: uuidSchema, peerIds: z.array(uuidSchema).max(128), profileIds: z.array(uuidSchema).max(128),
@@ -125,39 +126,50 @@ export class ProductionDashboardManagement {
 
 	public async snapshot(caller: NodeIdentityParams, session: LocalIpcSession): Promise<DashboardManagement> {
 		this.options.assertCaller(caller, session);
-		const handles = new Map<string, Binding>();
-		this.handles.set(session, handles);
 		if (!this.initialized || !this.options.ready()) {
+			this.handles.delete(session);
 			return { available: false, truncated: false, devices: [], workspaces: [], targets: [] };
 		}
+		const devices = await this.devices();
+		let taskRecords: Awaited<ReturnType<FileTaskStore['list']>> | undefined;
+		try { taskRecords = await this.options.tasks.list(); } catch { /* An unreadable task store blocks deletion. */ }
+		const deviceTasks = new Map<string, { activeTaskCount?: number; deleteBlockedReason?: string }>();
+		for (const device of devices.slice(0, 32)) {
+			try {
+				if (taskRecords === undefined) { throw forbidden('Task status is unavailable.'); }
+				const activeTaskCount = (await this.activeTasks(device, taskRecords)).length;
+				deviceTasks.set(device.deviceId, {
+					activeTaskCount,
+					...(activeTaskCount > 0 ? { deleteBlockedReason: this.t('This device has unfinished tasks. Wait for authoritative completion before deleting it.') } : {}),
+				});
+			} catch {
+				deviceTasks.set(device.deviceId, { deleteBlockedReason: this.t('Task status is unavailable. Refresh before deleting this device.') });
+			}
+		}
+		const peerRecords = await this.options.records.listPeers();
+		this.options.assertCaller(caller, session);
+		if (!this.options.ready()) {
+			this.handles.delete(session);
+			return { available: false, truncated: false, devices: [], workspaces: [], targets: [] };
+		}
+		const handles = new Map<string, Binding>();
+		const issueBinding = snapshotActionIssuer(this.handles.get(session), handles, (binding) => {
+			const handle = randomUUID(); handles.set(handle, binding); return handle;
+		});
 		const sources = this.sources(caller);
 		const scope = this.scope(caller);
 		const policyRevision = this.options.remotePolicies.revision();
 		let remoteEditable = true;
 		try { this.options.remotePolicies.requireEnabled(); } catch { remoteEditable = false; }
-		const issue = (action: DashboardManagementAction, rest: Partial<Binding> = {}): string => {
-			const handle = randomUUID();
-			handles.set(handle, { ...rest, action, caller: { ...caller }, generation: this.options.fence.generation, scope, policyRevision });
-			return handle;
-		};
-		const devices = await this.devices();
-		this.options.assertCaller(caller, session);
+		const issue = (action: DashboardManagementAction, rest: Partial<Binding> = {}): string => issueBinding({
+			...rest, action, caller: { ...caller }, generation: this.options.fence.generation, scope, policyRevision,
+		});
 		const snapshot: DashboardManagement = {
 			available: true, truncated: devices.length > 32 || sources.length > 32,
 			accountActionHandle: issue('switchAccount'), devices: [], workspaces: [], targets: [],
 		};
-		let taskRecords: Awaited<ReturnType<FileTaskStore['list']>> | undefined;
-		try { taskRecords = await this.options.tasks.list(); } catch { /* An unreadable task store blocks deletion. */ }
 		for (const device of devices.slice(0, 32)) {
-			let activeTaskCount: number | undefined;
-			let deleteBlockedReason: string | undefined;
-			try {
-				if (taskRecords === undefined) { throw forbidden('Task status is unavailable.'); }
-				activeTaskCount = (await this.activeTasks(device, taskRecords)).length;
-				if (activeTaskCount > 0) { deleteBlockedReason = this.t('This device has unfinished tasks. Wait for authoritative completion before deleting it.'); }
-			} catch {
-				deleteBlockedReason = this.t('Task status is unavailable. Refresh before deleting this device.');
-			}
+			const { activeTaskCount, deleteBlockedReason } = deviceTasks.get(device.deviceId)!;
 			const online = device.profiles.find((profile) =>
 				profile.generation !== undefined && this.authenticatedProfile(profile)
 				&& this.options.endpoints.get(profile.id)?.profileGeneration === profile.generation);
@@ -171,7 +183,7 @@ export class ProductionDashboardManagement {
 			});
 		}
 		const peerDevices = new Map(devices.flatMap((device) => device.peerIds.map((id) => [id, device] as const)));
-		const peers = (await this.options.records.listPeers()).filter((peer) =>
+		const peers = peerRecords.filter((peer) =>
 			!this.options.revocations.snapshot().some((entry) => entry.peerId === peer.peerId)
 			&& !this.deviceDenied(peer.coordinatorDeviceId) && !peer.cleanupPending);
 		const catalog = this.options.registry.catalogSnapshot();
@@ -293,7 +305,9 @@ export class ProductionDashboardManagement {
 			else { snapshot.devices.pop(); }
 		}
 		this.options.assertCaller(caller, session);
-		return dashboardManagementSnapshotSchema.parse(snapshot);
+		const result = dashboardManagementSnapshotSchema.parse(snapshot);
+		this.handles.set(session, handles);
+		return result;
 	}
 
 	public act(caller: NodeIdentityParams, raw: DashboardManagementActionParams, session: LocalIpcSession): Promise<void> {

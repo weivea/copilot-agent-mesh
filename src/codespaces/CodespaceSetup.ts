@@ -11,7 +11,7 @@ import {
 	codespacePreparedSchema,
 	CodespacePreparationError,
 } from './CodespaceSetupProtocol';
-import { NATIVE_CHAT_HELP_COMMAND, NATIVE_CHAT_STATUS_COMMAND, nativeChatStatusSchema } from './nativeChat/NativeChatApi';
+import { NATIVE_CHAT_ENABLE_COMMAND, NATIVE_CHAT_HELP_COMMAND, NATIVE_CHAT_STATUS_COMMAND, nativeChatStatusSchema } from './nativeChat/NativeChatApi';
 
 export function registerCodespaceSetup(
 	api: typeof vscode,
@@ -38,7 +38,7 @@ export function registerCodespaceSetup(
 			api.l10n.t('Install the matching Mesh companion in this Codespace?'),
 			{
 				modal: true,
-				detail: api.l10n.t('The companion runs authorized tasks in this Codespace. Native CLI download and license acceptance are a separate confirmation. No task is started.'),
+				detail: api.l10n.t('The companion runs authorized tasks in this Codespace and automatically saves its desktop native Chat permission; restart VS Code once to apply it. Native CLI download and license acceptance are a separate confirmation. No task is started.'),
 			},
 			install,
 		);
@@ -74,10 +74,20 @@ export function registerCodespaceSetup(
 			}
 			stage = api.l10n.t('checking native Chat setup');
 			const nativeChat = nativeChatStatusSchema.parse(await api.commands.executeCommand(NATIVE_CHAT_STATUS_COMMAND));
+			if (nativeChat.state === 'permissionRequired') {
+				await api.commands.executeCommand(NATIVE_CHAT_ENABLE_COMMAND);
+				return;
+			}
+			if (nativeChat.state === 'restartRequired') {
+				void api.window.showInformationMessage(api.l10n.t(
+					'Native Codespaces Chat permission is saved. Fully quit all VS Code windows and reopen once. No command-line parameters are needed.',
+				));
+				return;
+			}
 			if (nativeChat.state !== 'enabled') {
 				const help = api.l10n.t('Native Chat setup');
 				if (await api.window.showInformationMessage(
-					api.l10n.t('The execution runtime is ready. Native Chat POC is not enabled ({0}); it requires explicit desktop proposed-API setup.', nativeChat.state),
+					api.l10n.t('The execution runtime is ready, but native Chat is unavailable ({0}). Open native Chat setup for details.', nativeChat.state),
 					help,
 				) === help) {
 					await api.commands.executeCommand(NATIVE_CHAT_HELP_COMMAND);

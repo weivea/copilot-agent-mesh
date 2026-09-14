@@ -6,6 +6,96 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [Unreleased]
 
+## [0.5.12 Preview] - 2026-09-14
+
+- Fix refresh-driven clickable/disabled oscillation at its source: ordinary
+  background reads retain the last validated action map and do not publish a
+  temporary readonly phase. Only confirmed unavailability, invalid data or a
+  ten-second stalled read revokes the view's actions.
+- Keep unchanged, unconsumed UI and backend bindings stable across readonly
+  snapshots. Gather asynchronous data before atomic action-registry publication
+  so concurrent clicks are not rejected or resurrected by a later read.
+- Preserve exact caller/window/action/target/generation and permission checks,
+  post-confirmation validation, bounded registries and one-use consumption.
+  Test real clicks while both UI and backend snapshot reads are pending.
+
+## [0.5.11 Preview] - 2026-09-14
+
+- Make the short pending-refresh marker nonvisual. Normal background reads no
+  longer insert/remove the "Updating live status" banner or rebuild unchanged
+  visible rows.
+- Preserve stale-action fencing and show genuine new errors immediately;
+  connecting/reconnecting notices still appear after the existing grace.
+  This is a renderer-only correction, not a task or connection behavior change.
+
+## [0.5.10 Preview] - 2026-09-14
+
+- Fix the cross-device toolbar alternating Enable/Disable during every
+  Dashboard refresh. The action now follows the last confirmed saved enabled
+  preference, independently of transport liveness and reconnect notices.
+- Ignore unread or invalid snapshots for this preference, deduplicate unchanged
+  context values, and serialize/coalesce asynchronous toolbar updates.
+  Task execution, authentication and the existing reconnect action fences are
+  unchanged.
+
+## [0.5.9 Preview] - 2026-09-14
+
+- Separate Codespaces event delivery from the ordinary command timeout so a
+  temporary desktop Broker stall does not prematurely cancel the first task.
+  Align production Broker RPC, node heartbeat freshness and event acknowledgement
+  budgets while retaining task deadlines, companion heartbeat/control lanes,
+  bounded queues and explicit failure on real disconnect.
+- Add safe operation/budget/elapsed diagnostics and a real 31-second delayed
+  acknowledgement regression that completes the first task without replay.
+- Keep per-view last-known Dashboard data during a pending refresh, with a
+  one-second grace and one localized reconnecting notice instead of a cascade
+  of dependent red errors. Preserve the displayed saved connection preference.
+- Fence stale actions in both the Extension Host and UI. Fresh snapshots
+  restore controls; invalid data remains an explicit error. Ordinary healthy
+  active-task cancellation aliases remain stable, but revoked reconnect aliases
+  never revive. Delegate in Chat still opens only a partial draft.
+
+## [0.5.8 Preview] - 2026-09-14
+
+- Remove the 0.5.7 startup check that disposed a successfully registered native
+  Chat/Sessions provider when an internal menu command was absent. Preserve
+  automatic no-flag permission setup and actual API permission/error handling.
+- Keep incoming task transcripts when the native UI is waiting for a full
+  restart; warn instead of silently running without history. Log presentation
+  state and recording attachment without credentials or task content.
+- Exercise the production native service and task executor in the real native
+  UI harness, including a filtered command list, live output, Sessions and
+  process-restart history. The user confirmed the same native UI works on
+  0.5.6, narrowing the regression to the 0.5.7 startup changes.
+
+## [0.5.7 Preview] - 2026-09-14
+
+- Automatically save the Codespaces companion's native Chat permission on first
+  activation, including migration from a command-line grant. New devices need
+  no launch parameter or manual configuration edit; one full VS Code restart
+  applies the saved permission.
+- Preserve JSONC comments, other runtime preferences and other extension IDs.
+  Reject dirty, invalid or concurrently changed runtime configuration rather
+  than overwriting user edits. Keep native Chat opt-outs and task authorization.
+- Add **Enable Native Codespaces Chat** for retry, and verify native workbench
+  availability and rendered history across no-flag restarts in an isolated home.
+- Bundle the JSONC editor's ESM entry point to avoid unresolved UMD dependencies
+  in the private VSIX.
+
+## [0.5.6 Preview] - 2026-09-11
+
+- Coalesce adjacent model-output deltas losslessly into bounded 8 KiB batches.
+  Short token-fragmented responses no longer exhaust the runtime's 256-item
+  queue while a Codespace bridge or native history consumer is catching up.
+  Queue byte/item limits and control-event ordering remain enforced.
+- Give normal source `wait`/`getTask` summaries and event text their 16 KiB
+  task-text limit instead of silently applying the 2 KiB error-message limit.
+  Preserve Tool-wide byte/token budgets and truncation metadata.
+- Preserve word spacing across output boundaries and avoid splitting Unicode
+  surrogate pairs when genuine byte overflow requires clipping.
+- Cover Chinese/emoji token bursts through the AHP mapper, real Broker/bridge/
+  executor path, native history, and native Chat renderer with delayed consumers.
+
 ## [0.5.5 Preview] - 2026-09-11
 
 - Add a private-VSIX POC for native Codespace target Chat and Sessions, using

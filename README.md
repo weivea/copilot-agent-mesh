@@ -1,6 +1,6 @@
 # Copilot Agent Mesh
 
-Copilot Agent Mesh 0.5.5 Preview provides **Peer Window Delegation** for ordinary
+Copilot Agent Mesh 0.5.12 Preview provides **Peer Window Delegation** for ordinary
 VS Code windows on Windows x64/ARM64 and macOS arm64. Local discovery, task tools,
 window naming, and policy controls are enabled by default. In Agent mode, Copilot can use
 six Mesh tools to discover an explicitly authorized peer window, delegate tasks,
@@ -46,12 +46,35 @@ authorize target Workspaces and incoming tasks as usual. No public Codespace
 port, additional Dev Tunnel, PAT setting, or shell login is required.
 Unknown Agent protected resources still require an explicit provider mapping.
 Mesh-owned sessions support continuation within the same live execution
-generation. The **0.5.5 native Chat POC** adds target-side streaming in the
+generation. The **native Chat POC** adds target-side streaming in the
 native Chat editor and retained entries in Sessions, without another model call.
-It requires VS Code 1.137+ and explicit desktop opt-in: fully quit VS Code,
-launch `code --enable-proposed-api weivea.copilot-agent-mesh-codespaces`, then
-reconnect. **Native Codespaces Chat Setup (POC)** provides the instructions
-without changing your runtime arguments.
+It requires VS Code 1.137+. On first companion activation, Mesh automatically
+saves the required desktop permission. **Fully quit all VS Code windows and
+reopen once**, then reconnect. No launch flags or manual configuration edits
+are needed, even on a new device. Existing runtime preferences and other
+extension permissions are preserved. **Enable Native Codespaces Chat** retries
+setup if a dirty or invalid user configuration prevented the automatic save.
+
+Native provider registration no longer depends on discovering an internal
+workbench menu command. While a required full restart is pending, incoming
+tasks still retain their history and show an explicit presentation warning.
+
+Short shared Extension Host stalls no longer use the ordinary 15-second
+Codespaces command budget for Broker event acknowledgements. Execution can wait
+within a separate bounded grace period while companion heartbeats continue.
+This improves first-task resilience without replaying work or removing task
+deadlines; it does not isolate the Broker from other extensions' CPU usage.
+
+The Dashboard keeps its last validated actions usable during ordinary
+background refreshes. Unchanged, unused action bindings remain stable across
+reads; every action still revalidates the current caller, target and permissions.
+No temporary "updating" or disabled phase is emitted for a healthy read.
+Confirmed unavailable/invalid data or a read stalled for ten seconds instead
+enters a read-only reconnecting state. Saved connection preferences are not
+shown as switched off; local navigation and Refresh remain available.
+The title-bar **Enable/Disable cross-device connections** action follows the
+last confirmed saved preference, not the refresh or live transport state, so
+periodic refreshes do not alternate its icon or tooltip.
 
 Native conversation input is read-only in this POC; continue through the source
 Mesh tools, including `#meshAnswerTask` for questions. The target-side Mesh cancel button uses the existing task channel,
@@ -340,7 +363,7 @@ initialization; do not delete policy or revocation files to force a downgrade.
 git submodule update --init --recursive
 npm ci
 npm run package:vsix
-code --install-extension artifacts/copilot-agent-mesh-0.5.5-preview.vsix
+code --install-extension artifacts/copilot-agent-mesh-0.5.12-preview.vsix
 ```
 
 Project documents:

@@ -3,7 +3,7 @@
   "displayName": "Copilot Agent Mesh - Codespaces",
   "description": "Workspace-side execution companion for desktop Copilot Agent Mesh.",
   "publisher": "weivea",
-  "version": "0.5.5",
+  "version": "0.5.12",
   "preview": true,
   "license": "MIT",
   "repository": {
@@ -105,7 +105,7 @@
           "type": "boolean",
           "default": true,
           "scope": "machine",
-          "markdownDescription": "POC: show authorized Codespace tasks in native Chat and Sessions when the desktop explicitly enables this companion's proposed APIs. Reload after changing. Does not change Mesh task authorization or start a second Agent."
+          "markdownDescription": "POC: show authorized Codespace tasks in native Chat and Sessions. On first activation, Mesh automatically saves this companion's desktop API permission; fully restart VS Code once, without command-line parameters. An explicit false disables automatic setup. Does not change task authorization or start a second Agent."
         },
         "copilotAgentMesh.codespaces.nativeChat.autoOpen": {
           "type": "boolean",

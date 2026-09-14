@@ -50,6 +50,7 @@ import {
 	AgentRuntimeLifecycle,
 	AsyncEventQueue,
 	AsyncEventQueueCapacityError,
+	AGENT_RUNTIME_OUTPUT_BATCH_BYTES,
 	createAgentRuntimeEventQueue,
 	type AgentRuntimeEvent,
 	type AgentRuntimeErrorCode,
@@ -102,6 +103,56 @@ test('pinned SDK iterator return does not wake an already parked next', async ()
 	queue.close();
 	await new Promise<void>((resolve) => setImmediate(resolve));
 	assert.equal(settled, false);
+});
+
+test('a small Unicode response remains complete when token count exceeds the queue item limit', async () => {
+	const text = '逐字输出也必须完整保留中文、空格和表情🙂。\n'.repeat(100);
+	const queue = createAgentRuntimeEventQueue();
+	for (const character of text) {
+		await queue.push({ type: 'output', text: character });
+	}
+	await queue.pushAndClose({ type: 'completed' });
+	const events: AgentRuntimeEvent[] = [];
+	for await (const event of queue) { events.push(event); }
+	assert.equal(events.filter((event) => event.type === 'output').map((event) => event.text).join(''), text);
+	assert.ok(!events.some((event) => event.type === 'outputTruncated'));
+	assert.equal(events.at(-1)?.type, 'completed');
+});
+
+test('output coalescing is bounded and never crosses progress, tool, or input boundaries', async () => {
+	const queue = createAgentRuntimeEventQueue();
+	const text = '中文与表情🙂'.repeat(2_000);
+	for (const character of text) { await queue.push({ type: 'output', text: character }); }
+	await queue.push({ type: 'progress', message: 'Progress boundary.' });
+	await queue.push({ type: 'output', text: 'before tool' });
+	await queue.push({ type: 'tool', name: 'tool', status: 'done' });
+	await queue.push({ type: 'output', text: 'after tool' });
+	await queue.push({ type: 'inputRequired', request: { requestId: 'input', kind: 'chatInput', prompt: 'Continue?' } });
+	await queue.push({ type: 'output', text: 'after input' });
+	assert.ok(queue.bufferedItems < 256);
+	assert.ok(queue.bufferedBytes <= 512 * 1024);
+	await queue.pushAndClose({ type: 'completed' });
+	const events: AgentRuntimeEvent[] = [];
+	for await (const event of queue) { events.push(event); }
+	const progress = events.findIndex((event) => event.type === 'progress');
+	assert.equal(events.slice(0, progress).filter((event) => event.type === 'output').map((event) => event.text).join(''), text);
+	assert.deepEqual(events.slice(progress).map((event) => event.type), [
+		'progress', 'output', 'tool', 'output', 'inputRequired', 'output', 'completed',
+	]);
+	for (const event of events) {
+		if (event.type === 'output') { assert.ok(Buffer.byteLength(event.text, 'utf8') <= AGENT_RUNTIME_OUTPUT_BATCH_BYTES); }
+	}
+});
+
+test('real output byte-limit truncation does not split a Unicode surrogate pair', async () => {
+	for (let maxBytes = 128; maxBytes < 180; maxBytes += 1) {
+		const queue = createAgentRuntimeEventQueue({ maxItems: 8, maxBytes });
+		await queue.push({ type: 'output', text: 'x🙂'.repeat(100) });
+		queue.close();
+		for await (const event of queue) {
+			if (event.type === 'output') { assert.doesNotMatch(event.text, /\p{Cs}/u); }
+		}
+	}
 });
 
 test('agent event queue stays within count and byte bounds and preserves terminal events under output pressure', async () => {
@@ -1783,6 +1834,30 @@ for (const outcome of ['valid', 'wrong-workspace', 'cleanup-retry'] as const) {
 		await handle.dispose();
 		await selector.dispose();
 	});
+
+test('AHP token streaming preserves a small Chinese response until a slow consumer catches up', async () => {
+	const transport = new FakeAhpTransport();
+	const runtime = createRuntime(new FakeLauncher(), new FakeConnectionFactory([transport]));
+	const handle = await runtime.start(taskRequest());
+	try {
+		await nextEvent(handle.events);
+		const text = '云端逐字返回的故事，不应因为读取稍慢就丢失内容。🙂\n'.repeat(80);
+		for (const character of text) {
+			await transport.emitChat({
+				type: 'chat/delta', turnId: currentTurnId(transport), partId: 'streamed-story', content: character,
+			});
+		}
+		await transport.emitChat({ type: 'chat/turnComplete', turnId: currentTurnId(transport), duration: 1 });
+		const events: AgentRuntimeEvent[] = [];
+		for await (const event of handle.events) { events.push(event); }
+		assert.equal(events.filter((event) => event.type === 'output').map((event) => event.text).join(''), text);
+		assert.ok(!events.some((event) => event.type === 'outputTruncated'));
+		assert.equal(events.at(-1)?.type, 'completed');
+	} finally {
+		await handle.dispose();
+		await runtime.dispose();
+	}
+});
 
 test('AHP subscription pump applies bounded output pressure before accepting terminal completion', async () => {
 	const transport = new FakeAhpTransport();

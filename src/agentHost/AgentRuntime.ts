@@ -414,7 +414,7 @@ export class AsyncEventQueue<T> implements AsyncIterable<T> {
 			return false;
 		}
 		const priority = this.priority(value);
-		const coalesced = priority === 'coalescible' ? this.tryCoalesce(value) : undefined;
+		const coalesced = priority === 'nondroppable' ? undefined : this.tryCoalesce(value);
 		if (coalesced !== undefined) {
 			return coalesced;
 		}
@@ -665,6 +665,8 @@ export class AsyncEventQueue<T> implements AsyncIterable<T> {
 	}
 }
 
+export const AGENT_RUNTIME_OUTPUT_BATCH_BYTES = 8 * 1024;
+
 export function createAgentRuntimeEventQueue(
 	limits: { readonly maxItems?: number; readonly maxBytes?: number } = {},
 ): AsyncEventQueue<AgentRuntimeEvent> {
@@ -677,8 +679,16 @@ export function createAgentRuntimeEventQueue(
 			: event.type === 'output'
 				? 'droppable'
 				: 'nondroppable',
-		coalesce: (queued, incoming) =>
-			queued.type === 'progress' && incoming.type === 'progress' ? incoming : undefined,
+		coalesce: (queued, incoming) => {
+			if (queued.type === 'progress' && incoming.type === 'progress') { return incoming; }
+			// Output is concatenated, never replaced. Keep batches below a single
+			// downstream task-event limit and never merge across a control event.
+			if (queued.type === 'output' && incoming.type === 'output'
+				&& Buffer.byteLength(queued.text, 'utf8') + Buffer.byteLength(incoming.text, 'utf8') <= AGENT_RUNTIME_OUTPUT_BATCH_BYTES) {
+				return { type: 'output', text: queued.text + incoming.text };
+			}
+			return undefined;
+		},
 		truncate: truncateRuntimeEvent,
 		pressureEvent: () => ({
 			type: 'outputTruncated',
@@ -723,7 +733,11 @@ function fitRuntimeText(
 	let best: AgentRuntimeEvent | undefined;
 	while (low <= high) {
 		const middle = Math.floor((low + high) / 2);
-		const candidate = create(text.slice(0, middle));
+		const end = middle > 0 && middle < text.length
+			&& text.charCodeAt(middle - 1) >= 0xd800 && text.charCodeAt(middle - 1) <= 0xdbff
+			&& text.charCodeAt(middle) >= 0xdc00 && text.charCodeAt(middle) <= 0xdfff
+			? middle - 1 : middle;
+		const candidate = create(text.slice(0, end));
 		if (agentRuntimeEventSize(candidate) <= maxBytes) {
 			best = candidate;
 			low = middle + 1;

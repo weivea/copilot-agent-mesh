@@ -127,14 +127,9 @@ test('authenticated broker RPC keeps Tool and configuration directories separate
 			&& errorReason(error) === 'POLICY_FORBIDDEN',
 	);
 	const refreshed = await fixture.nodeA.listPeerPolicyCandidates(IDENTITY_A);
-	await assert.rejects(
-		fixture.nodeA.setPeerPolicyCandidate(IDENTITY_A, staleHandle, true),
-		(error: unknown) =>
-			error instanceof LocalIpcRemoteError
-			&& errorReason(error) === 'POLICY_FORBIDDEN',
-	);
 	const targetHandle = refreshed.candidates.find(({ self }) => !self)?.actionHandle;
 	assert.ok(targetHandle);
+	assert.equal(targetHandle, staleHandle, 'Reading unchanged candidates must not revoke an unused action.');
 	await fixture.nodeA.setPeerPolicyCandidate(IDENTITY_A, targetHandle, true);
 	await assert.rejects(
 		fixture.nodeA.setPeerPolicyCandidate(IDENTITY_A, targetHandle, false),

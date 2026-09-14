@@ -96,6 +96,7 @@ interface ActiveTask {
 	readonly autoApprovedInputs: Set<string>;
 	outputSummary: string;
 	outputTail: string;
+	outputPendingSpace: boolean;
 	grant: DelegationGrant | undefined;
 	delegatedExecutionContext: DelegatedExecutionContext | undefined;
 	terminal: boolean;
@@ -490,6 +491,7 @@ export class WindowNodeTaskExecutor {
 			autoApprovedInputs: new Set(),
 			outputSummary: '',
 			outputTail: '',
+			outputPendingSpace: false,
 			grant,
 			delegatedExecutionContext: { ...params.delegatedExecutionContext },
 			terminal: false,
@@ -695,7 +697,14 @@ export class WindowNodeTaskExecutor {
 				});
 				return false;
 			case 'output': {
-				const safeOutput = safeTaskText(event.text, PROTOCOL_LIMITS.outputEventBytes);
+				if (/^[ \t\r\n]*$/u.test(event.text)) {
+					active.outputPendingSpace ||= event.text.length > 0;
+					return false;
+				}
+				const separator = active.outputSummary.length > 0
+					&& (active.outputPendingSpace || /^[ \t\r\n]/u.test(event.text)) ? ' ' : '';
+				const safeOutput = separator + safeTaskText(event.text, PROTOCOL_LIMITS.outputEventBytes - separator.length);
+				active.outputPendingSpace = /[ \t\r\n]$/u.test(event.text);
 				active.outputSummary = boundUtf8(
 					active.outputSummary + safeOutput,
 					PROTOCOL_LIMITS.terminalSummaryBytes,

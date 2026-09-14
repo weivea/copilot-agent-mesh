@@ -661,6 +661,11 @@ export const LOCAL_BROKER_NOTIFICATIONS = {
  */
 export const LOCAL_BROKER_TASK_START_TIMEOUT_MS = 180_000;
 
+// The production Broker shares VS Code's Extension Host. These liveness budgets
+// tolerate a short host stall without changing any task's absolute deadline.
+export const LOCAL_BROKER_REQUEST_TIMEOUT_MS = 60_000;
+export const LOCAL_BROKER_HEARTBEAT_TTL_MS = 90_000;
+
 export const localBrokerMethodParamsSchemas = {
 	[LOCAL_BROKER_METHODS.register]: nodeRegisterParamsSchema,
 	[LOCAL_BROKER_METHODS.heartbeat]: nodeHeartbeatParamsSchema,

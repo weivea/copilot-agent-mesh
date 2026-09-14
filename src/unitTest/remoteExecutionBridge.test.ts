@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { test, type TestContext } from 'node:test';
 
-import type { NodeTaskEventParams, NodeTaskStartParams } from '../../shared/protocol';
+import { LOCAL_BROKER_HEARTBEAT_TTL_MS, LOCAL_BROKER_REQUEST_TIMEOUT_MS, LOCAL_BROKER_TASK_START_TIMEOUT_MS, type NodeTaskEventParams, type NodeTaskStartParams } from '../../shared/protocol';
 import {
 	AgentRuntimeApprovalCapabilityIssuer,
 	AgentRuntimeError,
@@ -14,7 +14,7 @@ import {
 	type AgentTaskRequest,
 	type RegisteredLocalWorkspace,
 } from '../agentHost/AgentRuntime';
-import { RemoteExecutionClient } from '../codespaces/RemoteExecutionClient';
+import { RemoteExecutionClient, type RemoteExecutionFailureDiagnostic } from '../codespaces/RemoteExecutionClient';
 import {
 	REMOTE_EXECUTION_CLIENT_EXTENSION_ID,
 	REMOTE_EXECUTION_COMMANDS,
@@ -146,6 +146,7 @@ interface FixtureOptions {
 	readonly createExecutor?: (context: RemoteExecutionExecutorContext) => RemoteExecutionExecutor | Promise<RemoteExecutionExecutor>;
 	readonly invoke?: (command: string, input: unknown, next: () => Promise<unknown>) => Promise<unknown>;
 	readonly onDisconnect?: (error: Error) => Promise<void> | void;
+	readonly reportFailure?: (diagnostic: RemoteExecutionFailureDiagnostic) => void;
 	readonly workspaceResolver?: (workspaceId: string) => Promise<RegisteredLocalWorkspace | undefined>;
 	readonly clientTiming?: Partial<RemoteExecutionTiming>;
 }
@@ -225,6 +226,7 @@ function fixture(t: TestContext, options: FixtureOptions = {}) {
 			disconnects.push(error);
 			await options.onDisconnect?.(error);
 		},
+		reportFailure: options.reportFailure,
 		reportError: (error) => errors.push(error),
 	});
 	t.after(async () => {
@@ -1119,6 +1121,70 @@ test('the normal empty-poll pause cannot let a real executor startup rejection o
 	assert.equal(f.client.generationClosed, false);
 	assert.ok(calls(f, 'events').some((call) =>
 		call.operation.kind === 'events' && call.operation.acknowledgedSeq === 1));
+});
+
+test('production stall budgets align transport delivery, acknowledgement and node liveness without extending task startup', () => {
+	const limits = remoteExecutionBudgets();
+	assert.equal(LOCAL_BROKER_REQUEST_TIMEOUT_MS, 60_000);
+	assert.equal(LOCAL_BROKER_HEARTBEAT_TTL_MS, 90_000);
+	assert.equal(limits.eventDeliveryTimeoutMs, 65_000);
+	assert.equal(limits.eventAcknowledgementTimeoutMs, 90_000);
+	assert.ok(limits.eventDeliveryTimeoutMs > LOCAL_BROKER_REQUEST_TIMEOUT_MS);
+	assert.ok(limits.eventAcknowledgementTimeoutMs > limits.eventDeliveryTimeoutMs + limits.pollWaitMs);
+	assert.equal(limits.callTimeoutMs, 15_000);
+	assert.equal(limits.startTimeoutMs, LOCAL_BROKER_TASK_START_TIMEOUT_MS);
+	assert.equal(limits.startTimeoutMs, 180_000);
+	assert.equal(limits.leaseMs, 30_000);
+	assert.equal(limits.heartbeatIntervalMs, 5_000);
+	assert.equal(limits.maxQueuedEvents, 512);
+});
+
+test('a bounded Broker acknowledgement stall must not invalidate a healthy first execution', async (t) => {
+	const gate = new Deferred<void>();
+	let waiting = false;
+	const f = fixture(t, {
+		clientBudgets: { callTimeoutMs: 40 },
+		eventSink: async (event) => {
+			if (event.event.type === 'output') { waiting = true; await gate.promise; }
+		},
+	});
+	try {
+		await f.client.start(startParams());
+		const handle = f.runtime.handles.get(TASK)!;
+		await handle.events.push({ type: 'output', text: 'First execution response.' });
+		await waitFor(() => waiting);
+		await new Promise((resolve) => setTimeout(resolve, 150));
+		assert.equal(f.client.generationClosed, false, 'A slow Broker is not a lost Codespace generation.');
+		assert.equal(f.disconnects.length, 0);
+		assert.ok(calls(f, 'heartbeat').length >= 2, 'The independent companion heartbeat must continue.');
+		gate.resolve();
+		await handle.events.push({ type: 'completed' });
+		await waitFor(() => f.events.some((event) => event.event.type === 'completed'));
+		assert.equal(f.runtime.requests.length, 1, 'The task must survive rather than being replayed.');
+		assert.equal(f.client.generationClosed, false);
+	} finally { gate.resolve(); }
+});
+
+test('a Broker event sink that exceeds its separate delivery budget still closes the exact generation', async (t) => {
+	const gate = new Deferred<void>();
+	const diagnostics: RemoteExecutionFailureDiagnostic[] = [];
+	const f = fixture(t, {
+		clientBudgets: { eventDeliveryTimeoutMs: 25 },
+		reportFailure: (diagnostic) => diagnostics.push(diagnostic),
+		eventSink: () => gate.promise,
+	});
+	try {
+		await f.client.start(startParams());
+		await f.runtime.handles.get(TASK)!.events.push({ type: 'output', text: 'Bounded delivery.' });
+		await waitFor(() => f.client.generationClosed);
+		assert.equal(f.disconnects.length, 1);
+		assert.equal(f.runtime.requests.length, 1);
+		const diagnostic = diagnostics.find((item) => item.operation === 'brokerEventAck');
+		assert.ok(diagnostic);
+		assert.equal(diagnostic.budgetMs, 25);
+		assert.ok(diagnostic.elapsedMs >= 25);
+		assert.deepEqual(Object.keys(diagnostic).sort(), ['budgetMs', 'elapsedMs', 'operation']);
+	} finally { gate.resolve(); }
 });
 
 test('disposal retires queued and late events for only that task, including a Broker sink awaiting disposal', async (t) => {

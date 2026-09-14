@@ -7,13 +7,23 @@ export const NATIVE_CHAT_OPEN_COMMAND = 'copilotAgentMesh.codespaces.openSession
 export const NATIVE_CHAT_CANCEL_COMMAND = 'copilotAgentMesh.codespaces.cancelSessionTask';
 export const NATIVE_CHAT_STATUS_COMMAND = 'copilotAgentMesh.codespaces.nativeChatStatus';
 export const NATIVE_CHAT_HELP_COMMAND = 'copilotAgentMesh.codespaces.nativeChatHelp';
+export const NATIVE_CHAT_ENABLE_COMMAND = 'copilotAgentMesh.codespaces.enableNativeChat';
 export const NATIVE_CHAT_EXTENSION_ID = 'weivea.copilot-agent-mesh-codespaces';
 export const NATIVE_CHAT_PROPOSALS = ['chatSessionsProvider', 'chatParticipantPrivate'] as const;
 
 export const nativeChatStatusSchema = z.strictObject({
-	state: z.enum(['enabled', 'disabled', 'apiUnavailable', 'permissionRequired', 'initializationFailed', 'unsupportedEnvironment']),
+	state: z.enum(['enabled', 'disabled', 'apiUnavailable', 'permissionRequired', 'restartRequired', 'initializationFailed', 'unsupportedEnvironment']),
 });
 export type NativeChatStatus = z.infer<typeof nativeChatStatusSchema>;
+
+export const nativeChatEnableRequestSchema = z.strictObject({
+	extensionVersion: z.string().min(1).max(64),
+});
+export const nativeChatEnableResultSchema = z.strictObject({
+	state: z.literal('restartRequired'),
+	changed: z.boolean(),
+});
+export type NativeChatEnableResult = z.infer<typeof nativeChatEnableResultSchema>;
 
 export interface NativeChatItem {
 	readonly resource: vscode.Uri;

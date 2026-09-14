@@ -518,6 +518,32 @@ suite('TaskToolsCore', () => {
 		assert.equal(clock.activeTimers, 0);
 	});
 
+	test('preserves task output above the error-message limit in both wait and get results', async () => {
+		const facade = new RecordingFacade();
+		const text = '中文正文不应使用错误消息的长度限制。🙂'.repeat(100);
+		assert.ok(Buffer.byteLength(text, 'utf8') > 2_048);
+		assert.ok(Buffer.byteLength(text, 'utf8') < 16 * 1_024);
+		facade.delegationSnapshot = {
+			taskId: TASK_ID, status: 'completed', title: 'Full response',
+			updatedAt: '2026-08-25T00:00:01.000Z', summary: text,
+		};
+		const delegated = await new TaskToolsCore(facade).delegateTask(delegationInput());
+		assert.equal((delegated.r as { summary: string }).summary, text);
+		facade.taskRead = {
+			snapshot: facade.delegationSnapshot,
+			eventCursor: 1,
+			events: [{ sequence: 1, type: 'output', at: '2026-08-25T00:00:01.000Z', summary: text }],
+			truncated: false,
+		};
+		const tracked = await new TaskToolsCore(facade).getTask({ taskId: TASK_ID });
+		assert.equal((tracked.snapshot as { summary: string }).summary, text);
+		assert.equal((tracked.events as Array<{ summary: string }>)[0].summary, text);
+		assert.equal(tracked.truncated, false);
+		const bounded = await new TaskToolsCore(facade, { outputByteLimit: 1_024 }).getTask({ taskId: TASK_ID });
+		assert.equal(bounded.truncated, true);
+		assert.ok(Buffer.byteLength(JSON.stringify(bounded), 'utf8') <= 1_024);
+	});
+
 	test('preserves safe multiline delegation text while removing sensitive spans', async () => {
 		const raw = [
 			'First safe line\r\nSecond safe line\twith details.',

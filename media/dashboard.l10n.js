@@ -11,6 +11,9 @@
 		savedHelp: 'Saved devices and permissions remain visible when cross-device connections are off. Deletion revokes trust and permissions but preserves task history. Active or unknown task state blocks deletion. Revoke trust remains a separate operation.',
 	};
 	window.dashboardDiagnostics = {
+		DASHBOARD_REFRESHING: 'Updating live status… Showing last-known data only. Actions will return when the refresh completes.',
+		DASHBOARD_RECONNECTING: 'Reconnecting to the local Broker. Showing last-known data, not current status. Saved connection preferences are unchanged; actions are unavailable until live status returns. Refresh to retry.',
+		DASHBOARD_CONNECTING: 'Connecting to the local Broker. Live status and saved connection preferences have not been read. No actions are available yet. Refresh to retry.',
 		DISABLED: 'Cross-device connections are off. Enable connections to discover remote devices.',
 		AUTH_REQUIRED: 'Authorize your VS Code account to connect or retry Tunnel cleanup.',
 		ACCOUNT_CHANGED: 'The selected account does not own this Tunnel. Select its original account to reconnect or finish cleanup.',
@@ -66,6 +69,10 @@
 			'Task history': '任务历史',
 			'Devices & permissions': '设备与权限',
 			'Loading…': '正在加载…',
+			'Dashboard data is unavailable. Refresh to retry.': '仪表盘数据不可用，请刷新后重试。',
+			'Updating live status… Showing last-known data only. Actions will return when the refresh completes.': '正在刷新实时状态… 当前仅显示上次确认的数据，刷新完成后将恢复操作。',
+			'Reconnecting to the local Broker. Showing last-known data, not current status. Saved connection preferences are unchanged; actions are unavailable until live status returns. Refresh to retry.': '正在重新连接本机 Broker。当前显示的是上次确认的数据，并非实时状态。已保存的连接设置未更改，实时状态恢复前暂不可操作。可刷新重试。',
+			'Connecting to the local Broker. Live status and saved connection preferences have not been read. No actions are available yet. Refresh to retry.': '正在连接本机 Broker。尚未读取到实时状态和已保存的连接设置，目前无法操作。可刷新重试。',
 			'Dismiss error': '关闭错误提示',
 			'Help': '帮助',
 			'Help: {0}': '帮助：{0}',

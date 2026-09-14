@@ -14,6 +14,7 @@ import { desktopCodespaceBinding } from '../codespaces/CodespaceEnvironment';
 import { DesktopCodespaceExecution } from '../codespaces/DesktopCodespaceExecution';
 import { RemoteExecutionClient } from '../codespaces/RemoteExecutionClient';
 import { registerCodespaceSetup } from '../codespaces/CodespaceSetup';
+import { registerNativeChatPermissionSetup } from '../codespaces/nativeChat/NativeChatPermissionSetup';
 import { boundUtf8 } from '../workspaces/WorkspaceMetadata';
 import { getWorkerPlatformSupport } from '../application/WorkerPlatformSupport';
 import {
@@ -61,6 +62,7 @@ import {
 	type DashboardTaskTarget,
 } from '../ui/DashboardFacade';
 import { ProductionBrokerRuntime } from './ProductionBrokerRuntime';
+import { LOCAL_BROKER_REQUEST_TIMEOUT_MS } from '../../shared/protocol';
 import { ProductionDashboardBindings } from './ProductionDashboardBindings';
 import {
 	createLocalBrokerIdentity,
@@ -155,6 +157,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			})),
 		);
 		const codespace = readCodespaceBinding();
+		contributions.push(registerNativeChatPermissionSetup(vscode, context, guard, logger));
 		contributions.push(registerCodespaceSetup(vscode, context, guard, logger));
 		const workerPlatform = getWorkerPlatformSupport();
 		const configuration = vscode.workspace.getConfiguration('copilotAgentMesh');
@@ -285,6 +288,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		node = new WindowNodeClient({
 			nodeId,
 			nodeInstanceId,
+			requestTimeoutMs: LOCAL_BROKER_REQUEST_TIMEOUT_MS,
 			label: nodeLabel,
 			capabilities: ['agentRuntime', 'tasks', ...(codespace === undefined ? [] : [CODESPACE_EXECUTION_CAPABILITY])],
 			identity: nodeIdentity,
@@ -307,6 +311,8 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 						invoke: (command: string, input: unknown) => Promise.resolve(vscode.commands.executeCommand(command, input)),
 						workspaceResolver,
 						eventSink,
+						reportFailure: (diagnostic) => logger.log('error', 'codespaces',
+							'Codespaces execution transport did not complete.', { ...diagnostic }),
 						onDisconnect: (error: Error) => {
 							execution.unavailable(error);
 							node.invalidateExecutor(execution);

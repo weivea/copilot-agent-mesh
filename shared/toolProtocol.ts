@@ -13,6 +13,7 @@ export const TASK_TOOL_LIMITS = {
 	answerBytes: 32 * 1024,
 	failureCodeBytes: 128,
 	errorMessageBytes: 2 * 1024,
+	summaryBytes: 16 * 1024,
 	maxDevices: 128,
 	maxNodesPerDevice: 128,
 	maxWorkspacesPerNode: 32,
