@@ -116,20 +116,21 @@ test('setup reports the exact preparation failure without blaming native or Tunn
 			return true;
 		});
 
-		test('updating an active companion asks for reload instead of reporting a failed install or claiming readiness', async (t) => {
-			for (const declineReload of [false, true]) {
-				const f = fixture({ declineReload, result: { ready: false, error: { code: 'PROTOCOL_INCOMPATIBLE' } } });
-				t.after(() => f.registration.dispose());
-				await f.run();
-				assert.equal(f.errors.length, 0);
-				assert.match(f.messages.at(-1)!, /old version is still active/u);
-				assert.match(f.messages.at(-1)!, /run Prepare Codespaces Runtime again/u);
-				assert.ok(!f.messages.some((message) => message.includes('runtime is ready')));
-				assert.equal(f.calls.filter((call) => call.command === 'workbench.action.reloadWindow').length, declineReload ? 0 : 1);
-				assert.equal(f.calls.filter((call) => call.command === CODESPACES_PREPARE_RUNTIME_COMMAND).length, 1);
-			}
-		});
 		assert.ok(!f.calls.some((call) => call.command === 'workbench.action.reloadWindow'));
+	}
+});
+
+test('updating an active companion asks for reload instead of reporting a failed install or claiming readiness', async (t) => {
+	for (const declineReload of [false, true]) {
+		const f = fixture({ declineReload, result: { ready: false, error: { code: 'PROTOCOL_INCOMPATIBLE' } } });
+		t.after(() => f.registration.dispose());
+		await f.run();
+		assert.equal(f.errors.length, 0);
+		assert.match(f.messages.at(-1)!, /old version is still active/u);
+		assert.match(f.messages.at(-1)!, /run Prepare Codespaces Runtime again/u);
+		assert.ok(!f.messages.some((message) => message.includes('runtime is ready')));
+		assert.equal(f.calls.filter((call) => call.command === 'workbench.action.reloadWindow').length, declineReload ? 0 : 1);
+		assert.equal(f.calls.filter((call) => call.command === CODESPACES_PREPARE_RUNTIME_COMMAND).length, 1);
 	}
 });
 

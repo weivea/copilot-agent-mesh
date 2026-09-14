@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, readdir, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -13,7 +13,7 @@ import { NativeChatStore } from '../codespaces/nativeChat/NativeChatStore';
 import { createAgentRuntimeEventQueue } from '../agentHost/AgentRuntime';
 
 async function fixture(t: TestContext, options: { enabled?: boolean; remoteName?: string; missingApi?: boolean; registrationFailure?: string; permissionSaveFailure?: boolean; missingContribution?: boolean } = {}) {
-	const root = await mkdtemp(join(tmpdir(), 'mesh-native-service-'));
+	const root = await realpath(await mkdtemp(join(tmpdir(), 'mesh-native-service-')));
 	await mkdir(join(root, 'workspace'));
 	const workspaceUri = pathToFileURL(join(root, 'workspace')).href;
 	const workspaceId = randomUUID();

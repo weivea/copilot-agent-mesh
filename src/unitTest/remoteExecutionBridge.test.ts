@@ -1168,21 +1168,37 @@ test('a bounded Broker acknowledgement stall must not invalidate a healthy first
 test('a Broker event sink that exceeds its separate delivery budget still closes the exact generation', async (t) => {
 	const gate = new Deferred<void>();
 	const diagnostics: RemoteExecutionFailureDiagnostic[] = [];
+	let now = 0;
+	let expireDelivery: (() => void) | undefined;
 	const f = fixture(t, {
 		clientBudgets: { eventDeliveryTimeoutMs: 25 },
+		clientTiming: {
+			now: () => now,
+			schedule: (callback, delay) => {
+				if (delay === 25) {
+					expireDelivery = callback;
+					return { dispose: () => { expireDelivery = undefined; } };
+				}
+				const timer = setTimeout(callback, delay);
+				return { dispose: () => clearTimeout(timer) };
+			},
+		},
 		reportFailure: (diagnostic) => diagnostics.push(diagnostic),
 		eventSink: () => gate.promise,
 	});
 	try {
 		await f.client.start(startParams());
 		await f.runtime.handles.get(TASK)!.events.push({ type: 'output', text: 'Bounded delivery.' });
+		await waitFor(() => expireDelivery !== undefined);
+		now = 25;
+		expireDelivery!();
 		await waitFor(() => f.client.generationClosed);
 		assert.equal(f.disconnects.length, 1);
 		assert.equal(f.runtime.requests.length, 1);
 		const diagnostic = diagnostics.find((item) => item.operation === 'brokerEventAck');
 		assert.ok(diagnostic);
 		assert.equal(diagnostic.budgetMs, 25);
-		assert.ok(diagnostic.elapsedMs >= 25);
+		assert.equal(diagnostic.elapsedMs, 25);
 		assert.deepEqual(Object.keys(diagnostic).sort(), ['budgetMs', 'elapsedMs', 'operation']);
 	} finally { gate.resolve(); }
 });
