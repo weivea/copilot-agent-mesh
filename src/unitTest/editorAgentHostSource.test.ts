@@ -539,6 +539,29 @@ test('local IPC connector rejects token/status/header failures, timeout, cancell
 	});
 });
 
+test('the WebSocket-owned handshake deadline is classified as a timeout before the outer connector timer fires', async (t) => {
+	await withSocketPath(async (socketPath) => {
+		const server = createTrackedNetServer(() => undefined);
+		await listen(server, socketPath);
+		let now = 0;
+		const clock = t.mock.method(Date, 'now', () => now);
+		const emitted = t.mock.method(WebSocket.prototype, 'emit');
+		try {
+			const connection = new UnixSocketWebSocketConnector({ timeoutMs: 1_000, connectionMode: 'directOnly' })
+				.connect(socketPath, 'token');
+			now = 999;
+			await assertConnectorFailure(connection, 'UPGRADE_TIMEOUT', socketPath, 'token');
+			assert.ok(emitted.mock.calls.some((call) => call.arguments[0] === 'error'
+				&& call.arguments[1] instanceof Error
+				&& call.arguments[1].message === 'Opening handshake has timed out'));
+		} finally {
+			clock.mock.restore();
+			emitted.mock.restore();
+			await closeNetServer(server);
+		}
+	});
+});
+
 test('source selector uses editor first, falls back exactly once, publishes safe status, and preserves default-off standalone behavior', async () => {
 	const editor = new FakeRuntime();
 	const standalone = new FakeRuntime();

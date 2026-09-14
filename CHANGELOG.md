@@ -18,6 +18,9 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 - Preserve exact caller/window/action/target/generation and permission checks,
   post-confirmation validation, bounded registries and one-use consumption.
   Test real clicks while both UI and backend snapshot reads are pending.
+- Classify the underlying WebSocket library's handshake timeout consistently as
+  a timeout, regardless of which deadline fires first. Keep socket validation,
+  cleanup and timeout bounds unchanged.
 
 ## [0.5.11 Preview] - 2026-09-14
 

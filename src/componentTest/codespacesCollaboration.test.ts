@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -398,7 +398,7 @@ class Ownership extends TestOwnership implements BrokerOwnership {
 }
 
 async function fixture(t: TestContext, options: { outputDelayMs?: number; productionTiming?: boolean; brokerEventDelayMs?: number } = {}) {
-	const root = await mkdtemp(join(tmpdir(), 'mesh-codespaces-tools-'));
+	const root = await realpath(await mkdtemp(join(process.platform === 'win32' ? tmpdir() : '/tmp', 'cam-cs-')));
 	const cleanups: Array<() => Promise<void>> = [() => rm(root, { recursive: true, force: true })];
 	let stopping = false;
 	t.after(async () => {

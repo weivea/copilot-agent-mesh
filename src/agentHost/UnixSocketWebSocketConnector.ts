@@ -525,7 +525,7 @@ function webSocketFailure(error: Error & { code?: unknown }): UnixSocketWebSocke
 			socketCode,
 		);
 	}
-	if (error.code === 'ETIMEDOUT') {
+	if (error.code === 'ETIMEDOUT' || error.message === 'Opening handshake has timed out') {
 		return new UnixSocketWebSocketError(
 			'UPGRADE_TIMEOUT',
 			'The editor Agent Host connection timed out.',
