@@ -2,10 +2,13 @@ import { MeshDomainError } from '../domain/errors';
 
 export interface WorkspaceFolderDescriptor {
 	readonly uriScheme: string;
+	readonly uriAuthority?: string;
 }
 
 export interface LocalDesktopEnvironment {
 	readonly remoteName: string | undefined;
+	readonly uiKind?: 'desktop' | 'web';
+	readonly extensionKind?: 'ui' | 'workspace';
 	readonly isTrusted: boolean;
 	readonly workspaceFolders: readonly WorkspaceFolderDescriptor[] | undefined;
 }
@@ -21,10 +24,13 @@ export class LocalDesktopWorkspaceGuard {
 
 	public assertAllowed(options: WorkspaceGuardOptions = { requireWorkspace: true }): void {
 		const environment = this.environment();
-		if (environment.remoteName !== undefined) {
+		const codespaces = environment.remoteName === 'codespaces'
+			&& environment.uiKind === 'desktop'
+			&& environment.extensionKind === 'ui';
+		if (environment.uiKind === 'web' || (environment.remoteName !== undefined && !codespaces)) {
 			throw new MeshDomainError(
 				'REMOTE_WORKSPACE_UNSUPPORTED',
-				'Copilot Agent Mesh v1 only supports local desktop workspaces.',
+				'Mesh supports local desktop workspaces and Codespaces attached to desktop VS Code.',
 			);
 		}
 		if (!environment.isTrusted) {
@@ -44,7 +50,19 @@ export class LocalDesktopWorkspaceGuard {
 				'Open at least one local file workspace folder.',
 			);
 		}
-		if (folders.some((folder) => folder.uriScheme !== 'file')) {
+		if (codespaces) {
+			const authority = folders[0].uriAuthority;
+			if (
+				authority === undefined || !/^codespaces\+[^/\s\\?#]+$/u.test(authority)
+				|| folders.some((folder) =>
+					folder.uriScheme !== 'vscode-remote' || folder.uriAuthority !== authority)
+			) {
+				throw new MeshDomainError(
+					'REMOTE_WORKSPACE_UNSUPPORTED',
+					'All folders must belong to the attached Codespace.',
+				);
+			}
+		} else if (folders.some((folder) => folder.uriScheme !== 'file')) {
 			throw new MeshDomainError(
 				'LOCAL_FILE_WORKSPACE_REQUIRED',
 				'All workspace folders must use the local file scheme.',

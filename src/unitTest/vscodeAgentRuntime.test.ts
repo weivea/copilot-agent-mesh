@@ -111,6 +111,35 @@ test('failure diagnostics are isolated to the gated runtime and remove task text
 	}
 });
 
+test('guarded runtime forwards exact startup cancellation even when execution is no longer allowed', async (t) => {
+	const cancellations: string[] = [];
+	t.mock.method(AgentHostSourceSelector.prototype, 'cancelStart', async (taskId: string) => {
+		cancellations.push(taskId);
+	});
+	for (const supported of [true, false]) {
+		const f = runtimeFixture(undefined, true, supported);
+		try {
+			await f.runtime.cancelStart!('exact-startup-task');
+			assert.equal(f.approvals, 0);
+			assert.equal(f.authentication.requests.length, 0);
+			assert.equal(existsSync(f.root), false);
+		} finally { await f.runtime.dispose(); }
+	}
+	assert.deepEqual(cancellations, ['exact-startup-task', 'exact-startup-task']);
+});
+
+test('guarded runtime preserves scoped startup cancellation cleanup failures', async (t) => {
+	const failure = new AgentRuntimeError(
+		'TASK_CANCELLATION_UNCONFIRMED', 'Synthetic startup cleanup failure.', false, undefined, true,
+	);
+	t.mock.method(AgentHostSourceSelector.prototype, 'cancelStart', async () => { throw failure; });
+	const f = runtimeFixture(undefined);
+	t.after(() => f.runtime.dispose());
+	await assert.rejects(f.runtime.cancelStart!('exact-startup-task'), (error: unknown) => error === failure);
+	assert.equal(f.approvals, 0);
+	assert.equal(f.authentication.requests.length, 0);
+});
+
 function runtimeFixture(previousSetting: boolean | undefined, registered = true, supported = true, editorOnly = false) {
 	const root = join(tmpdir(), `mesh-runtime-gate-${randomUUID()}`);
 	const reads: string[] = [];

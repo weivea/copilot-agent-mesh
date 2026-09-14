@@ -1,4 +1,6 @@
 {
+  "command.enableNativeCodespacesChat": "Enable Native Codespaces Chat",
+  "command.setupCodespaces": "Prepare Codespaces Runtime",
   "command.configureDevice": "Configure Device Name",
   "command.refreshDashboard": "Refresh Dashboard",
   "command.registerWorkspace": "Register Current Workspace",

@@ -39,7 +39,7 @@ test('all localized command and configuration references have English and Chines
 	assert.deepEqual(Object.keys(chinese).sort(), Object.keys(english).sort());
 });
 
-test('native toolbar shows the connection switch first and reserves color for the online command', () => {
+test('native toolbar shows the saved-preference switch first and colors the enabled command', () => {
 	const manifest = z.object({
 		contributes: z.object({
 			commands: z.array(z.object({ command: z.string(), icon: z.unknown().optional() })),
@@ -50,11 +50,13 @@ test('native toolbar shows the connection switch first and reserves color for th
 	}).parse(readJson('package.json'));
 	const actions = manifest.contributes.menus['view/title'];
 	assert.equal(actions.some((action) => action.command === 'copilotAgentMesh.configureDevice'), false);
-	assert.deepEqual(actions.map((action) => action.group), ['navigation@1', 'navigation@1', 'navigation@2', 'navigation@9']);
+	assert.deepEqual(actions.map((action) => action.group), ['navigation@1', 'navigation@1', 'navigation@2', 'navigation@3', 'navigation@9']);
+	assert.equal(actions[3].command, 'copilotAgentMesh.codespaces.setup');
+	assert.match(actions[3].when, /remoteName == codespaces && !isWeb/u);
 	assert.equal(actions[0].command, 'copilotAgentMesh.startListener');
 	assert.equal(actions[1].command, 'copilotAgentMesh.stopListener');
-	assert.match(actions[0].when, /!copilotAgentMesh\.connectionsOnline/u);
-	assert.match(actions[1].when, /&& copilotAgentMesh\.connectionsOnline$/u);
+	assert.match(actions[0].when, /!copilotAgentMesh\.connectionsEnabled/u);
+	assert.match(actions[1].when, /&& copilotAgentMesh\.connectionsEnabled$/u);
 	const start = manifest.contributes.commands.find((command) => command.command === actions[0].command);
 	const stop = manifest.contributes.commands.find((command) => command.command === actions[1].command);
 	assert.equal(start?.icon, '$(radio-tower)');

@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
 import { basename, isAbsolute, join } from 'node:path';
 
@@ -8,7 +8,14 @@ import {
 	AgentRuntimeApprovalCapabilityIssuer,
 	type AgentRuntime,
 } from '../agentHost/AgentRuntime';
-import { LocalDesktopWorkspaceGuard } from '../application/LocalDesktopWorkspaceGuard';
+import { LocalDesktopWorkspaceGuard, type LocalDesktopEnvironment } from '../application/LocalDesktopWorkspaceGuard';
+import { CODESPACE_EXECUTION_CAPABILITY } from '../../shared/protocol';
+import { desktopCodespaceBinding } from '../codespaces/CodespaceEnvironment';
+import { DesktopCodespaceExecution } from '../codespaces/DesktopCodespaceExecution';
+import { RemoteExecutionClient } from '../codespaces/RemoteExecutionClient';
+import { registerCodespaceSetup } from '../codespaces/CodespaceSetup';
+import { registerNativeChatPermissionSetup } from '../codespaces/nativeChat/NativeChatPermissionSetup';
+import { boundUtf8 } from '../workspaces/WorkspaceMetadata';
 import { getWorkerPlatformSupport } from '../application/WorkerPlatformSupport';
 import {
 	BrokerLifecycle,
@@ -55,6 +62,7 @@ import {
 	type DashboardTaskTarget,
 } from '../ui/DashboardFacade';
 import { ProductionBrokerRuntime } from './ProductionBrokerRuntime';
+import { LOCAL_BROKER_REQUEST_TIMEOUT_MS } from '../../shared/protocol';
 import { ProductionDashboardBindings } from './ProductionDashboardBindings';
 import {
 	createLocalBrokerIdentity,
@@ -128,16 +136,29 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 	try {
 		const persistentState = new VscodeGlobalStateStore(context.globalState);
 		const secrets = new VscodeSecretStore(context.secrets);
-		const guard = new LocalDesktopWorkspaceGuard(() => ({
+		const readEnvironment = (): LocalDesktopEnvironment => ({
 			remoteName: vscode.env.remoteName,
+			uiKind: vscode.env.uiKind === vscode.UIKind.Web ? 'web' : 'desktop',
+			extensionKind: context.extension.extensionKind === vscode.ExtensionKind.Workspace ? 'workspace' : 'ui',
 			isTrusted: vscode.workspace.isTrusted,
 			workspaceFolders: vscode.workspace.workspaceFolders?.map((folder) => ({
 				uriScheme: folder.uri.scheme,
+				uriAuthority: folder.uri.authority,
 			})),
-		}));
+		});
+		const guard = new LocalDesktopWorkspaceGuard(readEnvironment);
 		const delegatedToolInvocations = new DelegatedToolInvocationRegistry();
 		addApplicationCleanup(cleanup, () => delegatedToolInvocations.dispose());
 		guard.assertAllowed({ requireWorkspace: false });
+		const readCodespaceBinding = () => desktopCodespaceBinding(
+			readEnvironment(),
+			(vscode.workspace.workspaceFolders ?? []).map((folder) => ({
+				uri: folder.uri.toString(), name: folder.name,
+			})),
+		);
+		const codespace = readCodespaceBinding();
+		contributions.push(registerNativeChatPermissionSetup(vscode, context, guard, logger));
+		contributions.push(registerCodespaceSetup(vscode, context, guard, logger));
 		const workerPlatform = getWorkerPlatformSupport();
 		const configuration = vscode.workspace.getConfiguration('copilotAgentMesh');
 		const twoDeviceE2eRequested = process.env.MESH_TWO_DEVICE_E2E === '1';
@@ -256,21 +277,54 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		const runtimeApprovalCapabilities = new AgentRuntimeApprovalCapabilityIssuer();
 		const nodeConfirmation = new VscodeWindowNodeTaskConfirmation(vscode, e2eCapability);
 		let runtime!: ReturnType<typeof createVscodeAgentRuntime>;
+		let codespaceExecution: DesktopCodespaceExecution | undefined;
 		let sourceStatusSubscription: { dispose(): void } | undefined;
 		const nodeIdentity = createLocalBrokerIdentity(
 			brokerStorageUri,
 			sharedProfile.deviceId,
 		);
 		let nodeStartupComplete = false;
-		const node = new WindowNodeClient({
+		let node!: WindowNodeClient;
+		node = new WindowNodeClient({
 			nodeId,
 			nodeInstanceId,
+			requestTimeoutMs: LOCAL_BROKER_REQUEST_TIMEOUT_MS,
 			label: nodeLabel,
-			capabilities: ['agentRuntime', 'tasks'],
+			capabilities: ['agentRuntime', 'tasks', ...(codespace === undefined ? [] : [CODESPACE_EXECUTION_CAPABILITY])],
 			identity: nodeIdentity,
 			brokerKey,
 			executor: ({ workspaceResolver, eventSink }) => {
 				sourceStatusSubscription?.dispose();
+				if (codespace !== undefined) {
+					const binding = readCodespaceBinding();
+					if (binding === undefined) {
+						throw new Error('The Codespaces execution environment changed.');
+					}
+					let execution!: DesktopCodespaceExecution;
+					const connection = new RemoteExecutionClient({
+						identity: {
+							version: 1, clientId: randomUUID(), nodeId, nodeInstanceId, nodeLabel,
+							authority: binding.authority, expectedFolders: [...binding.expectedFolders],
+							token: randomBytes(32).toString('base64url'),
+						},
+						extensionVersion: environment.extensionVersion,
+						invoke: (command: string, input: unknown) => Promise.resolve(vscode.commands.executeCommand(command, input)),
+						workspaceResolver,
+						eventSink,
+						reportFailure: (diagnostic) => logger.log('error', 'codespaces',
+							'Codespaces execution transport did not complete.', { ...diagnostic }),
+						onDisconnect: (error: Error) => {
+							execution.unavailable(error);
+							node.invalidateExecutor(execution);
+						},
+					});
+					execution = new DesktopCodespaceExecution(connection, (error) =>
+						logger.error('codespaces', 'Codespaces execution requires attention.', error));
+					codespaceExecution = execution;
+					runtime = execution.runtime;
+					sourceStatusSubscription = runtime.onDidSourceStatusChange(() => changeEvents.fire());
+					return execution;
+				}
 				runtime = createVscodeAgentRuntime(
 					vscode,
 					context,
@@ -305,8 +359,14 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 					clock: { now: () => new Date() },
 				});
 			},
+			...(codespace === undefined ? {} : {
+				fileIdentityResolver: { resolve: (uri: string) => codespaceExecution!.resolveIdentity(uri) },
+			}),
 			workspaceSource: () => {
 				guard.assertAllowed({ requireWorkspace: false });
+				if (codespaceExecution !== undefined) {
+					return codespaceExecution.listWorkspaces();
+				}
 				const capabilityTags = vscode.workspace
 					.getConfiguration('copilotAgentMesh')
 					.get<readonly string[]>('workspace.capabilityTags', []);
@@ -334,6 +394,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		addApplicationCleanup(cleanup, () => node.dispose(), true);
 		addApplicationCleanup(cleanup, () => changeEvents.dispose());
 		addApplicationCleanup(cleanup, () => sourceStatusSubscription?.dispose());
+		await codespaceExecution?.initialize();
 		await node.start();
 		nodeStartupComplete = true;
 		const remoteTasks = new LocalIpcRemoteTaskAdapter(node);
@@ -450,6 +511,10 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 				logger,
 			),
 			vscode.workspace.onDidChangeWorkspaceFolders(() => {
+				if (codespaceExecution !== undefined) {
+					node.invalidateExecutor(codespaceExecution);
+					return;
+				}
 				void node.refreshWorkspaces().then(
 					() => changeEvents.fire(),
 					(error: unknown) => logger.error(
@@ -694,23 +759,6 @@ function windowNodeLabel(nodeId: string): string {
 		? 'VS Code'
 		: workspaceName;
 	return boundUtf8(`${base} Window ${nodeId.slice(0, 8)}`, 256);
-}
-
-function boundUtf8(value: string, maximumBytes: number): string {
-	if (Buffer.byteLength(value, 'utf8') <= maximumBytes) {
-		return value;
-	}
-	let result = '';
-	let bytes = 0;
-	for (const character of value) {
-		const size = Buffer.byteLength(character, 'utf8');
-		if (bytes + size > maximumBytes) {
-			break;
-		}
-		result += character;
-		bytes += size;
-	}
-	return result;
 }
 
 function supportedPlatform(platform: NodeJS.Platform): 'win32' | 'darwin' | 'linux' {

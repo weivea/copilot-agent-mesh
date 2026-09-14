@@ -1,7 +1,7 @@
 # Compatibility Matrix
 
-> Status: 0.5.0 Preview adds Windows x64/ARM64 implementation and default-on local peer features<br>
-> Updated: 2026-09-09; earlier live Agent evidence retains its original OS/version scope<br>
+> Status: 0.5.12 Preview keeps unchanged actions usable throughout ordinary background refreshes<br>
+> Updated: 2026-09-14; earlier live Agent evidence retains its original OS/version scope<br>
 > Mesh protocol: v2; v1 peers incompatible
 
 This document is the release gate for external platform compatibility. Installed
@@ -22,7 +22,11 @@ retroactively broaden any of these dated results.
 
 | Capability | Declared or detected | Validated | Status |
 | --- | --- | --- | --- |
-| Package | `0.5.0` Preview VSIX with Windows x64/ARM64 process helpers | Package allowlist includes only the exact helper binaries and their Go license alongside the extension | Preview; not published |
+| Package | `0.5.12` Preview VSIX with Windows x64/ARM64 process helpers and a matching Codespaces companion | Package allowlist includes the exact helper binaries, their Go license, and the separately checked companion VSIX alongside the extension | Private Preview; not published |
+| Shared-host pause resilience | Separate Broker event-delivery and acknowledgement budgets, bounded queues, independent companion heartbeat | Production IPC/Broker/Node/bridge component test delayed the first response acknowledgement by 31 seconds; one execution completed, both nodes stayed registered. Over-budget delay and actual disconnect remain failures | Pass for simulated Broker pause; not an independent-process Broker or a fix to Copilot CPU usage |
+| Automatic native permission | Exact companion permission saved in desktop user argv configuration; one full restart, no manual launch flag | Isolated Windows x64 / Stable 1.137.0: native contribution unavailable before persistence, user configuration preserved, native Chat and Sessions render after restart without a proposal flag | Pass for isolated desktop setup; real Codespace deployment remains a separate scope |
+| Codespaces native Chat POC | VS Code 1.137+; explicit `chatSessionsProvider` and `chatParticipantPrivate` permissions; native Chat editor and retained Sessions over existing owned execution | 2026-09-11 isolated Windows x64 / VS Code 1.137.0: native rendered output, one listed item per conversation, external continuation, close/reopen and full process-restart history; synthetic task events, no authentication/model call; cancel decision injected because test mode rejects modals | Pass for this native UI scope only; private VSIX/proposed API, not live Codespace qualification |
+| Codespaces adapter native Host bootstrap | Native CLI 1.137.0 `645f29cc3176500b4b5762ba887cf2a7f0ffdf2c`, Ubuntu 24.04 Linux x64, glibc 2.39, Node 24.13.0 | 2026-09-11 isolated local Linux run: official CLI installation, production owned Host launch with registry marker `0.1.0`, AHP initialization selecting `0.9.0`, one root snapshot, exact cleanup | Pass for unauthenticated local Linux bootstrap only; no cloud Codespace, authentication, or model turn claimed |
 | Mesh protocol | v2 | Local Broker/Node and remote routing schemas | v2 only; v1 peers incompatible |
 | VS Code minimum | `1.103.0` in `package.json` | Offline API/build coverage | Preview range; real minimum not yet proven |
 | VS Code tested | `1.135.0` and `1.136.1`, macOS arm64 | 1.135.0: real ordinary same-user-data windows and authenticated production AHP turn with offer/selection `["1.0.0"]`/`1.0.0`. 1.136.1: dedicated-profile editor discovery, Unix-socket WebSocket upgrade, dual offer `["1.0.0","0.9.0"]`, selected `0.9.0`, and authoritative short no-tool `chat/turnComplete` | 1.135.0 Pass for scoped Preview; 1.136.1 editor/AHP compatibility Pass |
@@ -74,6 +78,7 @@ arm64.
 | Windows | arm64 | Native ARM64 process helper is cross-compiled; no physical ARM64 task result is claimed | Worker implementation and active Window Node; physical ARM64 gate pending |
 | Windows | x86 | No packaged process controller; current VS Code Windows targets are x64/ARM64 | Worker host unsupported |
 | Linux | x64 | Unix IPC and offline coverage; no validated real Tunnel/Worker gate | Active client Window Node; Worker host unsupported |
+| Desktop-attached Codespace | Linux x64 / arm64 | Workspace companion, generation-bound task bridge, retained owned AHP implementation and native Chat POC; real deployment/Agent evidence is a separate gate | VS Code 1.137+ and companion/runtime setup; native Chat permission is saved automatically with one full restart; not browser or generic Linux desktop hosting |
 
 Windows lifecycle run `88c82a3b-408c-46bf-862b-819401aa7751` separately passed
 closed-window removal, same-Workspace reclaim, Broker takeover in 896 ms,
@@ -94,9 +99,14 @@ there is no unsafe process-killing fallback.
   `folder` isolation. Existing `ahp-session:` histories are not renamed. A Host
   that cannot honor this workspace policy fails explicitly; this does not add
   platform support or upgrade the Chat UI visibility gate from Unverified.
-- SSH, WSL, Dev Containers, Codespaces, `vscode.dev`, virtual workspaces,
+- SSH, WSL, Dev Containers, browser Codespaces, `vscode.dev`, virtual workspaces,
   untrusted workspaces, and mixed local/remote workspace folders remain
   unsupported.
+- Desktop-attached Codespaces use a separate, explicit Mesh-owned execution
+  backend. They do not borrow the Server's unpublished native Agent Host, change
+  desktop device identity, or enable generic Linux cross-device hosting. Setup,
+  session retention, and the deployment qualification boundary are described in
+  [Desktop Codespaces execution](./desktop-codespaces.md).
 
 ## Evidence requirements
 

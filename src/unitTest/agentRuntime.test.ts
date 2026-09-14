@@ -30,6 +30,11 @@ import {
 } from '../agentHost/AhpAgentRuntime';
 import { AhpEventMapper } from '../agentHost/AhpEventMapper';
 import {
+	CodespaceOwnedAgentRuntime,
+	type CodespaceOwnedAgentRuntimeOptions,
+} from '../agentHost/CodespaceOwnedAgentRuntime';
+import { RetainedOwnedAgentHostLauncher } from '../agentHost/RetainedOwnedAgentHostLauncher';
+import {
 	AgentHostLauncher,
 	OwnedAgentHost,
 	type AgentHostLauncherLike,
@@ -45,11 +50,14 @@ import {
 	AgentRuntimeLifecycle,
 	AsyncEventQueue,
 	AsyncEventQueueCapacityError,
+	AGENT_RUNTIME_OUTPUT_BATCH_BYTES,
 	createAgentRuntimeEventQueue,
 	type AgentRuntimeEvent,
 	type AgentRuntimeErrorCode,
 	type AgentRuntimeLifecycleObserver,
 	type AgentRuntimeLifecycleObservation,
+	type AgentHostSource,
+	type AgentTaskHandle,
 	type AgentTaskRequest,
 	type FirstTaskConfirmation,
 } from '../agentHost/AgentRuntime';
@@ -95,6 +103,56 @@ test('pinned SDK iterator return does not wake an already parked next', async ()
 	queue.close();
 	await new Promise<void>((resolve) => setImmediate(resolve));
 	assert.equal(settled, false);
+});
+
+test('a small Unicode response remains complete when token count exceeds the queue item limit', async () => {
+	const text = '逐字输出也必须完整保留中文、空格和表情🙂。\n'.repeat(100);
+	const queue = createAgentRuntimeEventQueue();
+	for (const character of text) {
+		await queue.push({ type: 'output', text: character });
+	}
+	await queue.pushAndClose({ type: 'completed' });
+	const events: AgentRuntimeEvent[] = [];
+	for await (const event of queue) { events.push(event); }
+	assert.equal(events.filter((event) => event.type === 'output').map((event) => event.text).join(''), text);
+	assert.ok(!events.some((event) => event.type === 'outputTruncated'));
+	assert.equal(events.at(-1)?.type, 'completed');
+});
+
+test('output coalescing is bounded and never crosses progress, tool, or input boundaries', async () => {
+	const queue = createAgentRuntimeEventQueue();
+	const text = '中文与表情🙂'.repeat(2_000);
+	for (const character of text) { await queue.push({ type: 'output', text: character }); }
+	await queue.push({ type: 'progress', message: 'Progress boundary.' });
+	await queue.push({ type: 'output', text: 'before tool' });
+	await queue.push({ type: 'tool', name: 'tool', status: 'done' });
+	await queue.push({ type: 'output', text: 'after tool' });
+	await queue.push({ type: 'inputRequired', request: { requestId: 'input', kind: 'chatInput', prompt: 'Continue?' } });
+	await queue.push({ type: 'output', text: 'after input' });
+	assert.ok(queue.bufferedItems < 256);
+	assert.ok(queue.bufferedBytes <= 512 * 1024);
+	await queue.pushAndClose({ type: 'completed' });
+	const events: AgentRuntimeEvent[] = [];
+	for await (const event of queue) { events.push(event); }
+	const progress = events.findIndex((event) => event.type === 'progress');
+	assert.equal(events.slice(0, progress).filter((event) => event.type === 'output').map((event) => event.text).join(''), text);
+	assert.deepEqual(events.slice(progress).map((event) => event.type), [
+		'progress', 'output', 'tool', 'output', 'inputRequired', 'output', 'completed',
+	]);
+	for (const event of events) {
+		if (event.type === 'output') { assert.ok(Buffer.byteLength(event.text, 'utf8') <= AGENT_RUNTIME_OUTPUT_BATCH_BYTES); }
+	}
+});
+
+test('real output byte-limit truncation does not split a Unicode surrogate pair', async () => {
+	for (let maxBytes = 128; maxBytes < 180; maxBytes += 1) {
+		const queue = createAgentRuntimeEventQueue({ maxItems: 8, maxBytes });
+		await queue.push({ type: 'output', text: 'x🙂'.repeat(100) });
+		queue.close();
+		for await (const event of queue) {
+			if (event.type === 'output') { assert.doesNotMatch(event.text, /\p{Cs}/u); }
+		}
+	}
 });
 
 test('agent event queue stays within count and byte bounds and preserves terminal events under output pressure', async () => {
@@ -1776,6 +1834,30 @@ for (const outcome of ['valid', 'wrong-workspace', 'cleanup-retry'] as const) {
 		await handle.dispose();
 		await selector.dispose();
 	});
+
+test('AHP token streaming preserves a small Chinese response until a slow consumer catches up', async () => {
+	const transport = new FakeAhpTransport();
+	const runtime = createRuntime(new FakeLauncher(), new FakeConnectionFactory([transport]));
+	const handle = await runtime.start(taskRequest());
+	try {
+		await nextEvent(handle.events);
+		const text = '云端逐字返回的故事，不应因为读取稍慢就丢失内容。🙂\n'.repeat(80);
+		for (const character of text) {
+			await transport.emitChat({
+				type: 'chat/delta', turnId: currentTurnId(transport), partId: 'streamed-story', content: character,
+			});
+		}
+		await transport.emitChat({ type: 'chat/turnComplete', turnId: currentTurnId(transport), duration: 1 });
+		const events: AgentRuntimeEvent[] = [];
+		for await (const event of handle.events) { events.push(event); }
+		assert.equal(events.filter((event) => event.type === 'output').map((event) => event.text).join(''), text);
+		assert.ok(!events.some((event) => event.type === 'outputTruncated'));
+		assert.equal(events.at(-1)?.type, 'completed');
+	} finally {
+		await handle.dispose();
+		await runtime.dispose();
+	}
+});
 
 test('AHP subscription pump applies bounded output pressure before accepting terminal completion', async () => {
 	const transport = new FakeAhpTransport();
@@ -4006,6 +4088,1186 @@ for (const outcome of ['decline', 'cancel'] as const) {
 		});
 }
 
+test('Codespace-owned runtime probe and preparation remain lazy and never authenticate or confirm a task', async (t) => {
+	const launcher = ownedLauncher();
+	const auth = new RecordingAuthBroker();
+	let confirmations = 0;
+	const transport = new FakeAhpTransport();
+	const runtime = createOwnedRuntime(launcher, [transport], {
+		authBroker: auth,
+		confirmation: { confirm: async () => { confirmations += 1; return 'once'; } },
+	});
+	t.after(() => runtime.dispose());
+	assert.deepEqual(runtime.sourceStatus(), { source: 'codespace-owned', degraded: false });
+	assert.deepEqual(await runtime.probe(), {
+		available: true, featureEnabled: true, version: '1.134.0', source: 'codespace-owned', reason: undefined,
+	});
+	await runtime.prepareStart();
+	assert.equal(launcher.launchCalls, 0);
+	assert.equal(transport.initialized, false);
+	assert.equal(auth.requests.length, 0);
+	assert.equal(confirmations, 0);
+});
+
+test('Codespace-owned runtime rejects missing or editor-selected backends before launch or approval', async (t) => {
+	const launcher = ownedLauncher();
+	let confirmations = 0;
+	const runtime = createOwnedRuntime(launcher, [], {
+		confirmation: { confirm: async () => { confirmations += 1; return 'once'; } },
+	});
+	t.after(() => runtime.dispose());
+	for (const request of [
+		taskRequest(),
+		{ ...taskRequest(), executionBackend: 'editor' as const },
+		{ ...ownedTaskRequest(), requireEditor: true as const },
+	]) {
+		await assert.rejects(runtime.start(request), (error: unknown) =>
+			error instanceof AgentRuntimeError && error.code === 'AGENT_UNAVAILABLE');
+	}
+	await assert.rejects(runtime.prepareStart({ requireEditor: true }), AgentRuntimeError);
+	assert.equal((await runtime.probe({ requireEditor: true })).available, false);
+	assert.equal(launcher.launchCalls, 0);
+	assert.equal(confirmations, 0);
+	assert.equal(runtime.sourceStatus().source, 'codespace-owned');
+	assert.equal(runtime.sourceStatus().degraded, false);
+});
+
+test('Codespace-owned prerequisite probes report safe failure and recover without poisoning an unused generation', async (t) => {
+	const launcher = ownedLauncher();
+	let installed = false;
+	let probes = 0;
+	launcher.probe = async () => {
+		probes += 1;
+		return { available: installed };
+	};
+	const runtime = createOwnedRuntime(launcher, []);
+	t.after(() => runtime.dispose());
+	assert.equal((await runtime.probe()).available, false);
+	const unavailable = runtime.sourceStatus();
+	assert.equal(unavailable.source, 'codespace-owned');
+	assert.equal(unavailable.source === 'codespace-owned' && unavailable.failure?.stage, 'discovery');
+	installed = true;
+	assert.equal((await runtime.probe()).available, true);
+	assert.deepEqual(runtime.sourceStatus(), { source: 'codespace-owned', degraded: false });
+	assert.equal(probes, 2);
+	assert.equal(launcher.launchCalls, 0);
+});
+
+test('Codespace-owned disabled runtime does not probe prerequisites or start a Host', async (t) => {
+	const launcher = ownedLauncher();
+	let probes = 0;
+	launcher.probe = async () => {
+		probes += 1;
+		return { available: true };
+	};
+	const runtime = createOwnedRuntime(launcher, [], { enabled: () => false });
+	t.after(() => runtime.dispose());
+	assert.deepEqual(await runtime.probe(), {
+		available: false, featureEnabled: false, source: 'codespace-owned', reason: 'AGENT_UNAVAILABLE',
+	});
+	await assert.rejects(runtime.prepareStart(), AgentRuntimeError);
+	await assert.rejects(runtime.start(ownedTaskRequest()), AgentRuntimeError);
+	assert.equal(launcher.launchCalls, 0);
+	assert.equal(probes, 0);
+});
+
+test('Codespace-owned runtime approval capabilities bind the exact selected backend', () => {
+	const issuer = new AgentRuntimeApprovalCapabilityIssuer();
+	const request = ownedTaskRequest();
+	const approvalCapability = issuer.issue(request);
+	assert.equal(issuer.accepts({ ...request, approvalCapability }), true);
+	assert.equal(issuer.accepts({ ...request, executionBackend: 'editor', approvalCapability }), false);
+	assert.equal(issuer.accepts({ ...request, executionBackend: undefined, approvalCapability }), false);
+});
+
+test('Codespace-owned runtime refuses an unbound workspace identity before launching a Host', async (t) => {
+	const launcher = ownedLauncher();
+	const transport = new FakeAhpTransport();
+	const runtime = createOwnedRuntime(launcher, [transport], { workspaceResolver: trustedWorkspaceResolver() });
+	t.after(() => runtime.dispose());
+	await assert.rejects(runtime.start(ownedTaskRequest()), (error: unknown) =>
+		error instanceof AgentRuntimeError && error.code === 'AGENT_UNAVAILABLE');
+	assert.equal(launcher.launchCalls, 0);
+	assert.equal(transport.createSessionCalls, 0);
+});
+
+test('Codespace-owned runtime reuses an injected retained launcher without nesting ownership', async (t) => {
+	const launcher = ownedLauncher();
+	const retained = new RetainedOwnedAgentHostLauncher(launcher);
+	const lease = await retained.launch();
+	const observations: AgentRuntimeLifecycleObservation[] = [];
+	const transport = new FakeAhpTransport();
+	transport.completeAfterTurnDispatch = true;
+	const runtime = createOwnedRuntime(retained, [transport], {
+		lifecycleObserver: { observeLifecycle: (event) => observations.push(event) },
+	});
+	t.after(() => runtime.dispose());
+	const handle = await runtime.start(ownedTaskRequest());
+	await completeAndDetach(handle);
+	assert.equal(launcher.launchCalls, 1);
+	const negotiation = observations.find((event) => event.eventType === 'protocol/negotiated');
+	assert.equal(negotiation?.endpointFingerprint, lease.endpointFingerprint);
+	assert.equal(launcher.host.disposed, false);
+	await lease.dispose();
+	await runtime.dispose();
+	assert.equal(launcher.disposeCalls, 1);
+	assert.equal(launcher.host.disposeCalls, 1);
+});
+
+for (const [registryVersion, selectedVersion] of [
+	['1.0.0', '1.0.0'],
+	['0.9.0', '0.9.0'],
+	['0.9.0', '1.0.0'],
+	['0.1.0', '0.9.0'],
+	['0.1.0', '1.0.0'],
+] as const) {
+	test(`Codespace-owned runtime negotiates registry ${registryVersion}, selected ${selectedVersion}, and enforces native folder Sessions`, async (t) => {
+		const { isActionKnownToVersion } = await import('@microsoft/agent-host-protocol');
+		const launcher = ownedLauncher(registryVersion);
+		const transport = new FakeAhpTransport();
+		transport.providerId = 'copilotcli';
+		transport.selectedProtocolVersion = selectedVersion;
+		transport.completeAfterTurnDispatch = true;
+		transport.assertActionSupported = (action, version) =>
+			assertOutboundAhpActionSupported(action, version, isActionKnownToVersion);
+		const observations: AgentRuntimeLifecycleObservation[] = [];
+		const runtime = createOwnedRuntime(launcher, [transport], {
+			lifecycleObserver: { observeLifecycle: (event) => observations.push(event) },
+		});
+		t.after(() => runtime.dispose());
+		const handle = await runtime.start({ ...ownedTaskRequest(), sourceWindowName: 'Desktop source' });
+		await completeAndDetach(handle);
+		assert.match(handle.recovery.sessionUri, /^copilotcli:\/[0-9a-f-]+$/u);
+		assert.equal(transport.created?.provider, 'copilotcli');
+		assert.deepEqual(transport.created?.workingDirectories, [workspaceUri]);
+		assert.deepEqual(transport.created?.config, { isolation: 'folder', model: 'test-model' });
+		assert.equal(transport.configRequests.length, 2);
+		assert.ok(transport.configRequests.every((config) => config.isolation === 'folder'));
+		assert.deepEqual(transport.protocolPolicy.offer, registryVersion === '1.0.0' ? ['1.0.0'] : ['1.0.0', '0.9.0']);
+		const negotiation = observations.find((event) => event.eventType === 'protocol/negotiated');
+		assert.equal(negotiation?.source, 'codespace-owned');
+		assert.equal(negotiation?.selectedProtocolVersion, selectedVersion);
+		assert.equal(transport.disposeSessionCalls, 0);
+		assert.equal(transport.shutdownCalls, 1);
+		assert.equal(launcher.host.disposed, false);
+	});
+}
+
+test('the native supervisor marker permits negotiation only for owned Codespaces and never enables AHP 0.1', async (t) => {
+	assert.throws(() => ahpProtocolPolicyForHost({ source: 'editor', registryProtocolVersion: '0.1.0' }),
+		{ code: 'AGENT_UNAVAILABLE' });
+	assert.deepEqual(ahpProtocolPolicyForHost({ source: 'standalone', registryProtocolVersion: '0.1.0' }).offer, ['1.0.0']);
+	for (const selectedProtocolVersion of ['0.1.0', '0.8.0', '1.1.0']) {
+		const launcher = ownedLauncher('0.1.0');
+		const transport = new FakeAhpTransport();
+		transport.selectedProtocolVersion = selectedProtocolVersion;
+		const runtime = createOwnedRuntime(launcher, [transport]);
+		t.after(() => runtime.dispose());
+		await assert.rejects(runtime.start(ownedTaskRequest()), { code: 'AGENT_UNAVAILABLE' });
+		assert.equal(transport.initialized, true);
+		assert.equal(transport.createSessionCalls, 0);
+	}
+});
+
+for (const version of ['0.8.0', '0.9.1', '1.1.0', 'unknown']) {
+	test(`Codespace-owned runtime refuses unknown registry protocol ${version} before connection or Session creation`, async (t) => {
+		const launcher = ownedLauncher(version);
+		const transport = new FakeAhpTransport();
+		const runtime = createOwnedRuntime(launcher, [transport]);
+		t.after(() => runtime.dispose());
+		await assert.rejects(runtime.start(ownedTaskRequest()), (error: unknown) =>
+			error instanceof AgentRuntimeError && error.code === 'AGENT_UNAVAILABLE');
+		assert.equal(transport.initialized, false);
+		assert.equal(transport.createSessionCalls, 0);
+		assert.equal(launcher.launchCalls, 1);
+		assert.equal(runtime.sourceStatus().source, 'codespace-owned');
+	});
+}
+
+test('Codespace-owned runtime cannot negotiate 0.9 against an exact 1.0 registry even with a permissive connection factory', async (t) => {
+	const launcher = ownedLauncher();
+	const transport = new FakeAhpTransport();
+	transport.protocolPolicy = { offer: AHP_EDITOR_0_9_PROTOCOL_OFFER };
+	transport.selectedProtocolVersion = '0.9.0';
+	const runtime = createOwnedRuntime(launcher, [], { connections: new FakeConnectionFactory([transport]) });
+	t.after(() => runtime.dispose());
+	await assert.rejects(runtime.start(ownedTaskRequest()), (error: unknown) =>
+		error instanceof AgentRuntimeError && error.code === 'AGENT_UNAVAILABLE');
+	assert.equal(transport.createSessionCalls, 0);
+	assert.equal(transport.shutdownCalls, 1);
+});
+
+for (const [name, isolationSchema, resolvedConfigOverrides] of [
+	['missing isolation schema', undefined, {}],
+	['worktree-only schema', { type: 'string', title: 'Isolation', enum: ['worktree'] }, {}],
+	['Host override', { type: 'string', title: 'Isolation', enum: ['folder', 'worktree'] }, { isolation: 'worktree' }],
+] as const) {
+	test(`Codespace-owned runtime rejects ${name} without loosening folder isolation`, async (t) => {
+		const transport = new FakeAhpTransport();
+		transport.isolationSchema = isolationSchema === undefined ? undefined : {
+			...isolationSchema, enum: [...isolationSchema.enum],
+		};
+		transport.resolvedConfigOverrides = resolvedConfigOverrides;
+		const launcher = ownedLauncher();
+		const runtime = createOwnedRuntime(launcher, [transport]);
+		t.after(() => runtime.dispose());
+		await assert.rejects(runtime.start(ownedTaskRequest()), (error: unknown) =>
+			error instanceof AgentRuntimeError && error.code === 'AGENT_CONFIG_REQUIRED');
+		assert.equal(transport.createSessionCalls, 0);
+		assert.equal(transport.shutdownCalls, 1);
+		assert.equal(launcher.host.disposed, false);
+	});
+}
+
+for (const [name, overrides] of [
+	['wrong provider', { provider: 'another-provider' }],
+	['wrong isolation', { config: { values: { isolation: 'worktree' } } }],
+	['missing directories', { workingDirectories: undefined }],
+	['a second directory', { workingDirectories: [workspaceUri, workspaceUri] }],
+	['an outside directory', { workingDirectories: [pathToFileURL(join(process.cwd(), 'outside-workspace')).href] }],
+] as const) {
+	test(`Codespace-owned runtime validates the actual provisional Session snapshot: ${name}`, async (t) => {
+		const launcher = ownedLauncher();
+		const transport = new FakeAhpTransport();
+		transport.sessionStartsProvisional = true;
+		transport.sessionSnapshotOverrides = overrides;
+		const runtime = createOwnedRuntime(launcher, [transport]);
+		t.after(() => runtime.dispose());
+		await assert.rejects(runtime.start(ownedTaskRequest()), (error: unknown) =>
+			error instanceof AgentRuntimeError && error.code === 'TASK_EXECUTION_FAILED');
+		assert.equal(transport.dispatched.some(({ action }) => action.type === 'chat/turnStarted'), false);
+		assert.equal(transport.disposeSessionCalls, 1);
+		assert.equal(launcher.host.disposed, false);
+	});
+}
+
+test('Codespace-owned concurrent tasks share a Host but completion and cancellation release only their own turn and client', async (t) => {
+	const launcher = ownedLauncher();
+	const catalog = new FakeAhpHostCatalog();
+	const first = new FakeAhpTransport(catalog);
+	const second = new FakeAhpTransport(catalog);
+	const observations: AgentRuntimeLifecycleObservation[] = [];
+	const runtime = createOwnedRuntime(launcher, [first, second], {
+		lifecycleObserver: { observeLifecycle: (event) => observations.push(event) },
+	});
+	t.after(() => runtime.dispose());
+	const [cancelled, completed] = await Promise.all([
+		runtime.start(ownedTaskRequest()),
+		runtime.start({ ...ownedTaskRequest(), taskId: 'task-2' }),
+	]);
+	assert.equal(launcher.launchCalls, 1);
+	assert.notEqual(cancelled.recovery.sessionUri, completed.recovery.sessionUri);
+	assert.notEqual(currentTurnId(first), currentTurnId(second));
+	await cancelled.cancel();
+	await completeAndDetach(cancelled, 'cancelled');
+	assert.equal(first.disposeSessionCalls, 0);
+	assert.equal(first.dispatched.filter(({ action }) => action.type === 'chat/turnCancelled').length, 1);
+	assert.equal(second.dispatched.some(({ action }) => action.type === 'chat/turnCancelled'), false);
+	assert.equal(launcher.host.disposed, false);
+	await second.emitChat({ type: 'chat/turnComplete', turnId: currentTurnId(second), duration: 0 });
+	await completeAndDetach(completed);
+	assert.equal(second.disposeSessionCalls, 0);
+	assert.equal(launcher.host.disposed, false);
+	const fingerprints = observations.filter((event) => event.eventType === 'protocol/negotiated')
+		.map((event) => event.endpointFingerprint);
+	assert.equal(new Set(fingerprints).size, 1);
+	assert.notEqual(fingerprints[0], undefined);
+	await runtime.dispose();
+	assert.equal(launcher.disposeCalls, 1);
+	assert.equal(launcher.host.disposeCalls, 1);
+});
+
+test('Codespace-owned continuation keeps the original provider, Session, Chat and Host but creates a fresh task turn', async (t) => {
+	const launcher = ownedLauncher('0.9.0');
+	const first = new FakeAhpTransport();
+	first.completeAfterTurnDispatch = true;
+	first.selectedProtocolVersion = '0.9.0';
+	const second = new FakeAhpTransport();
+	second.selectedProtocolVersion = '0.9.0';
+	const fresh = new FakeAhpTransport();
+	fresh.completeAfterTurnDispatch = true;
+	const runtime = createOwnedRuntime(launcher, [first, second, fresh]);
+	t.after(() => runtime.dispose());
+	const original = await runtime.start(ownedTaskRequest());
+	await completeAndDetach(original);
+	second.created = first.created;
+	second.sessionDefaultChat = 'ahp-chat:/another-default';
+	second.sessionSnapshotOverrides = { chats: [{ resource: original.recovery.chatUri }] };
+	second.chatSnapshotOverrides = {
+		turns: [{ id: currentTurnId(first), state: 'complete', responseParts: [{ kind: 'markdown', id: 'old', content: 'Old answer' }] }],
+	};
+	const continued = await runtime.start({
+		...ownedTaskRequest(), taskId: 'task-follow-up', prompt: 'Continue in the original Chat.',
+		continuation: { sessionUri: original.recovery.sessionUri, chatUri: original.recovery.chatUri },
+	});
+	assert.equal(continued.recovery.sessionUri, original.recovery.sessionUri);
+	assert.equal(continued.recovery.chatUri, original.recovery.chatUri);
+	assert.notEqual(continued.recovery.clientId, original.recovery.clientId);
+	assert.notEqual(currentTurnId(second), currentTurnId(first));
+	assert.equal(second.createSessionCalls, 0);
+	assert.equal(second.resolveConfigCalls, 0);
+	assert.equal(launcher.launchCalls, 1);
+	assert.equal((await nextEvent(continued.events)).type, 'progress');
+	await second.emitChat({ type: 'chat/delta', turnId: currentTurnId(first), partId: 'old', content: 'Old output' });
+	await second.emitChat({ type: 'chat/turnComplete', turnId: currentTurnId(first), duration: 0 });
+	await second.emitChat({ type: 'chat/delta', turnId: currentTurnId(second), partId: 'new', content: 'New output' });
+	assert.deepEqual(await nextEvent(continued.events), { type: 'output', text: 'New output' });
+	await second.emitChat({ type: 'chat/turnComplete', turnId: currentTurnId(second), duration: 0 });
+	await completeAndDetach(continued);
+	assert.equal(second.disposeSessionCalls, 0);
+	assert.equal(launcher.host.disposed, false);
+	const unrelated = await runtime.start({ ...ownedTaskRequest(), taskId: 'task-independent' });
+	await completeAndDetach(unrelated);
+	assert.notEqual(unrelated.recovery.sessionUri, original.recovery.sessionUri);
+	assert.equal(fresh.createSessionCalls, 1);
+	assert.equal(launcher.launchCalls, 1);
+});
+
+test('Codespace-owned continuation cannot start a fresh Host or borrow an arbitrary retained Session', async (t) => {
+	const launcher = ownedLauncher();
+	const transport = retainedTransport();
+	const runtime = createOwnedRuntime(launcher, [transport]);
+	t.after(() => runtime.dispose());
+	await assert.rejects(runtime.start({
+		...ownedTaskRequest(),
+		continuation: { sessionUri: transport.created!.sessionUri, chatUri: transport.sessionDefaultChat },
+	}), (error: unknown) => error instanceof AgentRuntimeError && error.code === 'TASK_RECOVERY_UNAVAILABLE');
+	assert.equal(launcher.launchCalls, 0);
+	assert.equal(transport.initialized, false);
+});
+
+test('Codespace-owned continuation requires completion and binds the exact canonical workspace, provider and Chat', async (t) => {
+	const launcher = ownedLauncher();
+	const first = new FakeAhpTransport();
+	const unused = new FakeAhpTransport();
+	let workspaceIdentity = 'identity-1';
+	const runtime = createOwnedRuntime(launcher, [first, unused], {
+		workspaceResolver: {
+			resolve: async (workspaceId) => ({
+				workspaceId, workspaceIdentity, displayName: 'Codespace workspace', uri: workspaceUri,
+			}),
+		},
+	});
+	t.after(() => runtime.dispose());
+	const original = await runtime.start(ownedTaskRequest());
+	const followUp = {
+		...ownedTaskRequest(), taskId: 'task-follow-up',
+		continuation: { sessionUri: original.recovery.sessionUri, chatUri: original.recovery.chatUri },
+	};
+	await assert.rejects(runtime.start(followUp), (error: unknown) =>
+		error instanceof AgentRuntimeError && error.code === 'TASK_RECOVERY_UNAVAILABLE');
+	assert.equal(unused.initialized, false);
+	await first.emitChat({ type: 'chat/turnComplete', turnId: currentTurnId(first), duration: 0 });
+	await completeAndDetach(original);
+	for (const request of [
+		{ ...followUp, workspaceId: 'workspace-2' },
+		{ ...followUp, providerId: 'different-provider' },
+		{ ...followUp, continuation: { ...followUp.continuation, chatUri: 'ahp-chat:/different' } },
+	]) {
+		await assert.rejects(runtime.start(request), (error: unknown) =>
+			error instanceof AgentRuntimeError && error.code === 'TASK_RECOVERY_UNAVAILABLE');
+	}
+	workspaceIdentity = 'identity-2';
+	await assert.rejects(runtime.start(followUp), (error: unknown) =>
+		error instanceof AgentRuntimeError && error.code === 'TASK_RECOVERY_UNAVAILABLE');
+	assert.equal(unused.initialized, false);
+	assert.equal(launcher.launchCalls, 1);
+});
+
+for (const [name, sessionOverrides, chatOverrides] of [
+	['busy Session', { status: 8 }, {}],
+	['archived Session', { status: 65 }, {}],
+	['another active client', { activeClients: [{ clientId: 'another-client' }] }, {}],
+	['missing original Chat', { defaultChat: 'ahp-chat:/different', chats: [] }, {}],
+	['changed workspace', { workingDirectories: [pathToFileURL(join(process.cwd(), 'outside-workspace')).href] }, {}],
+	['changed isolation', { config: { values: { isolation: 'worktree' } } }, {}],
+	['changed provider', { provider: 'another-provider' }, {}],
+	['active Chat turn', {}, { activeTurn: { id: 'another-turn' } }],
+	['queued Chat message', {}, { queuedMessages: [{ id: 'queued' }] }],
+	['steering message', {}, { steeringMessage: { id: 'steering' } }],
+	['busy Chat', {}, { status: 8 }],
+] as const) {
+	test(`Codespace-owned continuation rejects ${name} without creating or deleting the original Session`, async (t) => {
+		const launcher = ownedLauncher();
+		const first = new FakeAhpTransport();
+		first.completeAfterTurnDispatch = true;
+		const second = new FakeAhpTransport();
+		const runtime = createOwnedRuntime(launcher, [first, second]);
+		t.after(() => runtime.dispose());
+		const original = await runtime.start(ownedTaskRequest());
+		await completeAndDetach(original);
+		second.created = first.created;
+		second.sessionSnapshotOverrides = sessionOverrides;
+		second.chatSnapshotOverrides = chatOverrides;
+		await assert.rejects(runtime.start({
+			...ownedTaskRequest(), taskId: 'task-follow-up',
+			continuation: { sessionUri: original.recovery.sessionUri, chatUri: original.recovery.chatUri },
+		}), AgentRuntimeError);
+		assert.equal(second.createSessionCalls, 0);
+		assert.equal(second.disposeSessionCalls, 0);
+		assert.equal(second.dispatched.some(({ action }) => action.type === 'chat/turnStarted'), false);
+		assert.equal(second.shutdownCalls, 1);
+		assert.equal(launcher.host.disposed, false);
+	});
+}
+
+test('Codespace-owned continuation never substitutes a new Session when the retained snapshot disappears', async (t) => {
+	const launcher = ownedLauncher();
+	const first = new FakeAhpTransport();
+	first.completeAfterTurnDispatch = true;
+	const second = new FakeAhpTransport();
+	const runtime = createOwnedRuntime(launcher, [first, second]);
+	t.after(() => runtime.dispose());
+	const original = await runtime.start(ownedTaskRequest());
+	await completeAndDetach(original);
+	second.created = first.created;
+	second.missingSessionSnapshot = true;
+	const request = {
+		...ownedTaskRequest(), taskId: 'task-follow-up',
+		continuation: { sessionUri: original.recovery.sessionUri, chatUri: original.recovery.chatUri },
+	};
+	await assert.rejects(runtime.start(request), (error: unknown) =>
+		error instanceof AgentRuntimeError && error.code === 'TASK_RECOVERY_UNAVAILABLE');
+	await assert.rejects(runtime.start(request), (error: unknown) =>
+		error instanceof AgentRuntimeError && error.code === 'TASK_RECOVERY_UNAVAILABLE');
+	assert.equal(second.createSessionCalls, 0);
+	assert.equal(second.disposeSessionCalls, 0);
+	assert.equal(second.dispatched.some(({ action }) => action.type === 'chat/turnStarted'), false);
+	assert.equal(launcher.launchCalls, 1);
+});
+
+test('Codespace-owned runtime rejects simultaneous continuations after the first claims the completed Session', async (t) => {
+	const launcher = ownedLauncher();
+	const first = new FakeAhpTransport();
+	first.completeAfterTurnDispatch = true;
+	const second = new FakeAhpTransport();
+	const unused = new FakeAhpTransport();
+	const runtime = createOwnedRuntime(launcher, [first, second, unused]);
+	t.after(() => runtime.dispose());
+	const original = await runtime.start(ownedTaskRequest());
+	await completeAndDetach(original);
+	second.created = first.created;
+	const request = {
+		...ownedTaskRequest(), taskId: 'follow-up-1',
+		continuation: { sessionUri: original.recovery.sessionUri, chatUri: original.recovery.chatUri },
+	};
+	const [accepted, rejected] = await Promise.allSettled([
+		runtime.start(request),
+		runtime.start({ ...request, taskId: 'follow-up-2' }),
+	]);
+	assert.equal(accepted.status, 'fulfilled');
+	assert.equal(rejected.status, 'rejected');
+	assert.equal(unused.initialized, false);
+	if (accepted.status === 'fulfilled') {
+		await accepted.value.cancel();
+		await completeAndDetach(accepted.value, 'cancelled');
+	}
+	assert.equal(second.createSessionCalls, 0);
+	assert.equal(second.disposeSessionCalls, 0);
+});
+
+test('Codespace-owned Host exit invalidates retained identities and publishes safe source failure without replacement', async (t) => {
+	const launcher = ownedLauncher();
+	const first = new FakeAhpTransport();
+	first.completeAfterTurnDispatch = true;
+	const unused = new FakeAhpTransport();
+	const runtime = createOwnedRuntime(launcher, [first, unused]);
+	t.after(() => runtime.dispose());
+	const original = await runtime.start(ownedTaskRequest());
+	await completeAndDetach(original);
+	const statuses: string[] = [];
+	runtime.onDidSourceStatusChange((status) => statuses.push(JSON.stringify(status)));
+	launcher.host.crash();
+	assert.equal((await runtime.probe()).available, false);
+	assert.equal(statuses.length > 0, true);
+	assert.match(statuses.at(-1)!, /codespace-owned/u);
+	assert.doesNotMatch(statuses.at(-1)!, /not-a-real-token|ws:|127\.0\.0\.1/u);
+	await assert.rejects(runtime.start({
+		...ownedTaskRequest(), taskId: 'follow-up',
+		continuation: { sessionUri: original.recovery.sessionUri, chatUri: original.recovery.chatUri },
+	}), (error: unknown) => error instanceof AgentRuntimeError && error.code === 'TASK_RECOVERY_UNAVAILABLE');
+	await assert.rejects(runtime.start({ ...ownedTaskRequest(), taskId: 'unrelated' }), AgentRuntimeError);
+	assert.equal(launcher.launchCalls, 1);
+	assert.equal(unused.initialized, false);
+});
+
+test('Codespace-owned runtime closes an exited Host client without remote unsubscribe or task cancellation', async (t) => {
+	const launcher = ownedLauncher();
+	const transport = new FakeAhpTransport();
+	const runtime = createOwnedRuntime(launcher, [transport]);
+	t.after(() => runtime.dispose());
+	const handle = await runtime.start(ownedTaskRequest());
+	await nextEvent(handle.events);
+	launcher.host.crash();
+	assert.equal((await nextEvent(handle.events)).type, 'failed');
+	await handle.dispose();
+	assert.equal(transport.unsubscribedUris.length, 0);
+	assert.equal(transport.disposeSessionCalls, 0);
+	assert.equal(transport.dispatched.some(({ action }) => action.type === 'chat/turnCancelled'), false);
+	assert.equal(transport.shutdownCalls, 1);
+	await runtime.dispose();
+	assert.equal(launcher.host.disposeCalls, 1);
+});
+
+test('Codespace-owned runtime reports sanitized authentication failure and retries a fresh task on the same retained Host', async (t) => {
+	const launcher = ownedLauncher();
+	const first = new FakeAhpTransport();
+	const second = new FakeAhpTransport();
+	second.completeAfterTurnDispatch = true;
+	const broker = new RecordingAuthBroker();
+	let rejectAuthentication = true;
+	const runtime = createOwnedRuntime(launcher, [first, second], {
+		authBroker: {
+			authenticate: async (request, pushToken) => {
+				if (rejectAuthentication) {
+					throw new AgentRuntimeError('AGENT_AUTH_REQUIRED', 'secret-token and private-path must not reach status');
+				}
+				await broker.authenticate(request, pushToken);
+			},
+		},
+	});
+	t.after(() => runtime.dispose());
+	await assert.rejects(runtime.start(ownedTaskRequest()), (error: unknown) =>
+		error instanceof AgentRuntimeError && error.code === 'AGENT_AUTH_REQUIRED');
+	assert.doesNotMatch(JSON.stringify(runtime.sourceStatus()), /secret-token|private-path/u);
+	assert.equal((await runtime.probe()).canStart, true);
+	assert.equal((await runtime.probe()).reason, 'AGENT_AUTH_REQUIRED');
+	assert.equal(first.createSessionCalls, 0);
+	assert.equal(launcher.host.disposed, false);
+	rejectAuthentication = false;
+	const handle = await runtime.start({ ...ownedTaskRequest(), taskId: 'after-authentication' });
+	await completeAndDetach(handle);
+	assert.equal(launcher.launchCalls, 1);
+	assert.deepEqual(runtime.sourceStatus(), { source: 'codespace-owned', degraded: false });
+});
+
+test('Codespace-owned runtime disposal cancels a late native startup and owns its eventual cleanup', async () => {
+	const launcher = ownedLauncher();
+	let release!: () => void;
+	const barrier = new Promise<void>((resolve) => { release = resolve; });
+	let launchSignal: AbortSignal | undefined;
+	launcher.launch = async (signal?: AbortSignal) => {
+		launcher.launchCalls += 1;
+		launchSignal = signal;
+		await barrier;
+		return launcher.host;
+	};
+	const transport = new FakeAhpTransport();
+	const runtime = createOwnedRuntime(launcher, [transport]);
+	const starting = assert.rejects(runtime.start(ownedTaskRequest()), (error: unknown) =>
+		error instanceof AgentRuntimeError && error.code === 'AGENT_UNAVAILABLE');
+	await waitForCondition(() => launcher.launchCalls === 1);
+	const disposal = runtime.dispose();
+	assert.equal(runtime.dispose(), disposal);
+	await starting;
+	await waitForCondition(() => launchSignal?.aborted === true);
+	assert.equal(launchSignal?.aborted, true);
+	assert.equal(launcher.host.disposed, false);
+	release();
+	await disposal;
+	assert.equal(transport.initialized, false);
+	assert.equal(launcher.host.disposeCalls, 1);
+	assert.equal(launcher.disposeCalls, 1);
+});
+
+test('Codespace-owned runtime stops a turn if its execution generation is disabled before start returns', async () => {
+	const launcher = ownedLauncher();
+	const transport = new FakeAhpTransport();
+	let enabled = true;
+	const dispatch = transport.dispatch.bind(transport);
+	transport.dispatch = (channel, action, clientSeq) => {
+		const sequence = dispatch(channel, action, clientSeq);
+		if (typeof action === 'object' && action !== null && 'type' in action && action.type === 'chat/turnStarted') {
+			enabled = false;
+		}
+		return sequence;
+	};
+	const runtime = createOwnedRuntime(launcher, [transport], { enabled: () => enabled });
+	await assert.rejects(runtime.start(ownedTaskRequest()), (error: unknown) =>
+		error instanceof AgentRuntimeError && error.code === 'AGENT_UNAVAILABLE');
+	assert.equal(transport.dispatched.filter(({ action }) => action.type === 'chat/turnCancelled').length, 1);
+	assert.equal(transport.shutdownCalls, 1);
+	assert.equal(launcher.host.disposed, true);
+	assert.equal(launcher.host.disposeCalls, 1);
+	assert.equal((await runtime.probe()).available, false);
+	await runtime.dispose();
+});
+
+test('Codespace-owned runtime shutdown confirms each active task cancellation before cleaning the shared Host', async () => {
+	const launcher = ownedLauncher();
+	const first = new FakeAhpTransport();
+	const second = new FakeAhpTransport();
+	const runtime = createOwnedRuntime(launcher, [first, second]);
+	const handles = await Promise.all([
+		runtime.start(ownedTaskRequest()),
+		runtime.start({ ...ownedTaskRequest(), taskId: 'task-2' }),
+	]);
+	const disposeLauncher = launcher.dispose.bind(launcher);
+	launcher.dispose = async () => {
+		for (const transport of [first, second]) {
+			const cancellations = transport.dispatched.filter(({ action }) => action.type === 'chat/turnCancelled');
+			assert.equal(cancellations.length, 1);
+			assert.equal(cancellations[0].action.turnId, currentTurnId(transport));
+			assert.equal(transport.shutdownCalls, 1);
+			assert.equal(transport.disposeSessionCalls, 0);
+		}
+		await disposeLauncher();
+	};
+	await runtime.dispose();
+	for (const handle of handles) {
+		const events: AgentRuntimeEvent[] = [];
+		for await (const event of handle.events) { events.push(event); }
+		assert.equal(events.at(-1)?.type, 'cancelled');
+	}
+	assert.equal(launcher.launchCalls, 1);
+	assert.equal(launcher.host.disposeCalls, 1);
+});
+
+test('Codespace-owned runtime retries failed shutdown explicitly without reviving execution admission', async () => {
+	const launcher = ownedLauncher();
+	const transport = new FakeAhpTransport();
+	transport.completeAfterTurnDispatch = true;
+	const runtime = createOwnedRuntime(launcher, [transport]);
+	const handle = await runtime.start(ownedTaskRequest());
+	await completeAndDetach(handle);
+	launcher.host.disposeFailuresRemaining = 1;
+	await assert.rejects(runtime.dispose(), (error: unknown) =>
+		error instanceof AgentRuntimeError && error.cleanupFailed);
+	assert.equal(launcher.host.disposed, false);
+	await assert.rejects(runtime.start({ ...ownedTaskRequest(), taskId: 'after-disposal' }), AgentRuntimeError);
+	await runtime.dispose();
+	assert.equal(launcher.host.disposed, true);
+	assert.equal(launcher.host.disposeCalls, 2);
+	assert.equal(launcher.disposeCalls, 2);
+});
+
+test('Codespace-owned unconfirmed cancellation never deletes the Session or claims the task stopped', async () => {
+	const launcher = ownedLauncher();
+	const transport = new FakeAhpTransport();
+	const runtime = createOwnedRuntime(launcher, [transport]);
+	const handle = await runtime.start(ownedTaskRequest());
+	transport.rejectDispatchType = 'chat/turnCancelled';
+	await assert.rejects(handle.cancel(), (error: unknown) =>
+		error instanceof AgentRuntimeError && error.code === 'TASK_CANCELLATION_UNCONFIRMED');
+	await assert.rejects(handle.dispose(), (error: unknown) =>
+		error instanceof AgentRuntimeError && error.code === 'TASK_CANCELLATION_UNCONFIRMED' && error.cleanupFailed);
+	assert.equal(transport.disposeSessionCalls, 0);
+	assert.equal(launcher.host.disposed, false);
+	await assert.rejects(runtime.dispose(), (error: unknown) =>
+		error instanceof AgentRuntimeError && error.cleanupFailed);
+	assert.equal(launcher.host.disposed, true);
+	await runtime.dispose();
+	assert.equal(launcher.host.disposeCalls, 1);
+});
+
+test('Codespace-owned startup cancellation releases a queued task without waiting for another task approval', async (t) => {
+	const launcher = ownedLauncher();
+	const transport = new FakeAhpTransport();
+	transport.completeAfterTurnDispatch = true;
+	const approval = ownedStartBarrier();
+	const confirmations: string[] = [];
+	const runtime = createOwnedRuntime(launcher, [transport], {
+		confirmation: {
+			confirm: async (request) => {
+				confirmations.push(request.taskId);
+				if (request.taskId === 'holding-start') { await approval.promise; }
+				return 'once';
+			},
+		},
+	});
+	t.after(() => runtime.dispose());
+	const holding = runtime.start({ ...ownedTaskRequest(), taskId: 'holding-start' });
+	await waitForCondition(() => confirmations.length === 1);
+	const cancelled = assert.rejects(runtime.start(ownedTaskRequest()), AgentRuntimeError);
+	await runtime.cancelStart('task-1');
+	await cancelled;
+	assert.deepEqual(confirmations, ['holding-start']);
+	assert.equal(launcher.launchCalls, 0);
+	approval.resolve();
+	await completeAndDetach(await holding);
+	assert.equal(launcher.launchCalls, 1);
+});
+
+for (const stage of ['workspace resolution', 'task confirmation'] as const) {
+	test(`Codespace-owned startup cancellation ignores a late ${stage} result without launching execution`, async (t) => {
+		const launcher = ownedLauncher();
+		const barrier = ownedStartBarrier();
+		let entered = false;
+		const runtime = createOwnedRuntime(launcher, [], stage === 'workspace resolution' ? {
+			workspaceResolver: {
+				resolve: async (workspaceId) => {
+					entered = true;
+					await barrier.promise;
+					return { workspaceId, workspaceIdentity: 'identity', displayName: 'Workspace', uri: workspaceUri };
+				},
+			},
+		} : {
+			confirmation: { confirm: async () => { entered = true; await barrier.promise; return 'once'; } },
+		});
+		t.after(() => runtime.dispose());
+		const starting = assert.rejects(runtime.start(ownedTaskRequest()), AgentRuntimeError);
+		await waitForCondition(() => entered);
+		await runtime.cancelStart('task-1');
+		await starting;
+		barrier.resolve();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.equal(launcher.launchCalls, 0);
+	});
+}
+
+test('Codespace-owned cancelling cold startup does not cancel the shared Host or another queued task', async (t) => {
+	const launcher = ownedLauncher();
+	const barrier = ownedStartBarrier();
+	let launchSignal: AbortSignal | undefined;
+	launcher.launch = async (signal?: AbortSignal) => {
+		launcher.launchCalls += 1;
+		launchSignal = signal;
+		await barrier.promise;
+		return launcher.host;
+	};
+	const transport = new FakeAhpTransport();
+	transport.completeAfterTurnDispatch = true;
+	const runtime = createOwnedRuntime(launcher, [transport]);
+	t.after(() => runtime.dispose());
+	const cancelled = assert.rejects(runtime.start(ownedTaskRequest()), AgentRuntimeError);
+	await waitForCondition(() => launcher.launchCalls === 1);
+	const other = runtime.start({ ...ownedTaskRequest(), taskId: 'another-task' });
+	await runtime.cancelStart('task-1');
+	await cancelled;
+	assert.equal(launchSignal?.aborted, false);
+	assert.equal(launcher.host.disposed, false);
+	barrier.resolve();
+	await completeAndDetach(await other);
+	assert.equal(launcher.launchCalls, 1);
+});
+
+for (const stage of ['authentication', 'configuration'] as const) {
+	test(`Codespace-owned startup cancellation aborts pending ${stage} without affecting another running task`, async (t) => {
+		const launcher = ownedLauncher();
+		const first = new FakeAhpTransport();
+		const blocked = new FakeAhpTransport();
+		let calls = 0;
+		let waiting = false;
+		let cancelled = false;
+		const wait = async (signal?: AbortSignal) => {
+			if (++calls !== 2) { return; }
+			waiting = true;
+			await new Promise<void>((_resolve, reject) => {
+				signal?.addEventListener('abort', () => {
+					cancelled = true;
+					reject(new AgentRuntimeError('TASK_EXECUTION_FAILED', 'Synthetic startup cancellation.'));
+				}, { once: true });
+			});
+		};
+		const broker = new RecordingAuthBroker();
+		const runtime = createOwnedRuntime(launcher, [first, blocked], stage === 'authentication' ? {
+			authBroker: {
+				authenticate: async (request, pushToken) => {
+					await wait(request.signal);
+					await broker.authenticate(request, pushToken);
+				},
+			},
+		} : {
+			configResolver: {
+				resolve: async (request) => {
+					await wait(request.signal);
+					return { model: 'test-model' };
+				},
+			},
+		});
+		t.after(() => runtime.dispose());
+		const running = await runtime.start({ ...ownedTaskRequest(), taskId: 'running-task' });
+		const starting = assert.rejects(runtime.start(ownedTaskRequest()), AgentRuntimeError);
+		await waitForCondition(() => waiting);
+		await runtime.cancelStart('task-1');
+		await starting;
+		assert.equal(cancelled, true);
+		assert.equal(blocked.createSessionCalls, 0);
+		assert.equal(blocked.shutdownCalls, 1);
+		assert.equal(first.dispatched.some(({ action }) => action.type === 'chat/turnCancelled'), false);
+		assert.equal(launcher.host.disposed, false);
+		await first.emitChat({ type: 'chat/turnComplete', turnId: currentTurnId(first), duration: 0 });
+		await completeAndDetach(running);
+	});
+}
+
+test('Codespace-owned startup cancellation closes the exact client to interrupt initialization', async (t) => {
+	const launcher = ownedLauncher();
+	const transport = new FakeAhpTransport();
+	const barrier = ownedStartBarrier();
+	let initializing = false;
+	const initialize = transport.initialize.bind(transport);
+	const shutdown = transport.shutdown.bind(transport);
+	transport.initialize = async (clientId) => {
+		initializing = true;
+		await barrier.promise;
+		return initialize(clientId);
+	};
+	transport.shutdown = async () => {
+		await shutdown();
+		barrier.resolve();
+	};
+	const runtime = createOwnedRuntime(launcher, [transport]);
+	t.after(() => runtime.dispose());
+	const starting = assert.rejects(runtime.start(ownedTaskRequest()), AgentRuntimeError);
+	await waitForCondition(() => initializing);
+	await runtime.cancelStart('task-1');
+	await starting;
+	assert.equal(transport.createSessionCalls, 0);
+	assert.equal(transport.shutdownCalls, 1);
+	assert.equal(launcher.host.disposed, false);
+});
+
+test('Codespace-owned startup cancellation cleans a late Session creation instead of dispatching or orphaning it', async (t) => {
+	const launcher = ownedLauncher();
+	const first = new FakeAhpTransport();
+	const later = new FakeAhpTransport();
+	later.completeAfterTurnDispatch = true;
+	const barrier = ownedStartBarrier();
+	let creating = false;
+	const createSession = first.createSession.bind(first);
+	first.createSession = async (params) => {
+		creating = true;
+		await barrier.promise;
+		await createSession(params);
+	};
+	const runtime = createOwnedRuntime(launcher, [first, later]);
+	t.after(() => runtime.dispose());
+	const starting = assert.rejects(runtime.start(ownedTaskRequest()), AgentRuntimeError);
+	await waitForCondition(() => creating);
+	let cancellationComplete = false;
+	const cancellation = runtime.cancelStart('task-1').then(() => { cancellationComplete = true; });
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(cancellationComplete, false);
+	assert.equal(first.shutdownCalls, 0);
+	barrier.resolve();
+	await cancellation;
+	await starting;
+	assert.equal(first.createSessionCalls, 1);
+	assert.equal(first.disposeSessionCalls, 1);
+	assert.equal(first.dispatched.some(({ action }) => action.type === 'chat/turnStarted'), false);
+	assert.equal(first.shutdownCalls, 1);
+	assert.equal(launcher.host.disposed, false);
+	await completeAndDetach(await runtime.start({ ...ownedTaskRequest(), taskId: 'later-task' }));
+	assert.equal(launcher.launchCalls, 1);
+});
+
+test('Codespace-owned startup cancellation is unconfirmed while an in-flight creation cannot settle', async (t) => {
+	const launcher = ownedLauncher();
+	const transport = new FakeAhpTransport();
+	const barrier = ownedStartBarrier();
+	let creating = false;
+	const createSession = transport.createSession.bind(transport);
+	transport.createSession = async (params) => {
+		creating = true;
+		await barrier.promise;
+		await createSession(params);
+	};
+	const runtime = createOwnedRuntime(launcher, [transport], { cancellationTimeoutMs: 20 });
+	t.after(() => runtime.dispose());
+	const starting = assert.rejects(runtime.start(ownedTaskRequest()), AgentRuntimeError);
+	await waitForCondition(() => creating);
+	await assert.rejects(runtime.cancelStart('task-1'), (error: unknown) =>
+		error instanceof AgentRuntimeError && error.code === 'TASK_CANCELLATION_UNCONFIRMED' && error.cleanupFailed);
+	assert.equal(transport.disposeSessionCalls, 0);
+	assert.equal(transport.dispatched.some(({ action }) => action.type === 'chat/turnStarted'), false);
+	assert.equal(launcher.host.disposed, false);
+	barrier.resolve();
+	await starting;
+	await runtime.cancelStart('task-1');
+	assert.equal(transport.disposeSessionCalls, 1);
+});
+
+test('Codespace-owned startup cancellation retries its exact detached connection cleanup after a failed attempt', async (t) => {
+	const launcher = ownedLauncher();
+	const blocked = new FakeAhpTransport();
+	blocked.shutdownFails = true;
+	const later = new FakeAhpTransport();
+	later.completeAfterTurnDispatch = true;
+	const barrier = ownedStartBarrier();
+	let connecting = false;
+	let calls = 0;
+	const runtime = createOwnedRuntime(launcher, [], {
+		connections: {
+			connect: async (host) => {
+				if (++calls === 1) {
+					connecting = true;
+					await barrier.promise;
+					return blocked;
+				}
+				later.protocolPolicy = ahpProtocolPolicyForHost(host);
+				return later;
+			},
+		},
+	});
+	t.after(() => runtime.dispose());
+	const starting = assert.rejects(runtime.start(ownedTaskRequest()), (error: unknown) =>
+		error instanceof AgentRuntimeError && error.cleanupFailed);
+	await waitForCondition(() => connecting);
+	const cancellation = assert.rejects(runtime.cancelStart('task-1'), (error: unknown) =>
+		error instanceof AgentRuntimeError && error.code === 'TASK_CANCELLATION_UNCONFIRMED' && error.cleanupFailed);
+	barrier.resolve();
+	await Promise.all([starting, cancellation]);
+	assert.equal(blocked.shutdownCalls, 1);
+	blocked.shutdownFails = false;
+	await runtime.cancelStart('task-1');
+	assert.equal(blocked.shutdownCalls, 2);
+	assert.equal(launcher.host.disposed, false);
+	await completeAndDetach(await runtime.start({ ...ownedTaskRequest(), taskId: 'later-task' }));
+});
+
+test('Codespace-owned startup cancellation confirms an already-dispatched turn and coalesces duplicate requests', async (t) => {
+	const launcher = ownedLauncher();
+	const transport = new FakeAhpTransport();
+	const runtime = createOwnedRuntime(launcher, [transport]);
+	t.after(() => runtime.dispose());
+	const cancellations: Promise<void>[] = [];
+	const dispatch = transport.dispatch.bind(transport);
+	transport.dispatch = (channel, action, clientSeq) => {
+		const sequence = dispatch(channel, action, clientSeq);
+		if (typeof action === 'object' && action !== null && 'type' in action && action.type === 'chat/turnStarted') {
+			cancellations.push(runtime.cancelStart('task-1'), runtime.cancelStart('task-1'));
+		}
+		return sequence;
+	};
+	await assert.rejects(runtime.start(ownedTaskRequest()), AgentRuntimeError);
+	await Promise.all(cancellations);
+	assert.equal(cancellations.length, 2);
+	assert.equal(transport.dispatched.filter(({ action }) => action.type === 'chat/turnCancelled').length, 1);
+	assert.equal(transport.disposeSessionCalls, 0);
+	assert.equal(transport.shutdownCalls, 1);
+	assert.equal(launcher.host.disposed, false);
+});
+
+test('Codespace-owned startup cancellation cannot forget failed native-launch cleanup ownership', async () => {
+	const launcher = ownedLauncher();
+	launcher.host.disposeFailuresRemaining = 1;
+	launcher.launch = async () => {
+		launcher.launchCalls += 1;
+		throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'Synthetic partial launch cleanup failure.', false, undefined, true);
+	};
+	const runtime = createOwnedRuntime(launcher, []);
+	await assert.rejects(runtime.start(ownedTaskRequest()), (error: unknown) =>
+		error instanceof AgentRuntimeError && error.cleanupFailed);
+	await assert.rejects(runtime.cancelStart('task-1'), (error: unknown) =>
+		error instanceof AgentRuntimeError && error.code === 'TASK_CANCELLATION_UNCONFIRMED' && error.cleanupFailed);
+	assert.equal(launcher.host.disposeCalls, 1);
+	assert.equal(launcher.host.disposed, false);
+	await runtime.cancelStart('task-1');
+	assert.equal(launcher.host.disposed, true);
+	assert.equal(launcher.host.disposeCalls, 2);
+	await runtime.dispose();
+	assert.equal(launcher.host.disposeCalls, 2);
+});
+
+test('Codespace-owned startup cancellation leaves returned handles and crash outcomes with their task owner', async () => {
+	const launcher = ownedLauncher();
+	const transport = new FakeAhpTransport();
+	const runtime = createOwnedRuntime(launcher, [transport]);
+	const handle = await runtime.start(ownedTaskRequest());
+	await nextEvent(handle.events);
+	await runtime.cancelStart(handle.taskId);
+	await runtime.cancelStart('unrelated-task');
+	assert.equal(transport.dispatched.some(({ action }) => action.type === 'chat/turnCancelled'), false);
+	assert.equal(transport.shutdownCalls, 0);
+	launcher.host.crash();
+	assert.equal((await nextEvent(handle.events)).type, 'failed');
+	await runtime.cancelStart(handle.taskId);
+	assert.equal(transport.dispatched.some(({ action }) => action.type === 'chat/turnCancelled'), false);
+	assert.equal(transport.shutdownCalls, 0);
+	await handle.dispose();
+	await runtime.dispose();
+});
+
+for (const stage of ['initialization', 'authentication', 'configuration'] as const) {
+	test(`Codespace-owned startup cancellation ignores a late native ${stage} result even when it ignores abort`, async (t) => {
+		const launcher = ownedLauncher();
+		const transport = new FakeAhpTransport();
+		const barrier = ownedStartBarrier();
+		let entered = false;
+		let configPrompts = 0;
+		if (stage === 'initialization') {
+			const initialize = transport.initialize.bind(transport);
+			transport.initialize = async (clientId) => {
+				const result = await initialize(clientId);
+				entered = true;
+				await barrier.promise;
+				return result;
+			};
+		}
+		if (stage === 'configuration') {
+			const resolveConfig = transport.resolveSessionConfig.bind(transport);
+			transport.resolveSessionConfig = async (provider, directory, config) => {
+				const result = await resolveConfig(provider, directory, config);
+				entered = true;
+				await barrier.promise;
+				return result;
+			};
+		}
+		const broker = new RecordingAuthBroker();
+		const runtime = createOwnedRuntime(launcher, [transport], {
+			authBroker: {
+				authenticate: async (request, pushToken) => {
+					if (stage === 'authentication') {
+						entered = true;
+						await barrier.promise;
+					}
+					await broker.authenticate(request, pushToken);
+				},
+			},
+			configResolver: {
+				resolve: async () => {
+					configPrompts += 1;
+					return { model: 'test-model' };
+				},
+			},
+		});
+		t.after(() => runtime.dispose());
+		const starting = assert.rejects(runtime.start(ownedTaskRequest()), AgentRuntimeError);
+		await waitForCondition(() => entered);
+		await runtime.cancelStart('task-1');
+		await starting;
+		assert.equal(transport.shutdownCalls, 1);
+		assert.equal(launcher.host.disposed, false);
+		barrier.resolve();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.equal(transport.createSessionCalls, 0);
+		assert.equal(configPrompts, 0);
+		assert.equal(transport.dispatched.some(({ action }) => action.type === 'chat/turnStarted'), false);
+	});
+}
+
+for (const source of ['editor', 'standalone'] as const) {
+	test(`AHP ${source} startup cancellation retains cleanup ownership of a late Session creation`, async (t) => {
+		const launcher = source === 'editor' ? editorLauncher() : new FakeLauncher();
+		const transport = new FakeAhpTransport();
+		const barrier = ownedStartBarrier();
+		let creating = false;
+		const createSession = transport.createSession.bind(transport);
+		transport.createSession = async (params) => {
+			creating = true;
+			await barrier.promise;
+			await createSession(params);
+		};
+		const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+		t.after(() => runtime.dispose());
+		const starting = assert.rejects(runtime.start(taskRequest()), AgentRuntimeError);
+		await waitForCondition(() => creating);
+		const cancellation = runtime.cancelStart('task-1');
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.equal(transport.shutdownCalls, 0);
+		barrier.resolve();
+		await Promise.all([starting, cancellation]);
+		assert.equal(transport.createSessionCalls, 1);
+		assert.equal(transport.disposeSessionCalls, 1);
+		assert.equal(transport.shutdownCalls, 1);
+		assert.equal(transport.dispatched.some(({ action }) => action.type === 'chat/turnStarted'), false);
+		assert.equal(launcher.disposeCalls, 0);
+	});
+}
+
+for (const cleanupFails of [false, true]) {
+	test(`source selector cancels real AHP startup without fallback${cleanupFails ? ' and exposes failed cleanup' : ''}`, async (t) => {
+		const editorLauncherInstance = editorLauncher();
+		const standaloneLauncher = new FakeLauncher();
+		const transport = new FakeAhpTransport();
+		transport.shutdownFails = cleanupFails;
+		const authentication = ownedStartBarrier();
+		let authenticating = false;
+		const editor = createRuntime(editorLauncherInstance, new FakeConnectionFactory([transport]), {
+			authenticate: async () => {
+				authenticating = true;
+				await authentication.promise;
+			},
+		});
+		const standalone = createRuntime(standaloneLauncher, new FakeConnectionFactory([]));
+		const selector = new AgentHostSourceSelector({
+			preferEditor: () => true,
+			editor,
+			standalone,
+			confirmation: { confirm: async () => 'once' },
+			workspaceResolver: trustedWorkspaceResolver(),
+			approvalCapabilities: new AgentRuntimeApprovalCapabilityIssuer(),
+			editorConnectionRetryDelaysMs: [0, 0],
+		});
+		t.after(() => selector.dispose());
+		const starting = assert.rejects(selector.start(taskRequest()), (error: unknown) =>
+			error instanceof AgentRuntimeError && error.cleanupFailed === cleanupFails);
+		await waitForCondition(() => authenticating);
+		if (cleanupFails) {
+			await assert.rejects(selector.cancelStart('task-1'), (error: unknown) =>
+				error instanceof AgentRuntimeError && error.code === 'TASK_CANCELLATION_UNCONFIRMED' && error.cleanupFailed);
+			transport.shutdownFails = false;
+			await selector.cancelStart('task-1');
+		} else {
+			await selector.cancelStart('task-1');
+		}
+		await starting;
+		authentication.resolve();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.equal(transport.createSessionCalls, 0);
+		assert.equal(transport.dispatched.some(({ action }) => action.type === 'chat/turnStarted'), false);
+		assert.equal(editorLauncherInstance.launchCalls, 1);
+		assert.equal(editorLauncherInstance.disposeCalls, 0);
+		assert.equal(standaloneLauncher.launchCalls, 0);
+		assert.equal(standaloneLauncher.disposeCalls, 0);
+	});
+}
+
+function ownedStartBarrier(): { readonly promise: Promise<void>; readonly resolve: () => void } {
+	let resolve!: () => void;
+	const promise = new Promise<void>((complete) => { resolve = complete; });
+	return { promise, resolve };
+}
+
+function ownedLauncher(registryProtocolVersion = '1.0.0'): FakeLauncher {
+	const launcher = new FakeLauncher();
+	launcher.host.registryProtocolVersion = registryProtocolVersion;
+	return launcher;
+}
+
+function ownedTaskRequest(): AgentTaskRequest {
+	return { ...taskRequest(), executionBackend: 'codespace-owned' };
+}
+
+function createOwnedRuntime(
+	launcher: AgentHostLauncherLike,
+	transports: FakeAhpTransport[],
+	options: Partial<CodespaceOwnedAgentRuntimeOptions> = {},
+): CodespaceOwnedAgentRuntime {
+	const connections = new FakeConnectionFactory([...transports]);
+	return new CodespaceOwnedAgentRuntime({
+		enabled: () => true,
+		launcher,
+		connections: {
+			connect: async (host) => {
+				const connection = await connections.connect();
+				assert.ok(connection instanceof FakeAhpTransport);
+				connection.protocolPolicy = ahpProtocolPolicyForHost(host);
+				return connection;
+			},
+		},
+		authBroker: new RecordingAuthBroker(),
+		confirmation: { confirm: async () => 'once' },
+		workspaceResolver: {
+			resolve: async (workspaceId) => {
+				const workspace = await trustedWorkspaceResolver().resolve(workspaceId);
+				return workspace === undefined ? undefined : { ...workspace, workspaceIdentity: 'owned-workspace-identity' };
+			},
+		},
+		configResolver: { resolve: async () => ({ model: 'test-model' }) },
+		cancellationTimeoutMs: 100,
+		...options,
+	});
+}
+
+async function completeAndDetach(handle: AgentTaskHandle, expected: AgentRuntimeEvent['type'] = 'completed'): Promise<void> {
+	const events: AgentRuntimeEvent[] = [];
+	for await (const event of handle.events) { events.push(event); }
+	assert.equal(events.at(-1)?.type, expected);
+	await handle.dispose();
+}
+
 function editorLauncher(): FakeLauncher {
 	const launcher = new FakeLauncher();
 	launcher.host.source = 'editor';
@@ -4220,6 +5482,7 @@ class LateTokenAuthBroker implements AuthBroker {
 class FakeLauncher implements AgentHostLauncherLike {
 	readonly host = new FakeHost();
 	launchCalls = 0;
+	disposeCalls = 0;
 
 	async probe(): Promise<AgentHostProbe> {
 		return { available: true, executable: '/safe/code', version: '1.134.0' };
@@ -4231,6 +5494,7 @@ class FakeLauncher implements AgentHostLauncherLike {
 	}
 
 	async dispose(): Promise<void> {
+		this.disposeCalls += 1;
 		await this.host.dispose();
 	}
 }
@@ -4251,10 +5515,11 @@ class FakeHost implements LaunchedAgentHost {
 	readonly endpoint = new URL('ws://127.0.0.1:1234/?tkn=not-a-real-token');
 	readonly version = '1.134.0';
 	registryProtocolVersion = '0.1.0';
-	source: 'editor' | 'standalone' | undefined;
+	source: AgentHostSource | undefined;
 	preserveTerminalSession = false;
 	disposed = false;
 	disposeFailuresRemaining = 0;
+	disposeCalls = 0;
 	private listeners = new Set<(error: AgentRuntimeError) => void>();
 
 	onExit(listener: (error: AgentRuntimeError) => void): { dispose(): void } {
@@ -4269,6 +5534,7 @@ class FakeHost implements LaunchedAgentHost {
 	}
 
 	async dispose(): Promise<void> {
+		this.disposeCalls += 1;
 		if (this.disposeFailuresRemaining > 0) {
 			this.disposeFailuresRemaining -= 1;
 			throw new AgentRuntimeError('AGENT_UNAVAILABLE', 'Synthetic host cleanup failure.', false, undefined, true);

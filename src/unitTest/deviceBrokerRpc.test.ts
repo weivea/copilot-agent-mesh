@@ -635,6 +635,7 @@ test('routes authenticated local RPC across two nodes and fences workspace execu
 			nodeInstanceId: INSTANCE_A,
 			workspaceId: nodeA.workspaces[0].workspaceId,
 		}));
+		await waitForTask(clientB, TASK_A, (snapshot) => snapshot.state === 'running');
 		assert.equal(windowA.runtime.requests.length, 1);
 		assert.equal(windowA.confirmations.length, 0);
 		assert.equal(
@@ -664,6 +665,7 @@ test('routes authenticated local RPC across two nodes and fences workspace execu
 			nodeInstanceId: INSTANCE_A,
 			workspaceId: nodeA.workspaces[0].workspaceId,
 		}));
+		await waitForTask(clientB, TASK_B, (snapshot) => snapshot.state === 'running');
 		await emit(windowA.runtime.handles[1], {
 			type: 'inputRequired',
 			request: {

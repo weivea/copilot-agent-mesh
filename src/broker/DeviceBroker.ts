@@ -57,6 +57,7 @@ import {
 } from '../../shared/protocol';
 import { MeshDomainError } from '../domain/errors';
 import { containsUnsafeDashboardText } from '../ui/DashboardRedaction';
+import { snapshotActionIssuer, replaceSnapshotActions } from '../ui/SnapshotActionIssuer';
 import {
 	LocalIpcHandlerError,
 	LocalIpcRemoteError,
@@ -658,7 +659,9 @@ export class DeviceBroker {
 			case LOCAL_BROKER_METHODS.policyCandidates: {
 				const input = peerPolicyCandidateParamsSchema.parse(params);
 				this.assertIdentity(binding, input);
-				const actions = this.resetCandidateActions(session);
+				const currentActions = this.dashboardActionRegistry(session).candidates;
+				const actions = new Map<string, PeerPolicyCandidateBinding>();
+				const issue = snapshotActionIssuer(currentActions, actions, (candidate) => this.issueDashboardHandle(actions, candidate));
 				const bindings = this.options.peerPolicies.listCandidates(input);
 				const visibleBindings = bindings.slice(
 					0,
@@ -666,18 +669,20 @@ export class DeviceBroker {
 				);
 				const candidates = visibleBindings.map((candidateBinding) => {
 					const actionHandle = candidateBinding.candidate.canToggle
-						? this.issueDashboardHandle(actions, candidateBinding)
+						? issue(candidateBinding)
 						: undefined;
 					return {
 						...candidateBinding.candidate,
 						...(actionHandle === undefined ? {} : { actionHandle }),
 					};
 				});
-				return toJsonValue(peerPolicyCandidateListResultSchema.parse({
+				const result = peerPolicyCandidateListResultSchema.parse({
 					candidates,
 					truncated: bindings.length > visibleBindings.length,
 					totalCandidates: bindings.length,
-				}));
+				});
+				replaceSnapshotActions(currentActions, actions);
+				return toJsonValue(result);
 			}
 			case LOCAL_BROKER_METHODS.policyCandidateSet: {
 				const input = peerPolicyCandidateMutationParamsSchema.parse(params);
@@ -1351,14 +1356,6 @@ export class DeviceBroker {
 				: this.options.peerPolicies.displayLabel(node),
 			workspaceName: safeDashboardLabel(workspace?.name ?? 'Workspace', 'Workspace'),
 		};
-	}
-
-	private resetCandidateActions(
-		session: LocalIpcSession,
-	): Map<string, PeerPolicyCandidateBinding> {
-		const registry = this.dashboardActionRegistry(session);
-		registry.candidates.clear();
-		return registry.candidates;
 	}
 
 	private dashboardActionRegistry(session: LocalIpcSession): DashboardActionRegistry {

@@ -280,7 +280,7 @@ function assertDashboardViewModel(model: unknown): asserts model is DashboardVie
 	}
 	assertOptionalString(model.thisWindow.detail);
 	assertExactRecord(model.thisWindow.agentHost, ['source', 'label', 'degraded'], ['reason', 'detail']);
-	assertEnum(model.thisWindow.agentHost.source, ['editor', 'standalone', 'unavailable']);
+	assertEnum(model.thisWindow.agentHost.source, ['editor', 'standalone', 'codespace-owned', 'unavailable']);
 	assertString(model.thisWindow.agentHost.label);
 	assertBoolean(model.thisWindow.agentHost.degraded);
 	if (model.thisWindow.agentHost.reason !== undefined) {

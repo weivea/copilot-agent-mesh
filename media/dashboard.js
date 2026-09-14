@@ -35,11 +35,15 @@
 		...managementActions, ...remotePolicyActions, 'setAcceptIncoming', 'setPeerAllowed', 'openTargetChat',
 		'cancelOutgoingTask', 'cancelIncomingTask', 'pairDiscoveredPeer', 'revokeIncomingPeer',
 	]);
+	// These provider-owned notices make every service capability display-only, including cancellation.
+	const displayNoticeCodes = new Set(['DASHBOARD_REFRESHING', 'DASHBOARD_RECONNECTING', 'DASHBOARD_CONNECTING']);
+	const localNavigationActions = new Set(['refresh', 'openAdvancedSettings']);
 	const controls = new Map();
 	const focusTargets = new Map();
 	const encoder = new TextEncoder();
 	const state = {
 		model: undefined, pendingActions: new Set(), actionFailure: undefined, page: 'overview',
+		modelRejected: false,
 		permissionKey: undefined, treeKey: undefined, sourceKey: undefined, back: [], disclosures: new Map(),
 		sourceInitialized: false,
 		historyStatus: 'all', historyDirection: 'all', helpKey: undefined, helpFocus: undefined,
@@ -61,13 +65,32 @@
 		try {
 			if (!isOutboundMessage(message) || message.uiInstanceId !== uiInstanceId) { return; }
 		} catch { return; }
+		const quietRefresh = message.type === 'dashboard.snapshot'
+			&& state.pendingActions.size === 0 && !message.pendingActions?.length
+			&& isQuietRefresh(state.model, message.model);
 		state.pendingActions = new Set(message.pendingActions || []);
 		if (message.type === 'dashboard.error') {
-			state.actionFailure = { code: message.code, message: message.message };
+			if (message.code === 'UNSAFE_VIEW_MODEL') {
+				state.model = undefined;
+				state.modelRejected = true;
+			}
+			if (message.code !== 'STALE_ACTION' || (!displayNotice() && !state.modelRejected)) {
+				state.actionFailure = { code: message.code, message: message.message };
+			}
 		} else {
 			state.model = message.model;
+			if (!displayNotice()) {
+				state.modelRejected = false;
+				if (['UNSAFE_VIEW_MODEL', 'STALE_ACTION'].includes(state.actionFailure?.code)) {
+					state.actionFailure = undefined;
+				}
+			}
 		}
-		render();
+		if (quietRefresh) {
+			updateControls();
+		} else {
+			render();
+		}
 	});
 	document.addEventListener('keydown', (event) => {
 		if (event.key === 'Escape' && !popover.hidden) {
@@ -96,11 +119,23 @@
 		}
 		const model = state.model;
 		if (!model) {
-			content.append(tr('p', 'Loading…', 'empty'));
+			content.append(tr('p', state.modelRejected ? 'Dashboard data is unavailable. Refresh to retry.' : 'Loading…', 'empty'));
 			updateControls();
 			return;
 		}
+		const freshness = displayNotice();
+		if (freshness && freshness.code !== 'DASHBOARD_REFRESHING') {
+			const status = el('p', diagnosticText(freshness.code), 'freshness');
+			status.id = 'dashboardFreshness';
+			status.setAttribute('role', 'status');
+			status.setAttribute('aria-live', 'polite');
+			content.append(status);
+		}
 		renderOperationalErrors(model);
+		if (freshness?.code === 'DASHBOARD_CONNECTING') {
+			updateControls();
+			return;
+		}
 		if (state.page === 'overview') { renderOverview(model); }
 		else if (state.page === 'history') { renderHistory(model); }
 		else if (state.page === 'access') { renderAccess(model); }
@@ -154,7 +189,9 @@
 	}
 
 	function renderOperationalErrors(model) {
-		for (const error of model.errors) { content.append(renderError(error)); }
+		for (const error of model.errors) {
+			if (!displayNoticeCodes.has(error.code)) { content.append(renderError(error)); }
+		}
 		if (model.broker.error && !model.errors.some((error) => error.code === model.broker.error.code)) {
 			content.append(renderError(model.broker.error));
 		}
@@ -671,11 +708,34 @@
 
 	function updateControls() {
 		for (const [control, binding] of controls) {
-			control.disabled = binding.disabled || isActionPending(binding.action);
+			control.disabled = binding.disabled || isActionPending(binding.action) || isActionUnavailable(binding.action);
 		}
 		const pending = state.pendingActions.size > 0;
-		document.getElementById('operationStatus').textContent = pending
+		document.getElementById('operationStatus').textContent = pending && !displayNotice() && !state.modelRejected
 			? t('Action in progress. Navigation, task cancellation and disconnect remain available.') : '';
+	}
+
+	function displayNotice() {
+		return state.model?.errors.find((error) => displayNoticeCodes.has(error.code));
+	}
+
+	function isQuietRefresh(previous, next) {
+		if (!previous || state.modelRejected
+			|| !next.errors.some((error) => error.code === 'DASHBOARD_REFRESHING')
+			|| next.errors.some((error) => displayNoticeCodes.has(error.code) && error.code !== 'DASHBOARD_REFRESHING')
+			|| previous.errors.some((error) => displayNoticeCodes.has(error.code) && error.code !== 'DASHBOARD_REFRESHING')) {
+			return false;
+		}
+		const visibleModel = (model) => ({
+			...model, errors: model.errors.filter((error) => !displayNoticeCodes.has(error.code)),
+		});
+		// The pending marker fences actions without rebuilding the same rows or
+		// inserting a status paragraph on every successful background refresh.
+		return JSON.stringify(visibleModel(previous)) === JSON.stringify(visibleModel(next));
+	}
+
+	function isActionUnavailable(action) {
+		return !localNavigationActions.has(action) && (!state.model || Boolean(displayNotice()));
 	}
 
 	function isActionPending(action) {
@@ -684,7 +744,7 @@
 	}
 
 	function postAction(action, fields) {
-		if (!dashboardActions.has(action) || isActionPending(action)) { return; }
+		if (!dashboardActions.has(action) || isActionPending(action) || isActionUnavailable(action)) { return; }
 		if (managementActions.includes(action) && !state.model?.management.available) { return; }
 		if (handleActions.has(action) !== isActionHandle(fields?.actionHandle)
 			|| booleanActions.has(action) !== (typeof fields?.enabled === 'boolean')) { return; }
@@ -885,7 +945,7 @@
 			|| !booleans(current, ['previewEnabled', 'canRename', 'acceptsIncoming', 'canSetAcceptIncoming'])
 			|| !actionableHandle(current.canSetAcceptIncoming, current.acceptActionHandle)
 			|| !isExactRecord(current.agentHost, ['source', 'label', 'degraded'], ['reason', 'detail'])
-			|| !['editor', 'standalone', 'unavailable'].includes(current.agentHost.source)
+			|| !['editor', 'standalone', 'codespace-owned', 'unavailable'].includes(current.agentHost.source)
 			|| !isText(current.agentHost.label) || typeof current.agentHost.degraded !== 'boolean'
 			|| !optionalText(current.agentHost.detail)
 			|| (current.agentHost.reason !== undefined && !['EDITOR_DISCOVERY_FAILED', 'EDITOR_START_FAILED', 'STANDALONE_START_FAILED'].includes(current.agentHost.reason))) { return false; }

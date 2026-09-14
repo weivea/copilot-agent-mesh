@@ -206,6 +206,43 @@ test('management schemas strictly separate UUID backend handles from UI aliases 
 	}).success, false, 'The old incoming action-handle field must not be accepted.');
 });
 
+test('unchanged management reads preserve valid one-use actions', async () => {
+	const f = await fixture();
+	const first = await f.snapshot();
+	for (let index = 0; index < 20; index++) {
+		const next = await f.snapshot();
+		assert.equal(next.accountActionHandle, first.accountActionHandle);
+		assert.equal(next.workspaces[0].receiveActionHandle, first.workspaces[0].receiveActionHandle);
+		assert.equal(next.targets[0].sources[0].actionHandle, first.targets[0].sources[0].actionHandle);
+	}
+	await f.act('setWorkspaceReceiving', first.workspaces[0].receiveActionHandle!, true);
+	assert.ok(f.receiving.has(f.sources[0].workspaceIdentity));
+	assert.throws(() => f.act('setWorkspaceReceiving', first.workspaces[0].receiveActionHandle!, false), /stale/u);
+});
+
+test('a management action can complete during a background read without its consumed handle being resurrected', async () => {
+	const f = await fixture();
+	const first = await f.snapshot();
+	const handle = first.workspaces[0].receiveActionHandle!;
+	const original = f.options.records.listPeers.bind(f.options.records);
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => { release = resolve; });
+	let entered!: () => void;
+	const reading = new Promise<void>((resolve) => { entered = resolve; });
+	f.options.records.listPeers = async () => { entered(); await gate; return original(); };
+	const pending = f.snapshot();
+	try {
+		await reading;
+		await f.act('setWorkspaceReceiving', handle, true);
+		assert.ok(f.receiving.has(f.sources[0].workspaceIdentity));
+		f.options.records.listPeers = original;
+		release();
+		const next = await pending;
+		assert.notEqual(next.workspaces[0].receiveActionHandle, handle);
+		assert.throws(() => f.act('setWorkspaceReceiving', handle, false), /stale/u);
+	} finally { f.options.records.listPeers = original; release(); }
+});
+
 test('management localization preserves English mocks and translates template keys with display-only arguments', async () => {
 	assert.equal(localize({}, 'Device "{0}" has {1} tasks.', 'Laptop', 2), 'Device "Laptop" has 2 tasks.');
 	assert.equal(formatMessage('{0}: {1}', '$& {2}', false), '$& {2}: false');

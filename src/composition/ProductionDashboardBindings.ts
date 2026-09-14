@@ -56,12 +56,30 @@ import type { ProductionBrokerRuntime } from './ProductionBrokerRuntime';
 import { DashboardTreeBuilder } from '../ui/DashboardTreeBuilder';
 import { managementKey } from '../broker/DashboardManagementKey';
 import { localize } from './ProductionLocalization';
+import { codespaceFileUri } from '../codespaces/CodespaceEnvironment';
+import { snapshotActionIssuer, replaceSnapshotActions } from '../ui/SnapshotActionIssuer';
 
 const activeTaskStates = new Set<string>(ACTIVE_TASK_STATUSES);
 
 interface RemoteTaskActionBinding {
 	readonly taskId: string;
 	readonly lifecycleGeneration: string;
+}
+
+interface ReceiveActionBinding {
+	readonly workspaceIdentity: string;
+	readonly workspaceId: string;
+}
+
+interface TargetChatActionBinding {
+	readonly target: DashboardTaskTarget;
+	readonly generation: string;
+}
+
+interface RemotePolicyActionBinding {
+	readonly action: RemotePolicyAction;
+	readonly handle: string;
+	readonly generation: string;
 }
 
 export interface ProductionDashboardBindingsOptions {
@@ -80,16 +98,13 @@ export interface ProductionDashboardBindingsOptions {
 
 export class ProductionDashboardBindings implements DashboardServiceBindings, vscode.Disposable {
 	private readonly subscriptions: Array<{ dispose(): void }> = [];
-	private readonly acceptActions = new Map<string, {
-		readonly workspaceIdentity: string;
-		readonly workspaceId: string;
-	}>();
+	private readonly acceptActions = new Map<string, ReceiveActionBinding>();
 	private readonly remoteTaskActions = new Map<string, RemoteTaskActionBinding>();
 	private readonly remoteTaskHandlesById = new Map<string, string>();
 	private remoteHandleGeneration = 'uninitialized';
 	private readonly treeBuilder = new DashboardTreeBuilder();
-	private readonly targetChatActions = new Map<string, { readonly target: DashboardTaskTarget; readonly generation: string }>();
-	private readonly remotePolicyActions = new Map<string, { readonly action: RemotePolicyAction; readonly handle: string; readonly generation: string }>();
+	private readonly targetChatActions = new Map<string, TargetChatActionBinding>();
+	private readonly remotePolicyActions = new Map<string, RemotePolicyActionBinding>();
 
 	public constructor(private readonly options: ProductionDashboardBindingsOptions) {
 		this.subscriptions.push(
@@ -109,9 +124,6 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 		this.options.changed.event(listener);
 
 	public async getSnapshot(): Promise<DashboardSnapshot> {
-		this.acceptActions.clear();
-		this.targetChatActions.clear();
-		this.remotePolicyActions.clear();
 		this.refreshRemoteHandleGeneration();
 		this.options.guard.assertAllowed({ requireWorkspace: false });
 		const profile = this.options.profile();
@@ -245,21 +257,14 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 				&& connectivity.claimedWorkspaceCount === 1
 				? connectivity.receivingWorkspaceCount === 1
 				: thisWindowBase.acceptsIncoming,
-			...(thisWindowBase.canSetAcceptIncoming && policySelection.kind === 'selected'
-				? {
-					acceptActionHandle: this.issueBindingHandle(this.acceptActions, {
-						workspaceIdentity: policySelection.workspaceIdentity,
-						workspaceId: policySelection.workspaceId,
-					}),
-				}
-				: {}),
 			agentHost: !runtimePreviewEnabled ? {
 				source: 'unavailable',
 				label: 'Not in use',
 				degraded: false,
 				detail: 'The execution runtime is selected only when an authorized task needs it.',
 			} : {
-				source: runtimeProbe.source === 'editor'
+				source: runtimeProbe.source === 'codespace-owned'
+					? 'codespace-owned' : runtimeProbe.source === 'editor'
 					? 'editor'
 					: runtimeProbe.source === 'standalone' ? 'standalone' : 'unavailable',
 				label: listener.agentHost.label,
@@ -445,7 +450,6 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 				errors.push({ code: 'REMOTE_POLICY_UNAVAILABLE', message: 'Remote Workspace policy is unavailable.', action: 'Refresh after claims and Broker state are ready.' });
 			}
 		}
-		const generation = this.currentRemoteHandleGeneration();
 		let management: DashboardManagement = { available: false, truncated: false, devices: [], workspaces: [], targets: [] };
 		try {
 			management = dashboardManagementSnapshotSchema.parse(await this.options.node.managementSnapshot());
@@ -473,8 +477,24 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 					|| current === 'authFailed' || current === 'incompatible' ? current : 'offline' as const;
 				return { ...device, state, nodes: state === 'online' || state === 'busy' ? device.nodes : [] };
 			});
+		const generation = this.currentRemoteHandleGeneration();
+		const nextAccept = new Map<string, ReceiveActionBinding>();
+		const nextChat = new Map<string, TargetChatActionBinding>();
+		const nextPolicy = new Map<string, RemotePolicyActionBinding>();
+		const issueAccept = snapshotActionIssuer(this.acceptActions, nextAccept, (binding) => this.issueBindingHandle(nextAccept, binding));
+		const issueChat = snapshotActionIssuer(this.targetChatActions, nextChat, (binding) => this.issueBindingHandle(nextChat, binding));
+		const issuePolicy = snapshotActionIssuer(this.remotePolicyActions, nextPolicy, (binding) => this.issueBindingHandle(nextPolicy, binding));
+		const currentWindow: DashboardSnapshot['thisWindow'] = {
+			...snapshot.thisWindow,
+			...(snapshot.thisWindow.canSetAcceptIncoming && policySelection.kind === 'selected' ? {
+				acceptActionHandle: issueAccept({
+					workspaceIdentity: policySelection.workspaceIdentity, workspaceId: policySelection.workspaceId,
+				}),
+			} : {}),
+		};
 		const treeSnapshot = {
 			...snapshot,
+			thisWindow: currentWindow,
 			management,
 			remoteDevices: [
 				...authoritativeRemoteDevices,
@@ -486,8 +506,9 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 					})),
 			],
 		};
-		return {
+		const result: DashboardSnapshot = {
 			...snapshot,
+			thisWindow: currentWindow,
 			management,
 			remoteDevices: authoritativeRemoteDevices,
 			peers: authoritativeRemoteDevices.map((device) => ({
@@ -496,8 +517,8 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 			})),
 			deviceTree: this.treeBuilder.build(treeSnapshot, policy, {
 				currentPolicyWorkspaceId: policySelection.kind === 'selected' ? policySelection.workspaceId : undefined,
-				delegate: (target) => this.issueBindingHandle(this.targetChatActions, { target, generation }),
-				remoteAction: (action, handle) => this.issueBindingHandle(this.remotePolicyActions, { action, handle, generation }),
+				delegate: (target) => issueChat({ target, generation }),
+				remoteAction: (action, handle) => issuePolicy({ action, handle, generation }),
 				onTruncated: () => errors.push({
 					code: 'DEVICE_TREE_TRUNCATED',
 					message: 'Some Window Nodes or Workspaces were omitted from the bounded tree.',
@@ -505,6 +526,10 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 				}),
 			}),
 		};
+		replaceSnapshotActions(this.acceptActions, nextAccept);
+		replaceSnapshotActions(this.targetChatActions, nextChat);
+		replaceSnapshotActions(this.remotePolicyActions, nextPolicy);
+		return result;
 	}
 
 	public async configureDeviceName(name: string): Promise<void> {
@@ -963,9 +988,12 @@ export class ProductionDashboardBindings implements DashboardServiceBindings, vs
 
 	private activeWorkspaceUri(): string | undefined {
 		const documentUri = this.options.vscodeApi.window.activeTextEditor?.document.uri;
-		return documentUri === undefined
+		const folder = documentUri === undefined
 			? undefined
-			: this.options.vscodeApi.workspace.getWorkspaceFolder(documentUri)?.uri.toString();
+			: this.options.vscodeApi.workspace.getWorkspaceFolder(documentUri)?.uri;
+		return folder?.scheme === 'vscode-remote' && this.options.vscodeApi.env.remoteName === 'codespaces'
+			? codespaceFileUri(folder.toString(), folder.authority)
+			: folder?.toString();
 	}
 
 	private peerDelegationEnabled(): boolean {
@@ -1269,10 +1297,13 @@ function agentHostSnapshot(
 	platform: WorkerPlatformSupport,
 	failure?: AgentHostSourceFailure,
 ): DashboardSnapshot['listener']['agentHost'] {
-	if (!platform.supported) {
+	if (!platform.supported && probe.source !== 'codespace-owned') {
 		return { state: 'unavailable', label: 'Unsupported', detail: platform.agentMessage, action: 'Use Windows x64/ARM64 or macOS arm64 for task execution.' };
 	}
 	if (probe.available) {
+		if (probe.source === 'codespace-owned') {
+			return { state: 'ready', label: 'Codespace', detail: 'Tasks use a Mesh-owned Agent Host in the attached Codespace.' };
+		}
 		return probe.source === 'editor'
 			? { state: 'ready', label: 'Editor', detail: 'Tasks use the current VS Code instance Agent Host.' }
 			: probe.degradation === undefined
@@ -1296,6 +1327,12 @@ function agentHostSnapshot(
 		return {
 			state: 'stopped', label: 'On demand',
 			detail: 'An authorized task connects to the Agent Host when needed. Workspace permissions and task approval still apply.',
+		};
+	}
+	if (probe.source === 'codespace-owned') {
+		return {
+			state: 'unavailable', label: 'Codespaces setup required',
+			detail: 'Use Prepare Codespaces Runtime in the Dashboard toolbar or Command Palette, then retry.',
 		};
 	}
 	return {

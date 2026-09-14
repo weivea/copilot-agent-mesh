@@ -66,6 +66,7 @@ export interface DelegationWaiterOptions {
 	readonly start: (onTaskAvailable: () => void) => Promise<TaskToolSnapshot>;
 	readonly cancel: () => Promise<TaskToolSnapshot>;
 	readonly sanitizeText: (value: string) => string;
+	readonly sanitizeSummary?: (value: string) => string;
 }
 
 export class DelegationWaiter {
@@ -242,7 +243,7 @@ export class DelegationWaiter {
 					kind: 'completed',
 					taskId: this.options.taskId,
 					result: {
-						summary: this.options.sanitizeText(snapshot.summary ?? 'Task completed.'),
+						summary: (this.options.sanitizeSummary ?? this.options.sanitizeText)(snapshot.summary ?? 'Task completed.'),
 						...(snapshot.validation === undefined
 							? {}
 							: {
@@ -251,7 +252,7 @@ export class DelegationWaiter {
 									...(snapshot.validation.summary === undefined
 										? {}
 										: {
-											summary: this.options.sanitizeText(
+											summary: (this.options.sanitizeSummary ?? this.options.sanitizeText)(
 												snapshot.validation.summary,
 											),
 										}),

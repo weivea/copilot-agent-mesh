@@ -35,9 +35,10 @@ async function main() {
 	}
 	execFileSync(process.execPath, ['scripts/build-windows-process-host.mjs'], { stdio: 'inherit' });
 	const ctx = await esbuild.context({
-		entryPoints: [
-			'src/extension.ts'
-		],
+		entryPoints: {
+			extension: 'src/extension.ts',
+			'codespaces-companion': 'src/codespaces/extension.ts',
+		},
 		bundle: true,
 		metafile: true,
 		format: 'cjs',
@@ -45,8 +46,9 @@ async function main() {
 		sourcemap: !production,
 		sourcesContent: false,
 		platform: 'node',
-		outfile: 'dist/extension.js',
+		outdir: 'dist',
 		external: ['vscode'],
+		alias: { 'jsonc-parser': 'jsonc-parser/lib/esm/main.js' },
 		logLevel: 'silent',
 		plugins: [
 			/* add to the end of plugins array */

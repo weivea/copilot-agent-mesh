@@ -3,6 +3,7 @@ import { test } from 'node:test';
 
 import {
 	PROTOCOL_LIMITS,
+	LOCAL_BROKER_HEARTBEAT_TTL_MS,
 	brokerRemoteListResultSchema,
 	nodeDirectoryResultSchema,
 	serializedLocalResultBytes,
@@ -178,6 +179,30 @@ test('registers and lists deterministic Window Node descriptors', async (t) => {
 	assert.equal(directory.deviceId, DEVICE_ID);
 	assert.deepEqual(directory.nodes.map((node) => node.nodeId), [NODE_A, NODE_B]);
 	assert.equal(directory.nodes[0].status, 'online');
+});
+
+test('production heartbeat grace preserves a temporarily blocked host but still expires real liveness loss', async (t) => {
+	const { registry, time } = await createFixture({ heartbeatTtlMs: LOCAL_BROKER_HEARTBEAT_TTL_MS });
+	t.after(() => registry.dispose());
+	const session = new FakeSession();
+	registry.register(registration(), session.asRoute());
+	await registry.claimWorkspace(claim());
+	time.advance(60_000);
+	assert.deepEqual(registry.sweepExpired(), []);
+	assert.equal(registry.list().nodes[0].status, 'online');
+	time.advance(LOCAL_BROKER_HEARTBEAT_TTL_MS - 60_000);
+	assert.deepEqual(registry.sweepExpired(), [NODE_A]);
+	assert.equal(registry.list().nodes[0].status, 'offline');
+});
+
+test('production heartbeat grace never delays an actual transport disconnect', async (t) => {
+	const { registry } = await createFixture({ heartbeatTtlMs: LOCAL_BROKER_HEARTBEAT_TTL_MS });
+	t.after(() => registry.dispose());
+	const session = new FakeSession();
+	registry.register(registration(), session.asRoute());
+	await registry.claimWorkspace(claim());
+	session.disconnect();
+	assert.equal(registry.list().nodes[0].status, 'offline');
 });
 
 test('offline records leave live listings immediately and expire without modifying the Workspace catalog', async (t) => {

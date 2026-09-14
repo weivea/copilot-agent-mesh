@@ -11,6 +11,9 @@
 		savedHelp: 'Saved devices and permissions remain visible when cross-device connections are off. Deletion revokes trust and permissions but preserves task history. Active or unknown task state blocks deletion. Revoke trust remains a separate operation.',
 	};
 	window.dashboardDiagnostics = {
+		DASHBOARD_REFRESHING: 'Updating live status… Showing last-known data only. Actions will return when the refresh completes.',
+		DASHBOARD_RECONNECTING: 'Reconnecting to the local Broker. Showing last-known data, not current status. Saved connection preferences are unchanged; actions are unavailable until live status returns. Refresh to retry.',
+		DASHBOARD_CONNECTING: 'Connecting to the local Broker. Live status and saved connection preferences have not been read. No actions are available yet. Refresh to retry.',
 		DISABLED: 'Cross-device connections are off. Enable connections to discover remote devices.',
 		AUTH_REQUIRED: 'Authorize your VS Code account to connect or retry Tunnel cleanup.',
 		ACCOUNT_CHANGED: 'The selected account does not own this Tunnel. Select its original account to reconnect or finish cleanup.',
@@ -48,6 +51,10 @@
 	window.dashboardL10n = {
 		en: help,
 		zh: {
+			'Codespace': 'Codespace',
+			'Codespaces setup required': '需要配置 Codespaces 运行时',
+			'Tasks use a Mesh-owned Agent Host in the attached Codespace.': '任务使用当前 Codespace 中由 Mesh 管理的 Agent Host。',
+			'Use Prepare Codespaces Runtime in the Dashboard toolbar or Command Palette, then retry.': '请在仪表盘工具栏或命令面板中运行“准备 Codespaces 运行时”，然后重试。',
 			overviewHelp: '概览仅显示本机、已确认在线的远程设备，以及所有尚未终结的任务。已保存或状态未知的设备不是在线目标。打开工作区的“权限”可管理其准确范围。',
 			tasksHelp: '委派任务独立于聊天运行。停止聊天不会取消已提交的任务。请使用“取消任务”；恢复中、等待输入和等待取消确认的任务仍属于未结束任务。',
 			historyHelp: '历史仅包含此窗口有权查看、且已确认完成、失败、取消或超时的任务。筛选不会扩大可见范围，此处不能删除记录。',
@@ -62,6 +69,10 @@
 			'Task history': '任务历史',
 			'Devices & permissions': '设备与权限',
 			'Loading…': '正在加载…',
+			'Dashboard data is unavailable. Refresh to retry.': '仪表盘数据不可用，请刷新后重试。',
+			'Updating live status… Showing last-known data only. Actions will return when the refresh completes.': '正在刷新实时状态… 当前仅显示上次确认的数据，刷新完成后将恢复操作。',
+			'Reconnecting to the local Broker. Showing last-known data, not current status. Saved connection preferences are unchanged; actions are unavailable until live status returns. Refresh to retry.': '正在重新连接本机 Broker。当前显示的是上次确认的数据，并非实时状态。已保存的连接设置未更改，实时状态恢复前暂不可操作。可刷新重试。',
+			'Connecting to the local Broker. Live status and saved connection preferences have not been read. No actions are available yet. Refresh to retry.': '正在连接本机 Broker。尚未读取到实时状态和已保存的连接设置，目前无法操作。可刷新重试。',
 			'Dismiss error': '关闭错误提示',
 			'Help': '帮助',
 			'Help: {0}': '帮助：{0}',

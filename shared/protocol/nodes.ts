@@ -481,18 +481,29 @@ export const remoteTaskApprovalSchema = z.strictObject({
 });
 export type RemoteTaskApproval = z.infer<typeof remoteTaskApprovalSchema>;
 
+export const CODESPACE_EXECUTION_CAPABILITY = 'codespace-owned';
+export const executionBackendSchema = z.enum(['editor', 'codespace-owned']);
+
 export const nodeTaskStartParamsSchema = routedTaskStartParamsSchema.extend({
 	continuation: z.strictObject({
 		sessionUri: utf8String(PROTOCOL_LIMITS.identifierBytes, 'continuation session URI', 1),
 		chatUri: utf8String(PROTOCOL_LIMITS.identifierBytes, 'continuation chat URI', 1),
 	}).optional(),
 	requireEditor: z.literal(true).optional(),
+	executionBackend: executionBackendSchema.optional(),
 	remoteTaskApproval: remoteTaskApprovalSchema.optional(),
 	authenticatedOwnerId: uuidSchema,
 	sourceLabel: utf8String(PROTOCOL_LIMITS.nameBytes, 'task source label', 1),
 	delegationGrant: delegationGrantSchema,
 	delegatedExecutionContext: delegatedExecutionContextSchema,
 }).superRefine((params, context) => {
+	if (params.executionBackend === 'codespace-owned' && params.requireEditor === true) {
+		context.addIssue({
+			code: 'custom',
+			path: ['executionBackend'],
+			message: 'An editor-only request cannot select an owned Codespaces runtime',
+		});
+	}
 	if ((params.continueFromTaskId === undefined) !== (params.continuation === undefined)) {
 		context.addIssue({
 			code: 'custom',
@@ -649,6 +660,11 @@ export const LOCAL_BROKER_NOTIFICATIONS = {
  * finite so a wedged Node still fails the request instead of pinning the session forever.
  */
 export const LOCAL_BROKER_TASK_START_TIMEOUT_MS = 180_000;
+
+// The production Broker shares VS Code's Extension Host. These liveness budgets
+// tolerate a short host stall without changing any task's absolute deadline.
+export const LOCAL_BROKER_REQUEST_TIMEOUT_MS = 60_000;
+export const LOCAL_BROKER_HEARTBEAT_TTL_MS = 90_000;
 
 export const localBrokerMethodParamsSchemas = {
 	[LOCAL_BROKER_METHODS.register]: nodeRegisterParamsSchema,

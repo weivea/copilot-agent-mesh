@@ -5,3 +5,4 @@ node_modules
 .mw/
 *.vsix
 artifacts/peer-delegation-e2e/
+artifacts/codespaces-native-chat-*.json

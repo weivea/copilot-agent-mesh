@@ -66,10 +66,12 @@ export interface WindowNodeTaskExecutorOptions {
 	readonly nodeInstanceId: string;
 	readonly nodeLabel: string;
 	readonly runtime: AgentRuntime;
+	readonly executionBackend?: 'editor' | 'codespace-owned';
 	readonly workspaceResolver: WorkspaceResolver;
 	readonly confirmationHost: WindowNodeTaskConfirmationHost;
 	readonly approvalCapabilities?: AgentRuntimeApprovalCapabilityIssuer;
 	readonly eventSink: WindowNodeTaskEventSink;
+	readonly observeInputAnswer?: (taskId: string, inputId: string, answer: () => Promise<void>) => Promise<void>;
 	readonly ids: IdGenerator | (() => string);
 	readonly clock: Clock | (() => Date);
 }
@@ -94,6 +96,7 @@ interface ActiveTask {
 	readonly autoApprovedInputs: Set<string>;
 	outputSummary: string;
 	outputTail: string;
+	outputPendingSpace: boolean;
 	grant: DelegationGrant | undefined;
 	delegatedExecutionContext: DelegatedExecutionContext | undefined;
 	terminal: boolean;
@@ -106,8 +109,14 @@ interface ActiveTask {
 }
 
 interface StartRecord {
+	readonly taskId: string;
 	readonly fingerprint: string;
+	readonly coreOperation: Promise<NodeTaskStartedResult>;
 	operation: Promise<NodeTaskStartedResult>;
+	cancelRequested: boolean;
+	cancellationNotification: boolean;
+	cancellationPublished: boolean;
+	cancellationOperation?: Promise<void>;
 	result?: NodeTaskStartedResult;
 	active?: ActiveTask;
 	terminal: boolean;
@@ -169,6 +178,9 @@ export class WindowNodeTaskExecutor {
 		this.assertActive();
 		const params = nodeTaskStartParamsSchema.parse(input);
 		this.assertTarget(params.target.nodeId, params.target.nodeInstanceId);
+		if ((params.executionBackend ?? 'editor') !== (this.options.executionBackend ?? 'editor')) {
+			throw new MeshDomainError('AUTH_FAILED', 'The task is not authorized for this execution backend.');
+		}
 		const fingerprint = startFingerprint(params);
 		const existing = this.starts.get(params.taskId);
 		if (existing !== undefined) {
@@ -179,21 +191,33 @@ export class WindowNodeTaskExecutor {
 		}
 		this.assertWithinWorkerDeadline(params.workerDeadline);
 
-		const record: StartRecord = {
+		let record!: StartRecord;
+		const coreOperation = Promise.resolve().then(() => this.startCore(params, record));
+		record = {
+			taskId: params.taskId,
 			fingerprint,
-			operation: undefined as unknown as Promise<NodeTaskStartedResult>,
+			coreOperation,
+			operation: coreOperation.catch(async (error: unknown) => {
+				if (record.cancelRequested) {
+					await record.cancellationOperation;
+				}
+				throw error;
+			}),
+			cancelRequested: false,
+			cancellationNotification: false,
+			cancellationPublished: false,
 			terminal: false,
 			deadlineExpired: false,
 			runtimeStartPending: false,
 			preStartAbort: new AbortController(),
 		};
 		this.scheduleWorkerDeadline(record, params.workerDeadline);
-		const operation = this.startCore(params, record);
-		record.operation = operation;
+		const operation = record.operation;
 		this.starts.set(params.taskId, record);
 		void operation.catch(() => {
 			if (
 				this.starts.get(params.taskId) === record
+				&& !record.cancelRequested
 				&& record.result === undefined
 				&& record.active === undefined
 			) {
@@ -209,6 +233,19 @@ export class WindowNodeTaskExecutor {
 		const params = nodeTaskCancelParamsSchema.parse(input);
 		this.assertTarget(params.nodeId, params.nodeInstanceId);
 		const record = this.requireTask(params.taskId);
+		if (record.cancellationOperation !== undefined) {
+			if (record.terminal && !record.cancellationNotification) {
+				throw new MeshDomainError('TASK_NOT_CANCELLABLE', 'The pending start has already been disposed.');
+			}
+			record.cancellationNotification = true;
+			return record.cancellationOperation;
+		}
+		if (record.active === undefined && !record.terminal) {
+			record.cancelRequested = true;
+			record.cancellationNotification = true;
+			record.cancellationOperation = this.cancelBeforeStart(record);
+			return record.cancellationOperation;
+		}
 		await record.operation;
 		const active = record.active;
 		if (active === undefined || active.terminal) {
@@ -222,6 +259,14 @@ export class WindowNodeTaskExecutor {
 		const params = nodeTaskCancelParamsSchema.parse(input);
 		this.assertTarget(params.nodeId, params.nodeInstanceId);
 		const record = this.requireTask(params.taskId);
+		if (record.cancellationOperation !== undefined) {
+			return record.cancellationOperation;
+		}
+		if (record.active === undefined && !record.terminal) {
+			record.cancelRequested = true;
+			record.cancellationOperation = this.cancelBeforeStart(record);
+			return record.cancellationOperation;
+		}
 		await record.operation;
 		const active = record.active;
 		if (active === undefined) {
@@ -254,8 +299,18 @@ export class WindowNodeTaskExecutor {
 		if (pending === undefined) {
 			throw new MeshDomainError('INPUT_NOT_PENDING', 'The requested input is not pending.');
 		}
-
-		const operation = active.handle.answer(toAgentAnswer(pending.request, params.answer)).then(async () => {
+		const operation = Promise.resolve().then(async () => {
+			await this.assertCurrentWorkspace(active);
+			this.assertActive();
+			if (active.terminal || active.pendingInputs.get(params.inputId) !== pending) {
+				throw new MeshDomainError('INPUT_NOT_PENDING', 'The input changed while its workspace was being resolved.');
+			}
+			const applyAnswer = () => active.handle.answer(toAgentAnswer(pending.request, params.answer));
+			if (this.options.observeInputAnswer === undefined) {
+				await applyAnswer();
+			} else {
+				await this.options.observeInputAnswer(params.taskId, params.inputId, applyAnswer);
+			}
 			active.pendingInputs.delete(params.inputId);
 			active.answeredInputs.set(params.inputId, params.answerId);
 			await this.publishNextInput(record, active);
@@ -327,10 +382,12 @@ export class WindowNodeTaskExecutor {
 			record.preStartAbort.signal,
 		);
 		const grant = assertDelegationGrantBinding(params, workspace);
-		const requireEditor = params.requireEditor === true || params.continuation !== undefined;
+		const requireEditor = params.requireEditor === true
+			|| (params.continuation !== undefined && params.executionBackend !== 'codespace-owned');
 		const approval = params.remoteTaskApproval;
 		if (approval !== undefined && (
-			params.sourceNodeId !== undefined || params.requireEditor !== true
+			params.sourceNodeId !== undefined
+			|| (params.requireEditor !== true && params.executionBackend !== 'codespace-owned')
 			|| approval.peerId !== params.authenticatedOwnerId || approval.taskId !== params.taskId
 			|| approval.workspaceIdentity !== grant.workspaceIdentity
 		)) {
@@ -362,6 +419,7 @@ export class WindowNodeTaskExecutor {
 			workspaceId: workspace.workspaceId,
 			sourceWindowName: params.sourceLabel,
 			...(requireEditor ? { requireEditor: true as const } : {}),
+			...(params.executionBackend === undefined ? {} : { executionBackend: params.executionBackend }),
 			...(params.continuation === undefined ? {} : { continuation: { ...params.continuation } }),
 			allowInteractiveAuthentication: true,
 			delegatedExecutionContext: { ...params.delegatedExecutionContext },
@@ -433,6 +491,7 @@ export class WindowNodeTaskExecutor {
 			autoApprovedInputs: new Set(),
 			outputSummary: '',
 			outputTail: '',
+			outputPendingSpace: false,
 			grant,
 			delegatedExecutionContext: { ...params.delegatedExecutionContext },
 			terminal: false,
@@ -441,6 +500,11 @@ export class WindowNodeTaskExecutor {
 			disposeComplete: false,
 		};
 		record.active = active;
+		if (record.cancelRequested) {
+			await this.stopActiveTask(record, active);
+			await this.publishCancelledStart(record);
+			throw new MeshDomainError('TASK_EXECUTION_FAILED', 'The task was cancelled while its runtime was starting.');
+		}
 		if (record.deadlineExpired || this.deadlineHasPassed(params.workerDeadline)) {
 			record.deadlineExpired = true;
 			await this.stopActiveTask(record, active);
@@ -633,7 +697,14 @@ export class WindowNodeTaskExecutor {
 				});
 				return false;
 			case 'output': {
-				const safeOutput = safeTaskText(event.text, PROTOCOL_LIMITS.outputEventBytes);
+				if (/^[ \t\r\n]*$/u.test(event.text)) {
+					active.outputPendingSpace ||= event.text.length > 0;
+					return false;
+				}
+				const separator = active.outputSummary.length > 0
+					&& (active.outputPendingSpace || /^[ \t\r\n]/u.test(event.text)) ? ' ' : '';
+				const safeOutput = separator + safeTaskText(event.text, PROTOCOL_LIMITS.outputEventBytes - separator.length);
+				active.outputPendingSpace = /[ \t\r\n]$/u.test(event.text);
 				active.outputSummary = boundUtf8(
 					active.outputSummary + safeOutput,
 					PROTOCOL_LIMITS.terminalSummaryBytes,
@@ -717,6 +788,7 @@ export class WindowNodeTaskExecutor {
 		active: ActiveTask,
 		request: AgentInputRequest,
 	): Promise<void> {
+		await this.assertCurrentWorkspace(active);
 		if (
 			request.kind === 'toolConfirmation'
 			&& active.grant !== undefined
@@ -794,7 +866,7 @@ export class WindowNodeTaskExecutor {
 		const params = nodeTaskEventParamsSchema.parse({
 			nodeId: this.nodeId,
 			nodeInstanceId: this.nodeInstanceId,
-			taskId: record.result?.taskId,
+			taskId: record.taskId,
 			at: this.now().toISOString(),
 			event,
 		});
@@ -813,7 +885,52 @@ export class WindowNodeTaskExecutor {
 				'The exact Window Node instance does not resolve this workspace.',
 			);
 		}
+
 		return workspace;
+	}
+
+	private async assertCurrentWorkspace(active: ActiveTask): Promise<void> {
+		if (this.options.executionBackend !== 'codespace-owned') {
+			return;
+		}
+		const current = await this.resolveWorkspace(active.workspace.workspaceId);
+		if (current.workspaceIdentity !== active.workspace.workspaceIdentity || current.uri !== active.workspace.uri) {
+			throw new MeshDomainError('WORKSPACE_NOT_FOUND', 'The Codespaces workspace binding changed during execution.');
+		}
+	}
+
+	private async cancelBeforeStart(record: StartRecord): Promise<void> {
+		record.preStartAbort.abort(new MeshDomainError('TASK_EXECUTION_FAILED', 'The task was cancelled before execution.'));
+		let scopedCleanupConfirmed = false;
+		if (record.runtimeStartPending) {
+			if (this.options.runtime.cancelStart === undefined) {
+				throw new AgentRuntimeError('TASK_CANCELLATION_UNCONFIRMED', 'The runtime cannot yet confirm startup cancellation.');
+			}
+			await this.options.runtime.cancelStart(record.taskId);
+			scopedCleanupConfirmed = true;
+		}
+		const result = await Promise.allSettled([record.coreOperation]);
+		const failure = result[0].status === 'rejected' ? result[0].reason : undefined;
+		if (!scopedCleanupConfirmed && failure instanceof AgentRuntimeError && failure.cleanupFailed) {
+			throw new AgentRuntimeError('TASK_CANCELLATION_UNCONFIRMED', 'Startup cleanup could not be confirmed.', false, failure, true);
+		}
+		if (record.active !== undefined && (!record.active.cancelComplete || !record.active.disposeComplete)) {
+			await this.stopActiveTask(record, record.active);
+		}
+		await this.publishCancelledStart(record);
+	}
+
+	private async publishCancelledStart(record: StartRecord): Promise<void> {
+		if (record.cancellationPublished) {
+			return;
+		}
+		record.terminal = true;
+		this.clearWorkerDeadline(record);
+		if (!record.cancellationNotification) {
+			return;
+		}
+		await this.publish(record, { type: 'cancelled', summary: 'Cancelled before Agent startup completed.' });
+		record.cancellationPublished = true;
 	}
 
 	private assertTarget(nodeId: string, nodeInstanceId: string): void {
@@ -849,6 +966,9 @@ export class WindowNodeTaskExecutor {
 		record: StartRecord,
 		workerDeadline: string,
 	): void {
+		if (record.cancelRequested) {
+			throw new MeshDomainError('TASK_EXECUTION_FAILED', 'The task was cancelled before execution.');
+		}
 		if (record.deadlineExpired || this.deadlineHasPassed(workerDeadline)) {
 			record.deadlineExpired = true;
 			this.clearWorkerDeadline(record);
@@ -890,7 +1010,11 @@ export class WindowNodeTaskExecutor {
 			if (active !== undefined) {
 				this.trackDeadlineOperation(this.stopActiveTask(record, active));
 			} else if (record.runtimeStartPending) {
-				void this.dispose().catch(() => undefined);
+				if (this.options.runtime.cancelStart !== undefined) {
+					this.trackDeadlineOperation(this.options.runtime.cancelStart(record.taskId));
+				} else {
+					void this.dispose().catch(() => undefined);
+				}
 			}
 		}, Math.min(remaining, maximumTimerDelayMs));
 		timer.unref();

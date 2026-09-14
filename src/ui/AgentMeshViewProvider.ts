@@ -19,16 +19,27 @@ import {
 import { DashboardPresenter, type DashboardViewModel } from './DashboardPresenter';
 import {
 	CONNECTIVITY_ACTIONS,
+	DISABLED_CONNECTIVITY_SNAPSHOT,
 	REMOTE_POLICY_ACTIONS,
 	DASHBOARD_MANAGEMENT_ACTIONS,
 	type DashboardManagementAction,
 } from '../../shared/protocol';
 import { createDashboardHtml as renderDashboardHtml } from './DashboardHtml';
 import { createDashboardActionHandle } from './DashboardActionHandle';
+import { snapshotActionIssuer } from './SnapshotActionIssuer';
 
 const promptActions = new Set<string>([...CONNECTIVITY_ACTIONS, ...REMOTE_POLICY_ACTIONS, ...DASHBOARD_MANAGEMENT_ACTIONS]
 	.filter((action) => action !== 'disableConnectivity'));
 const managementActions = new Set<string>(DASHBOARD_MANAGEMENT_ACTIONS);
+const localNavigationActions = new Set<DashboardAction>(['refresh', 'openAdvancedSettings']);
+const unavailableReadCodes = new Set([
+	'LOCAL_BROKER_UNAVAILABLE', 'CONNECTIVITY_UNAVAILABLE', 'REMOTE_DIRECTORY_UNAVAILABLE',
+	'DASHBOARD_TASKS_UNAVAILABLE', 'MANAGEMENT_UNAVAILABLE', 'PEER_POLICY_UNAVAILABLE',
+	'PEER_CANDIDATES_UNAVAILABLE', 'REMOTE_POLICY_UNAVAILABLE',
+]);
+// Reserved display-only notices use the existing v10 errors field; service snapshots cannot supply them.
+const displayNoticeCodes = new Set(['DASHBOARD_REFRESHING', 'DASHBOARD_RECONNECTING', 'DASHBOARD_CONNECTING']);
+export const DASHBOARD_REFRESH_GRACE_MS = 10_000;
 
 interface ScopedDashboardAction {
 	readonly action: DashboardAction;
@@ -46,6 +57,14 @@ interface ViewInstance {
 	publishedRevision: number;
 	publication: Promise<void> | undefined;
 	readonly actions: Map<string, ScopedDashboardAction>;
+	authoritative: boolean;
+	// Validated Webview data only. It is never fed back into action scoping or the facade.
+	lastKnownModel: DashboardViewModel | undefined;
+	refreshDisplay: {
+		model: DashboardViewModel;
+		readonly hasLastKnown: boolean;
+		timer: vscode.Disposable | undefined;
+	} | undefined;
 }
 
 export const DASHBOARD_COMMANDS = {
@@ -53,7 +72,7 @@ export const DASHBOARD_COMMANDS = {
 	refresh: 'copilotAgentMesh.refreshDashboard',
 } as const;
 
-export const DASHBOARD_CONNECTIONS_CONTEXT = 'copilotAgentMesh.connectionsOnline';
+export const DASHBOARD_CONNECTIONS_CONTEXT = 'copilotAgentMesh.connectionsEnabled';
 
 export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
 	public static readonly viewType = 'copilotAgentMesh.dashboard';
@@ -61,12 +80,20 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 	private readonly instances = new Map<string, ViewInstance>();
 	private readonly presenter = new DashboardPresenter();
 	private readonly extensionUri: vscode.Uri;
+	private connectionPreference: boolean | undefined;
+	private pendingConnectionPreference: { readonly instance: ViewInstance; readonly enabled: boolean } | undefined;
+	private connectionContextUpdate: Promise<void> | undefined;
 
 	public constructor(
 		private readonly facade: DashboardFacade = new UnavailableDashboardFacade(),
 		extensionUri?: vscode.Uri,
-		private readonly setConnectionContext: (online: boolean) => Thenable<unknown> = (online) =>
-			vscode.commands.executeCommand('setContext', DASHBOARD_CONNECTIONS_CONTEXT, online),
+		private readonly setConnectionContext: (enabled: boolean) => Thenable<unknown> = (enabled) =>
+			vscode.commands.executeCommand('setContext', DASHBOARD_CONNECTIONS_CONTEXT, enabled),
+		private readonly scheduleDisplayNotice: (callback: () => void, delayMs: number) => vscode.Disposable =
+			(callback, delayMs) => {
+				const timer = setTimeout(callback, delayMs);
+				return new vscode.Disposable(() => clearTimeout(timer));
+			},
 	) {
 		this.extensionUri = extensionUri ?? getOwnExtensionUri();
 	}
@@ -87,6 +114,9 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 			publishedRevision: 0,
 			publication: undefined,
 			actions: new Map(),
+			authoritative: false,
+			lastKnownModel: undefined,
+			refreshDisplay: undefined,
 		};
 		this.instances.set(instance.id, instance);
 
@@ -135,6 +165,10 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 		}
 		if (message.type === 'ready') {
 			await this.publish(instance);
+			return;
+		}
+		if (!instance.authoritative && !localNavigationActions.has(message.action)) {
+			await this.postError(instance, 'STALE_ACTION', 'This Dashboard action is stale. Refresh and try again.');
 			return;
 		}
 		if (instance.pendingActions.has(message.action)
@@ -282,23 +316,50 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 		while (!instance.disposed && instance.publishedRevision < instance.requestedRevision) {
 			const revision = instance.requestedRevision;
 			try {
+				await this.beginRefresh(instance);
+				if (instance.disposed) { return; }
 				const model = this.presenter.present(await this.facade.getSnapshot());
 				if (instance.disposed) {
 					return;
 				}
 				if (revision === instance.requestedRevision) {
-					const scopedModel = this.scopeActions(instance, model);
+					const display = instance.refreshDisplay!;
+					const unavailable = model.errors.some((error) => unavailableReadCodes.has(error.code));
+					const actions = new Map<string, ScopedDashboardAction>();
+					const scopedModel = this.scopeActions(actions, model,
+						instance.authoritative && !unavailable ? instance.actions : undefined);
 					const message: DashboardOutboundMessage = {
 						version: DASHBOARD_MESSAGE_VERSION,
 						uiInstanceId: instance.id,
 						type: 'dashboard.snapshot',
 						model: scopedModel,
 					};
-					await this.safePost(instance, message);
+					assertSafeDashboardOutboundMessage(message);
+					if (scopedModel.errors.some((error) => displayNoticeCodes.has(error.code))) {
+						throw new Error('Service snapshots cannot supply display freshness notices.');
+					}
+					if (unavailable) {
+						instance.actions.clear();
+						instance.authoritative = false;
+						display.timer?.dispose();
+						display.timer = undefined;
+						display.model = reconnectingDisplayModel(instance.lastKnownModel, scopedModel);
+						await this.postRefreshDisplay(instance, display);
+					} else {
+						this.clearRefreshDisplay(instance);
+						instance.lastKnownModel = scopedModel;
+						instance.authoritative = true;
+						instance.actions.clear();
+						for (const [handle, action] of actions) { instance.actions.set(handle, action); }
+						await this.safePost(instance, message);
+					}
 				}
 			} catch {
-				if (revision === instance.requestedRevision) {
+				if (!instance.disposed && revision === instance.requestedRevision) {
 					instance.actions.clear();
+					instance.authoritative = false;
+					instance.lastKnownModel = undefined;
+					this.clearRefreshDisplay(instance);
 					await this.postError(
 						instance,
 						'UNSAFE_VIEW_MODEL',
@@ -308,6 +369,52 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 			}
 			instance.publishedRevision = revision;
 		}
+	}
+
+	private async beginRefresh(instance: ViewInstance): Promise<void> {
+		if (instance.refreshDisplay !== undefined) { return; }
+		const display: NonNullable<ViewInstance['refreshDisplay']> = {
+			model: instance.lastKnownModel ?? emptyDisplayModel(),
+			hasLastKnown: instance.lastKnownModel !== undefined,
+			timer: undefined,
+		};
+		instance.refreshDisplay = display;
+		display.timer = this.scheduleDisplayNotice(() => {
+			if (instance.disposed || instance.refreshDisplay !== display) { return; }
+			display.timer?.dispose();
+			display.timer = undefined;
+			instance.actions.clear();
+			instance.authoritative = false;
+			void this.postRefreshDisplay(instance, display).catch(() => {
+				if (!instance.disposed && instance.refreshDisplay === display) {
+					instance.lastKnownModel = undefined;
+					this.clearRefreshDisplay(instance);
+					void this.postError(instance, 'UNSAFE_VIEW_MODEL', 'The dashboard rejected an invalid service snapshot.');
+				}
+			});
+		}, DASHBOARD_REFRESH_GRACE_MS);
+	}
+
+	private async postRefreshDisplay(
+		instance: ViewInstance,
+		display: NonNullable<ViewInstance['refreshDisplay']>,
+	): Promise<void> {
+		if (instance.disposed || instance.refreshDisplay !== display) { return; }
+		const code = display.hasLastKnown ? 'DASHBOARD_RECONNECTING' : 'DASHBOARD_CONNECTING';
+		await this.safePost(instance, {
+			version: DASHBOARD_MESSAGE_VERSION,
+			uiInstanceId: instance.id,
+			type: 'dashboard.snapshot',
+			model: {
+				...display.model,
+				errors: [...display.model.errors, { code, message: code }],
+			},
+		});
+	}
+
+	private clearRefreshDisplay(instance: ViewInstance): void {
+		instance.refreshDisplay?.timer?.dispose();
+		instance.refreshDisplay = undefined;
 	}
 
 	private async postError(
@@ -330,26 +437,39 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 		}
 		const outbound: DashboardOutboundMessage = { ...message, pendingActions: [...instance.pendingActions] };
 		assertSafeDashboardOutboundMessage(outbound);
-		let online: boolean | undefined;
 		if (outbound.type === 'dashboard.snapshot') {
 			const { connectivity, errors } = outbound.model;
-			online = connectivity.enabled && connectivity.connectionState === 'online'
-				&& !errors.some((error) => error.code === 'CONNECTIVITY_UNAVAILABLE'
-					|| error.code === 'DASHBOARD_SERVICES_UNAVAILABLE');
-		} else if (outbound.code === 'UNSAFE_VIEW_MODEL') {
-			online = false;
-		}
-		if (online !== undefined) {
-			const current = online;
-			// Toolbar IPC must not delay snapshots or task cancellation.
-			void Promise.resolve().then(() => {
-				if (!instance.disposed) { return this.setConnectionContext(current); }
-				return undefined;
-			}).catch((error: unknown) => {
-				console.error('Unable to update the Dashboard connection indicator.', error);
-			});
+			// Enable/Disable describes the saved preference, not live transport
+			// health. An unread, cached or invalid snapshot cannot change it.
+			if (!errors.some((error) => error.code === 'CONNECTIVITY_UNAVAILABLE'
+				|| error.code === 'DASHBOARD_SERVICES_UNAVAILABLE'
+				|| displayNoticeCodes.has(error.code))) {
+				this.queueConnectionPreference(instance, connectivity.enabled);
+			}
 		}
 		await instance.view.webview.postMessage(outbound);
+	}
+
+	private queueConnectionPreference(instance: ViewInstance, enabled: boolean): void {
+		this.pendingConnectionPreference = { instance, enabled };
+		if (this.connectionContextUpdate !== undefined) { return; }
+		this.connectionContextUpdate = Promise.resolve().then(async () => {
+			while (this.pendingConnectionPreference !== undefined) {
+				const current = this.pendingConnectionPreference;
+				this.pendingConnectionPreference = undefined;
+				if (current.instance.disposed || current.enabled === this.connectionPreference) { continue; }
+				try {
+					await this.setConnectionContext(current.enabled);
+					this.connectionPreference = current.enabled;
+				} catch (error: unknown) {
+					console.error('Unable to update the Dashboard saved connection preference.', error);
+				}
+			}
+		}).finally(() => {
+			this.connectionContextUpdate = undefined;
+			const pending = this.pendingConnectionPreference;
+			if (pending !== undefined) { this.queueConnectionPreference(pending.instance, pending.enabled); }
+		});
 	}
 
 	private disposeInstance(instance: ViewInstance): void {
@@ -358,48 +478,42 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 		}
 		instance.disposed = true;
 		instance.actions.clear();
+		instance.authoritative = false;
+		instance.lastKnownModel = undefined;
+		this.clearRefreshDisplay(instance);
 		this.instances.delete(instance.id);
 		for (const subscription of instance.subscriptions.splice(0)) {
 			subscription.dispose();
 		}
 	}
 
-	private scopeActions(instance: ViewInstance, model: DashboardViewModel): DashboardViewModel {
-		const stableTaskAliases = new Map<string, string>();
-		for (const [uiHandle, action] of instance.actions) {
-			if (
-				action.action === 'cancelOutgoingTask'
-				|| action.action === 'cancelIncomingTask'
-			) {
-				stableTaskAliases.set(`${action.action}:${action.brokerHandle}`, uiHandle);
-			}
-		}
-		instance.actions.clear();
+	private scopeActions(
+		actions: Map<string, ScopedDashboardAction>,
+		model: DashboardViewModel,
+		previousActions?: ReadonlyMap<string, ScopedDashboardAction>,
+	): DashboardViewModel {
+		const issue = snapshotActionIssuer(previousActions, actions, (binding) => {
+			const handle = createDashboardActionHandle((candidate) => actions.has(candidate));
+			actions.set(handle, binding);
+			return handle;
+		});
 		const scope = (
 			action: DashboardAction,
 			brokerHandle: string | undefined,
 			options: {
-				readonly stable?: boolean;
 				readonly requiredEnabled?: boolean;
 			} = {},
 		): string | undefined => {
 			if (brokerHandle === undefined) {
 				return undefined;
 			}
-			let handle = options.stable
-				? stableTaskAliases.get(`${action}:${brokerHandle}`)
-				: undefined;
-			if (handle === undefined) {
-				handle = createDashboardActionHandle((candidate) => instance.actions.has(candidate));
-			}
-			instance.actions.set(handle, {
+			return issue({
 				action,
 				brokerHandle,
 				...(options.requiredEnabled === undefined
 					? {}
 					: { requiredEnabled: options.requiredEnabled }),
 			});
-			return handle;
 		};
 		return {
 			...model,
@@ -466,11 +580,11 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 			})),
 			outgoingTasks: model.outgoingTasks.map((task) => ({
 				...task,
-				actionHandle: scope('cancelOutgoingTask', task.actionHandle, { stable: true }),
+				actionHandle: scope('cancelOutgoingTask', task.actionHandle),
 			})),
 			incomingTasks: model.incomingTasks.map((task) => ({
 				...task,
-				actionHandle: scope('cancelIncomingTask', task.actionHandle, { stable: true }),
+				actionHandle: scope('cancelIncomingTask', task.actionHandle),
 			})),
 			deviceTree: model.deviceTree.map((device) => ({
 				...device,
@@ -517,6 +631,56 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 		}
 		return action;
 	}
+}
+
+function reconnectingDisplayModel(
+	lastKnown: DashboardViewModel | undefined,
+	unavailable: DashboardViewModel,
+): DashboardViewModel {
+	const brokerUnavailable = unavailable.errors.some((error) => error.code === 'LOCAL_BROKER_UNAVAILABLE');
+	const connectivityUnavailable = unavailable.errors.some((error) => error.code === 'CONNECTIVITY_UNAVAILABLE');
+	const base = lastKnown ?? unavailable;
+	return {
+		...base,
+		listener: unavailable.listener,
+		broker: {
+			...unavailable.broker,
+			error: brokerUnavailable && unavailable.broker.error
+				&& (unavailableReadCodes.has(unavailable.broker.error.code) || unavailable.broker.error.code === 'BROKER_UNAVAILABLE')
+				? undefined : unavailable.broker.error,
+		},
+		thisWindow: { ...base.thisWindow, agentHost: unavailable.thisWindow.agentHost },
+		connectivity: connectivityUnavailable && lastKnown ? lastKnown.connectivity : {
+			...unavailable.connectivity,
+			error: brokerUnavailable && connectivityUnavailable && unavailable.connectivity.error === 'DISCOVERY_UNAVAILABLE'
+				? undefined : unavailable.connectivity.error,
+		},
+		errors: unavailable.errors.filter((error) => !brokerUnavailable || !unavailableReadCodes.has(error.code)),
+	};
+}
+
+function emptyDisplayModel(): DashboardViewModel {
+	const component = { state: 'unavailable' as const, label: 'Unavailable' };
+	// Only the connecting notice is rendered. No preference or rows have been read for this view.
+	return {
+		device: {
+			name: 'Unavailable', platform: 'Unavailable', architecture: 'Unavailable', workerSupported: false,
+			vscodeVersion: 'Unavailable', extensionVersion: 'Unavailable',
+		},
+		listener: {
+			state: 'unavailable', gateway: component, tunnel: component, agentHost: component,
+			canStart: false, canStop: false, canCopyConnectionUrl: false,
+		},
+		broker: { state: 'starting', role: 'contender', takeover: 'waiting', holder: 'none' },
+		thisWindow: {
+			name: 'Unavailable', workspaceName: 'Unavailable', claimStatus: 'unclaimed', previewEnabled: false,
+			canRename: false, acceptsIncoming: false, canSetAcceptIncoming: false,
+			agentHost: { source: 'unavailable', label: 'Unavailable', degraded: false },
+		},
+		connectivity: DISABLED_CONNECTIVITY_SNAPSHOT,
+		management: { available: false, truncated: false, devices: [], workspaces: [], targets: [] },
+		deviceTree: [], localNodes: [], savedAuthorizations: [], outgoingTasks: [], incomingTasks: [], errors: [],
+	};
 }
 
 export function createDashboardHtml(

@@ -296,6 +296,161 @@ test('connection startup is cancellable immediately and navigation/task cancella
 	assert.ok(browser.element('historyTasks'));
 });
 
+test('refresh and reconnect notices retain last-known rows and preferences but reject even detached action callbacks', () => {
+	const browser = createDashboardBrowserHarness();
+	const data = model();
+	browser.render(data);
+	const previousDelegate = browser.control('delegate-tree-7');
+	browser.control('permission-tree-7').click();
+	browser.control('source-workspace').value = 'manage-workspace-1';
+	browser.control('source-workspace').emit('change');
+	const previousSourceToggle = browser.control('target-manage-target-1-manage-workspace-1');
+	const refreshing = {
+		...data, errors: [{ code: 'DASHBOARD_REFRESHING', message: 'DASHBOARD_REFRESHING' }],
+	};
+	browser.render(refreshing);
+	assert.equal(browser.control('target-manage-target-1-manage-workspace-1').disabled, true);
+	assert.equal(browser.control('allow-all-manage-target-1').disabled, true);
+	previousDelegate.emit('click');
+	previousSourceToggle.emit('change');
+	assert.equal(browser.messages.length, 1, 'Stale callbacks must not post actions even if the DOM disable is bypassed.');
+	assert.equal(browser.find((item) => item.className === 'error').length, 0);
+	assert.equal(browser.find((item) => item.id === 'dashboardFreshness').length, 0);
+	assert.doesNotMatch(browser.element('pageContent').text, /Updating live status/u);
+	assert.doesNotMatch(browser.element('pageContent').text, /Reconnecting/u);
+	browser.button('Overview').click();
+	assert.match(browser.element('deviceTree').text, /Remote root/u);
+	assert.match(browser.element('activeTasks').text, /Task 00000001/u);
+	assert.match(browser.element('connectivity').text, /Online 1 connected/u);
+	assert.equal(browser.control('delegate-tree-7').disabled, true);
+	assert.equal(browser.control('cancel-incoming-00000004').disabled, true);
+
+	const reconnecting = {
+		...data, errors: [{ code: 'DASHBOARD_RECONNECTING', message: 'DASHBOARD_RECONNECTING' }],
+	};
+	browser.render(reconnecting);
+	browser.send({ version: 10, uiInstanceId: 'media-view', type: 'dashboard.error', code: 'STALE_ACTION', message: 'This action is stale.' });
+	assert.equal(browser.find((item) => item.id === 'dashboardFreshness').length, 1);
+	assert.equal(browser.find((item) => item.className === 'error').length, 0);
+	assert.match(browser.element('dashboardFreshness').text, /not current status.*preferences are unchanged/u);
+	assert.equal(browser.element('dashboardFreshness').attributes.role, 'status');
+	browser.button('Devices & permissions').click();
+	for (const key of ['rename-device', 'rename-window', 'switch-account', 'connect-disable', 'remote-refresh', 'register-workspace', 'revoke-manage-device-1']) {
+		assert.equal(browser.control(key).disabled, true, key);
+	}
+	assert.equal(browser.control('advanced-settings').disabled, false);
+	assert.equal(browser.control('refresh').disabled, false);
+	browser.button('Task history').click();
+	assert.match(browser.element('historyTasks').text, /Task 00000002/u);
+	browser.button('Overview').click();
+	const recovered = model();
+	recovered.deviceTree[1].nodes[0].workspaces[0].name = 'Recovered root';
+	browser.render(recovered, ['switchAccount']);
+	assert.equal(browser.find((item) => item.id === 'dashboardFreshness').length, 0);
+	assert.equal(browser.find((item) => item.className === 'error').length, 0);
+	assert.match(browser.element('deviceTree').text, /Recovered root/u);
+	assert.equal(browser.control('delegate-tree-7').disabled, false);
+	assert.equal(browser.control('cancel-incoming-00000004').disabled, false, 'A fresh model permits cancellation during native prompts.');
+	browser.control('delegate-tree-7').click();
+	assert.deepEqual(browser.messages.at(-1), {
+		version: 10, uiInstanceId: 'media-view', type: 'action', action: 'openTargetChat', actionHandle: handle('C'),
+	});
+});
+
+test('repeated brief refreshes never insert a banner or replace the visible last-known rows', () => {
+	for (const language of ['en', 'zh'] as const) {
+		const browser = createDashboardBrowserHarness(language);
+		const data = model();
+		browser.render(data);
+		for (let index = 0; index < 20; index++) {
+			const tree = browser.element('deviceTree');
+			const refreshing = {
+				...data, errors: [{ code: 'DASHBOARD_REFRESHING', message: 'DASHBOARD_REFRESHING' }],
+			};
+			browser.render(refreshing);
+			assert.equal(browser.element('deviceTree'), tree, 'A control-plane refresh marker must not rebuild visible rows.');
+			assert.equal(browser.find((item) => item.id === 'dashboardFreshness').length, 0);
+			assert.doesNotMatch(browser.element('pageContent').text, /Updating live status|正在刷新实时状态/u);
+			assert.equal(browser.control('delegate-tree-7').disabled, true, 'Silent display is not stale-action authorization.');
+			browser.render(data);
+			assert.equal(browser.find((item) => item.id === 'dashboardFreshness').length, 0);
+			assert.equal(browser.control('delegate-tree-7').disabled, false);
+		}
+	}
+});
+
+test('a quiet refresh marker does not hide a new genuine error', () => {
+	const browser = createDashboardBrowserHarness();
+	const data = model();
+	browser.render(data);
+	browser.render({
+		...data, errors: [
+			{ code: 'AUTH_REQUIRED', message: 'Authentication is required.' },
+			{ code: 'DASHBOARD_REFRESHING', message: 'DASHBOARD_REFRESHING' },
+		],
+	});
+	assert.equal(browser.find((item) => item.id === 'dashboardFreshness').length, 0);
+	assert.match(browser.element('pageContent').text, /AUTH_REQUIRED/u);
+	assert.equal(browser.control('delegate-tree-7').disabled, true);
+});
+
+test('localized reconnecting notices preserve an explicitly disabled preference too', () => {
+	const browser = createDashboardBrowserHarness('zh-CN');
+	const data = model();
+	data.connectivity.enabled = false;
+	data.connectivity.connectionState = 'disabled';
+	browser.render({ ...data, errors: [{ code: 'DASHBOARD_RECONNECTING', message: 'DASHBOARD_RECONNECTING' }] });
+	assert.match(browser.element('dashboardFreshness').text, /重新连接本机 Broker.*并非实时状态.*连接设置未更改/u);
+	assert.doesNotMatch(browser.element('dashboardFreshness').text, /DASHBOARD_RECONNECTING/u);
+	assert.match(browser.element('connectivity').text, /已关闭/u);
+	assert.equal(browser.control('connect-enable').disabled, true);
+	assert.equal(browser.find((item) => item.className === 'error').length, 0);
+	browser.render(data);
+	assert.equal(browser.control('connect-enable').disabled, false);
+});
+
+test('a connecting view never renders unread fallback preferences or rows', () => {
+	for (const language of ['en', 'zh-CN']) {
+		const browser = createDashboardBrowserHarness(language);
+		browser.render({
+			...model(), errors: [{ code: 'DASHBOARD_CONNECTING', message: 'DASHBOARD_CONNECTING' }],
+		});
+		const text = browser.element('pageContent').text;
+		assert.match(text, language === 'en' ? /have not been read/u : /尚未读取到/u);
+		assert.doesNotMatch(text, /Remote root|Same name|Task 00000001|Online 1 connected|连接已关闭/u);
+		assert.equal(browser.find((item) => item.className === 'error').length, 0);
+		assert.equal(browser.find((item) => item.id === 'deviceTree' || item.id === 'connectivity').length, 0);
+		assert.equal(browser.control('refresh').disabled, false);
+		browser.control('refresh').click();
+		assert.equal(browser.messages.at(-1)?.action, 'refresh');
+	}
+});
+
+test('reconnecting retains real faults and rejected service data stays a failure until fresh recovery', () => {
+	const browser = createDashboardBrowserHarness();
+	browser.render({
+		...model(), errors: [
+			{ code: 'DASHBOARD_RECONNECTING', message: 'DASHBOARD_RECONNECTING' },
+			{ code: 'CONFIGURATION_INVALID', message: 'The configured listener port is invalid.' },
+		],
+		connectivity: { ...model().connectivity, error: 'ACCOUNT_CHANGED' },
+	});
+	assert.match(browser.element('pageContent').text, /CONFIGURATION_INVALID/u);
+	assert.match(browser.element('pageContent').text, /ACCOUNT_CHANGED/u);
+	browser.send({
+		version: 10, uiInstanceId: 'media-view', type: 'dashboard.error',
+		code: 'UNSAFE_VIEW_MODEL', message: 'The dashboard rejected an invalid service snapshot.',
+	});
+	assert.equal(browser.find((item) => item.id === 'dashboardFreshness' || item.id === 'deviceTree').length, 0);
+	assert.match(browser.element('pageContent').text, /UNSAFE_VIEW_MODEL/u);
+	assert.equal(browser.control('refresh').disabled, false);
+	browser.button('Dismiss error').click();
+	assert.match(browser.element('pageContent').text, /Dashboard data is unavailable/u);
+	browser.render(model());
+	assert.equal(browser.find((item) => item.className === 'error').length, 0);
+	assert.equal(browser.control('delegate-tree-7').disabled, false);
+});
+
 test('all connection states expose their precise recovery or stop actions', () => {
 	for (const [connectionState, label, action] of [
 		['disabled', 'Off', 'Enable cross-device connections'],

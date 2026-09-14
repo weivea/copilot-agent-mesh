@@ -340,6 +340,19 @@ class GuardedAgentRuntime implements AgentRuntime, AgentHostSourceStatusProvider
 		return this.diagnostic;
 	}
 
+	public async cancelStart(taskId: string): Promise<void> {
+		if (this.delegate.cancelStart === undefined) {
+			throw new AgentRuntimeError(
+				'TASK_CANCELLATION_UNCONFIRMED',
+				'The Agent runtime cannot confirm task startup cancellation.',
+				false,
+				undefined,
+				true,
+			);
+		}
+		await this.delegate.cancelStart(taskId);
+	}
+
 	public dispose(): Promise<void> {
 		return this.delegate.dispose();
 	}
@@ -759,7 +772,7 @@ interface CompletionRequest {
 	readonly controller: AbortController;
 }
 
-async function resolveAuthenticationProvider(
+export async function resolveAuthenticationProvider(
 	vscodeApi: typeof vscode,
 	resource: {
 		readonly resource: string;

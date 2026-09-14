@@ -56,12 +56,12 @@ const experimentStatus = z.enum(['pass', 'fail', 'unverified', 'unsupported']);
 
 export const peerDelegationEvidenceSchema = z.strictObject({
 	schemaVersion: z.literal(1),
-	release: z.enum(['0.4.0-preview', '0.5.0-preview']),
+	release: z.enum(['0.4.0-preview', '0.5.0-preview', '0.5.1-preview', '0.5.2-preview', '0.5.3-preview', '0.5.4-preview', '0.5.5-preview', '0.5.6-preview', '0.5.7-preview', '0.5.8-preview', '0.5.9-preview', '0.5.10-preview', '0.5.11-preview', '0.5.12-preview']),
 	runId: uuid,
 	outcome: status,
 	gitCommit: z.string().regex(/^[a-f0-9]{40}$/u),
 	versions: z.strictObject({
-		extension: z.enum(['0.4.0', '0.5.0']),
+		extension: z.enum(['0.4.0', '0.5.0', '0.5.1', '0.5.2', '0.5.3', '0.5.4', '0.5.5', '0.5.6', '0.5.7', '0.5.8', '0.5.9', '0.5.10', '0.5.11', '0.5.12']),
 		vscode: z.string().min(1).max(64),
 		ahpCommit: z.literal('f19dd8b3942d029744a3bdd31d830f9428e8ea47'),
 		ahpClient: z.literal('0.9.0'),
@@ -519,7 +519,7 @@ export type PeerDelegationEvidenceTerminalState = typeof terminalStateValues[num
 export const peerDelegationDiagnosticEvidenceSchema = z.strictObject({
 	schemaVersion: z.literal(1),
 	kind: z.literal('diagnostic'),
-	release: z.enum(['0.4.0-preview', '0.5.0-preview']),
+	release: z.enum(['0.4.0-preview', '0.5.0-preview', '0.5.1-preview', '0.5.2-preview', '0.5.3-preview', '0.5.4-preview', '0.5.5-preview', '0.5.6-preview', '0.5.7-preview', '0.5.8-preview', '0.5.9-preview', '0.5.10-preview', '0.5.11-preview', '0.5.12-preview']),
 	runId: uuid,
 	outcome: z.literal('fail'),
 	gitCommit: z.string().regex(/^[a-f0-9]{40}$/u),
@@ -542,7 +542,7 @@ export const peerDelegationTestDiagnosticEvidenceSchema = z.strictObject({
 	schemaVersion: z.literal(1),
 	kind: z.literal('test-diagnostic'),
 	testMode: z.literal(true),
-	release: z.enum(['0.4.0-preview', '0.5.0-preview']),
+	release: z.enum(['0.4.0-preview', '0.5.0-preview', '0.5.1-preview', '0.5.2-preview', '0.5.3-preview', '0.5.4-preview', '0.5.5-preview', '0.5.6-preview', '0.5.7-preview', '0.5.8-preview', '0.5.9-preview', '0.5.10-preview', '0.5.11-preview', '0.5.12-preview']),
 	runId: uuid,
 	outcome: z.literal('fail'),
 	gitCommit: z.string().regex(/^[a-f0-9]{40}$/u),
@@ -610,7 +610,7 @@ export function createPeerDelegationDiagnosticEvidence(input: {
 	return peerDelegationDiagnosticEvidenceSchema.parse({
 		schemaVersion: 1,
 		kind: 'diagnostic',
-		release: '0.5.0-preview',
+		release: '0.5.12-preview',
 		runId: input.runId,
 		outcome: 'fail',
 		gitCommit: input.gitCommit,
@@ -649,7 +649,7 @@ export function createPeerDelegationTestDiagnosticEvidence(input: {
 		schemaVersion: 1,
 		kind: 'test-diagnostic',
 		testMode: true,
-		release: '0.5.0-preview',
+		release: '0.5.12-preview',
 		runId: input.runId,
 		outcome: 'fail',
 		gitCommit: input.gitCommit,

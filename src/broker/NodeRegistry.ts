@@ -3,6 +3,7 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 
 import {
+	CODESPACE_EXECUTION_CAPABILITY,
 	PROTOCOL_LIMITS,
 	nodeDirectoryResultSchema,
 	delegationPrincipalSchema,
@@ -118,6 +119,7 @@ export interface TaskRouteRequest {
 
 export interface TaskRoute {
 	readonly session: LocalIpcSession;
+	readonly executionBackend?: 'codespace-owned';
 	readonly workspaceLeaseKey: string;
 	readonly delegatedExecutionContext: DelegatedExecutionContext;
 }
@@ -127,6 +129,7 @@ export interface ResolvedTaskRoute extends TaskRoute, NodeTaskBinding {
 }
 
 export interface NodeTaskBinding extends TaskRouteRequest {
+	readonly executionBackend?: 'codespace-owned';
 	readonly workspaceLeaseKey: string;
 	readonly delegatedExecutionContext: DelegatedExecutionContext;
 }
@@ -622,6 +625,8 @@ export class NodeRegistry {
 			);
 			const binding: NodeTaskBinding = {
 				...identity,
+				...(node.capabilities.includes(CODESPACE_EXECUTION_CAPABILITY)
+					? { executionBackend: 'codespace-owned' as const } : {}),
 				workspaceLeaseKey: claim.workspaceIdentity,
 				delegatedExecutionContext: this.taskBindings.get(identity.taskId)
 					?.delegatedExecutionContext
@@ -634,6 +639,7 @@ export class NodeRegistry {
 			this.taskBindings.set(identity.taskId, binding);
 			return {
 				session: node.session!,
+				...(binding.executionBackend === undefined ? {} : { executionBackend: binding.executionBackend }),
 				workspaceLeaseKey: claim.workspaceIdentity,
 				delegatedExecutionContext: binding.delegatedExecutionContext,
 			};

@@ -48,9 +48,12 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 	private status: AgentHostSourceStatus = { source: 'standalone', degraded: false };
 	private sourceSelected = false;
 	private readonly inFlightStarts = new Set<{
+		readonly taskId: string;
 		readonly controller: AbortController;
 		readonly operation: Promise<AgentTaskHandle>;
 	}>();
+	private readonly pendingSourceStarts = new Set<{ readonly taskId: string; readonly runtime: AgentRuntime }>();
+	private readonly startCancellations = new Map<string, Promise<void>>();
 	private disposed = false;
 	private disposal: Promise<void> | undefined;
 	private readonly editorConnectionRetryDelaysMs: readonly number[];
@@ -165,14 +168,49 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 		}
 		const controller = new AbortController();
 		let tracked!: {
+			readonly taskId: string;
 			readonly controller: AbortController;
 			readonly operation: Promise<AgentTaskHandle>;
 		};
 		const operation = this.startTracked(request, controller.signal)
 			.finally(() => this.inFlightStarts.delete(tracked));
-		tracked = { controller, operation };
+		tracked = { taskId: request.taskId, controller, operation };
 		this.inFlightStarts.add(tracked);
 		return operation;
+	}
+
+	public cancelStart(taskId: string): Promise<void> {
+		const existing = this.startCancellations.get(taskId);
+		if (existing !== undefined) { return existing; }
+		const operation = this.cancelTrackedStart(taskId).finally(() => {
+			if (this.startCancellations.get(taskId) === operation) {
+				this.startCancellations.delete(taskId);
+			}
+		});
+		this.startCancellations.set(taskId, operation);
+		return operation;
+	}
+
+	private async cancelTrackedStart(taskId: string): Promise<void> {
+		const starts = [...this.inFlightStarts].filter((start) => start.taskId === taskId);
+		for (const start of starts) {
+			start.controller.abort();
+		}
+		const settlement = Promise.allSettled(starts.map(({ operation }) => operation));
+		const unsupported = [...this.pendingSourceStarts].some((start) =>
+			start.taskId === taskId && start.runtime.cancelStart === undefined);
+		const cancellations = await Promise.allSettled(
+			[...new Set([this.options.editor, this.options.standalone])].map(async (runtime) => runtime.cancelStart?.(taskId)),
+		);
+		if (unsupported || cancellations.some(({ status }) => status === 'rejected')) {
+			throw startupCancellationFailure(cancellations.flatMap((result) => result.status === 'rejected' ? [result.reason] : []));
+		}
+		const results = await settlement;
+		const failures = results.flatMap((result) => result.status === 'rejected'
+			&& result.reason instanceof AgentRuntimeError && result.reason.cleanupFailed ? [result.reason] : []);
+		if (failures.length > 0) {
+			throw startupCancellationFailure(failures);
+		}
 	}
 
 	private async startTracked(
@@ -192,8 +230,9 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 		request: AgentTaskRequest,
 		signal: AbortSignal,
 	): Promise<AgentTaskHandle> {
+		throwIfSelectorAborted(signal);
 		if (!this.options.preferEditor() && request.requireEditor !== true && request.continuation === undefined) {
-			const handle = await this.options.standalone.start(request);
+			const handle = await this.startSource(this.options.standalone, request, signal);
 			this.sourceSelected = true;
 			this.setStatus({ source: 'standalone', degraded: false });
 			return handle;
@@ -210,13 +249,15 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 			await abortableSelectorOperation(this.editorInitialReadinessWait, signal);
 		}
 		for (let attempt = 0; attempt <= this.editorConnectionRetryDelaysMs.length; attempt += 1) {
+			throwIfSelectorAborted(signal);
 			try {
-				const handle = await this.options.editor.start(request);
+				const handle = await this.startSource(this.options.editor, request, signal);
 				this.assertActive();
 				this.sourceSelected = true;
 				this.setStatus({ source: 'editor', degraded: false });
 				return handle;
 			} catch (error: unknown) {
+				throwIfSelectorAborted(signal, error);
 				this.assertActive();
 				editorFailure = safeEditorFailure(error);
 				if (!isFallbackEligible(error)) {
@@ -238,6 +279,7 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 			}
 		}
 
+		throwIfSelectorAborted(signal);
 		if (request.requireEditor || request.continuation !== undefined) {
 			this.sourceSelected = true;
 			this.setStatus(editorFailureStatus(editorFailure!));
@@ -252,13 +294,30 @@ export class AgentHostSourceSelector implements AgentRuntime, AgentHostSourceSta
 		this.sourceSelected = true;
 		this.setStatus(status);
 		try {
-			const handle = await this.options.standalone.start(request);
+			const handle = await this.startSource(this.options.standalone, request, signal);
 			this.assertActive();
 			return handle;
 		} catch (error: unknown) {
+			throwIfSelectorAborted(signal, error);
 			const failed = degradedStatus('STANDALONE_START_FAILED');
 			this.setStatus(failed);
 			throw normalizeFallbackFailure(error);
+		}
+	}
+
+	private async startSource(
+		runtime: AgentRuntime,
+		request: AgentTaskRequest,
+		signal: AbortSignal,
+	): Promise<AgentTaskHandle> {
+		this.assertActive();
+		throwIfSelectorAborted(signal);
+		const pending = { taskId: request.taskId, runtime };
+		this.pendingSourceStarts.add(pending);
+		try {
+			return await runtime.start(request);
+		} finally {
+			this.pendingSourceStarts.delete(pending);
 		}
 	}
 
@@ -604,11 +663,24 @@ function probeWithStatus(
 	};
 }
 
-function throwIfSelectorAborted(signal: AbortSignal): void {
+function startupCancellationFailure(causes: readonly unknown[]): AgentRuntimeError {
+	return new AgentRuntimeError(
+		'TASK_CANCELLATION_UNCONFIRMED',
+		'The selected Agent Host source could not confirm task startup cancellation and cleanup.',
+		false,
+		causes.length === 0 ? undefined : new AggregateError(causes, 'Agent Host source startup cancellation failed.'),
+		true,
+	);
+}
+
+function throwIfSelectorAborted(signal: AbortSignal, failure?: unknown): void {
 	if (signal.aborted) {
+		if (failure instanceof AgentRuntimeError && failure.cleanupFailed) {
+			throw failure;
+		}
 		throw new AgentRuntimeError(
 			'AGENT_UNAVAILABLE',
-			'The Agent Host source selection was cancelled during shutdown.',
+			'The Agent Host task source selection was cancelled.',
 		);
 	}
 }
