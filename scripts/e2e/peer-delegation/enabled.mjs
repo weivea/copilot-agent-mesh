@@ -762,7 +762,7 @@ async function preflight() {
 	const submodule = runGit(['-C', 'third_party/agent-host-protocol', 'rev-parse', 'HEAD']);
 	assert.equal(submodule, 'f19dd8b3942d029744a3bdd31d830f9428e8ea47');
 	const manifest = JSON.parse(await readFile(join(repositoryRoot, 'package.json'), 'utf8'));
-	assert.equal(manifest.version, '0.5.12');
+	assert.equal(manifest.version, '0.5.13');
 	evidence.gitCommit = head;
 }
 
@@ -2547,12 +2547,12 @@ function deriveOutcome(value) {
 function initialEvidence() {
 	return {
 		schemaVersion: 1,
-		release: '0.5.12-preview',
+		release: '0.5.13-preview',
 		runId,
 		outcome: 'unverified',
 		gitCommit: '0000000000000000000000000000000000000000',
 		versions: {
-			extension: '0.5.12',
+			extension: '0.5.13',
 			vscode: 'not-observed',
 			ahpCommit: 'f19dd8b3942d029744a3bdd31d830f9428e8ea47',
 			ahpClient: '0.9.0',

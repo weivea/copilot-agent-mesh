@@ -6,6 +6,13 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [Unreleased]
 
+## [0.5.13 Preview] - 2026-09-14
+
+- Keep opening a "Delegate in Chat" draft out of global operation feedback, so
+  the progress banner and compact disconnect button no longer flash on each click.
+  Preserve duplicate-click prevention, stale-action checks, failure messages and
+  feedback for actual connection or task actions.
+
 ## [0.5.12 Preview] - 2026-09-14
 
 - Fix refresh-driven clickable/disabled oscillation at its source: ordinary

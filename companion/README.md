@@ -15,7 +15,7 @@ for other windows. Tasks run in the Codespace filesystem. Completed task session
 can be continued on the same live execution generation; they are Mesh-owned
 sessions, not the window's built-in Copilot Host sessions.
 
-**0.5.12 native Chat POC:** the companion requires desktop VS Code 1.137 or newer.
+**0.5.13 native Chat POC:** the companion requires desktop VS Code 1.137 or newer.
 On first activation it asks the desktop Mesh extension to automatically save
 its API permission. Fully quit all VS Code windows and reopen once, then
 reconnect. **No launch parameters or manual configuration edits are needed.**
