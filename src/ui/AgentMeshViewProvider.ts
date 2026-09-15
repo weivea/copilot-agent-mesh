@@ -37,7 +37,7 @@ const unavailableReadCodes = new Set([
 	'DASHBOARD_TASKS_UNAVAILABLE', 'MANAGEMENT_UNAVAILABLE', 'PEER_POLICY_UNAVAILABLE',
 	'PEER_CANDIDATES_UNAVAILABLE', 'REMOTE_POLICY_UNAVAILABLE',
 ]);
-// Reserved display-only notices use the existing v10 errors field; service snapshots cannot supply them.
+// Reserved display-only notices use the existing errors field; service snapshots cannot supply them.
 const displayNoticeCodes = new Set(['DASHBOARD_REFRESHING', 'DASHBOARD_RECONNECTING', 'DASHBOARD_CONNECTING']);
 export const DASHBOARD_REFRESH_GRACE_MS = 10_000;
 

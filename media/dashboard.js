@@ -3,7 +3,7 @@
 
 	const vscode = acquireVsCodeApi();
 	const uiInstanceId = document.body.dataset.uiInstanceId;
-	const version = 10;
+	const version = 11;
 	const language = /^zh(?:-|$)/i.test(document.body.dataset.language || '') ? 'zh' : 'en';
 	const dictionary = window.dashboardL10n?.[language] || {};
 	const t = (key, ...values) => (dictionary[key] || key).replace(/\{(\d+)\}/g, (_, index) => String(values[Number(index)] ?? ''));
@@ -304,6 +304,39 @@
 			root.append(property('Connected devices', String(value.connectedDeviceCount)));
 		}
 		if (value.error) { root.append(renderError({ code: value.error, message: diagnosticText(value.error) })); }
+		if (value.discoveryError) {
+			root.append(connectivityNotice('Device discovery', value.discoveryError,
+				'The remote device list could not be fully updated. This does not report a failure of local or Codespaces tasks.'));
+		}
+		if (value.actionError) {
+			const failure = connectivityNotice('Connection action failed', value.actionError.code,
+				'A previous connection action failed. Task execution status is shown separately.');
+			const label = {
+				enableConnectivity: 'Enable cross-device connections', disableConnectivity: 'Disable cross-device connections',
+				configureConnectivity: 'Connection settings or diagnostics', refreshDiscovery: 'Refresh remote devices',
+				refreshRemoteTargets: 'Refresh remote devices', pairDiscoveredPeer: 'Device trust',
+				configureRemotePolicy: 'Workspace permissions', revokeIncomingPeer: 'Revoke trust',
+				retryConnectivityCleanup: 'Retry Tunnel cleanup',
+			}[value.actionError.action];
+			failure.append(property('Action', t(label)));
+			root.append(failure);
+		}
+		if (value.peerErrors.length > 0) {
+			if (compact) {
+				root.append(notice(t('Remote device connection issues: {0}. Open Manage for details.', value.peerErrors.length)));
+			} else {
+				for (const error of value.peerErrors) {
+					const entry = connectivityNotice('Remote device connection', error.code,
+						'This device could not establish or verify a remote connection. Other devices and task execution have separate status.');
+					entry.append(el('p', error.label, 'detail'));
+					root.append(entry);
+				}
+			}
+		}
+		if (!compact && (value.failedCandidateCount > 0 || value.deferredCandidateCount > 0)) {
+			root.append(el('p', t('Discovery is partial: {0} failed, {1} deferred. Cached candidates are not confirmed live targets.',
+				value.failedCandidateCount, value.deferredCandidateCount), 'detail'));
+		}
 		if (!model.device.workerSupported) { root.append(notice(diagnosticText('PLATFORM_UNSUPPORTED'))); }
 		const available = !model.errors.some((error) => ['CONNECTIVITY_UNAVAILABLE', 'DASHBOARD_SERVICES_UNAVAILABLE'].includes(error.code));
 		const starting = ['authenticating', 'starting'].includes(value.connectionState) || state.pendingActions.has('enableConnectivity');
@@ -323,11 +356,20 @@
 			root.append(notice(t('Connections are stopped or being cleaned up. Use the account that owns the Tunnel to finish cleanup. Saved permissions are not broadened.')));
 			actions.append(actionButton('Retry Tunnel cleanup', 'retryConnectivityCleanup', undefined, !available, 'cleanup-retry'));
 		}
-		if (!compact) {
+		if (!compact || value.discoveryError) {
 			actions.append(actionButton('Refresh remote devices', 'refreshRemoteTargets', undefined,
 				!available || !value.enabled || value.connectionState !== 'online', 'remote-refresh'));
 		}
 		if (actions.children.length > 0) { root.append(actions); }
+		return root;
+	}
+
+	function connectivityNotice(title, code, description) {
+		const transient = ['TIMEOUT', 'OFFLINE', 'DISCOVERY_UNAVAILABLE', 'RATE_LIMITED'].includes(code);
+		const root = el('article', undefined, transient ? 'warning' : 'error');
+		root.setAttribute('role', transient ? 'status' : 'alert');
+		root.append(tr('strong', title), tr('p', description),
+			el('p', `${code}: ${diagnosticText(code)}`, 'detail'));
 		return root;
 	}
 
@@ -900,7 +942,7 @@
 			disposed: 'Disposed', owner: 'Owner', contender: 'Contender', thisWindow: 'This window',
 			anotherWindow: 'Another window', none: 'None', all: 'All', some: 'Some', stable: 'Stable', waiting: 'Waiting',
 			editor: 'VS Code editor', standalone: 'Standalone', disabled: 'Disabled', authRequired: 'Sign-in required',
-			discovering: 'Discovering',
+			discovering: 'Discovering', partial: 'Partially updated',
 		}[value] || 'Unknown');
 	}
 
@@ -1049,19 +1091,22 @@
 	function isConnectivity(value) {
 		return isExactRecord(value, ['discoveryEnabled', 'delegationEnabled', 'strictPolicyActivated', 'publishEnabled',
 			'hostingBackend', 'migrationPending', 'accountProvider', 'claimedWorkspaceCount', 'receivingWorkspaceCount',
-			'state', 'truncated', 'candidates', 'incomingPeers', 'enabled', 'connectionState', 'connectedDeviceCount'], ['error', 'accountLabel'])
+			'state', 'truncated', 'candidates', 'incomingPeers', 'enabled', 'connectionState', 'connectedDeviceCount',
+			'failedCandidateCount', 'deferredCandidateCount', 'peerErrors'], ['error', 'discoveryError', 'actionError', 'accountLabel'])
 			&& booleans(value, ['discoveryEnabled', 'delegationEnabled', 'strictPolicyActivated', 'publishEnabled', 'migrationPending', 'truncated', 'enabled'])
 			&& ['cli', 'sdk'].includes(value.hostingBackend) && ['none', 'github', 'microsoft'].includes(value.accountProvider)
-			&& ['disabled', 'authRequired', 'discovering', 'ready', 'error'].includes(value.state)
+			&& ['disabled', 'authRequired', 'discovering', 'ready', 'partial', 'error'].includes(value.state)
 			&& ['disabled', 'authenticating', 'starting', 'online', 'stopping', 'authRequired', 'error', 'cleanupPending'].includes(value.connectionState)
 			&& boundedInteger(value.connectedDeviceCount, 256)
 			&& (value.accountLabel === undefined || (isText(value.accountLabel) && value.accountLabel.length <= 256))
 			&& ['claimedWorkspaceCount', 'receivingWorkspaceCount'].every((key) => boundedInteger(value[key], 32))
-			&& (value.error === undefined || [
-				'DISABLED', 'AUTH_REQUIRED', 'ACCOUNT_CHANGED', 'SCOPES_CHANGED', 'OFFLINE', 'DISCOVERY_UNAVAILABLE',
-				'RATE_LIMITED', 'TIMEOUT', 'CANCELLED', 'INVALID_ENDPOINT', 'BINDING_CHANGED', 'POLICY_DENIED',
-				'PRIVATE_ACCESS_REQUIRED', 'CLEANUP_FAILED', 'MIGRATION_REQUIRED', 'PROTOCOL_INCOMPATIBLE', 'PLATFORM_UNSUPPORTED',
-			].includes(value.error))
+			&& (value.error === undefined || isConnectivityCode(value.error))
+			&& (value.discoveryError === undefined || isConnectivityCode(value.discoveryError))
+			&& boundedInteger(value.failedCandidateCount, 10) && boundedInteger(value.deferredCandidateCount, 10)
+			&& (value.actionError === undefined || (isExactRecord(value.actionError, ['action', 'code'])
+				&& connectivityActions.includes(value.actionError.action) && isConnectivityCode(value.actionError.code)))
+			&& boundedArray(value.peerErrors, 256, (error) => isExactRecord(error, ['label', 'code'])
+				&& typeof error.label === 'string' && /^Device [0-9a-f]{8}$/u.test(error.label) && isConnectivityCode(error.code))
 			&& boundedArray(value.candidates, 10, (candidate) =>
 				isExactRecord(candidate, ['actionHandle', 'label', 'hostHint', 'stale', 'admission'])
 				&& isActionHandle(candidate.actionHandle) && typeof candidate.label === 'string' && /^Candidate [0-9a-f]{8}$/u.test(candidate.label)
@@ -1071,6 +1116,12 @@
 				isExactRecord(peer, ['actionHandle', 'label', 'state', 'cleanupPending']) && isActionHandle(peer.actionHandle)
 				&& typeof peer.label === 'string' && /^Peer [0-9a-f]{8}$/u.test(peer.label)
 				&& ['active', 'pending', 'revoked'].includes(peer.state) && typeof peer.cleanupPending === 'boolean');
+	}
+
+	function isConnectivityCode(value) {
+		return ['DISABLED', 'AUTH_REQUIRED', 'ACCOUNT_CHANGED', 'SCOPES_CHANGED', 'OFFLINE', 'DISCOVERY_UNAVAILABLE',
+			'RATE_LIMITED', 'TIMEOUT', 'CANCELLED', 'INVALID_ENDPOINT', 'BINDING_CHANGED', 'POLICY_DENIED',
+			'PRIVATE_ACCESS_REQUIRED', 'CLEANUP_FAILED', 'MIGRATION_REQUIRED', 'PROTOCOL_INCOMPATIBLE', 'PLATFORM_UNSUPPORTED'].includes(value);
 	}
 
 	function isTasks(value) {

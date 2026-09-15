@@ -4,6 +4,7 @@ import { dashboardDeviceTreeSchema } from './DashboardTree';
 import { z } from 'zod';
 import {
 	CONNECTIVITY_ACTIONS,
+	connectivityErrorCodeSchema,
 	DASHBOARD_MANAGEMENT_ACTIONS,
 	MANAGEMENT_BOOLEAN_ACTIONS,
 	createDashboardManagementSchema,
@@ -12,7 +13,7 @@ import {
 	utf8ByteLength,
 } from '../../shared/protocol';
 
-export const DASHBOARD_MESSAGE_VERSION = 10 as const;
+export const DASHBOARD_MESSAGE_VERSION = 11 as const;
 
 export const DASHBOARD_ACTIONS = [
 	'configureDevice',
@@ -372,8 +373,11 @@ function assertConnectivity(value: unknown): void {
 			'enabled',
 			'connectionState',
 			'connectedDeviceCount',
+			'failedCandidateCount',
+			'deferredCandidateCount',
+			'peerErrors',
 		],
-		['error', 'accountLabel'],
+		['error', 'discoveryError', 'actionError', 'accountLabel'],
 	);
 	for (const key of [
 		'discoveryEnabled', 'delegationEnabled', 'strictPolicyActivated',
@@ -383,7 +387,7 @@ function assertConnectivity(value: unknown): void {
 	}
 	assertEnum(value.hostingBackend, ['cli', 'sdk']);
 	assertEnum(value.accountProvider, ['none', 'github', 'microsoft']);
-	assertEnum(value.state, ['disabled', 'authRequired', 'discovering', 'ready', 'error']);
+	assertEnum(value.state, ['disabled', 'authRequired', 'discovering', 'ready', 'partial', 'error']);
 	assertEnum(value.connectionState, ['disabled', 'authenticating', 'starting', 'online', 'stopping', 'authRequired', 'error', 'cleanupPending']);
 	if (value.accountLabel !== undefined) {
 		assertString(value.accountLabel);
@@ -399,13 +403,26 @@ function assertConnectivity(value: unknown): void {
 			throw new Error('Dashboard Workspace count is outside its safe bound.');
 		}
 	}
-	if (value.error !== undefined) {
-		assertEnum(value.error, [
-			'DISABLED', 'AUTH_REQUIRED', 'ACCOUNT_CHANGED', 'SCOPES_CHANGED', 'OFFLINE',
-			'DISCOVERY_UNAVAILABLE', 'RATE_LIMITED', 'TIMEOUT', 'CANCELLED', 'INVALID_ENDPOINT',
-			'BINDING_CHANGED', 'POLICY_DENIED', 'PRIVATE_ACCESS_REQUIRED', 'CLEANUP_FAILED',
-			'MIGRATION_REQUIRED', 'PROTOCOL_INCOMPATIBLE', 'PLATFORM_UNSUPPORTED',
-		]);
+	for (const code of [value.error, value.discoveryError]) {
+		if (code !== undefined) { assertEnum(code, connectivityErrorCodeSchema.options); }
+	}
+	for (const key of ['failedCandidateCount', 'deferredCandidateCount']) {
+		const count = value[key];
+		if (typeof count !== 'number' || !Number.isInteger(count) || count < 0 || count > 10) {
+			throw new Error('Dashboard discovery count is outside its safe bound.');
+		}
+	}
+	if (value.actionError !== undefined) {
+		assertExactRecord(value.actionError, ['action', 'code'], []);
+		assertEnum(value.actionError.action, CONNECTIVITY_ACTIONS);
+		assertEnum(value.actionError.code, connectivityErrorCodeSchema.options);
+	}
+	assertArray(value.peerErrors, 256);
+	for (const error of value.peerErrors) {
+		assertExactRecord(error, ['label', 'code'], []);
+		assertString(error.label);
+		if (!/^Device [0-9a-f]{8}$/u.test(error.label)) { throw new Error('Dashboard peer error label is invalid.'); }
+		assertEnum(error.code, connectivityErrorCodeSchema.options);
 	}
 	assertArray(value.candidates, 10);
 	for (const candidate of value.candidates) {

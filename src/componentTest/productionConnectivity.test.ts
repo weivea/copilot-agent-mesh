@@ -51,6 +51,97 @@ test('real production owner composition defaults off and serves authenticated lo
 	assert.ok(directory);
 });
 
+test('discovery warnings stay separate from an online listener and authenticated local window state', async (t) => {
+	const f = await productionFixture({ host: new ConnectionHost() });
+	t.after(() => f.dispose());
+	await f.runtime.start();
+	const local = await f.connect();
+	t.after(() => local.client.dispose());
+	await local.session.request(LOCAL_BROKER_METHODS.connectivityAction, { ...local.identity, action: 'enableConnectivity' });
+	const original = f.runtime.connectivity.discovery.snapshot.bind(f.runtime.connectivity.discovery);
+	let failed = true;
+	f.runtime.connectivity.discovery.snapshot = () => ({
+		...original(), state: failed ? 'partial' : 'ready',
+		...(failed ? { error: 'TIMEOUT' as const } : {}),
+		failedCandidateCount: failed ? 1 : 0,
+	});
+	const read = async () => connectivitySnapshotSchema.parse(
+		await local.session.request(LOCAL_BROKER_METHODS.connectivitySnapshot, local.identity));
+	const partial = await read();
+	assert.equal(partial.connectionState, 'online');
+	assert.equal(partial.error, undefined);
+	assert.equal(partial.discoveryError, 'TIMEOUT');
+	assert.equal(partial.failedCandidateCount, 1);
+	assert.equal(f.runtime.listener.snapshot().state, 'running');
+	const localDirectory = dashboardNodeDirectoryResultSchema.parse(
+		await local.session.request(LOCAL_BROKER_METHODS.dashboardList, local.identity));
+	assert.ok(localDirectory.nodes.some((node) => node.nodeId === local.identity.nodeId));
+	failed = false;
+	await local.session.request(LOCAL_BROKER_METHODS.connectivityAction, { ...local.identity, action: 'refreshRemoteTargets' });
+	const recovered = await read();
+	assert.equal(recovered.discoveryError, undefined);
+	assert.equal(recovered.error, undefined);
+	assert.equal(recovered.connectionState, 'online');
+});
+
+test('connection action errors clear on their own successful retry, not unrelated refreshes', async (t) => {
+	const f = await productionFixture({ host: new ConnectionHost() });
+	t.after(() => f.dispose());
+	await f.runtime.start();
+	const local = await f.connect();
+	t.after(() => local.client.dispose());
+	const act = (action: 'enableConnectivity' | 'refreshRemoteTargets' | 'refreshDiscovery') =>
+		local.session.request(LOCAL_BROKER_METHODS.connectivityAction, { ...local.identity, action });
+	await act('enableConnectivity');
+	f.runtime.remoteTasks.listDevices = async () => { throw new ConnectivityError('TIMEOUT'); };
+	await assert.rejects(act('refreshRemoteTargets'));
+	const read = async () => connectivitySnapshotSchema.parse(
+		await local.session.request(LOCAL_BROKER_METHODS.connectivitySnapshot, local.identity));
+	assert.deepEqual((await read()).actionError, { action: 'refreshRemoteTargets', code: 'TIMEOUT' });
+	assert.equal((await read()).error, undefined);
+	await act('refreshDiscovery');
+	assert.equal((await read()).actionError?.code, 'TIMEOUT');
+	f.runtime.remoteTasks.listDevices = async () => ({ devices: [], truncated: false, totalDevices: 0 });
+	await act('refreshRemoteTargets');
+	assert.equal((await read()).actionError, undefined);
+});
+
+test('successful directory actions cannot erase a failed hosting lifecycle', async (t) => {
+	const host = new ConnectionHost();
+	host.failStart = true;
+	const f = await productionFixture({ host });
+	t.after(() => f.dispose());
+	await f.runtime.start();
+	const local = await f.connect();
+	t.after(() => local.client.dispose());
+	const act = (action: 'enableConnectivity' | 'refreshDiscovery') =>
+		local.session.request(LOCAL_BROKER_METHODS.connectivityAction, { ...local.identity, action });
+	await assert.rejects(act('enableConnectivity'));
+	await act('refreshDiscovery');
+	const read = async () => connectivitySnapshotSchema.parse(
+		await local.session.request(LOCAL_BROKER_METHODS.connectivitySnapshot, local.identity));
+	assert.equal((await read()).error, 'OFFLINE');
+	host.failStart = false;
+	await act('enableConnectivity');
+	assert.equal((await read()).error, undefined);
+});
+
+test('only a remote directory request signals discovery demand; local dashboard reads do not', async (t) => {
+	const f = await productionFixture({ host: new ConnectionHost() });
+	t.after(() => f.dispose());
+	await f.runtime.start();
+	const local = await f.connect();
+	t.after(() => local.client.dispose());
+	await local.session.request(LOCAL_BROKER_METHODS.connectivityAction, { ...local.identity, action: 'enableConnectivity' });
+	let demand = 0;
+	f.runtime.connectivity.requestDiscovery = () => { demand += 1; };
+	await local.session.request(LOCAL_BROKER_METHODS.connectivitySnapshot, local.identity);
+	await local.session.request(LOCAL_BROKER_METHODS.dashboardList, local.identity);
+	assert.equal(demand, 0);
+	await local.session.request(LOCAL_BROKER_METHODS.remoteList, {});
+	assert.equal(demand, 1);
+});
+
 test('production management IPC serves every authenticated window and fences caller-scoped one-time actions without discovery', async (t) => {
 	const f = await productionFixture();
 	t.after(() => f.dispose());

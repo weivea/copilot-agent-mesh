@@ -8,13 +8,19 @@ import type { CancellationToken } from 'vscode-jsonrpc';
 
 import { assertDocumentFence, type DocumentFence } from '../storage/FencedDocumentStore';
 import type { AccountSessionProvider } from './AccountSessionProvider';
-import { ConnectivityError, type ConnectivityDiagnosticsReporter } from './ConnectivitySchemas';
+import { ConnectivityError, isTransientDiscoveryError, type ConnectivityDiagnosticsReporter } from './ConnectivitySchemas';
 import { ConnectivityOperation } from './ConnectivityOperations';
 import { validateManagementUri } from './DevTunnelUris';
 import { MeshDomainError } from '../domain/errors';
 
 export const DEV_TUNNELS_SDK_VERSION = '1.3.56';
 const MAX_MANAGEMENT_RESPONSE_BYTES = 1024 * 1024;
+
+export interface ManagementRequestOptions {
+	readonly timeoutMs?: number;
+	readonly phase?: 'discovery.list' | 'discovery.detail';
+	readonly operationId?: string;
+}
 
 /** Applied even to management requests made internally by the SDK host. */
 export function createGuardedTunnelHttpAdapter(send: AxiosAdapter): AxiosAdapter {
@@ -86,12 +92,15 @@ export class DevTunnelManagement {
 	public run<T>(
 		operation: (client: TunnelManagementClient, cancellation: CancellationToken) => Promise<T>,
 		signal?: AbortSignal,
+		options?: ManagementRequestOptions,
 	): Promise<T> {
-		const result = this.runCore(operation, signal);
+		const result = this.runCore(operation, signal, options);
 		this.pending.add(result);
 		void result.finally(() => this.pending.delete(result)).catch(() => undefined);
 		return result;
 	}
+
+	public get cancellationSignal(): AbortSignal { return this.lifetime.signal; }
 
 	public invalidate(): void {
 		this.lifetime.abort();
@@ -109,6 +118,7 @@ export class DevTunnelManagement {
 	private async runCore<T>(
 		action: (client: TunnelManagementClient, cancellation: CancellationToken) => Promise<T>,
 		signal?: AbortSignal,
+		request: ManagementRequestOptions = {},
 	): Promise<T> {
 		if (this.disposed || signal?.aborted) {
 			throw new ConnectivityError('CANCELLED');
@@ -122,38 +132,65 @@ export class DevTunnelManagement {
 		if (this.inFlight >= 2) {
 			throw new ConnectivityError('RATE_LIMITED', 1000);
 		}
+		const timeoutMs = Math.min(request.timeoutMs ?? 10_000, this.options.timeoutMs ?? 10_000);
+		const operation = new ConnectivityOperation(timeoutMs, this.lifetime.signal, signal);
 		this.inFlight += 1;
-		const operation = new ConnectivityOperation(this.options.timeoutMs ?? 10_000, this.lifetime.signal, signal);
+		const startedAt = Date.now();
+		let authMs = 0;
+		let httpMs = 0;
+		let stage = 'ownership';
+		let failure: ConnectivityError | undefined;
 		const send = this.options.adapter ?? guardedTunnelHttpAdapter;
 		const diagnostics = this.options.diagnostics;
 		const client = createTunnelManagementClient(
-			() => this.account.authorization(operation.controller.signal),
-			diagnostics === undefined ? this.options.adapter : async (config) => {
-				const response = await send(config);
-				if (config.method?.toLowerCase() === 'get' && config.url !== undefined
-					&& new URL(config.url).pathname === '/tunnels') {
-					diagnostics('Tunnel discovery HTTP response.', {
-						httpStatus: response.status, ...directoryResponseSummary(response.data),
-					});
+			async () => {
+				stage = 'authorization';
+				const start = Date.now();
+				try { return await this.account.authorization(operation.controller.signal); }
+				finally { authMs += Date.now() - start; }
+			},
+			async (config) => {
+				stage = 'http';
+				const start = Date.now();
+				try {
+					const response = await send(config);
+					if (config.method?.toLowerCase() === 'get' && config.url !== undefined
+						&& new URL(config.url).pathname === '/tunnels') {
+						diagnostics?.('Tunnel discovery HTTP response.', {
+							httpStatus: response.status, ...directoryResponseSummary(response.data),
+						});
+					}
+					return response;
+				} finally {
+					httpMs += Date.now() - start;
 				}
-				return response;
 			},
 		);
 		try {
 			operation.assertActive();
 			await assertDocumentFence(this.fence);
 			const result = await action(client, operation.cancellation.token);
+			stage = 'completion';
 			operation.assertActive();
 			await assertDocumentFence(this.fence);
+			operation.assertActive();
 			return result;
 		} catch (error: unknown) {
-			operation.assertActive();
-			const normalized = normalizeConnectivityError(error);
-			if (normalized.code === 'RATE_LIMITED') {
-				this.rateLimitedUntil = Date.now() + (normalized.retryAfterMs ?? 60_000);
+			failure = normalizeConnectivityError(error, operation.cancellationError);
+			if (failure.code === 'RATE_LIMITED') {
+				this.rateLimitedUntil = Date.now() + (failure.retryAfterMs ?? 60_000);
 			}
-			throw normalized;
+			throw failure;
 		} finally {
+			const elapsedMs = Date.now() - startedAt;
+			if (failure !== undefined || elapsedMs >= 2000) {
+				diagnostics?.('Connectivity management operation timing.', {
+					phase: request.phase ?? 'management', operationId: request.operationId,
+					stage, elapsedMs, budgetMs: timeoutMs, authMs, httpMs,
+					timerDelayMs: operation.deadlineDelayMs,
+					...(failure === undefined ? {} : { code: failure.code }),
+				});
+			}
 			operation.dispose();
 			this.inFlight -= 1;
 			await client.dispose();
@@ -194,7 +231,13 @@ function directoryResponseSummary(data: unknown): Readonly<Record<string, unknow
 	};
 }
 
-export function normalizeConnectivityError(error: unknown): ConnectivityError {
+export function normalizeConnectivityError(error: unknown, cancellation?: ConnectivityError): ConnectivityError {
+	const normalized = classifyConnectivityError(error);
+	return cancellation !== undefined && (isTransientDiscoveryError(normalized.code) || normalized.code === 'CANCELLED')
+		? cancellation : normalized;
+}
+
+function classifyConnectivityError(error: unknown): ConnectivityError {
 	if (error instanceof ConnectivityError) {
 		return error;
 	}
@@ -216,6 +259,9 @@ export function normalizeConnectivityError(error: unknown): ConnectivityError {
 				: typeof value === 'string' && Number.isFinite(Date.parse(value))
 					? (Date.parse(value) - Date.now()) / 1000 : 60;
 			return new ConnectivityError('RATE_LIMITED', Math.max(1000, Math.min(seconds * 1000, 300_000)));
+		}
+		if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+			return new ConnectivityError('TIMEOUT');
 		}
 	}
 	// Raw SDK/Axios errors can retain authorization headers and full resource identifiers.

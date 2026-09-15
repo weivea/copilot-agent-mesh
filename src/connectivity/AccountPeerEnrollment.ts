@@ -11,9 +11,9 @@ import type { AccountDeviceIdentityStore } from './AccountDeviceIdentity';
 import type { AccountSessionProvider } from './AccountSessionProvider';
 import type { BoundPeerTransport } from './BoundPeerTransport';
 import {
-	accountDeviceIdentitySchema, ConnectivityError, type AccountBinding, type ConnectivityCode,
+	accountDeviceIdentitySchema, ConnectivityError, isTransientDiscoveryError, type AccountBinding, type ConnectivityCode,
 } from './ConnectivitySchemas';
-import type { DiscoveredEndpoint } from './DevTunnelDiscoveryProvider';
+import type { DiscoveredEndpoint, DiscoveryAdvertisement } from './DevTunnelDiscoveryProvider';
 import { rpcEndpoint } from './DevTunnelUris';
 import type { EndpointBindingStore } from './EndpointBindingStore';
 
@@ -39,6 +39,7 @@ export class AccountPeerEnrollment {
 	private initialized = false;
 	private lifetime = new AbortController();
 	private syncing: Promise<void> = Promise.resolve();
+	private readonly peerFailures = new Map<string, ConnectivityCode>();
 
 	public constructor(
 		files: AtomicFileStore,
@@ -58,6 +59,7 @@ export class AccountPeerEnrollment {
 			readonly isRevoked: (peerId: string) => boolean;
 			readonly isDeviceDenied?: (deviceId: string) => boolean;
 			readonly report: (code: ConnectivityCode) => void;
+			readonly changed?: () => void;
 		},
 	) {
 		this.document = new FencedDocumentStore(files, 'connectivity/account-peers.json', documentSchema, {
@@ -99,6 +101,7 @@ export class AccountPeerEnrollment {
 				|| (candidate.accountRef === entry.accountRef && candidate.deviceId === entry.deviceId)
 				? { ...candidate, blocked: true } : candidate),
 		}));
+		this.clearFailure(entry.deviceId);
 		return [entry.incomingPeerId, ...entry.legacyIncomingPeerIds];
 	}
 
@@ -115,6 +118,7 @@ export class AccountPeerEnrollment {
 			...value, entries: value.entries.map((entry) => entry.deviceId === deviceId ? { ...entry, blocked: true } : entry),
 		}));
 		await this.syncing;
+		this.clearFailure(deviceId);
 	}
 
 	public incomingForProfile(profileId: string): string | undefined {
@@ -125,12 +129,32 @@ export class AccountPeerEnrollment {
 		return this.initialized ? this.document.snapshot().entries : [];
 	}
 
+	public failures(): readonly { deviceId: string; code: ConnectivityCode }[] {
+		return [...this.peerFailures].map(([deviceId, code]) => ({ deviceId, code }));
+	}
+
+	public clearRecoveredFailures(): void {
+		for (const [deviceId, code] of this.peerFailures) {
+			if (!isTransientDiscoveryError(code)) { continue; }
+			const entry = this.entries().find((candidate) =>
+				candidate.deviceId === deviceId && candidate.accountRef === this.account.current()?.accountRef);
+			if (entry === undefined || !this.permitsOutgoing(entry.profileId)) { continue; }
+			const peer = this.peers.get(entry.profileId);
+			const authentication = peer?.authenticatedBinding();
+			if (peer?.snapshot().state === 'online' && authentication?.deviceId === deviceId
+				&& authentication.profileGeneration === entry.profileGeneration
+				&& this.endpoints.get(entry.profileId)?.profileGeneration === entry.profileGeneration) {
+				this.clearFailure(deviceId);
+			}
+		}
+	}
+
 	/** Input is exclusively the management SDK's caller-owned list, not discovery hints sent over RPC. */
-	public synchronize(endpoints: readonly DiscoveredEndpoint[]): Promise<void> {
+	public synchronize(endpoints: readonly DiscoveredEndpoint[], advertisements: readonly DiscoveryAdvertisement[] = []): Promise<void> {
 		const signal = this.lifetime.signal;
 		const account = this.account.current();
 		const revision = this.account.revision();
-		const operation = this.syncing.then(() => this.synchronizeCore(endpoints, signal, account, revision));
+		const operation = this.syncing.then(() => this.synchronizeCore(endpoints, advertisements, signal, account, revision));
 		this.syncing = operation.catch(() => undefined);
 		return operation;
 	}
@@ -141,6 +165,10 @@ export class AccountPeerEnrollment {
 		await this.syncing;
 		await this.disconnectAll();
 		this.lifetime = new AbortController();
+		if (this.peerFailures.size > 0) {
+			this.peerFailures.clear();
+			this.options.changed?.();
+		}
 	}
 
 	public async disconnectAll(): Promise<void> {
@@ -149,7 +177,8 @@ export class AccountPeerEnrollment {
 	}
 
 	private async synchronizeCore(
-		endpoints: readonly DiscoveredEndpoint[], signal: AbortSignal, account: AccountBinding | undefined, revision: number,
+		endpoints: readonly DiscoveredEndpoint[], advertisements: readonly DiscoveryAdvertisement[],
+		signal: AbortSignal, account: AccountBinding | undefined, revision: number,
 	): Promise<void> {
 		if (account === undefined || !this.options.enabled() || signal.aborted) { return; }
 		const validate = async (): Promise<void> => {
@@ -160,24 +189,27 @@ export class AccountPeerEnrollment {
 			}
 		};
 		await validate();
-		const groups = new Map<string, DiscoveredEndpoint[]>();
-		for (const endpoint of endpoints) {
+		const groups = new Map<string, { candidates: DiscoveredEndpoint[]; publicKeys: Set<string> }>();
+		for (const endpoint of [...advertisements, ...endpoints]) {
 			const identity = endpoint.accountIdentity;
 			if (identity === undefined || identity.deviceId === this.deviceId || endpoint.admission !== 'private-port-token') { continue; }
-			groups.set(identity.deviceId, [...groups.get(identity.deviceId) ?? [], endpoint]);
+			const group = groups.get(identity.deviceId) ?? { candidates: [], publicKeys: new Set<string>() };
+			group.publicKeys.add(identity.publicKey);
+			if ('locator' in endpoint) { group.candidates.push(endpoint); }
+			groups.set(identity.deviceId, group);
 		}
-		for (const [deviceId, candidates] of groups) {
+		for (const [deviceId, { candidates, publicKeys }] of groups) {
 			await validate();
 			const existing = this.document.snapshot().entries.find((entry) =>
 				entry.accountRef === account.accountRef && entry.deviceId === deviceId);
 			if (this.options.isDeviceDenied?.(deviceId) || existing?.blocked || (existing !== undefined && this.options.isRevoked(existing.incomingPeerId))) {
 				if (existing !== undefined) { await this.peers.disconnect(existing.profileId); }
+				this.clearFailure(deviceId);
 				continue;
 			}
-			if (new Set(candidates.map((candidate) => candidate.accountIdentity!.publicKey)).size !== 1
-				|| (existing !== undefined && candidates[0].accountIdentity!.publicKey !== existing.publicKey)) {
+			if (publicKeys.size !== 1 || (existing !== undefined && !publicKeys.has(existing.publicKey))) {
 				if (existing !== undefined) { await this.peers.disconnect(existing.profileId); }
-				this.options.report('BINDING_CHANGED');
+				this.recordFailure(deviceId, 'BINDING_CHANGED');
 				continue;
 			}
 			const online = candidates.filter((candidate) => candidate.hostHint === 'online');
@@ -203,21 +235,41 @@ export class AccountPeerEnrollment {
 				await validatePeer();
 				const connection = this.peers.get(profile.id);
 				if (connection?.snapshot().state === 'online'
-					&& JSON.stringify(this.endpoints.get(profile.id)?.locator) === JSON.stringify(endpoint.locator)) { continue; }
+					&& JSON.stringify(this.endpoints.get(profile.id)?.locator) === JSON.stringify(endpoint.locator)) {
+					this.clearFailure(deviceId);
+					continue;
+				}
 				await this.peers.disconnect(profile.id);
 				await this.transport.prepare(profile, endpoint);
 				await validatePeer();
 				await this.peers.connect(profile.id);
 				await validatePeer();
+				this.clearFailure(deviceId);
 			} catch (error: unknown) {
 				if (profileId !== undefined && (signal.aborted || !this.permitsOutgoing(profileId)
 					|| this.account.revision() !== revision)) {
 					await this.peers.disconnect(profileId);
 				}
 				if (signal.aborted) { return; }
-				this.options.report(error instanceof ConnectivityError ? error.code : 'OFFLINE');
+				this.recordFailure(deviceId, error instanceof ConnectivityError ? error.code
+					: (profileId === undefined ? undefined : this.transport.lastError(profileId)) ?? 'OFFLINE');
 			}
 		}
+	}
+
+	private recordFailure(deviceId: string, code: ConnectivityCode): void {
+		if (this.peerFailures.get(deviceId) === code) { return; }
+		if (this.peerFailures.size >= 256 && !this.peerFailures.has(deviceId)) {
+			const oldest = this.peerFailures.keys().next().value;
+			if (oldest !== undefined) { this.peerFailures.delete(oldest); }
+		}
+		this.peerFailures.set(deviceId, code);
+		this.options.report(code);
+		this.options.changed?.();
+	}
+
+	private clearFailure(deviceId: string): void {
+		if (this.peerFailures.delete(deviceId)) { this.options.changed?.(); }
 	}
 
 	private async pin(

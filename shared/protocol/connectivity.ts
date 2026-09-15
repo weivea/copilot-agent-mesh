@@ -8,6 +8,13 @@ export const CONNECTIVITY_ACTIONS = [
 ] as const;
 export type ConnectivityAction = typeof CONNECTIVITY_ACTIONS[number];
 
+export const connectivityErrorCodeSchema = z.enum([
+	'DISABLED', 'AUTH_REQUIRED', 'ACCOUNT_CHANGED', 'SCOPES_CHANGED', 'OFFLINE',
+	'DISCOVERY_UNAVAILABLE', 'RATE_LIMITED', 'TIMEOUT', 'CANCELLED', 'INVALID_ENDPOINT',
+	'BINDING_CHANGED', 'POLICY_DENIED', 'PRIVATE_ACCESS_REQUIRED', 'CLEANUP_FAILED',
+	'MIGRATION_REQUIRED', 'PROTOCOL_INCOMPATIBLE', 'PLATFORM_UNSUPPORTED',
+]);
+
 export const connectivitySnapshotParamsSchema = z.strictObject({
 	nodeId: uuidSchema,
 	nodeInstanceId: uuidSchema,
@@ -33,12 +40,19 @@ export const connectivitySnapshotSchema = z.strictObject({
 	accountProvider: z.enum(['none', 'github', 'microsoft']),
 	claimedWorkspaceCount: z.number().int().min(0).max(32),
 	receivingWorkspaceCount: z.number().int().min(0).max(32),
-	state: z.enum(['disabled', 'authRequired', 'discovering', 'ready', 'error']),
-	error: z.enum([
-		'DISABLED', 'AUTH_REQUIRED', 'ACCOUNT_CHANGED', 'SCOPES_CHANGED', 'OFFLINE',
-		'DISCOVERY_UNAVAILABLE', 'RATE_LIMITED', 'TIMEOUT', 'CANCELLED', 'INVALID_ENDPOINT',
-		'BINDING_CHANGED', 'POLICY_DENIED', 'PRIVATE_ACCESS_REQUIRED', 'CLEANUP_FAILED', 'MIGRATION_REQUIRED', 'PROTOCOL_INCOMPATIBLE', 'PLATFORM_UNSUPPORTED',
-	]).optional(),
+	state: z.enum(['disabled', 'authRequired', 'discovering', 'ready', 'partial', 'error']),
+	error: connectivityErrorCodeSchema.optional(),
+	discoveryError: connectivityErrorCodeSchema.optional(),
+	failedCandidateCount: z.number().int().min(0).max(10),
+	deferredCandidateCount: z.number().int().min(0).max(10),
+	actionError: z.strictObject({
+		action: z.enum(CONNECTIVITY_ACTIONS),
+		code: connectivityErrorCodeSchema,
+	}).optional(),
+	peerErrors: z.array(z.strictObject({
+		label: z.string().regex(/^Device [0-9a-f]{8}$/u),
+		code: connectivityErrorCodeSchema,
+	})).max(256),
 	truncated: z.boolean(),
 	candidates: z.array(z.strictObject({
 		actionHandle: uuidSchema,
@@ -63,4 +77,5 @@ export const DISABLED_CONNECTIVITY_SNAPSHOT: ConnectivitySnapshot = {
 	publishEnabled: false, hostingBackend: 'sdk', migrationPending: false, accountProvider: 'none',
 	claimedWorkspaceCount: 0, receivingWorkspaceCount: 0,
 	state: 'disabled', truncated: false, candidates: [], incomingPeers: [],
+	failedCandidateCount: 0, deferredCandidateCount: 0, peerErrors: [],
 };

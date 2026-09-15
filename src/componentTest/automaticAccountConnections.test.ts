@@ -9,7 +9,7 @@ import { deviceInfoSchema } from '../../shared/protocol';
 import { AccountDeviceIdentityStore } from '../connectivity/AccountDeviceIdentity';
 import { AccountPeerEnrollment } from '../connectivity/AccountPeerEnrollment';
 import { BoundPeerTransport } from '../connectivity/BoundPeerTransport';
-import { ACCOUNT_IDENTITY_PREFIX, ADVERTISEMENT_PREFIX, DISCOVERY_LABELS, PRIVATE_LABEL, type ConnectivityCode } from '../connectivity/ConnectivitySchemas';
+import { ACCOUNT_IDENTITY_PREFIX, ADVERTISEMENT_PREFIX, ConnectivityError, DISCOVERY_LABELS, PRIVATE_LABEL, type ConnectivityCode } from '../connectivity/ConnectivitySchemas';
 import { DevTunnelDiscoveryProvider } from '../connectivity/DevTunnelDiscoveryProvider';
 import { DevTunnelEndpointResolver } from '../connectivity/DevTunnelEndpointResolver';
 import { DevTunnelManagement } from '../connectivity/DevTunnelManagement';
@@ -99,6 +99,54 @@ test('changed public keys and duplicate identities never silently replace a trus
 	b.tunnel.description = original;
 	await a.sync();
 	assert.equal(a.peers.get(profile.id)?.snapshot().state, 'online');
+});
+
+test('a deferred advertisement still enforces pinned identities without a hydrated endpoint', async (t) => {
+	const directory = new AccountDirectory();
+	const a = await accountDevice(directory, 951);
+	const b = await accountDevice(directory, 952);
+	t.after(async () => { await a.dispose(); await b.dispose(); });
+	await Promise.all([a.sync(), b.sync()]);
+	const profile = (await a.profiles.list()).find((entry) => entry.workerDeviceId === b.deviceId)!;
+	const endpoint = a.discovery.project(b.tunnel)[0];
+	await a.enrollment.synchronize([], [{
+		resource: { clusterId: endpoint.locator.clusterId, tunnelId: endpoint.locator.tunnelId },
+		advertisementId: endpoint.locator.advertisementId, admission: endpoint.admission,
+		accountIdentity: { ...b.publicIdentity, publicKey: a.publicIdentity.publicKey },
+	}]);
+	assert.notEqual(a.peers.get(profile.id)?.snapshot().state, 'online');
+	assert.deepEqual(a.enrollment.failures(), [{ deviceId: b.deviceId, code: 'BINDING_CHANGED' }]);
+	assert.deepEqual(await a.profiles.get(profile.id), profile);
+});
+
+test('peer-specific timeouts clear after an authenticated reconnect without another discovery round', async (t) => {
+	const directory = new AccountDirectory();
+	const a = await accountDevice(directory, 953);
+	const b = await accountDevice(directory, 954);
+	t.after(async () => { await a.dispose(); await b.dispose(); });
+	const connect = a.peers.connect.bind(a.peers);
+	a.peers.connect = async () => { throw new ConnectivityError('TIMEOUT'); };
+	await a.sync();
+	assert.deepEqual(a.enrollment.failures(), [{ deviceId: b.deviceId, code: 'TIMEOUT' }]);
+	a.peers.connect = connect;
+	await b.sync();
+	await a.peers.connect((await a.profiles.list())[0].id);
+	a.enrollment.clearRecoveredFailures();
+	assert.deepEqual(a.enrollment.failures(), []);
+});
+
+test('withdrawing a failed peer also removes its obsolete connection diagnostic', async (t) => {
+	const directory = new AccountDirectory();
+	const a = await accountDevice(directory, 955);
+	const b = await accountDevice(directory, 956);
+	t.after(async () => { await a.dispose(); await b.dispose(); });
+	a.peers.connect = async () => { throw new ConnectivityError('TIMEOUT'); };
+	await a.sync();
+	assert.equal(a.enrollment.failures().length, 1);
+	const entry = a.enrollment.entries()[0];
+	await a.enrollment.block(entry.incomingPeerId);
+	assert.deepEqual(a.enrollment.failures(), []);
+	assert.equal(a.enrollment.permitsOutgoing(entry.profileId), false);
 });
 
 test('revoked account devices remain blocked across rediscovery and enrollment-store restart', async (t) => {

@@ -191,7 +191,7 @@ test('hydration preserves resource, request and endpoint caps including newly re
 	}
 });
 
-test('list and hydration share the original management deadline rather than resetting it', async (t) => {
+test('hydration has its own bounded deadline after the list completes', async (t) => {
 	t.mock.timers.enable({ apis: ['setTimeout'] });
 	const fixture = connectivityFixture();
 	const listed = deferred();
@@ -213,15 +213,18 @@ test('list and hydration share the original management deadline rather than rese
 	};
 	const management = new DevTunnelManagement(fixture.account, fixture.fence, () => true, { adapter, timeoutMs: 100 });
 	t.after(async () => { await management.dispose(); fixture.account.dispose(); });
-	const rejected = assert.rejects(new DevTunnelDiscoveryProvider(management).list(new AbortController().signal), { code: 'TIMEOUT' });
+	const result = new DevTunnelDiscoveryProvider(management).list(new AbortController().signal);
 	await listed.promise;
 	t.mock.timers.tick(60);
 	releaseList.resolve();
 	await detailStarted.promise;
-	t.mock.timers.tick(39);
+	t.mock.timers.tick(99);
 	assert.equal(detailAborted, false);
 	t.mock.timers.tick(1);
-	await rejected;
+	const partial = await result;
+	assert.equal(partial.error, 'TIMEOUT');
+	assert.equal(partial.failedCandidateCount, 1);
+	assert.deepEqual(partial.endpoints, []);
 	assert.equal(detailAborted, true);
 });
 
@@ -277,8 +280,15 @@ test('detail read failures remain explicit and rate limiting retains its cooldow
 			});
 			t.after(async () => { await management.dispose(); fixture.account.dispose(); });
 			const provider = new DevTunnelDiscoveryProvider(management);
-			await assert.rejects(provider.list(new AbortController().signal), (error: unknown) =>
-				error instanceof ConnectivityError && error.code === code && !JSON.stringify(error).includes('private-failure'));
+			if (status === 404 || status === 429) {
+				const result = await provider.list(new AbortController().signal);
+				assert.equal(result.error, code);
+				assert.equal(result.failedCandidateCount, 1);
+				assert.doesNotMatch(JSON.stringify(result), /private-failure/u);
+			} else {
+				await assert.rejects(provider.list(new AbortController().signal), (error: unknown) =>
+					error instanceof ConnectivityError && error.code === code && !JSON.stringify(error).includes('private-failure'));
+			}
 			if (status === 429) {
 				await assert.rejects(provider.list(new AbortController().signal), { code: 'RATE_LIMITED' });
 				assert.equal(requests, 2);
@@ -303,13 +313,16 @@ test('a failed detail refresh does not replace a previous directory with an empt
 		() => true, () => true, () => undefined, () => now);
 	t.after(async () => { await discovery.dispose(); await management.dispose(); fixture.account.dispose(); });
 	await discovery.refresh();
-	const previous = discovery.endpoints();
+	const previous = discovery.snapshot().candidates;
 	fail = true;
 	now += 10_001;
 	await discovery.refresh();
-	assert.equal(discovery.snapshot().state, 'error');
+	assert.equal(discovery.snapshot().state, 'partial');
 	assert.equal(discovery.snapshot().error, 'OFFLINE');
-	assert.deepEqual(discovery.endpoints(), previous);
+	assert.deepEqual(discovery.endpoints(), []);
+	assert.equal(discovery.snapshot().candidates.length, previous.length);
+	assert.equal(discovery.snapshot().candidates[0].stale, true);
+	assert.throws(() => discovery.select(previous[0].candidateHandle), { code: 'BINDING_CHANGED' });
 });
 
 function privateTunnel(): Tunnel {

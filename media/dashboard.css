@@ -53,7 +53,7 @@ select {
 .empty { padding: 12px 0; }
 .warning, .error { padding: 8px 10px; margin-top: 8px; border-left: 2px solid var(--vscode-editorWarning-foreground); background: var(--vscode-inputValidation-warningBackground); font-size: 11px; overflow-wrap: anywhere; }
 .error { border-color: var(--vscode-inputValidation-errorBorder, var(--vscode-errorForeground)); background: var(--vscode-inputValidation-errorBackground); }
-.error strong { display: block; }
+.error strong, .warning strong { display: block; }
 .freshness { padding: 8px 10px; margin-bottom: 12px; border-left: 2px solid var(--vscode-focusBorder); background: var(--vscode-textBlockQuote-background); color: var(--vscode-descriptionForeground); font-size: 11px; overflow-wrap: anywhere; }
 .connection { border: 1px solid var(--vscode-widget-border); padding: 10px; }
 .compactConnection { padding: 7px 10px; }
