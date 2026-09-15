@@ -264,11 +264,42 @@ device use the local Broker's authenticated IPC, not the Tunnel.
 If the Dashboard is Online but shows no other devices, inspect **Output -> Copilot
 Agent Mesh** in the Broker owner window. Discovery diagnostics distinguish HTTP
 region results, SDK Tunnel counts, eligible endpoints, cancellation and refresh
-scheduling. They omit account credentials, Tunnel capabilities and raw responses.
+scheduling. Slow or failed operations also report authorization/HTTP time, their
+phase and budget, and delayed deadline/refresh timers. These diagnostics omit
+account credentials, Tunnel capabilities, task content and raw responses.
 Global listings can omit cross-region port details. Mesh reads the exact listed
-resource's details when port metadata is incomplete, within the same discovery
-timeout and resource limit, before validating its advertisement and endpoints.
+resource's details when port metadata is incomplete: the list has a 10-second
+deadline, each sequential detail read has a separate 5-second deadline, and the
+whole round has a 20-second deadline. The existing 10-resource/10-endpoint and
+management-concurrency limits remain. Incomplete offline candidates are deferred
+unless an established connection needs their details; their advertised identities
+are still checked against pinned identities.
 A successful detail read alone never proves account ownership or grants task access.
+
+Transient detail failures produce an explicit **partial** result instead of
+discarding healthy, validated candidates. Previous candidates may be displayed
+as **stale**, but are not used for enrollment or selected as live endpoints.
+Authentication, account, identity and endpoint-validation failures do not fall
+back to a partial success. Failed details back off independently from 30 seconds
+up to five minutes; a changed advertisement or a fresh complete summary is
+re-evaluated without reusing an old endpoint or capability.
+
+With an authenticated remote connection or recent explicit remote-directory
+demand, discovery normally refreshes after 15-18 seconds; otherwise it refreshes
+after 60-63 seconds. Failed rounds back off from one to five minutes. **Refresh
+remote devices** requests fresh discovery, subject to the minimum request interval
+and service rate limits. Remote tool listings signal discovery demand without
+waiting for the cloud round or bypassing failure backoff; local-only listings
+and **Refresh local** do not.
+These intervals do not change peer heartbeats, host renewal or task deadlines.
+
+The connection badge describes this device's hosting lifecycle, not the outcome
+of every directory request. Discovery warnings, individual remote-device
+connection problems and failed user actions are shown separately. Recovering
+discovery clears its own warning; a verified reconnect clears that peer's
+transient error. An unrelated refresh cannot erase a hosting or action failure.
+In particular, a discovery timeout does not report that a same-device or
+desktop-attached Codespaces task failed.
 
 **Device trust is not Workspace or task authorization.** In **Devices & permissions**,
 or through a Workspace's **Permissions** shortcut on Overview, B separately grants

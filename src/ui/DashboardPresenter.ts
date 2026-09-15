@@ -161,6 +161,11 @@ function presentConnectivity(snapshot: ConnectivitySnapshot): DashboardConnectiv
 		receivingWorkspaceCount: value.receivingWorkspaceCount,
 		state: value.state,
 		...(value.error === undefined ? {} : { error: value.error }),
+		...(value.discoveryError === undefined ? {} : { discoveryError: value.discoveryError }),
+		...(value.actionError === undefined ? {} : { actionError: value.actionError }),
+		failedCandidateCount: value.failedCandidateCount,
+		deferredCandidateCount: value.deferredCandidateCount,
+		peerErrors: value.peerErrors,
 		truncated: value.truncated,
 		candidates: value.candidates.map((candidate) => ({
 			actionHandle: candidate.actionHandle,

@@ -6,6 +6,19 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [Unreleased]
 
+- Isolate transient per-candidate discovery failures, retain explicitly stale
+  display-only candidates, and defer incomplete offline metadata while still
+  enforcing advertised identities. Keep authentication and binding failures strict.
+- Split list/detail deadlines under a bounded overall discovery deadline, add
+  per-candidate retry backoff and idle/active polling, and make remote refresh
+  request fresh discovery without changing peer heartbeat or task deadlines.
+- Separate hosting, discovery, peer and user-action errors in the Dashboard.
+  Show transient discovery failures as localized warnings rather than implying a
+  local or Codespaces task failed; clear errors only in their corresponding scope.
+- Add sanitized phase, authorization/HTTP duration and timer-delay diagnostics,
+  with regression coverage for slow requests, partial recovery, cancellation,
+  account changes and the version-11 Dashboard contract.
+
 ## [0.5.13 Preview] - 2026-09-14
 
 - Keep opening a "Delegate in Chat" draft out of global operation feedback, so

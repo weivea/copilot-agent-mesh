@@ -122,6 +122,9 @@ export class ProductionConnectivity implements BrokerConnectivity {
 	private settingsLoaded = false;
 	private disposed = false;
 	private error: ConnectivityCode | undefined;
+	private actionError: ConnectivitySnapshot['actionError'];
+	private directoryError: ConnectivityCode | undefined;
+	private directoryRefreshGeneration = 0;
 	private connectionState: ConnectivitySnapshot['connectionState'] = 'disabled';
 	private stopRequested = false;
 	private stopEpoch = 0;
@@ -146,9 +149,17 @@ export class ProductionConnectivity implements BrokerConnectivity {
 			options.reportDiscovery?.(message, { localDeviceMarker: options.deviceId.slice(0, 8), ...fields });
 		this.management = new DevTunnelManagement(this.account, fence, () =>
 			this.ready && this.account.current() !== undefined, { diagnostics });
-		this.discovery = new DiscoveryService(new DevTunnelDiscoveryProvider(this.management, diagnostics), fence,
+		this.discovery = new DiscoveryService(new DevTunnelDiscoveryProvider(this.management, diagnostics, {
+			needsDetail: (advertisement) => this.peers.listConnections().some((connection) => {
+				const locator = this.endpoints.get(connection.profileId)?.locator;
+				return connection.snapshot().state === 'online' && locator?.clusterId === advertisement.resource.clusterId
+					&& locator.tunnelId === advertisement.resource.tunnelId;
+			}),
+		}), fence,
 			() => this.connectionsEnabled() && this.connectionState === 'online',
-			() => this.account.current() !== undefined, options.changed, Date.now, diagnostics);
+			() => this.account.current() !== undefined, options.changed, Date.now, diagnostics, {
+				active: () => this.peers.listConnections().some((connection) => connection.snapshot().state === 'online'),
+			});
 		this.revocations = new PeerRevocationService(files, fence, options.records, options.secrets,
 			(peerId) => options.listener()?.closePeer(peerId),
 			async (peerId) => {
@@ -209,7 +220,8 @@ export class ProductionConnectivity implements BrokerConnectivity {
 				enabled: () => this.connectionsEnabled(),
 				isRevoked: (peerId) => this.revocations.snapshot().some((entry) => entry.peerId === peerId),
 				isDeviceDenied: (deviceId) => this.dashboardManagement.deviceDenied(deviceId),
-				report: (code) => this.recordError(code),
+				report: options.report,
+				changed: options.changed,
 			},
 		);
 		this.sdkExposure = new SdkDevTunnelExposureProvider(files, fence, this.management, this.account, {
@@ -247,7 +259,7 @@ export class ProductionConnectivity implements BrokerConnectivity {
 		this.stopEpoch += 1;
 		this.clearRecovery();
 		this.management.invalidate();
-		this.discovery.invalidate();
+		this.invalidateDiscovery();
 		this.sdkExposure.cancel();
 	}
 
@@ -273,8 +285,9 @@ export class ProductionConnectivity implements BrokerConnectivity {
 			this.account.setBinding(this.currentSettings().account);
 			this.ready = true;
 			this.subscriptions = [
+				{ dispose: this.peers.onDidChange(() => this.enrollment.clearRecoveredFailures()) },
 				this.account.onDidChange(() => {
-					this.discovery.invalidate();
+					this.invalidateDiscovery();
 					if (!this.starting && this.connectionsEnabled()) {
 						this.accountReaction = this.actionQueue.then(() => this.refreshAccount())
 							.catch((error: unknown) => this.recordError(normalizeConnectivityError(error).code));
@@ -282,9 +295,20 @@ export class ProductionConnectivity implements BrokerConnectivity {
 					}
 				}),
 				this.discovery.onDidRefresh(() => {
-					void this.enrollment.synchronize(this.discovery.endpoints())
+					const generation = ++this.directoryRefreshGeneration;
+					void this.enrollment.synchronize(this.discovery.endpoints(), this.discovery.advertisements())
 						.then(() => this.refreshConnectedDirectory())
-						.catch((error: unknown) => this.recordError(normalizeConnectivityError(error).code));
+						.then(() => {
+							if (generation === this.directoryRefreshGeneration) {
+								this.directoryError = undefined;
+								this.options.changed();
+							}
+						})
+						.catch((error: unknown) => {
+							if (generation === this.directoryRefreshGeneration) {
+								this.recordDirectoryError(normalizeConnectivityError(error).code);
+							}
+						});
 				}),
 			];
 			// Denial is live before any cleanup can fail and before the Listener accepts connections.
@@ -306,7 +330,8 @@ export class ProductionConnectivity implements BrokerConnectivity {
 		const settings = this.currentSettings();
 		const discovery = this.discovery.snapshot(this.options.deviceId);
 		const claimed = this.options.registry.peerNode(caller)?.workspaces.filter((workspace) => workspace.status === 'claimed') ?? [];
-		const error = this.error ?? discovery.error;
+		const error = this.error;
+		const discoveryError = discovery.error ?? this.directoryError;
 		const catalog = this.ready ? await this.incomingPeers() : [];
 		this.assertCaller(caller, session);
 		const handles = new Map<string, ActionBinding>();
@@ -337,10 +362,15 @@ export class ProductionConnectivity implements BrokerConnectivity {
 			accountProvider: settings.account?.providerId ?? 'none',
 			claimedWorkspaceCount: claimed.length,
 			receivingWorkspaceCount: claimed.filter((workspace) => this.options.localPolicies.acceptsIncoming(workspace.workspaceIdentity)).length,
-			state: !this.ready || error !== undefined
-				? ['AUTH_REQUIRED', 'ACCOUNT_CHANGED', 'SCOPES_CHANGED'].includes(error ?? '') ? 'authRequired' : 'error'
-				: discovery.state,
+			state: !this.ready ? 'error' : discovery.state,
 			...(error === undefined ? {} : { error }),
+			...(discoveryError === undefined ? {} : { discoveryError }),
+			failedCandidateCount: discovery.failedCandidateCount,
+			deferredCandidateCount: discovery.deferredCandidateCount,
+			...(this.actionError === undefined ? {} : { actionError: this.actionError }),
+			peerErrors: this.enrollment.failures().map((failure) => ({
+				label: `Device ${failure.deviceId.slice(0, 8)}`, code: failure.code,
+			})),
 			truncated: discovery.truncated || incomingTruncated, incomingPeers: incoming,
 			candidates: discovery.candidates.map(({ candidateHandle, ...candidate }) => ({
 				...candidate, actionHandle: issue('candidate', candidateHandle),
@@ -509,7 +539,7 @@ export class ProductionConnectivity implements BrokerConnectivity {
 			this.stopRequested = true;
 			this.clearRecovery();
 			this.sdkExposure.cancel();
-			this.discovery.invalidate();
+			this.invalidateDiscovery();
 		}
 		const stopEpoch = this.stopEpoch;
 		const binding = input.actionHandle === undefined ? undefined : this.actions.get(session)?.get(input.actionHandle);
@@ -528,10 +558,11 @@ export class ProductionConnectivity implements BrokerConnectivity {
 					case 'configureConnectivity': await this.configure(caller, session); break;
 					case 'refreshRemoteTargets':
 						if (!this.remotePolicies.remoteDirectoryAvailable()) { throw new ConnectivityError('DISABLED'); }
+						await this.discovery.refresh({ interactive: true });
 						await this.options.remoteTasks().listDevices(new AbortController().signal);
 						break;
 					case 'refreshDiscovery':
-						await this.discovery.refresh();
+						await this.discovery.refresh({ interactive: true });
 						break;
 					case 'pairDiscoveredPeer':
 						throw new ConnectivityError('POLICY_DENIED');
@@ -559,10 +590,15 @@ export class ProductionConnectivity implements BrokerConnectivity {
 						}
 						break;
 				}
-				this.error = undefined;
+				if (this.actionError?.action === input.action) { this.actionError = undefined; }
 			} catch (error: unknown) {
 				const normalized = normalizeConnectivityError(error);
-				this.recordError(normalized.code);
+				if (['enableConnectivity', 'disableConnectivity', 'retryConnectivityCleanup'].includes(input.action)) {
+					this.recordError(normalized.code);
+				} else {
+					this.actionError = { action: input.action, code: normalized.code };
+					this.options.report(normalized.code);
+				}
 				throw new MeshDomainError('POLICY_FORBIDDEN', normalized.message);
 			} finally { this.options.changed(); }
 		});
@@ -806,9 +842,11 @@ export class ProductionConnectivity implements BrokerConnectivity {
 			await this.requireListener().start();
 			await validate();
 			this.connectionState = 'online';
+			this.actionError = undefined;
+			this.directoryError = undefined;
 			this.recoveryAttempts = 0;
 			this.options.changed();
-			void this.discovery.refresh().catch((error: unknown) => this.recordError(normalizeConnectivityError(error).code));
+			void this.discovery.refresh().catch((error: unknown) => this.recordDirectoryError(normalizeConnectivityError(error).code));
 		} catch (error: unknown) {
 			const normalized = normalizeConnectivityError(error);
 			if (hostAttempted) {
@@ -840,7 +878,7 @@ export class ProductionConnectivity implements BrokerConnectivity {
 		this.stopRequested = true;
 		this.clearRecovery();
 		this.connectionState = 'stopping';
-		this.discovery.invalidate();
+		this.invalidateDiscovery();
 		this.sdkExposure.cancel();
 		await this.settings.update((value) => ({
 			...value, enabled: false, publishEnabled: false, cleanupPending: true,
@@ -851,6 +889,7 @@ export class ProductionConnectivity implements BrokerConnectivity {
 			await this.settings.update((value) => ({ ...value, cleanupPending: false, migrationPending: false }));
 			this.connectionState = 'disabled';
 			this.error = undefined;
+			this.actionError = undefined;
 		} catch (error: unknown) {
 			this.connectionState = 'cleanupPending';
 			const normalized = normalizeConnectivityError(error);
@@ -988,8 +1027,13 @@ export class ProductionConnectivity implements BrokerConnectivity {
 	private async refreshConnectedDirectory(): Promise<void> {
 		if (!this.connectionsEnabled() || this.connectionState !== 'online') { return; }
 		await this.options.remoteTasks().listDevices(new AbortController().signal);
-		if (this.error === 'OFFLINE') { this.error = undefined; }
 		this.options.changed();
+	}
+
+	public requestDiscovery(): void {
+		if (!this.connectionsEnabled() || this.connectionState !== 'online') { return; }
+		void this.discovery.refresh({ demand: true })
+			.catch((error: unknown) => this.recordDirectoryError(normalizeConnectivityError(error).code));
 	}
 
 	private async refreshAccount(): Promise<void> {
@@ -1063,8 +1107,17 @@ export class ProductionConnectivity implements BrokerConnectivity {
 	private recordError(code: ConnectivityCode): void {
 		this.error = code; this.options.report(code); this.options.changed();
 	}
+	private recordDirectoryError(code: ConnectivityCode): void {
+		if (!this.connectionsEnabled() || this.connectionState !== 'online') { return; }
+		this.directoryError = code; this.options.report(code); this.options.changed();
+	}
+	private invalidateDiscovery(): void {
+		this.directoryRefreshGeneration += 1;
+		this.directoryError = undefined;
+		this.discovery.invalidate();
+	}
 	private blockRemote(): void {
-		this.ready = false; this.management.invalidate(); this.discovery.invalidate();
+		this.ready = false; this.management.invalidate(); this.invalidateDiscovery();
 		this.recordError('DISCOVERY_UNAVAILABLE');
 	}
 }

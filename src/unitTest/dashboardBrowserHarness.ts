@@ -147,7 +147,7 @@ export function createDashboardBrowserHarness(language = 'en') {
 		messages, element, find, body,
 		get activeElement() { return activeElement; },
 		render(model: unknown, pendingActions: string[] = []) {
-			send({ version: 10, uiInstanceId: 'media-view', type: 'dashboard.snapshot', model, pendingActions });
+			send({ version: 11, uiInstanceId: 'media-view', type: 'dashboard.snapshot', model, pendingActions });
 		},
 		send,
 		keydown(key: string) { documentListeners.get('keydown')?.({ key, preventDefault() {} }); },

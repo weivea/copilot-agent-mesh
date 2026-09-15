@@ -846,6 +846,7 @@ export class DeviceBroker {
 				if (this.options.remotePolicies?.remoteDirectoryAvailable() === false) {
 					return { devices: [], truncated: false, totalDevices: 0 };
 				}
+				this.options.connectivity?.requestDiscovery?.();
 				const directory = await this.requireRemoteTaskService().listDevices(
 					new AbortController().signal,
 				);

@@ -19,6 +19,7 @@ function model() {
 			discoveryEnabled: true, delegationEnabled: true, strictPolicyActivated: true, publishEnabled: true,
 			hostingBackend: 'sdk', migrationPending: false, accountProvider: 'github', claimedWorkspaceCount: 2, receivingWorkspaceCount: 0,
 			state: 'ready', truncated: false, candidates: [], incomingPeers: [], enabled: true, connectionState: 'online', connectedDeviceCount: 1,
+			failedCandidateCount: 0, deferredCandidateCount: 0, peerErrors: [],
 		},
 		management: {
 			available: true, truncated: false, accountActionHandle: handle('A'),
@@ -77,7 +78,7 @@ function task(state: string, shortId: string) {
 test('overview uses positive liveness and preserves every nonterminal task', () => {
 	const browser = createDashboardBrowserHarness();
 	browser.render(model());
-	assert.deepEqual(browser.messages[0], { version: 10, uiInstanceId: 'media-view', type: 'ready' });
+	assert.deepEqual(browser.messages[0], { version: 11, uiInstanceId: 'media-view', type: 'ready' });
 	assert.equal(browser.messages.length, 1);
 	assert.match(browser.element('deviceTree').text, /Remote root/u);
 	assert.doesNotMatch(browser.element('deviceTree').text, /Stale root|Stale window|Cached tree device/u);
@@ -107,6 +108,75 @@ test('overview keeps workspace shortcuts inline and moves normal device controls
 	assert.match(browser.element('connectivity').text, /Account/u);
 });
 
+test('discovery timeouts are scoped warnings, preserve delegation, and disappear on discovery recovery', () => {
+	for (const language of ['en', 'zh']) {
+		const browser = createDashboardBrowserHarness(language);
+		const source = model();
+		browser.render(source);
+		const tasks = browser.element('activeTasks').text;
+		browser.render({ ...source, connectivity: {
+			...source.connectivity, state: 'partial', discoveryError: 'TIMEOUT', failedCandidateCount: 1,
+		} });
+		const panel = browser.element('connectivity');
+		assert.match(panel.text, /TIMEOUT/u);
+		assert.match(panel.text, language === 'en' ? /Device discovery.*does not report a failure of local or Codespaces tasks/u : /设备发现.*不表示本机或 Codespaces 任务执行失败/u);
+		assert.ok(panel.children.some((child) => child.className === 'warning' && child.getAttribute('role') === 'status'));
+		assert.ok(!panel.children.some((child) => child.className === 'error'));
+		assert.equal(browser.control('delegate-tree-7').disabled, false);
+		assert.equal(browser.element('activeTasks').text, tasks);
+		assert.equal(browser.find((item) => item.dataset.focusKey === 'connect-disable').length, 0);
+		browser.control('remote-refresh').click();
+		assert.equal(browser.messages.at(-1)?.action, 'refreshRemoteTargets');
+		browser.render(source);
+		assert.doesNotMatch(browser.element('connectivity').text, /TIMEOUT/u);
+		assert.equal(browser.element('activeTasks').text, tasks);
+	}
+});
+
+test('intentional offline deferrals are explicit in management without showing a failure banner', () => {
+	const browser = createDashboardBrowserHarness();
+	const source = model();
+	browser.render({ ...source, connectivity: { ...source.connectivity, state: 'partial', deferredCandidateCount: 1 } });
+	assert.ok(!browser.element('connectivity').children.some((child) => ['warning', 'error'].includes(child.className)));
+	browser.button('Devices & permissions').click();
+	assert.match(browser.element('connectivity').text, /Discovery is partial: 0 failed, 1 deferred/u);
+	assert.match(browser.element('diagnostics').text, /Partially updated/u);
+});
+
+test('peer and action failures keep their own labels and authentication failures remain errors', () => {
+	const browser = createDashboardBrowserHarness();
+	const source = model();
+	browser.render({ ...source, connectivity: {
+		...source.connectivity, discoveryError: 'AUTH_REQUIRED',
+		actionError: { action: 'configureConnectivity', code: 'TIMEOUT' },
+		peerErrors: [{ label: 'Device 12345678', code: 'OFFLINE' }],
+	} });
+	assert.ok(browser.element('connectivity').children.some((child) =>
+		child.className === 'error' && child.getAttribute('role') === 'alert' && child.text.includes('Device discovery')));
+	assert.match(browser.element('connectivity').text, /Connection action failed/u);
+	assert.match(browser.element('connectivity').text, /Remote device connection issues: 1/u);
+	assert.equal(browser.control('delegate-tree-7').disabled, false);
+	browser.button('Devices & permissions').click();
+	assert.match(browser.element('connectivity').text, /Remote device connection.*Device 12345678/u);
+});
+
+test('renderer rejects malformed scoped discovery and peer diagnostics', () => {
+	const browser = createDashboardBrowserHarness();
+	const source = model();
+	browser.render(source);
+	const original = browser.element('connectivity').text;
+	for (const patch of [
+		{ discoveryError: 'UNKNOWN' }, { failedCandidateCount: 11 }, { deferredCandidateCount: -1 },
+		{ actionError: { action: 'runTask', code: 'TIMEOUT' } },
+		{ actionError: { action: 'refreshDiscovery', code: 'TIMEOUT', token: 'private' } },
+		{ peerErrors: [{ label: 'untrusted identity', code: 'OFFLINE' }] },
+		{ peerErrors: Array.from({ length: 257 }, () => ({ label: 'Device 12345678', code: 'OFFLINE' })) },
+	]) {
+		browser.render({ ...source, connectivity: { ...source.connectivity, ...patch } });
+		assert.equal(browser.element('connectivity').text, original);
+	}
+});
+
 test('opening Chat drafts never flashes global progress or compact disconnect controls', () => {
 	for (const language of ['en', 'zh']) {
 		const browser = createDashboardBrowserHarness(language);
@@ -126,7 +196,7 @@ test('opening Chat drafts never flashes global progress or compact disconnect co
 			assert.equal(browser.control('delegate-tree-7').disabled, true);
 			assertQuietOverview();
 			assert.deepEqual(browser.messages.at(-1), {
-				version: 10, uiInstanceId: 'media-view', type: 'action', action: 'openTargetChat', actionHandle: handle('C'),
+				version: 11, uiInstanceId: 'media-view', type: 'action', action: 'openTargetChat', actionHandle: handle('C'),
 			});
 			delegate.emit('click');
 			browser.control('delegate-tree-7').click();
@@ -172,7 +242,7 @@ test('Chat draft failures remain visible and retries only lock the draft action'
 	const connection = browser.element('connectivity').text;
 	browser.control('delegate-tree-7').click();
 	browser.send({
-		version: 10, uiInstanceId: 'media-view', type: 'dashboard.error',
+		version: 11, uiInstanceId: 'media-view', type: 'dashboard.error',
 		code: 'ACTION_FAILED', message: 'The Chat draft could not be opened.', pendingActions: ['openTargetChat'],
 	});
 	assert.match(browser.element('pageContent').text, /The Chat draft could not be opened/u);
@@ -213,7 +283,7 @@ test('workspace permissions use exact keys and back restores scroll and triggeri
 	assert.equal(browser.find((item) => item.dataset.focusKey === 'enabled-manage-workspace-1').length, 0);
 	browser.control('enabled-manage-workspace-2').click();
 	assert.deepEqual(browser.messages.at(-1), {
-		version: 10, uiInstanceId: 'media-view', type: 'action', action: 'setWorkspaceEnabled', actionHandle: handle('F'), enabled: true,
+		version: 11, uiInstanceId: 'media-view', type: 'action', action: 'setWorkspaceEnabled', actionHandle: handle('F'), enabled: true,
 	});
 	browser.button('Back').click();
 	assert.equal(browser.element('pageScroll').scrollTop, 321);
@@ -236,7 +306,7 @@ test('device naming is an accessible inline edit next to the value, not a standa
 		assert.throws(() => browser.button(language === 'en' ? 'Rename device' : '重命名设备'));
 		edit.click();
 		assert.deepEqual(browser.messages.at(-1), {
-			version: 10, uiInstanceId: 'media-view', type: 'action', action: 'configureDevice',
+			version: 11, uiInstanceId: 'media-view', type: 'action', action: 'configureDevice',
 		});
 		browser.render(data);
 		assert.equal(browser.activeElement?.dataset.focusKey, 'rename-device');
@@ -412,7 +482,7 @@ test('refresh and reconnect notices retain last-known rows and preferences but r
 		...data, errors: [{ code: 'DASHBOARD_RECONNECTING', message: 'DASHBOARD_RECONNECTING' }],
 	};
 	browser.render(reconnecting);
-	browser.send({ version: 10, uiInstanceId: 'media-view', type: 'dashboard.error', code: 'STALE_ACTION', message: 'This action is stale.' });
+	browser.send({ version: 11, uiInstanceId: 'media-view', type: 'dashboard.error', code: 'STALE_ACTION', message: 'This action is stale.' });
 	assert.equal(browser.find((item) => item.id === 'dashboardFreshness').length, 1);
 	assert.equal(browser.find((item) => item.className === 'error').length, 0);
 	assert.match(browser.element('dashboardFreshness').text, /not current status.*preferences are unchanged/u);
@@ -436,7 +506,7 @@ test('refresh and reconnect notices retain last-known rows and preferences but r
 	assert.equal(browser.control('cancel-incoming-00000004').disabled, false, 'A fresh model permits cancellation during native prompts.');
 	browser.control('delegate-tree-7').click();
 	assert.deepEqual(browser.messages.at(-1), {
-		version: 10, uiInstanceId: 'media-view', type: 'action', action: 'openTargetChat', actionHandle: handle('C'),
+		version: 11, uiInstanceId: 'media-view', type: 'action', action: 'openTargetChat', actionHandle: handle('C'),
 	});
 });
 
@@ -521,7 +591,7 @@ test('reconnecting retains real faults and rejected service data stays a failure
 	assert.match(browser.element('pageContent').text, /CONFIGURATION_INVALID/u);
 	assert.match(browser.element('pageContent').text, /ACCOUNT_CHANGED/u);
 	browser.send({
-		version: 10, uiInstanceId: 'media-view', type: 'dashboard.error',
+		version: 11, uiInstanceId: 'media-view', type: 'dashboard.error',
 		code: 'UNSAFE_VIEW_MODEL', message: 'The dashboard rejected an invalid service snapshot.',
 	});
 	assert.equal(browser.find((item) => item.id === 'dashboardFreshness' || item.id === 'deviceTree').length, 0);
@@ -572,7 +642,7 @@ test('operational errors and truncation stay inline and preserve detailed reason
 	assert.match(browser.element('pageContent').text, /所选账号不拥有此隧道/u);
 	assert.match(browser.element('pageContent').text, /安全显示上限/u);
 	assert.equal(browser.find((item) => item.text === 'Exact source registration changed.')[0]?.visible, true);
-	browser.send({ version: 10, uiInstanceId: 'media-view', type: 'dashboard.error', code: 'ACTION_FAILED', message: 'Device probe was rejected.' });
+	browser.send({ version: 11, uiInstanceId: 'media-view', type: 'dashboard.error', code: 'ACTION_FAILED', message: 'Device probe was rejected.' });
 	assert.match(browser.element('pageContent').text, /Device probe was rejected/u);
 	browser.render(model());
 	assert.match(browser.element('pageContent').text, /Device probe was rejected/u, 'Snapshot updates must not expire action errors');

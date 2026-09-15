@@ -3,6 +3,7 @@ import { test } from 'node:test';
 
 import {
 	DASHBOARD_MANAGEMENT_ACTIONS,
+	DISABLED_CONNECTIVITY_SNAPSHOT,
 	MANAGEMENT_BOOLEAN_ACTIONS,
 	type DashboardManagement,
 } from '../../shared/protocol';
@@ -86,6 +87,35 @@ test('unavailable management is explicit and contains no fabricated setting acti
 	assertSafeDashboardOutboundMessage({
 		version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'view', type: 'dashboard.snapshot', model,
 	});
+});
+
+test('scoped connectivity diagnostics survive projection and reject unsafe or unbounded metadata', () => {
+	const source: DashboardSnapshot = { ...snapshot(), connectivity: {
+		...DISABLED_CONNECTIVITY_SNAPSHOT, enabled: true, connectionState: 'online', state: 'partial',
+		discoveryError: 'TIMEOUT', failedCandidateCount: 1, deferredCandidateCount: 1,
+		actionError: { action: 'configureConnectivity', code: 'OFFLINE' },
+		peerErrors: [{ label: 'Device 12345678', code: 'TIMEOUT' }],
+	} };
+	const presenter = new DashboardPresenter();
+	const model = presenter.present(source);
+	const outbound = { version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: 'view', type: 'dashboard.snapshot' as const, model };
+	assertSafeDashboardOutboundMessage(outbound);
+	assert.equal(model.connectivity.error, undefined);
+	assert.equal(model.connectivity.discoveryError, 'TIMEOUT');
+	assert.equal(model.connectivity.actionError?.action, 'configureConnectivity');
+	assert.equal(model.connectivity.peerErrors[0].code, 'TIMEOUT');
+	for (const patch of [
+		{ discoveryError: 'UNKNOWN' }, { failedCandidateCount: 11 }, { deferredCandidateCount: -1 },
+		{ actionError: { action: 'runTask', code: 'TIMEOUT' } },
+		{ peerErrors: [{ label: 'Device private-identity', code: 'TIMEOUT' }] },
+		{ peerErrors: Array.from({ length: 257 }, () => ({ label: 'Device 12345678', code: 'OFFLINE' })) },
+	]) {
+		const invalid = {
+			...outbound, model: { ...model, connectivity: { ...model.connectivity, ...patch } },
+		};
+		// @ts-expect-error Deliberately inject malformed wire data into the runtime guard.
+		assert.throws(() => assertSafeDashboardOutboundMessage(invalid));
+	}
 });
 
 test('management actions accept only their handle and exact boolean shape', () => {

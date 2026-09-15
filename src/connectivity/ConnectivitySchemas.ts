@@ -1,7 +1,7 @@
 import { TunnelConstraints } from '@microsoft/dev-tunnels-contracts';
 import { z } from 'zod';
 
-import { timestampSchema, uuidSchema } from '../../shared/protocol';
+import { connectivityErrorCodeSchema, timestampSchema, uuidSchema } from '../../shared/protocol';
 
 export const DISCOVERY_LABELS = ['copilot-agent-mesh', 'mesh-discovery-v1', 'mesh-protocol-v2'];
 export const PRIVATE_LABEL = 'mesh-private-v1';
@@ -88,12 +88,11 @@ export const EMPTY_CONNECTIVITY_SETTINGS: ConnectivitySettings = {
 	accounts: [],
 };
 
-export type ConnectivityCode =
-	| 'DISABLED' | 'AUTH_REQUIRED' | 'ACCOUNT_CHANGED' | 'SCOPES_CHANGED'
-	| 'OFFLINE' | 'DISCOVERY_UNAVAILABLE' | 'RATE_LIMITED' | 'TIMEOUT'
-	| 'CANCELLED' | 'INVALID_ENDPOINT' | 'BINDING_CHANGED' | 'POLICY_DENIED'
-	| 'PRIVATE_ACCESS_REQUIRED' | 'CLEANUP_FAILED' | 'MIGRATION_REQUIRED' | 'PROTOCOL_INCOMPATIBLE'
-	| 'PLATFORM_UNSUPPORTED';
+export type ConnectivityCode = z.infer<typeof connectivityErrorCodeSchema>;
+
+export function isTransientDiscoveryError(code: ConnectivityCode): boolean {
+	return code === 'OFFLINE' || code === 'DISCOVERY_UNAVAILABLE' || code === 'RATE_LIMITED' || code === 'TIMEOUT';
+}
 
 const messages: Record<ConnectivityCode, string> = {
 	DISABLED: 'Cross-device connectivity is disabled.',

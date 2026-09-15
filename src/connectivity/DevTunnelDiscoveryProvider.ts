@@ -6,6 +6,7 @@ import {
 	ACCOUNT_IDENTITY_PREFIX,
 	accountDeviceIdentitySchema,
 	ConnectivityError,
+	isTransientDiscoveryError,
 	DISCOVERY_LABELS,
 	PRIVATE_LABEL,
 	endpointLocatorSchema,
@@ -14,9 +15,12 @@ import {
 	type TunnelResource,
 	type AccountDeviceIdentity,
 	type ConnectivityDiagnosticsReporter,
+	type ConnectivityCode,
 } from './ConnectivitySchemas';
 import { readAccountPublicKey } from './AccountDeviceIdentity';
 import type { DevTunnelManagement } from './DevTunnelManagement';
+import { normalizeConnectivityError } from './DevTunnelManagement';
+import { ConnectivityOperation } from './ConnectivityOperations';
 import { portOrigin } from './DevTunnelUris';
 
 export interface DiscoveredEndpoint {
@@ -29,32 +33,62 @@ export interface DiscoveredEndpoint {
 
 const advertisementSchema = endpointLocatorSchema.omit({ provider: true, portNumber: true });
 
-interface DiscoveryAdvertisement {
+export interface DiscoveryAdvertisement {
 	readonly resource: TunnelResource;
 	readonly advertisementId: string;
 	readonly admission: PeerAdmission;
 	readonly accountIdentity?: AccountDeviceIdentity;
 }
 
+export interface DiscoveryListResult {
+	readonly endpoints: readonly DiscoveredEndpoint[];
+	readonly advertisements: readonly DiscoveryAdvertisement[];
+	readonly truncated: boolean;
+	readonly failedCandidateCount: number;
+	readonly deferredCandidateCount: number;
+	readonly error?: ConnectivityCode;
+	readonly retryAfterMs?: number;
+}
+
+export const DISCOVERY_BUDGETS = { listMs: 10_000, detailMs: 5_000, roundMs: 20_000 } as const;
+
 export class DevTunnelDiscoveryProvider {
+	private readonly retries = new Map<string, { failures: number; retryAt: number; code: ConnectivityCode }>();
+
 	public constructor(
 		private readonly management: DevTunnelManagement,
 		private readonly diagnostics?: ConnectivityDiagnosticsReporter,
+		private readonly options: {
+			readonly listTimeoutMs?: number;
+			readonly detailTimeoutMs?: number;
+			readonly roundTimeoutMs?: number;
+			readonly now?: () => number;
+			readonly needsDetail?: (advertisement: DiscoveryAdvertisement) => boolean;
+		} = {},
 	) {}
 
-	public async list(signal: AbortSignal): Promise<{
-		readonly endpoints: readonly DiscoveredEndpoint[];
-		readonly truncated: boolean;
-	}> {
-		// Listing and detail reads share one management timeout, cancellation and concurrency slot.
-		return this.management.run(async (client, cancellation) => {
-			const tunnels = await client.listTunnels(undefined, undefined, {
+	public invalidate(): void { this.retries.clear(); }
+
+	public async list(signal: AbortSignal): Promise<DiscoveryListResult> {
+		const accountSignal = this.management.cancellationSignal;
+		const round = new ConnectivityOperation(this.options.roundTimeoutMs ?? DISCOVERY_BUDGETS.roundMs, signal, accountSignal);
+		const operationId = randomUUID();
+		const startedAt = Date.now();
+		let failedCandidateCount = 0;
+		let deferredCandidateCount = 0;
+		let error: ConnectivityCode | undefined;
+		let retryAfterMs: number | undefined;
+		try {
+			const tunnels = await this.management.run((client, cancellation) => client.listTunnels(undefined, undefined, {
 				labels: [...DISCOVERY_LABELS],
 				requireAllLabels: true,
 				includePorts: true,
 				limit: 10,
 				followRedirects: false,
-			}, cancellation);
+			}, cancellation), round.controller.signal, {
+				phase: 'discovery.list', operationId, timeoutMs: this.options.listTimeoutMs ?? DISCOVERY_BUDGETS.listMs,
+			});
+			round.assertActive();
 			this.diagnostics?.('Tunnel discovery SDK result.', {
 				tunnelCount: tunnels.length,
 				tunnels: tunnels.slice(0, 10).map((tunnel) => ({
@@ -70,45 +104,94 @@ export class DevTunnelDiscoveryProvider {
 				})),
 			});
 			const endpoints: DiscoveredEndpoint[] = [];
+			// Validate every summary before deferring any work; a partial result is not a validation bypass.
+			const candidates = tunnels.slice(0, 10).flatMap((summary) => {
+				const advertisement = readAdvertisement(summary);
+				if (advertisement === undefined) { return []; }
+				const incomplete = !summary.ports?.length || summary.ports.some((port) => port.protocol === undefined
+					|| ((port.protocol === 'http' || port.protocol === 'https') && !port.portForwardingUris?.length));
+				return [{ summary, advertisement, incomplete, projected: incomplete ? [] : this.project(summary) }];
+			});
+			const keys = new Set(candidates.map((candidate) => JSON.stringify(candidate.advertisement)));
+			for (const key of this.retries.keys()) {
+				if (!keys.has(key)) { this.retries.delete(key); }
+			}
 			let portCount = tunnels.reduce((count, tunnel) => count + (tunnel.ports?.length ?? 0), 0);
-			for (const summary of tunnels.slice(0, 10)) {
-				if (signal.aborted || cancellation.isCancellationRequested) {
-					throw new ConnectivityError('CANCELLED');
+			for (const { summary, advertisement, incomplete, projected } of candidates) {
+				if (signal.aborted || accountSignal.aborted) { throw new ConnectivityError('CANCELLED'); }
+				const key = JSON.stringify(advertisement);
+				if (!incomplete) {
+					this.retries.delete(key);
+					endpoints.push(...projected);
+					continue;
 				}
-				let tunnel = summary;
-				if (!summary.ports?.length || summary.ports.some((port) => port.protocol === undefined
-					|| ((port.protocol === 'http' || port.protocol === 'https') && !port.portForwardingUris?.length))) {
-					const advertised = readAdvertisement(summary);
-					if (advertised === undefined) { continue; }
-					// Only an exact member of the caller-owned list may supply discovery details.
-					const detail = await client.getTunnel(advertised.resource,
-						{ includePorts: true, followRedirects: false }, cancellation);
+				if (readHostHint(summary) === 'offline' && this.options.needsDetail?.(advertisement) !== true) {
+					this.retries.delete(key);
+					deferredCandidateCount += 1;
+					continue;
+				}
+				const previous = this.retries.get(key);
+				const now = this.options.now?.() ?? Date.now();
+				if (previous !== undefined && now < previous.retryAt) {
+					deferredCandidateCount += 1;
+					error ??= previous.code;
+					continue;
+				}
+				if (round.cancellationError?.code === 'TIMEOUT') {
+					deferredCandidateCount += 1;
+					error ??= 'TIMEOUT';
+					continue;
+				}
+				try {
+					// A fresh exact detail read cannot inherit the list's nearly exhausted deadline.
+					const detail = await this.management.run((client, cancellation) =>
+						client.getTunnel(advertisement.resource, { includePorts: true, followRedirects: false }, cancellation),
+					round.controller.signal, {
+						phase: 'discovery.detail', operationId, timeoutMs: this.options.detailTimeoutMs ?? DISCOVERY_BUDGETS.detailMs,
+					});
 					if (detail === null) { throw new ConnectivityError('OFFLINE'); }
 					const current = readAdvertisement(detail);
 					if (current === undefined
-						|| current.resource.clusterId !== advertised.resource.clusterId
-						|| current.resource.tunnelId !== advertised.resource.tunnelId
-						|| current.advertisementId !== advertised.advertisementId
-						|| current.admission !== advertised.admission
-						|| current.accountIdentity?.deviceId !== advertised.accountIdentity?.deviceId
-						|| current.accountIdentity?.publicKey !== advertised.accountIdentity?.publicKey) {
+						|| JSON.stringify(current) !== JSON.stringify(advertisement)) {
 						throw new ConnectivityError('BINDING_CHANGED');
 					}
 					portCount += (detail.ports?.length ?? 0) - (summary.ports?.length ?? 0);
-					tunnel = detail;
+					const resolved = this.project(detail);
+					if (resolved.length === 0) { throw new ConnectivityError('OFFLINE'); }
+					endpoints.push(...resolved);
+					this.retries.delete(key);
 					this.diagnostics?.('Tunnel discovery detail resolved.', {
+						operationId,
 						tunnelMarker: detail.tunnelId?.slice(0, 12),
 						clusterMarker: detail.clusterId?.slice(0, 8),
 						portCount: detail.ports?.length ?? 0,
 						hostHint: readHostHint(detail),
 					});
+				} catch (cause: unknown) {
+					if (signal.aborted || accountSignal.aborted) { throw new ConnectivityError('CANCELLED'); }
+					const normalized = normalizeConnectivityError(cause, round.cancellationError);
+					if (!isTransientDiscoveryError(normalized.code)) { throw normalized; }
+					failedCandidateCount += 1;
+					error ??= normalized.code;
+					const failures = Math.min((previous?.failures ?? 0) + 1, 5);
+					const delayMs = Math.max(normalized.retryAfterMs ?? 0, Math.min(300_000, 30_000 * 2 ** (failures - 1)));
+					this.retries.set(key, { failures, retryAt: (this.options.now?.() ?? Date.now()) + delayMs, code: normalized.code });
+					if (normalized.code === 'RATE_LIMITED') { retryAfterMs = Math.max(retryAfterMs ?? 0, normalized.retryAfterMs ?? 60_000); }
+					this.diagnostics?.('Tunnel discovery candidate deferred after failure.', {
+						operationId, tunnelMarker: advertisement.resource.tunnelId.slice(0, 12),
+						code: normalized.code, retryAfterMs: delayMs,
+					});
 				}
-				endpoints.push(...this.project(tunnel));
 			}
+			if (signal.aborted || accountSignal.aborted) { throw new ConnectivityError('CANCELLED'); }
 			const result = {
 				endpoints: endpoints.slice(0, 10),
+				advertisements: candidates.map((candidate) => candidate.advertisement),
 				// The released SDK discards pagination. Never infer deletion/completeness at the cap.
 				truncated: tunnels.length >= 10 || portCount > 10,
+				failedCandidateCount, deferredCandidateCount,
+				...(error === undefined ? {} : { error }),
+				...(retryAfterMs === undefined ? {} : { retryAfterMs }),
 			};
 			this.diagnostics?.('Tunnel discovery projected endpoints.', {
 				endpointCount: result.endpoints.length,
@@ -121,7 +204,20 @@ export class DevTunnelDiscoveryProvider {
 				})),
 			});
 			return result;
-		}, signal);
+		} catch (cause: unknown) {
+			error = normalizeConnectivityError(cause).code;
+			throw cause;
+		} finally {
+			const elapsedMs = Date.now() - startedAt;
+			if (elapsedMs >= 2000 || error !== undefined || round.cancellationError !== undefined) {
+				this.diagnostics?.('Discovery round timing.', {
+					operationId, elapsedMs, budgetMs: this.options.roundTimeoutMs ?? DISCOVERY_BUDGETS.roundMs,
+					timerDelayMs: round.deadlineDelayMs, failedCandidateCount, deferredCandidateCount,
+					...(error === undefined ? {} : { code: error }),
+				});
+			}
+			round.dispose();
+		}
 	}
 
 	public async publish(

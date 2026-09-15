@@ -6,6 +6,7 @@ import type {
 import type { LocalIpcSession } from '../ipc';
 
 export interface BrokerConnectivity {
+	requestDiscovery?(): void;
 	snapshot(caller: NodeIdentityParams, session: LocalIpcSession): Promise<ConnectivitySnapshot>;
 	act(caller: NodeIdentityParams, input: ConnectivityActionParams, session: LocalIpcSession): Promise<void>;
 	policySnapshot?(caller: NodeIdentityParams, session: LocalIpcSession): Promise<RemotePolicyDashboard>;
