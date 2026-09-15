@@ -313,7 +313,7 @@
 				'enableConnectivity', undefined, !available || !model.device.workerSupported, 'connect-enable', false, true));
 		}
 		if ((value.enabled || starting || value.connectionState === 'online')
-			&& (!compact || starting || value.connectionState !== 'online' || state.pendingActions.size > 0 || value.error)) {
+			&& (!compact || starting || value.connectionState !== 'online' || hasPendingOperation() || value.error)) {
 			actions.append(actionButton(starting ? 'Cancel connection startup' : 'Disable cross-device connections',
 				'disableConnectivity', undefined, !available || value.connectionState === 'stopping', 'connect-disable', true));
 		}
@@ -710,9 +710,14 @@
 		for (const [control, binding] of controls) {
 			control.disabled = binding.disabled || isActionPending(binding.action) || isActionUnavailable(binding.action);
 		}
-		const pending = state.pendingActions.size > 0;
+		const pending = hasPendingOperation();
 		document.getElementById('operationStatus').textContent = pending && !displayNotice() && !state.modelRejected
 			? t('Action in progress. Navigation, task cancellation and disconnect remain available.') : '';
+	}
+
+	function hasPendingOperation() {
+		// Opening a Chat draft needs its own pending-action lock, not global operation UI.
+		return [...state.pendingActions].some((action) => action !== 'openTargetChat');
 	}
 
 	function displayNotice() {

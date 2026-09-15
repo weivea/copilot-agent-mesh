@@ -107,6 +107,89 @@ test('overview keeps workspace shortcuts inline and moves normal device controls
 	assert.match(browser.element('connectivity').text, /Account/u);
 });
 
+test('opening Chat drafts never flashes global progress or compact disconnect controls', () => {
+	for (const language of ['en', 'zh']) {
+		const browser = createDashboardBrowserHarness(language);
+		const data = model();
+		browser.render(data);
+		const connection = browser.element('connectivity').text;
+		const assertQuietOverview = () => {
+			assert.equal(browser.element('operationStatus').text, '');
+			assert.equal(browser.element('connectivity').text, connection);
+			assert.equal(browser.find((item) => item.dataset.focusKey === 'connect-disable').length, 0);
+		};
+		for (let index = 0; index < 3; index++) {
+			assertQuietOverview();
+			const delegate = browser.control('delegate-tree-7');
+			const messageCount = browser.messages.length;
+			delegate.click();
+			assert.equal(browser.control('delegate-tree-7').disabled, true);
+			assertQuietOverview();
+			assert.deepEqual(browser.messages.at(-1), {
+				version: 10, uiInstanceId: 'media-view', type: 'action', action: 'openTargetChat', actionHandle: handle('C'),
+			});
+			delegate.emit('click');
+			browser.control('delegate-tree-7').click();
+			assert.equal(browser.messages.length, messageCount + 1, 'Pending drafts must still reject duplicate clicks.');
+			for (const pending of [['openTargetChat'], ['openTargetChat'], []]) {
+				browser.render(data, pending);
+				assert.equal(browser.control('delegate-tree-7').disabled, pending.length > 0);
+				assertQuietOverview();
+			}
+		}
+	}
+});
+
+test('pending Chat drafts preserve management disconnect and concurrent operation feedback', () => {
+	const browser = createDashboardBrowserHarness();
+	const data = model();
+	browser.render(data, ['openTargetChat']);
+	browser.button('Devices & permissions').click();
+	assert.equal(browser.element('operationStatus').text, '');
+	assert.equal(browser.control('connect-disable').disabled, false);
+	browser.control('switch-account').click();
+	browser.render(data, ['openTargetChat', 'switchAccount']);
+	browser.button('Overview').click();
+	assert.match(browser.element('operationStatus').text, /Action in progress/u);
+	assert.equal(browser.control('delegate-tree-7').disabled, true);
+	assert.equal(browser.control('connect-disable').disabled, false);
+	assert.equal(browser.control('cancel-incoming-00000004').disabled, false);
+	browser.control('cancel-incoming-00000004').click();
+	assert.equal(browser.messages.at(-1)?.action, 'cancelIncomingTask');
+	browser.control('connect-disable').click();
+	assert.equal(browser.messages.at(-1)?.action, 'disableConnectivity');
+	assert.equal(browser.control('connect-disable').disabled, true);
+	browser.render(data, ['openTargetChat']);
+	assert.equal(browser.control('delegate-tree-7').disabled, true);
+	assert.equal(browser.element('operationStatus').text, '');
+	assert.equal(browser.find((item) => item.dataset.focusKey === 'connect-disable').length, 0);
+});
+
+test('Chat draft failures remain visible and retries only lock the draft action', () => {
+	const browser = createDashboardBrowserHarness();
+	const data = model();
+	browser.render(data);
+	const connection = browser.element('connectivity').text;
+	browser.control('delegate-tree-7').click();
+	browser.send({
+		version: 10, uiInstanceId: 'media-view', type: 'dashboard.error',
+		code: 'ACTION_FAILED', message: 'The Chat draft could not be opened.', pendingActions: ['openTargetChat'],
+	});
+	assert.match(browser.element('pageContent').text, /The Chat draft could not be opened/u);
+	assert.equal(browser.control('delegate-tree-7').disabled, true);
+	assert.equal(browser.element('operationStatus').text, '');
+	assert.equal(browser.element('connectivity').text, connection);
+	browser.render(data);
+	assert.match(browser.element('pageContent').text, /The Chat draft could not be opened/u);
+	assert.equal(browser.control('delegate-tree-7').disabled, false);
+	browser.control('delegate-tree-7').click();
+	assert.doesNotMatch(browser.element('pageContent').text, /The Chat draft could not be opened/u);
+	assert.equal(browser.control('delegate-tree-7').disabled, true);
+	assert.equal(browser.element('operationStatus').text, '');
+	assert.equal(browser.element('connectivity').text, connection);
+	assert.equal(browser.messages.filter(({ action }) => action === 'openTargetChat').length, 2);
+});
+
 test('overview retains exceptional claim, busy and cleanup hints and full claim details remain scoped', () => {
 	const browser = createDashboardBrowserHarness();
 	const data = model();

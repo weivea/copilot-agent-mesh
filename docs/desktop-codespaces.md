@@ -189,7 +189,7 @@ view revision exposes the preceding resource for state migration.
 
 ### Automatic first-run enablement
 
-Install the matching 0.5.12 packages and run the normal Codespaces runtime setup.
+Install the matching 0.5.13 packages and run the normal Codespaces runtime setup.
 On first companion activation, the desktop extension automatically saves the
 companion's permission, then asks the user to **fully quit all VS Code windows
 and reopen once**. Reconnect normally. No launch flags or manual JSON edits are
@@ -508,6 +508,12 @@ actions continuously usable. Tests actually click Delegate while the production
 bindings refresh is blocked, and execute a management action while a backend
 snapshot is waiting; both complete without a stale-action error, and consumed
 handles remain rejected on replay.
+
+0.5.13 separates pending Chat drafts from global operation feedback. Clicking
+**Delegate in Chat** no longer briefly inserts the progress banner or the
+compact disconnect button. The draft action keeps its duplicate-click lock,
+target checks and visible failures; concurrent connection and task operations
+still show their normal feedback.
 
 On transient transport loss, stop admission and reconcile the exact existing
 request/task IDs. On a changed helper generation, retire the old execution

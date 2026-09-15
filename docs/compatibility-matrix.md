@@ -1,6 +1,6 @@
 # Compatibility Matrix
 
-> Status: 0.5.12 Preview keeps unchanged actions usable throughout ordinary background refreshes<br>
+> Status: 0.5.13 Preview opens Chat drafts without flashing global operation controls<br>
 > Updated: 2026-09-14; earlier live Agent evidence retains its original OS/version scope<br>
 > Mesh protocol: v2; v1 peers incompatible
 
@@ -22,7 +22,7 @@ retroactively broaden any of these dated results.
 
 | Capability | Declared or detected | Validated | Status |
 | --- | --- | --- | --- |
-| Package | `0.5.12` Preview VSIX with Windows x64/ARM64 process helpers and a matching Codespaces companion | Package allowlist includes the exact helper binaries, their Go license, and the separately checked companion VSIX alongside the extension | Private Preview; not published |
+| Package | `0.5.13` Preview VSIX with Windows x64/ARM64 process helpers and a matching Codespaces companion | Package allowlist includes the exact helper binaries, their Go license, and the separately checked companion VSIX alongside the extension | Private Preview; not published |
 | Shared-host pause resilience | Separate Broker event-delivery and acknowledgement budgets, bounded queues, independent companion heartbeat | Production IPC/Broker/Node/bridge component test delayed the first response acknowledgement by 31 seconds; one execution completed, both nodes stayed registered. Over-budget delay and actual disconnect remain failures | Pass for simulated Broker pause; not an independent-process Broker or a fix to Copilot CPU usage |
 | Automatic native permission | Exact companion permission saved in desktop user argv configuration; one full restart, no manual launch flag | Isolated Windows x64 / Stable 1.137.0: native contribution unavailable before persistence, user configuration preserved, native Chat and Sessions render after restart without a proposal flag | Pass for isolated desktop setup; real Codespace deployment remains a separate scope |
 | Codespaces native Chat POC | VS Code 1.137+; explicit `chatSessionsProvider` and `chatParticipantPrivate` permissions; native Chat editor and retained Sessions over existing owned execution | 2026-09-11 isolated Windows x64 / VS Code 1.137.0: native rendered output, one listed item per conversation, external continuation, close/reopen and full process-restart history; synthetic task events, no authentication/model call; cancel decision injected because test mode rejects modals | Pass for this native UI scope only; private VSIX/proposed API, not live Codespace qualification |

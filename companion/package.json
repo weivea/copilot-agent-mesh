@@ -3,7 +3,7 @@
   "displayName": "Copilot Agent Mesh - Codespaces",
   "description": "Workspace-side execution companion for desktop Copilot Agent Mesh.",
   "publisher": "weivea",
-  "version": "0.5.12",
+  "version": "0.5.13",
   "preview": true,
   "license": "MIT",
   "repository": {

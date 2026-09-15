@@ -1,6 +1,6 @@
 # Preview release engineering
 
-> Version: `0.5.12` Preview
+> Version: `0.5.13` Preview
 > Gate status: historical G0 Go; Peer Window Delegation requires its own real evidence gate
 
 This document describes a reproducible evaluation package. It does not authorize
@@ -71,8 +71,8 @@ npm run verify
 The package command creates:
 
 ```text
-artifacts/copilot-agent-mesh-0.5.12-preview.vsix
-artifacts/copilot-agent-mesh-codespaces-0.5.12-preview.vsix
+artifacts/copilot-agent-mesh-0.5.13-preview.vsix
+artifacts/copilot-agent-mesh-codespaces-0.5.13-preview.vsix
 ```
 
 The production bundle is separate from VSIX creation:
@@ -98,14 +98,14 @@ Inspect and hash the result independently:
 
 ```sh
 npx vsce ls --no-dependencies
-unzip -Z1 artifacts/copilot-agent-mesh-0.5.12-preview.vsix
-shasum -a 256 artifacts/copilot-agent-mesh-0.5.12-preview.vsix
+unzip -Z1 artifacts/copilot-agent-mesh-0.5.13-preview.vsix
+shasum -a 256 artifacts/copilot-agent-mesh-0.5.13-preview.vsix
 ```
 
 On Windows, install the same universal VSIX from PowerShell:
 
 ```powershell
-code --install-extension ".\artifacts\copilot-agent-mesh-0.5.12-preview.vsix" --force
+code --install-extension ".\artifacts\copilot-agent-mesh-0.5.13-preview.vsix" --force
 ```
 
 Local discovery, policy controls, and Mesh tools are enabled by default.
@@ -122,7 +122,7 @@ The companion uses a fixed GitHub protected-resource mapping for
 `https://api.github.com` (`github`, `read:user`, `user:email`); user-configured exact
 mappings take precedence and other resources fail closed.
 
-The 0.5.12 companion requires desktop VS Code 1.137+. The desktop extension saves
+The 0.5.13 companion requires desktop VS Code 1.137+. The desktop extension saves
 the native Chat permission automatically on first companion activation. Fully
 quit all VS Code windows and reopen once, then reconnect normally. No proposed-API
 launch flag or manual configuration edit is needed. Dirty, invalid or concurrent

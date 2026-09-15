@@ -1,6 +1,6 @@
 # Copilot Agent Mesh
 
-Copilot Agent Mesh 0.5.12 Preview provides **Peer Window Delegation** for ordinary
+Copilot Agent Mesh 0.5.13 Preview provides **Peer Window Delegation** for ordinary
 VS Code windows on Windows x64/ARM64 and macOS arm64. Local discovery, task tools,
 window naming, and policy controls are enabled by default. In Agent mode, Copilot can use
 six Mesh tools to discover an explicitly authorized peer window, delegate tasks,
@@ -363,7 +363,7 @@ initialization; do not delete policy or revocation files to force a downgrade.
 git submodule update --init --recursive
 npm ci
 npm run package:vsix
-code --install-extension artifacts/copilot-agent-mesh-0.5.12-preview.vsix
+code --install-extension artifacts/copilot-agent-mesh-0.5.13-preview.vsix
 ```
 
 Project documents:
