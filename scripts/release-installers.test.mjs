@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { test } from 'node:test';
@@ -199,7 +199,7 @@ for (const runtime of runtimes) {
 }
 
 async function createFixture(t) {
-	const root = await mkdtemp(join(tmpdir(), 'mesh installer test '));
+	const root = await realpath(await mkdtemp(join(tmpdir(), 'mesh installer test ')));
 	t.after(() => rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }));
 	const bin = join(root, 'mock bin');
 	const temporary = join(root, 'temporary downloads');

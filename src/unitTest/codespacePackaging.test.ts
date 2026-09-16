@@ -34,9 +34,12 @@ test('desktop and companion manifests preserve one public tool surface with sepa
 
 test('release packages the exact companion without including native CLI downloads or loose helper output', () => {
 	const main = JSON.parse(read('package.json'));
-	const artifact = `artifacts/${main.name}-${main.version}-preview.vsix`;
-	for (const script of ['package:vsix', 'verify:vsix', 'smoke:vsix']) {
-		assert.ok(main.scripts[script].includes(artifact), `${script} must use the current package version`);
+	assert.equal(main.scripts['package:vsix'], 'node scripts/package-vsix.mjs && npm run vsix:list');
+	assert.equal(main.scripts['verify:vsix'], 'npm run vsix:list && node scripts/verify-vsix.mjs');
+	assert.equal(main.scripts['smoke:vsix'], 'node scripts/smoke-vsix.mjs');
+	for (const script of ['package-vsix.mjs', 'verify-vsix.mjs', 'smoke-vsix.mjs']) {
+		assert.ok(read(`scripts/${script}`).includes('${manifest.version}-preview.vsix'),
+			`${script} must derive its default artifact from the current package version`);
 	}
 	assert.ok(main.files.includes('dist/codespaces-companion.vsix'));
 	assert.ok(!main.files.includes('dist/**'));
