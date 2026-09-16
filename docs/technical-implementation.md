@@ -2,7 +2,7 @@
 
 > **跨设备连接操作说明已取代（2026-09-06，HISTORICAL）。** 下文的 CLI hosting、
 > CLI 登录、手动 Listener/邀请和多开关流程仅保留为历史设计。当前采用
-> [SDK-only 单开关流程](../README.md#cross-device-opt-in)：每台设备原生账号登录后自动发现并认证同账号设备，
+> [SDK-only 单开关流程](./project-guide.md#cross-device-opt-in)：每台设备原生账号登录后自动发现并认证同账号设备，
 > Workspace/任务授权仍独立默认拒绝。关闭仅删除本 Broker 精确拥有的 Tunnel，保留持久身份和策略；
 > 清理失败持久化提示，重启用自动重建/重绑定。既有日期和验证证据不因此扩展到新物理设备、平台或 SLA。
 
@@ -16,7 +16,7 @@
 
 > 状态：0.4.0 Preview Peer Window Delegation 已实现；真实 UI/editor Gate 待显式运行<br>
 > 日期：2026-08-30<br>
-> 依据：[产品需求文档 v0.3](../copilot-agent-mesh-prd.md)<br>
+> 依据：[产品需求文档 v0.3](./product-requirements.md)<br>
 > 首版范围：本机桌面 Workspace；不支持 SSH、WSL、Dev Containers、Codespaces 或 vscode.dev
 
 > 当前实现采用 Mesh protocol v2；v1 Peer 明确不兼容。真实普通窗口 E2E 已通过

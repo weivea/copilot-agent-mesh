@@ -45,7 +45,7 @@ VS Code account selection/sign-in; no Dev Tunnel CLI installation or login is
 required. Same-account device trust does not grant Workspace or task permission.
 Disable deletes only the Broker's exact owned Tunnel, retaining durable identity,
 authentication, policies and task records; failed cleanup remains pending.
-See [the current workflow](../../README.md#cross-device-opt-in).
+See [the current workflow](../project-guide.md#cross-device-opt-in).
 
 Earlier D1/D2 CLI prerequisites and multi-toggle setup are **HISTORICAL /
 SUPERSEDED**. Existing dated gates below retain their original scope; the new
@@ -73,6 +73,10 @@ The package command creates:
 ```text
 artifacts/copilot-agent-mesh-0.5.13-preview.vsix
 artifacts/copilot-agent-mesh-codespaces-0.5.13-preview.vsix
+artifacts/copilot-agent-mesh-0.5.13-preview.vsix.sha256
+artifacts/copilot-agent-mesh-codespaces-0.5.13-preview.vsix.sha256
+artifacts/install.ps1
+artifacts/install.sh
 ```
 
 The production bundle is separate from VSIX creation:
@@ -82,7 +86,8 @@ npm run bundle
 npm run package:vsix
 ```
 
-`package:vsix` invokes `vsce package --pre-release --no-dependencies`, prints
+`package:vsix` uses the `vsce` packaging API with `preRelease: true` and
+`dependencies: false`, runs the existing production prepublish hook, prints
 `vsce ls`, and verifies the ZIP central directory against an exact allowlist.
 Only the production bundle, the two exact Windows process-helper binaries and
 their Go license, media, extension manifest, release documents, project notices,
@@ -107,6 +112,52 @@ On Windows, install the same universal VSIX from PowerShell:
 ```powershell
 code --install-extension ".\artifacts\copilot-agent-mesh-0.5.13-preview.vsix" --force
 ```
+
+## GitHub release installers
+
+`package.json` is the source of the installers' target extension version. After
+successful VSIX creation and allowlist verification, `npm run package:vsix`
+updates the managed version line in `scripts/install.ps1` and `scripts/install.sh`,
+copies them to `artifacts`, and writes a `.vsix.sha256` sidecar for each VSIX.
+Missing/duplicate version markers, nonnumeric VSIX versions, or a mismatched
+companion version fail packaging instead of emitting misleading installers.
+VSIX filenames, verification, and smoke-test defaults derive from the manifest;
+there is no version-bearing filename in the npm commands to update manually.
+
+For each release:
+
+1. Update the root and companion manifest versions together, keep the npm
+   lockfile in sync, and update the release notes.
+2. Run `npm run test:installers` and `npm run package:vsix`. Commit the updated
+   installer version lines along with the release changes.
+3. Create a GitHub release with the exact tag `v<version>` (for example,
+   `v0.5.13`). Mark experimental releases as **Pre-release**. Upload the two
+   matching VSIX files, their two `.vsix.sha256` sidecars, and both installer
+   scripts from `artifacts`. A VSIX without its matching checksum cannot be
+   installed by these scripts.
+4. Make the updated scripts available on `main` when those assets are published.
+   The README bootstrap URLs read `main`; they cannot install an unpublished
+   version. Packaging and CI artifact upload do not create a GitHub release.
+
+The installers use `/releases/download/v<version>/...`, not `/releases/latest`,
+so GitHub Pre-releases work without a stable release. Both platforms install
+the same universal main VSIX; the macOS script does not imply Worker support
+on macOS x64. Checksums detect corruption or mismatched uploads, not a
+compromised publisher. The scripts never enable Proposed API or change account,
+Workspace, task, or operating-system policies.
+
+Users may download and inspect a release's installer before executing it:
+`powershell -File .\install.ps1` on Windows or `bash install.sh` on macOS.
+For a nonstandard installation or Insiders, explicitly select the CLI with
+`.\install.ps1 -CodePath <path-to-code.cmd>` or `bash install.sh <path-to-code>`.
+Otherwise the scripts prefer `code` on PATH and then the usual stable VS Code
+installation directories. Missing CLI commands fail before any download.
+The README one-command bootstrap requires public, unauthenticated GitHub access.
+Managed Windows execution policies remain in force; no bypass is requested.
+Re-run the command for updates; it is not an automatic updater, and `--force`
+can replace a newer manually installed build with the pinned release.
+
+## Installed Preview setup
 
 Local discovery, policy controls, and Mesh tools are enabled by default.
 An existing explicit `experimental.peerDelegation: false` remains an opt-out;

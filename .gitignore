@@ -4,5 +4,8 @@ node_modules
 .vscode-test/
 .mw/
 *.vsix
+artifacts/install.ps1
+artifacts/install.sh
+artifacts/*.vsix.sha256
 artifacts/peer-delegation-e2e/
 artifacts/codespaces-native-chat-*.json

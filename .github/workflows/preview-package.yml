@@ -64,6 +64,10 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: copilot-agent-mesh-preview-${{ runner.os }}-${{ runner.arch }}
-          path: artifacts/*.vsix
+          path: |
+            artifacts/*.vsix
+            artifacts/*.vsix.sha256
+            artifacts/install.ps1
+            artifacts/install.sh
           if-no-files-found: error
           retention-days: 14

@@ -907,7 +907,7 @@ test('0.5.13 enables local peer discovery without enabling real-turn harnesses',
 		].default,
 		true,
 	);
-	assert.match(manifest.scripts['package:vsix'], /copilot-agent-mesh-0\.5\.13-preview\.vsix/u);
+	assert.match(manifest.scripts['package:vsix'], /^node scripts\/package-vsix\.mjs\b/u);
 	assert.doesNotMatch(JSON.stringify(manifest.scripts), /0\.3\.0-preview\.vsix/u);
 	assert.ok(
 		wrapper.indexOf(`process.env[environmentVariable] !== '1'`)
