@@ -7,7 +7,7 @@
 > 状态：0.4.0 P1 已移除 0.3.0 Same-device Multi-project Collaboration；
 > Gate G0 在 macOS arm64 验证范围内 Go<br>
 > 日期：2026-08-30<br>
-> 依据：[PRD v0.3](../copilot-agent-mesh-prd.md) 与 [技术实施方案](./technical-implementation.md)<br>
+> 依据：[PRD v0.3](./product-requirements.md) 与 [技术实施方案](./technical-implementation.md)<br>
 > 兼容性 Gate：[Compatibility Matrix](./compatibility-matrix.md)<br>
 > 计划方式：按技术 Gate 推进，不以未经验证的日历日期承诺
 

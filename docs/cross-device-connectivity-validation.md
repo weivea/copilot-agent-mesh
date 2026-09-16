@@ -15,7 +15,7 @@ Broker starts a private SDK Tunnel and automatically discovers/authenticates
 same-account devices; there is no master/hub or invitation exchange. Remote
 traffic uses outbound private WSS through the target Tunnel's relay; local
 windows use authenticated IPC. Workspace grants, receive and task approval remain
-independent, default-deny gates. See [the current guide](../README.md#cross-device-opt-in).
+independent, default-deny gates. See [the current guide](./project-guide.md#cross-device-opt-in).
 
 **Disable cross-device connections** stops discovery, outbound peers and hosting,
 and deletes only this Broker's exact owned Tunnel. Authentication, durable device

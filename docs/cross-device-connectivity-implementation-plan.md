@@ -2,7 +2,7 @@
 
 > **HISTORICAL / 已取代的操作说明（2026-09-06）**：下文保留 D1/D2 设计与当时证据，
 > 不再作为当前连接配置指引。多开关、CLI 后端/登录、手动 Listener 和邀请步骤已被
-> [SDK-only 单开关流程](../README.md#cross-device-opt-in)取代：每台设备启用同一开关，
+> [SDK-only 单开关流程](./project-guide.md#cross-device-opt-in)取代：每台设备启用同一开关，
 > 使用 VS Code 原生账号选择/登录，自动发现并认证同账号设备；Workspace 授权、接收和任务批准仍独立默认拒绝。
 > 关闭会删除本 Broker 精确拥有的 Tunnel，保留账号、设备密钥、peer 凭据、策略和任务记录；
 > 清理失败持久化并提示重试，重启用自动重建/重绑定。本文没有新增真实物理设备、平台或 SLA 验证。
