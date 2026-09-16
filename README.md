@@ -22,6 +22,23 @@ Use Copilot Chat in **Agent mode**. The six Mesh tools handle discovery,
 delegation, status, input, cancellation, and history; see the
 [tool workflow](./docs/project-guide.md#mesh-tool-workflow).
 
+## Screenshots
+
+Real VS Code captures. Only identifying names, paths, and IDs are masked;
+controls, task actions, and statuses remain visible. Unrelated panes are cropped out.
+
+**Dashboard overview**
+
+![Agent Mesh dashboard with only identifying names masked](./docs/screenshots/dashboard-overview.png)
+
+**Task delegation and live progress in a desktop-attached Codespace**
+
+![Mesh task delegation and readable native Chat progress with private values masked](./docs/screenshots/task-delegation.png)
+
+**Retained Mesh sessions**
+
+![Native Chat session history with readable task titles and statuses and project names masked](./docs/screenshots/retained-sessions.png)
+
 ## Architecture
 
 ```mermaid
