@@ -1,7 +1,7 @@
 # Compatibility Matrix
 
 > Status: 0.5.13 Preview opens Chat drafts without flashing global operation controls<br>
-> Updated: 2026-09-14; earlier live Agent evidence retains its original OS/version scope<br>
+> Updated: 2026-09-20; earlier live Agent evidence retains its original OS/version scope<br>
 > Mesh protocol: v2; v1 peers incompatible
 
 This document is the release gate for external platform compatibility. Installed
@@ -34,7 +34,8 @@ retroactively broaden any of these dated results.
 | Device Broker | One owner, generation-fenced takeover, authenticated local IPC | Exactly one Broker; takeover changed generation in 1878 ms | Pass on tested build |
 | Workspace claims | Canonical identity hash, one claim per physical workspace | Duplicate repo conflict; node loss and same-`workspaceId` reclaim | Pass on tested build |
 | Local routing | Window A → Broker → Window B → real AHP → Broker store → Window A; no Tunnel | Authenticated start/output/cancel passed without touching Tunnel | Pass on tested build |
-| AHP package | TypeScript package `0.9.0` from pinned upstream commit `f19dd8b3942d029744a3bdd31d830f9428e8ea47`; standalone and registry-1.0 editors offer exact `["1.0.0"]`, registry-0.9 editors offer `["1.0.0","0.9.0"]` | VS Code 1.135.0 selected `1.0.0`; VS Code 1.136.1 selected `0.9.0` and completed a real turn with the same generated client | Pass; upstream revision is not yet tagged or npm-published |
+| AHP package | TypeScript package `0.9.0` from pinned upstream commit `f19dd8b3942d029744a3bdd31d830f9428e8ea47`; registry-1.0 Hosts offer exact `["1.0.0"]`; registry-0.9 Hosts and owned Hosts with the native CLI marker `0.1.0` offer `["1.0.0","0.9.0"]` | VS Code 1.135.0 selected `1.0.0`; VS Code 1.136.1 selected `0.9.0` and completed a real turn with the same generated client | Existing live evidence retains its original scope; standalone compatibility update is separately covered below |
+| Standalone AHP compatibility (unreleased) | Explicit standalone and the default owned launcher use the dual offer for registry `0.9.0` and native CLI marker `0.1.0`; no wire-level AHP `0.1.0` support | Production SDK over loopback WebSocket covers `0.9.0`/`1.0.0` handshake selection; deterministic runtime coverage includes output, completion, cancellation, owned cleanup, unoffered-version rejection, and editor fallback under one approval | Offline compatibility coverage only; no authenticated VS Code 1.138.0 standalone model turn claimed |
 | AHP authentication | `https://api.github.com` → provider `github`, scopes `read:user`, `user:email` | Dedicated profile exposed a silent session accepted by Agent Host | Pass on tested profile |
 | Editor Agent Host source (0.4.0 P6) | schema-v2 editor endpoint, known registry metadata `1.0.0` or `0.9.0`, Unix socket WebSocket, registry-derived exact protocol policy, selected-version membership validation, and per-action version guards; standalone fallback | Offline strict parser/socket/selector/lifecycle coverage plus live authenticated editor completions on VS Code 1.135.0 (`1.0.0`) and 1.136.1 (`0.9.0`) | Live execution Pass on both versions; Chat Sessions UI visibility remains Unverified |
 | Editor Session identity/workspace policy | Provider-scoped new Session URI, schema-supported folder isolation, and authoritative snapshot re-reads | VS Code 1.136.1 source compatibility plus offline Runtime/SDK coverage; earlier live execution evidence predates this policy | Real target Chat visibility remains Unverified; no history migration |

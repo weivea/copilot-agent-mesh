@@ -6,6 +6,10 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [Unreleased]
 
+- Let standalone Agent Hosts, including editor fallback, negotiate AHP `0.9.0`
+  when their registry advertises `0.9.0` or the native CLI supervisor marker
+  `0.1.0`. Preserve `1.0.0` support, reject unoffered wire versions, and retain
+  existing task approval, Session policy, and owned cleanup.
 - Isolate transient per-candidate discovery failures, retain explicitly stale
   display-only candidates, and defer incomplete offline metadata while still
   enforcing advertised identities. Keep authentication and binding failures strict.

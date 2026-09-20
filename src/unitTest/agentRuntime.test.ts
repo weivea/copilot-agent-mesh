@@ -1277,12 +1277,12 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 		assert.ok(Buffer.byteLength(title, 'utf8') <= 256);
 	});
 
-	test('runtime requires the Agent Host to select exact protocol 1.0 before Session creation', async () => {
+	test('runtime requires a registry 1.0 Host to select exact protocol 1.0 before Session creation', async () => {
 		assert.deepEqual(AHP_PROTOCOL_OFFER, ['1.0.0']);
 		for (const selectedProtocolVersion of ['0.9.0', '1.1.0']) {
 			const transport = new FakeAhpTransport();
 			transport.selectedProtocolVersion = selectedProtocolVersion;
-			const runtime = createRuntime(new FakeLauncher(), new FakeConnectionFactory([transport]));
+			const runtime = createRuntime(ownedLauncher('1.0.0'), new FakeConnectionFactory([transport]));
 			await assert.rejects(
 				runtime.start(taskRequest()),
 				(error: unknown) => error instanceof AgentRuntimeError
@@ -1295,15 +1295,22 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 		}
 	});
 
-	test('protocol policy preserves exact 1.0 for standalone and registry 1.0 editors', () => {
-		assert.deepEqual(ahpProtocolPolicyForHost({
-			source: 'standalone',
-			registryProtocolVersion: '0.9.0',
-		}).offer, ['1.0.0']);
-		assert.deepEqual(ahpProtocolPolicyForHost({
-			source: 'editor',
-			registryProtocolVersion: '1.0.0',
-		}).offer, ['1.0.0']);
+	test('protocol policy preserves exact 1.0 registries and offers implemented compatibility for 0.9 registries', () => {
+		for (const source of [undefined, 'standalone', 'editor', 'codespace-owned'] as const) {
+			assert.deepEqual(ahpProtocolPolicyForHost({
+				source,
+				registryProtocolVersion: '1.0.0',
+			}).offer, ['1.0.0']);
+			assert.deepEqual(ahpProtocolPolicyForHost({
+				source,
+				registryProtocolVersion: '0.9.0',
+			}).offer, ['1.0.0', '0.9.0']);
+		}
+		for (const source of [undefined, 'standalone'] as const) {
+			for (const registryProtocolVersion of ['0.8.0', '0.9.1', '1.1.0', 'unknown']) {
+				assert.deepEqual(ahpProtocolPolicyForHost({ source, registryProtocolVersion }).offer, ['1.0.0']);
+			}
+		}
 		assert.throws(
 			() => ahpProtocolPolicyForHost({
 				source: 'editor',
@@ -1313,6 +1320,81 @@ test('production runtime initializes, authenticates, resolves config, runs a tur
 				&& error.code === 'AGENT_UNAVAILABLE',
 		);
 	});
+
+for (const source of [undefined, 'standalone'] as const) {
+	for (const registryProtocolVersion of ['0.1.0', '0.9.0']) {
+		for (const terminal of ['completed', 'cancelled'] as const) {
+			test(`standalone ${source ?? 'implicit'} registry ${registryProtocolVersion} negotiates 0.9 with output, ${terminal}, and owned cleanup`, async (t) => {
+				const { isActionKnownToVersion } = await import('@microsoft/agent-host-protocol');
+				const launcher = new FakeLauncher();
+				launcher.host.source = source;
+				launcher.host.registryProtocolVersion = registryProtocolVersion;
+				const transport = new FakeAhpTransport();
+				transport.protocolPolicy = ahpProtocolPolicyForHost(launcher.host);
+				transport.selectedProtocolVersion = '0.9.0';
+				transport.assertActionSupported = (action, version) =>
+					assertOutboundAhpActionSupported(action, version, isActionKnownToVersion);
+				const observations: AgentRuntimeLifecycleObservation[] = [];
+				const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]), undefined, undefined, {
+					observeLifecycle: (event) => observations.push(event),
+				});
+				t.after(() => runtime.dispose());
+				const handle = await runtime.start(taskRequest());
+				assert.deepEqual(transport.protocolPolicy.offer, ['1.0.0', '0.9.0']);
+				assert.equal(transport.createSessionCalls, 1);
+				assert.match(handle.recovery.sessionUri, /^ahp-session:\//u);
+				assert.deepEqual(transport.created?.workingDirectories, [workspaceUri]);
+				assert.deepEqual(transport.created?.config, { model: 'test-model' });
+				assert.equal(observations[0]?.eventType, 'protocol/negotiated');
+				assert.deepEqual(observations[0], {
+					taskId: 'task-1',
+					eventType: 'protocol/negotiated',
+					source: 'standalone',
+					protocolOffer: ['1.0.0', '0.9.0'],
+					selectedProtocolVersion: '0.9.0',
+				});
+				await transport.emitChat({
+					type: 'chat/delta', turnId: currentTurnId(transport), partId: 'part-1', content: 'Standalone output',
+				});
+				if (terminal === 'cancelled') {
+					await handle.cancel();
+				} else {
+					await transport.emitChat({
+						type: 'chat/turnComplete', turnId: currentTurnId(transport), duration: 1,
+					});
+				}
+				const events: AgentRuntimeEvent[] = [];
+				for await (const event of handle.events) { events.push(event); }
+				assert.deepEqual(events.filter((event) => event.type === 'output'), [{ type: 'output', text: 'Standalone output' }]);
+				assert.equal(events.at(-1)?.type, terminal);
+				await handle.dispose();
+				assert.equal(transport.disposeSessionCalls, 1);
+				assert.equal(transport.shutdownCalls, 1);
+				assert.equal(launcher.host.disposeCalls, 1);
+			});
+		}
+		test(`standalone ${source ?? 'implicit'} registry ${registryProtocolVersion} rejects unoffered wire versions before Session creation`, async (t) => {
+			for (const selectedProtocolVersion of ['0.1.0', '0.8.0', '0.9.1', '1.1.0', 'unknown']) {
+				const launcher = new FakeLauncher();
+				launcher.host.source = source;
+				launcher.host.registryProtocolVersion = registryProtocolVersion;
+				const transport = new FakeAhpTransport();
+				transport.protocolPolicy = ahpProtocolPolicyForHost(launcher.host);
+				transport.selectedProtocolVersion = selectedProtocolVersion;
+				const runtime = createRuntime(launcher, new FakeConnectionFactory([transport]));
+				t.after(() => runtime.dispose());
+				await assert.rejects(runtime.start(taskRequest()), {
+					code: 'AGENT_UNAVAILABLE',
+					message: 'The Agent Host selected an incompatible protocol version.',
+				});
+				assert.equal(transport.createSessionCalls, 0);
+				assert.equal(transport.dispatched.length, 0);
+				assert.equal(transport.shutdownCalls, 1);
+				assert.equal(launcher.host.disposed, true);
+			}
+		});
+	}
+}
 
 	test('registry 0.9 editor completes the current Session and turn path with the dual offer', async () => {
 		const transport = new FakeAhpTransport();
@@ -1834,6 +1916,36 @@ for (const outcome of ['valid', 'wrong-workspace', 'cleanup-retry'] as const) {
 		await handle.dispose();
 		await selector.dispose();
 	});
+
+test('editor failure falls back to a standalone 0.9 Host under the same task approval', async (t) => {
+	const capabilities = new AgentRuntimeApprovalCapabilityIssuer();
+	let confirmations = 0;
+	const approval: FirstTaskConfirmation = {
+		confirm: async () => { confirmations += 1; return 'once'; },
+	};
+	const launcher = new FakeLauncher();
+	const transport = new FakeAhpTransport();
+	transport.protocolPolicy = ahpProtocolPolicyForHost(launcher.host);
+	transport.selectedProtocolVersion = '0.9.0';
+	transport.completeAfterTurnDispatch = true;
+	const selector = new AgentHostSourceSelector({
+		preferEditor: () => true,
+		editor: sourceRuntime(new FailingLauncher(), new FakeConnectionFactory([]), approval, capabilities),
+		standalone: sourceRuntime(launcher, new FakeConnectionFactory([transport]), approval, capabilities),
+		confirmation: approval,
+		workspaceResolver: trustedWorkspaceResolver(),
+		approvalCapabilities: capabilities,
+	});
+	t.after(() => selector.dispose());
+	const handle = await selector.start(taskRequest());
+	await completeAndDetach(handle);
+	assert.equal(confirmations, 1);
+	assert.equal(launcher.launchCalls, 1);
+	assert.equal(transport.createSessionCalls, 1);
+	assert.equal(selector.sourceStatus().source, 'standalone');
+	assert.equal(selector.sourceStatus().degraded, true);
+	assert.equal(launcher.host.disposed, true);
+});
 
 test('AHP token streaming preserves a small Chinese response until a slow consumer catches up', async () => {
 	const transport = new FakeAhpTransport();
@@ -4253,10 +4365,12 @@ for (const [registryVersion, selectedVersion] of [
 	});
 }
 
-test('the native supervisor marker permits negotiation only for owned Codespaces and never enables AHP 0.1', async (t) => {
+test('the native supervisor marker permits negotiation for owned Hosts but never for editors or AHP 0.1', async (t) => {
 	assert.throws(() => ahpProtocolPolicyForHost({ source: 'editor', registryProtocolVersion: '0.1.0' }),
 		{ code: 'AGENT_UNAVAILABLE' });
-	assert.deepEqual(ahpProtocolPolicyForHost({ source: 'standalone', registryProtocolVersion: '0.1.0' }).offer, ['1.0.0']);
+	for (const source of [undefined, 'standalone', 'codespace-owned'] as const) {
+		assert.deepEqual(ahpProtocolPolicyForHost({ source, registryProtocolVersion: '0.1.0' }).offer, ['1.0.0', '0.9.0']);
+	}
 	for (const selectedProtocolVersion of ['0.1.0', '0.8.0', '1.1.0']) {
 		const launcher = ownedLauncher('0.1.0');
 		const transport = new FakeAhpTransport();

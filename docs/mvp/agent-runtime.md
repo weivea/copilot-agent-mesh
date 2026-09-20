@@ -2,10 +2,20 @@
 
 The MVP runtime is a production adapter over the TypeScript 0.9.0 client built
 from pinned `microsoft-agent-host-protocol` commit
-`f19dd8b3942d029744a3bdd31d830f9428e8ea47`; it offers exactly `["1.0.0"]`
-and negotiates AHP 1.0.0 with
-VS Code 1.135.0 and does not use the Fake Agent. Fake AHP connections are limited
-to deterministic tests.
+`f19dd8b3942d029744a3bdd31d830f9428e8ea47`. Registry `1.0.0` Hosts receive
+the exact offer `["1.0.0"]`; registry `0.9.0` Hosts receive
+`["1.0.0","0.9.0"]`. Standalone (including the default owned launcher and
+editor fallback) and Codespace-owned Hosts also use the dual offer for the
+native CLI supervisor's fixed registry marker `0.1.0`. That marker is not a
+wire protocol offer: the selected version must be one of the offered versions,
+and outbound actions remain guarded by the selected version. Editor discovery
+still rejects registry `0.1.0`; unknown standalone registry versions retain
+the legacy `1.0.0`-only offer rather than enabling arbitrary wire versions.
+
+The runtime negotiated AHP `1.0.0` with VS Code 1.135.0 and editor AHP `0.9.0`
+with VS Code 1.136.1. The standalone compatibility update has deterministic
+runtime and production-SDK loopback coverage, not an authenticated VS Code
+1.138.0 model-turn claim. Fake AHP connections are limited to tests.
 
 ## Authorize and invoke
 
@@ -25,7 +35,7 @@ The first-task safety decision is an injected `FirstTaskConfirmation`. The VS Co
 
 When the default-off Peer Delegation Preview is enabled, the target Window Node
 first derives the current product's user-data directory and strictly discovers one
-live schema-v2 `editor` Unix-socket endpoint at AHP `1.0.0`. Each delegated task
+live schema-v2 `editor` Unix-socket endpoint at AHP `1.0.0` or `0.9.0`. Each delegated task
 uses its own `net.connect` + authenticated WebSocket Upgrade + AHP client. Discovery,
 connection, initialize, or protocol failure falls back to the existing standalone
 launcher exactly once and exposes `standalone` plus a bounded degradation reason.
@@ -67,7 +77,8 @@ E2E-only; ordinary production tasks do not inherit it.
 Fallback is forbidden when cleanup of the failed editor attempt is unconfirmed;
 starting standalone in that state could overlap resources or execution. Selector
 disposal retains failed cleanup for an explicit retry.
-With Peer Delegation disabled, the historical standalone behavior is unchanged.
+With Peer Delegation disabled, tasks use standalone directly with the same
+registry-derived protocol policy as fallback.
 After an editor connection has initialized, authentication, configuration, title,
 or task-start failures do not fall back. Source status records the editor as the
 selected source plus a bounded failure code/message, rather than retaining an
