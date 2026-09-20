@@ -158,12 +158,12 @@ export interface AhpProtocolPolicy {
 export function ahpProtocolPolicyForHost(
 	host: Pick<LaunchedAgentHost, 'registryProtocolVersion' | 'source'>,
 ): AhpProtocolPolicy {
-	if (host.source === 'codespace-owned' && host.registryProtocolVersion === '0.1.0') {
+	if (host.source !== 'editor' && host.registryProtocolVersion === '0.1.0') {
 		// The native CLI supervisor publishes this fixed registry marker independently of its backend.
 		// Negotiate only implemented wire versions; this does not enable AHP 0.1.
 		return { offer: AHP_RETAINED_0_9_PROTOCOL_OFFER };
 	}
-	if (!usesFolderSessionPolicy(host.source)) {
+	if (!usesFolderSessionPolicy(host.source) && host.registryProtocolVersion !== '0.9.0') {
 		return { offer: AHP_PROTOCOL_OFFER };
 	}
 	switch (host.registryProtocolVersion) {
