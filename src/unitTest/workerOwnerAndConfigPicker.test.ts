@@ -1,5 +1,5 @@
 import * as assert from 'node:assert/strict';
-import { mkdtemp, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, test } from 'node:test';
@@ -433,7 +433,7 @@ test('heartbeat rejects a replacement generation even when owner identity matche
 	await owner.dispose();
 });
 
-test('orphaned takeover mutex fails closed instead of being stolen', async () => {
+test('an expired takeover from an exited process recovers only after winning ownerless publication', async () => {
 	const root = await makeDirectory();
 	const now = Date.parse('2026-08-25T00:00:01.000Z');
 	await writeFile(join(root, 'worker-owner.takeover'), JSON.stringify({
@@ -452,7 +452,177 @@ test('orphaned takeover mutex fails closed instead of being stolen', async () =>
 		heartbeatMs: 60_000,
 		pidAlive: () => false,
 	});
+	assert.equal(contender.isOwner(), true);
+	assert.equal(contender.snapshot().takeoverBlocked, undefined);
+	await contender.assertOwner();
+	await assert.rejects(readFile(join(root, 'worker-owner.takeover')), /ENOENT/u);
+	await contender.dispose();
+});
+
+test('concurrent orphan recovery elects exactly one owner and losers cannot release it', async () => {
+	const root = await makeDirectory();
+	const now = Date.now();
+	await writeFile(join(root, 'worker-owner.takeover'), JSON.stringify({
+		schemaVersion: 1, pid: 999, instanceId: 'crashed', token: 'orphan',
+		createdAt: new Date(now - 60_000).toISOString(),
+	}));
+	let candidates = 0;
+	const ready = deferred<void>();
+	const publish = deferred<void>();
+	const acquisitions = [101, 202].map((pid) => WorkerOwnerLock.acquire(root, {
+		pid, instanceId: `window-${pid}`, now: () => now,
+		pidAlive: (candidate) => candidate !== 999,
+		heartbeatMs: 60_000,
+		onOwnerCandidateReady: async () => {
+			if (++candidates === 2) { ready.resolve(undefined); }
+			await publish.promise;
+		},
+	}));
+	await ready.promise;
+	publish.resolve(undefined);
+	const locks = await Promise.all(acquisitions);
+	assert.equal(locks.filter((lock) => lock.isOwner()).length, 1);
+	const owner = locks.find((lock) => lock.isOwner())!;
+	await locks.find((lock) => !lock.isOwner())!.dispose();
+	await owner.assertOwner();
+	await assert.rejects(readFile(join(root, 'worker-owner.takeover')), /ENOENT/u);
+	await owner.dispose();
+});
+
+for (const scenario of ['live', 'recent', 'future', 'malformed', 'invalid-pid', 'existing-owner', 'incomplete-owner'] as const) {
+	test(`orphan recovery preserves a ${scenario} lock without guessing authority`, async () => {
+		const root = await makeDirectory();
+		const now = Date.now();
+		const takeoverPath = join(root, 'worker-owner.takeover');
+		const createdAt = new Date(now + (scenario === 'future' ? 60_000 : scenario === 'recent' ? 0 : -60_000)).toISOString();
+		const text = scenario === 'malformed' ? '{' : JSON.stringify({
+			schemaVersion: 1, pid: scenario === 'invalid-pid' ? -1 : 999,
+			instanceId: 'previous-window', token: 'previous-token', createdAt,
+		});
+		await writeFile(takeoverPath, text);
+		if (scenario === 'existing-owner') {
+			await writeOwnerRecord(root, {
+				pid: 404, instanceId: 'owner', token: 'owner-token', generation: 'owner-generation',
+				at: new Date(now - 60_000).toISOString(),
+			});
+		}
+		if (scenario === 'incomplete-owner') { await writeFile(join(root, 'worker-owner.lock'), '{'); }
+		const contender = await WorkerOwnerLock.acquire(root, {
+			pid: 202, now: () => now, heartbeatMs: 60_000,
+			pidAlive: (pid) => scenario === 'live' && pid === 999,
+		});
+		assert.equal(contender.isOwner(), false);
+		assert.equal(contender.snapshot().takeoverBlocked, true);
+		await contender.contend();
+		assert.equal(contender.isOwner(), false);
+		await contender.dispose();
+		assert.equal(await readFile(takeoverPath, 'utf8'), text);
+	});
+}
+
+test('orphan recovery rechecks the mutex inode and record before publishing an owner', async () => {
+	for (const sameContents of [false, true]) {
+		const root = await makeDirectory();
+		const takeoverPath = join(root, 'worker-owner.takeover');
+		const old = JSON.stringify({
+			schemaVersion: 1, pid: 999, instanceId: 'dead', token: 'old',
+			createdAt: new Date(Date.now() - 60_000).toISOString(),
+		});
+		const replacement = sameContents ? old : JSON.stringify({
+			schemaVersion: 1, pid: 777, instanceId: 'live', token: 'new',
+			createdAt: new Date().toISOString(),
+		});
+		await writeFile(takeoverPath, old);
+		const contender = await WorkerOwnerLock.acquire(root, {
+			pid: 202, pidAlive: (pid) => pid === 777,
+			onOwnerCandidateReady: async () => {
+				const replacementPath = join(root, 'replacement-mutex');
+				await writeFile(replacementPath, replacement);
+				await rename(replacementPath, takeoverPath);
+			},
+		});
+		assert.equal(contender.isOwner(), false);
+		await assert.rejects(readFile(join(root, 'worker-owner.lock')), /ENOENT/u);
+		await contender.dispose();
+		assert.equal(await readFile(takeoverPath, 'utf8'), replacement);
+	}
+});
+
+test('a new owner appearing during orphan recovery is never replaced', async () => {
+	const root = await makeDirectory();
+	const takeoverPath = join(root, 'worker-owner.takeover');
+	await writeFile(takeoverPath, JSON.stringify({
+		schemaVersion: 1, pid: 999, instanceId: 'dead', token: 'old',
+		createdAt: new Date(Date.now() - 60_000).toISOString(),
+	}));
+	const contender = await WorkerOwnerLock.acquire(root, {
+		pid: 202, pidAlive: () => false,
+		onOwnerCandidateReady: () => writeOwnerRecord(root, {
+			pid: 303, instanceId: 'new-owner', token: 'new-token', generation: 'new-generation',
+			at: new Date().toISOString(),
+		}),
+	});
 	assert.equal(contender.isOwner(), false);
+	await contender.dispose();
+	assert.equal(JSON.parse(await readFile(join(root, 'worker-owner.lock'), 'utf8')).token, 'new-token');
+	assert.equal(JSON.parse(await readFile(takeoverPath, 'utf8')).token, 'old');
+});
+
+test('failed recovery preparation leaves the original mutex and no published owner', async () => {
+	const root = await makeDirectory();
+	const takeoverPath = join(root, 'worker-owner.takeover');
+	const original = JSON.stringify({
+		schemaVersion: 1, pid: 999, instanceId: 'dead', token: 'old',
+		createdAt: new Date(Date.now() - 60_000).toISOString(),
+	});
+	await writeFile(takeoverPath, original);
+	await assert.rejects(WorkerOwnerLock.acquire(root, {
+		pid: 202, pidAlive: () => false,
+		onOwnerCandidateReady: async () => { throw new Error('Recovery write failed.'); },
+	}), /Recovery write failed/u);
+	assert.equal(await readFile(takeoverPath, 'utf8'), original);
+	await assert.rejects(readFile(join(root, 'worker-owner.lock')), /ENOENT/u);
+});
+
+test('orphan cleanup never removes a mutex created after its atomic claim', async () => {
+	const root = await makeDirectory();
+	const takeoverPath = join(root, 'worker-owner.takeover');
+	await writeFile(takeoverPath, JSON.stringify({
+		schemaVersion: 1, pid: 999, instanceId: 'dead', token: 'old',
+		createdAt: new Date(Date.now() - 60_000).toISOString(),
+	}));
+	const replacement = JSON.stringify({
+		schemaVersion: 1, pid: 303, instanceId: 'live', token: 'replacement',
+		createdAt: new Date().toISOString(),
+	});
+	const contender = await WorkerOwnerLock.acquire(root, {
+		pid: 202, pidAlive: (pid) => pid !== 999,
+		onTakeoverMutexReleaseClaimed: () => writeFile(takeoverPath, replacement),
+	});
+	assert.equal(contender.isOwner(), true);
+	assert.equal(await readFile(takeoverPath, 'utf8'), replacement);
+	await contender.dispose();
+	assert.equal(await readFile(takeoverPath, 'utf8'), replacement);
+});
+
+test('a recovered mutex that changes before deletion is restored and provisional ownership is released', async () => {
+	const root = await makeDirectory();
+	const takeoverPath = join(root, 'worker-owner.takeover');
+	await writeFile(takeoverPath, JSON.stringify({
+		schemaVersion: 1, pid: 999, instanceId: 'dead', token: 'old',
+		createdAt: new Date(Date.now() - 60_000).toISOString(),
+	}));
+	const contender = await WorkerOwnerLock.acquire(root, {
+		pid: 202, pidAlive: () => false,
+		onTakeoverMutexReleaseClaimed: async () => {
+			const claimed = (await readdir(root)).find((file) => file.startsWith('worker-owner.takeover.release-'));
+			assert.ok(claimed);
+			await writeFile(join(root, claimed), '{');
+		},
+	});
+	assert.equal(contender.isOwner(), false);
+	assert.equal(contender.snapshot().takeoverBlocked, true);
+	assert.equal(await readFile(takeoverPath, 'utf8'), '{');
 	await assert.rejects(readFile(join(root, 'worker-owner.lock')), /ENOENT/u);
 	await contender.dispose();
 });

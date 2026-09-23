@@ -114,8 +114,11 @@ recovery; `canStart` does not hide a recorded failure.
    VS Code mapping. For editor, reuse the host's existing identity without an
    initial `authenticate` request. Then resolve Session configuration, create the
    Session with the registered workspace URI, and apply its snapshot.
-6. Wait for `defaultChat`, subscribe to the Chat, then dispatch only the supplied
-   prompt plus acceptance criteria. AHP 1.0 providers may keep a provisional
+6. Wait for `defaultChat`, subscribe to the Chat, then dispatch the supplied
+   prompt plus acceptance criteria. Production Mesh tools already include the
+   packaged `mesh-execute` guidance in that prompt before identity/approval
+   binding; this runtime neither reparses a slash command nor appends a second
+   copy. AHP 1.0 providers may keep a provisional
    Session in `creating` until that first turn materializes it, so startup must
    not wait for `session/ready` before dispatch.
 7. Map bounded Chat output/reasoning, tool lifecycle and confirmation, elicited input, MCP authentication, Terminal summaries, and authoritative completion/cancellation/error actions to Mesh-neutral events.

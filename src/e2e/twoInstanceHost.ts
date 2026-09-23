@@ -41,6 +41,8 @@ export async function run(): Promise<void> {
 		throw new Error('The Copilot Agent Mesh development extension is unavailable.');
 	}
 	const api = await extension.activate();
+	await api.ready;
+	await api.node.start();
 	if (api.twoDeviceE2e === undefined) {
 		throw new Error('The gated two-device E2E API was not activated.');
 	}

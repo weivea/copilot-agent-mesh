@@ -85,7 +85,7 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 	private connectionContextUpdate: Promise<void> | undefined;
 
 	public constructor(
-		private readonly facade: DashboardFacade = new UnavailableDashboardFacade(),
+		private facade: DashboardFacade = new UnavailableDashboardFacade(),
 		extensionUri?: vscode.Uri,
 		private readonly setConnectionContext: (enabled: boolean) => Thenable<unknown> = (enabled) =>
 			vscode.commands.executeCommand('setContext', DASHBOARD_CONNECTIONS_CONTEXT, enabled),
@@ -146,6 +146,14 @@ export class AgentMeshViewProvider implements vscode.WebviewViewProvider, vscode
 		for (const instance of this.instances.values()) {
 			void this.publish(instance);
 		}
+	}
+
+	public setFacade(facade: DashboardFacade): void {
+		this.facade = facade;
+		for (const instance of this.instances.values()) {
+			instance.subscriptions.push(facade.onDidChange(() => { void this.publish(instance); }));
+		}
+		this.refresh();
 	}
 
 	public dispose(): void {

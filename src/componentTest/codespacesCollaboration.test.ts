@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { test, type TestContext } from 'node:test';
 import { z } from 'zod';
@@ -29,11 +29,14 @@ import { FileTaskStore } from '../tasks/FileTaskStore';
 import { WorkspaceLeaseManager } from '../tasks/WorkspaceLeaseManager';
 import { LocalBrokerTaskFacade } from '../tools/LocalBrokerTaskFacade';
 import { TaskToolsCore } from '../tools/taskToolsCore';
+import { buildMeshExecutionPrompt, loadMeshExecutionInstructions } from '../skills/MeshSkills';
 import { MemoryAtomicFileSystem, TestOwnership } from '../unitTest/artifactStoreTestSupport';
 import { NodeFileIdentityResolver } from '../workspaces/NodeFileIdentityResolver';
 import { AgentHostLauncher } from '../agentHost/AgentHostLauncher';
 import { NativeChatControlRegistry, NativeChatExecution } from '../codespaces/nativeChat/NativeChatExecution';
 import { NativeChatStore } from '../codespaces/nativeChat/NativeChatStore';
+
+const executionInstructions = loadMeshExecutionInstructions(resolve(__dirname, '..', '..', '..'));
 
 const directorySchema = z.object({
 	status: z.literal('ok'),
@@ -67,10 +70,16 @@ test('six existing tools collaborate through the real Broker, Codespaces bridge 
 	await waitFor(() => f.remote.handles.has(taskId));
 	const handle = f.remote.handles.get(taskId)!;
 	assert.equal(f.remote.requests[0].executionBackend, 'codespace-owned');
+	assert.equal(f.remote.requests[0].prompt, buildMeshExecutionPrompt(request.prompt, executionInstructions));
 	assert.equal(f.remote.requests[0].requireEditor, undefined);
 	assert.equal((await f.sourceTools.delegateTask(request)).t, taskId);
 	assert.equal(f.remote.requests.length, 1);
 	assert.equal((await f.sourceTools.delegateTask({ ...request, prompt: 'Different request.' })).e, 'IDEMPOTENCY_CONFLICT');
+	const changedSkill = new TaskToolsCore(f.sourceFacade, {
+		executionInstructions: `${executionInstructions}\nDifferent execution guidance.`,
+	});
+	assert.equal((await changedSkill.delegateTask(request)).e, 'IDEMPOTENCY_CONFLICT');
+	assert.equal(f.remote.requests.length, 1, 'Changing guidance must not restart an accepted task.');
 	const running = z.object({ tasks: z.array(z.object({ taskId: z.string() })) }).parse(await f.sourceTools.listTasks({}));
 	assert.ok(running.tasks.some((task) => task.taskId === taskId));
 	await handle.events.push({
@@ -101,6 +110,7 @@ test('six existing tools collaborate through the real Broker, Codespaces bridge 
 		sessionUri: handle.recovery.sessionUri, chatUri: handle.recovery.chatUri,
 	});
 	assert.equal(f.remote.requests[1].requireEditor, undefined);
+	assert.equal(f.remote.requests[1].prompt, buildMeshExecutionPrompt('Continue the same session.', executionInstructions));
 	await waitFor(() => f.remoteStarted.has(nextId));
 	assert.equal((await f.sourceTools.cancelTask({ taskId: nextId })).status, 'ok');
 	const cancelled = taskReadSchema.parse(await f.sourceTools.getTask({ taskId: nextId, waitFor: 'outcome', waitSeconds: 5 }));
@@ -181,6 +191,7 @@ test('a Codespaces window uses the unchanged tools to delegate back to a desktop
 	await handle.events.push({ type: 'completed' });
 	assert.equal((await waiting).s, 0);
 	assert.equal(f.local.requests[0].executionBackend, undefined);
+	assert.equal(f.local.requests[0].prompt, buildMeshExecutionPrompt('Run in the desktop workspace.', executionInstructions));
 	assert.equal(f.remote.requests.length, 0);
 	assert.equal(f.errors.length, 0);
 });
@@ -563,7 +574,9 @@ async function fixture(t: TestContext, options: { outputDelayMs?: number; produc
 	cleanups.push(async () => { sourceFacade.dispose(); targetFacade.dispose(); });
 	return {
 		source, target, remote, local, errors, brokerStarts: 1, nativeStore, nativeControls, remoteStarted,
-		sourceTools: new TaskToolsCore(sourceFacade), targetTools: new TaskToolsCore(targetFacade),
+		sourceFacade,
+		sourceTools: new TaskToolsCore(sourceFacade, { executionInstructions }),
+		targetTools: new TaskToolsCore(targetFacade, { executionInstructions }),
 		authorizeBothDirections: async () => {
 			await source.setPeerPolicy({
 				workspaceIdentity: sourceSelection.workspaceIdentity,

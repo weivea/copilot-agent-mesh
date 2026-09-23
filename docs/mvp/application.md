@@ -4,6 +4,14 @@
 entry point creates one `Application`; asynchronous deactivation awaits
 `Application.dispose()`. Activation does not install a simulated worker or spike tool.
 
+The Dashboard provider and its refresh command register before asynchronous
+backend initialization. Activation returns an API with a `ready` promise;
+consumers await that promise before accessing backend services, and await
+`api.node.start()` separately if they require the first registered connection.
+Pending/failed initialization shows a read-only startup diagnostic. Once the
+backend is ready, the same view switches to the production facade. Deactivation
+cancels pending shared-identity waits and still awaits owned resource cleanup.
+
 ## Production graph
 
 The application creates:
@@ -48,7 +56,12 @@ The mutable Mesh application is exclusive across VS Code windows that share the 
 `globalStorageUri`. Activation acquires an atomic owner lock containing a process ID, instance
 ID, generation, token, and heartbeat. A stale takeover first acquires a separate `O_EXCL`
 mutex, then re-reads the exact observed generation/token before replacing it. Concurrent
-contenders remain passive, and an orphaned takeover mutex fails closed. Owner records are fully
+contenders remain passive. An orphaned takeover mutex is recoverable only if its
+valid record is older than the ownership TTL, its holder PID is confirmed exited,
+and the owner file is absent. One contender first wins no-replace owner
+publication, rechecks the exact mutex inode and record, then removes only that
+orphan. Existing owner files (including incomplete ones), live/unknown PIDs and
+ambiguous mutexes remain protected with `BROKER_TAKEOVER_BLOCKED`. Owner records are fully
 written and synced through a private candidate inode before a no-replace hard link publishes
 them, so readers never observe a partially initialized record. Every non-crash mutex exit removes
 only its own on-disk token. Takeover also requires both an expired heartbeat and a dead owner

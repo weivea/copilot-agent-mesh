@@ -44,6 +44,7 @@ export interface WorkerOwnershipSnapshot {
 	readonly holderInstanceId?: string;
 	readonly acquiredAt?: string;
 	readonly heartbeatAt?: string;
+	readonly takeoverBlocked?: boolean;
 }
 
 export interface WorkerOwnership {
@@ -87,6 +88,7 @@ export class WorkerOwnerLock implements BrokerOwnership {
 	private disposed = false;
 	private disposeComplete = false;
 	private lockReleased = false;
+	private takeoverBlocked = false;
 
 	private constructor(
 		private readonly path: string,
@@ -124,7 +126,16 @@ export class WorkerOwnerLock implements BrokerOwnership {
 			options.onTakeoverMutexOpened,
 		);
 		await mkdir(rootDirectory, { recursive: true });
-		await lock.tryAcquire();
+		try {
+			await lock.tryAcquire();
+		} catch (error) {
+			try {
+				await lock.dispose();
+			} catch (cleanupError) {
+				throw new AggregateError([error, cleanupError], 'Broker acquisition failed and cleanup is incomplete.');
+			}
+			throw error;
+		}
 		return lock;
 	}
 
@@ -146,6 +157,7 @@ export class WorkerOwnerLock implements BrokerOwnership {
 			holderInstanceId: record?.instanceId,
 			acquiredAt: record?.acquiredAt,
 			heartbeatAt: record?.heartbeatAt,
+			...(this.takeoverBlocked ? { takeoverBlocked: true } : {}),
 		};
 	}
 
@@ -330,7 +342,7 @@ export class WorkerOwnerLock implements BrokerOwnership {
 		}
 	}
 
-	private async createOwnerFile(): Promise<boolean> {
+	private async createOwnerFile(beforePublish?: () => Promise<boolean>): Promise<boolean> {
 		if (this.disposed) {
 			return false;
 		}
@@ -352,6 +364,9 @@ export class WorkerOwnerLock implements BrokerOwnership {
 			await writeRecord(handle, record);
 			await this.onOwnerCandidateReady?.();
 			if (this.disposed) {
+				return false;
+			}
+			if (beforePublish !== undefined && !await beforePublish()) {
 				return false;
 			}
 			try {
@@ -382,12 +397,15 @@ export class WorkerOwnerLock implements BrokerOwnership {
 	}
 
 	private async tryAcquireWithMutex(observed: WorkerOwnerRecord | undefined): Promise<void> {
+		this.takeoverBlocked = false;
 		let mutex: FileHandle | undefined;
 		try {
 			mutex = await open(this.takeoverPath, 'wx+', 0o600);
 		} catch (error) {
 			if (hasCode(error, 'EEXIST')) {
 				this.holder = observed;
+				this.takeoverBlocked = true;
+				await this.recoverOwnerlessTakeover();
 				return;
 			}
 			throw error;
@@ -433,6 +451,60 @@ export class WorkerOwnerLock implements BrokerOwnership {
 		if (failures.length > 1) {
 			throw new AggregateError(failures, 'Broker takeover operation failed.');
 		}
+	}
+
+	private async recoverOwnerlessTakeover(): Promise<void> {
+		const stale = await readTakeoverSnapshot(this.takeoverPath);
+		if (stale?.record === undefined || !this.isRecoverableTakeover(stale.record)) {
+			return;
+		}
+		const record = stale.record;
+		try {
+			await statFile(this.path);
+			return;
+		} catch (error) {
+			if (!hasCode(error, 'ENOENT')) { throw error; }
+		}
+		const stillRecoverable = async (): Promise<boolean> => {
+			const current = await readTakeoverSnapshot(this.takeoverPath);
+			return sameTakeoverSnapshot(stale, current)
+				&& this.isRecoverableTakeover(record);
+		};
+		// Publish without replacement before touching the orphan mutex: only one
+		// recovering contender may clean it, and any existing owner blocks recovery.
+		if (!await this.createOwnerFile(stillRecoverable)) {
+			this.holder = await readRecordIfPresent(this.path);
+			return;
+		}
+		let recovered = false;
+		try {
+			if (await stillRecoverable()) {
+				recovered = await releaseTakeoverMutex(
+					this.takeoverPath, record, stale.identity, this.onTakeoverMutexReleaseClaimed, false,
+				);
+			}
+			if (recovered) {
+				this.takeoverBlocked = false;
+			}
+		} finally {
+			if (!recovered) {
+				const current = await readRecordIfPresent(this.path);
+				if (current?.token === this.token && current.generation === this.record?.generation) {
+					await unlinkIfPresent(this.path);
+				}
+				await this.loseOwnership();
+				this.holder = await readRecordIfPresent(this.path);
+			}
+		}
+	}
+
+	private isRecoverableTakeover(record: TakeoverRecord): boolean {
+		const created = Date.parse(record.createdAt);
+		return Number.isSafeInteger(record.pid) && record.pid > 0
+			&& record.pid <= 0x7fff_ffff
+			&& record.token.length > 0 && record.instanceId.length > 0
+			&& Number.isFinite(created) && this.now() - created > this.ttlMs
+			&& !this.pidAlive(record.pid);
 	}
 
 	private async contendWithMutex(
@@ -600,13 +672,14 @@ async function releaseTakeoverMutex(
 	expected: TakeoverRecord,
 	expectedIdentity: FileIdentity,
 	onClaimed?: () => Promise<void>,
-): Promise<void> {
+	allowIncompleteRecord = true,
+): Promise<boolean> {
 	const claimedPath = `${path}.release-${randomUUID()}`;
 	try {
 		await rename(path, claimedPath);
 	} catch (error) {
 		if (hasCode(error, 'ENOENT')) {
-			return;
+			return false;
 		}
 		throw error;
 	}
@@ -616,10 +689,12 @@ async function releaseTakeoverMutex(
 	const sameInode = claimedStats.device === expectedIdentity.device
 		&& claimedStats.inode === expectedIdentity.inode;
 	const matchingToken = claimed?.token === expected.token
-		&& claimed.instanceId === expected.instanceId;
-	if (sameInode && (claimed === undefined || matchingToken)) {
+		&& claimed.instanceId === expected.instanceId
+		&& claimed.pid === expected.pid
+		&& claimed.createdAt === expected.createdAt;
+	if (sameInode && ((allowIncompleteRecord && claimed === undefined) || matchingToken)) {
 		await unlinkIfPresent(claimedPath);
-		return;
+		return true;
 	}
 	try {
 		await link(claimedPath, path);
@@ -629,11 +704,47 @@ async function releaseTakeoverMutex(
 			throw error;
 		}
 	}
+	return false;
 }
 
 interface FileIdentity {
 	readonly device: number;
 	readonly inode: number;
+}
+
+interface TakeoverSnapshot {
+	readonly identity: FileIdentity;
+	readonly record: TakeoverRecord | undefined;
+}
+
+async function readTakeoverSnapshot(path: string): Promise<TakeoverSnapshot | undefined> {
+	let handle: FileHandle;
+	try {
+		handle = await open(path, 'r');
+	} catch (error) {
+		if (hasCode(error, 'ENOENT')) { return undefined; }
+		throw error;
+	}
+	try {
+		const stats = await handle.stat();
+		const identity = { device: stats.dev, inode: stats.ino };
+		if (!stats.isFile() || stats.size > 16 * 1_024) {
+			return { identity, record: undefined };
+		}
+		return { identity, record: parseTakeoverRecord(await handle.readFile('utf8')) };
+	} finally {
+		await handle.close();
+	}
+}
+
+function sameTakeoverSnapshot(expected: TakeoverSnapshot, current: TakeoverSnapshot | undefined): boolean {
+	return current?.record !== undefined && expected.record !== undefined
+		&& current.identity.device === expected.identity.device
+		&& current.identity.inode === expected.identity.inode
+		&& current.record.pid === expected.record.pid
+		&& current.record.instanceId === expected.record.instanceId
+		&& current.record.token === expected.record.token
+		&& current.record.createdAt === expected.record.createdAt;
 }
 
 async function statFile(path: string): Promise<FileIdentity> {
@@ -647,9 +758,13 @@ async function statFile(path: string): Promise<FileIdentity> {
 }
 
 async function readTakeoverRecord(path: string): Promise<TakeoverRecord | undefined> {
+	return parseTakeoverRecord(await readFile(path, 'utf8'));
+}
+
+function parseTakeoverRecord(text: string): TakeoverRecord | undefined {
 	let value: unknown;
 	try {
-		value = JSON.parse(await readFile(path, 'utf8')) as unknown;
+		value = JSON.parse(text) as unknown;
 	} catch (error) {
 		if (error instanceof SyntaxError) {
 			return undefined;
@@ -680,7 +795,7 @@ function isPidAlive(pid: number): boolean {
 		process.kill(pid, 0);
 		return true;
 	} catch (error) {
-		return hasCode(error, 'EPERM');
+		return !hasCode(error, 'ESRCH');
 	}
 }
 

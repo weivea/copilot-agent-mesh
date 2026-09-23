@@ -8,6 +8,16 @@ state.
 
 ## Tool surface
 
+The desktop extension also contributes explicit `/mesh-delegate` and
+`/mesh-execute` skills. Production tool registration requires the canonical
+execution guidance loaded from the extension's packaged `SKILL.md`. Preparation
+and invocation compose the same bounded prompt before calling the Facade, so
+the instruction body participates in task identity, approval and retry binding.
+Trusted child-invocation correlation still uses the original tool input before
+composition; adding guidance cannot bypass the recursion guard. The full
+workflow and compatibility requirements are in
+[Agent skills](../project-guide.md#agent-skills).
+
 | Tool | Behavior | Application deadline |
 | --- | --- | ---: |
 | `mesh_list_workers` | Returns bounded peer capability and opaque workspace metadata; same-device Window Nodes are visible only after the directional double authorization gate. | 5 s |

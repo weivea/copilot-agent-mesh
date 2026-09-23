@@ -455,6 +455,10 @@ export class UnavailableDashboardFacade implements DashboardFacade {
 
 	public readonly onDidChange = this.changed.event;
 
+	public dispose(): void {
+		this.changed.dispose();
+	}
+
 	public async getSnapshot(): Promise<DashboardSnapshot> {
 		const configuration = vscode.workspace.getConfiguration('copilotAgentMesh');
 		const configuredName = configuration.get<string>('deviceName', '').trim();

@@ -2,7 +2,7 @@
   "name": "copilot-agent-mesh",
   "displayName": "Copilot Agent Mesh",
   "description": "Preview agent collaboration for desktop VS Code and desktop-attached Codespaces.",
-  "version": "0.5.13",
+  "version": "0.5.14",
   "preview": true,
   "publisher": "weivea",
   "license": "MIT",
@@ -15,7 +15,7 @@
     "url": "https://github.com/weivea/copilot-agent-mesh/issues"
   },
   "engines": {
-    "vscode": "^1.103.0"
+    "vscode": "^1.109.3"
   },
   "extensionKind": [
     "ui"
@@ -40,6 +40,7 @@
     "dist/windows/**",
     "dist/codespaces-companion.vsix",
     "media/**",
+    "skills/**",
     "package.json",
     "package.nls*.json",
     "l10n/**",
@@ -62,6 +63,14 @@
     }
   },
   "contributes": {
+    "chatSkills": [
+      {
+        "path": "./skills/mesh-delegate/SKILL.md"
+      },
+      {
+        "path": "./skills/mesh-execute/SKILL.md"
+      }
+    ],
     "languageModelTools": [
       {
         "name": "mesh_list_workers",
@@ -178,7 +187,7 @@
               "type": "string",
               "minLength": 1,
               "maxLength": 131072,
-              "description": "Exact task prompt (maximum 128 KiB UTF-8)."
+              "description": "Task prompt. The extension includes bundled mesh-execute guidance before authorization and execution; the combined prompt is limited to 128 KiB UTF-8. Do not prepend a slash command or copy the skill."
             },
             "acceptanceCriteria": {
               "type": "array",

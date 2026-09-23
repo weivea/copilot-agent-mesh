@@ -62,7 +62,9 @@ test('production composition uses per-window runtime and local Broker tools', ()
 	assert.match(application, /sourceWorkspaceIdentity: \(\) => node\.delegationSourceScopeIdentity\(\)/u);
 	assert.match(application, /facade\.cancelDashboardTask\(selected\.actionHandle, selected\.direction\)/u);
 	assert.doesNotMatch(application, /activeTextEditor[\s\S]{0,500}sourceWorkspaceIdentity/u);
-	assert.match(application, /registerMeshTaskTools\(localTasks,\s*\{\s*delegatedToolInvocations\s*\}\)/u);
+	assert.match(application, /const executionInstructions = loadMeshExecutionInstructions\(context\.extensionUri\.fsPath\)/u);
+	assert.match(application, /registerMeshTaskTools\(localTasks,\s*\{\s*delegatedToolInvocations,\s*executionInstructions\s*\}\)/u);
+	assert.match(application, /registerMeshTaskTools\(localTasks,\s*\{\s*delegatedToolInvocations,\s*executionInstructions,\s*clock: peerDelegationToolClock/u);
 	assert.doesNotMatch(application, /Collaboration|collaboration/u);
 	assert.doesNotMatch(owner, /CollaborationService|FileCollaborationStore|sameDeviceCollaboration/u);
 	assert.match(owner, /new ProductionRemoteTaskAdapter\(\s*peers,\s*peerProfiles,\s*fencedState/u);

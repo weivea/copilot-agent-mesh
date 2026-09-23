@@ -1,5 +1,8 @@
 import * as assert from 'node:assert/strict';
+import { resolve } from 'node:path';
 import { suite, test } from 'node:test';
+import { TASK_TOOL_LIMITS } from '../../shared/toolProtocol';
+import { buildMeshExecutionPrompt, loadMeshExecutionInstructions } from '../skills/MeshSkills';
 
 import type {
 	DelegationAcceptance,
@@ -183,6 +186,59 @@ function encodeInsertedCodePoint(value: string, rounds: number): string {
 }
 
 suite('TaskToolsCore', () => {
+	test('binds execution guidance before preparation, identity and persistence for either target form and mode', async () => {
+		const executionInstructions = loadMeshExecutionInstructions(resolve(__dirname, '..', '..', '..'));
+		for (const mode of ['wait', 'submit'] as const) {
+			for (const useHandle of [false, true]) {
+				const facade = new RecordingFacade();
+				const scoped = Object.assign(facade, {
+					resolveTargetHandle: async () => ({
+						deviceId: DEVICE_ID, nodeId: NODE_ID, nodeInstanceId: NODE_INSTANCE_ID,
+						workspaceId: WORKSPACE_ID, peerId: PEER_ID,
+					}),
+				});
+				const input = Object.freeze(useHandle
+					? {
+						targetHandle: 'h'.repeat(32), title: 'Scoped task', prompt: 'Keep the task exact.',
+						acceptanceCriteria: ['Verify the task.'], mode,
+					}
+					: { ...delegationInput(), mode });
+				const core = new TaskToolsCore(scoped, { executionInstructions });
+				const expectedPrompt = buildMeshExecutionPrompt(input.prompt, executionInstructions);
+				const prepared = await core.prepareDelegateInvocation(input);
+				assert.match(prepared.confirmationMessage, /bundled mesh-execute skill/u);
+				assert.equal(facade.persistCalls, 0);
+				assert.equal(facade.identifiedIntents.length, 0);
+				assert.equal(facade.describedIntents[0].prompt, expectedPrompt);
+				await core.delegateTask(input);
+				await core.delegateTask(input);
+				await core.delegateTask({ ...input, continueFromTaskId: OTHER_TASK_ID });
+				for (const intent of [...facade.identifiedIntents, ...facade.persistedIntents]) {
+					assert.equal(intent.prompt, expectedPrompt);
+					assert.deepEqual(intent.acceptanceCriteria, input.acceptanceCriteria);
+				}
+				assert.equal(facade.persistedIntents[2].continueFromTaskId, OTHER_TASK_ID);
+				assert.equal(input.prompt.includes('# Mesh execution'), false);
+			}
+		}
+	});
+
+	test('rejects a prompt that only exceeds the limit after guidance before identifying or starting work', async () => {
+		const facade = new RecordingFacade();
+		const executionInstructions = loadMeshExecutionInstructions(resolve(__dirname, '..', '..', '..'));
+		const core = new TaskToolsCore(facade, { executionInstructions });
+		const input = { ...delegationInput(), prompt: 'x'.repeat(TASK_TOOL_LIMITS.promptBytes) };
+		await assert.rejects(core.prepareDelegateInvocation(input), /128 KiB/u);
+		assert.deepEqual((await core.delegateTask(input)).error, {
+			code: 'INVALID_INPUT',
+			message: 'The tool input does not match the required schema or byte limits.',
+			retryable: false,
+		});
+		assert.equal(facade.describedIntents.length, 0);
+		assert.equal(facade.identifiedIntents.length, 0);
+		assert.equal(facade.persistCalls, 0);
+	});
+
 	test('submit waits for durable acceptance and no longer links later Chat cancellation to the task', async () => {
 		const facade = new RecordingFacade();
 		facade.delegationSnapshot = runningSnapshot();
@@ -2134,10 +2190,13 @@ class RecordingFacade implements TaskToolFacade {
 	callOrder: string[] = [];
 	lastAcceptanceSignal?: AbortSignal;
 	persistedIntents: DelegationIntentInput[] = [];
+	identifiedIntents: DelegationIntentInput[] = [];
+	describedIntents: DelegationIntentInput[] = [];
 	private readonly taskListeners = new Set<(snapshot: TaskToolSnapshot) => void>();
 	get taskListenerCount(): number { return this.taskListeners.size; }
 
 	identifyDelegation(intent: DelegationIntentInput) {
+		this.identifiedIntents.push(intent);
 		return {
 			delegationRequestId: intent.delegationRequestId ?? DELEGATION_ID,
 			taskId: this.persisted.taskId,
@@ -2145,7 +2204,8 @@ class RecordingFacade implements TaskToolFacade {
 		};
 	}
 
-	async describeDelegationTarget() {
+	async describeDelegationTarget(intent: DelegationIntentInput) {
+		this.describedIntents.push(intent);
 		return { windowName: 'Window One', workspaceName: 'app' };
 	}
 

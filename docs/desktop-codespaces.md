@@ -189,7 +189,7 @@ view revision exposes the preceding resource for state migration.
 
 ### Automatic first-run enablement
 
-Install the matching 0.5.13 packages and run the normal Codespaces runtime setup.
+Install the matching 0.5.14 packages and run the normal Codespaces runtime setup.
 On first companion activation, the desktop extension automatically saves the
 companion's permission, then asks the user to **fully quit all VS Code windows
 and reopen once**. Reconnect normally. No launch flags or manual JSON edits are

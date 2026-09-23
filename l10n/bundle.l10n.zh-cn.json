@@ -1,4 +1,5 @@
 {
+  "Copilot Agent Mesh could not finish startup. Open the Dashboard for status and check the Mesh output channel.": "Copilot Agent Mesh 未能完成启动。请打开仪表盘查看状态，并检查 Mesh 输出日志。",
   "Mesh is saving this task history, but native Chat is waiting for a full VS Code restart. Fully quit all VS Code windows and reopen; no launch parameters are needed.": "Mesh 正在保存此任务的历史，但原生 Chat 仍需完整重启 VS Code 后启用。请退出所有 VS Code 窗口并正常重开，无需启动参数。",
   "Mesh is saving this task history, but native Chat is unavailable. See Output: Copilot Agent Mesh - Codespaces.": "Mesh 正在保存此任务的历史，但原生 Chat 暂不可用。详情见“输出：Copilot Agent Mesh - Codespaces”。",
   "checking native Chat setup": "检查原生 Chat 配置",

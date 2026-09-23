@@ -26,6 +26,21 @@ import type { AgentMeshExtensionApi } from '../composition/createApplication';
 import { codespaceFileUri, desktopCodespaceBinding } from '../codespaces/CodespaceEnvironment';
 
 suite('Copilot Agent Mesh', () => {
+	test('contributes both explicit skills from readable extension resources', async () => {
+		const extension = getExtension();
+		const names = ['mesh-delegate', 'mesh-execute'];
+		assert.deepStrictEqual(extension.packageJSON.contributes.chatSkills,
+			names.map((name) => ({ path: `./skills/${name}/SKILL.md` })));
+		for (const name of names) {
+			const content = await vscode.workspace.fs.readFile(
+				vscode.Uri.joinPath(extension.extensionUri, 'skills', name, 'SKILL.md'),
+			);
+			const markdown = Buffer.from(content).toString('utf8').replace(/\r\n/gu, '\n');
+			assert.match(markdown, new RegExp(`^name: ${name}$`, 'mu'));
+			assert.match(markdown, /^disable-model-invocation: true$/mu);
+		}
+	});
+
 	test('maps actual VS Code remote URI serialization to the Codespace filesystem', () => {
 		const uri = vscode.Uri.from({
 			scheme: 'vscode-remote', authority: 'codespaces+example', path: '/workspaces/a b%file',
@@ -130,6 +145,8 @@ suite('Copilot Agent Mesh', () => {
 	test('exposes the production Window Node and Broker lifecycle state', async () => {
 		const extension = getExtension();
 		const api = await extension.activate() as AgentMeshExtensionApi;
+		await api.ready;
+		await api.node.start();
 		assert.match(api.nodeId, /^[0-9a-f-]{36}$/u);
 		assert.match(api.nodeInstanceId, /^[0-9a-f-]{36}$/u);
 		assert.strictEqual(api.nodeState().state, 'online');

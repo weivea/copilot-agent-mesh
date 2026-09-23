@@ -33,6 +33,8 @@ const expected = [
 	'extension/package.nls.json',
 	'extension/package.nls.zh-cn.json',
 	'extension/readme.md',
+	'extension/skills/mesh-delegate/SKILL.md',
+	'extension/skills/mesh-execute/SKILL.md',
 	'extension/third_party/agent-host-protocol/LICENSE',
 ].sort();
 

@@ -9,7 +9,7 @@ and historical evidence. For a short introduction, start with the feature overvi
 
 ## Preview overview
 
-Copilot Agent Mesh 0.5.13 Preview provides **Peer Window Delegation** for ordinary
+Copilot Agent Mesh 0.5.14 Preview provides **Peer Window Delegation** for ordinary
 VS Code windows on Windows x64/ARM64 and macOS arm64. Local discovery, task tools,
 window naming, and policy controls are enabled by default. In Agent mode, Copilot can use
 six Mesh tools to discover an explicitly authorized peer window, delegate tasks,
@@ -101,7 +101,7 @@ distinguishes an undetected libc version from a confirmed unsupported platform.
 
 ## Preview prerequisites and limitations
 
-- Local desktop windows require VS Code 1.103 or newer; the Codespaces companion and native Chat POC require 1.137 or newer.
+- Local desktop windows require VS Code 1.109.3 or newer for the bundled Skills slash commands; the Codespaces companion and native Chat POC require 1.137 or newer. This manifest minimum does not establish live Agent Host compatibility for every version.
 - Real Worker execution is experimental, requires Workspace/task authorization, and may consume Copilot quota.
 - The Agent Host connects on demand for an authorized task. There is no separate runtime feature switch; merely enabling connections or opening the Dashboard does not start an Agent task.
 - Same-device discovery and policy controls work without an extra settings step.
@@ -198,6 +198,73 @@ visibility: its provider and actual working directory must also match the target
 window. Normal terminal cleanup retains Editor history without keeping the Mesh
 connection alive. Old `ahp-session:` resources are not renamed or migrated by the
 new-session policy.
+
+## Dashboard startup recovery
+
+The Dashboard is registered before backend initialization and shows a read-only
+startup page even while waiting for shared identity, Skills, or the first Broker
+connection. It switches to the connected services when initialization completes;
+startup failures remain visible rather than leaving a blank view. Task actions
+still require a registered and authorized Node. Extension API consumers must
+await `api.ready` before accessing backend services and `api.node.start()` when
+they require the first registered connection.
+
+An interrupted ownership attempt can leave `worker-owner.takeover`. Mesh
+automatically recovers it only when the record is valid and older than the
+30-second ownership TTL, its holder process is confirmed exited, and no owner
+file exists (even an incomplete owner file blocks recovery). Recovery first wins
+atomic no-replace owner publication, then rechecks the mutex identity and contents
+before removing that exact orphan. Concurrent windows cannot both become owner.
+Live, recent, future-dated, malformed, or ambiguous locks remain protected and
+surface `BROKER_TAKEOVER_BLOCKED`; elapsed time alone never overrides a live PID.
+Do not delete the extension's storage directory: it also contains task history,
+device identity and permissions.
+
+## Agent skills
+
+The desktop extension packages two native `SKILL.md` resources through
+`contributes.chatSkills`. With `chat.useAgentSkills` enabled, use Agent mode and
+type `/mesh-delegate` followed by the task in the source Chat. It guides the
+existing six tools through target selection, bounded delegation, input handling,
+cancellation, recovery, and session continuation. `/mesh-execute` applies the
+execution and evidence-based handoff workflow in the current Chat; it does not
+switch workspaces or start a remote session.
+
+Both skills use `disable-model-invocation: true`: they remain visible in the `/`
+menu but are not automatically selected. A skill is guidance, not a permission
+grant or a new agent/tool. Existing Dashboard grants, incoming-task settings,
+tool availability, and sensitive-operation confirmations still apply.
+
+Every production `mesh_delegate_task` invocation includes the bundled execution
+skill body automatically, even without `/mesh-delegate`. The source extension
+loads its own packaged `skills/mesh-execute/SKILL.md` once at activation and
+normalizes its line endings. It prepends the body to the task before target
+description, identity calculation, persistence, and authorization binding. The
+original task text and separate acceptance criteria are preserved; the composed
+prompt is sent over the existing Mesh protocol and AHP path. No target-side
+slash parser, shared extension path, workspace file installation, or implicit
+inheritance of the source conversation is required.
+
+The same path covers local/remote desktop targets, standalone fallback, and the
+Codespaces companion. The desktop extension owns both slash entries; the
+companion does not register duplicates or replace the received instructions.
+The target receives the source extension's bundled guidance, not a user override
+with the same skill name. Missing or malformed packaged execution guidance fails
+backend startup explicitly while leaving the Dashboard available to show the
+failure. Disabling the Chat Skills UI does not remove runtime
+execution guidance from an otherwise enabled Mesh delegation.
+
+The combined prompt, including guidance and its task heading, must fit the
+existing 128 KiB UTF-8 limit. Oversized requests fail before task allocation;
+they are not truncated. Exact retries compose the same prompt, and continuations
+include guidance in each new turn. If an extension update changes that guidance,
+reusing an old `delegationRequestId` can return `IDEMPOTENCY_CONFLICT`; recover
+the original task with get/list rather than silently starting replacement work.
+
+Static extension skills became available in VS Code 1.109; the slash entry
+requires the 1.109.3 update, which is this extension's minimum. No proposed API
+is needed for the two static skills. Existing Codespaces native Chat proposal
+requirements remain separate.
 
 ## Mesh tool workflow
 

@@ -2,7 +2,7 @@ import * as assert from 'node:assert/strict';
 import { ChildProcess } from 'node:child_process';
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 import { pathToFileURL } from 'node:url';
 
@@ -74,6 +74,7 @@ import {
 	type ProtectedResource,
 } from '../agentHost/AuthBroker';
 import { OwnedCommandError } from '../spikes/ownedProcess';
+import { buildMeshExecutionPrompt, loadMeshExecutionInstructions } from '../skills/MeshSkills';
 
 const workspaceUri = pathToFileURL(join(tmpdir(), 'copilot-agent-mesh-safe-workspace')).href;
 const protectedResource = {
@@ -493,6 +494,29 @@ test('launcher retains auxiliary command cleanup ownership after discovery clean
 	await launcher.dispose();
 	assert.equal(terminationAttempts, 2);
 });
+
+for (const source of ['editor', 'standalone', 'codespace-owned'] as const) {
+	test(`${source} dispatches the exact authorized execution guidance and task without slash resolution`, async (t) => {
+		const transport = new FakeAhpTransport();
+		const launcher = source === 'editor' ? editorLauncher() : new FakeLauncher();
+		const runtime = source === 'codespace-owned'
+			? createOwnedRuntime(launcher, [transport])
+			: createRuntime(launcher, new FakeConnectionFactory([transport]));
+		t.after(() => runtime.dispose());
+		const request = source === 'codespace-owned' ? ownedTaskRequest() : taskRequest();
+		const instructions = loadMeshExecutionInstructions(resolve(__dirname, '..', '..', '..'));
+		const prompt = buildMeshExecutionPrompt(request.prompt, instructions);
+		const handle = await runtime.start({ ...request, prompt });
+		const turn = transport.dispatched.find(({ action }) => action.type === 'chat/turnStarted');
+		assert.ok(turn && 'message' in turn.action && 'turnId' in turn.action);
+		assert.deepEqual(turn.action.message, {
+			text: `${prompt}\n\nAcceptance criteria:\n- Finish successfully`,
+			origin: { kind: 'user' },
+		});
+		transport.emitChat({ type: 'chat/turnComplete', turnId: turn.action.turnId });
+		await completeAndDetach(handle);
+	});
+}
 
 test('production runtime initializes, authenticates, resolves config, runs a turn, answers input, and cancels', async () => {
 	const transport = new FakeAhpTransport();

@@ -55,7 +55,10 @@ test('handle-based submit preserves the trusted child context rather than bypass
 		},
 		waitForDelegationAcceptance: unused, getTask: unused, cancelOwnedTask: unused, answerOwnedTask: unused,
 	};
-	const result = await new TaskToolsCore(facade, { delegatedToolInvocations: registry }).delegateTask(input);
+	const result = await new TaskToolsCore(facade, {
+		delegatedToolInvocations: registry,
+		executionInstructions: 'Execute only the authorized task.',
+	}).delegateTask(input);
 	assert.deepEqual(receivedContext, context);
 	assert.equal(result.e, 'DELEGATION_RECURSION');
 	assert.equal(result.s, 2);
