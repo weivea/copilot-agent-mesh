@@ -1,6 +1,6 @@
 # Preview release engineering
 
-> Version: `0.5.13` Preview
+> Version: `0.5.14` Preview
 > Gate status: historical G0 Go; Peer Window Delegation requires its own real evidence gate
 
 This document describes a reproducible evaluation package. It does not authorize
@@ -71,10 +71,10 @@ npm run verify
 The package command creates:
 
 ```text
-artifacts/copilot-agent-mesh-0.5.13-preview.vsix
-artifacts/copilot-agent-mesh-codespaces-0.5.13-preview.vsix
-artifacts/copilot-agent-mesh-0.5.13-preview.vsix.sha256
-artifacts/copilot-agent-mesh-codespaces-0.5.13-preview.vsix.sha256
+artifacts/copilot-agent-mesh-0.5.14-preview.vsix
+artifacts/copilot-agent-mesh-codespaces-0.5.14-preview.vsix
+artifacts/copilot-agent-mesh-0.5.14-preview.vsix.sha256
+artifacts/copilot-agent-mesh-codespaces-0.5.14-preview.vsix.sha256
 artifacts/install.ps1
 artifacts/install.sh
 ```
@@ -90,7 +90,8 @@ npm run package:vsix
 `dependencies: false`, runs the existing production prepublish hook, prints
 `vsce ls`, and verifies the ZIP central directory against an exact allowlist.
 Only the production bundle, the two exact Windows process-helper binaries and
-their Go license, media, extension manifest, release documents, project notices,
+their Go license, media, the two `skills/mesh-{delegate,execute}/SKILL.md` resources,
+extension manifest, release documents, project notices,
 and the AHP license are permitted. The single exact nested
 `dist/codespaces-companion.vsix` is built and allowlist-checked separately; the
 main setup action installs that matching workspace companion in the attached
@@ -99,18 +100,25 @@ in the esbuild output, so the AHP source submodule and all other nested archives
 excluded alongside source, tests, shared TypeScript, build output, test
 downloads, source maps, credentials, and external CLIs.
 
+The desktop manifest requires VS Code 1.109.3 for native skill slash invocation.
+It owns both static `chatSkills` contributions; the companion adds no duplicate
+slash entries and continues to require 1.137. The source packages and transmits
+the canonical execution guidance as part of the authorized task prompt, so the
+remote companion needs no source-extension filesystem access or extra skill
+installation. The installed-package smoke also checks both skill resources.
+
 Inspect and hash the result independently:
 
 ```sh
 npx vsce ls --no-dependencies
-unzip -Z1 artifacts/copilot-agent-mesh-0.5.13-preview.vsix
-shasum -a 256 artifacts/copilot-agent-mesh-0.5.13-preview.vsix
+unzip -Z1 artifacts/copilot-agent-mesh-0.5.14-preview.vsix
+shasum -a 256 artifacts/copilot-agent-mesh-0.5.14-preview.vsix
 ```
 
 On Windows, install the same universal VSIX from PowerShell:
 
 ```powershell
-code --install-extension ".\artifacts\copilot-agent-mesh-0.5.13-preview.vsix" --force
+code --install-extension ".\artifacts\copilot-agent-mesh-0.5.14-preview.vsix" --force
 ```
 
 ## GitHub release installers
@@ -131,7 +139,7 @@ For each release:
 2. Run `npm run test:installers` and `npm run package:vsix`. Commit the updated
    installer version lines along with the release changes.
 3. Create a GitHub release with the exact tag `v<version>` (for example,
-   `v0.5.13`). Mark experimental releases as **Pre-release**. Upload the two
+   `v0.5.14`). Mark experimental releases as **Pre-release**. Upload the two
    matching VSIX files, their two `.vsix.sha256` sidecars, and both installer
    scripts from `artifacts`. A VSIX without its matching checksum cannot be
    installed by these scripts.
@@ -173,7 +181,7 @@ The companion uses a fixed GitHub protected-resource mapping for
 `https://api.github.com` (`github`, `read:user`, `user:email`); user-configured exact
 mappings take precedence and other resources fail closed.
 
-The 0.5.13 companion requires desktop VS Code 1.137+. The desktop extension saves
+The 0.5.14 companion requires desktop VS Code 1.137+. The desktop extension saves
 the native Chat permission automatically on first companion activation. Fully
 quit all VS Code windows and reopen once, then reconnect normally. No proposed-API
 launch flag or manual configuration edit is needed. Dirty, invalid or concurrent

@@ -869,7 +869,7 @@ test('peer-delegation Tool clock shortens only minute-scale budget timers', () =
 	assert.equal(clock.snapshot().timersDisposed, 2);
 });
 
-test('0.5.13 enables local peer discovery without enabling real-turn harnesses', () => {
+test('0.5.14 enables local peer discovery without enabling real-turn harnesses', () => {
 	const root = resolve('.');
 	const manifest = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8'));
 	const wrapper = readFileSync(
@@ -892,7 +892,7 @@ test('0.5.13 enables local peer discovery without enabling real-turn harnesses',
 		resolve(root, 'src/composition/ProductionBrokerRuntime.ts'),
 		'utf8',
 	);
-	assert.equal(manifest.version, '0.5.13');
+	assert.equal(manifest.version, '0.5.14');
 	assert.equal(
 		manifest.scripts['test:peer-delegation-real'],
 		'node scripts/e2e/peer-delegation/run.mjs',
@@ -990,7 +990,7 @@ test('0.5.13 enables local peer discovery without enabling real-turn harnesses',
 test('0.5.x evidence records supported Windows hardware without upgrading historical evidence', () => {
 	const historical = unverifiedEvidence();
 	assert.equal(parsePeerDelegationEvidence(historical).platform.os, 'darwin');
-	for (const extension of ['0.5.0', '0.5.1', '0.5.2', '0.5.3', '0.5.4', '0.5.5', '0.5.6', '0.5.7', '0.5.8', '0.5.9', '0.5.10', '0.5.11', '0.5.12', '0.5.13']) {
+	for (const extension of ['0.5.0', '0.5.1', '0.5.2', '0.5.3', '0.5.4', '0.5.5', '0.5.6', '0.5.7', '0.5.8', '0.5.9', '0.5.10', '0.5.11', '0.5.12', '0.5.13', '0.5.14']) {
 		for (const architecture of ['x64', 'arm64'] as const) {
 			const current = {
 				...historical,

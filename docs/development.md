@@ -9,7 +9,7 @@ build toolchain; use the [release installers](../README.md#install) instead.
 
 ## Requirements
 
-- VS Code 1.103 or newer; Codespaces companion/native Chat development requires 1.137 or newer.
+- VS Code 1.109.3 or newer; Codespaces companion/native Chat development requires 1.137 or newer.
 - Node.js 22 or newer and npm.
 - Go at the version declared in `native/windows-process-host/go.mod` or newer
   (build-time only; not required to install or use the VSIX).
@@ -54,6 +54,16 @@ for version, tag, checksum, and publishing conventions.
 
 ## Real execution tests
 
+The two slash skills live in `skills/mesh-delegate/SKILL.md` and
+`skills/mesh-execute/SKILL.md`. Keep execution guidance in the latter: production
+delegation reads that packaged body rather than a duplicated prompt constant.
+Restart the Extension Development Host after editing it; the body is cached for
+that activation. The skill manifest/resource tests, tool-core binding tests,
+runtime tests, Codespaces collaboration tests, and exact VSIX allowlist cover
+this contract without model calls. In an authenticated Chat, separately check
+that both names appear in `/` and a selected skill loads; resource/manifest tests
+alone are not live Chat UI evidence.
+
 Real AHP tests may consume Copilot quota and require explicit opt-in. Use a
 dedicated authenticated test profile, never the developer's normal profile.
 Follow [real multi-window verification](./mvp/release.md#real-multi-window-verification)
@@ -88,6 +98,8 @@ target-side cancel action are the mitigation. See the
 
 ```text
 shared/                       Protocol v2 and bounded wire schemas
+skills/                       Bundled source and target Agent Skills
+src/skills/                   Canonical execution-guidance loading and prompt composition
 src/broker/                   Device Broker ownership, IPC, routing, and node catalog
 src/node/                     Window Node lifecycle, routing adapters, and runtime handles
 src/ipc/                      Authenticated local IPC transport

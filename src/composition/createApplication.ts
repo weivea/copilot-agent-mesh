@@ -52,6 +52,7 @@ import {
 import { DelegatedToolInvocationRegistry } from '../tools/DelegatedToolInvocationRegistry';
 import { LocalBrokerTaskFacade } from '../tools/LocalBrokerTaskFacade';
 import { registerMeshTaskTools } from '../tools/taskTools';
+import { loadMeshExecutionInstructions } from '../skills/MeshSkills';
 import {
 	AgentMeshViewProvider,
 	DASHBOARD_COMMANDS,
@@ -150,6 +151,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		const delegatedToolInvocations = new DelegatedToolInvocationRegistry();
 		addApplicationCleanup(cleanup, () => delegatedToolInvocations.dispose());
 		guard.assertAllowed({ requireWorkspace: false });
+		const executionInstructions = loadMeshExecutionInstructions(context.extensionUri.fsPath);
 		const readCodespaceBinding = () => desktopCodespaceBinding(
 			readEnvironment(),
 			(vscode.workspace.workspaceFolders ?? []).map((folder) => ({
@@ -488,9 +490,10 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 				.get<boolean>('experimental.peerDelegation', true);
 			if (enabled && meshTools === undefined) {
 				meshTools = peerDelegationRecorder === undefined
-					? registerMeshTaskTools(localTasks, { delegatedToolInvocations })
+					? registerMeshTaskTools(localTasks, { delegatedToolInvocations, executionInstructions })
 					: registerMeshTaskTools(localTasks, {
 						delegatedToolInvocations,
+						executionInstructions,
 						clock: peerDelegationToolClock,
 						observer: peerDelegationRecorder,
 					});

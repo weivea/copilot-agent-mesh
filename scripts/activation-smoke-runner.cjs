@@ -22,6 +22,15 @@ async function run() {
 	await Promise.all(['x64', 'arm64'].map((architecture) => access(
 		path.join(extension.extensionPath, 'dist', 'windows', `mesh-process-host-${architecture}.exe`),
 	)));
+	const skillNames = ['mesh-delegate', 'mesh-execute'];
+	assert.deepEqual(extension.packageJSON.contributes.chatSkills,
+		skillNames.map((name) => ({ path: `./skills/${name}/SKILL.md` })));
+	for (const name of skillNames) {
+		const markdown = (await readFile(path.join(extension.extensionPath, 'skills', name, 'SKILL.md'), 'utf8'))
+			.replace(/\r\n/gu, '\n');
+		assert.match(markdown, new RegExp(`^name: ${name}$`, 'mu'));
+		assert.match(markdown, /^disable-model-invocation: true$/mu);
+	}
 
 	await extension.activate();
 	assert.equal(extension.isActive, true);

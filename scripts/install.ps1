@@ -6,7 +6,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 # Updated from package.json by npm run package:vsix.
-$ExtensionVersion = '0.5.13'
+$ExtensionVersion = '0.5.14'
 $ExtensionId = 'weivea.copilot-agent-mesh'
 $AssetName = "copilot-agent-mesh-$ExtensionVersion-preview.vsix"
 $ReleaseUrl = "https://github.com/weivea/copilot-agent-mesh/releases/download/v$ExtensionVersion"

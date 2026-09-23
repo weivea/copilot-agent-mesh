@@ -684,7 +684,7 @@ VS Code Build 的 Host 版本与 SDK Offer 有交集，不能靠 Feature Flag �
 跟随 `main`，因为测试中的 VS Code 1.135.0 Host 要求 `^1.0.0`。
 [AHP Versioning](https://github.com/microsoft/agent-host-protocol/blob/main/docs/specification/versioning.md)
 
-当前 `engines.vscode = ^1.103.0` 只足以覆盖 Language Model Tool API，不能自动证明对应版本的 `code agent host` 与目标 AHP 行为可用。Phase 0 完成后，将最低 VS Code 版本提高到验证通过的最低版本，并在启动时做 Capability Probe。
+当前 `engines.vscode = ^1.109.3` 覆盖 Language Model Tool API 和扩展内置 Skills 的 slash 入口，不能自动证明对应版本的 `code agent host` 与目标 AHP 行为可用。Agent Host 的最低版本仍需要独立验证，并在启动时做 Capability Probe。
 
 ### 10.2 启动与发现
 

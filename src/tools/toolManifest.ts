@@ -68,7 +68,7 @@ export const MESH_TOOL_MANIFEST_DESCRIPTORS: readonly ToolManifestDescriptor[] =
 				workspaceId: { ...idSchema, description: 'Opaque workspace ID returned by mesh_list_workers.' },
 				peerId: { ...idSchema, description: 'Optional internal routing metadata for a remote device; it does not replace explicit target IDs.' },
 				title: { type: 'string', minLength: 1, maxLength: 256, description: 'Short task title (maximum 256 UTF-8 bytes).' },
-				prompt: { type: 'string', minLength: 1, maxLength: 131072, description: 'Exact task prompt (maximum 128 KiB UTF-8).' },
+				prompt: { type: 'string', minLength: 1, maxLength: 131072, description: 'Task prompt. The extension includes bundled mesh-execute guidance before authorization and execution; the combined prompt is limited to 128 KiB UTF-8. Do not prepend a slash command or copy the skill.' },
 				acceptanceCriteria: {
 					type: 'array',
 					maxItems: 32,

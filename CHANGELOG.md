@@ -6,6 +6,14 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [Unreleased]
 
+## [0.5.14 Preview] - 2026-09-23
+
+- Bundle explicit `/mesh-delegate` and `/mesh-execute` Agent Skills; require
+  VS Code 1.109.3 or newer for native skill slash commands.
+- Include the canonical execution skill in delegated task prompts before
+  identity and approval binding, across desktop and Codespaces execution.
+  Preserve recursion protection, exact retries and per-turn continuation;
+  reject oversized combined prompts instead of silently omitting guidance.
 - Let standalone Agent Hosts, including editor fallback, negotiate AHP `0.9.0`
   when their registry advertises `0.9.0` or the native CLI supervisor marker
   `0.1.0`. Preserve `1.0.0` support, reject unoffered wire versions, and retain

@@ -269,12 +269,13 @@ export class MeshAnswerTaskTool extends TaskToolBase implements vscode.LanguageM
 }
 
 export interface RegisterMeshTaskToolsOptions extends TaskToolsCoreOptions {
+	readonly executionInstructions: string;
 	readonly observer?: TaskToolInvocationObserver;
 }
 
 export function registerMeshTaskTools(
 	facade: TaskToolFacade,
-	options: RegisterMeshTaskToolsOptions = {},
+	options: RegisterMeshTaskToolsOptions,
 ): vscode.Disposable {
 	assertMeshToolNameParity(
 		MESH_TOOL_MANIFEST_DESCRIPTORS.map(({ name }) => name),

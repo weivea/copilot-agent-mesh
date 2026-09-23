@@ -22,6 +22,23 @@ Use Copilot Chat in **Agent mode**. The six Mesh tools handle discovery,
 delegation, status, input, cancellation, and history; see the
 [tool workflow](./docs/project-guide.md#mesh-tool-workflow).
 
+## Agent Skills
+
+On VS Code **1.109.3 or newer**, the extension contributes two explicit Chat
+skills. With Agent Skills enabled (`chat.useAgentSkills`), type `/` and select:
+
+- **`/mesh-delegate`** in the source chat to discover authorized targets, define
+  a task, coordinate execution, and collect results.
+- **`/mesh-execute`** to explicitly apply the target execution workflow to a
+  task in the current chat.
+
+Both skills are manual-only, not automatically selected by the model. Delegation
+automatically includes the same `mesh-execute` guidance in the authorized task
+prompt, including for desktop-attached Codespaces; the target does not need a
+second slash invocation. Skills do not grant permissions or create agents by
+themselves. The Codespaces companion still requires VS Code 1.137 or newer.
+See [skill behavior and limits](./docs/project-guide.md#agent-skills).
+
 ## Screenshots
 
 Real VS Code captures. Only identifying names, paths, and IDs are masked;

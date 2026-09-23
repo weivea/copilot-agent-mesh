@@ -39,6 +39,7 @@ import { MESH_TOOL_NAMES } from './toolManifest';
 import type { DelegatedToolInvocationRegistry } from './DelegatedToolInvocationRegistry';
 import { isTaskOutcome, TaskSnapshotWaiter, type TaskReadWaitOutcome } from './TaskSnapshotWaiter';
 import { compactPresentedDelegation } from './ToolResultPresentation';
+import { buildMeshExecutionPrompt } from '../skills/MeshSkills';
 
 export type { ToolCancellation, ToolClock } from './DelegationWaiter';
 export type { ListTasksInput } from '../../shared/toolProtocol';
@@ -99,6 +100,7 @@ export interface TaskToolsCoreOptions {
 	readonly outputByteLimit?: number;
 	readonly id?: () => string;
 	readonly delegatedToolInvocations?: DelegatedToolInvocationRegistry;
+	readonly executionInstructions?: string;
 }
 
 interface OperationSuccess<T> {
@@ -196,6 +198,7 @@ export class TaskToolsCore {
 	private readonly outputByteLimit: number;
 	private readonly id: () => string;
 	private readonly delegatedToolInvocations: DelegatedToolInvocationRegistry | undefined;
+	private readonly executionInstructions: string | undefined;
 
 	constructor(
 		private readonly facade: TaskToolFacade,
@@ -205,6 +208,10 @@ export class TaskToolsCore {
 		this.outputByteLimit = options.outputByteLimit ?? TASK_TOOL_LIMITS.defaultOutputBytes;
 		this.id = options.id ?? randomUUID;
 		this.delegatedToolInvocations = options.delegatedToolInvocations;
+		this.executionInstructions = options.executionInstructions;
+		if (this.executionInstructions !== undefined) {
+			buildMeshExecutionPrompt('', this.executionInstructions);
+		}
 		if (
 			!Number.isSafeInteger(this.outputByteLimit)
 			|| this.outputByteLimit < TASK_TOOL_LIMITS.minimumOutputBytes
@@ -217,7 +224,7 @@ export class TaskToolsCore {
 		rawInput: unknown,
 		cancellation: ToolCancellation = neverCancelled,
 	): Promise<DelegateInvocationPreparation> {
-		const parsed = parseDelegateTaskInput(rawInput);
+		const parsed = this.withExecutionInstructions(parseDelegateTaskInput(rawInput));
 		const input = 'targetHandle' in parsed
 			? await this.resolveHandleInput(parsed)
 			: delegationIntent(parsed, parsed);
@@ -244,6 +251,9 @@ export class TaskToolsCore {
 				`Target window: ${windowName}`,
 				`Workspace: ${workspaceName}`,
 				`Task: ${summary}`,
+				...(this.executionInstructions === undefined
+					? []
+					: ['Execution guidance: the bundled mesh-execute skill is included in this task.']),
 				...(input.continueFromTaskId === undefined
 					? []
 					: [`Session: reuse completed task ${input.continueFromTaskId}, including its conversation history.`]),
@@ -386,8 +396,9 @@ export class TaskToolsCore {
 		let delegatedExecutionContext: DelegatedExecutionContext | undefined;
 		let mode: 'wait' | 'submit';
 		try {
-			const parsed = parseDelegateTaskInput(rawInput);
-			delegatedExecutionContext = this.delegatedToolInvocations?.consume(parsed);
+			const original = parseDelegateTaskInput(rawInput);
+			delegatedExecutionContext = this.delegatedToolInvocations?.consume(original);
+			const parsed = this.withExecutionInstructions(original);
 			mode = parsed.mode ?? 'wait';
 			const intent = 'targetHandle' in parsed
 				? await this.resolveHandleInput(parsed)
@@ -601,6 +612,13 @@ export class TaskToolsCore {
 		} catch (error: unknown) {
 			return error instanceof TaskToolFacadeError ? this.errorFromUnknown(error) : this.errorResult('OUTPUT_INVALID');
 		}
+	}
+
+	private withExecutionInstructions(input: ParsedDelegateTaskInput): ParsedDelegateTaskInput {
+		return this.executionInstructions === undefined ? input : {
+			...input,
+			prompt: buildMeshExecutionPrompt(input.prompt, this.executionInstructions),
+		};
 	}
 
 	private async resolveHandleInput(

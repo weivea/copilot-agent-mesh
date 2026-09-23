@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Updated from package.json by npm run package:vsix.
-EXTENSION_VERSION='0.5.13'
+EXTENSION_VERSION='0.5.14'
 EXTENSION_ID='weivea.copilot-agent-mesh'
 ASSET_NAME="copilot-agent-mesh-${EXTENSION_VERSION}-preview.vsix"
 RELEASE_URL="https://github.com/weivea/copilot-agent-mesh/releases/download/v${EXTENSION_VERSION}"

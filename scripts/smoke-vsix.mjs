@@ -32,7 +32,7 @@ try {
 		displayName: 'Mesh Preview Smoke Harness',
 		publisher: 'weivea',
 		version: '0.0.0',
-		engines: { vscode: '^1.103.0' },
+		engines: manifest.engines,
 		main: './extension.cjs',
 	}, null, 2));
 	writeFileSync(join(harnessDirectory, 'extension.cjs'), 'exports.activate = () => undefined;\n');
