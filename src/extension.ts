@@ -15,7 +15,7 @@ export async function activate(
 	const multiWindowMode = process.env.MESH_MULTI_WINDOW_E2E === '1';
 	const peerDelegationMode = process.env.MESH_PEER_DELEGATION_E2E === '1';
 	if (multiWindowMode) {
-		void import('./e2e/multiWindowHost.js')
+		void application.api.ready.then(() => import('./e2e/multiWindowHost.js'))
 			.then(({ runWithApi }) => runWithApi(application!.api))
 			.catch((error: unknown) => {
 				process.emitWarning(
@@ -25,7 +25,7 @@ export async function activate(
 			});
 	}
 	if (peerDelegationMode) {
-		void import('./e2e/peerDelegationHost.js')
+		void application.api.ready.then(() => import('./e2e/peerDelegationHost.js'))
 			.then(({ runWithApi }) => runWithApi(application!.api))
 			.catch((error: unknown) => {
 				process.emitWarning(

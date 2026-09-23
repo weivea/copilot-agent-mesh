@@ -214,6 +214,18 @@ set `MESH_SMOKE_COMPANION_VSIX` to the exact companion VSIX path before running
 profile; local companion activation must report `unsupportedEnvironment`
 without starting a Codespace runtime.
 
+To reproduce startup after a crashed ownership contender, set
+`MESH_SMOKE_TAKEOVER_STATE=orphan` before `npm run smoke:vsix`. The harness first
+warms its isolated profile, then seeds an expired takeover mutex with a confirmed
+exited child PID and no owner file. The installed extension must activate, resolve
+the Dashboard view, recover ownership and connect its Window Node within bounded
+waits. Modes `live` and `malformed` instead verify that the exact mutex bytes are
+preserved while activation and Dashboard view resolution complete with the safe
+`BROKER_TAKEOVER_BLOCKED` diagnostic. None of these checks use or modify the normal
+VS Code profile, authenticate a model, or count as a live delegated task test.
+The malformed case also waits for backend startup to fail explicitly and checks
+that the Dashboard and its refresh command remain available.
+
 The UI extension and companion must have matching extension versions and bridge
 protocol versions. Both VSIXs are emitted by `package:vsix`; the separate
 companion artifact can also be installed manually with **Install from VSIX** in

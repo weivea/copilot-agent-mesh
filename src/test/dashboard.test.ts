@@ -2933,6 +2933,66 @@ suite('Dashboard', () => {
 		assert.equal(clock.pendingCount, 0);
 	});
 
+	test('a blocked startup renders its takeover diagnostic without enabling stale actions', async () => {
+		const facade = new DeferredDashboardFacade();
+		const provider = new AgentMeshViewProvider(facade, getExtension().extensionUri, async () => undefined);
+		const view = new TestWebviewView();
+		const media = await createDashboardMediaHarness();
+		provider.resolveWebviewView(view);
+		try {
+			await view.webview.receive({
+				version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: getUiInstanceId(view.webview.html), type: 'ready',
+			});
+			const disconnected = disconnectedDashboardSnapshot();
+			const error = {
+				code: 'BROKER_TAKEOVER_BLOCKED',
+				message: 'Broker startup is blocked by an existing takeover lock. Automatic recovery requires a confirmed exited holder and no owner record.',
+			};
+			facade.resolveNext({
+				...disconnected,
+				broker: { state: 'contending', role: 'contender', takeover: 'waiting', holder: 'none', error },
+				errors: [...disconnected.errors, error],
+			});
+			await settle();
+			assert.equal(latestModel(view).broker.error?.code, error.code);
+			assert.ok(latestModel(view).errors.some(({ code }) => code === error.code));
+			media.receive({ ...view.webview.sent.at(-1), uiInstanceId: 'media-view' });
+			assert.match(media.element('pageContent').text, /existing takeover lock/u);
+			assert.equal(media.button('Refresh local').disabled, false);
+			assert.deepEqual(facade.calls, []);
+			assert.doesNotMatch(view.webview.sent.map((message) => JSON.stringify(message)).join(''), /UNSAFE_VIEW_MODEL/u);
+		} finally { provider.dispose(); }
+	});
+
+	test('Dashboard switches from pending startup to connected services without recreating the view', async () => {
+		const startup = new DeferredDashboardFacade();
+		const connected = new DeferredDashboardFacade();
+		const provider = new AgentMeshViewProvider(startup, getExtension().extensionUri, async () => undefined);
+		const view = new TestWebviewView();
+		provider.resolveWebviewView(view);
+		try {
+			await view.webview.receive({
+				version: DASHBOARD_MESSAGE_VERSION, uiInstanceId: getUiInstanceId(view.webview.html), type: 'ready',
+			});
+			const initialHtml = view.webview.html;
+			provider.setFacade(connected);
+			startup.resolveNext(disconnectedDashboardSnapshot());
+			await settle();
+			assert.equal(connected.pendingCount, 1);
+			connected.resolveNext(withDeviceName(managedSnapshot(), 'connected-device'));
+			await settle();
+			assert.equal(view.webview.html, initialHtml);
+			assert.equal(latestModel(view).device.name, 'connected-device');
+			assert.deepEqual(latestModel(view).errors, []);
+			connected.fireChanged();
+			await settle();
+			assert.equal(connected.pendingCount, 1);
+			connected.resolveNext(withDeviceName(managedSnapshot(), 'updated-device'));
+			await settle();
+			assert.equal(latestModel(view).device.name, 'updated-device');
+		} finally { provider.dispose(); }
+	});
+
 	test('Broker reconnect suppression preserves genuine configuration, authentication and runtime faults', async () => {
 		const facade = new RecordingDashboardFacade();
 		facade.snapshotValue = managedSnapshot();

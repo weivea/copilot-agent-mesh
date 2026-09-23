@@ -199,6 +199,27 @@ window. Normal terminal cleanup retains Editor history without keeping the Mesh
 connection alive. Old `ahp-session:` resources are not renamed or migrated by the
 new-session policy.
 
+## Dashboard startup recovery
+
+The Dashboard is registered before backend initialization and shows a read-only
+startup page even while waiting for shared identity, Skills, or the first Broker
+connection. It switches to the connected services when initialization completes;
+startup failures remain visible rather than leaving a blank view. Task actions
+still require a registered and authorized Node. Extension API consumers must
+await `api.ready` before accessing backend services and `api.node.start()` when
+they require the first registered connection.
+
+An interrupted ownership attempt can leave `worker-owner.takeover`. Mesh
+automatically recovers it only when the record is valid and older than the
+30-second ownership TTL, its holder process is confirmed exited, and no owner
+file exists (even an incomplete owner file blocks recovery). Recovery first wins
+atomic no-replace owner publication, then rechecks the mutex identity and contents
+before removing that exact orphan. Concurrent windows cannot both become owner.
+Live, recent, future-dated, malformed, or ambiguous locks remain protected and
+surface `BROKER_TAKEOVER_BLOCKED`; elapsed time alone never overrides a live PID.
+Do not delete the extension's storage directory: it also contains task history,
+device identity and permissions.
+
 ## Agent skills
 
 The desktop extension packages two native `SKILL.md` resources through
@@ -229,7 +250,8 @@ Codespaces companion. The desktop extension owns both slash entries; the
 companion does not register duplicates or replace the received instructions.
 The target receives the source extension's bundled guidance, not a user override
 with the same skill name. Missing or malformed packaged execution guidance fails
-activation explicitly. Disabling the Chat Skills UI does not remove runtime
+backend startup explicitly while leaving the Dashboard available to show the
+failure. Disabling the Chat Skills UI does not remove runtime
 execution guidance from an otherwise enabled Mesh delegation.
 
 The combined prompt, including guidance and its task heading, must fit the

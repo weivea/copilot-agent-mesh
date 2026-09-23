@@ -59,7 +59,9 @@ import {
 } from '../ui/AgentMeshViewProvider';
 import {
 	ServiceDashboardFacade,
+	UnavailableDashboardFacade,
 	type DashboardFacade,
+	type DashboardSnapshot,
 	type DashboardTaskTarget,
 } from '../ui/DashboardFacade';
 import { ProductionBrokerRuntime } from './ProductionBrokerRuntime';
@@ -108,6 +110,7 @@ export const APPLICATION_COMMANDS = {
 } as const;
 
 export interface AgentMeshExtensionApi {
+	readonly ready: Promise<void>;
 	readonly agentRuntime: AgentRuntime;
 	readonly node: WindowNodeClient;
 	readonly nodeId: string;
@@ -129,6 +132,118 @@ export interface Application {
 }
 
 export async function createApplication(context: vscode.ExtensionContext): Promise<Application> {
+	const startupFacade = new StartupDashboardFacade();
+	const dashboard = new AgentMeshViewProvider(startupFacade, context.extensionUri);
+	const registration = vscode.window.registerWebviewViewProvider(AgentMeshViewProvider.viewType, dashboard);
+	const refreshCommand = vscode.commands.registerCommand(DASHBOARD_COMMANDS.refresh, () => dashboard.refresh());
+	let current: Application | undefined;
+	let disposed = false;
+	const startupAbort = new AbortController();
+	let startupSubscription: { dispose(): void } | undefined;
+	let startupLifecycle: BrokerLifecycle<ProductionBrokerRuntime> | undefined;
+	const ready = createInitializedApplication(context, dashboard, startupAbort.signal, (lifecycle) => {
+		startupLifecycle = lifecycle;
+		startupFacade.lifecycle = lifecycle;
+		startupSubscription = lifecycle.onDidChange(() => dashboard.refresh());
+		dashboard.refresh();
+	}).then(async (application) => {
+		current = application;
+		startupSubscription?.dispose();
+		if (disposed) {
+			await application.dispose();
+			throw new Error('Copilot Agent Mesh was disposed during startup.');
+		}
+	}, (error: unknown) => {
+		startupFacade.failed = true;
+		dashboard.setFacade(startupFacade);
+		if (!disposed) {
+			console.error('Copilot Agent Mesh startup failed. See the Mesh output channel.');
+			void vscode.window.showErrorMessage(vscode.l10n.t(
+				'Copilot Agent Mesh could not finish startup. Open the Dashboard for status and check the Mesh output channel.',
+			));
+		}
+		throw error;
+	});
+	// The ready promise remains rejectable for API consumers; the Dashboard owns
+	// user-visible startup errors even when no caller is waiting for the backend.
+	void ready.catch(() => undefined);
+	const requireApi = (): AgentMeshExtensionApi => {
+		if (current === undefined || disposed) {
+			throw new Error('Copilot Agent Mesh services are not ready. Await the extension API ready promise.');
+		}
+		return current.api;
+	};
+	return {
+		api: {
+			ready,
+			get agentRuntime() { return requireApi().agentRuntime; },
+			get node() { return requireApi().node; },
+			get nodeId() { return requireApi().nodeId; },
+			get nodeInstanceId() { return requireApi().nodeInstanceId; },
+			get brokerLifecycle() {
+				if (startupLifecycle === undefined) { return requireApi().brokerLifecycle; }
+				return startupLifecycle;
+			},
+			nodeState: () => requireApi().nodeState(),
+			brokerState: () => startupLifecycle?.snapshot() ?? requireApi().brokerState(),
+			get coordinator() { return current?.api.coordinator; },
+			get workerTasks() { return current?.api.workerTasks; },
+			get listener() { return current?.api.listener; },
+			get twoDeviceE2e() { return current?.api.twoDeviceE2e; },
+			get multiWindowE2e() { return current?.api.multiWindowE2e; },
+			get peerDelegationE2e() { return current?.api.peerDelegationE2e; },
+		},
+		dispose: async () => {
+			disposed = true;
+			startupAbort.abort();
+			registration.dispose();
+			refreshCommand.dispose();
+			dashboard.dispose();
+			startupSubscription?.dispose();
+			startupFacade.dispose();
+			await ready.catch(() => undefined);
+			await current?.dispose();
+		},
+	};
+}
+
+class StartupDashboardFacade extends UnavailableDashboardFacade {
+	public lifecycle: BrokerLifecycle<ProductionBrokerRuntime> | undefined;
+	public failed = false;
+
+	public override async getSnapshot(): Promise<DashboardSnapshot> {
+		const snapshot = await super.getSnapshot();
+		const state = this.lifecycle?.snapshot();
+		const diagnostic = state?.error ?? {
+			code: this.failed ? 'DASHBOARD_STARTUP_FAILED' : 'DASHBOARD_STARTING',
+			message: this.failed
+				? 'Mesh startup failed. Check the Mesh output channel before reloading this window.'
+				: 'Mesh services are starting. Waiting for local Broker identity and connection.',
+		};
+		return {
+			...snapshot,
+			broker: {
+				state: state?.state ?? (this.failed ? 'error' : 'starting'),
+				role: state?.owner ? 'owner' : 'contender',
+				takeover: state?.error || this.failed ? 'error' : 'waiting',
+				holder: state?.owner ? 'thisWindow' : state?.holderWindowId ? 'anotherWindow' : 'none',
+				error: diagnostic,
+			},
+			errors: [diagnostic],
+		};
+	}
+
+	public override async configureDeviceName(): Promise<void> {
+		throw new Error('Device settings are unavailable until Mesh startup completes.');
+	}
+}
+
+async function createInitializedApplication(
+	context: vscode.ExtensionContext,
+	dashboard: AgentMeshViewProvider,
+	startupSignal: AbortSignal,
+	onLifecycle: (lifecycle: BrokerLifecycle<ProductionBrokerRuntime>) => void,
+): Promise<Application> {
 	const output = vscode.window.createOutputChannel('Copilot Agent Mesh', { log: true });
 	const logger = new StructuredLogger(output);
 	const contributions: vscode.Disposable[] = [];
@@ -223,6 +338,10 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		const ownership = await BrokerOwnerLock.acquire(brokerStorageUri.fsPath, {
 			instanceId: windowInstanceId,
 		});
+		logger.log('info', 'startup', 'Broker ownership inspection finished.', {
+			owner: ownership.isOwner(),
+			takeoverBlocked: ownership.snapshot().takeoverBlocked === true,
+		});
 		const ownershipCleanup = addApplicationCleanup(cleanup, () => ownership.dispose(), true);
 		const changeEvents = new vscode.EventEmitter<void>();
 		let profile: DeviceProfile | undefined;
@@ -260,6 +379,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			},
 		);
 		ownershipCleanup.dispose = () => lifecycle.dispose();
+		onLifecycle(lifecycle);
 		await lifecycle.start().catch((error: unknown) => {
 			logger.error(
 				'broker',
@@ -269,10 +389,18 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			void reportPeerStartup?.('BROKER_RUNTIME_START_FAILED');
 		});
 
+		logger.log('info', 'startup', 'Waiting for shared Broker identity.');
 		const [sharedProfile, brokerKey] = await Promise.all([
-			waitForDeviceProfile(rawState, environment),
-			waitForBrokerKey(secrets),
+			waitForDeviceProfile(rawState, environment, { signal: startupSignal }).then((value) => {
+				logger.log('info', 'startup', 'Shared device profile is available.');
+				return value;
+			}),
+			waitForBrokerKey(secrets, { signal: startupSignal }).then((value) => {
+				logger.log('info', 'startup', 'Shared Broker authentication state is available.');
+				return value;
+			}),
 		]);
+		logger.log('info', 'startup', 'Shared Broker identity is available.');
 		profile = sharedProfile;
 		const nodeLabel = windowNodeLabel(nodeId);
 		const runtimeApproval = new VscodeLocalTaskApproval(vscode, rawState, e2eCapability);
@@ -397,8 +525,13 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		addApplicationCleanup(cleanup, () => changeEvents.dispose());
 		addApplicationCleanup(cleanup, () => sourceStatusSubscription?.dispose());
 		await codespaceExecution?.initialize();
-		await node.start();
-		nodeStartupComplete = true;
+		void node.start().then(() => {
+			nodeStartupComplete = true;
+		}, (error: unknown) => {
+			if (node.snapshot().state !== 'disposed') {
+				logger.error('window-node', 'Initial Window Node connection failed; Dashboard remains available.', error);
+			}
+		});
 		const remoteTasks = new LocalIpcRemoteTaskAdapter(node);
 		addApplicationCleanup(cleanup, () => remoteTasks.dispose());
 		const localTasks = new LocalBrokerTaskFacade(node, {
@@ -441,8 +574,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		});
 		addApplicationCleanup(cleanup, () => bindings.dispose());
 		const dashboardFacade = new ServiceDashboardFacade(bindings);
-		const dashboard = new AgentMeshViewProvider(dashboardFacade, context.extensionUri);
-		addApplicationCleanup(cleanup, () => dashboard.dispose());
+		dashboard.setFacade(dashboardFacade);
 		const gatedE2e = createTwoDeviceE2eApi({
 			vscodeApi: vscode,
 			bindings,
@@ -505,7 +637,6 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 		syncMeshTools();
 		contributions.push(
 			{ dispose: () => meshTools?.dispose() },
-			vscode.window.registerWebviewViewProvider(AgentMeshViewProvider.viewType, dashboard),
 			...registerCommands(
 				dashboardFacade,
 				dashboard,
@@ -557,6 +688,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 
 		let disposal: Promise<void> | undefined;
 		const api: AgentMeshExtensionApi = {
+			ready: Promise.resolve(),
 			get agentRuntime() {
 				return runtime;
 			},
@@ -603,6 +735,7 @@ export async function createApplication(context: vscode.ExtensionContext): Promi
 			},
 		};
 	} catch (error: unknown) {
+		logger.error('startup', 'Copilot Agent Mesh backend initialization failed.', error);
 		try {
 			await disposeApplicationResources(contributions, cleanup, logger, cleanupState);
 		} catch (cleanupError: unknown) {
@@ -648,7 +781,6 @@ function registerCommands(
 	};
 	return [
 		register(DASHBOARD_COMMANDS.configureDevice, false, () => facade.configureDeviceName()),
-		register(DASHBOARD_COMMANDS.refresh, false, () => dashboard.refresh()),
 		register(APPLICATION_COMMANDS.registerWorkspace, true, () => facade.registerCurrentWorkspace()),
 		register(APPLICATION_COMMANDS.removeWorkspace, true, async (value) => {
 			const id = opaqueId(value) ?? await selectTarget('workspace');

@@ -27,6 +27,7 @@ export type BrokerLifecycleState =
 	| 'disposed';
 
 export type BrokerLifecycleErrorCode =
+	| 'BROKER_TAKEOVER_BLOCKED'
 	| 'BROKER_CONTENTION_FAILED'
 	| 'BROKER_OWNERSHIP_RELEASE_FAILED'
 	| 'BROKER_OWNERSHIP_INVALID'
@@ -463,7 +464,8 @@ export class BrokerLifecycle<Runtime extends BrokerRuntime = BrokerRuntime> {
 		state: BrokerLifecycleState,
 		error?: BrokerLifecycleStatusError,
 	): BrokerLifecycleStatus {
-		const snapshot = publicOwnerSnapshot(this.ownership.snapshot());
+		const ownership = this.ownership.snapshot();
+		const snapshot = publicOwnerSnapshot(ownership);
 		const generation = this.runtimeGeneration ?? snapshot.generation;
 		return {
 			state,
@@ -471,7 +473,11 @@ export class BrokerLifecycle<Runtime extends BrokerRuntime = BrokerRuntime> {
 			owner: snapshot.owner,
 			holderWindowId: snapshot.holderWindowId,
 			ownership: snapshot,
-			error,
+			error: error ?? (state === 'contending' && ownership.takeoverBlocked ? {
+				code: 'BROKER_TAKEOVER_BLOCKED',
+				message: 'Broker startup is blocked by an existing takeover lock. Automatic recovery requires a confirmed exited holder and no owner record.',
+				retryable: true,
+			} : undefined),
 		};
 	}
 }

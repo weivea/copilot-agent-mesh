@@ -48,6 +48,8 @@ export async function runWindowE2eHostWithApi(
 	if (nonce === undefined) {
 		throw new Error(`${environmentPrefix}_NONCE is required.`);
 	}
+	await api.ready;
+	await api.node.start();
 	const controller = options.controller(api);
 	if (controller === undefined) {
 		throw new Error(`The gated ${options.label} API was not activated.`);

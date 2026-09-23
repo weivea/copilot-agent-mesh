@@ -43,8 +43,11 @@
 		WINDOW_NAME_CONFLICT: 'Another window already uses this name. Choose a different window name.',
 		WINDOW_NAME_INVALID: 'The window name is invalid. Choose a nonempty valid name.',
 		BROKER_UNAVAILABLE: 'The local Device Broker lifecycle is unavailable.',
+		BROKER_TAKEOVER_BLOCKED: 'Broker startup is blocked by an existing takeover lock. Automatic recovery requires a confirmed exited holder and no owner record.',
 		CONNECTIVITY_UNAVAILABLE: 'Cross-device connection status is unavailable. Refresh to retry.',
 		DASHBOARD_SERVICES_UNAVAILABLE: 'Dashboard services are unavailable. Refresh to retry.',
+		DASHBOARD_STARTING: 'Mesh services are starting. Waiting for local Broker identity and connection.',
+		DASHBOARD_STARTUP_FAILED: 'Mesh startup failed. Check the Mesh output channel before reloading this window.',
 		ACTIVE_TASKS: 'Active tasks block deletion. Cancel them or wait for a terminal outcome.',
 		TASK_STATUS_UNKNOWN: 'Task status is unknown. Refresh device diagnostics before deleting.',
 	};
@@ -349,8 +352,11 @@
 			'Another window already uses this name. Choose a different window name.': '其他窗口已使用此名称，请选择另一个窗口名称。',
 			'The window name is invalid. Choose a nonempty valid name.': '窗口名称无效，请选择非空的有效名称。',
 			'The local Device Broker lifecycle is unavailable.': '本机设备 Broker 生命周期不可用。',
+			'Broker startup is blocked by an existing takeover lock. Automatic recovery requires a confirmed exited holder and no owner record.': '现有接管锁阻止了 Broker 启动。只有确认持锁进程已退出且不存在 owner 记录时，才会自动恢复。',
 			'Cross-device connection status is unavailable. Refresh to retry.': '跨设备连接状态不可用，请刷新后重试。',
 			'Dashboard services are unavailable. Refresh to retry.': '仪表板服务不可用，请刷新后重试。',
+			'Mesh services are starting. Waiting for local Broker identity and connection.': 'Mesh 服务正在启动，等待本机 Broker 身份和连接。',
+			'Mesh startup failed. Check the Mesh output channel before reloading this window.': 'Mesh 启动失败。请先检查 Mesh 输出日志，再重新加载窗口。',
 		},
 	};
 }());

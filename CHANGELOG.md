@@ -6,6 +6,13 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [Unreleased]
 
+- Recover an expired orphaned Broker takeover mutex only after confirming the
+  holder exited, no owner file exists, and one contender wins atomic ownership.
+  Preserve live/ambiguous locks and display an explicit blocked diagnostic.
+- Register the Dashboard without waiting indefinitely for the first Window Node
+  connection. Cover recovery and blocked startup with installed-VSIX restart
+  smoke tests in an isolated persisted profile.
+
 ## [0.5.14 Preview] - 2026-09-23
 
 - Bundle explicit `/mesh-delegate` and `/mesh-execute` Agent Skills; require

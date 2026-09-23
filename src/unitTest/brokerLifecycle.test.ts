@@ -56,6 +56,23 @@ test('non-owner remains contending without creating a runtime', async () => {
 	await lifecycle.dispose();
 });
 
+test('blocked takeover is an explicit safe diagnostic rather than a healthy waiting owner', async () => {
+	const cluster = new OwnershipCluster();
+	const ownership = cluster.create('node');
+	const originalSnapshot = ownership.snapshot.bind(ownership);
+	ownership.snapshot = () => ({ ...originalSnapshot(), takeoverBlocked: true });
+	const lifecycle = new BrokerLifecycle(ownership, () => {
+		throw new Error('Blocked ownership must not start a runtime.');
+	});
+	await lifecycle.start();
+	assert.equal(lifecycle.snapshot().state, 'contending');
+	assert.equal(lifecycle.snapshot().error?.code, 'BROKER_TAKEOVER_BLOCKED');
+	assert.match(lifecycle.snapshot().error!.message, /confirmed exited holder/u);
+	assert.equal('takeoverBlocked' in lifecycle.snapshot().ownership, false);
+	assert.doesNotMatch(JSON.stringify(lifecycle.snapshot()), /token|pid|worker-owner/u);
+	await lifecycle.dispose();
+});
+
 test('graceful owner close elects a contender and starts its runtime', async () => {
 	const cluster = new OwnershipCluster();
 	const ownerRuntime = runtime();

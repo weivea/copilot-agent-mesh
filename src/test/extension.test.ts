@@ -145,6 +145,8 @@ suite('Copilot Agent Mesh', () => {
 	test('exposes the production Window Node and Broker lifecycle state', async () => {
 		const extension = getExtension();
 		const api = await extension.activate() as AgentMeshExtensionApi;
+		await api.ready;
+		await api.node.start();
 		assert.match(api.nodeId, /^[0-9a-f-]{36}$/u);
 		assert.match(api.nodeInstanceId, /^[0-9a-f-]{36}$/u);
 		assert.strictEqual(api.nodeState().state, 'online');
